@@ -89,7 +89,7 @@ export default function Netflow() {
         <div className="space-y-6">
           {graph && <NetflowGraph graph={graph} scope="global" />}
           <NetflowSummary hosts={data.hosts} />
-          <NetflowTable flows={data.flows} dropped={data.dropped_total} asnLoaded={data.asn_loaded} scope="global" />
+          <NetflowTable flows={data.flows} droppedTotal={data.dropped_total} asnLoaded={data.asn_loaded} scope="global" />
         </div>
       )}
     </div>

@@ -115,6 +115,33 @@ impl FlowView {
     }
 }
 
+/// The `?from=`/`?to=` window actually applied to produce `NetflowResponse::flows`
+/// (and, transitively, `hosts`) — deliberately NOT `dropped_total`, which is
+/// whole-file by definition (see that field's doc comment).
+///
+/// Present unconditionally on every response (both sides `null` when
+/// unbounded, i.e. no filter was requested) rather than only when a filter
+/// is active — Minor 4, Task 3 review round 1: this gives a caller positive
+/// confirmation that whatever filter it sent was actually honoured, and
+/// makes `dropped_total`'s whole-file scope legible BY CONTRAST (a reader
+/// comparing a narrow `window` against an unrelated-looking `dropped_total`
+/// has a visual cue that the two are not the same scope), rather than that
+/// meaning being carried by the field name alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowEcho {
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<&rupu_netflow::ledger::TimeRange> for WindowEcho {
+    fn from(range: &rupu_netflow::ledger::TimeRange) -> Self {
+        Self {
+            from: range.from,
+            to: range.to,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetflowResponse {
     pub flows: Vec<FlowView>,
@@ -122,6 +149,16 @@ pub struct NetflowResponse {
     /// percentile and unknown-bytes logic has exactly ONE implementation
     /// (`rupu_netflow::ledger::host_rollup`).
     pub hosts: Vec<rupu_netflow::ledger::HostRollup>,
+    /// The `?from=`/`?to=` window that was actually applied to `flows` —
+    /// see [`WindowEcho`]. `#[serde(default)]` so a response proxied from
+    /// an older remote that predates this field (but already has
+    /// `dropped_total`, so it still deserializes at all) degrades to
+    /// unbounded rather than failing closed the way a missing
+    /// `dropped_total` does — `run_netflow_from_host` immediately
+    /// overwrites this with the LOCALLY enforced range regardless, so a
+    /// stale/absent value from the remote is never actually trusted.
+    #[serde(default)]
+    pub window: WindowEcho,
     /// Records lost to writer-channel overflow, for the WHOLE ledger
     /// file(s) this response reads — NEVER narrowed by `?from=`/`?to=`. A
     /// drop batch (`LedgerLine::Dropped`) carries no per-record timestamp,
@@ -405,11 +442,17 @@ fn merge_with_transcript(
 /// `table` is a parameter rather than an internal `load_asn_table()` call so
 /// this function is testable in both directions (table present / absent)
 /// without touching the real `$RUPU_HOME` on disk — every caller (the route
-/// handlers below) loads the table itself and passes it in.
+/// handlers below) loads the table itself and passes it in. `range` is
+/// echoed into the response's `window` field (see [`WindowEcho`]) — it is
+/// NOT re-applied to `flows` here; every caller has already filtered
+/// `flows` (via `read_flows_in_range` or an explicit `range.contains`
+/// pass) before calling this function, so this is purely reporting what
+/// was already enforced, not enforcing it again.
 pub(crate) fn build_response(
     flows: Vec<FlowRecord>,
     dropped: u64,
     table: Option<&AsnTable>,
+    range: &rupu_netflow::ledger::TimeRange,
 ) -> NetflowResponse {
     let hosts = rupu_netflow::ledger::host_rollup(&flows);
     NetflowResponse {
@@ -419,6 +462,7 @@ pub(crate) fn build_response(
             .collect(),
         hosts,
         dropped_total: dropped,
+        window: WindowEcho::from(range),
         asn_loaded: table.is_some(),
     }
 }
@@ -560,7 +604,7 @@ fn collect_run_netflow(
     let (merged, dropped) =
         run_scoped_flows_and_dropped(store, run_id, workspace, global_dir, range);
     let table = load_asn_table(cache);
-    build_response(merged, dropped, table.as_deref())
+    build_response(merged, dropped, table.as_deref(), range)
 }
 
 /// A registered workspace store, rooted at `<global_dir>/workspaces/` —
@@ -743,7 +787,7 @@ async fn get_project_netflow(
             read_all_run_ledgers_in_dir(&project_local_netflow_dir(&workspace), &range);
         let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
         let table = load_asn_table(&cache);
-        build_response(flows, dropped, table.as_deref())
+        build_response(flows, dropped, table.as_deref(), &range)
     })
     .await?;
     Ok(Json(resp))
@@ -762,7 +806,7 @@ async fn get_global_netflow(
         let (flows, dropped) = read_all_workspaces_sync(&global_dir, &range);
         let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
         let table = load_asn_table(&cache);
-        build_response(flows, dropped, table.as_deref())
+        build_response(flows, dropped, table.as_deref(), &range)
     })
     .await?;
     Ok(Json(resp))
@@ -960,7 +1004,31 @@ async fn run_netflow_from_host(
         }
         other => ApiError::internal(other.to_string()),
     })?;
-    serde_json::from_value(value).map_err(|e| ApiError::internal(e.to_string()))
+    // A deserialization failure here is most likely `dropped_total` not
+    // parsing on an OLDER remote still emitting the pre-rename `dropped`
+    // key (no `#[serde(default)]` on `NetflowResponse`, deliberately —
+    // failing closed here beats silently defaulting `dropped_total` to 0
+    // and rendering an older remote's response as if nothing was lost).
+    // Name that likely cause instead of relaying `e.to_string()`, which is
+    // a bare serde message an operator has no way to act on.
+    let mut resp: NetflowResponse = serde_json::from_value(value).map_err(|e| {
+        ApiError::internal(format!(
+            "host {host_id} returned a netflow response this build cannot read ({e}); \
+             the remote CP is likely older than this one"
+        ))
+    })?;
+    // Re-filter the deserialized flows locally even though `range` was
+    // already forwarded in `path` above: a no-op against a CURRENT remote
+    // (which already applied the identical window server-side, so nothing
+    // here changes), and CORRECTIVE against an older remote that
+    // recognizes the route but silently ignores unfamiliar `from`/`to`
+    // query params and returns everything unbounded — closing that class
+    // of version skew permanently rather than relying solely on the
+    // deserialize failure above to catch it. `dropped_total` is left
+    // untouched: it is whole-file by definition (see its doc comment) and
+    // is not affected by which `flows` survive this filter.
+    resp.flows.retain(|v| range.contains(v.flow.ts));
+    Ok(resp)
 }
 
 /// Render `range` as a `?from=&to=` query-string suffix (empty string when
@@ -1044,7 +1112,7 @@ async fn get_run_netflow(
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
                 let table = load_asn_table(&cache);
-                build_response(Vec::new(), 0, table.as_deref())
+                build_response(Vec::new(), 0, table.as_deref(), &range)
             })
             .await?;
             Ok(Json(resp))
@@ -1103,10 +1171,52 @@ mod tests {
     #[test]
     fn build_response_wires_a_server_computed_host_rollup() {
         let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
-        let resp = build_response(vec![f], 0, None);
+        let resp = build_response(
+            vec![f],
+            0,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
         assert_eq!(resp.hosts.len(), 1);
         assert_eq!(resp.hosts[0].host, "api.anthropic.com");
         assert_eq!(resp.hosts[0].calls, 1);
+    }
+
+    /// Minor 4 (Task 3 review round 1): `window` must echo whatever
+    /// `range` was actually applied, not stay at its `Default` regardless
+    /// of input — proving `build_response` threads `range` through to
+    /// `WindowEcho::from` rather than the field being hardcoded or
+    /// disconnected from the range it claims to describe.
+    #[test]
+    fn build_response_echoes_the_applied_window() {
+        let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
+        let range = rupu_netflow::ledger::TimeRange {
+            from: Some(chrono::DateTime::from_timestamp(100, 0).unwrap()),
+            to: Some(chrono::DateTime::from_timestamp(200, 0).unwrap()),
+        };
+
+        let resp = build_response(vec![f], 0, None, &range);
+
+        assert_eq!(resp.window.from, range.from);
+        assert_eq!(resp.window.to, range.to);
+    }
+
+    /// The unbounded case: both sides `null`, not omitted — a caller must
+    /// be able to tell "no filter was applied" from "the response has no
+    /// opinion", which an omitted key would blur.
+    #[test]
+    fn build_response_with_an_unbounded_range_echoes_a_null_window() {
+        let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
+
+        let resp = build_response(
+            vec![f],
+            0,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
+
+        assert!(resp.window.from.is_none());
+        assert!(resp.window.to.is_none());
     }
 
     /// The other half of `build_response`'s contract, previously untested:
@@ -1121,7 +1231,12 @@ mod tests {
         let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
         f.peer_ip = Some("1.0.0.7".parse().unwrap());
 
-        let resp = build_response(vec![f], 0, None);
+        let resp = build_response(
+            vec![f],
+            0,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
 
         assert!(!resp.asn_loaded, "no table was supplied");
         assert!(
@@ -1146,7 +1261,12 @@ mod tests {
         let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
         f.peer_ip = Some("1.0.0.7".parse().unwrap());
 
-        let resp = build_response(vec![f], 0, Some(&table));
+        let resp = build_response(
+            vec![f],
+            0,
+            Some(&table),
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
 
         assert!(resp.asn_loaded);
         assert_eq!(resp.flows.len(), 1);
