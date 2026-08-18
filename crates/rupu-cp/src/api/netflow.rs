@@ -9,12 +9,16 @@
 //!
 //! With one ledger file per run (`NetflowPaths::for_run`), a flow's
 //! attribution to a run is the FILE it landed in, not the `ctx.run_id`
-//! field — `Origin::Scm`, `Auth`/`System`, `Update` and `Cp` flows still
-//! carry `run_id: None` (see `rupu_netflow::ctx::FlowCtx::system`), but a
-//! per-run sink writes them into THIS run's own ledger file regardless, so
-//! a plain read of that file already includes them. `filter_by_run`'s old
-//! job — recovering `run_id: None` flows a shared ledger's field filter
-//! would otherwise drop — is not what the transcript merge is for anymore.
+//! field — `run_id` is `None` on every production flow today (see
+//! `rupu_netflow::ctx::FlowCtx`'s doc comment), so it was never usable
+//! for attribution to begin with. `Origin::Scm` (SCM connector traffic,
+//! e.g. `Registry::discover`) is the one kind of `run_id: None` flow that
+//! DOES reach a real per-run sink and lands in THIS run's own ledger file
+//! — `Auth`, `System`, `Update` and `Cp` are all wired to `NullSink` and
+//! reach no ledger at all (see `ScopeDisclosure.tsx` for the full
+//! accounting). `filter_by_run`'s old job — recovering `run_id: None`
+//! flows a shared ledger's field filter would otherwise drop — is not
+//! what the transcript merge is for anymore.
 //!
 //! What it's for instead: `netflow_sink::for_run` (rupu-cli) is
 //! best-effort — capture must never break a run, so a ledger file that
@@ -404,24 +408,38 @@ pub(crate) fn build_response(
     }
 }
 
-/// Resolve which ledger file a given run/step id's flows actually landed
-/// in: the workspace-local `<workspace>/.rupu/netflow/<id>.jsonl` when it
-/// exists, the global `<global_dir>/netflow/<id>.jsonl` fallback
-/// otherwise. Mirrors `rupu_netflow::netflow_dir`'s write-side routing
-/// rule exactly (project-local ONLY if the directory already existed at
-/// write time) — this is the read side of that same decision, applied
-/// per id rather than once per process, because two different ids
-/// belonging to the SAME workspace can legitimately have been written to
-/// different roots if `<workspace>/.rupu/netflow/` was created partway
-/// through the workspace's history (e.g. by an operator running `mkdir`,
-/// or a future `rupu init` enhancement). Neither branch is created here —
-/// this only READS whichever one the writer actually used.
-fn resolve_ledger_path(workspace: &StdPath, global_dir: &StdPath, id: &str) -> PathBuf {
-    let workspace_paths = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), id);
-    if workspace_paths.flows.is_file() {
-        workspace_paths.flows
+/// Resolve every ledger file a given run/step id's flows could have
+/// landed in: the workspace-local `<workspace>/.rupu/netflow/<id>.jsonl`
+/// AND the global `<global_dir>/netflow/<id>.jsonl` fallback — BOTH, not
+/// whichever exists first. Whole-branch review (Finding 5): `cp serve`
+/// resumes a paused run by spawning a DETACHED command with the DAEMON's
+/// own cwd, not the original invocation's; `resume.rs`/`workflow.rs`
+/// derive `project_root` from that cwd via `project_root_for`. So the
+/// SAME run id can legitimately end up with a ledger written to the
+/// workspace-local root by its original dispatch and a SECOND, later
+/// ledger written to the global root by a resumed step running under a
+/// different cwd (or the reverse) — `<workspace>/.rupu/netflow/` existing
+/// or not is a per-process observation, not a fixed property of the id.
+/// Reading only "whichever exists" silently drops whichever wrote last.
+/// Both callers already tolerate a missing file
+/// (`read_flows_and_dropped` degrades to `([], 0)`) and dedupe by
+/// `FlowId` (`merge_with_transcript`), so reading both unconditionally is
+/// safe — the only cost is one extra open-attempt on a path that, in the
+/// common (non-split) case, doesn't exist.
+///
+/// Deduped when both paths canonicalize to the SAME directory (the
+/// `$HOME`/`~/.rupu` collision `read_all_workspaces_sync` also guards
+/// against) so that case reads one file once, not twice — reading the
+/// identical file under two different-looking paths would double-count
+/// its flows and its `Dropped` line the same way the un-deduped global
+/// union used to.
+fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> Vec<PathBuf> {
+    let workspace_path = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), id).flows;
+    let global_path = NetflowPaths::for_run(&global_dir.join("netflow"), id).flows;
+    if canonicalize_or_self(&workspace_path) == canonicalize_or_self(&global_path) {
+        vec![workspace_path]
     } else {
-        NetflowPaths::for_run(&global_dir.join("netflow"), id).flows
+        vec![workspace_path, global_path]
     }
 }
 
@@ -479,10 +497,12 @@ fn run_scoped_flows_and_dropped(
     let mut all = Vec::new();
     let mut dropped = 0u64;
     for id in run_and_unit_ids(store, run_id) {
-        let ledger_path = resolve_ledger_path(workspace, global_dir, &id);
-        let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&ledger_path).unwrap_or_default();
-        all.extend(f);
-        dropped += d;
+        for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
+            let (f, d) =
+                rupu_netflow::ledger::read_flows_and_dropped(&ledger_path).unwrap_or_default();
+            all.extend(f);
+            dropped += d;
+        }
     }
     let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
     let merged = merge_with_transcript(all, &transcript_paths);
@@ -551,7 +571,7 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
 /// run that happens to be named "flows" — reading it back in as if it
 /// were one would silently resurrect the exact shared-file model this
 /// plan replaced.
-fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
+fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<(String, FlowRecord)>, u64) {
     let mut flows = Vec::new();
     let mut dropped = 0u64;
     let Ok(entries) = std::fs::read_dir(netflow_dir) else {
@@ -565,8 +585,17 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) 
         if path.file_name().and_then(|n| n.to_str()) == Some("flows.jsonl") {
             continue;
         }
+        // `NetflowPaths::for_run` always names a ledger `<id>.jsonl`, so
+        // the file stem IS the owning run/step id -- this is the "the
+        // read side already knows which file each flow came from" the
+        // whole-branch review named as the fix for `graph_view`'s
+        // single-node collapse. A file whose stem somehow isn't valid
+        // UTF-8 is skipped rather than guessed at.
+        let Some(run_id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&path).unwrap_or_default();
-        flows.extend(f);
+        flows.extend(f.into_iter().map(|flow| (run_id.to_string(), flow)));
         dropped += d;
     }
     (flows, dropped)
@@ -604,7 +633,7 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) 
 /// scales with the number of registered workspaces AND with the number of
 /// runs each one has, so it's the one most worth keeping off the async
 /// task).
-fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
+fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<(String, FlowRecord)>, u64) {
     let workspaces = (WorkspaceStore {
         root: global_dir.join("workspaces"),
     })
@@ -646,10 +675,11 @@ fn canonicalize_or_self(path: &StdPath) -> PathBuf {
 
 /// `GET /api/projects/:id/netflow` — every flow in a workspace's own
 /// `.rupu/netflow/` ledger directory, including `system`-origin egress
-/// (`run_id: None`) that has no run to attach to (e.g. a `rupu run`
-/// invocation's own update-notice check, which carries `Origin::Update`
-/// but no `run_id`). Unlike run scope, this reads the ledger directly
-/// with no `run_id` filter.
+/// (`run_id: None`, e.g. `Origin::Scm` traffic from `Registry::discover`)
+/// that has no run to attach to. NOT the update checker, which despite
+/// also using `Origin::Update` reaches no ledger at all —
+/// `rupu-update`'s client is wired to `Arc::new(NullSink)`. Unlike run
+/// scope, this reads the ledger directly with no `run_id` filter.
 ///
 /// KNOWN GAP (unlike run scope and global scope, deliberately not fixed
 /// in this pass): this does NOT fall back to `<global_dir>/netflow/` for
@@ -671,6 +701,7 @@ async fn get_project_netflow(
     let cache = Arc::clone(&state.asn_cache);
     let resp = run_blocking(move || {
         let (flows, dropped) = read_all_run_ledgers_in_dir(&workspace.join(".rupu/netflow"));
+        let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
         let table = load_asn_table(&cache);
         build_response(flows, dropped, table.as_deref())
     })
@@ -685,6 +716,7 @@ async fn get_global_netflow(State(state): State<AppState>) -> ApiResult<Json<Net
     let cache = Arc::clone(&state.asn_cache);
     let resp = run_blocking(move || {
         let (flows, dropped) = read_all_workspaces_sync(&global_dir);
+        let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
         let table = load_asn_table(&cache);
         build_response(flows, dropped, table.as_deref())
     })
@@ -708,7 +740,19 @@ pub struct GraphQuery {
 /// (global store / project-local store / remote host / unpersisted / 404).
 /// The `Global`/`ProjectLocal` branches read through [`run_blocking`]; the
 /// `Host` branch is a network proxy call, not disk I/O, so it stays inline.
-async fn run_scoped_flows_for_graph(s: &AppState, run_id: &str) -> ApiResult<Vec<FlowRecord>> {
+///
+/// Every flow is tagged with THIS run's own `run_id`, not the finer id of
+/// whichever per-step ledger file it actually came from
+/// (`run_and_unit_ids`/`resolve_ledger_paths` may read several) — at run
+/// scope the graph is meant to answer "what did THIS run reach", so it
+/// shows one source node for the run, not a fragmented node per
+/// internally-dispatched step. Project/global scope go the other way
+/// (one node per contributing run) via `read_all_run_ledgers_in_dir`.
+async fn run_scoped_flows_for_graph(
+    s: &AppState,
+    run_id: &str,
+) -> ApiResult<Vec<(String, FlowRecord)>> {
+    let tag = |flows: Vec<FlowRecord>| flows.into_iter().map(|f| (run_id.to_string(), f)).collect();
     match resolve_run_location(s, run_id).await {
         RunLocation::Global => {
             let run = s
@@ -716,26 +760,28 @@ async fn run_scoped_flows_for_graph(s: &AppState, run_id: &str) -> ApiResult<Vec
                 .load(run_id)
                 .map_err(|e| run_not_found_or_internal(run_id, e))?;
             let store = Arc::clone(&s.run_store);
-            let run_id = run_id.to_string();
+            let rid = run_id.to_string();
             let workspace = run.workspace_path.clone();
             let global_dir = s.global_dir.clone();
-            run_blocking(move || {
-                run_scoped_flows_and_dropped(&store, &run_id, &workspace, &global_dir).0
+            let flows = run_blocking(move || {
+                run_scoped_flows_and_dropped(&store, &rid, &workspace, &global_dir).0
             })
-            .await
+            .await?;
+            Ok(tag(flows))
         }
         RunLocation::ProjectLocal { path } => {
-            let run_id = run_id.to_string();
+            let rid = run_id.to_string();
             let global_dir = s.global_dir.clone();
-            run_blocking(move || {
+            let flows = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                run_scoped_flows_and_dropped(&store, &run_id, &path, &global_dir).0
+                run_scoped_flows_and_dropped(&store, &rid, &path, &global_dir).0
             })
-            .await
+            .await?;
+            Ok(tag(flows))
         }
         RunLocation::Host { host_id } => {
             let resp = run_netflow_from_host(s, &host_id, run_id).await?;
-            Ok(resp.flows.into_iter().map(|v| v.flow).collect())
+            Ok(tag(resp.flows.into_iter().map(|v| v.flow).collect()))
         }
         // No artifacts anywhere to build a graph from — empty, not an
         // error, mirroring `get_run_netflow`'s `Unpersisted` branch.
@@ -746,7 +792,7 @@ async fn run_scoped_flows_for_graph(s: &AppState, run_id: &str) -> ApiResult<Vec
 
 /// `GET /api/netflow/graph?scope=` — the bipartite source↔endpoint graph
 /// (`rupu_netflow::ledger::graph_view` does the actual bipartite build; this
-/// only resolves `scope` to the flow set it runs over).
+/// only resolves `scope` to the (run id, flow) set it runs over).
 async fn get_netflow_graph(
     State(state): State<AppState>,
     Query(q): Query<GraphQuery>,

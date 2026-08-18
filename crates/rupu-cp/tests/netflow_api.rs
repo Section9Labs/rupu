@@ -847,6 +847,87 @@ async fn run_netflow_falls_back_to_the_global_netflow_dir_when_the_workspace_has
     assert_eq!(flows[0]["host"], "api.anthropic.com");
 }
 
+/// Finding 5, whole-branch review: `cp serve` resumes a run via a detached
+/// command running under the DAEMON's own cwd, which need not match the
+/// run's original workspace. A run whose early steps wrote to the
+/// workspace-local netflow dir can have its later steps' ledger land at
+/// the global fallback instead (or vice versa) — one run id split across
+/// both roots. The old `resolve_ledger_path` (singular) picked whichever
+/// root it found first and stopped, silently losing every flow (and
+/// `Dropped` line) that landed in the other one. `resolve_ledger_paths`
+/// (plural) now reads both roots and unions the results.
+#[tokio::test]
+async fn run_netflow_unions_a_run_split_across_workspace_and_global_roots() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_split";
+
+    // First half of this run's ledger: workspace-local root.
+    write_ledger(
+        project.path(),
+        run_id,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(run_id),
+                "api.anthropic.com",
+                Origin::Provider("anthropic".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 2,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+    // Second half of the SAME run's ledger: global root.
+    write_global_ledger(
+        global.path(),
+        run_id,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(run_id),
+                "api.github.com",
+                Origin::Scm("github".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 3,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(
+        flows.len(),
+        2,
+        "both halves of a run split across workspace-local and global roots must be read: {body}"
+    );
+    let hosts: std::collections::HashSet<&str> =
+        flows.iter().map(|f| f["host"].as_str().unwrap()).collect();
+    assert!(hosts.contains("api.anthropic.com"));
+    assert!(hosts.contains("api.github.com"));
+    assert_eq!(
+        body["dropped"], 5,
+        "dropped must sum across both halves of the split ledger: {body}"
+    );
+}
+
 /// The DAG scheduler mints a fresh run id per dispatched step, so a
 /// step's provider flows AND its `Dropped` line land in
 /// `<netflow_dir>/<step_run_id>.jsonl`, not the parent workflow run's own
@@ -940,28 +1021,42 @@ async fn global_netflow_with_no_registered_workspaces_is_empty_not_an_error() {
 
 // ── Graph scope ─────────────────────────────────────────────────────────
 
+/// Finding 4, whole-branch review: `graph_view` used to derive a flow's
+/// source id from `ctx.run_id`, a field no production `FlowCtx` ever
+/// populates -- every graph, at every scope, collapsed to one node
+/// literally called `system`. The read side now tags each flow with the
+/// id of the LEDGER FILE it came from, so this test writes two SEPARATE
+/// per-run ledger files (not one file with two differing `ctx.run_id`
+/// values, which is what the pre-fix version of this test did) to prove
+/// two distinct source nodes -- one per contributing file, regardless of
+/// what `ctx.run_id` the flow inside each one happens to carry.
 #[tokio::test]
-async fn netflow_graph_project_scope_is_bipartite_and_keeps_system_source() {
+async fn netflow_graph_project_scope_is_bipartite_with_one_source_per_ledger_file() {
     let global = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
     write_ledger(
         project.path(),
         "run-a",
-        &[
-            LedgerLine::Flow(Box::new(e2e_flow(
-                FlowId::new(),
-                Some("run-a"),
-                "api.anthropic.com",
-                Origin::Provider("anthropic".into()),
-            ))),
-            LedgerLine::Flow(Box::new(e2e_flow(
-                FlowId::new(),
-                None,
-                "api.anthropic.com",
-                Origin::System,
-            ))),
-        ],
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some("run-a"),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+    // A second run's own ledger file. `ctx.run_id: None` here on purpose
+    // -- matches what a real Origin::Scm flow looks like -- to prove the
+    // source id comes from the FILE, not this field.
+    write_ledger(
+        project.path(),
+        "run-b",
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            None,
+            "api.anthropic.com",
+            Origin::Scm("github".into()),
+        )))],
     );
 
     let store = rupu_workspace::WorkspaceStore {
@@ -982,11 +1077,20 @@ async fn netflow_graph_project_scope_is_bipartite_and_keeps_system_source() {
 
     let sources: Vec<_> = nodes.iter().filter(|n| n["side"] == "source").collect();
     let endpoints: Vec<_> = nodes.iter().filter(|n| n["side"] == "endpoint").collect();
-    assert_eq!(sources.len(), 2, "run-a and system: {body}");
+    assert_eq!(
+        sources.len(),
+        2,
+        "one source per contributing ledger file: {body}"
+    );
     assert_eq!(endpoints.len(), 1);
     assert!(
-        sources.iter().any(|n| n["id"] == "system"),
-        "unattributed egress keeps a system source node: {body}"
+        sources.iter().any(|n| n["id"] == "run-a"),
+        "run-a's ledger file must be its own source node: {body}"
+    );
+    assert!(
+        sources.iter().any(|n| n["id"] == "run-b"),
+        "run-b's ledger file must be its own source node, not merged into \
+         a system fallback: {body}"
     );
 }
 

@@ -231,14 +231,26 @@ pub struct GraphView {
     pub edges: Vec<GraphEdge>,
 }
 
-/// Bipartite topology: sources (runs, or `system` for unattributed
-/// process-global egress) on one side, `host:port` endpoints on the other.
-pub fn graph_view(flows: &[FlowRecord]) -> GraphView {
+/// Bipartite topology: sources on one side, `host:port` endpoints on the
+/// other. The source id for each flow is supplied by the CALLER, not
+/// derived from `f.ctx.run_id` — no production `FlowCtx` ever populates
+/// that field (see `crate::ctx::FlowCtx`'s doc comment: attribution is by
+/// ledger FILE, not by this field), so deriving the source from it
+/// collapsed every graph at every scope into one node labelled `system`.
+/// The read side (`rupu-cp/src/api/netflow.rs`'s `resolve_ledger_path`/
+/// `read_all_run_ledgers_in_dir`) already knows which run/ledger-file each
+/// flow came from, so it passes that id in directly: the run's own id at
+/// run scope (one source node per run, even though its flows may be
+/// spread across several of that run's own per-step ledger files — see
+/// `run_and_unit_ids`), or the ledger file's own name at project/global
+/// scope (one source node per run whose ledger contributed to that
+/// union).
+pub fn graph_view(flows: &[(String, FlowRecord)]) -> GraphView {
     let mut nodes: HashMap<String, GraphNode> = HashMap::new();
     let mut edges: HashMap<(String, String), GraphEdge> = HashMap::new();
 
-    for f in flows {
-        let source_id = f.ctx.run_id.clone().unwrap_or_else(|| "system".to_string());
+    for (source_id, f) in flows {
+        let source_id = source_id.clone();
         let endpoint_id = format!("{}:{}", f.host, f.port);
 
         nodes.entry(source_id.clone()).or_insert_with(|| GraphNode {
@@ -500,9 +512,18 @@ mod tests {
     #[test]
     fn graph_view_is_bipartite_source_to_endpoint() {
         let flows = vec![
-            flow(1, "api.anthropic.com", Some("r1"), 10, true),
-            flow(2, "api.anthropic.com", Some("r1"), 20, false),
-            flow(3, "api.github.com", Some("r2"), 30, true),
+            (
+                "r1".to_string(),
+                flow(1, "api.anthropic.com", Some("r1"), 10, true),
+            ),
+            (
+                "r1".to_string(),
+                flow(2, "api.anthropic.com", Some("r1"), 20, false),
+            ),
+            (
+                "r2".to_string(),
+                flow(3, "api.github.com", Some("r2"), 30, true),
+            ),
         ];
         let g = graph_view(&flows);
 
@@ -530,11 +551,20 @@ mod tests {
     }
 
     #[test]
-    fn unattributed_flows_group_under_a_system_source_node() {
-        let flows = vec![flow(1, "api.github.com", None, 10, true)];
+    fn source_id_is_whatever_the_caller_supplies_not_ctx_run_id() {
+        // `graph_view` no longer derives the source from `f.ctx.run_id`
+        // (no production `FlowCtx` ever populates it) -- the caller
+        // passes the owning run id explicitly. This flow's own
+        // `ctx.run_id` is `None` (unattributed by construction) yet the
+        // node must still take the SUPPLIED id, proving the field is
+        // genuinely ignored, not just usually absent.
+        let flows = vec![(
+            "run-x".to_string(),
+            flow(1, "api.github.com", None, 10, true),
+        )];
         let g = graph_view(&flows);
         let source = g.nodes.iter().find(|n| n.side == NodeSide::Source).unwrap();
-        assert_eq!(source.id, "system");
+        assert_eq!(source.id, "run-x");
     }
 
     #[test]
