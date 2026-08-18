@@ -131,8 +131,14 @@ export interface HostRollup {
 export interface NetflowResponse {
   flows: FlowView[];
   hosts: HostRollup[];
-  /** Records lost to writer overflow. Non-zero means the UI must say so. */
-  dropped: number;
+  /** Records lost to writer overflow, for the WHOLE ledger file — NOT
+   *  scoped to `?from=`/`?to=` when a time filter is applied. A drop batch
+   *  carries no per-record timestamp, so it can never be attributed to a
+   *  window; this count is the same value regardless of which (if any)
+   *  filter produced `flows`. Named `dropped_total` (not `dropped`) so a
+   *  filtered view can never be misread as "nothing was lost in this
+   *  window" — see `rupu_netflow::ledger::views::read_flows_in_range`'s doc. */
+  dropped_total: number;
   /** `false` means enrichment was unavailable, not that flows lack an ASN. */
   asn_loaded: boolean;
 }

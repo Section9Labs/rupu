@@ -22,7 +22,7 @@ describe('fetch helpers', () => {
   it('encodes the run id into the path', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ flows: [], hosts: [], dropped: 0, asn_loaded: true }),
+      json: async () => ({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true }),
     });
     vi.stubGlobal('fetch', fetchMock);
 

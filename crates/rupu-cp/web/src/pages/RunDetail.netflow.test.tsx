@@ -64,7 +64,7 @@ afterEach(() => {
 beforeEach(() => {
   fetchRunNetflow.mockReset();
   fetchNetflowGraph.mockReset();
-  fetchRunNetflow.mockResolvedValue({ flows: [], hosts: [], dropped: 0, asn_loaded: true } satisfies NetflowResponse);
+  fetchRunNetflow.mockResolvedValue({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true } satisfies NetflowResponse);
   fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] } satisfies GraphView);
   vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
 });
@@ -182,7 +182,7 @@ describe('RunDetail netflow tab', () => {
         },
       ],
       hosts: [],
-      dropped: 0,
+      dropped_total: 0,
       asn_loaded: true,
     } satisfies NetflowResponse);
     stubApi(GRAPH);
