@@ -92,4 +92,55 @@ describe('NetflowTable', () => {
     expect(screen.getByText(/9 flows dropped/i)).toBeInTheDocument();
     expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
   });
+
+  // Task 4 (time-range picker): an empty result now has two distinct
+  // honest readings — "nothing matched the selected window" vs "nothing
+  // was ever recorded" — and the empty state must not conflate them. The
+  // `appliedWindow` prop is the server's OWN echo of the applied
+  // `?from=`/`?to=` (`NetflowResponse.window`), not the picker's local UI
+  // state, so this reflects what the server actually did, not what was
+  // merely requested.
+  it('states "no flows in range" — not "nothing recorded" — when a window was applied and matched nothing', () => {
+    render(
+      <NetflowTable
+        flows={[]}
+        droppedTotal={0}
+        asnLoaded
+        appliedWindow={{ from: '2026-08-17T14:00:00Z', to: null }}
+      />,
+    );
+    expect(screen.getByText(/no network flows.*this range/i)).toBeInTheDocument();
+    // Must not claim the ledger itself is empty — only that this window is.
+    expect(screen.queryByText(/^No network flows recorded for this scope$/i)).not.toBeInTheDocument();
+  });
+
+  it('keeps the unbounded "nothing recorded at all" wording when no window was applied', () => {
+    render(
+      <NetflowTable
+        flows={[]}
+        droppedTotal={0}
+        asnLoaded
+        appliedWindow={{ from: null, to: null }}
+      />,
+    );
+    expect(screen.getByText(/No network flows recorded for this scope/i)).toBeInTheDocument();
+    expect(screen.queryByText(/this range/i)).not.toBeInTheDocument();
+  });
+
+  it('defaults to the unbounded wording when no `appliedWindow` prop is passed at all (back-compat)', () => {
+    render(<NetflowTable flows={[]} droppedTotal={0} asnLoaded />);
+    expect(screen.getByText(/No network flows recorded for this scope/i)).toBeInTheDocument();
+  });
+
+  it('does not apply the range-empty wording when flows are present, even with a window applied', () => {
+    render(
+      <NetflowTable
+        flows={[flow()]}
+        droppedTotal={0}
+        asnLoaded
+        appliedWindow={{ from: '2026-08-17T14:00:00Z', to: null }}
+      />,
+    );
+    expect(screen.queryByText(/no network flows/i)).not.toBeInTheDocument();
+  });
 });
