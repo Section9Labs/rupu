@@ -45,6 +45,12 @@ export type NodeSide = 'source' | 'endpoint';
  * (`provider` / `scm`); the unit variants (`update` / `cp` / `system`)
  * serialize with no `name` key at all, not `name: null`.
  *
+ * Careful: "can occur" is not "is captured". `update` / `cp` / `system`
+ * can be constructed, but every production call site wires them to a
+ * `NullSink`, so no flow with those origins ever reaches a ledger at any
+ * scope — see `rupu-netflow`'s crate doc. Only `provider` and `scm` are
+ * actually recorded.
+ *
  * This lists only egress that can actually occur, mirroring the Rust enum:
  * `mcp` and `webhook` don't exist because neither subsystem makes outbound
  * HTTP (MCP dispatches into SCM connectors, which tag their own calls

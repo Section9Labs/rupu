@@ -45,7 +45,7 @@ describe('Netflow global page', () => {
       flows: [
         {
           id: '1', ts: '2026-08-03T00:00:00Z',
-          ctx: { origin: { kind: 'update' } },
+          ctx: { origin: { kind: 'scm', name: 'github' } },
           fidelity: 'http', method: 'GET', scheme: 'https',
           host: 'api.github.com', port: 443, path: '/releases',
           outcome: 'ok', body_complete: true,
