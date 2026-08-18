@@ -18,6 +18,7 @@
 //! is the test that would catch a regression moving the sink build after
 //! the provider build, or reverting `paths::netflow_dir` back to raw `pwd`.
 
+use assert_cmd::Command;
 use assert_fs::prelude::*;
 use rupu_netflow::{FlowCtx, MemorySink, Origin};
 use std::sync::Arc;
@@ -369,4 +370,264 @@ async fn two_sequential_rupu_run_invocations_in_one_process_get_separate_ledgers
         1,
         "run-second's ledger must contain exactly its own one request, got: {second_text}"
     );
+}
+
+/// Important 4 (netflow-per-run Plan 3 Task 2 review round 1): the
+/// requirement-4 machinery (partial failure -> non-zero exit, report
+/// printed first) lives in `cmd::netflow::prune`/`handle`, which none
+/// of `prune_ledgers`'s own unit tests exercise — those stop at the
+/// library function. Drives the real `rupu` binary end to end, the same
+/// pattern `cli_transcript.rs`'s `prune_deletes_old_archived_standalone_
+/// transcripts_and_uses_config_default` uses for `transcript prune`.
+///
+/// Strips write permission from the ledger directory so `remove_file`
+/// fails deterministically for the one eligible ledger inside it, then
+/// asserts BOTH halves of requirement 4: the process exits non-zero,
+/// Can this process actually be denied by directory permissions? Root
+/// holds `CAP_DAC_OVERRIDE`, so stripping write permission from a parent
+/// directory does not stop `remove_file` — and CI runs as root, which is
+/// where this first bit. Probe by attempting the operation rather than
+/// reading the uid: `geteuid` needs `libc` and `unsafe`, forbidden
+/// workspace-wide, and the probe answers whether the denial is enforced
+/// *here* rather than a proxy for it.
+#[cfg(unix)]
+fn permission_denial_is_enforced() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = assert_fs::TempDir::new().unwrap();
+    let dir = probe.path();
+    let victim = dir.join("probe.jsonl");
+    std::fs::write(&victim, "{}\n").unwrap();
+
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    let mut locked = original.clone();
+    locked.set_mode(0o555);
+    std::fs::set_permissions(dir, locked).unwrap();
+    let denied = std::fs::remove_file(&victim).is_err();
+    std::fs::set_permissions(dir, original).unwrap();
+    denied
+}
+
+/// AND the report (naming the failed ledger) was still printed to
+/// stdout before that exit — a failure must not look like silence.
+#[cfg(unix)]
+#[tokio::test]
+async fn prune_reports_a_removal_failure_and_exits_non_zero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = ENV_LOCK.lock().await;
+
+    if !permission_denial_is_enforced() {
+        eprintln!(
+            "skipping prune_reports_a_removal_failure_and_exits_non_zero: this process can \
+             bypass directory permissions (running as root?), so the removal cannot be made \
+             to fail and the non-zero-exit assertion would be vacuous"
+        );
+        return;
+    }
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    let netflow_dir = global.path().join("netflow");
+    std::fs::create_dir_all(&netflow_dir).unwrap();
+
+    let stuck = netflow_dir.join("run_stuck.jsonl");
+    std::fs::write(&stuck, "{}\n").unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stuck)
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+
+    let original_perms = std::fs::metadata(&netflow_dir).unwrap().permissions();
+    let mut locked = original_perms.clone();
+    locked.set_mode(0o555); // read+execute, no write — remove_file fails EACCES
+    std::fs::set_permissions(&netflow_dir, locked).unwrap();
+
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["netflow", "prune", "--older-than", "30d"])
+        .output()
+        .unwrap();
+
+    // Restore before any assertion can panic, so the TempDir's own
+    // cleanup on drop never fails.
+    std::fs::set_permissions(&netflow_dir, original_perms).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a removal failure must exit non-zero; status: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("run_stuck"),
+        "the report must name the ledger that failed to remove, printed \
+         BEFORE the non-zero exit, not swallowed by it; stdout: {stdout}"
+    );
+    assert!(
+        stuck.exists(),
+        "the failed removal must leave the file in place"
+    );
+}
+
+/// Important 2 (netflow-per-run Plan 3 Task 2 review round 2): every
+/// `prune_ledgers` unit test drives that function directly against ONE
+/// temp directory, and the only prior integration test seeds just the
+/// global root — nothing pinned `prune()`'s OWN candidate resolution
+/// (`crates/rupu-cli/src/cmd/netflow.rs`'s `prune` function), so
+/// deleting the entire project-local branch, its scope label, or its
+/// `is_dir()` gate would have left the suite green. This drives the
+/// real `rupu` binary against a project whose OWN `.rupu/netflow/` is
+/// GENUINELY DISTINCT from the global root (a separate `home/` subtree
+/// entirely, not the `project_root == ~` collision Important 1's dedup
+/// fix addresses) with one stale ledger in each, and asserts both are
+/// swept: both run ids gone from disk, both scope labels present in
+/// the report. A genuinely-different pair of roots also guards the
+/// dedup fix from the other direction — it must never collapse two
+/// roots that are NOT the same directory.
+#[tokio::test]
+async fn prune_sweeps_both_a_distinct_project_local_root_and_the_global_root() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let project_dir = tmp.child("project");
+    project_dir.create_dir_all().unwrap();
+    let project_netflow = project_dir.path().join(".rupu/netflow");
+    std::fs::create_dir_all(&project_netflow).unwrap();
+
+    // A `home/` subtree entirely separate from `project/` — canonicalizing
+    // either root must never make them collide.
+    let home = tmp.child("home");
+    let global_netflow = home.path().join(".rupu/netflow");
+    std::fs::create_dir_all(&global_netflow).unwrap();
+
+    let project_ledger = project_netflow.join("run_project.jsonl");
+    let global_ledger = global_netflow.join("run_global.jsonl");
+    std::fs::write(&project_ledger, "{}\n").unwrap();
+    std::fs::write(&global_ledger, "{}\n").unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+    for p in [&project_ledger, &global_ledger] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path().join(".rupu"))
+        .current_dir(project_dir.path())
+        .args([
+            "--format",
+            "json",
+            "netflow",
+            "prune",
+            "--older-than",
+            "30d",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""run_id": "run_project""#),
+        "project-local ledger missing from the report: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""run_id": "run_global""#),
+        "global ledger missing from the report: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""scope": "project""#),
+        "project scope label missing: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""scope": "global""#),
+        "global scope label missing: {stdout}"
+    );
+
+    assert!(
+        !project_ledger.exists(),
+        "the project-local ledger must be removed"
+    );
+    assert!(!global_ledger.exists(), "the global ledger must be removed");
+}
+
+/// Important 1 (netflow-per-run Plan 3 Task 2 review round 2): when
+/// `project_root_for` resolves the project root to `$HOME` itself (the
+/// common case for `cwd == $HOME` or anywhere under it that isn't
+/// inside a rupu project — the global root literally IS `~/.rupu`),
+/// `project_local_netflow_dir(project_root)` and `global_netflow_dir`
+/// are the SAME directory. Before the dedup fix, `candidates` held
+/// that directory twice, so `--dry-run` reported every eligible ledger
+/// TWICE and doubled the reclaimable-bytes total — the one number an
+/// operator sizing a deletion is reading the preview for. Asserts the
+/// dry-run report lists the one stale ledger exactly once.
+#[tokio::test]
+async fn dry_run_does_not_double_report_when_the_project_root_is_home() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    let netflow_dir = home.path().join(".rupu/netflow");
+    std::fs::create_dir_all(&netflow_dir).unwrap();
+
+    let ledger = netflow_dir.join("run_home.jsonl");
+    std::fs::write(&ledger, "{}\n").unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ledger)
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+
+    // `cwd == RUPU_HOME`'s parent (i.e. `cwd` IS `$HOME`): `project_root_for`
+    // finds `home/.rupu` walking up from `home` itself, so the project-local
+    // and global candidates resolve to the exact same directory — the
+    // collision this test pins.
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path().join(".rupu"))
+        .current_dir(home.path())
+        .args([
+            "--format",
+            "json",
+            "netflow",
+            "prune",
+            "--older-than",
+            "30d",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches(r#""run_id": "run_home""#).count(),
+        1,
+        "the colliding project-local/global roots must be swept ONCE, not \
+         twice, or --dry-run doubles the reported reclaimable bytes: {stdout}"
+    );
+
+    assert!(ledger.exists(), "dry-run must never delete");
 }

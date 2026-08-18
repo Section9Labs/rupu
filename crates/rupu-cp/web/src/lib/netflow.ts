@@ -42,15 +42,22 @@ export type NodeSide = 'source' | 'endpoint';
 /**
  * `rupu_netflow::ctx::Origin` — adjacently tagged (`tag = "kind", content =
  * "name"`). `name` is present only for the variants that carry data
- * (`provider` / `scm` / `mcp`); the unit variants (`webhook` / `update` /
- * `cp` / `system`) serialize with no `name` key at all, not `name: null`.
+ * (`provider` / `scm`); the unit variants (`update` / `cp` / `system`)
+ * serialize with no `name` key at all, not `name: null`.
  *
- * `mcp` and `webhook` are never constructed in practice (see the netflow
- * Plan 3 Task 4 brief) — don't build UI affordances that assume they occur,
- * but keep them in the type since the wire format allows them.
+ * Careful: "can occur" is not "is captured". `update` / `cp` / `system`
+ * can be constructed, but every production call site wires them to a
+ * `NullSink`, so no flow with those origins ever reaches a ledger at any
+ * scope — see `rupu-netflow`'s crate doc. Only `provider` and `scm` are
+ * actually recorded.
+ *
+ * This lists only egress that can actually occur, mirroring the Rust enum:
+ * `mcp` and `webhook` don't exist because neither subsystem makes outbound
+ * HTTP (MCP dispatches into SCM connectors, which tag their own calls
+ * `scm`; the webhook server is inbound-only).
  */
 export interface Origin {
-  kind: 'provider' | 'scm' | 'mcp' | 'webhook' | 'update' | 'cp' | 'system';
+  kind: 'provider' | 'scm' | 'update' | 'cp' | 'system';
   name?: string;
 }
 
@@ -130,10 +137,25 @@ export interface HostRollup {
 export interface NetflowResponse {
   flows: FlowView[];
   hosts: HostRollup[];
-  /** Records lost to writer overflow. Non-zero means the UI must say so. */
-  dropped: number;
+  /** Records lost to writer overflow, for the WHOLE ledger file — NOT
+   *  scoped to `?from=`/`?to=` when a time filter is applied. A drop batch
+   *  carries no per-record timestamp, so it can never be attributed to a
+   *  window; this count is the same value regardless of which (if any)
+   *  filter produced `flows`. Named `dropped_total` (not `dropped`) so a
+   *  filtered view can never be misread as "nothing was lost in this
+   *  window" — see `rupu_netflow::ledger::views::read_flows_in_range`'s doc. */
+  dropped_total: number;
   /** `false` means enrichment was unavailable, not that flows lack an ASN. */
   asn_loaded: boolean;
+  /** `rupu_cp::api::netflow::WindowEcho` — the `?from=`/`?to=` window the
+   *  server actually applied to produce `flows` (both fields present, each
+   *  independently `null` when that side is unbounded). This is the
+   *  positive confirmation a caller's filter was honoured — Task 4 (the
+   *  time-range picker) uses it, rather than its own request state, to
+   *  decide whether an empty `flows` means "nothing in this range" or
+   *  "nothing recorded at all", since the echo reflects what the server
+   *  actually did, not what the UI asked for. */
+  window: { from: string | null; to: string | null };
 }
 
 /** `rupu_netflow::ledger::views::GraphNode`. */
@@ -168,34 +190,82 @@ export interface GraphView {
 // ---------------------------------------------------------------------------
 
 /**
- * A minimal, single-argument `fetch(url)` call is required here rather than
- * `./api`'s `request<T>` helper: `request` unconditionally calls
- * `res.text()` to build its error body, which the CP server always
- * supports but which would throw on a bare `{ ok, status }` response.
- * Errors still surface as `ApiError` — the same class/convention the rest
- * of the client uses — just without the response-body read.
+ * A single-argument `fetch(url)` call, mirroring `./api`'s `request<T>`
+ * shape closely enough to stay on the same `ApiError` convention, without
+ * pulling in `request`'s JSON body/`Content-Type` request defaults this
+ * module's plain GETs don't need.
+ *
+ * On a non-ok response this reads the body and, when it parses as the CP's
+ * standard `{ "error": "..." }` shape (`rupu_cp::error::ApiError`'s
+ * `IntoResponse`), surfaces that message verbatim — this is how a
+ * malformed `?from=`/`?to=` 400 (Task 3's `parse_time_range`, which names
+ * the offending parameter and the expected format) actually reaches an
+ * operator instead of collapsing to a bare "HTTP 400". Falls back to the
+ * generic `url → HTTP status` message when the body is absent, unreadable,
+ * or not JSON — e.g. the plain mocks in this module's own tests, which
+ * don't implement `.text()` at all.
  */
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) {
-    throw new ApiError(res.status, `${url} → HTTP ${res.status}`);
+    let message = `${url} → HTTP ${res.status}`;
+    let body = '';
+    try {
+      body = await res.text();
+      const parsed = body ? (JSON.parse(body) as { error?: string }) : null;
+      if (parsed?.error) message = parsed.error;
+    } catch {
+      // No body, unreadable, or not JSON — keep the generic message.
+    }
+    throw new ApiError(res.status, message, body);
   }
   return (await res.json()) as T;
 }
 
-export const fetchRunNetflow = (runId: string): Promise<NetflowResponse> =>
-  getJson<NetflowResponse>(`/api/runs/${encodeURIComponent(runId)}/netflow`);
+/** `?from=`/`?to=` for the four netflow-read routes (Task 3's
+ *  `TimeRangeQuery`/`GraphQuery`) — both independently optional, RFC 3339.
+ *  Passing `undefined` (rather than an empty object) from a call site
+ *  means "no filter", appending neither parameter — see `appendRange`. */
+export interface NetflowRange {
+  from?: string;
+  to?: string;
+}
 
-export const fetchProjectNetflow = (projectId: string): Promise<NetflowResponse> =>
-  getJson<NetflowResponse>(`/api/projects/${encodeURIComponent(projectId)}/netflow`);
+/** Appends `from`/`to` to `url` only when present on `range`, and only
+ *  when `range` itself is given at all — an omitted `range` argument
+ *  produces byte-identical URLs to before this parameter existed, so
+ *  every unfiltered call site (still the common case) is unaffected. */
+function appendRange(url: string, range?: NetflowRange): string {
+  if (!range) return url;
+  const params = new URLSearchParams();
+  if (range.from) params.set('from', range.from);
+  if (range.to) params.set('to', range.to);
+  const qs = params.toString();
+  if (!qs) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}${qs}`;
+}
 
-export const fetchGlobalNetflow = (): Promise<NetflowResponse> =>
-  getJson<NetflowResponse>('/api/netflow');
+export const fetchRunNetflow = (runId: string, range?: NetflowRange): Promise<NetflowResponse> =>
+  getJson<NetflowResponse>(appendRange(`/api/runs/${encodeURIComponent(runId)}/netflow`, range));
+
+export const fetchProjectNetflow = (
+  projectId: string,
+  range?: NetflowRange,
+): Promise<NetflowResponse> =>
+  getJson<NetflowResponse>(
+    appendRange(`/api/projects/${encodeURIComponent(projectId)}/netflow`, range),
+  );
+
+export const fetchGlobalNetflow = (range?: NetflowRange): Promise<NetflowResponse> =>
+  getJson<NetflowResponse>(appendRange('/api/netflow', range));
 
 /** `scope` is `run:<id>` or `project:<id>`; omitted entirely for global. */
-export const fetchNetflowGraph = (scope?: string): Promise<GraphView> =>
+export const fetchNetflowGraph = (scope?: string, range?: NetflowRange): Promise<GraphView> =>
   getJson<GraphView>(
-    scope ? `/api/netflow/graph?scope=${encodeURIComponent(scope)}` : '/api/netflow/graph',
+    appendRange(
+      scope ? `/api/netflow/graph?scope=${encodeURIComponent(scope)}` : '/api/netflow/graph',
+      range,
+    ),
   );
 
 // ---------------------------------------------------------------------------

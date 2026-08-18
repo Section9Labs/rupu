@@ -547,6 +547,25 @@ archived_session_retention = "30d"
 archived_transcript_retention = "14d"
 ```
 
+Netflow ledger retention:
+
+- `rupu netflow prune [--older-than 30d] [--dry-run]` deletes per-run netflow ledgers
+  (`<netflow_dir>/<run_id>.jsonl` — the audit trail of every host rupu's own outbound HTTP
+  reached during a run) older than the cutoff
+- omitting `--dry-run` deletes immediately, same direction as `transcript prune`; run
+  `--dry-run` first to preview what would be removed and how many bytes would be reclaimed
+- has **no `[storage]` config key of its own** — it does not read
+  `archived_transcript_retention`/`archived_session_retention`, or any other retention
+  default. When `--older-than` is omitted it falls back to a hardcoded `30d`.
+- a ledger is matched by file mtime, not by asking whether its owning run has actually
+  finished — a run that has been idle (no outbound calls) longer than the cutoff can still be
+  pruned mid-run. If you are not sure everything in scope has finished, run `--dry-run` first.
+- regardless of `--older-than`, anything modified in roughly the last hour is never eligible —
+  a fixed one-hour floor, not configurable, that exists specifically to keep a very short or
+  mistaken cutoff from deleting a ledger a run is actively writing to right now
+- sweeps both the project-local `.rupu/netflow/` (if it exists) and the global
+  `~/.rupu/netflow/` root, deduplicated when they resolve to the same directory
+
 UI themes:
 
 - `rupu ui themes`

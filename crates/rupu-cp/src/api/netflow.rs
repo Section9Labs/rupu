@@ -36,10 +36,17 @@
 //!
 //! ## Blocking I/O never runs on the async task
 //!
-//! `rupu-netflow` has no ledger rotation, retention or compaction — a
-//! ledger grows unbounded for the life of a `cp serve` daemon. Every
-//! ledger/transcript/ASN-table read in this module is a synchronous
-//! `std::fs` call, so running it directly on an async handler would block
+//! A ledger is per-run (`<netflow_dir>/<run_id>.jsonl`), so its life is
+//! bounded by its own run, not by the `cp serve` daemon's — but nothing
+//! deletes it automatically either: `rupu netflow prune --older-than
+//! <duration>` (`rupu-cli`'s `cmd::netflow`) is the retention tool, and an
+//! installation that never runs it keeps every ledger forever (see
+//! `rupu_netflow`'s crate doc, `# Retention`, for the full accounting —
+//! this paragraph used to claim there was no retention story at all,
+//! which stopped being true once that command landed). Every
+//! ledger/transcript/ASN-table read in THIS module is still a synchronous
+//! `std::fs` call regardless of how many or how large the ledgers it
+//! reads are, so running it directly on an async handler would block
 //! whatever tokio worker thread picked up the request — stalling *every
 //! other* concurrent CP request sharing that thread (approvals, the gate
 //! sweep, unrelated API calls), not just the netflow caller. [`run_blocking`]
@@ -57,7 +64,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rupu_netflow::{AsnInfo, AsnTable, FlowId, FlowRecord, NetflowPaths};
+use rupu_netflow::{
+    global_netflow_dir, is_per_run_ledger_path, project_local_netflow_dir, AsnInfo, AsnTable,
+    FlowId, FlowRecord, NetflowPaths,
+};
 use rupu_orchestrator::runs::RunStore;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader};
 use rupu_workspace::WorkspaceStore;
@@ -112,6 +122,33 @@ impl FlowView {
     }
 }
 
+/// The `?from=`/`?to=` window actually applied to produce `NetflowResponse::flows`
+/// (and, transitively, `hosts`) — deliberately NOT `dropped_total`, which is
+/// whole-file by definition (see that field's doc comment).
+///
+/// Present unconditionally on every response (both sides `null` when
+/// unbounded, i.e. no filter was requested) rather than only when a filter
+/// is active — Minor 4, Task 3 review round 1: this gives a caller positive
+/// confirmation that whatever filter it sent was actually honoured, and
+/// makes `dropped_total`'s whole-file scope legible BY CONTRAST (a reader
+/// comparing a narrow `window` against an unrelated-looking `dropped_total`
+/// has a visual cue that the two are not the same scope), rather than that
+/// meaning being carried by the field name alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowEcho {
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<&rupu_netflow::ledger::TimeRange> for WindowEcho {
+    fn from(range: &rupu_netflow::ledger::TimeRange) -> Self {
+        Self {
+            from: range.from,
+            to: range.to,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetflowResponse {
     pub flows: Vec<FlowView>,
@@ -119,9 +156,28 @@ pub struct NetflowResponse {
     /// percentile and unknown-bytes logic has exactly ONE implementation
     /// (`rupu_netflow::ledger::host_rollup`).
     pub hosts: Vec<rupu_netflow::ledger::HostRollup>,
-    /// Records lost to writer-channel overflow. Surfaced so the UI can say
-    /// "N flows dropped" instead of quietly under-reporting.
-    pub dropped: u64,
+    /// The `?from=`/`?to=` window that was actually applied to `flows` —
+    /// see [`WindowEcho`]. `#[serde(default)]` so a response proxied from
+    /// an older remote that predates this field (but already has
+    /// `dropped_total`, so it still deserializes at all) degrades to
+    /// unbounded rather than failing closed the way a missing
+    /// `dropped_total` does — `run_netflow_from_host` immediately
+    /// overwrites this with the LOCALLY enforced range regardless, so a
+    /// stale/absent value from the remote is never actually trusted.
+    #[serde(default)]
+    pub window: WindowEcho,
+    /// Records lost to writer-channel overflow, for the WHOLE ledger
+    /// file(s) this response reads — NEVER narrowed by `?from=`/`?to=`. A
+    /// drop batch (`LedgerLine::Dropped`) carries no per-record timestamp,
+    /// so it can never be tested against a window (see
+    /// `rupu_netflow::ledger::TimeRange`'s and `read_flows_in_range`'s doc
+    /// comments). Named `dropped_total` rather than `dropped` so a
+    /// time-filtered response can never be misread as "nothing was lost in
+    /// this window" — a bare `dropped` next to a filtered `flows` list
+    /// would read that way even though doc comments explaining otherwise
+    /// don't survive into JSON. Surfaced so the UI can say "N flows
+    /// dropped" instead of quietly under-reporting.
+    pub dropped_total: u64,
     /// Whether the ASN table was available for this request. `false` means
     /// the `asn` fields are absent because we could not look them up, NOT
     /// because the flows had no ASN.
@@ -393,11 +449,17 @@ fn merge_with_transcript(
 /// `table` is a parameter rather than an internal `load_asn_table()` call so
 /// this function is testable in both directions (table present / absent)
 /// without touching the real `$RUPU_HOME` on disk — every caller (the route
-/// handlers below) loads the table itself and passes it in.
+/// handlers below) loads the table itself and passes it in. `range` is
+/// echoed into the response's `window` field (see [`WindowEcho`]) — it is
+/// NOT re-applied to `flows` here; every caller has already filtered
+/// `flows` (via `read_flows_in_range` or an explicit `range.contains`
+/// pass) before calling this function, so this is purely reporting what
+/// was already enforced, not enforcing it again.
 pub(crate) fn build_response(
     flows: Vec<FlowRecord>,
     dropped: u64,
     table: Option<&AsnTable>,
+    range: &rupu_netflow::ledger::TimeRange,
 ) -> NetflowResponse {
     let hosts = rupu_netflow::ledger::host_rollup(&flows);
     NetflowResponse {
@@ -406,7 +468,8 @@ pub(crate) fn build_response(
             .map(|f| FlowView::from_flow(f, table))
             .collect(),
         hosts,
-        dropped,
+        dropped_total: dropped,
+        window: WindowEcho::from(range),
         asn_loaded: table.is_some(),
     }
 }
@@ -445,8 +508,8 @@ pub(crate) fn build_response(
 /// operator-chosen ids across workspaces the same way — and impossible for
 /// the generated `run_<ULID>` ids every real dispatch path mints.
 fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> Vec<PathBuf> {
-    let workspace_path = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), id).flows;
-    let global_path = NetflowPaths::for_run(&global_dir.join("netflow"), id).flows;
+    let workspace_path = NetflowPaths::for_run(&project_local_netflow_dir(workspace), id).flows;
+    let global_path = NetflowPaths::for_run(&global_netflow_dir(global_dir), id).flows;
     if canonicalize_or_self(&workspace_path) == canonicalize_or_self(&global_path) {
         vec![workspace_path]
     } else {
@@ -504,19 +567,29 @@ fn run_scoped_flows_and_dropped(
     run_id: &str,
     workspace: &StdPath,
     global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<FlowRecord>, u64) {
     let mut all = Vec::new();
     let mut dropped = 0u64;
     for id in run_and_unit_ids(store, run_id) {
         for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
             let (f, d) =
-                rupu_netflow::ledger::read_flows_and_dropped(&ledger_path).unwrap_or_default();
+                rupu_netflow::ledger::read_flows_in_range(&ledger_path, range).unwrap_or_default();
             all.extend(f);
             dropped += d;
         }
     }
     let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
-    let merged = merge_with_transcript(all, &transcript_paths);
+    // `merge_with_transcript` can add flows the ledger read never saw at
+    // all (the degraded-sink recovery case — see its own doc comment), so
+    // filtering only the ledger side above is not enough: an out-of-window
+    // transcript-only flow would otherwise leak back in unfiltered. Apply
+    // `range` once more to the merged set so every surviving flow, from
+    // EITHER source, satisfies the same window.
+    let merged = merge_with_transcript(all, &transcript_paths)
+        .into_iter()
+        .filter(|f| range.contains(f.ts))
+        .collect();
     (merged, dropped)
 }
 
@@ -533,10 +606,12 @@ fn collect_run_netflow(
     workspace: &StdPath,
     global_dir: &StdPath,
     cache: &AsnCache,
+    range: &rupu_netflow::ledger::TimeRange,
 ) -> NetflowResponse {
-    let (merged, dropped) = run_scoped_flows_and_dropped(store, run_id, workspace, global_dir);
+    let (merged, dropped) =
+        run_scoped_flows_and_dropped(store, run_id, workspace, global_dir, range);
     let table = load_asn_table(cache);
-    build_response(merged, dropped, table.as_deref())
+    build_response(merged, dropped, table.as_deref(), range)
 }
 
 /// A registered workspace store, rooted at `<global_dir>/workspaces/` —
@@ -571,18 +646,18 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
 /// ever written a ledger there) degrades to `([], 0)`, the same "missing
 /// data" tolerance every other read in this module already relies on.
 ///
-/// Skips exactly two kinds of file: the `.gitignore` `NetflowPaths::
-/// ensure_dir` drops into every such directory (no `.jsonl` extension),
-/// and a file literally named `flows.jsonl` — the pre-plan shared-ledger
-/// filename (one file for a whole workspace/daemon, before the
-/// netflow-per-run migration). `NetflowPaths::for_run` never produces
-/// that name: every real run id comes from `run_<ULID>` or an
-/// operator-supplied `--run-id`, so a bare `flows.jsonl` sitting in this
-/// directory is unambiguously a leftover from before this plan, not a
-/// run that happens to be named "flows" — reading it back in as if it
-/// were one would silently resurrect the exact shared-file model this
-/// plan replaced.
-fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<(String, FlowRecord)>, u64) {
+/// Which files count as a per-run ledger (accepts `*.jsonl`, rejects
+/// the `.gitignore` `NetflowPaths::ensure_dir` drops into every such
+/// directory and the pre-plan shared-ledger file literally named
+/// `flows.jsonl`) is decided in exactly one place,
+/// `rupu_netflow::ledger::is_per_run_ledger_path` — see its doc comment
+/// for the reasoning. `rupu-cli`'s `netflow prune` calls the same
+/// function so the read side and the destructive prune side can never
+/// drift apart on what a "ledger" is.
+fn read_all_run_ledgers_in_dir(
+    netflow_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+) -> (Vec<(String, FlowRecord)>, u64) {
     let mut flows = Vec::new();
     let mut dropped = 0u64;
     let Ok(entries) = std::fs::read_dir(netflow_dir) else {
@@ -590,10 +665,7 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<(String, FlowRecor
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str()) == Some("flows.jsonl") {
+        if !is_per_run_ledger_path(&path) {
             continue;
         }
         // `NetflowPaths::for_run` always names a ledger `<id>.jsonl`, so
@@ -605,7 +677,7 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<(String, FlowRecor
         let Some(run_id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&path).unwrap_or_default();
+        let (f, d) = rupu_netflow::ledger::read_flows_in_range(&path, range).unwrap_or_default();
         flows.extend(f.into_iter().map(|flow| (run_id.to_string(), flow)));
         dropped += d;
     }
@@ -644,7 +716,10 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<(String, FlowRecor
 /// scales with the number of registered workspaces AND with the number of
 /// runs each one has, so it's the one most worth keeping off the async
 /// task).
-fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<(String, FlowRecord)>, u64) {
+fn read_all_workspaces_sync(
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+) -> (Vec<(String, FlowRecord)>, u64) {
     let workspaces = (WorkspaceStore {
         root: global_dir.join("workspaces"),
     })
@@ -653,14 +728,14 @@ fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<(String, FlowRecord)>,
 
     let mut dirs: std::collections::HashSet<PathBuf> = workspaces
         .iter()
-        .map(|w| canonicalize_or_self(&std::path::Path::new(&w.path).join(".rupu/netflow")))
+        .map(|w| canonicalize_or_self(&project_local_netflow_dir(std::path::Path::new(&w.path))))
         .collect();
-    dirs.insert(canonicalize_or_self(&global_dir.join("netflow")));
+    dirs.insert(canonicalize_or_self(&global_netflow_dir(global_dir)));
 
     let mut flows = Vec::new();
     let mut dropped = 0u64;
     for dir in &dirs {
-        let (f, d) = read_all_run_ledgers_in_dir(dir);
+        let (f, d) = read_all_run_ledgers_in_dir(dir, range);
         flows.extend(f);
         dropped += d;
     }
@@ -708,30 +783,37 @@ fn canonicalize_or_self(path: &StdPath) -> PathBuf {
 async fn get_project_netflow(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    Query(q): Query<TimeRangeQuery>,
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
+    let range = parse_time_range(&q.from, &q.to)?;
     let workspace = workspace_for_project(&state, &project_id)?;
     let cache = Arc::clone(&state.asn_cache);
     let resp = run_blocking(move || {
-        let (flows, dropped) = read_all_run_ledgers_in_dir(&workspace.join(".rupu/netflow"));
+        let (flows, dropped) =
+            read_all_run_ledgers_in_dir(&project_local_netflow_dir(&workspace), &range);
         let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
         let table = load_asn_table(&cache);
-        build_response(flows, dropped, table.as_deref())
+        build_response(flows, dropped, table.as_deref(), &range)
     })
     .await?;
     Ok(Json(resp))
 }
 
 /// `GET /api/netflow` — the union across every registered workspace.
-async fn get_global_netflow(State(state): State<AppState>) -> ApiResult<Json<NetflowResponse>> {
+async fn get_global_netflow(
+    State(state): State<AppState>,
+    Query(q): Query<TimeRangeQuery>,
+) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
+    let range = parse_time_range(&q.from, &q.to)?;
     let global_dir = state.global_dir.clone();
     let cache = Arc::clone(&state.asn_cache);
     let resp = run_blocking(move || {
-        let (flows, dropped) = read_all_workspaces_sync(&global_dir);
+        let (flows, dropped) = read_all_workspaces_sync(&global_dir, &range);
         let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
         let table = load_asn_table(&cache);
-        build_response(flows, dropped, table.as_deref())
+        build_response(flows, dropped, table.as_deref(), &range)
     })
     .await?;
     Ok(Json(resp))
@@ -745,6 +827,71 @@ pub struct GraphQuery {
     /// `scope`, matching the brief's own catch-all for this endpoint. This
     /// is a deliberate permissive default, not an unhandled error path.
     pub scope: Option<String>,
+    /// Same contract as [`TimeRangeQuery`]'s fields, duplicated here rather
+    /// than composed via `#[serde(flatten)]`: `serde_urlencoded` (which
+    /// Axum's `Query` extractor uses) does not reliably support flattening
+    /// a nested struct out of a query string, so this endpoint carries its
+    /// own `from`/`to` and parses them through the same
+    /// [`parse_time_range`] the other three routes use.
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// `?from=`/`?to=` query parameters accepted by every netflow-read route
+/// (`/api/runs/:id/netflow`, `/api/projects/:id/netflow`, `/api/netflow`,
+/// and — via its own duplicated `from`/`to` fields, see [`GraphQuery`]'s
+/// doc comment for why they're not composed from this struct —
+/// `/api/netflow/graph`).
+///
+/// Both are RFC 3339 timestamps (e.g. `2026-08-17T14:00:00Z`), each
+/// independently optional, and BOTH BOUNDS INCLUSIVE — see
+/// `rupu_netflow::ledger::TimeRange`'s doc comment for the full contract:
+/// which timestamp is filtered (`FlowRecord::ts`, stamped at response-header
+/// time, not request start or body completion), and why `from > to` is an
+/// empty window rather than a rejected request.
+///
+/// Kept as raw `Option<String>` rather than `Option<DateTime<Utc>>` so a
+/// malformed value produces the NAMED 400 built by [`parse_time_range`]
+/// instead of Axum's generic query-deserialization-failure 400 (which would
+/// not name the accepted format or which parameter was at fault).
+#[derive(Debug, Default, Deserialize)]
+pub struct TimeRangeQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// Parse `from`/`to` (see [`TimeRangeQuery`]) into a
+/// `rupu_netflow::ledger::TimeRange`, independently for each side.
+///
+/// A PRESENT-but-unparseable value is a 400 naming the offending parameter
+/// and the accepted format — NEVER a silent fall-back to unbounded.
+/// Silently ignoring an unparseable filter would show the caller MORE data
+/// than they asked for while the response still looks like their filter was
+/// applied — worse than an error, because nothing signals it happened.
+fn parse_time_range(
+    from: &Option<String>,
+    to: &Option<String>,
+) -> ApiResult<rupu_netflow::ledger::TimeRange> {
+    fn parse_one(
+        name: &str,
+        raw: &Option<String>,
+    ) -> ApiResult<Option<chrono::DateTime<chrono::Utc>>> {
+        let Some(s) = raw else {
+            return Ok(None);
+        };
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+            .map_err(|e| {
+                ApiError::bad_request(format!(
+                    "invalid `{name}` query parameter {s:?}: expected an RFC 3339 timestamp \
+                     (e.g. \"2026-08-17T14:00:00Z\") — {e}"
+                ))
+            })
+    }
+    Ok(rupu_netflow::ledger::TimeRange {
+        from: parse_one("from", from)?,
+        to: parse_one("to", to)?,
+    })
 }
 
 /// Raw (unenriched) flows for the graph endpoint's `run:` scope — mirrors
@@ -764,6 +911,7 @@ pub struct GraphQuery {
 async fn run_scoped_flows_for_graph(
     s: &AppState,
     run_id: &str,
+    range: &rupu_netflow::ledger::TimeRange,
 ) -> ApiResult<Vec<(String, FlowRecord)>> {
     let tag = |flows: Vec<FlowRecord>| flows.into_iter().map(|f| (run_id.to_string(), f)).collect();
     match resolve_run_location(s, run_id).await {
@@ -776,8 +924,9 @@ async fn run_scoped_flows_for_graph(
             let rid = run_id.to_string();
             let workspace = run.workspace_path.clone();
             let global_dir = s.global_dir.clone();
+            let range = range.clone();
             let flows = run_blocking(move || {
-                run_scoped_flows_and_dropped(&store, &rid, &workspace, &global_dir).0
+                run_scoped_flows_and_dropped(&store, &rid, &workspace, &global_dir, &range).0
             })
             .await?;
             Ok(tag(flows))
@@ -785,15 +934,16 @@ async fn run_scoped_flows_for_graph(
         RunLocation::ProjectLocal { path } => {
             let rid = run_id.to_string();
             let global_dir = s.global_dir.clone();
+            let range = range.clone();
             let flows = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                run_scoped_flows_and_dropped(&store, &rid, &path, &global_dir).0
+                run_scoped_flows_and_dropped(&store, &rid, &path, &global_dir, &range).0
             })
             .await?;
             Ok(tag(flows))
         }
         RunLocation::Host { host_id } => {
-            let resp = run_netflow_from_host(s, &host_id, run_id).await?;
+            let resp = run_netflow_from_host(s, &host_id, run_id, range).await?;
             Ok(tag(resp.flows.into_iter().map(|v| v.flow).collect()))
         }
         // No artifacts anywhere to build a graph from — empty, not an
@@ -803,25 +953,33 @@ async fn run_scoped_flows_for_graph(
     }
 }
 
-/// `GET /api/netflow/graph?scope=` — the bipartite source↔endpoint graph
-/// (`rupu_netflow::ledger::graph_view` does the actual bipartite build; this
-/// only resolves `scope` to the (run id, flow) set it runs over).
+/// `GET /api/netflow/graph?scope=&from=&to=` — the bipartite
+/// source↔endpoint graph (`rupu_netflow::ledger::graph_view` does the
+/// actual bipartite build; this only resolves `scope` to the (run id, flow)
+/// set it runs over, after filtering that set to `from`/`to` — see
+/// [`TimeRangeQuery`]). Filtering happens BEFORE `graph_view` so nodes/edges
+/// for an out-of-window flow never appear at all, keeping the graph and the
+/// table (`get_run_netflow`/`get_project_netflow`/`get_global_netflow`)
+/// derived from the identical filtered set for the same window.
 async fn get_netflow_graph(
     State(state): State<AppState>,
     Query(q): Query<GraphQuery>,
 ) -> ApiResult<Json<rupu_netflow::ledger::GraphView>> {
+    let range = parse_time_range(&q.from, &q.to)?;
     let flows = if let Some(run_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("run:")) {
-        run_scoped_flows_for_graph(&state, run_id).await?
+        run_scoped_flows_for_graph(&state, run_id, &range).await?
     } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
         let workspace = workspace_for_project(&state, project_id)?;
         // Same known gap as `get_project_netflow`: no fallback to
         // `<global_dir>/netflow/` for this project's runs that landed
         // there. See that function's doc comment.
-        run_blocking(move || read_all_run_ledgers_in_dir(&workspace.join(".rupu/netflow")).0)
-            .await?
+        run_blocking(move || {
+            read_all_run_ledgers_in_dir(&project_local_netflow_dir(&workspace), &range).0
+        })
+        .await?
     } else {
         let global_dir = state.global_dir.clone();
-        run_blocking(move || read_all_workspaces_sync(&global_dir).0).await?
+        run_blocking(move || read_all_workspaces_sync(&global_dir, &range).0).await?
     };
     Ok(Json(rupu_netflow::ledger::graph_view(&flows)))
 }
@@ -829,23 +987,113 @@ async fn get_netflow_graph(
 /// Proxy `GET /api/runs/:id/netflow` to a resolved host. Mirrors
 /// `graph.rs`'s `run_graph_from_host` — the remote CP does the same
 /// ledger+transcript merge locally and we just relay its response.
+///
+/// `range` is forwarded as a `?from=&to=` query string appended to the
+/// proxied path so a CURRENT remote applies the SAME window before
+/// replying — but [`enforce_range_on_proxied_response`] ALSO re-filters
+/// `flows` (and recomputes `hosts`/`window` from the filtered set) after
+/// deserializing, rather than trusting the remote to have applied it: an
+/// OLDER remote that doesn't recognize `from`/`to` would otherwise
+/// silently return everything unbounded while looking filtered.
+/// `dropped_total` is the one field intentionally left as the remote
+/// reported it — whole-file by definition, so filtering here has nothing
+/// to do with it either way.
 async fn run_netflow_from_host(
     s: &AppState,
     host_id: &str,
     id: &str,
+    range: &rupu_netflow::ledger::TimeRange,
 ) -> ApiResult<NetflowResponse> {
     let conn = resolve_host(s, host_id)?;
-    let value = conn
-        .proxy_get_json(&format!("/api/runs/{id}/netflow"))
-        .await
-        .map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Unreachable(m) => {
-                ApiError::internal(format!("host {host_id} unreachable: {m}"))
-            }
-            other => ApiError::internal(other.to_string()),
-        })?;
-    serde_json::from_value(value).map_err(|e| ApiError::internal(e.to_string()))
+    let path = format!("/api/runs/{id}/netflow{}", time_range_query_string(range));
+    let value = conn.proxy_get_json(&path).await.map_err(|e| match e {
+        HostConnectorError::NotFound(m) => ApiError::not_found(m),
+        HostConnectorError::Unreachable(m) => {
+            ApiError::internal(format!("host {host_id} unreachable: {m}"))
+        }
+        other => ApiError::internal(other.to_string()),
+    })?;
+    // A deserialization failure here is most likely `dropped_total` not
+    // parsing on an OLDER remote still emitting the pre-rename `dropped`
+    // key (no `#[serde(default)]` on `NetflowResponse`, deliberately —
+    // failing closed here beats silently defaulting `dropped_total` to 0
+    // and rendering an older remote's response as if nothing was lost).
+    // Name that likely cause instead of relaying `e.to_string()`, which is
+    // a bare serde message an operator has no way to act on.
+    let mut resp: NetflowResponse = serde_json::from_value(value).map_err(|e| {
+        ApiError::internal(format!(
+            "host {host_id} returned a netflow response this build cannot read ({e}); \
+             the remote CP is likely older than this one"
+        ))
+    })?;
+    enforce_range_on_proxied_response(&mut resp, range);
+    Ok(resp)
+}
+
+/// Correct a host-proxied [`NetflowResponse`] to match `range` regardless
+/// of what the remote actually enforced — a no-op against a CURRENT remote
+/// (which already applied the identical window server-side before
+/// replying, so every field here is already consistent), and CORRECTIVE
+/// against an OLDER remote that recognizes the route but silently ignores
+/// unfamiliar `from`/`to` query params and returns everything unbounded.
+/// Pulled out of [`run_netflow_from_host`] as its own function so the
+/// correction (retain, then recompute `hosts` and stamp `window` from the
+/// SAME retained set) is unit-testable without a real HTTP round trip
+/// through a `HostConnector`.
+///
+/// `dropped_total` is deliberately left as the remote reported it: it is
+/// whole-file by definition (see that field's doc comment) and is not
+/// affected by which `flows` survive this filter either way.
+fn enforce_range_on_proxied_response(
+    resp: &mut NetflowResponse,
+    range: &rupu_netflow::ledger::TimeRange,
+) {
+    resp.flows.retain(|v| range.contains(v.flow.ts));
+    // `hosts` was computed by the REMOTE from its own (possibly unbounded,
+    // on an older build) flow set, so leaving it as-is would show call
+    // counts/byte totals for flows the retained `flows` list no longer
+    // contains — the same "two adjacent widgets disagree" defect already
+    // fixed once for the graph endpoint. Recompute it from the flows THIS
+    // side actually kept.
+    resp.hosts = rupu_netflow::ledger::host_rollup(
+        &resp
+            .flows
+            .iter()
+            .map(|v| v.flow.clone())
+            .collect::<Vec<_>>(),
+    );
+    // Likewise `window`: an older remote either omits the field (defaults
+    // to unbounded via `#[serde(default)]`) or echoes whatever range IT
+    // parsed, neither of which describes what this side actually
+    // enforced above. Stamp it from the range THIS function applied, so
+    // `NetflowWindowReadout` can never read "Showing all recorded flows"
+    // over a response that was, in fact, just filtered.
+    resp.window = WindowEcho::from(range);
+}
+
+/// Render `range` as a `?from=&to=` query-string suffix (empty string when
+/// unbounded on both sides) for [`run_netflow_from_host`]'s proxy call.
+/// Both `:` and `+` need escaping in a form-encoded query value — mirrors
+/// `usage.rs`'s `urlencoding_rfc3339`, which a doc comment there notes was
+/// added after a bare `+` silently decoded as a space and corrupted a
+/// forwarded timestamp.
+fn time_range_query_string(range: &rupu_netflow::ledger::TimeRange) -> String {
+    let mut parts = Vec::new();
+    if let Some(from) = range.from {
+        parts.push(format!("from={}", urlencoding_rfc3339(from)));
+    }
+    if let Some(to) = range.to {
+        parts.push(format!("to={}", urlencoding_rfc3339(to)));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+fn urlencoding_rfc3339(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339().replace('+', "%2B").replace(':', "%3A")
 }
 
 /// `GET /api/runs/:id/netflow` — network flows attributed to one run, from
@@ -859,8 +1107,10 @@ async fn run_netflow_from_host(
 async fn get_run_netflow(
     State(s): State<AppState>,
     Path(run_id): Path<String>,
+    Query(q): Query<TimeRangeQuery>,
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&s), &s.asn_cache);
+    let range = parse_time_range(&q.from, &q.to)?;
     match resolve_run_location(&s, &run_id).await {
         RunLocation::Global => {
             let run = s
@@ -873,7 +1123,7 @@ async fn get_run_netflow(
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
-                collect_run_netflow(&store, &rid, &workspace, &global_dir, &cache)
+                collect_run_netflow(&store, &rid, &workspace, &global_dir, &cache, &range)
             })
             .await?;
             Ok(Json(resp))
@@ -884,14 +1134,14 @@ async fn get_run_netflow(
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                collect_run_netflow(&store, &rid, &path, &global_dir, &cache)
+                collect_run_netflow(&store, &rid, &path, &global_dir, &cache, &range)
             })
             .await?;
             Ok(Json(resp))
         }
-        RunLocation::Host { host_id } => {
-            run_netflow_from_host(&s, &host_id, &run_id).await.map(Json)
-        }
+        RunLocation::Host { host_id } => run_netflow_from_host(&s, &host_id, &run_id, &range)
+            .await
+            .map(Json),
         // No artifacts anywhere: the run never persisted a workspace to
         // read a ledger or transcript from. Empty, not an error — mirrors
         // `run_graph`'s `Unpersisted` branch. Still routed through
@@ -902,7 +1152,7 @@ async fn get_run_netflow(
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
                 let table = load_asn_table(&cache);
-                build_response(Vec::new(), 0, table.as_deref())
+                build_response(Vec::new(), 0, table.as_deref(), &range)
             })
             .await?;
             Ok(Json(resp))
@@ -961,10 +1211,109 @@ mod tests {
     #[test]
     fn build_response_wires_a_server_computed_host_rollup() {
         let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
-        let resp = build_response(vec![f], 0, None);
+        let resp = build_response(
+            vec![f],
+            0,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
         assert_eq!(resp.hosts.len(), 1);
         assert_eq!(resp.hosts[0].host, "api.anthropic.com");
         assert_eq!(resp.hosts[0].calls, 1);
+    }
+
+    /// Minor 4 (Task 3 review round 1): `window` must echo whatever
+    /// `range` was actually applied, not stay at its `Default` regardless
+    /// of input — proving `build_response` threads `range` through to
+    /// `WindowEcho::from` rather than the field being hardcoded or
+    /// disconnected from the range it claims to describe.
+    #[test]
+    fn build_response_echoes_the_applied_window() {
+        let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
+        let range = rupu_netflow::ledger::TimeRange {
+            from: Some(chrono::DateTime::from_timestamp(100, 0).unwrap()),
+            to: Some(chrono::DateTime::from_timestamp(200, 0).unwrap()),
+        };
+
+        let resp = build_response(vec![f], 0, None, &range);
+
+        assert_eq!(resp.window.from, range.from);
+        assert_eq!(resp.window.to, range.to);
+    }
+
+    /// The unbounded case: both sides `null`, not omitted — a caller must
+    /// be able to tell "no filter was applied" from "the response has no
+    /// opinion", which an omitted key would blur.
+    #[test]
+    fn build_response_with_an_unbounded_range_echoes_a_null_window() {
+        let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
+
+        let resp = build_response(
+            vec![f],
+            0,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
+
+        assert!(resp.window.from.is_none());
+        assert!(resp.window.to.is_none());
+    }
+
+    /// Important 1 (Fix round 2 review): `enforce_range_on_proxied_response`
+    /// must correct ALL THREE fields the retain touches transitively, not
+    /// just `flows` — this is the exact "corrects flows but not window or
+    /// hosts" defect the review caught. Simulates an OLDER remote's
+    /// response: `hosts` rolled up from its own unfiltered flow set, and
+    /// `window` left at its `#[serde(default)]` unbounded value (as if the
+    /// remote never echoed the field at all).
+    #[test]
+    fn enforce_range_on_proxied_response_recomputes_hosts_and_window() {
+        let mut in_window = flow(FlowId::new(), Some("r"), "in.example");
+        in_window.ts = chrono::DateTime::from_timestamp(150, 0).unwrap();
+        let mut out_of_window = flow(FlowId::new(), Some("r"), "out.example");
+        out_of_window.ts = chrono::DateTime::from_timestamp(500, 0).unwrap();
+
+        let mut resp = build_response(
+            vec![in_window, out_of_window],
+            3,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
+        assert_eq!(
+            resp.hosts.len(),
+            2,
+            "sanity: both hosts present pre-correction"
+        );
+        assert!(
+            resp.window.from.is_none(),
+            "sanity: unbounded pre-correction"
+        );
+
+        let range = rupu_netflow::ledger::TimeRange {
+            from: Some(chrono::DateTime::from_timestamp(100, 0).unwrap()),
+            to: Some(chrono::DateTime::from_timestamp(200, 0).unwrap()),
+        };
+        enforce_range_on_proxied_response(&mut resp, &range);
+
+        assert_eq!(resp.flows.len(), 1);
+        assert_eq!(resp.flows[0].flow.host, "in.example");
+        assert_eq!(
+            resp.hosts.len(),
+            1,
+            "hosts must be recomputed from the RETAINED flows only, not left \
+             as the remote's own unfiltered rollup: {:?}",
+            resp.hosts
+        );
+        assert_eq!(resp.hosts[0].host, "in.example");
+        assert_eq!(
+            resp.window.from, range.from,
+            "window must be stamped from the range THIS side enforced"
+        );
+        assert_eq!(resp.window.to, range.to);
+        assert_eq!(
+            resp.dropped_total, 3,
+            "dropped_total is untouched by this correction — whole-file by definition"
+        );
     }
 
     /// The other half of `build_response`'s contract, previously untested:
@@ -979,7 +1328,12 @@ mod tests {
         let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
         f.peer_ip = Some("1.0.0.7".parse().unwrap());
 
-        let resp = build_response(vec![f], 0, None);
+        let resp = build_response(
+            vec![f],
+            0,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
 
         assert!(!resp.asn_loaded, "no table was supplied");
         assert!(
@@ -1004,7 +1358,12 @@ mod tests {
         let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
         f.peer_ip = Some("1.0.0.7".parse().unwrap());
 
-        let resp = build_response(vec![f], 0, Some(&table));
+        let resp = build_response(
+            vec![f],
+            0,
+            Some(&table),
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
 
         assert!(resp.asn_loaded);
         assert_eq!(resp.flows.len(), 1);

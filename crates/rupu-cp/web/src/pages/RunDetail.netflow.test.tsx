@@ -64,7 +64,13 @@ afterEach(() => {
 beforeEach(() => {
   fetchRunNetflow.mockReset();
   fetchNetflowGraph.mockReset();
-  fetchRunNetflow.mockResolvedValue({ flows: [], hosts: [], dropped: 0, asn_loaded: true } satisfies NetflowResponse);
+  fetchRunNetflow.mockResolvedValue({
+    flows: [],
+    hosts: [],
+    dropped_total: 0,
+    asn_loaded: true,
+    window: { from: null, to: null },
+  } satisfies NetflowResponse);
   fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] } satisfies GraphView);
   vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
 });
@@ -182,8 +188,9 @@ describe('RunDetail netflow tab', () => {
         },
       ],
       hosts: [],
-      dropped: 0,
+      dropped_total: 0,
       asn_loaded: true,
+      window: { from: null, to: null },
     } satisfies NetflowResponse);
     stubApi(GRAPH);
     renderPage();
@@ -217,5 +224,98 @@ describe('RunDetail netflow tab', () => {
 
     await waitFor(() => expect(fetchRunNetflow).toHaveBeenCalledWith('run-2'));
     expect(fetchRunNetflow).toHaveBeenCalledTimes(2);
+  });
+
+  // --- Important 3 (whole-branch review round 1): unlike pages/Netflow.tsx
+  // and ProjectNetworkTab.tsx, this effect used to skip resetting
+  // netflow/netflowGraph/netflowError before starting a range-change fetch,
+  // so the PREVIOUS window's table/graph/error kept rendering under the
+  // NEW range selection until the request landed. ---
+
+  it('clears the previous window\'s flows and shows Loading while a range change is in flight', async () => {
+    fetchRunNetflow.mockResolvedValueOnce({
+      flows: [
+        {
+          id: 'f1',
+          ts: '2026-08-03T00:00:00Z',
+          ctx: { origin: { kind: 'provider', name: 'anthropic' } },
+          fidelity: 'http',
+          method: 'POST',
+          scheme: 'https',
+          host: 'first-window-host.example.com',
+          port: 443,
+          path: '/v1/messages',
+          outcome: 'ok',
+          body_complete: true,
+        },
+      ],
+      hosts: [],
+      dropped_total: 0,
+      asn_loaded: true,
+      window: { from: null, to: null },
+    } satisfies NetflowResponse);
+    stubApi(GRAPH);
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /network/i }));
+    await screen.findByText('first-window-host.example.com');
+
+    // Deferred: the second fetch (triggered by the range change below)
+    // never resolves during this test's assertions, so we can observe the
+    // in-flight state.
+    let resolveSecond!: (v: NetflowResponse) => void;
+    fetchRunNetflow.mockReturnValueOnce(
+      new Promise<NetflowResponse>((resolve) => {
+        resolveSecond = resolve;
+      }),
+    );
+    fetchNetflowGraph.mockResolvedValueOnce({ nodes: [], edges: [] } satisfies GraphView);
+
+    fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
+
+    // The previous window's flow must be gone immediately, replaced by
+    // the loading state — not left rendering under the new, unresolved
+    // range (the exact stale-render bug this test guards against).
+    await waitFor(() =>
+      expect(screen.queryByText('first-window-host.example.com')).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText(/loading network flows/i)).toBeInTheDocument();
+
+    // Clean up the in-flight promise so it doesn't leak into later tests.
+    resolveSecond({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true, window: { from: null, to: null } });
+    await waitFor(() => expect(screen.queryByText(/loading network flows/i)).not.toBeInTheDocument());
+  });
+
+  it('clears a stale netflow error once a subsequent range change succeeds', async () => {
+    fetchRunNetflow.mockRejectedValueOnce(new Error('boom'));
+    stubApi(GRAPH);
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /network/i }));
+    await screen.findByText(/boom/i);
+
+    fetchRunNetflow.mockResolvedValueOnce({
+      flows: [],
+      hosts: [],
+      dropped_total: 0,
+      asn_loaded: true,
+      window: { from: '2026-08-17T14:00:00.000Z', to: null },
+    } satisfies NetflowResponse);
+    fetchNetflowGraph.mockResolvedValueOnce({ nodes: [], edges: [] } satisfies GraphView);
+
+    fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
+
+    // The old error must not survive a range change that actually
+    // succeeds — and the error branch is checked first in RunDetail's
+    // render, so a stale error would otherwise permanently hide the data
+    // the new range just fetched.
+    await waitFor(() => expect(screen.queryByText(/boom/i)).not.toBeInTheDocument());
+    // Window WAS applied this time (from set) — the range-aware empty
+    // state, not the unbounded one, is the honest read here.
+    await waitFor(() =>
+      expect(screen.getByText(/no network flows in this range/i)).toBeInTheDocument(),
+    );
   });
 });

@@ -30,6 +30,8 @@ import NetflowGraph from '../components/netflow/NetflowGraph';
 import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
 import NetflowSummary from '../components/netflow/NetflowSummary';
 import NetflowTable from '../components/netflow/NetflowTable';
+import NetflowWindowReadout from '../components/netflow/NetflowWindowReadout';
+import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../components/netflow/TimeRangePicker';
 import {
   fetchGlobalNetflow,
   fetchNetflowGraph,
@@ -41,21 +43,33 @@ export default function Netflow() {
   const [data, setData] = useState<NetflowResponse | null>(null);
   const [graph, setGraph] = useState<GraphView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Relative-default time-range filter (Task 4). `toNetflowRange` collapses
+  // the 'all' preset (and an as-yet-unapplied 'custom') to `undefined`, so
+  // the fetches below stay call-compatible with the pre-Task-4 "no scope,
+  // no range" shape whenever no filter is actually in effect.
+  const [range, setRange] = useState<TimeRangeValue>({ preset: 'all' });
 
   useEffect(() => {
     let cancelled = false;
     setData(null);
     setGraph(null);
     setError(null);
+    const q = toNetflowRange(range);
     // Global scope: call both fetchers with NO scope argument at all,
     // rather than passing an empty string — the API contract distinguishes
-    // "no scope param" (global) from a malformed scoped request.
+    // "no scope param" (global) from a malformed scoped request. The range
+    // argument is likewise omitted entirely (not passed as `undefined`)
+    // when `q` is `undefined`, so an unfiltered load calls exactly as it
+    // did before this picker existed.
     //
     // Combined into one `Promise.all` (Fix 6) rather than two independent
     // `.then`/`.catch` pairs: a failure on EITHER fetch now surfaces one
     // error message and one retry story instead of a panel that silently
     // renders whatever half succeeded with no explanation for the rest.
-    Promise.all([fetchGlobalNetflow(), fetchNetflowGraph()])
+    Promise.all([
+      q ? fetchGlobalNetflow(q) : fetchGlobalNetflow(),
+      q ? fetchNetflowGraph(undefined, q) : fetchNetflowGraph(),
+    ])
       .then(([d, g]) => {
         if (cancelled) return;
         setData(d);
@@ -68,18 +82,24 @@ export default function Netflow() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [range]);
 
   return (
     <div className="p-8">
       <header className="mb-6">
         <h1 className="text-2xl font-semibold text-ink">Network</h1>
         <p className="mt-1 text-sm text-ink-dim">
-          Every flow recorded across all runs, plus unattributed system egress that belongs to no
-          single run.
+          Every flow recorded across all runs in the selected time range.
         </p>
         <NetflowScopeDisclosure scope="global" className="mt-2" />
       </header>
+
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <TimeRangePicker value={range} onChange={setRange} />
+        {/* Server-echoed, never picker-state-derived — see the component's
+            header comment (whole-branch review round 1, "Also do"). */}
+        {data && <NetflowWindowReadout appliedWindow={data.window} />}
+      </div>
 
       {error ? (
         <p className="text-sm text-err">{error}</p>
@@ -87,9 +107,15 @@ export default function Netflow() {
         <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <div className="space-y-6">
-          {graph && <NetflowGraph graph={graph} scope="global" />}
+          {graph && <NetflowGraph graph={graph} scope="global" appliedWindow={data.window} />}
           <NetflowSummary hosts={data.hosts} />
-          <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} scope="global" />
+          <NetflowTable
+            flows={data.flows}
+            droppedTotal={data.dropped_total}
+            asnLoaded={data.asn_loaded}
+            scope="global"
+            appliedWindow={data.window}
+          />
         </div>
       )}
     </div>

@@ -33,7 +33,7 @@ function flow(over: Partial<FlowView> = {}): FlowView {
 
 describe('NetflowTable', () => {
   it('renders host, path and ASN org', () => {
-    render(<NetflowTable flows={[flow()]} dropped={0} asnLoaded />);
+    render(<NetflowTable flows={[flow()]} droppedTotal={0} asnLoaded />);
     expect(screen.getByText('api.anthropic.com')).toBeInTheDocument();
     expect(screen.getByText('/v1/messages')).toBeInTheDocument();
     expect(screen.getByText(/CLOUDFLARENET/)).toBeInTheDocument();
@@ -41,7 +41,7 @@ describe('NetflowTable', () => {
   });
 
   it('always shows the fidelity badge', () => {
-    render(<NetflowTable flows={[flow({ fidelity: 'coarse' })]} dropped={0} asnLoaded />);
+    render(<NetflowTable flows={[flow({ fidelity: 'coarse' })]} droppedTotal={0} asnLoaded />);
     expect(screen.getByText('coarse')).toBeInTheDocument();
   });
 
@@ -55,7 +55,7 @@ describe('NetflowTable', () => {
     render(
       <NetflowTable
         flows={[flow({ fidelity: 'coarse', bytes_in: undefined, bytes_out: undefined })]}
-        dropped={0}
+        droppedTotal={0}
         asnLoaded
       />,
     );
@@ -64,7 +64,7 @@ describe('NetflowTable', () => {
   });
 
   it('surfaces dropped flows rather than under-reporting silently', () => {
-    render(<NetflowTable flows={[flow()]} dropped={17} asnLoaded />);
+    render(<NetflowTable flows={[flow()]} droppedTotal={17} asnLoaded />);
     expect(screen.getByText(/17 flows dropped/i)).toBeInTheDocument();
   });
 
@@ -73,12 +73,12 @@ describe('NetflowTable', () => {
     // (`#[serde(skip_serializing_if = "Option::is_none")]`) OMITS the key
     // rather than serializing `null`, so `undefined` is the correct "no
     // ASN" value here, not `null`.
-    render(<NetflowTable flows={[flow({ asn: undefined })]} dropped={0} asnLoaded={false} />);
+    render(<NetflowTable flows={[flow({ asn: undefined })]} droppedTotal={0} asnLoaded={false} />);
     expect(screen.getByText(/ASN data not loaded/i)).toBeInTheDocument();
   });
 
   it('states the phase-1 scope limit on the empty state', () => {
-    render(<NetflowTable flows={[]} dropped={0} asnLoaded />);
+    render(<NetflowTable flows={[]} droppedTotal={0} asnLoaded />);
     expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
     expect(screen.getByText(/does not cover.*subprocess/i)).toBeInTheDocument();
   });
@@ -88,8 +88,59 @@ describe('NetflowTable', () => {
     // so an all-dropped scope silently under-reported — exactly the defect
     // the dropped banner exists to prevent, in its worst form (total loss
     // reads as "nothing happened" rather than "everything was lost").
-    render(<NetflowTable flows={[]} dropped={9} asnLoaded />);
+    render(<NetflowTable flows={[]} droppedTotal={9} asnLoaded />);
     expect(screen.getByText(/9 flows dropped/i)).toBeInTheDocument();
     expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
+  });
+
+  // Task 4 (time-range picker): an empty result now has two distinct
+  // honest readings — "nothing matched the selected window" vs "nothing
+  // was ever recorded" — and the empty state must not conflate them. The
+  // `appliedWindow` prop is the server's OWN echo of the applied
+  // `?from=`/`?to=` (`NetflowResponse.window`), not the picker's local UI
+  // state, so this reflects what the server actually did, not what was
+  // merely requested.
+  it('states "no flows in range" — not "nothing recorded" — when a window was applied and matched nothing', () => {
+    render(
+      <NetflowTable
+        flows={[]}
+        droppedTotal={0}
+        asnLoaded
+        appliedWindow={{ from: '2026-08-17T14:00:00Z', to: null }}
+      />,
+    );
+    expect(screen.getByText(/no network flows.*this range/i)).toBeInTheDocument();
+    // Must not claim the ledger itself is empty — only that this window is.
+    expect(screen.queryByText(/^No network flows recorded for this scope$/i)).not.toBeInTheDocument();
+  });
+
+  it('keeps the unbounded "nothing recorded at all" wording when no window was applied', () => {
+    render(
+      <NetflowTable
+        flows={[]}
+        droppedTotal={0}
+        asnLoaded
+        appliedWindow={{ from: null, to: null }}
+      />,
+    );
+    expect(screen.getByText(/No network flows recorded for this scope/i)).toBeInTheDocument();
+    expect(screen.queryByText(/this range/i)).not.toBeInTheDocument();
+  });
+
+  it('defaults to the unbounded wording when no `appliedWindow` prop is passed at all (back-compat)', () => {
+    render(<NetflowTable flows={[]} droppedTotal={0} asnLoaded />);
+    expect(screen.getByText(/No network flows recorded for this scope/i)).toBeInTheDocument();
+  });
+
+  it('does not apply the range-empty wording when flows are present, even with a window applied', () => {
+    render(
+      <NetflowTable
+        flows={[flow()]}
+        droppedTotal={0}
+        asnLoaded
+        appliedWindow={{ from: '2026-08-17T14:00:00Z', to: null }}
+      />,
+    );
+    expect(screen.queryByText(/no network flows/i)).not.toBeInTheDocument();
   });
 });

@@ -132,6 +132,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::models::Action,
     },
+    /// Manage per-run netflow ledgers (retention / pruning).
+    Netflow {
+        #[command(subcommand)]
+        action: cmd::netflow::Action,
+    },
     /// SCM repository operations.
     Repos {
         #[command(subcommand)]
@@ -315,6 +320,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Cleanup(args) => cmd::cleanup::handle(args, cli.format).await,
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
         Cmd::Models { action } => cmd::models::handle(action, cli.format).await,
+        Cmd::Netflow { action } => {
+            cmd::netflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
         Cmd::Session { action } => {
             cmd::session::handle(action, cli.format, cli.absolute, cli.all_columns).await
@@ -375,6 +383,7 @@ fn ensure_output_format_supported(
         Cmd::Cleanup(_) => cmd::cleanup::ensure_output_format(format),
         Cmd::Auth { action } => cmd::auth::ensure_output_format(action, format),
         Cmd::Models { action } => cmd::models::ensure_output_format(action, format),
+        Cmd::Netflow { action } => cmd::netflow::ensure_output_format(action, format),
         Cmd::Repos { action } => cmd::repos::ensure_output_format(action, format),
         Cmd::Session { action } => cmd::session::ensure_output_format(action, format),
         Cmd::Issues { action } => cmd::issues::ensure_output_format(action, format),

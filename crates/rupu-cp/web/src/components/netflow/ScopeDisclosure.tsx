@@ -8,21 +8,24 @@
 // fix (four copy-pasted/hand-written fragments, several of them wrong).
 //
 // Coverage list intentionally excludes MCP and webhooks (Fix 2, round 3):
-// grep the workspace and `Origin::Mcp` / `Origin::Webhook` are constructed
-// nowhere — see `rupu_netflow::ctx::Origin`'s variants and
+// `rupu_netflow::ctx::Origin` no longer even HAS an `Mcp`/`Webhook` variant
+// (netflow-per-run Plan 2, Task 1) — neither subsystem makes outbound HTTP,
+// so there was nothing for those variants to ever be constructed for. See
+// `rupu_netflow::ctx::Origin`'s doc comment and
 // `crates/rupu-cp/web/src/lib/netflow.ts`'s `Origin` doc comment. Claiming
 // coverage that cannot exist is exactly the failure this subsystem was
-// built to prevent. Add them back here the day something actually
-// constructs one, not before.
+// built to prevent. Add an entry back here only if a future subsystem
+// change actually gives one of them outbound HTTP to make.
 //
-// It also excludes "the updater" entirely (Fix 2, round 4 — Blocker 2):
-// there are exactly two production `rupu_netflow::http::init` call sites in
-// the workspace, `cmd/run.rs` and `cmd/cp.rs`. `cmd/update.rs` (the `rupu
-// update` release download) calls neither, so that traffic is wired to a
-// `NullSink` and recorded nowhere at any scope. The only `Origin::Update`
-// flow that CAN land is the passive update-notice check spawned in
-// `lib.rs`, which races `cmd/run.rs`'s `init` call further down dispatch —
-// not a claim worth making. Installing a sink in `cmd/update.rs` is new
+// It also excludes "the updater" entirely: `rupu_netflow::http::init` (the
+// process-global sink installer this paragraph used to cite) was deleted
+// in the netflow-per-run rewrite — `rupu-netflow/src/http/` has no `init`
+// at all any more. Every remaining `rupu update` / update-
+// notice call site (`GithubReleaseSource::new`, `rupu-update/src/
+// github.rs`) constructs its HTTP client with `Arc::new(NullSink)`
+// directly, including the passive update-notice check spawned in
+// `lib.rs` — there is no `Origin::Update` flow that reaches any ledger,
+// at any scope, full stop. Installing a real sink there is new
 // capability work, tracked as a follow-up, not a wording fix.
 //
 // It ALSO excludes "CP fleet traffic" entirely now (netflow-per-run plan,
@@ -88,7 +91,8 @@ function disclosureText(scope: NetflowScope): string {
     `This covers rupu's own egress — ${coverage} — never traffic from the agent's bash ` +
     `subprocess. It also can't see non-HTTP egress: git2 clones (often a run's ` +
     `largest byte volume), object_store bucket traffic, and the node WebSocket are invisible ` +
-    `here too.`
+    `here too. Ledgers are kept indefinitely unless an operator runs rupu netflow prune — ` +
+    `nothing here expires or rotates on its own.`
   );
 }
 
@@ -162,6 +166,44 @@ export function netflowEmptyStateHint(scope: NetflowScope): string {
  *  node regardless of the `graph_view` bug above. */
 export function netflowSystemSourceHint(_scope: NetflowScope): string {
   return `Sources — runs — connect to the host:port endpoints they reached.`;
+}
+
+/** `NetflowResponse.window` — the wire shape (kept structurally typed
+ *  rather than imported from `lib/netflow.ts` to avoid a dependency
+ *  cycle: that module doesn't need to know about this one). */
+export interface NetflowWindowEcho {
+  from: string | null;
+  to: string | null;
+}
+
+/** Whether the server actually applied a `?from=`/`?to=` bound to produce
+ *  the current result — read from the response's OWN echo
+ *  (`NetflowResponse.window`), never from the picker's local UI state.
+ *  Shared by `NetflowTable` and `NetflowGraph` (Critical 1/2, whole-branch
+ *  review round 1) so "was a range applied" can't end up computed two
+ *  different ways that drift apart. */
+export function netflowWindowApplied(window?: NetflowWindowEcho | null): boolean {
+  return window != null && (window.from !== null || window.to !== null);
+}
+
+/** The empty-state hint for "a `?from=`/`?to=` window was applied and
+ *  matched nothing" — shared by `NetflowTable`'s per-flow empty state and
+ *  `NetflowGraph`'s topology empty state (Critical 2, whole-branch review
+ *  round 1: these two used to disagree on the same screen — an in-range-
+ *  empty result showed the table's "No network flows in this range"
+ *  directly above the graph's unqualified "No flows to graph for this
+ *  scope", and only one of those two adjacent sentences could be true).
+ *  Says flows "may still exist outside" rather than asserting they do —
+ *  an empty windowed result is not proof the wider scope is empty, only
+ *  that this window is. Names the actual clearing affordance ("All")
+ *  rather than the vaguer "clear the range" (Minor finding, same round:
+ *  the hint and the control it referred to used different words for the
+ *  same action). */
+export function netflowRangeEmptyHint(): string {
+  return (
+    `Flows may still exist outside the selected window — widen the range, or choose All to ` +
+    `see everything recorded.`
+  );
 }
 
 export default NetflowScopeDisclosure;

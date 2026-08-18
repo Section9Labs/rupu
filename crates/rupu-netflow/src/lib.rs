@@ -1,10 +1,31 @@
 //! Network egress observability for rupu.
 //!
-//! Phase 1 captures rupu's OWN outbound HTTP — provider APIs, SCM
-//! connectors, MCP, webhooks, the update checker. It does NOT cover
-//! traffic from the agent's `bash` subprocesses; that arrives with the
-//! microVM backend (spec §9). Every record carries a [`Fidelity`] so no
-//! view ever claims coverage it does not have.
+//! Phase 1 captures rupu's OWN outbound HTTP — provider APIs and SCM
+//! connectors, wired to a per-run sink. Login/OAuth, the update checker,
+//! and CP's own fleet traffic are deliberately captured nowhere (wired to
+//! [`sink::NullSink`]) — see [`ctx::Origin`]'s doc for the full accounting,
+//! including why `Mcp`/`Webhook` variants don't exist at all: `rupu-mcp`
+//! dispatches into SCM connectors, which tag their own calls `Scm`, and
+//! `rupu-webhook` is an inbound server that makes no outbound HTTP. It does
+//! NOT cover traffic from the agent's `bash` subprocesses; that arrives
+//! with the microVM backend (spec §9). Every record carries a [`Fidelity`]
+//! so no view ever claims coverage it does not have.
+//!
+//! # Retention
+//!
+//! A ledger is never deleted automatically — one file per run
+//! accumulates in `<netflow_dir>/<run_id>.jsonl` (see [`NetflowPaths`])
+//! for as long as an operator leaves it there. `rupu netflow prune
+//! --older-than <duration>` (`rupu-cli`'s `cmd::netflow` module) is the
+//! retention tool, mirroring `rupu transcript prune`; nothing in this
+//! crate or `rupu-cli` schedules it, so an installation that never runs
+//! it keeps every ledger forever. A prune sweep never touches a ledger
+//! modified within `MIN_LEDGER_AGE`, the directory's own self-ignoring
+//! `.gitignore`, or the legacy pre-per-run `flows.jsonl`. Note that the
+//! age floor is a proxy for liveness, not a guarantee of it: there is no
+//! cheap filename-to-run-state lookup, so a genuinely long-idle
+//! `Running` run is not provably safe — see that module's doc comment
+//! for the full accept/reject and liveness reasoning.
 //!
 //! # Adding an HTTP client
 //!
@@ -24,6 +45,9 @@ pub mod sink;
 
 pub use asn::{AsnInfo, AsnTable};
 pub use ctx::{FlowCtx, Origin};
-pub use ledger::{netflow_dir, NetflowPaths, NetflowWriter, NetflowWriterHandle};
+pub use ledger::{
+    global_netflow_dir, is_per_run_ledger_path, netflow_dir, project_local_netflow_dir,
+    NetflowPaths, NetflowWriter, NetflowWriterHandle, LEGACY_LEDGER_FILENAME,
+};
 pub use record::{Fidelity, FlowId, FlowRecord, LedgerLine, Outcome};
 pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};

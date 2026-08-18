@@ -35,6 +35,41 @@ describe('NetflowGraph', () => {
     expect(document.querySelector('svg')).not.toBeInTheDocument();
   });
 
+  // Critical 2 (whole-branch review round 1): a windowed empty result used
+  // to render this unqualified "for this scope" sentence directly above
+  // NetflowTable's corrected, range-aware "No network flows in this
+  // range" — one of the two adjacent sentences was necessarily false. The
+  // graph must use the same server-echoed `appliedWindow` signal the table
+  // does, never scope-only wording, once a bound was actually applied.
+  it('says "in this range" — not "for this scope" — when a window was applied and matched nothing', () => {
+    render(
+      <NetflowGraph
+        graph={{ nodes: [], edges: [] }}
+        scope="global"
+        appliedWindow={{ from: '2026-08-17T14:00:00Z', to: null }}
+      />,
+    );
+    expect(screen.getByText(/no flows to graph.*this range/i)).toBeInTheDocument();
+    expect(screen.queryByText(/^No flows to graph for this scope$/i)).not.toBeInTheDocument();
+  });
+
+  it('keeps the unbounded "for this scope" wording when no window was applied', () => {
+    render(
+      <NetflowGraph
+        graph={{ nodes: [], edges: [] }}
+        scope="global"
+        appliedWindow={{ from: null, to: null }}
+      />,
+    );
+    expect(screen.getByText(/No flows to graph for this scope/i)).toBeInTheDocument();
+    expect(screen.queryByText(/this range/i)).not.toBeInTheDocument();
+  });
+
+  it('defaults to the unbounded wording when no `appliedWindow` prop is passed at all (back-compat)', () => {
+    render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="global" />);
+    expect(screen.getByText(/No flows to graph for this scope/i)).toBeInTheDocument();
+  });
+
   it('never claims CP fleet traffic in the empty-state hint at any scope', () => {
     // netflow-per-run plan, Task 8: `Origin::Cp` (the CP daemon's own fleet
     // HTTP traffic) is wired to `NullSink` and recorded nowhere, at any

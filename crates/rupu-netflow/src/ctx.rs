@@ -6,6 +6,22 @@
 use serde::{Deserialize, Serialize};
 
 /// Which subsystem opened the connection.
+///
+/// This enum is a claim about what the subsystem can capture, so it lists
+/// only egress that can actually occur. `Mcp` and `Webhook` were removed
+/// deliberately: `rupu-mcp` makes no outbound HTTP (it dispatches into
+/// `rupu-scm`'s connectors, which tag their own calls `Scm`), and
+/// `rupu-webhook` is an inbound server. A variant nothing can construct
+/// is a promise of coverage that does not exist.
+///
+/// "Can occur" is not "is captured", though: `Update`, `Cp` and `System`
+/// CAN be constructed (every one of their production call sites does), but
+/// every one of those sites wires its client to `Arc::new(NullSink)`, so
+/// none of that traffic ever reaches a ledger, at any scope — see this
+/// crate's own top-of-file doc comment ("Login/OAuth, the update checker,
+/// and CP's own fleet traffic are deliberately captured nowhere") and
+/// `rupu-cp`'s `ScopeDisclosure.tsx` for the full accounting of where each
+/// variant's flows actually land.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "name", rename_all = "snake_case")]
 pub enum Origin {
@@ -13,9 +29,6 @@ pub enum Origin {
     Provider(String),
     /// SCM / issue connector, by platform (`github`, `gitlab`, …).
     Scm(String),
-    /// MCP server, by configured server name.
-    Mcp(String),
-    Webhook,
     Update,
     Cp,
     System,
@@ -58,5 +71,32 @@ impl FlowCtx {
             workspace_id: None,
             origin,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_enumerates_only_egress_that_can_occur() {
+        // The enum is a claim about what this subsystem can capture.
+        // `Mcp` and `Webhook` were removed because neither crate makes
+        // outbound HTTP: rupu-mcp dispatches into rupu-scm's connectors
+        // (already tagged Scm), and rupu-webhook is an inbound server.
+        // A variant that can never be constructed is a false claim.
+        for json in [
+            r#"{"kind":"provider","name":"anthropic"}"#,
+            r#"{"kind":"scm","name":"github"}"#,
+            r#"{"kind":"update"}"#,
+            r#"{"kind":"cp"}"#,
+            r#"{"kind":"system"}"#,
+        ] {
+            serde_json::from_str::<Origin>(json).expect("known variant must parse");
+        }
+
+        // Retired variants must no longer deserialize.
+        assert!(serde_json::from_str::<Origin>(r#"{"kind":"mcp","name":"x"}"#).is_err());
+        assert!(serde_json::from_str::<Origin>(r#"{"kind":"webhook"}"#).is_err());
     }
 }
