@@ -106,32 +106,6 @@ export function NetflowScopeDisclosure({
   );
 }
 
-/** NetflowGraph's empty-state hint — folded in here (Fix 2, round 4) so its
- *  source-labelling claim can't drift from the same scope rules as the
- *  rest of this file.
- *
- *  UPDATED (Finding 4, whole-branch review): the graph's source id is no
- *  longer ever the literal string `system`. `rupu_netflow::ledger::
- *  graph_view` used to derive the source from `f.ctx.run_id`, which no
- *  production `FlowCtx` has ever populated — every graph, at every scope,
- *  was a hub-and-spoke picture of one node called `system`. The read side
- *  now passes the OWNING RUN ID in explicitly (`rupu-cp/src/api/
- *  netflow.rs`'s `resolve_ledger_paths`/`read_all_run_ledgers_in_dir`
- *  already know it — it's the ledger FILE's own name), so every source
- *  node is a real run id: one per run at run scope, one per contributing
- *  run at project/global scope. There is no longer an "unattributed"
- *  fallback case in the graph endpoint's own code, so this hint no
- *  longer promises one.
- *
- *  `Origin::System` (auth/oauth token exchange — `rupu-auth`'s resolver /
- *  oauth/device / oauth/callback) is unrelated to this and worth noting
- *  for a different reason: ALL THREE of those sites are wired to
- *  `Arc::new(NullSink)` (matt's explicit scope call — login/update
- *  traffic is out of netflow's scope even when a token refresh fires
- *  mid-run; see `rupu-auth/src/resolver.rs`'s doc comment), so that
- *  traffic reaches no ledger at any scope either. It was never going to
- *  produce a `system`-labelled node regardless of the `graph_view` bug
- *  above. */
 /** NetflowTable's empty-state hint (Blocker 1, whole-branch review) --
  *  authored here for the same reason `netflowSystemSourceHint` is: a
  *  scope-specific caveat can be added without `NetflowTable` itself
@@ -156,11 +130,36 @@ export function netflowEmptyStateHint(scope: NetflowScope): string {
   const generic = `Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}. It does not cover traffic from the agent's bash subprocess.`;
   if (scope !== 'project') return generic;
   return (
-    `This project has no .rupu/netflow/ directory of its own, so its runs' flows are ` +
-    `recorded at global scope instead of here — check the global Network view. ${generic}`
+    `If this project has no .rupu/netflow/ directory of its own, its runs' flows are ` +
+    `recorded at global scope instead — check the global Network view. ${generic}`
   );
 }
 
+/** NetflowGraph's empty-state hint — folded in here (Fix 2, round 4) so its
+ *  source-labelling claim can't drift from the same scope rules as the
+ *  rest of this file.
+ *
+ *  UPDATED (Finding 4, whole-branch review): the graph's source id is no
+ *  longer ever the literal string `system`. `rupu_netflow::ledger::
+ *  graph_view` used to derive the source from `f.ctx.run_id`, which no
+ *  production `FlowCtx` has ever populated — every graph, at every scope,
+ *  was a hub-and-spoke picture of one node called `system`. The read side
+ *  now passes the OWNING RUN ID in explicitly (`rupu-cp/src/api/
+ *  netflow.rs`'s `resolve_ledger_paths`/`read_all_run_ledgers_in_dir`
+ *  already know it — it's the ledger FILE's own name), so every source
+ *  node is a real run id: one per run at run scope, one per contributing
+ *  run at project/global scope. There is no longer an "unattributed"
+ *  fallback case in the graph endpoint's own code, so this hint no
+ *  longer promises one.
+ *
+ *  `Origin::System` — auth/oauth token exchange (`resolver.rs`,
+ *  `oauth/device.rs`, `oauth/callback.rs`), the theme-URL fetch
+ *  (`output/theme.rs`), and the ASN-table refresh (`cmd/cp.rs`'s sweep,
+ *  this crate's `maybe_refresh_asn`) — is unrelated to this and worth
+ *  noting for a different reason: EVERY production construction site for
+ *  it is wired to `Arc::new(NullSink)`, so that traffic reaches no ledger
+ *  at any scope either. It was never going to produce a `system`-labelled
+ *  node regardless of the `graph_view` bug above. */
 export function netflowSystemSourceHint(_scope: NetflowScope): string {
   return `Sources — runs — connect to the host:port endpoints they reached.`;
 }

@@ -197,11 +197,11 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
         .unwrap_or_else(|_| oauth.token_url.to_string());
 
-    // Pre-existing compile break from Task 4 (netflow-per-run plan) removing
-    // the process-global sink; not this call site's concern to attribute
-    // egress (auth/OAuth traffic is deliberately out of netflow's scope —
-    // see the plan's progress ledger), so a `NullSink` here is correct, not
-    // a stopgap. Task 7 owns the final wiring of this call site.
+    // `Arc::new(NullSink)`, deliberately: auth/OAuth traffic is out of
+    // netflow's scope by matt's explicit ruling — "I do not care about
+    // update or login" — not a stopgap pending further wiring. See
+    // `resolver.rs`'s `refresh_inner` doc comment for the same ruling
+    // stated at its call site; there is no further wiring planned here.
     let client = rupu_netflow::http::client_with(
         rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
         reqwest::Client::builder(),

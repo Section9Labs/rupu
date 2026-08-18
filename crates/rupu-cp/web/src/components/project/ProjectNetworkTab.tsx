@@ -1,15 +1,14 @@
 // Project Network tab body — the project-scoped netflow aggregate: every
-// flow across every run under this project, PLUS `system`-origin egress
-// (auth/oauth token exchange — see `ScopeDisclosure.tsx`) that carries no
-// run_id and so never surfaces on a per-run Network tab. That's a property
-// of this scope, not an accident — those flows only ever attach to a
-// workspace, never to a single run. This scope deliberately does NOT
-// include the update checker's traffic, the CP daemon's own fleet traffic
-// (`Origin::Cp`), or its ASN-table refresh (`Origin::System`, `cmd/cp.rs`'s
-// sweep / this crate's `maybe_refresh_asn`) — not because any of those
-// live somewhere else, but because none of them live anywhere: all three
-// are wired to a `NullSink` (netflow-per-run plan), so they're recorded at
-// no scope, this one included; see
+// flow across every run under this project. This scope deliberately does
+// NOT include the update checker's traffic (`Origin::Update`), the CP
+// daemon's own fleet traffic (`Origin::Cp`), or `Origin::System` — which
+// covers auth/oauth token exchange, the theme-URL fetch, AND the
+// ASN-table refresh (`cmd/cp.rs`'s sweep / this crate's
+// `maybe_refresh_asn`) — not because any of those live somewhere else,
+// but because none of them live anywhere: every production construction
+// site for all three origins is wired to a `NullSink` (netflow-per-run
+// plan), so they're recorded at no scope, this one included; see
+// `ScopeDisclosure.tsx`'s header comment and
 // `rupu_cp::api::netflow::get_project_netflow`'s doc comment.
 //
 // KNOWN GAP (Blocker 1, whole-branch review): `get_project_netflow` reads

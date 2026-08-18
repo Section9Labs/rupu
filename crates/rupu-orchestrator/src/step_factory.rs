@@ -62,13 +62,18 @@ use std::sync::Arc;
 /// independent `NetflowWriterHandle` — its own bounded channel,
 /// background task, open fd, and `dropped` counter — per step, all
 /// pointed at the SAME `<run_id>.jsonl` file rather than one shared
-/// writer. This is safe, not silently lossy: every write is one
-/// `write_all` of a complete JSON line (see `writer.rs`), so concurrent
-/// appenders can't interleave a torn line, and the read side sums every
-/// `Dropped` line it finds in a file regardless of which writer instance
-/// produced it (`rupu_netflow::ledger::read_flows_and_dropped`) — so a
-/// step's own overflow is still counted, just via its own line rather
-/// than a merged counter. The cost is purely resource waste (N
+/// writer. This is safe in practice, not silently lossy: each writer
+/// issues one `write_all` of a complete JSON line per append (see
+/// `writer.rs`) — that's a loop over partial writes in general, not an
+/// atomic syscall, so the real guarantee against a torn line rests on
+/// `O_APPEND` plus regular-file write behaviour, not on the `write_all`
+/// API itself. In practice these appenders barely overlap: each one only
+/// runs for the brief window around its own step's dispatch. And the
+/// read side sums every `Dropped` line it finds in a file regardless of
+/// which writer instance produced it
+/// (`rupu_netflow::ledger::read_flows_and_dropped`) — so a step's own
+/// overflow is still counted, just via its own line rather than a
+/// merged counter. The cost is purely resource waste (N
 /// short-lived tasks/fds instead of one long-lived one for one workflow
 /// run), not a correctness gap. Left as-is rather than caching/sharing a
 /// writer keyed by run id: a process-wide cache keyed by run id is

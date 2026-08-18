@@ -295,7 +295,7 @@ impl GithubClient {
     ///
     /// Does NOT emit a netflow record per attempt. The one caller that
     /// uses this directly — `graphql_json` — already sends its request
-    /// through `rupu_netflow::http::client_from`, which records an
+    /// through `rupu_netflow::http::client_with`, which records an
     /// accurate `Fidelity::Http` entry per real send via the netflow
     /// middleware. Recording a second, less-precise `Coarse` entry here
     /// for the same connection would duplicate data, not complement it.

@@ -28,6 +28,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   NetflowScopeDisclosure,
   netflowCoverageList,
+  netflowEmptyStateHint,
   netflowSystemSourceHint,
   type NetflowScope,
 } from './ScopeDisclosure';
@@ -58,6 +59,22 @@ describe('netflowCoverageList', () => {
   it.each(SCOPES)('never claims MCP or webhook coverage at %s scope', (scope) => {
     expect(netflowCoverageList(scope)).not.toMatch(/MCP/i);
     expect(netflowCoverageList(scope)).not.toMatch(/webhook/i);
+  });
+});
+
+describe('netflowEmptyStateHint', () => {
+  // Blocker 1, whole-branch review: nothing creates
+  // `<workspace>/.rupu/netflow/` on `rupu init`, so on a default install a
+  // project's own scope is empty even for a project with real, captured
+  // runs — the flows landed at global scope instead. Only project scope's
+  // hint may point the operator at the global Network view; run and
+  // global scope have no such gap to disclose.
+  it.each(SCOPES)('names the global-scope fallback only at project scope, not %s', (scope) => {
+    if (scope === 'project') {
+      expect(netflowEmptyStateHint(scope)).toMatch(/global scope/i);
+    } else {
+      expect(netflowEmptyStateHint(scope)).not.toMatch(/global scope/i);
+    }
   });
 });
 

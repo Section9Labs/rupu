@@ -237,7 +237,7 @@ pub struct GraphView {
 /// that field (see `crate::ctx::FlowCtx`'s doc comment: attribution is by
 /// ledger FILE, not by this field), so deriving the source from it
 /// collapsed every graph at every scope into one node labelled `system`.
-/// The read side (`rupu-cp/src/api/netflow.rs`'s `resolve_ledger_path`/
+/// The read side (`rupu-cp/src/api/netflow.rs`'s `resolve_ledger_paths`/
 /// `read_all_run_ledgers_in_dir`) already knows which run/ledger-file each
 /// flow came from, so it passes that id in directly: the run's own id at
 /// run scope (one source node per run, even though its flows may be

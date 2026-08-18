@@ -12,13 +12,16 @@
 //! field — `run_id` is `None` on every production flow today (see
 //! `rupu_netflow::ctx::FlowCtx`'s doc comment), so it was never usable
 //! for attribution to begin with. `Origin::Scm` (SCM connector traffic,
-//! e.g. `Registry::discover`) is the one kind of `run_id: None` flow that
-//! DOES reach a real per-run sink and lands in THIS run's own ledger file
-//! — `Auth`, `System`, `Update` and `Cp` are all wired to `NullSink` and
-//! reach no ledger at all (see `ScopeDisclosure.tsx` for the full
-//! accounting). `filter_by_run`'s old job — recovering `run_id: None`
-//! flows a shared ledger's field filter would otherwise drop — is not
-//! what the transcript merge is for anymore.
+//! e.g. `Registry::discover`) is the one *non-provider* origin that DOES
+//! reach a real per-run sink and lands in THIS run's own ledger file,
+//! same as `Origin::Provider` does. `Origin::System` (which covers
+//! auth/oauth token exchange, the theme-URL fetch, and the ASN-table
+//! refresh — there is no separate `Auth` variant), `Origin::Update` and
+//! `Origin::Cp` are all wired to `NullSink` and reach no ledger at all
+//! (see `ScopeDisclosure.tsx` for the full accounting). `filter_by_run`'s
+//! old job — recovering `run_id: None` flows a shared ledger's field
+//! filter would otherwise drop — is not what the transcript merge is for
+//! anymore.
 //!
 //! What it's for instead: `netflow_sink::for_run` (rupu-cli) is
 //! best-effort — capture must never break a run, so a ledger file that
@@ -129,7 +132,7 @@ pub struct NetflowResponse {
 /// `ctx.run_id`.
 ///
 /// No production read path calls this anymore: a run-scoped read opens
-/// that run's own per-run ledger FILE directly (`resolve_ledger_path` /
+/// that run's own per-run ledger FILE(s) directly (`resolve_ledger_paths` /
 /// [`run_scoped_flows_and_dropped`]), so attribution comes from which file
 /// a flow landed in, not from this field — see the module doc. Kept as a
 /// pure, still-exported function because
@@ -421,11 +424,11 @@ pub(crate) fn build_response(
 /// different cwd (or the reverse) — `<workspace>/.rupu/netflow/` existing
 /// or not is a per-process observation, not a fixed property of the id.
 /// Reading only "whichever exists" silently drops whichever wrote last.
-/// Both callers already tolerate a missing file
-/// (`read_flows_and_dropped` degrades to `([], 0)`) and dedupe by
-/// `FlowId` (`merge_with_transcript`), so reading both unconditionally is
-/// safe — the only cost is one extra open-attempt on a path that, in the
-/// common (non-split) case, doesn't exist.
+/// Both reads already tolerate a missing file (`read_flows_and_dropped`
+/// degrades to `([], 0)`) and dedupe by `FlowId` (`merge_with_transcript`),
+/// so reading both unconditionally is safe — the only cost is one extra
+/// open-attempt on a path that, in the common (non-split) case, doesn't
+/// exist.
 ///
 /// Deduped when both paths canonicalize to the SAME directory (the
 /// `$HOME`/`~/.rupu` collision `read_all_workspaces_sync` also guards
@@ -433,6 +436,14 @@ pub(crate) fn build_response(
 /// identical file under two different-looking paths would double-count
 /// its flows and its `Dropped` line the same way the un-deduped global
 /// union used to.
+///
+/// Reading both roots does widen an existing id-collision window: two
+/// DIFFERENT projects given the same operator-supplied `--run-id` could
+/// now have their same-named ledger files unioned together where before
+/// only one would ever be read. Not a new hazard this change introduces
+/// on its own — `read_all_workspaces_sync`'s global union already collides
+/// operator-chosen ids across workspaces the same way — and impossible for
+/// the generated `run_<ULID>` ids every real dispatch path mints.
 fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> Vec<PathBuf> {
     let workspace_path = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), id).flows;
     let global_path = NetflowPaths::for_run(&global_dir.join("netflow"), id).flows;
@@ -462,7 +473,7 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// `StepResultRecord.run_id`/`ItemResultRecord.run_id` are `String::new()`
 /// for `for_each`/`parallel`/panel STEP records themselves (only their
 /// per-unit `items` carry a real id) and for a skipped item — filtered
-/// out before dedup so `resolve_ledger_path` is never asked to stat
+/// out before dedup so `resolve_ledger_paths` is never asked to stat
 /// `<dir>/.jsonl` (harmless today — that file never exists — but an empty
 /// id in this list is never a valid ledger name and shouldn't linger).
 fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
@@ -480,7 +491,7 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
 }
 
 /// The ledger's run-scoped flows for `run_id` — unioned across every id
-/// [`run_and_unit_ids`] names, each resolved through [`resolve_ledger_path`]
+/// [`run_and_unit_ids`] names, each resolved through [`resolve_ledger_paths`]
 /// — merged with the run's own transcript (see the module doc for why the
 /// ledger alone under-reports), plus the summed dropped-count from those
 /// same files. Synchronous — every caller runs this through
@@ -511,8 +522,8 @@ fn run_scoped_flows_and_dropped(
 
 /// Read the ledger(s) + run transcript for a run whose artifacts live
 /// under `workspace` (a project root; `global_dir` is the fallback root
-/// `resolve_ledger_path` reads from when the workspace never got its own
-/// `.rupu/netflow/` — see that function's doc) and whatever `store`
+/// `resolve_ledger_paths` also reads from when the workspace never got its
+/// own `.rupu/netflow/` — see that function's doc) and whatever `store`
 /// reports as this run's step transcript paths, scope to `run_id`, merge,
 /// and build the response. A missing ledger is an empty result, not an
 /// error. Synchronous — see [`run_scoped_flows_and_dropped`].
