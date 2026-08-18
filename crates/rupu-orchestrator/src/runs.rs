@@ -651,15 +651,20 @@ pub struct ItemResultRecord {
     pub output: String,
     pub success: bool,
     /// Mirrors `runner::ItemResult::is_fixer` -- see that field's doc
-    /// comment. `#[serde(default)]` so a `step_results.jsonl` record
-    /// persisted before this field existed deserializes as `false`,
-    /// which is correct: no record from before this field was added
-    /// could have been a fixer item in the first place (the fixer's own
-    /// `ItemResult` didn't exist until the same change that added this
-    /// field). Round-trips through both `From` impls below so a fixer
+    /// comment. Round-trips through both `From` impls below so a fixer
     /// item reconstructed for a resumed run's template context is
     /// excluded from `results`/`sub_results` the same way a freshly
     /// dispatched one is.
+    ///
+    /// `#[serde(default)]` so an older `step_results.jsonl` still
+    /// deserializes. Note the one case that default gets *wrong*: fixer
+    /// items were persisted for a short window before this field was
+    /// added, and those records deserialize as `false`, so resuming such
+    /// a run leaks the fixer's output back into a downstream step's
+    /// `{{ steps.<panel>.results }}`. That window is entirely within this
+    /// feature's own development -- no released build ever wrote such a
+    /// record -- so the gap is recorded here rather than migrated. Do not
+    /// restate it as "impossible": it is merely unreachable in practice.
     #[serde(default)]
     pub is_fixer: bool,
 }
