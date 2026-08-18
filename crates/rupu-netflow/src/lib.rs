@@ -43,6 +43,9 @@ pub mod sink;
 
 pub use asn::{AsnInfo, AsnTable};
 pub use ctx::{FlowCtx, Origin};
-pub use ledger::{netflow_dir, NetflowPaths, NetflowWriter, NetflowWriterHandle};
+pub use ledger::{
+    global_netflow_dir, is_per_run_ledger_path, netflow_dir, project_local_netflow_dir,
+    NetflowPaths, NetflowWriter, NetflowWriterHandle, LEGACY_LEDGER_FILENAME,
+};
 pub use record::{Fidelity, FlowId, FlowRecord, LedgerLine, Outcome};
 pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};

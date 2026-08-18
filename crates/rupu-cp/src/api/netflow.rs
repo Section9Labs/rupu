@@ -57,7 +57,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rupu_netflow::{AsnInfo, AsnTable, FlowId, FlowRecord, NetflowPaths};
+use rupu_netflow::{
+    global_netflow_dir, is_per_run_ledger_path, project_local_netflow_dir, AsnInfo, AsnTable,
+    FlowId, FlowRecord, NetflowPaths,
+};
 use rupu_orchestrator::runs::RunStore;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader};
 use rupu_workspace::WorkspaceStore;
@@ -445,8 +448,8 @@ pub(crate) fn build_response(
 /// operator-chosen ids across workspaces the same way — and impossible for
 /// the generated `run_<ULID>` ids every real dispatch path mints.
 fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> Vec<PathBuf> {
-    let workspace_path = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), id).flows;
-    let global_path = NetflowPaths::for_run(&global_dir.join("netflow"), id).flows;
+    let workspace_path = NetflowPaths::for_run(&project_local_netflow_dir(workspace), id).flows;
+    let global_path = NetflowPaths::for_run(&global_netflow_dir(global_dir), id).flows;
     if canonicalize_or_self(&workspace_path) == canonicalize_or_self(&global_path) {
         vec![workspace_path]
     } else {
@@ -571,17 +574,14 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
 /// ever written a ledger there) degrades to `([], 0)`, the same "missing
 /// data" tolerance every other read in this module already relies on.
 ///
-/// Skips exactly two kinds of file: the `.gitignore` `NetflowPaths::
-/// ensure_dir` drops into every such directory (no `.jsonl` extension),
-/// and a file literally named `flows.jsonl` — the pre-plan shared-ledger
-/// filename (one file for a whole workspace/daemon, before the
-/// netflow-per-run migration). `NetflowPaths::for_run` never produces
-/// that name: every real run id comes from `run_<ULID>` or an
-/// operator-supplied `--run-id`, so a bare `flows.jsonl` sitting in this
-/// directory is unambiguously a leftover from before this plan, not a
-/// run that happens to be named "flows" — reading it back in as if it
-/// were one would silently resurrect the exact shared-file model this
-/// plan replaced.
+/// Which files count as a per-run ledger (accepts `*.jsonl`, rejects
+/// the `.gitignore` `NetflowPaths::ensure_dir` drops into every such
+/// directory and the pre-plan shared-ledger file literally named
+/// `flows.jsonl`) is decided in exactly one place,
+/// `rupu_netflow::ledger::is_per_run_ledger_path` — see its doc comment
+/// for the reasoning. `rupu-cli`'s `netflow prune` calls the same
+/// function so the read side and the destructive prune side can never
+/// drift apart on what a "ledger" is.
 fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<(String, FlowRecord)>, u64) {
     let mut flows = Vec::new();
     let mut dropped = 0u64;
@@ -590,10 +590,7 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<(String, FlowRecor
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str()) == Some("flows.jsonl") {
+        if !is_per_run_ledger_path(&path) {
             continue;
         }
         // `NetflowPaths::for_run` always names a ledger `<id>.jsonl`, so

@@ -34,13 +34,22 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug)]
 pub struct PruneArgs {
-    /// Retention cutoff, e.g. `30d`, `12h`, or `1w`. Defaults to `30d`
-    /// (mirrors `transcript prune`'s own fallback) when omitted.
+    /// Retention cutoff, e.g. `30d`, `12h`, or `1w`. Must be positive —
+    /// `0s` or a negative value is rejected, not treated as "everything".
+    /// Defaults to `30d` (mirrors `transcript prune`'s own fallback) when
+    /// omitted. A ledger is matched by file mtime, NOT by asking whether
+    /// its owning run has actually finished, so a run that has been idle
+    /// (no outbound calls) longer than this cutoff can still be pruned
+    /// mid-run — this command cannot tell "idle" from "finished". Run
+    /// `--dry-run` first if you're unsure. Anything modified in roughly
+    /// the last hour is never eligible regardless of what you pass here.
     #[arg(long, value_name = "DURATION")]
     pub older_than: Option<String>,
     /// Preview deletions without removing files. Always cheap to run
     /// first — the default (no flag) deletes immediately, same as
-    /// `transcript prune`.
+    /// `transcript prune`. Recommended before any cutoff shorter than a
+    /// day, since this command cannot distinguish an idle run from a
+    /// finished one (see `--older-than`'s own help).
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -51,6 +60,42 @@ pub struct PruneArgs {
 /// adding one is out of this task's scope, so the default lives here,
 /// matching the same `30d` value `transcript prune` falls back to.
 const DEFAULT_RETENTION: &str = "30d";
+
+/// Reject a zero or negative `--older-than` outright rather than let
+/// `Utc::now() - duration` silently do the wrong thing (Critical fix,
+/// netflow-per-run Plan 3 Task 2 review round 1): `0s` puts the cutoff
+/// at `now`, so a ledger being appended to at this exact instant
+/// satisfies `mtime <= cutoff` and is deleted — silently, since the
+/// writer's own open file descriptor survives the unlink on POSIX. A
+/// negative value pushes the cutoff into the future and deletes
+/// everything unconditionally.
+///
+/// Deliberately local to `netflow prune`, NOT folded into the shared
+/// `crate::cmd::retention::parse_retention_duration` that `transcript
+/// prune`/`session prune`/`cleanup` also use: those three commands only
+/// ever prune already-ARCHIVED data (a run's own liveness check already
+/// gates archival — see `transcript.rs`'s `prune_archived_transcripts`
+/// skipping any transcript with a live `session_id`), so an operator
+/// deliberately passing `0s` there to mean "everything currently
+/// archived" is not the same hazard: there is no live writer on the
+/// other end of an archived file. `netflow prune`, by contrast, can
+/// reach a ledger belonging to a run that is `Running`/`Pending` RIGHT
+/// NOW — see `prune_ledgers`'s own "Liveness" doc section. Those three
+/// commands' own test suites already rely on `0s` as a deliberate
+/// "select everything regardless of age" convenience (`cli_cleanup.rs`),
+/// so widening this check into the shared parser would both misdescribe
+/// a risk that doesn't apply there and break existing, intentional
+/// test contracts for a problem this review was not about.
+fn reject_non_positive_retention(value: &str, duration: chrono::Duration) -> anyhow::Result<()> {
+    if duration <= chrono::Duration::zero() {
+        anyhow::bail!(
+            "invalid duration `{value}`: retention cutoff must be positive \
+             (a zero or negative duration would delete everything, including \
+             files being written to right now)"
+        );
+    }
+    Ok(())
+}
 
 pub async fn handle(
     action: Action,
@@ -201,6 +246,7 @@ async fn prune(
 ) -> anyhow::Result<()> {
     let retention = args.older_than.as_deref().unwrap_or(DEFAULT_RETENTION);
     let older_than = parse_retention_duration(retention)?;
+    reject_non_positive_retention(retention, older_than)?;
 
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
@@ -214,23 +260,47 @@ async fn prune(
     // some runs already wrote to the global directory can have stale
     // ledgers sitting in global even though every new run now lands
     // in the project-local one. Mirrors `transcript prune`'s own dual
-    // project+global scan.
+    // project+global scan. Both suffixes are DERIVED from
+    // `rupu-netflow`'s own path helpers, not hardcoded here a second
+    // time — see `rupu_netflow::ledger::paths`'s doc comment on why a
+    // second copy of this suffix is exactly the drift it warns against.
     let mut candidates: Vec<(&'static str, PathBuf)> = Vec::new();
     if let Some(root) = project_root.as_deref() {
-        let local = root.join(".rupu/netflow");
+        let local = rupu_netflow::project_local_netflow_dir(root);
         if local.is_dir() {
             candidates.push(("project", local));
         }
     }
-    candidates.push(("global", global.join("netflow")));
+    candidates.push(("global", rupu_netflow::global_netflow_dir(&global)));
 
     let mut rows = Vec::new();
+    // Two DIFFERENT failure shapes, both non-silent: `failures` is a
+    // per-file removal failure (we identified the file, selected it,
+    // and `remove_file` itself failed — see `PrunedLedger::error`).
+    // `scan_failures` is a directory-level failure (an entire root
+    // could not even be listed) — distinct because it has no per-file
+    // row of its own to attach to, but must not be dropped either.
     let mut failures: Vec<String> = Vec::new();
+    let mut scan_failures: Vec<String> = Vec::new();
     for (scope, dir) in candidates {
         if !dir.is_dir() {
             continue;
         }
-        for entry in prune_ledgers(&dir, older_than, args.dry_run)? {
+        // Deliberately NOT `?` — a failure sweeping ONE root (e.g. its
+        // `read_dir` failing after a permissions change mid-run) must
+        // never discard rows already collected from a PRIOR root in
+        // this same loop, some of which may already have been deleted
+        // from disk. Record the failure and keep going; every
+        // already-known outcome still reaches the report and the exit
+        // code still goes non-zero (see below).
+        let entries = match prune_ledgers(&dir, older_than, args.dry_run) {
+            Ok(entries) => entries,
+            Err(e) => {
+                scan_failures.push(format!("{} ({e})", dir.display()));
+                continue;
+            }
+        };
+        for entry in entries {
             let status = match &entry.error {
                 Some(err) => {
                     failures.push(format!("{} ({err})", entry.path.display()));
@@ -243,7 +313,10 @@ async fn prune(
                 run_id: run_id_from_ledger_path(&entry.path),
                 scope: scope.to_string(),
                 bytes: entry.bytes,
-                modified_at: entry.modified_at.to_rfc3339(),
+                modified_at: entry
+                    .modified_at
+                    .map(|ts| ts.to_rfc3339())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 status,
             });
         }
@@ -275,16 +348,31 @@ async fn prune(
 
     // Partial failure must not be silent: the report above already
     // named every file that could not be removed (STATUS
-    // `failed: <reason>`), but a non-zero exit is what actually tells
-    // a script — or an operator glancing at `$?` — that this run did
-    // NOT fully succeed. Every candidate that COULD be removed already
-    // was; this only affects the exit code, never a rollback.
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "failed to remove {} netflow ledger(s): {}",
-            failures.len(),
-            failures.join(", ")
-        );
+    // `failed: <reason>`) AND every root that could not even be
+    // scanned, but a non-zero exit is what actually tells a script —
+    // or an operator glancing at `$?` — that this run did NOT fully
+    // succeed. Every candidate that COULD be removed already was; this
+    // only affects the exit code, never a rollback. The report is
+    // ALWAYS printed above before this returns, in whatever `--format`
+    // was requested — never only on the success path.
+    if !failures.is_empty() || !scan_failures.is_empty() {
+        let mut detail = Vec::new();
+        if !failures.is_empty() {
+            detail.push(format!(
+                "failed to remove {} ledger(s): {}",
+                failures.len(),
+                failures.join(", ")
+            ));
+        }
+        if !scan_failures.is_empty() {
+            detail.push(format!(
+                "failed to scan {} netflow director{}: {}",
+                scan_failures.len(),
+                if scan_failures.len() == 1 { "y" } else { "ies" },
+                scan_failures.join(", ")
+            ));
+        }
+        anyhow::bail!(detail.join("; "));
     }
     Ok(())
 }
@@ -299,11 +387,23 @@ fn run_id_from_ledger_path(path: &Path) -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct PrunedLedger {
     pub path: PathBuf,
+    /// Bytes reclaimed by removing `path`. For a symlink this is
+    /// always `0`, never the target's size: `remove_file` on a symlink
+    /// unlinks only the link, so reporting the target's byte count
+    /// would claim space that was never actually freed.
     pub bytes: u64,
-    pub modified_at: chrono::DateTime<chrono::Utc>,
-    /// `Some(message)` when removal was attempted and failed. Always
-    /// `None` for a dry run (nothing is ever attempted) and for a real
-    /// prune that succeeded.
+    /// `None` when the file's mtime could not be determined at all
+    /// (a metadata read failure recorded via `error` below, or a
+    /// platform with no mtime support) — distinct from a real,
+    /// successfully-read timestamp.
+    pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Some(message)` when this entry could not be fully evaluated or
+    /// removed — a `remove_file` failure on a selected candidate, a
+    /// `std::fs::metadata` failure on an otherwise-matching filename,
+    /// or a directory-entry read failure with no path of its own (see
+    /// this function's "Partial failure" doc section). Always `None`
+    /// for a dry run (nothing is ever attempted) and for a real prune
+    /// that succeeded.
     pub error: Option<String>,
 }
 
@@ -312,32 +412,24 @@ pub(crate) struct PrunedLedger {
 ///
 /// # Filename filter — accept/reject
 ///
-/// - **Accept**: a regular file (`path.is_file()`, so a symlink to a
-///   file counts, but removing it only ever unlinks the symlink itself
-///   — never its target) directly in `dir` (never recursed into) whose
-///   extension is exactly `.jsonl`.
-/// - **Reject — directories**: `path.is_file()` gates these out before
-///   the extension check ever runs, so a subdirectory (e.g. a leftover
-///   `archive/` from an older layout) is never touched, let alone
-///   descended into.
-/// - **Reject — `.gitignore`**: its extension isn't `.jsonl`, so the
-///   filter never reaches it. This is deliberate and load-bearing: the
-///   self-ignoring `.gitignore` `NetflowPaths::ensure_dir` writes into
-///   this directory is the actual privacy boundary keeping every
-///   ledger out of `git add .` (see `ledger/paths.rs`); a prune that
-///   could delete it would reopen the exact leak class that file was
-///   added to close.
-/// - **Reject — legacy `flows.jsonl`**: excluded by exact filename. It
-///   matches `*.jsonl` but is the pre-migration, single cross-run
-///   ledger this per-run layout replaced — not a PER-RUN ledger, which
-///   is the one thing this function's contract promises to prune nb.
-///   Nothing writes it anymore; an operator who wants it gone can
-///   remove it by hand. (A run that happened to be named literally
-///   `flows` would also be excluded by this rule — an intentional
-///   over-retention, not a bug: keeping a file this function is unsure
-///   about is always the safe direction.)
+/// Delegates the filename accept/reject decision to
+/// [`rupu_netflow::is_per_run_ledger_path`] — see its doc comment for
+/// the full accept/reject reasoning (`*.jsonl` accepted; `.gitignore`
+/// and the legacy `flows.jsonl` rejected). That is the ONE place this
+/// rule is decided; `rupu-cp`'s read side calls the same function so
+/// the two can never drift apart on what counts as a ledger. This
+/// function layers exactly one more check on top, AFTER that cheap
+/// no-I/O name check: `metadata.is_file()` (from the SAME `metadata()`
+/// call already needed for mtime/size, not a second `Path::is_file()`
+/// stat — see the "Partial failure" section below for why a second
+/// call would be the wrong move) — a destructive prune must never
+/// touch a directory (e.g. a leftover `archive/`), which the read side
+/// does not need to guard against the same way. A symlink to a file
+/// still counts as accepted; removing it only ever unlinks the symlink
+/// itself, never walks through to delete its target, and its own size
+/// is never counted as reclaimed (see `PrunedLedger::bytes`'s doc).
 ///
-/// # Liveness: why this is mtime-only
+/// # Liveness: why this is mtime-only, and the recency floor
 ///
 /// This function has no access to any run store. A ledger's filename
 /// is a run (or workflow-step / fan-out unit) id, and those ids are
@@ -363,51 +455,126 @@ pub(crate) struct PrunedLedger {
 /// the `30d` default. A caller passing a much shorter `--older-than`
 /// than any real run could plausibly still be going widens that
 /// window and takes on the corresponding risk knowingly (documented on
-/// the flag's own help text); when age cannot even be read (a
-/// platform without mtime support), the file is left alone rather than
-/// guessed at — over-retention over deletion, per this command's
-/// governing rule.
+/// the flag's own `--help` text — read it there, not just here).
+///
+/// `MIN_LEDGER_AGE` is the UNCONDITIONAL backstop for that risk: no
+/// matter what `older_than` (or `parse_retention_duration`'s own
+/// positivity check) allows through, a file modified more recently
+/// than this floor is never eligible. This is what makes `--older-than
+/// 0s` (rejected outright, see `parse_retention_duration`) and a small
+/// positive value like `1s`/`1m` behave the same way — the effective
+/// cutoff can never be more recent than `now - MIN_LEDGER_AGE` — so the
+/// single most dangerous case (a ledger being appended to at this
+/// exact instant getting deleted out from under its writer, silently,
+/// because the writer's own open file descriptor survives the unlink
+/// on POSIX) is structurally impossible, not just discouraged by
+/// documentation. It does NOT fully solve the general "idle gap"
+/// problem a `--older-than 1h`/`1d` cutoff still has against a live but
+/// quiet run — no floor short enough to be useful for real pruning
+/// could — that residual risk is the one the `--older-than`/`--dry-run`
+/// help text asks an operator to reason about themselves; the floor's
+/// job is only to make the worst, silent, instantaneous case
+/// impossible regardless of input.
+///
+/// When age cannot even be read (a platform without mtime support),
+/// the file is left alone rather than guessed at — over-retention over
+/// deletion, per this command's governing rule.
 ///
 /// # Partial failure
 ///
-/// A `remove_file` failure on one candidate does not stop the sweep —
-/// every other eligible file is still attempted — and is reported back
-/// as a per-file `error`, never silently absorbed. The caller
-/// (`prune`) turns any non-empty error set into a non-zero exit after
-/// printing which files they were.
+/// Nothing in this loop aborts the sweep once it has begun — every
+/// error surfaces as a `PrunedLedger.error` row instead, so a failure
+/// on one candidate never discards the record of what was already
+/// removed earlier in the same directory:
+///
+/// - A directory-entry read failure (`entries` yielding an `Err` with
+///   no path of its own) is recorded against `dir` itself.
+/// - A `std::fs::metadata` failure on an otherwise-matching filename
+///   (anything other than the raced-away `NotFound` case, which is
+///   silently skipped — nothing is left to prune) is recorded against
+///   that file, with `bytes: 0` and `modified_at: None` since neither
+///   could be determined.
+/// - A `remove_file` failure on a selected candidate is recorded
+///   against that file, with the `bytes`/`modified_at` already read
+///   before the removal attempt.
+///
+/// Only `std::fs::read_dir(dir)` itself failing (the directory cannot
+/// be opened at all) still returns `Err` from this function — nothing
+/// has been scanned yet at that point, so there is no partial state to
+/// lose. The caller (`prune`) is responsible for not letting THAT
+/// failure discard rows already collected from a different directory
+/// in a multi-directory sweep — see its own comment on why it uses a
+/// `match`, not `?`, around this function's call.
+const MIN_LEDGER_AGE: chrono::Duration = chrono::Duration::hours(1);
+
 pub(crate) fn prune_ledgers(
     dir: &Path,
     older_than: chrono::Duration,
     dry_run: bool,
 ) -> anyhow::Result<Vec<PrunedLedger>> {
-    let cutoff = chrono::Utc::now() - older_than;
+    let now = chrono::Utc::now();
+    // See `MIN_LEDGER_AGE`'s doc section above: the effective cutoff
+    // can never be more recent than `now - MIN_LEDGER_AGE`, regardless
+    // of how short an `older_than` the caller passed in.
+    let cutoff = (now - older_than).min(now - MIN_LEDGER_AGE);
     let mut out = Vec::new();
 
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("reading netflow ledger directory {}", dir.display()))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("reading an entry in {}", dir.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                // No path available for this specific entry — record
+                // the failure against the directory itself rather than
+                // aborting the rest of the scan.
+                out.push(PrunedLedger {
+                    path: dir.to_path_buf(),
+                    bytes: 0,
+                    modified_at: None,
+                    error: Some(format!("could not read a directory entry: {e}")),
+                });
+                continue;
+            }
+        };
         let path = entry.path();
 
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-            continue;
-        }
-        if path.file_name().and_then(|name| name.to_str()) == Some("flows.jsonl") {
+        // Cheap, no-I/O filename check FIRST: a name this predicate
+        // rejects (`.gitignore`, `flows.jsonl`, anything without a
+        // `.jsonl` extension) was never a prune candidate, so a
+        // permission problem reading THAT file's metadata is
+        // irrelevant to this command's contract and must not be
+        // reported as a prune failure below.
+        if !rupu_netflow::is_per_run_ledger_path(&path) {
             continue;
         }
 
+        // One `metadata()` call, used for both "is this really a
+        // file, not a directory" and "is this stale enough". A
+        // separate `Path::is_file()` pre-check would call `metadata()`
+        // a SECOND time and map any error (including a permission
+        // failure) to a bare `false` — silently indistinguishable from
+        // "genuinely not a file", which is exactly the class of error
+        // this function's "Partial failure" contract promises to
+        // surface, not swallow.
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             // Raced away between the readdir listing and this stat —
             // nothing left to prune, not a failure.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                return Err(e).with_context(|| format!("reading metadata for {}", path.display()))
+                out.push(PrunedLedger {
+                    path,
+                    bytes: 0,
+                    modified_at: None,
+                    error: Some(e.to_string()),
+                });
+                continue;
             }
         };
+        if !metadata.is_file() {
+            continue;
+        }
         let Ok(modified) = metadata.modified() else {
             // No mtime support on this platform: cannot judge age, so
             // keep the file rather than guess.
@@ -418,12 +585,22 @@ pub(crate) fn prune_ledgers(
             continue;
         }
 
-        let bytes = metadata.len();
+        // A symlink's OWN size is negligible and not what "bytes
+        // reclaimed" should mean; `metadata()` above followed the link
+        // to get `len()`, which is the TARGET's size — removing the
+        // link never frees that. `symlink_metadata` does not follow
+        // the link, so its file type reveals whether `path` itself is
+        // a symlink without a second round-trip through the target.
+        let is_symlink = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let bytes = if is_symlink { 0 } else { metadata.len() };
+
         if dry_run {
             out.push(PrunedLedger {
                 path,
                 bytes,
-                modified_at,
+                modified_at: Some(modified_at),
                 error: None,
             });
             continue;
@@ -433,13 +610,13 @@ pub(crate) fn prune_ledgers(
             Ok(()) => out.push(PrunedLedger {
                 path,
                 bytes,
-                modified_at,
+                modified_at: Some(modified_at),
                 error: None,
             }),
             Err(e) => out.push(PrunedLedger {
                 path,
                 bytes,
-                modified_at,
+                modified_at: Some(modified_at),
                 error: Some(e.to_string()),
             }),
         }
@@ -457,6 +634,30 @@ mod tests {
         let then =
             std::time::SystemTime::now() - std::time::Duration::from_secs(days_ago * 24 * 60 * 60);
         file.set_modified(then).unwrap();
+    }
+
+    #[test]
+    fn reject_non_positive_retention_accepts_a_positive_duration() {
+        assert!(reject_non_positive_retention("30d", chrono::Duration::days(30)).is_ok());
+        assert!(reject_non_positive_retention("1s", chrono::Duration::seconds(1)).is_ok());
+    }
+
+    #[test]
+    fn reject_non_positive_retention_rejects_zero() {
+        let err = reject_non_positive_retention("0s", chrono::Duration::zero()).unwrap_err();
+        assert!(
+            err.to_string().contains("must be positive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_non_positive_retention_rejects_negative() {
+        let err = reject_non_positive_retention("-5d", chrono::Duration::days(-5)).unwrap_err();
+        assert!(
+            err.to_string().contains("must be positive"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -610,5 +811,165 @@ mod tests {
         );
         assert!(stuck.exists());
         assert!(removable.exists());
+    }
+
+    /// Critical fix (netflow-per-run Plan 3 Task 2 review round 1):
+    /// before this floor existed, `--older-than 0s` (now rejected by
+    /// `parse_retention_duration`, but exercised here directly against
+    /// `prune_ledgers`, which only sees the already-parsed
+    /// `chrono::Duration` and has no opinion of its own on what
+    /// produced it) put the cutoff at `now`, so a ledger being
+    /// appended to at this exact instant satisfied `mtime <= cutoff`
+    /// and was deleted — silently, since the writer's own open file
+    /// descriptor survives the unlink on POSIX. `MIN_LEDGER_AGE` makes
+    /// this structurally impossible: a freshly-written file (mtime =
+    /// now) must survive ANY cutoff, however short.
+    #[test]
+    fn a_very_short_cutoff_never_deletes_something_touched_moments_ago() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let fresh = dir.join("run-fresh.jsonl");
+        std::fs::write(&fresh, "{}\n").unwrap();
+
+        let removed = prune_ledgers(dir, chrono::Duration::seconds(1), false).unwrap();
+
+        assert!(
+            removed.is_empty(),
+            "a file written moments ago must survive even a 1-second cutoff"
+        );
+        assert!(fresh.exists());
+    }
+
+    /// Same floor, from the other direction: a file old enough to
+    /// clear BOTH the requested cutoff and the recency floor is still
+    /// pruned — the floor must not turn into a blanket "nothing is
+    /// ever eligible" behavior.
+    #[test]
+    fn a_cutoff_past_the_recency_floor_still_prunes_a_genuinely_old_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let old = dir.join("run-old.jsonl");
+        std::fs::write(&old, "{}\n").unwrap();
+        backdate(&old, 40);
+
+        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+
+        assert_eq!(removed.len(), 1);
+        assert!(!old.exists());
+    }
+
+    /// Minor 3: dry-run and a real run must select the exact same
+    /// files. Structurally guaranteed today (one cutoff computation,
+    /// one filter chain, `dry_run` only gates the `remove_file` call at
+    /// the very end) — pinned here against a future refactor that
+    /// accidentally lets the two paths diverge.
+    #[test]
+    fn dry_run_and_a_real_run_select_the_same_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let old_a = dir.join("run-a.jsonl");
+        let old_b = dir.join("run-b.jsonl");
+        let new_c = dir.join("run-c.jsonl");
+        for p in [&old_a, &old_b, &new_c] {
+            std::fs::write(p, "{}\n").unwrap();
+        }
+        backdate(&old_a, 40);
+        backdate(&old_b, 35);
+
+        let mut previewed: Vec<_> = prune_ledgers(dir, chrono::Duration::days(30), true)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.path)
+            .collect();
+        previewed.sort();
+
+        // Dry run touched nothing, so the same two files are still
+        // there to select for real.
+        let mut removed: Vec<_> = prune_ledgers(dir, chrono::Duration::days(30), false)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.path)
+            .collect();
+        removed.sort();
+
+        assert_eq!(previewed, vec![old_a.clone(), old_b.clone()]);
+        assert_eq!(previewed, removed);
+    }
+
+    /// Minor 2: a symlink named `*.jsonl` must never report the
+    /// target's byte size as reclaimed — `remove_file` only ever
+    /// unlinks the symlink itself, so the target's bytes were never
+    /// actually freed.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_reports_zero_bytes_reclaimed_not_the_targets_size() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let target = dir.join("target-data.bin");
+        std::fs::write(&target, vec![0u8; 4096]).unwrap();
+        backdate(&target, 40);
+
+        let link = dir.join("run-link.jsonl");
+        symlink(&target, &link).unwrap();
+
+        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            removed[0].bytes, 0,
+            "removing a symlink reclaims none of its target's bytes"
+        );
+        assert!(!link.exists(), "the symlink itself is gone");
+        assert!(
+            target.exists(),
+            "remove_file on a symlink must never touch its target"
+        );
+    }
+
+    /// Important 1 fix: a `metadata()` failure on an otherwise-matching
+    /// filename must be reported as a per-file error, not silently
+    /// skipped (the old `Path::is_file()` pre-check would have mapped
+    /// this same error to a bare `false`, indistinguishable from
+    /// "genuinely not a file") and must not abort the rest of the
+    /// sweep. Strips execute (search) permission from the parent
+    /// directory — `read_dir` can still list entry NAMES with only
+    /// read permission, but resolving a full path to stat it needs
+    /// search permission on every containing directory, so
+    /// `std::fs::metadata` on an entry inside fails with EACCES while
+    /// the directory listing itself still succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn a_metadata_read_failure_is_reported_and_does_not_abort_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let blocked = dir.join("run-blocked.jsonl");
+        std::fs::write(&blocked, "{}\n").unwrap();
+        backdate(&blocked, 40);
+
+        let original_perms = std::fs::metadata(dir).unwrap().permissions();
+        let mut locked = original_perms.clone();
+        locked.set_mode(0o600); // read+write, no execute/search
+        std::fs::set_permissions(dir, locked).unwrap();
+
+        let result = prune_ledgers(dir, chrono::Duration::days(30), false);
+
+        // Restore before any assertion can early-return / panic, so
+        // the TempDir's own cleanup on drop never fails.
+        std::fs::set_permissions(dir, original_perms).unwrap();
+
+        let removed = result.unwrap();
+        assert_eq!(
+            removed.len(),
+            1,
+            "the entry was found and reported, even though its metadata \
+             could not be read: {removed:?}"
+        );
+        assert!(removed[0].error.is_some());
+        assert!(removed[0].modified_at.is_none());
+        assert!(blocked.exists());
     }
 }
