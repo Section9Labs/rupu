@@ -607,19 +607,31 @@ async fn global_netflow_unions_every_workspace_including_system_egress() {
     );
 }
 
-// ── Regression guards: no daemon-wide (non-workspace) ledger union ────────
+// ── Regression guards: only a literal `flows.jsonl` stays excluded ────────
 //
-// A prior revision of this API unioned a `cp serve`-daemon-wide ledger at
-// `$RUPU_HOME/netflow/flows.jsonl` into global scope (Fix 1, netflow Plan 3
-// review round 3) — that file no longer exists at all: per the netflow
-// per-run plan, `cp serve`'s own fleet/ASN-refresh traffic is deliberately
-// unrecorded (see `rupu-cli/src/cmd/cp.rs`'s deleted `http::init` call), and
-// `read_all_workspaces_sync` no longer reads any path outside a registered
-// workspace's own `.rupu/netflow/` directory. These two tests are now
-// regression guards for that: a stray `.jsonl` sitting directly under
-// `$RUPU_HOME/netflow/` (e.g. left over from an install that predates this
-// plan) must stay invisible at both global and project scope, not silently
-// start leaking again if a future change re-adds a shared-directory read.
+// IMPORTANT: `read_all_workspaces_sync` DOES read `<global_dir>/netflow/`
+// now (the Critical fix — every run's ledger lands there on a fresh
+// install, since `rupu init` never creates a project's own
+// `.rupu/netflow/`; see `rupu_netflow::netflow_dir`'s doc comment). A REAL
+// per-run file sitting there (`<run_id>.jsonl`) DOES surface at global
+// scope — proved by `global_netflow_includes_a_run_that_fell_back_to_the_
+// global_netflow_dir`, below. Do not "fix" these two tests back toward
+// "global scope reads nothing outside a registered workspace" — that
+// claim is false and reintroducing it is exactly the Critical this
+// plan's own review caught.
+//
+// What's actually still excluded is narrower: `read_all_run_ledgers_in_dir`
+// skips a file literally named `flows.jsonl` (the pre-plan shared-ledger
+// filename — no real run id ever produces that name), so a leftover from
+// before this migration can't be silently reinterpreted as a valid run's
+// ledger. `global_netflow_ignores_a_legacy_daemon_wide_ledger_file` below
+// proves exactly that filename exclusion, at global scope (the only scope
+// that reads `<global_dir>/netflow/` at all).
+// `project_netflow_does_not_leak_a_legacy_daemon_wide_ledger_file` proves
+// something more basic, for a different reason: project scope never reads
+// `<global_dir>/netflow/` in the first place (a separate, still-open gap —
+// see `get_project_netflow`'s doc comment), so a file sitting there,
+// `flows.jsonl` or not, was never going to appear in a project's own view.
 
 #[tokio::test]
 async fn global_netflow_ignores_a_legacy_daemon_wide_ledger_file() {
@@ -724,9 +736,65 @@ async fn global_netflow_includes_a_run_that_fell_back_to_the_global_netflow_dir(
     assert_eq!(
         flows.len(),
         1,
-        "a run whose ledger fell back to <global_dir>/netflow/ must still          surface at global scope: {body}"
+        "a run whose ledger fell back to <global_dir>/netflow/ must still surface at global scope: {body}"
     );
     assert_eq!(flows[0]["host"], "api.anthropic.com");
+}
+
+/// The default `RUPU_HOME=~/.rupu` shape: a workspace registered at
+/// `$HOME` makes `<workspace>/.rupu/netflow/` and `<global_dir>/netflow/`
+/// the SAME directory, because `global_dir` IS `<home>/.rupu`. This is
+/// reachable, not theoretical -- `rupu run` executed from `$HOME` both
+/// registers `$HOME` as a workspace (`cmd/run.rs`) and writes its ledger
+/// to `~/.rupu/netflow` (`project_root_for` walks up and matches
+/// `~/.rupu`). Without directory dedup, `read_all_workspaces_sync` would
+/// read that one shared directory twice: every flow would be listed
+/// twice (global scope has no `FlowId` dedup, unlike run scope's
+/// `merge_with_transcript`) and `dropped` would double.
+#[tokio::test]
+async fn global_netflow_does_not_double_count_when_a_workspace_ledger_dir_is_the_global_one() {
+    let home = tempfile::tempdir().unwrap();
+    let global = home.path().join(".rupu");
+    std::fs::create_dir_all(&global).unwrap();
+
+    write_global_ledger(
+        &global,
+        "run-collision",
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some("run-collision"),
+                "api.anthropic.com",
+                Origin::Provider("anthropic".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 4,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let store = rupu_workspace::WorkspaceStore {
+        root: global.join("workspaces"),
+    };
+    rupu_workspace::upsert(&store, home.path()).unwrap();
+
+    let addr = serve(new_state(&global)).await;
+    let resp = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(
+        flows.len(),
+        1,
+        "a workspace whose ledger dir IS the global one must not be read twice: {body}"
+    );
+    assert_eq!(
+        body["dropped"], 4,
+        "dropped must not double when the workspace and global ledger dirs collide: {body}"
+    );
 }
 
 #[tokio::test]
@@ -768,7 +836,7 @@ async fn run_netflow_falls_back_to_the_global_netflow_dir_when_the_workspace_has
     assert_eq!(
         flows.len(),
         1,
-        "run scope must fall back to the global netflow dir when the          workspace has none: {body}"
+        "run scope must fall back to the global netflow dir when the workspace has none: {body}"
     );
     assert_eq!(flows[0]["host"], "api.anthropic.com");
 }

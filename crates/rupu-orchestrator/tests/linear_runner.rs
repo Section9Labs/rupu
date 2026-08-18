@@ -1652,6 +1652,21 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
     let calls = factory.calls.lock().unwrap().clone();
     assert_eq!(calls.get("security-reviewer").copied(), Some(2));
     assert_eq!(calls.get("fixer").copied(), Some(1));
+
+    // The fixer's own minted run id must be recorded as an item, not
+    // just folded into the next iteration's subject string -- otherwise
+    // its ledger (and specifically its Dropped line, which has no
+    // transcript fallback) is unreachable from step_results.jsonl.
+    let fixer_item = panel
+        .items
+        .iter()
+        .find(|i| i.sub_id.starts_with("fixer:"))
+        .expect("the fixer's own dispatch must be recorded as an item");
+    assert!(
+        fixer_item.run_id.starts_with("run_"),
+        "the fixer's own minted run id must be recorded, got: {:?}",
+        fixer_item.run_id
+    );
 }
 
 const WF_PANEL_GATE_EXHAUSTED: &str = r#"

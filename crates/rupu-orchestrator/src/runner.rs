@@ -7363,7 +7363,17 @@ async fn run_panel_step(
     //      fixer's output becomes the next iteration's subject.
     let mut subject = initial_subject.clone();
     let mut iterations = 0u32;
-    let (final_pass, resolved) = loop {
+    // Every fixer dispatch across every iteration, in order. Each
+    // fixer mints its own run id (`dispatch_fixer`) independent of any
+    // panelist's — that id needs to reach the persisted `StepResult`
+    // the same way a panelist's does, or its ledger (and specifically
+    // its `Dropped` line, which has no transcript fallback) is
+    // unreachable from `step_results.jsonl`. Accumulated across ALL
+    // iterations, not just the final one, so an early iteration's
+    // fixer is not silently dropped the way an early iteration's
+    // panelist items already are (`final_pass.items` only).
+    let mut fixer_items: Vec<ItemResult> = Vec::new();
+    let (mut final_pass, resolved) = loop {
         iterations += 1;
         if let Some(sink) = opts.event_sink.as_ref() {
             sink.emit(
@@ -7423,23 +7433,60 @@ async fn run_panel_step(
         )
         .await?;
         match fixer_outcome {
-            FixerOutcome::Ok { output } => {
+            FixerOutcome::Ok {
+                output,
+                run_id,
+                transcript_path,
+            } => {
+                fixer_items.push(ItemResult {
+                    index: fixer_index,
+                    item: serde_json::Value::Null,
+                    sub_id: format!("fixer:iter{iterations}"),
+                    rendered_prompt: fixer_subject,
+                    run_id,
+                    transcript_path,
+                    output: output.clone(),
+                    success: true,
+                });
                 subject = output;
                 // Loop continues; pass is dropped — its findings are
                 // about to be addressed by the fixer.
             }
-            FixerOutcome::Failed(e) if !continue_on_error => {
+            FixerOutcome::Failed {
+                error,
+                run_id: _,
+                transcript_path: _,
+            } if !continue_on_error => {
+                // Aborting the whole step here (no `StepResult` is ever
+                // built or persisted on this path — same as any other
+                // hard failure), so there is nothing to record the
+                // fixer's id onto; recording it would be dead code.
                 return Err(RunWorkflowError::Agent {
                     step: format!("{}.fixer({})", step.id, gate.fix_with),
-                    source: e,
+                    source: error,
                 });
             }
-            FixerOutcome::Failed(e) => {
-                warn!(step = %step.id, error = %e, "fixer agent failed; tolerating via continue_on_error");
+            FixerOutcome::Failed {
+                error,
+                run_id,
+                transcript_path,
+            } => {
+                fixer_items.push(ItemResult {
+                    index: fixer_index,
+                    item: serde_json::Value::Null,
+                    sub_id: format!("fixer:iter{iterations}"),
+                    rendered_prompt: fixer_subject,
+                    run_id,
+                    transcript_path,
+                    output: error.to_string(),
+                    success: false,
+                });
+                warn!(step = %step.id, error = %error, "fixer agent failed; tolerating via continue_on_error");
                 break (pass, false);
             }
         }
     };
+    final_pass.items.extend(fixer_items);
 
     Ok(final_pass.into_step_result(step, &initial_subject, iterations, resolved))
 }
@@ -7499,10 +7546,22 @@ impl PanelPass {
     }
 }
 
-/// Outcome of one fixer-agent dispatch in the gate loop.
+/// Outcome of one fixer-agent dispatch in the gate loop. Carries the
+/// fixer's own minted `run_id`/`transcript_path` (see `dispatch_fixer`)
+/// on BOTH arms — even a failed fixer may have produced ledger traffic
+/// (and possibly a `Dropped` line) before it failed, so the caller needs
+/// the id in either case to record it as an `ItemResult`.
 enum FixerOutcome {
-    Ok { output: String },
-    Failed(RunError),
+    Ok {
+        output: String,
+        run_id: String,
+        transcript_path: PathBuf,
+    },
+    Failed {
+        error: RunError,
+        run_id: String,
+        transcript_path: PathBuf,
+    },
 }
 
 /// Render a structured prompt for the fixer agent given the current
@@ -7592,9 +7651,17 @@ async fn dispatch_fixer(
     match outcome {
         Ok(_) => {
             let output = read_final_assistant_text(&transcript_path, true, &run_id, &step.id);
-            Ok(FixerOutcome::Ok { output })
+            Ok(FixerOutcome::Ok {
+                output,
+                run_id,
+                transcript_path,
+            })
         }
-        Err(e) => Ok(FixerOutcome::Failed(e)),
+        Err(e) => Ok(FixerOutcome::Failed {
+            error: e,
+            run_id,
+            transcript_path,
+        }),
     }
 }
 

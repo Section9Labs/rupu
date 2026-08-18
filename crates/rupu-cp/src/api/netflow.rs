@@ -403,6 +403,13 @@ fn resolve_ledger_path(workspace: &StdPath, global_dir: &StdPath, id: &str) -> P
 /// merge below can still recover under a different id) — skipping a
 /// step's own ledger file here would silently under-report loss for any
 /// run with more than one dispatched step, which is the common case.
+///
+/// `StepResultRecord.run_id`/`ItemResultRecord.run_id` are `String::new()`
+/// for `for_each`/`parallel`/panel STEP records themselves (only their
+/// per-unit `items` carry a real id) and for a skipped item — filtered
+/// out before dedup so `resolve_ledger_path` is never asked to stat
+/// `<dir>/.jsonl` (harmless today — that file never exists — but an empty
+/// id in this list is never a valid ledger name and shouldn't linger).
 fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
     let mut ids = vec![run_id.to_string()];
     for record in store.read_step_results(run_id).unwrap_or_default() {
@@ -411,6 +418,7 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
             ids.push(item.run_id);
         }
     }
+    ids.retain(|id| !id.is_empty());
     ids.sort();
     ids.dedup();
     ids
@@ -538,7 +546,18 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) 
 /// then permanently unreachable" defect a prior arc already had to fix
 /// once for the (now-removed) CP-daemon-wide ledger.
 ///
-/// The summed dropped-count follows the same union. Mirrors
+/// Directories are DEDUPED (canonicalized, collected into a `HashSet`)
+/// before any of them is read: a workspace registered at `$HOME` and the
+/// default `RUPU_HOME=~/.rupu` name the SAME `~/.rupu/netflow/`
+/// directory, and `rupu run` executed from `$HOME` produces exactly that
+/// (`cmd/run.rs` upserts `pwd` as a workspace; `project_root_for` walks
+/// up and matches `~/.rupu`). Without the dedup, that directory would be
+/// read twice, every flow in it would be double-counted with no `FlowId`
+/// dedup at this scope (unlike run scope's `merge_with_transcript`), and
+/// `host_rollup`'s byte/count totals plus `dropped` would silently double
+/// — a doubled egress total is worse than a missing one.
+///
+/// The summed dropped-count follows the same deduped union. Mirrors
 /// `coverage.rs`'s `list_coverage`: a workspace whose path is
 /// gone/unreadable is skipped (its ledger read degrades to empty via
 /// [`read_all_run_ledgers_in_dir`]'s own missing-directory tolerance),
@@ -555,20 +574,37 @@ fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
     .list()
     .unwrap_or_default();
 
+    let mut dirs: std::collections::HashSet<PathBuf> = workspaces
+        .iter()
+        .map(|w| canonicalize_or_self(&std::path::Path::new(&w.path).join(".rupu/netflow")))
+        .collect();
+    dirs.insert(canonicalize_or_self(&global_dir.join("netflow")));
+
     let mut flows = Vec::new();
     let mut dropped = 0u64;
-    for w in &workspaces {
-        let wp = std::path::Path::new(&w.path);
-        let (f, d) = read_all_run_ledgers_in_dir(&wp.join(".rupu/netflow"));
+    for dir in &dirs {
+        let (f, d) = read_all_run_ledgers_in_dir(dir);
         flows.extend(f);
         dropped += d;
     }
 
-    let (gf, gd) = read_all_run_ledgers_in_dir(&global_dir.join("netflow"));
-    flows.extend(gf);
-    dropped += gd;
-
     (flows, dropped)
+}
+
+/// Canonicalize `path` for directory-identity comparisons (resolving
+/// symlinks and `..`/`.` components so two different-looking paths that
+/// name the SAME directory — e.g. a workspace registered at `$HOME` and
+/// the global netflow root both resolving under the default
+/// `RUPU_HOME=~/.rupu` — dedup correctly in a `HashSet`). Falls back to
+/// the path as given when it doesn't exist yet: `canonicalize` requires
+/// the path to exist, but a directory nobody has ever written a ledger to
+/// can't collide with anything real either, so using it verbatim as the
+/// dedup key is safe (worst case, two distinct nonexistent paths that
+/// happen to be the same directory both get read — each yields `([], 0)`
+/// per [`read_all_run_ledgers_in_dir`]'s own tolerance, so nothing is
+/// double-counted, just a wasted `read_dir` call).
+fn canonicalize_or_self(path: &StdPath) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `GET /api/projects/:id/netflow` — every flow in a workspace's own
