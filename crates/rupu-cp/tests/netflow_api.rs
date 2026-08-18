@@ -493,15 +493,26 @@ async fn run_netflow_missing_ledger_is_empty_not_an_error() {
     assert_eq!(body["dropped_total"], 0);
 }
 
-// ── Project scope: must include system-origin egress with no run_id ───────
+// ── Project scope: must include a flow whose OWN `run_id` field is
+//    `None`, from the same ledger directory as a normal run-scoped one ──
 //
-// The updater, the ASN refresh and CP's own fleet traffic are all
-// `run_id: None` (`Origin::System`/`Update`/`Cp`). Project scope is where
-// that egress becomes visible — a filter that dropped it here would hide
-// exactly the traffic this scope exists to show.
+// `Origin::System`/`Update`/`Cp` traffic is NOT this case: every
+// production construction site for those three wires its client to
+// `Arc::new(NullSink)`, so none of it ever reaches a ledger at any scope
+// (see `ScopeDisclosure.tsx`'s header comment for the full accounting) —
+// asserting otherwise here would test a state production cannot produce,
+// the exact defect a whole-branch review caught this file making (fix
+// round 2). The REAL case: `Origin::Scm` traffic from
+// `rupu_scm::Registry::discover` DOES reach a run's own per-run ledger
+// file when a run is active, but — per this module doc and
+// `rupu_netflow::ctx::FlowCtx`'s own doc comment — no production
+// `FlowCtx` ever populates the `run_id` field itself; attribution is by
+// which FILE a flow landed in, not by this field. Project scope unions
+// every file in the directory regardless of that field, so this is the
+// fixture that actually matches what a real ledger directory can contain.
 
 #[tokio::test]
-async fn project_netflow_includes_run_scoped_and_system_origin_flows() {
+async fn project_netflow_includes_a_run_id_none_flow_from_the_same_ledger_directory() {
     let global = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
@@ -511,7 +522,12 @@ async fn project_netflow_includes_run_scoped_and_system_origin_flows() {
         "api.anthropic.com",
         Origin::Provider("anthropic".into()),
     );
-    let system_flow = e2e_flow(FlowId::new(), None, "iptoasn.com", Origin::System);
+    let scm_flow = e2e_flow(
+        FlowId::new(),
+        None,
+        "api.gitlab.example",
+        Origin::Scm("gitlab".into()),
+    );
     // Project scope unions EVERY `.jsonl` file under the workspace's
     // netflow directory, so which run id names this particular file is
     // incidental to what's under test here (unlike the run-scope test
@@ -521,7 +537,7 @@ async fn project_netflow_includes_run_scoped_and_system_origin_flows() {
         "run-a",
         &[
             LedgerLine::Flow(Box::new(run_flow.clone())),
-            LedgerLine::Flow(Box::new(system_flow.clone())),
+            LedgerLine::Flow(Box::new(scm_flow.clone())),
         ],
     );
 
@@ -540,14 +556,14 @@ async fn project_netflow_includes_run_scoped_and_system_origin_flows() {
     assert_eq!(
         flows.len(),
         2,
-        "run-scoped and system-origin flows both present: {body}"
+        "both flows present regardless of the ctx.run_id field: {body}"
     );
 
     let hosts: std::collections::HashSet<&str> =
         flows.iter().map(|f| f["host"].as_str().unwrap()).collect();
     assert!(
-        hosts.contains("iptoasn.com"),
-        "system-origin egress must survive project scope: {body}"
+        hosts.contains("api.gitlab.example"),
+        "a run_id: None flow from the SAME ledger directory must survive project scope: {body}"
     );
 }
 
@@ -561,10 +577,17 @@ async fn project_netflow_unknown_project_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
-// ── Global scope: union across every workspace, including system egress ───
+// ── Global scope: unions across every workspace, including a flow whose
+//    OWN `run_id` field is `None` in a SEPARATE workspace's ledger ───────
+//
+// Same correction as the project-scope fixture above (fix round 2): the
+// second flow here used to be `Origin::System`, which no production site
+// ever writes to any ledger (every one of them is wired to `NullSink`).
+// `Origin::Scm` from `Registry::discover` is the fixture that matches a
+// real ledger directory's contents.
 
 #[tokio::test]
-async fn global_netflow_unions_every_workspace_including_system_egress() {
+async fn global_netflow_unions_every_workspace_including_a_run_id_none_flow() {
     let global = tempfile::tempdir().unwrap();
     let project_a = tempfile::tempdir().unwrap();
     let project_b = tempfile::tempdir().unwrap();
@@ -581,12 +604,12 @@ async fn global_netflow_unions_every_workspace_including_system_egress() {
     );
     write_ledger(
         project_b.path(),
-        "system",
+        "run-b",
         &[LedgerLine::Flow(Box::new(e2e_flow(
             FlowId::new(),
             None,
-            "iptoasn.com",
-            Origin::System,
+            "api.gitlab.example",
+            Origin::Scm("gitlab".into()),
         )))],
     );
 
@@ -608,8 +631,8 @@ async fn global_netflow_unions_every_workspace_including_system_egress() {
         flows.iter().map(|f| f["host"].as_str().unwrap()).collect();
     assert!(hosts.contains("api.anthropic.com"));
     assert!(
-        hosts.contains("iptoasn.com"),
-        "system-origin egress must survive global scope: {body}"
+        hosts.contains("api.gitlab.example"),
+        "a run_id: None flow from a DIFFERENT workspace's ledger must survive global scope: {body}"
     );
 }
 
