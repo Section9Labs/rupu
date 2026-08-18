@@ -1,16 +1,21 @@
 // Netflow — the global egress page: the UNION of every flow rupu recorded,
-// across every run, plus `system`-origin traffic (the rare passive
-// update-notice check, `Origin::Update`) that carries no run_id and
-// therefore never surfaces on a per-run Network tab or a workflow page
-// (flows belong to a run, never to a workflow *definition* — nothing
-// netflow-shaped is mounted there). Neither CP's own fleet traffic nor
-// its ASN-table refresh are among that system-origin traffic — both
+// across every run. `Origin::System` flows (auth/oauth token exchange —
+// see `ScopeDisclosure.tsx`) carry no run_id and therefore never surface
+// on a per-run Network tab or a workflow page (flows belong to a run,
+// never to a workflow *definition* — nothing netflow-shaped is mounted
+// there), but they DO land in whichever ledger file their sink was built
+// for, same as any other flow.
+//
+// The update checker is NOT among that traffic, despite also using
+// `Origin::Update`: `rupu-update`'s client is wired to `Arc::new(NullSink)`
+// (netflow-per-run plan) and produces no flow record at all, at any scope.
+// Neither is CP's own fleet traffic nor its ASN-table refresh — both
 // `Origin::Cp` (`HttpHostConnector`) and `Origin::System` ASN downloads
-// (`cmd/cp.rs`'s sweep, this crate's own `maybe_refresh_asn`) are wired to
-// a `NullSink` and recorded nowhere, at any scope (netflow-per-run plan,
-// Task 8). This is also the ONE scope that unions every per-run ledger
-// file (`<run_id>.jsonl`) under `$RUPU_HOME/netflow/` alongside every
-// registered workspace's own `.rupu/netflow/` — see
+// (`cmd/cp.rs`'s sweep, this crate's own `maybe_refresh_asn`) are ALSO wired
+// to a `NullSink` and recorded nowhere, at any scope. This is also the ONE
+// scope that unions every per-run ledger file (`<run_id>.jsonl`) under
+// `$RUPU_HOME/netflow/` alongside every registered workspace's own
+// `.rupu/netflow/` — see
 // `rupu_cp::api::netflow::read_all_workspaces_sync`'s doc comment.
 //
 // This is the one place a viewer forms their mental model of what this
@@ -86,7 +91,7 @@ export default function Netflow() {
         <div className="space-y-6">
           {graph && <NetflowGraph graph={graph} scope="global" />}
           <NetflowSummary hosts={data.hosts} />
-          <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} />
+          <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} scope="global" />
         </div>
       )}
     </div>

@@ -293,10 +293,17 @@ impl KeychainResolver {
         // Provider-agnostic refresh: standard OAuth refresh-token grant.
         let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
             .unwrap_or_else(|_| oauth.token_url.to_string());
-        // Pre-existing compile break from Task 4 (netflow-per-run plan) removing
-        // the process-global sink; auth/OAuth traffic is deliberately out of
-        // netflow's scope, so `NullSink` here is correct, not a stopgap. Task 7
-        // owns the final wiring of this call site.
+        // Deliberately `NullSink`, not a stopgap: matt's scope call for this
+        // plan was explicit — "I do not care about update or login" — and a
+        // token refresh is login traffic even when it fires mid-run (a
+        // credential nearing expiry gets refreshed inline, on whatever
+        // thread happens to need it next, which can easily be mid-run).
+        // The alternative — threading the calling run's sink all the way
+        // into `CredentialResolver::refresh` — was considered and rejected
+        // on that scope call, not deferred; there is no further wiring
+        // planned for this call site. It is named in the disclosure's
+        // exclusion list (`ScopeDisclosure.tsx`) so the absence is honest,
+        // not silent.
         let client = rupu_netflow::http::client_with(
             rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
             reqwest::Client::builder(),

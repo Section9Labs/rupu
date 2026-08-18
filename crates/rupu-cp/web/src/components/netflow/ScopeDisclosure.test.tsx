@@ -77,15 +77,15 @@ describe('netflowSystemSourceHint', () => {
     expect(netflowSystemSourceHint(scope)).not.toMatch(/ASN refresh/i);
   });
 
-  it.each(SCOPES)('still names `system` as a source at %s scope', (scope) => {
-    // The scope-gated piece is the PARENTHETICAL EXAMPLE, not the "or
-    // system for unattributed egress" clause itself — `Origin::System`
-    // also covers auth/oauth token exchange, which genuinely can reach
-    // project scope (lands directly in that workspace's own ledger file)
-    // and run scope (the run's own ledger file, or its transcript for a
-    // run whose ledger could not be opened). Dropping the whole clause at
-    // those scopes would overcorrect into a different inaccuracy.
-    expect(netflowSystemSourceHint(scope)).toMatch(/system for unattributed egress/i);
+  it.each(SCOPES)('no longer claims a `system` fallback source at %s scope', (scope) => {
+    // Finding 4, whole-branch review: `graph_view` used to derive the
+    // source id from `f.ctx.run_id`, which no production `FlowCtx` ever
+    // populates, so every graph collapsed to one node literally called
+    // `system`. The read side now passes the owning run id in explicitly
+    // (the ledger file's own name), so every source is a real run id and
+    // there is no more "unattributed" fallback case to name here.
+    expect(netflowSystemSourceHint(scope)).not.toMatch(/system for unattributed egress/i);
+    expect(netflowSystemSourceHint(scope)).toMatch(/runs/i);
   });
 });
 

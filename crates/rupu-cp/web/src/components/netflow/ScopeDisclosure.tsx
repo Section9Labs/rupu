@@ -49,6 +49,18 @@
 // ledger at startup" premise the CP-fleet-traffic carve-out relied on.
 // Same conclusion: nothing captures it at any scope, so nothing here may
 // claim it either.
+//
+// It ALSO excludes auth/oauth token exchange entirely (Finding 3,
+// whole-branch review) — including a token REFRESH firing mid-run, which
+// is the one case someone might expect to be in scope since it happens
+// while a run is active. It isn't: `rupu-auth`'s resolver
+// (`resolver.rs`), device-code flow (`oauth/device.rs`) and callback
+// server (`oauth/callback.rs`) all build their client with
+// `Arc::new(NullSink)`. This is a deliberate ruling, not a gap pending
+// wiring — matt's scope call for this plan was explicit: "I do not care
+// about update or login", and a token exchange is login even when it
+// fires mid-run. See `resolver.rs`'s own comment on `refresh_inner` for
+// the same ruling stated at the call site.
 
 export type NetflowScope = 'run' | 'project' | 'global';
 
@@ -95,34 +107,62 @@ export function NetflowScopeDisclosure({
 }
 
 /** NetflowGraph's empty-state hint — folded in here (Fix 2, round 4) so its
- *  "what does the `system` source cover" example list can't drift from the
- *  same scope rules as the rest of this file. Previously hard-coded in
- *  NetflowGraph.tsx itself, independently of `NETFLOW_COVERAGE_LIST`, and
- *  claimed both "updater" and "CP fleet traffic" unconditionally — the same
- *  two defects as the main disclosure, just in a fourth, un-centralized
- *  copy.
+ *  source-labelling claim can't drift from the same scope rules as the
+ *  rest of this file.
  *
- *  Both parenthetical examples this used to offer at `scope === 'global'`
- *  — "CP fleet traffic" and "ASN refresh" — are gone now (netflow-per-run
- *  plan, Task 8; see this file's header comment for both). Nothing in
- *  either category reaches any ledger anymore, at any scope, so there is
- *  currently no example left to offer here at all.
+ *  UPDATED (Finding 4, whole-branch review): the graph's source id is no
+ *  longer ever the literal string `system`. `rupu_netflow::ledger::
+ *  graph_view` used to derive the source from `f.ctx.run_id`, which no
+ *  production `FlowCtx` has ever populated — every graph, at every scope,
+ *  was a hub-and-spoke picture of one node called `system`. The read side
+ *  now passes the OWNING RUN ID in explicitly (`rupu-cp/src/api/
+ *  netflow.rs`'s `resolve_ledger_paths`/`read_all_run_ledgers_in_dir`
+ *  already know it — it's the ledger FILE's own name), so every source
+ *  node is a real run id: one per run at run scope, one per contributing
+ *  run at project/global scope. There is no longer an "unattributed"
+ *  fallback case in the graph endpoint's own code, so this hint no
+ *  longer promises one.
  *
- *  The `system` SOURCE ITSELF stays valid at every scope, though — that's
- *  a decision, not an oversight: `Origin::System` also covers auth/oauth
- *  token exchange (`rupu-auth`'s resolver / oauth/device / oauth/callback).
- *  With one ledger file per run (and project scope reading every ledger
- *  file under a workspace's netflow directory), that traffic reaches
- *  project and run scope because it lands directly in the relevant ledger
- *  file — attribution is by FILE, not by `ctx.run_id` — or, for a run
- *  whose own ledger file could not be opened, via that run's transcript,
- *  which the same per-run sink always writes to regardless of the
- *  ledger's fate (`merge_with_transcript` in
- *  `rupu-cp/src/api/netflow.rs`; see that module's doc). Only the
- *  PARENTHETICAL EXAMPLE(S) were ever scope-gated here, not the "or
- *  system for unattributed egress" clause that names the source. */
+ *  `Origin::System` (auth/oauth token exchange — `rupu-auth`'s resolver /
+ *  oauth/device / oauth/callback) is unrelated to this and worth noting
+ *  for a different reason: ALL THREE of those sites are wired to
+ *  `Arc::new(NullSink)` (matt's explicit scope call — login/update
+ *  traffic is out of netflow's scope even when a token refresh fires
+ *  mid-run; see `rupu-auth/src/resolver.rs`'s doc comment), so that
+ *  traffic reaches no ledger at any scope either. It was never going to
+ *  produce a `system`-labelled node regardless of the `graph_view` bug
+ *  above. */
+/** NetflowTable's empty-state hint (Blocker 1, whole-branch review) --
+ *  authored here for the same reason `netflowSystemSourceHint` is: a
+ *  scope-specific caveat can be added without `NetflowTable` itself
+ *  knowing anything about the underlying ledger-directory layout.
+ *
+ *  Project scope gets a real caveat, not just the generic coverage
+ *  sentence: `get_project_netflow` (`rupu-cp`) reads only
+ *  `<workspace>/.rupu/netflow/`, and nothing creates that directory on
+ *  `rupu init` -- `templates.rs`'s `GITIGNORE_ENTRIES` lists the
+ *  `.gitignore` entry for it, but `cmd/init.rs` never creates the
+ *  directory itself. `paths::netflow_dir`'s existence gate is deliberate
+ *  (it's what keeps ledgers out of a repo that never opted in) but its
+ *  consequence is that on every default install, EVERY run's ledger
+ *  lands at the global fallback root regardless of which project it
+ *  belongs to -- so a project's own scope is empty even for a project
+ *  with real, captured runs. An empty project scope must say that
+ *  plainly: the flows are one scope away, not missing. (The
+ *  data-reachability half of this -- `rupu-cp` cross-referencing the
+ *  global directory for a project's own runs -- is a tracked follow-up,
+ *  not fixed here; this is the wording-only half.) */
+export function netflowEmptyStateHint(scope: NetflowScope): string {
+  const generic = `Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}. It does not cover traffic from the agent's bash subprocess.`;
+  if (scope !== 'project') return generic;
+  return (
+    `This project has no .rupu/netflow/ directory of its own, so its runs' flows are ` +
+    `recorded at global scope instead of here — check the global Network view. ${generic}`
+  );
+}
+
 export function netflowSystemSourceHint(_scope: NetflowScope): string {
-  return `Sources — runs, or system for unattributed egress — connect to the host:port endpoints they reached.`;
+  return `Sources — runs — connect to the host:port endpoints they reached.`;
 }
 
 export default NetflowScopeDisclosure;

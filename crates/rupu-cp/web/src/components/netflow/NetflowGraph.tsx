@@ -1,5 +1,7 @@
-// NetflowGraph — bipartite topology: sources (runs, or `system` for
-// unattributed egress) on the left, endpoints (`host:port`) on the right.
+// NetflowGraph — bipartite topology: sources (runs — one node per run id
+// the read side attributed a flow to; see ScopeDisclosure.tsx's Finding-4
+// note, there is no `system` fallback source any more) on the left,
+// endpoints (`host:port`) on the right.
 //
 // This is the honest alternative to a geographic map: nearly every endpoint
 // resolves to a CDN edge, so a country pin would show a PoP, not who was

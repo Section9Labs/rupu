@@ -25,7 +25,10 @@ import { formatBytes, type FlowView } from '../../lib/netflow';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { EmptyState } from '../ui/EmptyState';
 import { FidelityBadge } from './FidelityBadge';
-import { NETFLOW_COVERAGE_LIST } from './ScopeDisclosure';
+import {
+  netflowEmptyStateHint,
+  type NetflowScope,
+} from './ScopeDisclosure';
 
 export interface NetflowTableProps {
   flows: FlowView[];
@@ -35,6 +38,11 @@ export interface NetflowTableProps {
   /** `false` means ASN enrichment was unavailable, not that flows lack an
    *  ASN. Drives an explanatory note rather than a blank Network column. */
   asnLoaded: boolean;
+  /** Selects the empty-state hint (`netflowEmptyStateHint`) — project
+   *  scope gets a caveat the other two don't need. Defaults to `'run'`
+   *  (the generic hint) so existing callers that don't pass this keep
+   *  their prior behaviour exactly. */
+  scope?: NetflowScope;
 }
 
 function originLabel(f: FlowView): string {
@@ -65,14 +73,14 @@ function DroppedBanner({ dropped }: { dropped: number }) {
   );
 }
 
-export function NetflowTable({ flows, dropped, asnLoaded }: NetflowTableProps) {
+export function NetflowTable({ flows, dropped, asnLoaded, scope = 'run' }: NetflowTableProps) {
   if (flows.length === 0) {
     return (
       <div className="space-y-3">
         <DroppedBanner dropped={dropped} />
         <EmptyState
           title="No network flows recorded for this scope"
-          hint={`Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}. It does not cover traffic from the agent's bash subprocess.`}
+          hint={netflowEmptyStateHint(scope)}
         />
       </div>
     );

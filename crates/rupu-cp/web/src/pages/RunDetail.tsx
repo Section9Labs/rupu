@@ -1296,6 +1296,7 @@ export default function RunDetail() {
                   flows={netflow.flows}
                   dropped={netflow.dropped}
                   asnLoaded={netflow.asn_loaded}
+                  scope="run"
                 />
               </>
             )}
