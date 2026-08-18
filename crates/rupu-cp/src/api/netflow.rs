@@ -36,10 +36,17 @@
 //!
 //! ## Blocking I/O never runs on the async task
 //!
-//! `rupu-netflow` has no ledger rotation, retention or compaction — a
-//! ledger grows unbounded for the life of a `cp serve` daemon. Every
-//! ledger/transcript/ASN-table read in this module is a synchronous
-//! `std::fs` call, so running it directly on an async handler would block
+//! A ledger is per-run (`<netflow_dir>/<run_id>.jsonl`), so its life is
+//! bounded by its own run, not by the `cp serve` daemon's — but nothing
+//! deletes it automatically either: `rupu netflow prune --older-than
+//! <duration>` (`rupu-cli`'s `cmd::netflow`) is the retention tool, and an
+//! installation that never runs it keeps every ledger forever (see
+//! `rupu_netflow`'s crate doc, `# Retention`, for the full accounting —
+//! this paragraph used to claim there was no retention story at all,
+//! which stopped being true once that command landed). Every
+//! ledger/transcript/ASN-table read in THIS module is still a synchronous
+//! `std::fs` call regardless of how many or how large the ledgers it
+//! reads are, so running it directly on an async handler would block
 //! whatever tokio worker thread picked up the request — stalling *every
 //! other* concurrent CP request sharing that thread (approvals, the gate
 //! sweep, unrelated API calls), not just the netflow caller. [`run_blocking`]
@@ -982,13 +989,15 @@ async fn get_netflow_graph(
 /// ledger+transcript merge locally and we just relay its response.
 ///
 /// `range` is forwarded as a `?from=&to=` query string appended to the
-/// proxied path so the remote CP applies the SAME window before replying,
-/// rather than this side re-filtering an unbounded response (which would
-/// also misreport `dropped_total` as this-window-scoped when it isn't —
-/// see that field's doc). A remote CP running an OLDER build that doesn't
-/// recognize `from`/`to` will simply ignore them and return everything
-/// unbounded; that is a version-skew gap in the proxy path, not something
-/// this endpoint can detect or correct for.
+/// proxied path so a CURRENT remote applies the SAME window before
+/// replying — but [`enforce_range_on_proxied_response`] ALSO re-filters
+/// `flows` (and recomputes `hosts`/`window` from the filtered set) after
+/// deserializing, rather than trusting the remote to have applied it: an
+/// OLDER remote that doesn't recognize `from`/`to` would otherwise
+/// silently return everything unbounded while looking filtered.
+/// `dropped_total` is the one field intentionally left as the remote
+/// reported it — whole-file by definition, so filtering here has nothing
+/// to do with it either way.
 async fn run_netflow_from_host(
     s: &AppState,
     host_id: &str,
@@ -1017,18 +1026,49 @@ async fn run_netflow_from_host(
              the remote CP is likely older than this one"
         ))
     })?;
-    // Re-filter the deserialized flows locally even though `range` was
-    // already forwarded in `path` above: a no-op against a CURRENT remote
-    // (which already applied the identical window server-side, so nothing
-    // here changes), and CORRECTIVE against an older remote that
-    // recognizes the route but silently ignores unfamiliar `from`/`to`
-    // query params and returns everything unbounded — closing that class
-    // of version skew permanently rather than relying solely on the
-    // deserialize failure above to catch it. `dropped_total` is left
-    // untouched: it is whole-file by definition (see its doc comment) and
-    // is not affected by which `flows` survive this filter.
-    resp.flows.retain(|v| range.contains(v.flow.ts));
+    enforce_range_on_proxied_response(&mut resp, range);
     Ok(resp)
+}
+
+/// Correct a host-proxied [`NetflowResponse`] to match `range` regardless
+/// of what the remote actually enforced — a no-op against a CURRENT remote
+/// (which already applied the identical window server-side before
+/// replying, so every field here is already consistent), and CORRECTIVE
+/// against an OLDER remote that recognizes the route but silently ignores
+/// unfamiliar `from`/`to` query params and returns everything unbounded.
+/// Pulled out of [`run_netflow_from_host`] as its own function so the
+/// correction (retain, then recompute `hosts` and stamp `window` from the
+/// SAME retained set) is unit-testable without a real HTTP round trip
+/// through a `HostConnector`.
+///
+/// `dropped_total` is deliberately left as the remote reported it: it is
+/// whole-file by definition (see that field's doc comment) and is not
+/// affected by which `flows` survive this filter either way.
+fn enforce_range_on_proxied_response(
+    resp: &mut NetflowResponse,
+    range: &rupu_netflow::ledger::TimeRange,
+) {
+    resp.flows.retain(|v| range.contains(v.flow.ts));
+    // `hosts` was computed by the REMOTE from its own (possibly unbounded,
+    // on an older build) flow set, so leaving it as-is would show call
+    // counts/byte totals for flows the retained `flows` list no longer
+    // contains — the same "two adjacent widgets disagree" defect already
+    // fixed once for the graph endpoint. Recompute it from the flows THIS
+    // side actually kept.
+    resp.hosts = rupu_netflow::ledger::host_rollup(
+        &resp
+            .flows
+            .iter()
+            .map(|v| v.flow.clone())
+            .collect::<Vec<_>>(),
+    );
+    // Likewise `window`: an older remote either omits the field (defaults
+    // to unbounded via `#[serde(default)]`) or echoes whatever range IT
+    // parsed, neither of which describes what this side actually
+    // enforced above. Stamp it from the range THIS function applied, so
+    // `NetflowWindowReadout` can never read "Showing all recorded flows"
+    // over a response that was, in fact, just filtered.
+    resp.window = WindowEcho::from(range);
 }
 
 /// Render `range` as a `?from=&to=` query-string suffix (empty string when
@@ -1217,6 +1257,63 @@ mod tests {
 
         assert!(resp.window.from.is_none());
         assert!(resp.window.to.is_none());
+    }
+
+    /// Important 1 (Fix round 2 review): `enforce_range_on_proxied_response`
+    /// must correct ALL THREE fields the retain touches transitively, not
+    /// just `flows` — this is the exact "corrects flows but not window or
+    /// hosts" defect the review caught. Simulates an OLDER remote's
+    /// response: `hosts` rolled up from its own unfiltered flow set, and
+    /// `window` left at its `#[serde(default)]` unbounded value (as if the
+    /// remote never echoed the field at all).
+    #[test]
+    fn enforce_range_on_proxied_response_recomputes_hosts_and_window() {
+        let mut in_window = flow(FlowId::new(), Some("r"), "in.example");
+        in_window.ts = chrono::DateTime::from_timestamp(150, 0).unwrap();
+        let mut out_of_window = flow(FlowId::new(), Some("r"), "out.example");
+        out_of_window.ts = chrono::DateTime::from_timestamp(500, 0).unwrap();
+
+        let mut resp = build_response(
+            vec![in_window, out_of_window],
+            3,
+            None,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+        );
+        assert_eq!(
+            resp.hosts.len(),
+            2,
+            "sanity: both hosts present pre-correction"
+        );
+        assert!(
+            resp.window.from.is_none(),
+            "sanity: unbounded pre-correction"
+        );
+
+        let range = rupu_netflow::ledger::TimeRange {
+            from: Some(chrono::DateTime::from_timestamp(100, 0).unwrap()),
+            to: Some(chrono::DateTime::from_timestamp(200, 0).unwrap()),
+        };
+        enforce_range_on_proxied_response(&mut resp, &range);
+
+        assert_eq!(resp.flows.len(), 1);
+        assert_eq!(resp.flows[0].flow.host, "in.example");
+        assert_eq!(
+            resp.hosts.len(),
+            1,
+            "hosts must be recomputed from the RETAINED flows only, not left \
+             as the remote's own unfiltered rollup: {:?}",
+            resp.hosts
+        );
+        assert_eq!(resp.hosts[0].host, "in.example");
+        assert_eq!(
+            resp.window.from, range.from,
+            "window must be stamped from the range THIS side enforced"
+        );
+        assert_eq!(resp.window.to, range.to);
+        assert_eq!(
+            resp.dropped_total, 3,
+            "dropped_total is untouched by this correction — whole-file by definition"
+        );
     }
 
     /// The other half of `build_response`'s contract, previously untested:

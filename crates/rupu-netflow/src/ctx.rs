@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 /// `rupu-scm`'s connectors, which tag their own calls `Scm`), and
 /// `rupu-webhook` is an inbound server. A variant nothing can construct
 /// is a promise of coverage that does not exist.
+///
+/// "Can occur" is not "is captured", though: `Update`, `Cp` and `System`
+/// CAN be constructed (every one of their production call sites does), but
+/// every one of those sites wires its client to `Arc::new(NullSink)`, so
+/// none of that traffic ever reaches a ledger, at any scope — see this
+/// crate's own top-of-file doc comment ("Login/OAuth, the update checker,
+/// and CP's own fleet traffic are deliberately captured nowhere") and
+/// `rupu-cp`'s `ScopeDisclosure.tsx` for the full accounting of where each
+/// variant's flows actually land.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "name", rename_all = "snake_case")]
 pub enum Origin {

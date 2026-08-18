@@ -89,8 +89,7 @@ export default function Netflow() {
       <header className="mb-6">
         <h1 className="text-2xl font-semibold text-ink">Network</h1>
         <p className="mt-1 text-sm text-ink-dim">
-          Every flow recorded across all runs in the selected time range, plus unattributed system
-          egress that belongs to no single run.
+          Every flow recorded across all runs in the selected time range.
         </p>
         <NetflowScopeDisclosure scope="global" className="mt-2" />
       </header>

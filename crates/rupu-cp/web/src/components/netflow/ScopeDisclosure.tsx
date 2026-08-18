@@ -17,14 +17,15 @@
 // built to prevent. Add an entry back here only if a future subsystem
 // change actually gives one of them outbound HTTP to make.
 //
-// It also excludes "the updater" entirely (Fix 2, round 4 — Blocker 2):
-// there are exactly two production `rupu_netflow::http::init` call sites in
-// the workspace, `cmd/run.rs` and `cmd/cp.rs`. `cmd/update.rs` (the `rupu
-// update` release download) calls neither, so that traffic is wired to a
-// `NullSink` and recorded nowhere at any scope. The only `Origin::Update`
-// flow that CAN land is the passive update-notice check spawned in
-// `lib.rs`, which races `cmd/run.rs`'s `init` call further down dispatch —
-// not a claim worth making. Installing a sink in `cmd/update.rs` is new
+// It also excludes "the updater" entirely: `rupu_netflow::http::init` (the
+// process-global sink installer this paragraph used to cite) was deleted
+// in the netflow-per-run rewrite — see `rupu-providers/tests/netflow_
+// capture.rs`'s header comment. Every remaining `rupu update` / update-
+// notice call site (`GithubReleaseSource::new`, `rupu-update/src/
+// github.rs`) constructs its HTTP client with `Arc::new(NullSink)`
+// directly, including the passive update-notice check spawned in
+// `lib.rs` — there is no `Origin::Update` flow that reaches any ledger,
+// at any scope, full stop. Installing a real sink there is new
 // capability work, tracked as a follow-up, not a wording fix.
 //
 // It ALSO excludes "CP fleet traffic" entirely now (netflow-per-run plan,
