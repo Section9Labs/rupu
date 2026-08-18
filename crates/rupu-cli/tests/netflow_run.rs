@@ -440,3 +440,156 @@ async fn prune_reports_a_removal_failure_and_exits_non_zero() {
         "the failed removal must leave the file in place"
     );
 }
+
+/// Important 2 (netflow-per-run Plan 3 Task 2 review round 2): every
+/// `prune_ledgers` unit test drives that function directly against ONE
+/// temp directory, and the only prior integration test seeds just the
+/// global root — nothing pinned `prune()`'s OWN candidate resolution
+/// (`crates/rupu-cli/src/cmd/netflow.rs`'s `prune` function), so
+/// deleting the entire project-local branch, its scope label, or its
+/// `is_dir()` gate would have left the suite green. This drives the
+/// real `rupu` binary against a project whose OWN `.rupu/netflow/` is
+/// GENUINELY DISTINCT from the global root (a separate `home/` subtree
+/// entirely, not the `project_root == ~` collision Important 1's dedup
+/// fix addresses) with one stale ledger in each, and asserts both are
+/// swept: both run ids gone from disk, both scope labels present in
+/// the report. A genuinely-different pair of roots also guards the
+/// dedup fix from the other direction — it must never collapse two
+/// roots that are NOT the same directory.
+#[tokio::test]
+async fn prune_sweeps_both_a_distinct_project_local_root_and_the_global_root() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let project_dir = tmp.child("project");
+    project_dir.create_dir_all().unwrap();
+    let project_netflow = project_dir.path().join(".rupu/netflow");
+    std::fs::create_dir_all(&project_netflow).unwrap();
+
+    // A `home/` subtree entirely separate from `project/` — canonicalizing
+    // either root must never make them collide.
+    let home = tmp.child("home");
+    let global_netflow = home.path().join(".rupu/netflow");
+    std::fs::create_dir_all(&global_netflow).unwrap();
+
+    let project_ledger = project_netflow.join("run_project.jsonl");
+    let global_ledger = global_netflow.join("run_global.jsonl");
+    std::fs::write(&project_ledger, "{}\n").unwrap();
+    std::fs::write(&global_ledger, "{}\n").unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+    for p in [&project_ledger, &global_ledger] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path().join(".rupu"))
+        .current_dir(project_dir.path())
+        .args(["--format", "json", "netflow", "prune", "--older-than", "30d"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""run_id": "run_project""#),
+        "project-local ledger missing from the report: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""run_id": "run_global""#),
+        "global ledger missing from the report: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""scope": "project""#),
+        "project scope label missing: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""scope": "global""#),
+        "global scope label missing: {stdout}"
+    );
+
+    assert!(
+        !project_ledger.exists(),
+        "the project-local ledger must be removed"
+    );
+    assert!(
+        !global_ledger.exists(),
+        "the global ledger must be removed"
+    );
+}
+
+/// Important 1 (netflow-per-run Plan 3 Task 2 review round 2): when
+/// `project_root_for` resolves the project root to `$HOME` itself (the
+/// common case for `cwd == $HOME` or anywhere under it that isn't
+/// inside a rupu project — the global root literally IS `~/.rupu`),
+/// `project_local_netflow_dir(project_root)` and `global_netflow_dir`
+/// are the SAME directory. Before the dedup fix, `candidates` held
+/// that directory twice, so `--dry-run` reported every eligible ledger
+/// TWICE and doubled the reclaimable-bytes total — the one number an
+/// operator sizing a deletion is reading the preview for. Asserts the
+/// dry-run report lists the one stale ledger exactly once.
+#[tokio::test]
+async fn dry_run_does_not_double_report_when_the_project_root_is_home() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    let netflow_dir = home.path().join(".rupu/netflow");
+    std::fs::create_dir_all(&netflow_dir).unwrap();
+
+    let ledger = netflow_dir.join("run_home.jsonl");
+    std::fs::write(&ledger, "{}\n").unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ledger)
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+
+    // `cwd == RUPU_HOME`'s parent (i.e. `cwd` IS `$HOME`): `project_root_for`
+    // finds `home/.rupu` walking up from `home` itself, so the project-local
+    // and global candidates resolve to the exact same directory — the
+    // collision this test pins.
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path().join(".rupu"))
+        .current_dir(home.path())
+        .args([
+            "--format",
+            "json",
+            "netflow",
+            "prune",
+            "--older-than",
+            "30d",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches(r#""run_id": "run_home""#).count(),
+        1,
+        "the colliding project-local/global roots must be swept ONCE, not \
+         twice, or --dry-run doubles the reported reclaimable bytes: {stdout}"
+    );
+
+    assert!(ledger.exists(), "dry-run must never delete");
+}
