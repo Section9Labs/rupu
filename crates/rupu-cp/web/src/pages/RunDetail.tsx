@@ -42,6 +42,7 @@ import CyclesTab from '../components/run/CyclesTab';
 import NetflowTable from '../components/netflow/NetflowTable';
 import NetflowSummary from '../components/netflow/NetflowSummary';
 import NetflowGraph from '../components/netflow/NetflowGraph';
+import NetflowWindowReadout from '../components/netflow/NetflowWindowReadout';
 import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
 import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../components/netflow/TimeRangePicker';
 import { fetchNetflowGraph, fetchRunNetflow, type GraphView, type NetflowResponse } from '../lib/netflow';
@@ -376,6 +377,16 @@ export default function RunDetail() {
     const key = `${id}::${netflowRange.preset}::${q?.from ?? ''}::${q?.to ?? ''}`;
     if (netflowRequestedKeyRef.current === key) return;
     netflowRequestedKeyRef.current = key;
+    // Important 3 (whole-branch review round 1): reset before fetching,
+    // matching pages/Netflow.tsx and ProjectNetworkTab.tsx exactly — this
+    // was the one outlier that skipped it. Without this, a range change
+    // on an already-open tab left the PREVIOUS window's table/graph
+    // rendering (and a stale error, since the error branch is checked
+    // first below) under the newly-selected range until the new request
+    // landed.
+    setNetflow(null);
+    setNetflowGraph(null);
+    setNetflowError(null);
     let cancelled = false;
     // Combined into one `Promise.all` (Fix 6, netflow Plan 3 review round
     // 3) — previously each fetch independently swallowed its own failure
@@ -1304,14 +1315,22 @@ export default function RunDetail() {
         {tab === 'netflow' && (
           <div className="h-full min-h-0 space-y-4 overflow-auto">
             <NetflowScopeDisclosure scope="run" />
-            <TimeRangePicker value={netflowRange} onChange={setNetflowRange} />
+            <div className="flex flex-wrap items-center gap-3">
+              <TimeRangePicker value={netflowRange} onChange={setNetflowRange} />
+              {/* Server-echoed, never picker-state-derived — see the
+                  component's header comment (whole-branch review round 1,
+                  "Also do"). */}
+              {netflow && <NetflowWindowReadout appliedWindow={netflow.window} />}
+            </div>
             {netflowError ? (
               <p className="text-sm text-err">{netflowError}</p>
             ) : netflow === null ? (
               <p className="text-sm text-ink-dim">Loading network flows…</p>
             ) : (
               <>
-                {netflowGraph && <NetflowGraph graph={netflowGraph} scope="run" />}
+                {netflowGraph && (
+                  <NetflowGraph graph={netflowGraph} scope="run" appliedWindow={netflow.window} />
+                )}
                 <NetflowSummary hosts={netflow.hosts} />
                 <NetflowTable
                   flows={netflow.flows}
