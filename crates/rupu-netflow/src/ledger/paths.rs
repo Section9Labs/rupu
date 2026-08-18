@@ -20,6 +20,26 @@ pub struct NetflowPaths {
     pub flows: PathBuf,
 }
 
+/// The project-local candidate ledger directory `project_root` would
+/// resolve to if it opted in — `<project_root>/.rupu/netflow` — computed
+/// UNCONDITIONALLY, with no existence check. [`netflow_dir`]'s existence
+/// gate tests exactly this path; exposed separately so a caller that
+/// needs to enumerate every root a ledger could ever have landed in
+/// (not just the one [`netflow_dir`] currently resolves to — e.g.
+/// `rupu-cli`'s `netflow prune`, which must sweep both a project's
+/// current root AND wherever ledgers landed before that root existed)
+/// doesn't hardcode `.rupu/netflow` a second time.
+pub fn project_local_netflow_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".rupu/netflow")
+}
+
+/// The global fallback ledger directory — `<global>/netflow`. Exposed
+/// for the same reason as [`project_local_netflow_dir`]: one place
+/// owns the `netflow` suffix.
+pub fn global_netflow_dir(global: &Path) -> PathBuf {
+    global.join("netflow")
+}
+
 /// Resolve which directory a run's netflow ledger belongs in:
 /// project-local `<project_root>/.rupu/netflow/` when that directory
 /// ALREADY EXISTS, the global `<global>/netflow/` fallback otherwise.
@@ -40,12 +60,48 @@ pub struct NetflowPaths {
 /// the read path — see that module's fallback-to-global handling.
 pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
     if let Some(p) = project_root {
-        let local = p.join(".rupu/netflow");
+        let local = project_local_netflow_dir(p);
         if local.is_dir() {
             return local;
         }
     }
-    global.join("netflow")
+    global_netflow_dir(global)
+}
+
+/// Legacy, pre-per-run shared ledger filename that predates this crate's
+/// one-file-per-run layout — the whole workspace/daemon wrote every flow
+/// into this one file before the netflow-per-run migration.
+/// [`NetflowPaths::for_run`] never produces this exact name: every real
+/// run id comes from `run_<ULID>` or an operator-supplied `--run-id`, so
+/// a file with exactly this name sitting in a netflow directory is
+/// unambiguously the leftover shared ledger, not a run that happens to
+/// be named "flows".
+pub const LEGACY_LEDGER_FILENAME: &str = "flows.jsonl";
+
+/// True when `path`'s bare filename names a per-run ledger this crate's
+/// per-run layout would have written: extension exactly `.jsonl`,
+/// excluding the [`LEGACY_LEDGER_FILENAME`] exception above. A pure name
+/// check — no I/O, no `is_file()` — so a caller that also cares whether
+/// the path is a regular file (not a directory) must check that
+/// itself. Compare:
+///
+/// - `rupu-cli`'s `cmd::netflow::prune_ledgers` layers `Path::is_file()`
+///   on top, because a DESTRUCTIVE prune must never touch a directory.
+/// - `rupu-cp`'s read side tolerates a directory matching this
+///   predicate (a wasted, harmless `read_dir` that produces no flows),
+///   because reading is not destructive.
+///
+/// This is the ONE place the `.gitignore` exclusion (implicit — its
+/// extension isn't `.jsonl`, so it never matches) and the legacy
+/// filename exclusion are decided. Both call sites above call this
+/// instead of keeping their own copy, so the two can never drift apart
+/// the way [`netflow_dir`]'s own doc comment warns the directory-ROUTING
+/// rule must never drift.
+pub fn is_per_run_ledger_path(path: &Path) -> bool {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return false;
+    }
+    path.file_name().and_then(|name| name.to_str()) != Some(LEGACY_LEDGER_FILENAME)
 }
 
 impl NetflowPaths {
@@ -137,6 +193,32 @@ impl NetflowPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_per_run_ledger_path_accepts_only_dot_jsonl_excluding_the_legacy_name() {
+        assert!(is_per_run_ledger_path(Path::new("/tmp/run_01ABC.jsonl")));
+        assert!(is_per_run_ledger_path(Path::new(
+            "/tmp/an-operator-chosen-id.jsonl"
+        )));
+        assert!(
+            !is_per_run_ledger_path(Path::new("/tmp/flows.jsonl")),
+            "the legacy pre-per-run shared ledger is never a per-run ledger"
+        );
+        assert!(!is_per_run_ledger_path(Path::new("/tmp/.gitignore")));
+        assert!(!is_per_run_ledger_path(Path::new("/tmp/archive")));
+        assert!(!is_per_run_ledger_path(Path::new("/tmp/run.json")));
+    }
+
+    #[test]
+    fn project_local_and_global_netflow_dir_use_the_same_suffixes_netflow_dir_does() {
+        let global = Path::new("/home/x/.rupu");
+        let project = Path::new("/repo");
+        assert_eq!(
+            project_local_netflow_dir(project),
+            project.join(".rupu/netflow")
+        );
+        assert_eq!(global_netflow_dir(global), global.join("netflow"));
+    }
 
     #[test]
     fn for_run_puts_each_run_in_its_own_file() {

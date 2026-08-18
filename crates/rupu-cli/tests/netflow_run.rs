@@ -18,6 +18,7 @@
 //! is the test that would catch a regression moving the sink build after
 //! the provider build, or reverting `paths::netflow_dir` back to raw `pwd`.
 
+use assert_cmd::Command;
 use assert_fs::prelude::*;
 use rupu_netflow::{FlowCtx, MemorySink, Origin};
 use std::sync::Arc;
@@ -368,5 +369,74 @@ async fn two_sequential_rupu_run_invocations_in_one_process_get_separate_ledgers
             .count(),
         1,
         "run-second's ledger must contain exactly its own one request, got: {second_text}"
+    );
+}
+
+/// Important 4 (netflow-per-run Plan 3 Task 2 review round 1): the
+/// requirement-4 machinery (partial failure -> non-zero exit, report
+/// printed first) lives in `cmd::netflow::prune`/`handle`, which none
+/// of `prune_ledgers`'s own unit tests exercise — those stop at the
+/// library function. Drives the real `rupu` binary end to end, the same
+/// pattern `cli_transcript.rs`'s `prune_deletes_old_archived_standalone_
+/// transcripts_and_uses_config_default` uses for `transcript prune`.
+///
+/// Strips write permission from the ledger directory so `remove_file`
+/// fails deterministically for the one eligible ledger inside it, then
+/// asserts BOTH halves of requirement 4: the process exits non-zero,
+/// AND the report (naming the failed ledger) was still printed to
+/// stdout before that exit — a failure must not look like silence.
+#[cfg(unix)]
+#[tokio::test]
+async fn prune_reports_a_removal_failure_and_exits_non_zero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    let netflow_dir = global.path().join("netflow");
+    std::fs::create_dir_all(&netflow_dir).unwrap();
+
+    let stuck = netflow_dir.join("run_stuck.jsonl");
+    std::fs::write(&stuck, "{}\n").unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stuck)
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+
+    let original_perms = std::fs::metadata(&netflow_dir).unwrap().permissions();
+    let mut locked = original_perms.clone();
+    locked.set_mode(0o555); // read+execute, no write — remove_file fails EACCES
+    std::fs::set_permissions(&netflow_dir, locked).unwrap();
+
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["netflow", "prune", "--older-than", "30d"])
+        .output()
+        .unwrap();
+
+    // Restore before any assertion can panic, so the TempDir's own
+    // cleanup on drop never fails.
+    std::fs::set_permissions(&netflow_dir, original_perms).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a removal failure must exit non-zero; status: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("run_stuck"),
+        "the report must name the ledger that failed to remove, printed \
+         BEFORE the non-zero exit, not swallowed by it; stdout: {stdout}"
+    );
+    assert!(
+        stuck.exists(),
+        "the failed removal must leave the file in place"
     );
 }
