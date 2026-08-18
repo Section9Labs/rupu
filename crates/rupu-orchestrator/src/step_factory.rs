@@ -55,6 +55,27 @@ use std::sync::Arc;
 /// `NetflowWriterHandle::shutdown`'s doc comment for why a caller-held
 /// `Arc<NetflowWriter>` clone is exactly the case that keeps a dropped
 /// handle's task alive rather than hanging it.
+///
+/// KNOWN, ACCEPTED OVERHEAD (whole-branch review, Minor #15): a workflow
+/// run's linear steps share the WORKFLOW's own `run_id` (see the `run_id`
+/// doc above), so calling this once per linear step spawns one
+/// independent `NetflowWriterHandle` — its own bounded channel,
+/// background task, open fd, and `dropped` counter — per step, all
+/// pointed at the SAME `<run_id>.jsonl` file rather than one shared
+/// writer. This is safe, not silently lossy: every write is one
+/// `write_all` of a complete JSON line (see `writer.rs`), so concurrent
+/// appenders can't interleave a torn line, and the read side sums every
+/// `Dropped` line it finds in a file regardless of which writer instance
+/// produced it (`rupu_netflow::ledger::read_flows_and_dropped`) — so a
+/// step's own overflow is still counted, just via its own line rather
+/// than a merged counter. The cost is purely resource waste (N
+/// short-lived tasks/fds instead of one long-lived one for one workflow
+/// run), not a correctness gap. Left as-is rather than caching/sharing a
+/// writer keyed by run id: a process-wide cache keyed by run id is
+/// shaped exactly like the `OnceLock` this whole plan removed, just
+/// scoped smaller — worth reconsidering only if this overhead is ever
+/// shown to matter in practice (heavy fan-out with many steps sharing one
+/// id), not preemptively.
 fn step_netflow_sink(
     global: &Path,
     project_root: Option<&Path>,
