@@ -852,8 +852,18 @@ impl RunStore {
 
     /// Sub-run directory: lives under the parent's run dir so cleanup
     /// follows parent lifecycle. See spec § 5.1.
+    /// The `sub/` directory a given id's own sub-runs live under —
+    /// `<root>/<id>/sub/`. Shared by [`Self::sub_run_dir`] (which appends
+    /// one more sub-run id) and [`Self::sub_run_ids`] (which lists it), so
+    /// a future layout change to this one path component can't drift the
+    /// write side and the read side apart the way two independent
+    /// `.join("sub")` call sites could.
+    fn sub_dir(&self, parent_run_id: &str) -> PathBuf {
+        self.run_dir(parent_run_id).join("sub")
+    }
+
     fn sub_run_dir(&self, parent_run_id: &str, sub_run_id: &str) -> PathBuf {
-        self.run_dir(parent_run_id).join("sub").join(sub_run_id)
+        self.sub_dir(parent_run_id).join(sub_run_id)
     }
 
     fn sub_run_transcript(&self, parent_run_id: &str, sub_run_id: &str) -> PathBuf {
@@ -961,15 +971,67 @@ impl RunStore {
     /// missing data is not an error here, only genuinely malformed input
     /// would be, and there is no such input for a directory listing.
     /// Order is whatever `read_dir` yields, not guaranteed stable.
+    ///
+    /// A degrade past "the directory simply doesn't exist" (the ordinary
+    /// case for a run with no sub-runs) is logged at debug — mirrors
+    /// `netflow_sink::for_run`'s precedent for a best-effort capture
+    /// degrade. This subsystem exists to eliminate "traffic with no
+    /// record and no error"; a permissions failure that silently hides a
+    /// sub-agent's ledger (and its unrecoverable `Dropped` count) from
+    /// every caller of [`Self::sub_run_ids_recursive`] would be exactly
+    /// that, with nothing anywhere to notice it happened.
     pub fn sub_run_ids(&self, run_id: &str) -> Vec<String> {
-        let dir = self.run_dir(run_id).join("sub");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
+        let dir = self.sub_dir(run_id);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(
+                        run_id,
+                        path = ?dir,
+                        error = %e,
+                        "sub-run directory unreadable; any sub-agent ledger under it \
+                         (and its Dropped count) is invisible to this read"
+                    );
+                }
+                return Vec::new();
+            }
         };
         entries
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().into_string().ok())
+            .filter_map(|entry| {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        tracing::debug!(
+                            run_id,
+                            error = %e,
+                            "unreadable entry in a sub-run directory listing; skipped"
+                        );
+                        return None;
+                    }
+                };
+                // `file_type()` reuses the `dirent` info `read_dir` already
+                // fetched on platforms that provide it, rather than
+                // `entry.path().is_dir()`'s extra `stat` per entry. A type
+                // that can't be determined (rare — a race, or a filesystem
+                // that doesn't report it) is logged and skipped rather than
+                // silently treated as "not a directory": the entry's ledger
+                // may be perfectly readable even though its type wasn't.
+                match entry.file_type() {
+                    Ok(ft) if ft.is_dir() => entry.file_name().into_string().ok(),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::debug!(
+                            run_id,
+                            path = ?entry.path(),
+                            error = %e,
+                            "could not determine file type for a sub-run directory \
+                             entry; skipped even though its ledger may be readable"
+                        );
+                        None
+                    }
+                }
+            })
             .collect()
     }
 
