@@ -1035,6 +1035,219 @@ async fn run_netflow_sums_dropped_counts_across_a_dispatched_steps_own_ledger() 
     );
 }
 
+// ── Run scope: dispatched sub-agents (recursive) ───────────────────────────
+//
+// A `dispatch_agent` sub-run gets its OWN per-run ledger, written under the
+// exact same netflow root as the dispatching run (`netflow_sink::for_run`
+// in `rupu-cli`'s `cmd/dispatch.rs` is handed the same `global`/
+// `project_root` the parent used) — but until `RunStore::sub_run_ids`/
+// `sub_run_ids_recursive` existed, nothing on the read side ever looked
+// for it: `run_and_unit_ids` only ever harvested ids from
+// `step_results.jsonl`, which a sub-agent dispatch never writes to (that's
+// the DAG-scheduled STEP path, a different mechanism). These tests use the
+// real `RunStore::create_sub_run` (not a hand-rolled directory) so they
+// exercise the actual on-disk layout dispatch produces.
+
+#[tokio::test]
+async fn run_netflow_includes_a_dispatched_sub_agents_flows_and_dropped_count() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_sub_agent";
+
+    write_ledger(
+        project.path(),
+        run_id,
+        &[LedgerLine::Dropped {
+            count: 5,
+            ts: chrono::Utc::now(),
+        }],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let (sub_run_id, _transcript) = state.run_store.create_sub_run(run_id, "fixer").unwrap();
+
+    let sub_flow = e2e_flow(
+        FlowId::new(),
+        Some(&sub_run_id),
+        "api.anthropic.com",
+        Origin::Provider("anthropic".into()),
+    );
+    write_ledger(
+        project.path(),
+        &sub_run_id,
+        &[
+            LedgerLine::Flow(Box::new(sub_flow)),
+            LedgerLine::Dropped {
+                count: 7,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["dropped_total"], 12,
+        "must sum the run's own ledger (5) AND its dispatched sub-agent's own \
+         ledger (7): {body}"
+    );
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.anthropic.com"),
+        "the sub-agent's own flow must surface at the parent's run scope: {body}"
+    );
+}
+
+/// The decisive nested case: a sub-agent that itself dispatches a
+/// sub-agent (two levels deep). Both levels' flows AND drop counts must
+/// surface at the top parent's run scope.
+#[tokio::test]
+async fn run_netflow_reaches_a_nested_sub_agents_sub_agent() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_nested_sub_agents";
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let (child_id, _) = state
+        .run_store
+        .create_sub_run(run_id, "researcher")
+        .unwrap();
+    let (grandchild_id, _) = state.run_store.create_sub_run(&child_id, "fixer").unwrap();
+
+    write_ledger(
+        project.path(),
+        &child_id,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(&child_id),
+                "api.github.com",
+                Origin::Scm("github".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 2,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+    write_ledger(
+        project.path(),
+        &grandchild_id,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(&grandchild_id),
+                "api.openai.com",
+                Origin::Provider("openai".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 3,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.github.com"),
+        "the first-level sub-agent's flow must surface: {body}"
+    );
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.openai.com"),
+        "the SECOND-level (grandchild) sub-agent's flow must also surface: {body}"
+    );
+    assert_eq!(
+        body["dropped_total"], 5,
+        "must sum both levels' own dropped counts (2 + 3): {body}"
+    );
+}
+
+/// Attribution safety: a sub-run dispatched under a DIFFERENT parent run
+/// must never appear in this run's netflow view, even though both
+/// ledgers live in the same netflow directory.
+#[tokio::test]
+async fn run_netflow_does_not_leak_a_sub_agent_belonging_to_a_different_parent() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_a = "run_a_with_sub_agent";
+    let run_b = "run_b_with_sub_agent";
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_a, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    state
+        .run_store
+        .create(
+            seed_run(run_b, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let (sub_of_a, _) = state.run_store.create_sub_run(run_a, "agent").unwrap();
+    let (sub_of_b, _) = state.run_store.create_sub_run(run_b, "agent").unwrap();
+
+    write_ledger(
+        project.path(),
+        &sub_of_a,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(&sub_of_a),
+            "a.example",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+    write_ledger(
+        project.path(),
+        &sub_of_b,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(&sub_of_b),
+            "b.example",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_a}/netflow"))
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(flows.iter().any(|f| f["host"] == "a.example"));
+    assert!(
+        !flows.iter().any(|f| f["host"] == "b.example"),
+        "run A's netflow view must never include run B's sub-agent's flow: {body}"
+    );
+}
+
 // ── Project scope: id-driven global-fallback recovery ─────────────────────
 //
 // `get_project_netflow` used to read ONLY `<workspace>/.rupu/netflow/`

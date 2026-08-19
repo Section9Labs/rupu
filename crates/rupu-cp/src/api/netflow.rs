@@ -518,20 +518,30 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 }
 
 /// Every ledger-file id this run's own dispatch could have written to:
-/// the run's own id (covers `Registry::discover`'s SCM sink, and every
-/// non-DAG-scheduled provider call — `rupu session`'s per-turn worker,
-/// sub-agent dispatch — which reuse the run's own id directly), PLUS
-/// every dispatched step's — and fan-out item's — own freshly-minted id
-/// recorded in `step_results.jsonl`. The concurrent DAG scheduler mints a
-/// fresh run id per dispatched unit (see `rupu-orchestrator`'s
-/// `runner.rs`, and `step_factory.rs`'s `step_netflow_sink`, which is
-/// handed that id and builds THAT unit's own `NetflowPaths::for_run`), so
-/// a step's provider flows AND its ledger-only `Dropped` count live in
-/// their own file, never the parent workflow run's. A `Dropped` line has
-/// no transcript fallback (unlike a flow record, which the transcript
-/// merge below can still recover under a different id) — skipping a
-/// step's own ledger file here would silently under-report loss for any
-/// run with more than one dispatched step, which is the common case.
+/// the run's own id (covers `Registry::discover`'s SCM sink and every
+/// non-DAG-scheduled provider call made directly under this run's own
+/// id, e.g. `rupu session`'s per-turn worker), PLUS every dispatched
+/// step's — and fan-out item's — own freshly-minted id recorded in
+/// `step_results.jsonl`, PLUS every sub-agent id this run (or one of its
+/// sub-agents, transitively) dispatched via `dispatch_agent`. The
+/// concurrent DAG scheduler mints a fresh run id per dispatched unit (see
+/// `rupu-orchestrator`'s `runner.rs`, and `step_factory.rs`'s
+/// `step_netflow_sink`, which is handed that id and builds THAT unit's
+/// own `NetflowPaths::for_run`), so a step's provider flows AND its
+/// ledger-only `Dropped` count live in their own file, never the parent
+/// workflow run's. `dispatch_agent` (`rupu-cli`'s `cmd/dispatch.rs`) does
+/// the identical thing by a different mechanism — CORRECTION: an earlier
+/// version of this doc comment claimed sub-agent dispatch "reuses the
+/// run's own id directly"; it does not and never has. `RunStore::
+/// create_sub_run` mints its own fresh `sub_<ULID>` id, and `dispatch.rs`
+/// hands THAT id (never the parent's) to `netflow_sink::for_run`, so a
+/// sub-agent's flows and `Dropped` count land in their own ledger file
+/// from the start — same as a dispatched step's. A `Dropped` line has no
+/// transcript fallback (unlike a flow record, which the transcript merge
+/// below can still recover under a different id) — skipping any of these
+/// own-id ledger files here would silently under-report loss for any run
+/// that dispatches more than one step or sub-agent, which is the common
+/// case.
 ///
 /// `StepResultRecord.run_id`/`ItemResultRecord.run_id` are `String::new()`
 /// for `for_each`/`parallel`/panel STEP records themselves (only their
@@ -539,6 +549,27 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// out before dedup so `resolve_ledger_paths` is never asked to stat
 /// `<dir>/.jsonl` (harmless today — that file never exists — but an empty
 /// id in this list is never a valid ledger name and shouldn't linger).
+///
+/// Sub-agent ids come from [`RunStore::sub_run_ids_recursive`], which
+/// walks the WHOLE dispatch tree (a sub-agent can itself dispatch
+/// sub-agents up to `rupu-tools::dispatch_agent::MAX_DEPTH`), not just
+/// the first level — before this, there was no way to discover a
+/// sub-agent's id from its parent at all, so its ledger (and its
+/// ledger-only `Dropped` count) was reachable only at global scope, with
+/// no indication from the parent run's own netflow view that any
+/// traffic — or any loss — was missing.
+///
+/// **Attribution decision**: sub-agent flows are FOLDED into the
+/// dispatching run's view, the same way a dispatched step's already are
+/// — not kept as a separate scope. Both are "this run's own dispatch,
+/// each in its own file" (see `resolve_ledger_paths`'s doc), so both are
+/// recovered the same way and neither can be told apart from a normal
+/// direct provider call by inspecting the merged `flows` list alone
+/// (`FlowCtx::agent`/`run_id` are unset on every production flow — see
+/// `rupu_netflow::ctx::FlowCtx`'s doc). The operator-facing text in
+/// `ScopeDisclosure.tsx` says so explicitly, so "this run's netflow"
+/// is never silently read as "only what this run's own provider calls
+/// did" when it also includes what every agent it dispatched did.
 fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
     let mut ids = vec![run_id.to_string()];
     for record in store.read_step_results(run_id).unwrap_or_default() {
@@ -547,6 +578,7 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
             ids.push(item.run_id);
         }
     }
+    ids.extend(store.sub_run_ids_recursive(run_id));
     ids.retain(|id| !id.is_empty());
     ids.sort();
     ids.dedup();
@@ -1079,12 +1111,13 @@ fn parse_time_range(
 /// `Host` branch is a network proxy call, not disk I/O, so it stays inline.
 ///
 /// Every flow is tagged with THIS run's own `run_id`, not the finer id of
-/// whichever per-step ledger file it actually came from
-/// (`run_and_unit_ids`/`resolve_ledger_paths` may read several) — at run
-/// scope the graph is meant to answer "what did THIS run reach", so it
-/// shows one source node for the run, not a fragmented node per
-/// internally-dispatched step. Project/global scope go the other way
-/// (one node per contributing run) via `read_all_run_ledgers_in_dir`.
+/// whichever per-step (or per-dispatched-sub-agent) ledger file it
+/// actually came from (`run_and_unit_ids`/`resolve_ledger_paths` may read
+/// several) — at run scope the graph is meant to answer "what did THIS
+/// run reach", so it shows one source node for the run, not a fragmented
+/// node per internally-dispatched step or sub-agent. Project/global scope
+/// go the other way (one node per contributing run) via
+/// `read_all_run_ledgers_in_dir`.
 async fn run_scoped_flows_for_graph(
     s: &AppState,
     run_id: &str,
@@ -1276,9 +1309,11 @@ fn urlencoding_rfc3339(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339().replace('+', "%2B").replace(':', "%3A")
 }
 
-/// `GET /api/runs/:id/netflow` — network flows attributed to one run, from
-/// the workspace ledger merged with the run transcript (see module doc),
-/// with read-time ASN enrichment and a server-computed per-host rollup.
+/// `GET /api/runs/:id/netflow` — network flows attributed to one run
+/// (including every sub-agent it dispatched, at any depth — see
+/// `run_and_unit_ids`'s doc for the attribution decision), from the
+/// workspace ledger merged with the run transcript (see module doc), with
+/// read-time ASN enrichment and a server-computed per-host rollup.
 ///
 /// Dispatches on [`resolve_run_location`] exactly like `run_graph`:
 /// `Global`/`ProjectLocal` read locally, `Host` proxies, `Unpersisted` has
