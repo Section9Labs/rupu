@@ -684,6 +684,175 @@ fn read_all_run_ledgers_in_dir(
     (flows, dropped)
 }
 
+/// Every run id a project's OWN run records name via their `workspace_path`
+/// field — never inferred from scanning a directory's file names. Two
+/// sources, mirroring `resolve_run_location`'s `Global`/`ProjectLocal`
+/// split: `global_store` (rooted at `<global_dir>/runs`) filtered to
+/// `workspace_path == workspace`, and a project-local store rooted at
+/// `<workspace>/.rupu/runs` (whatever it holds belongs to this project by
+/// construction — there is no `workspace_path` filter to apply there).
+///
+/// This is the attribution-safety property the id-driven global-fallback
+/// pass depends on: a run belonging to some OTHER project never
+/// contributes an id here just because its ledger happens to live in the
+/// same shared `<global_dir>/netflow/` directory — only a run record that
+/// itself declares THIS workspace as its own does.
+///
+/// Both sides of the comparison go through [`canonicalize_or_self`], not a
+/// bare `==`: `RunRecord::workspace_path` is stamped canonicalized at run
+/// creation (`rupu-cli`'s `canonicalize_if_exists`), but `workspace` here
+/// comes from the registered `Workspace`'s own path, which this function
+/// has no control over — comparing raw strings would silently miss a
+/// match across e.g. a symlinked temp/mount path, the same hazard
+/// [`resolve_ledger_paths`] and [`read_all_workspaces_sync`] already guard
+/// against for directory identity.
+///
+/// Cost: `global_store.list()` is one `read_dir` plus one small
+/// `run.json` parse per run IN THE WHOLE GLOBAL STORE (not filtered by
+/// workspace at the I/O layer — `RunStore` has no index by
+/// `workspace_path`), so this is O(total runs across every project) on
+/// every project-scope request, not O(this project's own runs). At ~500
+/// runs total that's ~500 small file opens; see the caller's doc comment
+/// for the full accounting of what happens after this filter narrows
+/// down to just this project's own ids.
+fn project_run_ids(global_store: &RunStore, workspace: &StdPath) -> Vec<String> {
+    let workspace = canonicalize_or_self(workspace);
+    let mut ids: Vec<String> = global_store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| canonicalize_or_self(&r.workspace_path) == workspace)
+        .map(|r| r.id)
+        .collect();
+
+    let local_store = RunStore::new(workspace.join(".rupu").join("runs"));
+    ids.extend(
+        local_store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.id),
+    );
+
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// The id-driven recovery pass: every flow in `<global_dir>/netflow/`
+/// belonging to one of THIS project's own runs (or their dispatched
+/// steps/units — see [`run_and_unit_ids`]), for projects whose
+/// `.rupu/netflow/` didn't exist at write time so their ledgers fell back
+/// to the global root (the common case — `rupu init` only started
+/// creating that directory once `crates/rupu-cli/src/cmd/init.rs`'s
+/// `ensure_netflow_dir` landed; every project initialised before that, or
+/// never `rupu init`'d at all, still has every historical run's ledger
+/// sitting in the global root with no way to re-run `init` after the
+/// fact).
+///
+/// Deliberately narrower than [`resolve_ledger_paths`] (which also
+/// resolves the workspace-local candidate): the workspace-local root is
+/// already covered by the whole-directory scan
+/// ([`read_all_run_ledgers_in_dir`]) the caller runs separately, so this
+/// function only ever computes the GLOBAL path for each id — resolving
+/// the workspace-local one here too would re-read files the whole-
+/// directory scan already read, double-counting them (no `FlowId` dedup
+/// exists at project/global scope, unlike run scope's
+/// `merge_with_transcript`).
+///
+/// Paths are collected into a `HashSet` before any read, so an id that
+/// resolves to the same global path more than once (shouldn't happen in
+/// practice — ids are unique per run/unit — but costs nothing to guard)
+/// is still only opened once.
+///
+/// Cost, continued from [`project_run_ids`]'s doc comment: for each of
+/// this project's own k run ids (k ≤ total runs), one `read_step_results`
+/// call (a small `step_results.jsonl` read, `Ok(vec![])` if the run never
+/// dispatched a step) to discover its units' own ids, then one
+/// `read_flows_in_range` per distinct resolved global path. At a few
+/// steps per run this is on the order of a few hundred additional small
+/// file opens for a 500-run installation — all synchronous, but always
+/// run through [`run_blocking`] by the caller, same as every other read in
+/// this module, so it never stalls the async task. This scales with the
+/// TOTAL run count in the global store (the `project_run_ids` filter) and
+/// with this project's own run/unit count, never with the size of the
+/// global directory itself — the opposite scaling from a `read_dir` over
+/// that directory, which is what made a directory-scan-based fix
+/// unworkable here (a project has no way to tell, from the global
+/// directory's contents alone, which files are its own — see the removed
+/// KNOWN GAP note this function replaces).
+///
+/// Two things this can NEVER recover, by construction, not by omission:
+/// a `system`-origin flow with `ctx.run_id: None` has no run record to be
+/// enumerated from at all, so it stays correctly invisible at project
+/// scope (it belongs only at global scope); and a ledger whose owning
+/// run's record has been deleted (archived-and-purged, or otherwise gone)
+/// contributes no id here either — that ledger is an orphan, and staying
+/// unreachable is the correct outcome, not a bug to chase.
+fn project_fallback_flows_and_dropped(
+    global_store: &RunStore,
+    workspace: &StdPath,
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+) -> (Vec<(String, FlowRecord)>, u64) {
+    let mut paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for run_id in project_run_ids(global_store, workspace) {
+        for id in run_and_unit_ids(global_store, &run_id) {
+            paths.insert(NetflowPaths::for_run(&global_netflow_dir(global_dir), &id).flows);
+        }
+    }
+
+    let mut flows = Vec::new();
+    let mut dropped = 0u64;
+    for path in paths {
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let (f, d) = rupu_netflow::ledger::read_flows_in_range(&path, range).unwrap_or_default();
+        flows.extend(f.into_iter().map(|flow| (id.to_string(), flow)));
+        dropped += d;
+    }
+    (flows, dropped)
+}
+
+/// Every flow at project scope: the workspace-local ledger directory
+/// (whole-directory scan, [`read_all_run_ledgers_in_dir`]) UNIONED with
+/// the id-driven global-fallback recovery pass
+/// ([`project_fallback_flows_and_dropped`]) for runs whose ledgers landed
+/// in `<global_dir>/netflow/` instead — see that function's doc for the
+/// full cost accounting and what it deliberately cannot recover. Shared
+/// by [`get_project_netflow`] and the graph endpoint's `project:` scope so
+/// the table and the graph are always built from the identical set,
+/// mirroring [`run_scoped_flows_and_dropped`]'s equivalent role at run
+/// scope.
+///
+/// Guards the same `$HOME`/`RUPU_HOME` collision [`resolve_ledger_paths`]
+/// guards at run scope: when the workspace-local netflow dir and the
+/// global one are literally the same directory (a workspace registered at
+/// `$HOME` with the default `RUPU_HOME=~/.rupu`), the whole-directory scan
+/// above has already read every file in it, so the id-driven pass is
+/// skipped entirely rather than re-reading (and double-counting) that
+/// same directory a second time.
+fn project_scoped_flows_and_dropped(
+    global_store: &RunStore,
+    workspace: &StdPath,
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+) -> (Vec<(String, FlowRecord)>, u64) {
+    let local_dir = project_local_netflow_dir(workspace);
+    let (mut flows, mut dropped) = read_all_run_ledgers_in_dir(&local_dir, range);
+
+    if canonicalize_or_self(&local_dir) == canonicalize_or_self(&global_netflow_dir(global_dir)) {
+        return (flows, dropped);
+    }
+
+    let (fallback_flows, fallback_dropped) =
+        project_fallback_flows_and_dropped(global_store, workspace, global_dir, range);
+    flows.extend(fallback_flows);
+    dropped += fallback_dropped;
+    (flows, dropped)
+}
+
 /// Every flow across every registered workspace's ledger directory, PLUS
 /// `<global_dir>/netflow/` — the fallback root every run writes to when
 /// its workspace never got its own `.rupu/netflow/` (see
@@ -759,27 +928,20 @@ fn canonicalize_or_self(path: &StdPath) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// `GET /api/projects/:id/netflow` — every flow in a workspace's own
-/// `.rupu/netflow/` ledger directory, including unattributed
-/// (`run_id: None`) egress that has no run to attach to — e.g.
-/// `Origin::Scm` traffic from `Registry::discover` (NOT `Origin::System`;
-/// see `ScopeDisclosure.tsx`'s header comment for why that's a separate,
-/// unrecorded-at-any-scope case). NOT the update checker either, which
-/// despite also using `Origin::Update` reaches no ledger at all —
-/// `rupu-update`'s client is wired to `Arc::new(NullSink)`. Unlike run
-/// scope, this reads the ledger directly with no `run_id` filter.
-///
-/// KNOWN GAP (unlike run scope and global scope, deliberately not fixed
-/// in this pass): this does NOT fall back to `<global_dir>/netflow/` for
-/// runs that landed there because `<workspace>/.rupu/netflow/` didn't
-/// exist yet at write time (see `rupu_netflow::netflow_dir`'s doc
-/// comment) — there is no cheap way to tell, from the global directory
-/// alone, which of its per-run files belong to THIS project versus some
-/// other one without cross-referencing every registered workspace's own
-/// `RunStore`. Project scope can therefore under-report on a fresh
-/// install the same way global scope used to; run scope
-/// (`collect_run_netflow`) and global scope (`read_all_workspaces_sync`)
-/// both already resolve this correctly for the ids they know about.
+/// `GET /api/projects/:id/netflow` — every flow attributable to a
+/// project: its own `.rupu/netflow/` ledger directory (whole-directory
+/// scan, including unattributed `run_id: None` egress that has no run to
+/// attach to — e.g. `Origin::Scm` traffic from `Registry::discover`, NOT
+/// `Origin::System`; see `ScopeDisclosure.tsx`'s header comment for why
+/// that's a separate, unrecorded-at-any-scope case, and NOT the update
+/// checker either, which despite also using `Origin::Update` reaches no
+/// ledger at all — `rupu-update`'s client is wired to `Arc::new(NullSink)`)
+/// UNIONED with an id-driven recovery pass over `<global_dir>/netflow/`
+/// for this project's own runs whose ledgers landed there instead — see
+/// [`project_scoped_flows_and_dropped`]'s doc comment for the full
+/// mechanism, cost accounting, and what it deliberately cannot recover
+/// (an unattributable `run_id: None` global-scope flow, or an orphaned
+/// ledger whose run record is gone).
 async fn get_project_netflow(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -789,9 +951,11 @@ async fn get_project_netflow(
     let range = parse_time_range(&q.from, &q.to)?;
     let workspace = workspace_for_project(&state, &project_id)?;
     let cache = Arc::clone(&state.asn_cache);
+    let store = Arc::clone(&state.run_store);
+    let global_dir = state.global_dir.clone();
     let resp = run_blocking(move || {
         let (flows, dropped) =
-            read_all_run_ledgers_in_dir(&project_local_netflow_dir(&workspace), &range);
+            project_scoped_flows_and_dropped(&store, &workspace, &global_dir, &range);
         let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
         let table = load_asn_table(&cache);
         build_response(flows, dropped, table.as_deref(), &range)
@@ -970,11 +1134,14 @@ async fn get_netflow_graph(
         run_scoped_flows_for_graph(&state, run_id, &range).await?
     } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
         let workspace = workspace_for_project(&state, project_id)?;
-        // Same known gap as `get_project_netflow`: no fallback to
-        // `<global_dir>/netflow/` for this project's runs that landed
-        // there. See that function's doc comment.
+        let store = Arc::clone(&state.run_store);
+        let global_dir = state.global_dir.clone();
+        // Shares `project_scoped_flows_and_dropped` with `get_project_netflow`
+        // so the graph and the table are always built from the identical
+        // set, including the id-driven global-fallback recovery pass — see
+        // that function's doc comment.
         run_blocking(move || {
-            read_all_run_ledgers_in_dir(&project_local_netflow_dir(&workspace), &range).0
+            project_scoped_flows_and_dropped(&store, &workspace, &global_dir, &range).0
         })
         .await?
     } else {
