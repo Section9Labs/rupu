@@ -85,6 +85,20 @@ export function netflowCoverageList(_scope: NetflowScope): string {
   return NETFLOW_COVERAGE_LIST;
 }
 
+/** Run scope's own addendum: sub-agent flows are FOLDED into the parent
+ *  run's total, the same way a dispatched workflow step's already were —
+ *  see `rupu-cp::api::netflow::run_and_unit_ids`'s "Attribution decision"
+ *  note for the full reasoning. Said explicitly, on the same surface
+ *  every other scope-limit sentence lives on, so "this run's netflow"
+ *  is never silently read as "only what this run's own provider calls
+ *  did" — the merged `flows`/`dropped_total` carry no marker that would
+ *  let a reader tell a sub-agent's traffic apart from the run's own
+ *  otherwise (`FlowCtx.agent`/`run_id` are unset on every production
+ *  flow). */
+const RUN_SCOPE_SUB_AGENT_NOTE =
+  ' Includes any sub-agents this run dispatched — at any depth, not just the first level — ' +
+  'folded into the same totals, not shown as a separate scope.';
+
 function disclosureText(scope: NetflowScope): string {
   const coverage = netflowCoverageList(scope);
   return (
@@ -92,7 +106,8 @@ function disclosureText(scope: NetflowScope): string {
     `subprocess. It also can't see non-HTTP egress: git2 clones (often a run's ` +
     `largest byte volume), object_store bucket traffic, and the node WebSocket are invisible ` +
     `here too. Ledgers are kept indefinitely unless an operator runs rupu netflow prune — ` +
-    `nothing here expires or rotates on its own.`
+    `nothing here expires or rotates on its own.` +
+    (scope === 'run' ? RUN_SCOPE_SUB_AGENT_NOTE : '')
   );
 }
 
@@ -115,27 +130,33 @@ export function NetflowScopeDisclosure({
  *  scope-specific caveat can be added without `NetflowTable` itself
  *  knowing anything about the underlying ledger-directory layout.
  *
- *  Project scope gets a real caveat, not just the generic coverage
- *  sentence: `get_project_netflow` (`rupu-cp`) reads only
- *  `<workspace>/.rupu/netflow/`, and nothing creates that directory on
- *  `rupu init` -- `templates.rs`'s `GITIGNORE_ENTRIES` lists the
- *  `.gitignore` entry for it, but `cmd/init.rs` never creates the
- *  directory itself. `paths::netflow_dir`'s existence gate is deliberate
- *  (it's what keeps ledgers out of a repo that never opted in) but its
- *  consequence is that on every default install, EVERY run's ledger
- *  lands at the global fallback root regardless of which project it
- *  belongs to -- so a project's own scope is empty even for a project
- *  with real, captured runs. An empty project scope must say that
- *  plainly: the flows are one scope away, not missing. (The
- *  data-reachability half of this -- `rupu-cp` cross-referencing the
- *  global directory for a project's own runs -- is a tracked follow-up,
- *  not fixed here; this is the wording-only half.) */
+ *  FIXED (previously a wording-only caveat pending a data-reachability
+ *  follow-up): `get_project_netflow` (`rupu-cp`) used to read ONLY
+ *  `<workspace>/.rupu/netflow/`, and `rupu init` never created that
+ *  directory -- `templates.rs`'s `GITIGNORE_ENTRIES` listed the
+ *  `.gitignore` entry for it, but `cmd/init.rs` didn't create the
+ *  directory itself, so on a fresh install EVERY run's ledger landed at
+ *  the global fallback root regardless of project, and project scope was
+ *  empty even for projects with real, captured runs. Both halves are
+ *  fixed now: `rupu init` creates `.rupu/netflow/` for every NEW project
+ *  (`cmd/init.rs`'s `ensure_netflow_dir`), and `get_project_netflow`
+ *  additionally runs an id-driven recovery pass over the global fallback
+ *  root for EXISTING projects' own runs
+ *  (`rupu-cp::api::netflow::project_scoped_flows_and_dropped`). An empty
+ *  project scope therefore means what it says -- no recorded runs with
+ *  network flows for this project -- with two narrow, deliberate
+ *  exceptions that stay invisible everywhere except global scope: a
+ *  `run_id: None` flow with no run record to attribute it to (there is
+ *  nothing to enumerate it from), and a ledger whose owning run's record
+ *  has since been deleted (an orphan). Neither is a bug to chase; see
+ *  that function's own doc comment for the full accounting. */
 export function netflowEmptyStateHint(scope: NetflowScope): string {
   const generic = `Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}. It does not cover traffic from the agent's bash subprocess.`;
   if (scope !== 'project') return generic;
   return (
-    `If this project has no .rupu/netflow/ directory of its own, its runs' flows are ` +
-    `recorded at global scope instead — check the global Network view. ${generic}`
+    `This covers both this project's own .rupu/netflow/ directory (if it has one) and ` +
+    `any of its runs' ledgers that fell back to global scope instead — whether or not ` +
+    `this project has that directory yet. ${generic}`
   );
 }
 

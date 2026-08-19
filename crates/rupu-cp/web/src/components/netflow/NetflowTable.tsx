@@ -10,9 +10,10 @@
 //   - The fidelity badge is unconditional: every row gets one, so a Coarse
 //     row never LOOKS as complete as an HTTP row.
 //   - `droppedTotal > 0` gets a loud banner, explicitly scoped ("full
-//     history") to the whole ledger rather than any active date filter —
-//     the list is silently incomplete without it, which is the exact
-//     defect this subsystem prevents. This banner renders even when
+//     history", across every ledger this view reads) rather than any
+//     active date filter — the list is silently incomplete without it,
+//     which is the exact defect this subsystem prevents. This banner
+//     renders even when
 //     `flows` is empty (an all-dropped scope): the empty state and the
 //     loss banner are not mutually exclusive, and showing only the empty
 //     state there would be the same silent-loss defect in its worst form.
@@ -83,11 +84,20 @@ function originLabel(f: FlowView): string {
  *
  * Netflow Plan 3 Task 3, review round 1: the copy explicitly says "full
  * history" rather than just "N flows dropped" — `droppedTotal` is the whole
- * ledger's loss regardless of any date-range filter applied to `flows`
+ * loss regardless of any date-range filter applied to `flows`
  * (`NetflowResponse.dropped_total`'s doc comment), and once Task 4 puts a
  * date picker above this table, an unqualified count would read as
  * "dropped within the selected range", which is exactly the silent-gap
  * misreading this whole subsystem exists to prevent.
+ *
+ * Deliberately says "every ledger this view reads", not "this ledger" (a
+ * wording this banner used to carry): even at run scope, `droppedTotal` is
+ * already a sum across more than one file — this run's own ledger, plus
+ * any dispatched step's, plus any sub-agent's, at any dispatch depth (see
+ * `rupu-cp::api::netflow::run_and_unit_ids`) — and project/global scope
+ * sum across every contributing run's ledger on top of that. Naming a
+ * single ledger would have undersold how wide "incomplete" can actually
+ * be.
  */
 function DroppedBanner({ droppedTotal }: { droppedTotal: number }) {
   if (droppedTotal <= 0) return null;
@@ -96,9 +106,9 @@ function DroppedBanner({ droppedTotal }: { droppedTotal: number }) {
       role="status"
       className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn"
     >
-      <span className="font-medium">{droppedTotal} flows dropped</span> across this
-      ledger's full history — the capture buffer overflowed at some point, so this list
-      may be incomplete regardless of any date range shown here.
+      <span className="font-medium">{droppedTotal} flows dropped</span> across the full
+      history of every ledger this view reads — the capture buffer overflowed at some
+      point, so this list may be incomplete regardless of any date range shown here.
     </div>
   );
 }

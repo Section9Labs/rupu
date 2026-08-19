@@ -44,11 +44,17 @@ pub fn global_netflow_dir(global: &Path) -> PathBuf {
 /// project-local `<project_root>/.rupu/netflow/` when that directory
 /// ALREADY EXISTS, the global `<global>/netflow/` fallback otherwise.
 /// Mirrors `transcripts_dir`'s existing-only gate — the load-bearing
-/// property that keeps ledgers out of repos that never opted in (an
-/// un-`rupu init`'d project, or one initialised before this directory
-/// existed, gets no ledger written inside it; `rupu init` only ever adds
-/// a `.gitignore` entry, it does not create this directory, so "never
-/// opted in" is the common case, not the edge case).
+/// property that keeps ledgers out of repos that never opted in.
+///
+/// `rupu init` now creates this directory itself (`ensure_netflow_dir`,
+/// called from `crates/rupu-cli/src/cmd/init.rs`'s `init_inner`, in the
+/// same breath as the `.gitignore` entry that protects it) — so a project
+/// `rupu init`'d at or after that change routes locally from its very
+/// first run. "Never opted in" is still the reality for every project
+/// initialised before that change, or never `rupu init`'d at all (there is
+/// no way to retroactively create the directory short of re-running
+/// `init`), so this gate still exists and still matters; it just isn't
+/// the universal case it used to be.
 ///
 /// Both `rupu-cli` (every agent-driven entry point: `rupu run`, `rupu
 /// session`, `rupu workflow`, sub-agent dispatch) and `rupu-orchestrator`
@@ -57,7 +63,10 @@ pub fn global_netflow_dir(global: &Path) -> PathBuf {
 /// the write side's routing decision can never drift into two competing
 /// copies of the same rule. `rupu-cp`'s read side
 /// (`crates/rupu-cp/src/api/netflow.rs`) must mirror this same rule on
-/// the read path — see that module's fallback-to-global handling.
+/// the read path — see that module's `project_scoped_flows_and_dropped`,
+/// which additionally recovers a PRE-EXISTING project's global-fallback
+/// ledgers that this write-side gate alone cannot route locally after the
+/// fact.
 pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
     if let Some(p) = project_root {
         let local = project_local_netflow_dir(p);
@@ -140,53 +149,69 @@ impl NetflowPaths {
     /// strictly better than leaking it. Do not "simplify" this into a
     /// best-effort write that swallows the error.
     pub fn ensure_dir(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.root)?;
-        self.ensure_self_ignore()
+        ensure_netflow_dir(&self.root)
     }
+}
 
-    /// Write the self-ignoring `.gitignore`, but only if one is not
-    /// already there — never clobber a file the user may have
-    /// customised. Uses `create_new` so the presence check and the write
-    /// are atomic (no separate `exists()` + `write()` TOCTOU window);
-    /// an `AlreadyExists` error means the file is already there, which
-    /// is success for our purposes, not a failure to propagate.
-    ///
-    /// Note this intentionally does *not* re-validate or heal an
-    /// existing `.gitignore`, even one that is empty or lacks the `*`
-    /// pattern (e.g. a user deliberately cleared it): requirement 1 is
-    /// "never clobber a file the user may have customised", and an
-    /// empty file is a valid customisation, not corruption, from
-    /// `ensure_dir`'s point of view. See `write_all`'s error arm below
-    /// for the one case this crate itself can produce that *does* need
-    /// cleaning up.
-    fn ensure_self_ignore(&self) -> std::io::Result<()> {
-        let gitignore = self.root.join(".gitignore");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&gitignore)
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(NETFLOW_GITIGNORE.as_bytes()) {
-                    // `create_new` already succeeded, so a 0-byte (or
-                    // partially written) file is sitting on disk. Left
-                    // alone, every future call would hit `AlreadyExists`
-                    // below and treat that corpse as "already
-                    // protected" forever — silently reintroducing the
-                    // exact leak this function exists to close, just
-                    // one layer down. Best-effort delete it so the next
-                    // call retries `create_new` cleanly; if the cleanup
-                    // itself fails there's nothing further to do, so
-                    // its result is deliberately ignored and the
-                    // original write error is what gets surfaced.
-                    let _ = std::fs::remove_file(&gitignore);
-                    return Err(e);
-                }
-                Ok(())
+/// Create a netflow ledger directory at `dir` and make sure it is
+/// self-ignoring — the same two steps [`NetflowPaths::ensure_dir`] runs,
+/// factored out so a caller with no run id to hand (`rupu init`, opting a
+/// project's `.rupu/netflow/` into local routing before any run has
+/// happened — see `netflow_dir`'s doc comment) doesn't have to construct a
+/// throwaway [`NetflowPaths`] just to reach this. Both call sites share
+/// this ONE implementation so the write-side protection can never drift
+/// between "a run's first ledger write" and "an explicit `init`
+/// opt-in".
+///
+/// See [`NetflowPaths::ensure_dir`]'s doc comment for the fail-closed
+/// contract and [`ensure_self_ignore`] for the customised-`.gitignore`
+/// preservation rule.
+pub fn ensure_netflow_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    ensure_self_ignore(dir)
+}
+
+/// Write the self-ignoring `.gitignore` into `dir`, but only if one is not
+/// already there — never clobber a file the user may have customised.
+/// Uses `create_new` so the presence check and the write are atomic (no
+/// separate `exists()` + `write()` TOCTOU window); an `AlreadyExists`
+/// error means the file is already there, which is success for our
+/// purposes, not a failure to propagate.
+///
+/// Note this intentionally does *not* re-validate or heal an existing
+/// `.gitignore`, even one that is empty or lacks the `*` pattern (e.g. a
+/// user deliberately cleared it): requirement 1 is "never clobber a file
+/// the user may have customised", and an empty file is a valid
+/// customisation, not corruption, from [`ensure_netflow_dir`]'s point of
+/// view. See `write_all`'s error arm below for the one case this crate
+/// itself can produce that *does* need cleaning up.
+fn ensure_self_ignore(dir: &Path) -> std::io::Result<()> {
+    let gitignore = dir.join(".gitignore");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gitignore)
+    {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(NETFLOW_GITIGNORE.as_bytes()) {
+                // `create_new` already succeeded, so a 0-byte (or
+                // partially written) file is sitting on disk. Left
+                // alone, every future call would hit `AlreadyExists`
+                // below and treat that corpse as "already
+                // protected" forever — silently reintroducing the
+                // exact leak this function exists to close, just
+                // one layer down. Best-effort delete it so the next
+                // call retries `create_new` cleanly; if the cleanup
+                // itself fails there's nothing further to do, so
+                // its result is deliberately ignored and the
+                // original write error is what gets surfaced.
+                let _ = std::fs::remove_file(&gitignore);
+                return Err(e);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(e) => Err(e),
+            Ok(())
         }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
     }
 }
 

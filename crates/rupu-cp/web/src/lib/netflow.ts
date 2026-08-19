@@ -137,8 +137,12 @@ export interface HostRollup {
 export interface NetflowResponse {
   flows: FlowView[];
   hosts: HostRollup[];
-  /** Records lost to writer overflow, for the WHOLE ledger file — NOT
-   *  scoped to `?from=`/`?to=` when a time filter is applied. A drop batch
+  /** Records lost to writer overflow, for the WHOLE ledger file(s) this
+   *  response reads — NOT scoped to `?from=`/`?to=` when a time filter is
+   *  applied. At run scope this is already a sum across more than one
+   *  file whenever the run dispatched a step or a sub-agent (see
+   *  `rupu_cp::api::netflow::run_and_unit_ids`); project/global scope sum
+   *  across every contributing run's ledger on top of that. A drop batch
    *  carries no per-record timestamp, so it can never be attributed to a
    *  window; this count is the same value regardless of which (if any)
    *  filter produced `flows`. Named `dropped_total` (not `dropped`) so a

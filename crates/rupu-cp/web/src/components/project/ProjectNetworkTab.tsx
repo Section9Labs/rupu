@@ -11,14 +11,19 @@
 // `ScopeDisclosure.tsx`'s header comment and
 // `rupu_cp::api::netflow::get_project_netflow`'s doc comment.
 //
-// KNOWN GAP (Blocker 1, whole-branch review): `get_project_netflow` reads
-// only `<workspace>/.rupu/netflow/`, and nothing creates that directory on
-// `rupu init` — so on a default install this scope is EMPTY for every
-// project, even ones with real captured runs, because those runs' ledgers
-// all landed at the global fallback instead. `NetflowTable`'s empty-state
-// hint (`scope="project"`) says so explicitly; this comment is not a
-// substitute for reading that fix — see
-// `ScopeDisclosure.tsx`'s `netflowEmptyStateHint`.
+// FIXED (previously Blocker 1, whole-branch review): `get_project_netflow`
+// used to read ONLY `<workspace>/.rupu/netflow/`, and nothing created that
+// directory on `rupu init` — so on a default install this scope was EMPTY
+// for every project, even ones with real captured runs, because those
+// runs' ledgers all landed at the global fallback instead. Two fixes
+// close this: `rupu init` now creates `.rupu/netflow/` for every NEW
+// project (`crates/rupu-cli/src/cmd/init.rs`'s `ensure_netflow_dir`), and
+// `get_project_netflow` now ALSO runs an id-driven recovery pass over the
+// global fallback root for EXISTING projects' own runs
+// (`project_scoped_flows_and_dropped`) — see that function's doc comment
+// for the mechanism, cost, and the two cases it deliberately still cannot
+// recover (an unattributable `run_id: None` flow, or an orphaned ledger
+// whose run record is gone).
 //
 // Mirrors ProjectCoverageTab's shape: self-fetches on the `wsId` prop, no
 // filter chips. This tab body only mounts while "Network" is the active

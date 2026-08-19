@@ -730,13 +730,18 @@ async fn project_netflow_does_not_leak_a_legacy_daemon_wide_ledger_file() {
 
 // ── Critical-fix regression tests: global-fallback routing ────────────────
 //
-// On a fresh install `<project>/.rupu/netflow/` never gets created (`rupu
-// init` only ever adds a `.gitignore` entry there -- see `rupu_netflow::
-// netflow_dir`'s doc comment), so EVERY run's ledger actually lands in
+// `rupu init` now creates `<project>/.rupu/netflow/` for a NEW project
+// (`crates/rupu-cli/src/cmd/init.rs`'s `ensure_netflow_dir`), but every
+// project initialised before that change -- or never `rupu init`'d at all
+// -- still has `<project>/.rupu/netflow/` missing, and there is no way to
+// retroactively create it for old runs short of re-running `init` (which
+// only helps runs dispatched AFTER it runs). These fixtures below
+// deliberately don't call `init` at all, simulating exactly that
+// pre-existing-project shape: EVERY run's ledger lands in
 // `<global_dir>/netflow/<run_id>.jsonl`, not under any registered
-// workspace. These prove the read side now mirrors that write-side
-// routing rule, rather than only ever finding project-rooted ledgers a
-// fresh install never produces.
+// workspace's own directory. These prove the read side mirrors that
+// write-side routing rule, rather than only ever finding project-rooted
+// ledgers such a project never produces.
 
 #[tokio::test]
 async fn global_netflow_includes_a_run_that_fell_back_to_the_global_netflow_dir() {
@@ -1027,6 +1032,781 @@ async fn run_netflow_sums_dropped_counts_across_a_dispatched_steps_own_ledger() 
     assert!(
         flows.iter().any(|f| f["host"] == "api.github.com"),
         "the dispatched step's own flow must surface too: {body}"
+    );
+}
+
+// ── Run scope: dispatched sub-agents (recursive) ───────────────────────────
+//
+// A `dispatch_agent` sub-run gets its OWN per-run ledger, written under the
+// exact same netflow root as the dispatching run (`netflow_sink::for_run`
+// in `rupu-cli`'s `cmd/dispatch.rs` is handed the same `global`/
+// `project_root` the parent used) — but until `RunStore::sub_run_ids`/
+// `sub_run_ids_recursive` existed, nothing on the read side ever looked
+// for it: `run_and_unit_ids` only ever harvested ids from
+// `step_results.jsonl`, which a sub-agent dispatch never writes to (that's
+// the DAG-scheduled STEP path, a different mechanism). These tests use the
+// real `RunStore::create_sub_run` (not a hand-rolled directory) so they
+// exercise the actual on-disk layout dispatch produces.
+
+#[tokio::test]
+async fn run_netflow_includes_a_dispatched_sub_agents_flows_and_dropped_count() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_sub_agent";
+
+    write_ledger(
+        project.path(),
+        run_id,
+        &[LedgerLine::Dropped {
+            count: 5,
+            ts: chrono::Utc::now(),
+        }],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let (sub_run_id, _transcript) = state.run_store.create_sub_run(run_id, "fixer").unwrap();
+
+    let sub_flow = e2e_flow(
+        FlowId::new(),
+        Some(&sub_run_id),
+        "api.anthropic.com",
+        Origin::Provider("anthropic".into()),
+    );
+    write_ledger(
+        project.path(),
+        &sub_run_id,
+        &[
+            LedgerLine::Flow(Box::new(sub_flow)),
+            LedgerLine::Dropped {
+                count: 7,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["dropped_total"], 12,
+        "must sum the run's own ledger (5) AND its dispatched sub-agent's own \
+         ledger (7): {body}"
+    );
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.anthropic.com"),
+        "the sub-agent's own flow must surface at the parent's run scope: {body}"
+    );
+}
+
+/// The Critical fix-round-1 case: a sub-agent dispatched from INSIDE a
+/// fan-out unit. `for_each`/`parallel`/panel each mint a fresh unit run
+/// id (`step_factory.rs` hands it down as `ToolContext.parent_run_id`),
+/// so a `dispatch_agent` call made from within that unit's own agent run
+/// calls `create_sub_run(unit_id, ...)`, not `create_sub_run(run_id, ...)`
+/// — the sub-run lives at `<root>/<unit_id>/sub/`, a directory
+/// `sub_run_ids_recursive(run_id)` alone never visits (it only starts
+/// from the TOP-level run id). `run_and_unit_ids` must recurse from
+/// EVERY id it already collects (the run id AND each step/item id), not
+/// just the run id, or a sub-agent dispatched from a fan-out unit keeps
+/// exactly the invisibility this task exists to remove.
+#[tokio::test]
+async fn run_netflow_includes_a_sub_agent_dispatched_from_a_fan_out_unit() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_fan_out_sub_agent";
+    let unit_run_id = "run_fan_out_unit";
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let unit_transcript = project
+        .path()
+        .join(".rupu")
+        .join("transcripts")
+        .join("unit.jsonl");
+    JsonlWriter::create(&unit_transcript).unwrap();
+    state
+        .run_store
+        .append_step_result(run_id, &seed_step(unit_run_id, unit_transcript))
+        .unwrap();
+
+    // The unit's OWN agent run dispatches a sub-agent — parented on the
+    // UNIT's id, exactly as `step_factory.rs`'s `ToolContext.parent_run_id`
+    // wiring does for a real `for_each`/`parallel`/panel unit.
+    let (sub_of_unit, _) = state
+        .run_store
+        .create_sub_run(unit_run_id, "fixer")
+        .unwrap();
+
+    write_ledger(
+        project.path(),
+        &sub_of_unit,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(&sub_of_unit),
+                "api.fanout-sub.example",
+                Origin::Provider("anthropic".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 4,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.fanout-sub.example"),
+        "a sub-agent dispatched from inside a fan-out unit must surface at \
+         the top-level run's netflow view: {body}"
+    );
+    assert_eq!(
+        body["dropped_total"], 4,
+        "its ledger-only Dropped count, which has no transcript fallback, \
+         must also surface: {body}"
+    );
+}
+
+/// The decisive nested case: a sub-agent that itself dispatches a
+/// sub-agent (two levels deep). Both levels' flows AND drop counts must
+/// surface at the top parent's run scope.
+#[tokio::test]
+async fn run_netflow_reaches_a_nested_sub_agents_sub_agent() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_nested_sub_agents";
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let (child_id, _) = state
+        .run_store
+        .create_sub_run(run_id, "researcher")
+        .unwrap();
+    let (grandchild_id, _) = state.run_store.create_sub_run(&child_id, "fixer").unwrap();
+
+    write_ledger(
+        project.path(),
+        &child_id,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(&child_id),
+                "api.github.com",
+                Origin::Scm("github".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 2,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+    write_ledger(
+        project.path(),
+        &grandchild_id,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(&grandchild_id),
+                "api.openai.com",
+                Origin::Provider("openai".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 3,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.github.com"),
+        "the first-level sub-agent's flow must surface: {body}"
+    );
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.openai.com"),
+        "the SECOND-level (grandchild) sub-agent's flow must also surface: {body}"
+    );
+    assert_eq!(
+        body["dropped_total"], 5,
+        "must sum both levels' own dropped counts (2 + 3): {body}"
+    );
+}
+
+/// Attribution safety: a sub-run dispatched under a DIFFERENT parent run
+/// must never appear in this run's netflow view, even though both
+/// ledgers live in the same netflow directory.
+#[tokio::test]
+async fn run_netflow_does_not_leak_a_sub_agent_belonging_to_a_different_parent() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_a = "run_a_with_sub_agent";
+    let run_b = "run_b_with_sub_agent";
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_a, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    state
+        .run_store
+        .create(
+            seed_run(run_b, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let (sub_of_a, _) = state.run_store.create_sub_run(run_a, "agent").unwrap();
+    let (sub_of_b, _) = state.run_store.create_sub_run(run_b, "agent").unwrap();
+
+    write_ledger(
+        project.path(),
+        &sub_of_a,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(&sub_of_a),
+            "a.example",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+    write_ledger(
+        project.path(),
+        &sub_of_b,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(&sub_of_b),
+            "b.example",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_a}/netflow"))
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(flows.iter().any(|f| f["host"] == "a.example"));
+    assert!(
+        !flows.iter().any(|f| f["host"] == "b.example"),
+        "run A's netflow view must never include run B's sub-agent's flow: {body}"
+    );
+}
+
+// ── Project scope: id-driven global-fallback recovery ─────────────────────
+//
+// `get_project_netflow` used to read ONLY `<workspace>/.rupu/netflow/`
+// (the whole-directory scan) -- so on every default install, where `rupu
+// init` never created that directory, every run's ledger landed at the
+// global fallback and project scope was empty for every project, forever
+// (`ScopeDisclosure.tsx`'s old `netflowEmptyStateHint` said so explicitly).
+// `project_scoped_flows_and_dropped` now ALSO runs an id-driven pass over
+// the global fallback root, scoped to run ids this project's OWN run
+// records name via their `workspace_path` field -- never inferred from
+// scanning the global directory's file names. These tests prove both the
+// recovery AND that it stays attribution-safe.
+
+#[tokio::test]
+async fn project_netflow_recovers_a_run_whose_ledger_fell_back_to_the_global_dir() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_fallback_project_scoped";
+
+    // Deliberately do NOT create `<project>/.rupu/netflow/` -- the
+    // fresh-install shape: this run's ledger lives only at the global
+    // fallback path.
+    write_global_ledger(
+        global.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(run_id),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(
+        flows.len(),
+        1,
+        "project scope must recover a run whose ledger fell back to the global dir: {body}"
+    );
+    assert_eq!(flows[0]["host"], "api.anthropic.com");
+}
+
+/// The failure mode worse than the empty tab this replaces: a project
+/// scope showing a flow that belongs to some OTHER project. Two projects
+/// are registered; only project B has a run record (`workspace_path ==
+/// project_b`) whose ledger fell back to the global dir. Project A's own
+/// scope must stay empty -- attribution comes from B's run record naming
+/// B's own workspace, never from A merely sharing the same global
+/// fallback directory.
+#[tokio::test]
+async fn project_netflow_does_not_recover_a_different_projects_run_from_the_global_dir() {
+    let global = tempfile::tempdir().unwrap();
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+    let run_id = "run_belongs_to_b";
+
+    write_global_ledger(
+        global.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(run_id),
+            "api.b-only.example",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws_a = rupu_workspace::upsert(&ws_store, project_a.path()).unwrap();
+    rupu_workspace::upsert(&ws_store, project_b.path()).unwrap();
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project_b.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws_a.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["flows"].as_array().unwrap().len(),
+        0,
+        "project A must never see project B's run just because both ledgers \
+         share the same global fallback directory: {body}"
+    );
+}
+
+/// The DAG scheduler mints a fresh id per dispatched step/unit, so its
+/// flows land in `<id>.jsonl`, never the parent workflow run's own file
+/// (see `run_and_unit_ids`). A project-scope recovery pass that only
+/// looked up the workflow run's own id would miss it.
+#[tokio::test]
+async fn project_netflow_recovers_a_dispatched_steps_own_global_fallback_ledger() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_step_fallback";
+    let step_run_id = "run_step_fallback_own_id";
+
+    write_global_ledger(
+        global.path(),
+        step_run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(step_run_id),
+            "api.github.com",
+            Origin::Scm("github".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let step_transcript = project
+        .path()
+        .join(".rupu")
+        .join("transcripts")
+        .join("s1.jsonl");
+    JsonlWriter::create(&step_transcript).unwrap();
+    state
+        .run_store
+        .append_step_result(run_id, &seed_step(step_run_id, step_transcript))
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.github.com"),
+        "a dispatched step's own global-fallback ledger must surface at project scope: {body}"
+    );
+}
+
+/// A run recorded in the PROJECT-LOCAL store (`<workspace>/.rupu/runs/`,
+/// not the global one -- `resolve_run_location`'s `ProjectLocal` branch)
+/// whose ledger still fell back to the global dir. Proves the recovery
+/// pass enumerates both stores, not just the global one.
+#[tokio::test]
+async fn project_netflow_recovers_a_project_local_run_whose_ledger_fell_back_to_global() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_project_local_fallback";
+
+    write_global_ledger(
+        global.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(run_id),
+            "api.project-local.example",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+
+    let local_store =
+        rupu_orchestrator::runs::RunStore::new(project.path().join(".rupu").join("runs"));
+    local_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows
+            .iter()
+            .any(|f| f["host"] == "api.project-local.example"),
+        "a project-local-store run's global-fallback ledger must surface too: {body}"
+    );
+}
+
+/// Fix round 1, Important 1: the dispatched-step counterpart of the test
+/// above. A run recorded in the PROJECT-LOCAL store dispatches a step
+/// whose own id gets a SEPARATE global-fallback ledger — the parent run's
+/// own id has no ledger at all, so this only passes if the step's id is
+/// looked up via `run_and_unit_ids` against the PROJECT-LOCAL store's own
+/// `step_results.jsonl`, not the global store's (which has no record of
+/// this run and would silently resolve to nothing beyond the parent id).
+#[tokio::test]
+async fn project_netflow_recovers_a_project_local_runs_dispatched_step_global_fallback_ledger() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_project_local_with_step";
+    let step_run_id = "run_project_local_step_own_id";
+
+    // Deliberately NO ledger for `run_id` itself -- only the dispatched
+    // step's own id has one. If the id-driven pass fell back to
+    // resolving units against the wrong store, it would find zero units
+    // for this run and this flow would never surface.
+    write_global_ledger(
+        global.path(),
+        step_run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(step_run_id),
+            "api.project-local-step.example",
+            Origin::Scm("github".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+
+    let local_store =
+        rupu_orchestrator::runs::RunStore::new(project.path().join(".rupu").join("runs"));
+    local_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let step_transcript = project
+        .path()
+        .join(".rupu")
+        .join("transcripts")
+        .join("s1.jsonl");
+    JsonlWriter::create(&step_transcript).unwrap();
+    local_store
+        .append_step_result(run_id, &seed_step(step_run_id, step_transcript))
+        .unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows
+            .iter()
+            .any(|f| f["host"] == "api.project-local-step.example"),
+        "a project-local run's dispatched step's own global-fallback ledger \
+         must surface -- units must be resolved against the store the run id \
+         actually came from: {body}"
+    );
+}
+
+/// The two "correct absence" cases the recovery pass deliberately does NOT
+/// fix, alongside proof that a real fallback flow for the same project
+/// still surfaces: (1) a `run_id: None` flow sitting under an id with no
+/// run record anywhere is unattributable and stays invisible at project
+/// scope; (2) an orphaned ledger (its owning run's record has been
+/// deleted) is likewise never resurrected. Neither is a bug -- there is no
+/// run record to enumerate either id from.
+#[tokio::test]
+async fn project_netflow_does_not_recover_unattributable_or_orphaned_global_ledgers() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let real_run_id = "run_real_and_attributed";
+
+    // A real, attributed run -- must surface.
+    write_global_ledger(
+        global.path(),
+        real_run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(real_run_id),
+            "api.attributed.example",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+    // An orphan: a ledger file with no run record behind it at all (e.g.
+    // the run was deleted, or a `run_id: None` system-origin flow that
+    // was never tied to a run to begin with).
+    write_global_ledger(
+        global.path(),
+        "run_no_record_at_all",
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            None,
+            "api.orphaned.example",
+            Origin::Scm("github".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(real_run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    let hosts: std::collections::HashSet<&str> =
+        flows.iter().map(|f| f["host"].as_str().unwrap()).collect();
+    assert!(
+        hosts.contains("api.attributed.example"),
+        "the real, attributed run must still surface: {body}"
+    );
+    assert!(
+        !hosts.contains("api.orphaned.example"),
+        "an orphaned/unattributable ledger with no run record must stay invisible \
+         at project scope, not be swept in just because it's in the global dir: {body}"
+    );
+    assert_eq!(flows.len(), 1, "exactly the one attributed flow: {body}");
+}
+
+/// The `$HOME`/`RUPU_HOME` collision (mirrors `global_netflow_does_not_
+/// double_count_when_a_workspace_ledger_dir_is_the_global_one`): when a
+/// workspace is registered at `$HOME` and `global_dir` is the default
+/// `~/.rupu`, `<workspace>/.rupu/netflow/` and `<global_dir>/netflow/`
+/// are the SAME directory. The whole-directory scan already reads every
+/// file in it; the id-driven fallback pass must not read it a second
+/// time, or this flow (and its dropped count) would be double-counted.
+#[tokio::test]
+async fn project_netflow_does_not_double_count_when_workspace_and_global_netflow_dirs_collide() {
+    let home = tempfile::tempdir().unwrap();
+    let global = home.path().join(".rupu");
+    std::fs::create_dir_all(&global).unwrap();
+    let run_id = "run_home_collision";
+
+    write_global_ledger(
+        &global,
+        run_id,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(run_id),
+                "api.anthropic.com",
+                Origin::Provider("anthropic".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 4,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, home.path()).unwrap();
+
+    let state = new_state(&global);
+    state
+        .run_store
+        .create(
+            seed_run(run_id, home.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["flows"].as_array().unwrap().len(),
+        1,
+        "must not be double-counted when workspace-local and global netflow dirs collide: {body}"
+    );
+    assert_eq!(
+        body["dropped_total"], 4,
+        "dropped must not be doubled either: {body}"
+    );
+}
+
+/// The graph endpoint's `project:` scope must recover global-fallback
+/// flows too -- it shares `project_scoped_flows_and_dropped` with the
+/// table endpoint precisely so the two never drift apart on this.
+#[tokio::test]
+async fn netflow_graph_project_scope_recovers_a_global_fallback_run() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_graph_fallback";
+
+    write_global_ledger(
+        global.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(run_id),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/netflow/graph?scope=project:{}",
+        ws.id
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["label"] == "api.anthropic.com" || n["id"] == "api.anthropic.com"),
+        "graph project scope must include the recovered global-fallback flow's endpoint: {body}"
     );
 }
 

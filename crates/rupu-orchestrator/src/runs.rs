@@ -819,6 +819,16 @@ pub struct RunStore {
     pub root: PathBuf,
 }
 
+/// Defensive ceiling on [`RunStore::sub_run_ids_recursive`]'s descent,
+/// independent of `rupu-tools::dispatch_agent::MAX_DEPTH` (currently 5,
+/// the real ceiling on how deep an actual dispatch tree can ever grow —
+/// this crate has no dependency on `rupu-tools` and must not gain one
+/// just for a constant). This exists purely so a hand-edited or
+/// symlink-produced `sub/` directory tree can never make that walk
+/// recurse without bound; it is deliberately far more generous than any
+/// real dispatch tree should ever reach.
+const MAX_SUB_RUN_RECURSION_DEPTH: u32 = 64;
+
 impl RunStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -842,8 +852,18 @@ impl RunStore {
 
     /// Sub-run directory: lives under the parent's run dir so cleanup
     /// follows parent lifecycle. See spec § 5.1.
+    /// The `sub/` directory a given id's own sub-runs live under —
+    /// `<root>/<id>/sub/`. Shared by [`Self::sub_run_dir`] (which appends
+    /// one more sub-run id) and [`Self::sub_run_ids`] (which lists it), so
+    /// a future layout change to this one path component can't drift the
+    /// write side and the read side apart the way two independent
+    /// `.join("sub")` call sites could.
+    fn sub_dir(&self, parent_run_id: &str) -> PathBuf {
+        self.run_dir(parent_run_id).join("sub")
+    }
+
     fn sub_run_dir(&self, parent_run_id: &str, sub_run_id: &str) -> PathBuf {
-        self.run_dir(parent_run_id).join("sub").join(sub_run_id)
+        self.sub_dir(parent_run_id).join(sub_run_id)
     }
 
     fn sub_run_transcript(&self, parent_run_id: &str, sub_run_id: &str) -> PathBuf {
@@ -935,6 +955,138 @@ impl RunStore {
         // races during testing).
         File::create(&transcript)?;
         Ok((sub_run_id, transcript))
+    }
+
+    /// Immediate sub-run ids of `run_id` — one directory-listing level of
+    /// `<runs>/<run_id>/sub/`, the exact directory [`Self::create_sub_run`]
+    /// writes into (see [`Self::sub_run_dir`]). This is the public
+    /// enumeration `rupu-cp`'s netflow read path (and any other future
+    /// consumer) needs to discover a run's dispatched sub-agents — there
+    /// was previously no way to list them at all, only to compute a path
+    /// for an id you already had.
+    ///
+    /// Degrades to an empty vec for a run with no sub-runs, a `sub/`
+    /// directory that doesn't exist yet, or one that can't be read
+    /// (permissions, races) — matches every other read in this store:
+    /// missing data is not an error here, only genuinely malformed input
+    /// would be, and there is no such input for a directory listing.
+    /// Order is whatever `read_dir` yields, not guaranteed stable.
+    ///
+    /// A degrade past "the directory simply doesn't exist" (the ordinary
+    /// case for a run with no sub-runs) is logged at debug — mirrors
+    /// `netflow_sink::for_run`'s precedent for a best-effort capture
+    /// degrade. This subsystem exists to eliminate "traffic with no
+    /// record and no error"; a permissions failure that silently hides a
+    /// sub-agent's ledger (and its unrecoverable `Dropped` count) from
+    /// every caller of [`Self::sub_run_ids_recursive`] would be exactly
+    /// that, with nothing anywhere to notice it happened.
+    pub fn sub_run_ids(&self, run_id: &str) -> Vec<String> {
+        let dir = self.sub_dir(run_id);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(
+                        run_id,
+                        path = ?dir,
+                        error = %e,
+                        "sub-run directory unreadable; any sub-agent ledger under it \
+                         (and its Dropped count) is invisible to this read"
+                    );
+                }
+                return Vec::new();
+            }
+        };
+        entries
+            .filter_map(|entry| {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        tracing::debug!(
+                            run_id,
+                            error = %e,
+                            "unreadable entry in a sub-run directory listing; skipped"
+                        );
+                        return None;
+                    }
+                };
+                // `file_type()` reuses the `dirent` info `read_dir` already
+                // fetched on platforms that provide it, rather than
+                // `entry.path().is_dir()`'s extra `stat` per entry. A type
+                // that can't be determined (rare — a race, or a filesystem
+                // that doesn't report it) is logged and skipped rather than
+                // silently treated as "not a directory": the entry's ledger
+                // may be perfectly readable even though its type wasn't.
+                match entry.file_type() {
+                    Ok(ft) if ft.is_dir() => entry.file_name().into_string().ok(),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::debug!(
+                            run_id,
+                            path = ?entry.path(),
+                            error = %e,
+                            "could not determine file type for a sub-run directory \
+                             entry; skipped even though its ledger may be readable"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Every sub-run id reachable from `run_id`, at any depth: a
+    /// dispatched sub-agent can itself dispatch sub-agents (up to
+    /// `rupu-tools::dispatch_agent::MAX_DEPTH`, currently 5 — this crate
+    /// has no dependency on `rupu-tools` and must not gain one just to
+    /// reference that constant, so [`MAX_SUB_RUN_RECURSION_DEPTH`] below
+    /// is deliberately its own, more generous, backstop rather than a
+    /// mirror of it).
+    ///
+    /// Reaching the whole tree means re-querying [`Self::sub_run_ids`]
+    /// once per discovered id, NOT walking the literal filesystem tree
+    /// from `run_id`'s own directory: `sub_run_dir`'s doc comment notes
+    /// each level's `sub/` directory is keyed off that level's bare id,
+    /// under the store's root, not nested inside the physical parent
+    /// path — so a grandchild's directory is `<root>/<child_id>/sub/`,
+    /// not `<root>/<run_id>/sub/<child_id>/sub/`. This walk mirrors that
+    /// scheme exactly.
+    ///
+    /// This data comes from disk — possibly hand-edited or reached
+    /// through a symlink — so two defenses apply, per the task's "don't
+    /// trust the data" requirement:
+    /// - **Cycles**: a `visited` set records every id already expanded;
+    ///   an id seen again (however it's reached) is never re-expanded,
+    ///   so a directory graph with a cycle still terminates and each id
+    ///   is queried exactly once.
+    /// - **Pathological depth**: even with no repeated id, descent stops
+    ///   at [`MAX_SUB_RUN_RECURSION_DEPTH`] rather than recursing without
+    ///   bound. Hitting the cap silently truncates that branch — a
+    ///   partial result is safer than a hung or failing request, and no
+    ///   real dispatch tree should ever come close to the cap.
+    ///
+    /// Sound against cross-parent misattribution: `sub_run_id`s are
+    /// `sub_<ULID>`, effectively globally unique, so `<root>/<id>/sub/`
+    /// can only ever have been populated by a dispatch that used `id` as
+    /// its own `parent_run_id` — i.e. a true descendant of `run_id`.
+    /// Starting the walk anywhere else could never reach it.
+    pub fn sub_run_ids_recursive(&self, run_id: &str) -> Vec<String> {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(run_id.to_string());
+        let mut out = Vec::new();
+        let mut frontier = vec![(run_id.to_string(), 0u32)];
+        while let Some((id, depth)) = frontier.pop() {
+            if depth >= MAX_SUB_RUN_RECURSION_DEPTH {
+                continue;
+            }
+            for child in self.sub_run_ids(&id) {
+                if visited.insert(child.clone()) {
+                    out.push(child.clone());
+                    frontier.push((child, depth + 1));
+                }
+            }
+        }
+        out
     }
 
     /// Load a run by id.
@@ -5079,5 +5231,164 @@ mod tests {
         r.event = Some(serde_json::json!({}));
         r.source_wake_id = Some("wake_1".into());
         assert_eq!(r.trigger_str(), "event");
+    }
+
+    // ── sub-run enumeration ─────────────────────────────────────────────
+
+    #[test]
+    fn sub_run_ids_lists_direct_children() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(sample_record("run_parent"), "name: wf\nsteps: []\n")
+            .unwrap();
+
+        let (child_a, _) = store.create_sub_run("run_parent", "agent-a").unwrap();
+        let (child_b, _) = store.create_sub_run("run_parent", "agent-b").unwrap();
+
+        let mut ids = store.sub_run_ids("run_parent");
+        ids.sort();
+        let mut expected = vec![child_a, child_b];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn sub_run_ids_of_a_run_with_no_sub_runs_is_empty_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(sample_record("run_lonely"), "name: wf\nsteps: []\n")
+            .unwrap();
+
+        assert!(store.sub_run_ids("run_lonely").is_empty());
+        assert!(store.sub_run_ids("run_never_existed").is_empty());
+    }
+
+    /// The decisive nested case: a sub-agent that itself dispatches a
+    /// sub-agent. `create_sub_run`'s own directory scheme keys a level's
+    /// `sub/` directory off that level's bare id (see its doc comment),
+    /// not off the physical parent path, so the grandchild's dir lives at
+    /// `<root>/<child_id>/sub/<grandchild_id>/` — a location
+    /// `sub_run_ids_recursive` must re-query per discovered id, not reach
+    /// by walking the literal filesystem tree from the parent's own dir.
+    #[test]
+    fn sub_run_ids_recursive_reaches_a_grandchild() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(sample_record("run_root"), "name: wf\nsteps: []\n")
+            .unwrap();
+
+        let (child, _) = store.create_sub_run("run_root", "agent-a").unwrap();
+        let (grandchild, _) = store.create_sub_run(&child, "agent-b").unwrap();
+
+        let ids = store.sub_run_ids_recursive("run_root");
+        assert!(ids.contains(&child), "expected {child} in {ids:?}");
+        assert!(
+            ids.contains(&grandchild),
+            "expected {grandchild} in {ids:?}"
+        );
+        assert_eq!(ids.len(), 2, "no duplicates, no unrelated ids: {ids:?}");
+    }
+
+    #[test]
+    fn sub_run_ids_recursive_reaches_a_great_grandchild() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(sample_record("run_root"), "name: wf\nsteps: []\n")
+            .unwrap();
+
+        let (c1, _) = store.create_sub_run("run_root", "a1").unwrap();
+        let (c2, _) = store.create_sub_run(&c1, "a2").unwrap();
+        let (c3, _) = store.create_sub_run(&c2, "a3").unwrap();
+
+        let ids = store.sub_run_ids_recursive("run_root");
+        assert!(ids.contains(&c1));
+        assert!(ids.contains(&c2));
+        assert!(ids.contains(&c3));
+    }
+
+    /// A second, unrelated parent's sub-run must never appear when
+    /// enumerating the first parent's tree — the attribution-safety
+    /// property this whole feature depends on (sub-run ids are ULIDs, so
+    /// this also proves there's no accidental string-prefix matching
+    /// anywhere in the walk).
+    #[test]
+    fn sub_run_ids_recursive_does_not_cross_into_a_different_parents_tree() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(sample_record("run_a"), "name: wf\nsteps: []\n")
+            .unwrap();
+        store
+            .create(sample_record("run_b"), "name: wf\nsteps: []\n")
+            .unwrap();
+
+        let (child_a, _) = store.create_sub_run("run_a", "agent").unwrap();
+        let (child_b, _) = store.create_sub_run("run_b", "agent").unwrap();
+
+        let ids_a = store.sub_run_ids_recursive("run_a");
+        assert!(ids_a.contains(&child_a));
+        assert!(!ids_a.contains(&child_b));
+    }
+
+    /// A hand-edited (or symlink-produced) cycle in the `sub/` directory
+    /// graph must not hang the enumeration. Constructed directly on disk
+    /// (not through `create_sub_run`, which can never produce a cycle on
+    /// its own) since this is exactly the "don't trust the data" case the
+    /// task calls out.
+    #[test]
+    fn sub_run_ids_recursive_terminates_on_a_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(sample_record("run_root"), "name: wf\nsteps: []\n")
+            .unwrap();
+
+        // run_root -> A -> B -> A (cycle back to A).
+        std::fs::create_dir_all(tmp.path().join("run_root").join("sub").join("A")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("A").join("sub").join("B")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("B").join("sub").join("A")).unwrap();
+
+        let ids = store.sub_run_ids_recursive("run_root");
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted,
+            vec!["A".to_string(), "B".to_string()],
+            "cycle must be visited once each, not hang or duplicate: {ids:?}"
+        );
+    }
+
+    /// A chain of distinct ids (not a repeated id, so the visited-set
+    /// guard alone wouldn't stop it) deeper than any real dispatch tree
+    /// should ever reach must still terminate rather than recurse without
+    /// bound.
+    #[test]
+    fn sub_run_ids_recursive_terminates_on_pathological_depth() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(sample_record("run_root"), "name: wf\nsteps: []\n")
+            .unwrap();
+
+        let mut prev = "run_root".to_string();
+        for i in 0..500 {
+            let next = format!("depth_{i}");
+            std::fs::create_dir_all(tmp.path().join(&prev).join("sub").join(&next)).unwrap();
+            prev = next;
+        }
+
+        // Must return promptly (no hang) with a bounded, non-empty result.
+        let ids = store.sub_run_ids_recursive("run_root");
+        assert!(!ids.is_empty());
+        assert!(
+            ids.len() < 500,
+            "recursion must stop well short of the full pathological chain: {} ids",
+            ids.len()
+        );
     }
 }

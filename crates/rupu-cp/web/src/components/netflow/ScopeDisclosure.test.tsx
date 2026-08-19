@@ -63,12 +63,16 @@ describe('netflowCoverageList', () => {
 });
 
 describe('netflowEmptyStateHint', () => {
-  // Blocker 1, whole-branch review: nothing creates
-  // `<workspace>/.rupu/netflow/` on `rupu init`, so on a default install a
-  // project's own scope is empty even for a project with real, captured
-  // runs — the flows landed at global scope instead. Only project scope's
-  // hint may point the operator at the global Network view; run and
-  // global scope have no such gap to disclose.
+  // FIXED (previously Blocker 1, whole-branch review): `get_project_netflow`
+  // now recovers a project's own runs whose ledgers fell back to the
+  // global directory (`project_scoped_flows_and_dropped`), on top of
+  // `rupu init` creating `.rupu/netflow/` for new projects
+  // (`cmd/init.rs`'s `ensure_netflow_dir`) — so an empty project scope no
+  // longer means "check global scope instead". Only project scope's hint
+  // still names "global scope" at all, but now to explain WHAT the empty
+  // result already covers (both its own directory and the recovered
+  // fallback), not to send the operator elsewhere; run and global scope
+  // have no such distinction to draw.
   it.each(SCOPES)('names the global-scope fallback only at project scope, not %s', (scope) => {
     if (scope === 'project') {
       expect(netflowEmptyStateHint(scope)).toMatch(/global scope/i);
@@ -104,6 +108,32 @@ describe('netflowSystemSourceHint', () => {
     expect(netflowSystemSourceHint(scope)).not.toMatch(/system for unattributed egress/i);
     expect(netflowSystemSourceHint(scope)).toMatch(/runs/i);
   });
+});
+
+describe('NetflowScopeDisclosure sub-agent note', () => {
+  // Run scope's flows/dropped_total now fold in every sub-agent this run
+  // dispatched, at any depth (`RunStore::sub_run_ids_recursive`) — the
+  // operator-facing text must say so on THIS surface, the one place every
+  // netflow scope-limit sentence is authored, or "this run's netflow"
+  // silently reads as "only this run's own provider calls" while actually
+  // including everything its sub-agents did too.
+  it('names sub-agent dispatch at run scope', () => {
+    render(<NetflowScopeDisclosure scope="run" />);
+    expect(screen.getByText(/sub-agents/i)).toBeInTheDocument();
+  });
+
+  it.each(['project', 'global'] as NetflowScope[])(
+    'does not repeat the run-scope sub-agent note at %s scope',
+    (scope) => {
+      // Project/global scope already union every contributing run's own
+      // ledger directory-wide (`read_all_run_ledgers_in_dir`) — a
+      // sub-agent's ledger file is just one more file in that union, with
+      // no separate "folded from a parent" wrinkle to call out there the
+      // way run scope's id-driven fold needs explaining.
+      render(<NetflowScopeDisclosure scope={scope} />);
+      expect(screen.queryByText(/sub-agents/i)).not.toBeInTheDocument();
+    },
+  );
 });
 
 describe('NetflowScopeDisclosure', () => {
