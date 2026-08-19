@@ -36,6 +36,15 @@ fn rupu_init_with_samples_smoke() {
         stdout.contains("init: created"),
         "stdout missing tally line: {stdout}"
     );
+    // The netflow opt-in is the visible signal that rupu-cp's
+    // project-scoped Network tab will now work for this project -- it
+    // must show up as its own CREATED line and count toward the tally,
+    // the same as .rupu/config.toml does, not be silently folded into
+    // the `.rupu/agents`/`.rupu/workflows` directories' silent creation.
+    assert!(
+        stdout.contains("CREATED .rupu/netflow"),
+        "stdout missing the netflow directory's own CREATED line: {stdout}"
+    );
 
     // Spot-check a couple of files actually exist.
     assert!(tmp.path().join(".rupu/agents/review-diff.md").exists());

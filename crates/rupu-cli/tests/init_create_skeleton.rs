@@ -60,3 +60,41 @@ fn creates_the_project_local_netflow_directory_so_it_routes_locally() {
         "expected the netflow dir's own self-ignoring .gitignore, got: {gitignore:?}"
     );
 }
+
+/// Fix round 1, Minor 1: re-running `init` on an already-opted-in project
+/// must report SKIPPED for the netflow directory, not silently re-count
+/// it as CREATED — mirrors `.rupu/config.toml`'s existing-file handling.
+/// Exercised via the actual binary (`Command`, like `init_smoke.rs`)
+/// because the printed CREATED/SKIPPED lines aren't observable through
+/// `init_for_test`'s `Result`-only return.
+#[test]
+fn rerunning_init_reports_the_netflow_directory_as_skipped_not_created_again() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_rupu"))
+        .args(["init", tmp.path().to_str().unwrap()])
+        .output()
+        .expect("spawn rupu (first init)");
+    assert!(first.status.success());
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_stdout.contains("CREATED .rupu/netflow"),
+        "first init should report the netflow directory as newly created: {first_stdout}"
+    );
+
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_rupu"))
+        .args(["init", tmp.path().to_str().unwrap()])
+        .output()
+        .expect("spawn rupu (second init)");
+    assert!(second.status.success());
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second_stdout.contains("SKIPPED .rupu/netflow"),
+        "re-running init on an already-opted-in project should report SKIPPED, \
+         not silently re-create: {second_stdout}"
+    );
+    assert!(
+        !second_stdout.contains("CREATED .rupu/netflow"),
+        "re-running init must not re-report the netflow directory as CREATED: {second_stdout}"
+    );
+}

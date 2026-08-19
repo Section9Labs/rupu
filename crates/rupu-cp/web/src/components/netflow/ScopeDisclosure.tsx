@@ -139,8 +139,9 @@ export function netflowEmptyStateHint(scope: NetflowScope): string {
   const generic = `Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}. It does not cover traffic from the agent's bash subprocess.`;
   if (scope !== 'project') return generic;
   return (
-    `This covers both this project's own .rupu/netflow/ directory and any of its runs' ` +
-    `ledgers that fell back to global scope before that directory existed. ${generic}`
+    `This covers both this project's own .rupu/netflow/ directory (if it has one) and ` +
+    `any of its runs' ledgers that fell back to global scope instead — whether or not ` +
+    `this project has that directory yet. ${generic}`
   );
 }
 

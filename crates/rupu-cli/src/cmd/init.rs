@@ -55,7 +55,7 @@ fn init_inner(args: InitArgs) -> anyhow::Result<()> {
     let mut tally = WriteTally::default();
     create_skeleton(root, &mut tally)?;
     ensure_gitignore_entry(root)?;
-    ensure_netflow_dir(root)?;
+    ensure_netflow_dir(root, &mut tally)?;
 
     if args.with_samples {
         write_manifest(root, args.force, &mut tally)?;
@@ -229,8 +229,26 @@ fn ensure_gitignore_entry(root: &Path) -> anyhow::Result<()> {
 /// self-ignoring `.gitignore` `ensure_netflow_dir` installs) lands in the
 /// very same `init` invocation, before any ledger can ever be written
 /// there.
-fn ensure_netflow_dir(root: &Path) -> anyhow::Result<()> {
-    rupu_netflow::ensure_netflow_dir(&rupu_netflow::project_local_netflow_dir(root))?;
+fn ensure_netflow_dir(root: &Path, tally: &mut WriteTally) -> anyhow::Result<()> {
+    let dir = rupu_netflow::project_local_netflow_dir(root);
+    // Checked BEFORE the call (not derived from its `Result`, which is
+    // `Ok(())` either way — `create_dir_all`/`ensure_self_ignore` are both
+    // idempotent) so re-running `init` on an already-opted-in project
+    // reports SKIPPED rather than a misleading second CREATED. This is
+    // the one visible line confirming the netflow opt-in actually
+    // happened — unlike `.rupu/agents`/`.rupu/workflows` (silently
+    // created, no tally line), this directory's existence is what makes
+    // rupu-cp's project-scoped Network tab work, so it earns its own
+    // confirmation the way `.rupu/config.toml` does.
+    let already_existed = dir.is_dir();
+    rupu_netflow::ensure_netflow_dir(&dir)?;
+    if already_existed {
+        println!("SKIPPED {} (exists)", relpath(root, &dir));
+        tally.skipped += 1;
+    } else {
+        println!("CREATED {}", relpath(root, &dir));
+        tally.created += 1;
+    }
     Ok(())
 }
 
