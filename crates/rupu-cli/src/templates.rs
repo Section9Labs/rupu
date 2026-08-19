@@ -172,8 +172,14 @@ pub const CONFIG_SKELETON: &str = r#"# rupu project config — see https://githu
 /// from an existing `.gitignore` (or creates one) when missing.
 ///
 /// `.rupu/netflow/` MUST be here alongside `.rupu/transcripts/` — the
-/// netflow ledger (`<project>/.rupu/netflow/flows.jsonl`) records every
-/// host, IP, path and timing rupu contacted on the user's behalf.
-/// Without this entry, `git add .` in a freshly-`init`'d project commits
-/// that record straight into the user's repo.
+/// netflow ledger (one `<project>/.rupu/netflow/<run_id>.jsonl` per run,
+/// see `NetflowPaths::for_run`; `flows.jsonl` was the pre-per-run shared
+/// filename and no longer exists) records every host, IP, path and
+/// timing rupu contacted on the user's behalf. Without this entry,
+/// `git add .` in a freshly-`init`'d project commits that record
+/// straight into the user's repo. `cmd::init::ensure_netflow_dir` also
+/// creates this directory itself (with its own self-ignoring
+/// `.gitignore`, belt-and-suspenders with this entry) — see that
+/// function's doc comment for why that's a deliberate, explicit opt-in
+/// and not auto-creation-on-write.
 pub const GITIGNORE_ENTRIES: &[&str] = &[".rupu/transcripts/", ".rupu/netflow/"];

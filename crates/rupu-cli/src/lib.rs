@@ -152,7 +152,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::issues::Action,
     },
-    /// Bootstrap a new rupu project (`.rupu/agents`, `.rupu/workflows`, config).
+    /// Bootstrap a new rupu project (`.rupu/agents`, `.rupu/workflows`,
+    /// `.rupu/netflow`, config).
     Init(cmd::init::InitArgs),
     /// MCP server operations.
     Mcp {
