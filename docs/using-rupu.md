@@ -57,7 +57,9 @@ Project-local agents and workflows shadow global ones with the same `name:`.
 rupu init --with-samples --git
 ```
 
-This creates `.rupu/agents/`, `.rupu/workflows/`, `.rupu/config.toml`, and the sample set also seeds `.rupu/contracts/`.
+This creates `.rupu/agents/`, `.rupu/workflows/`, `.rupu/netflow/` (a self-ignoring ledger
+directory for `rupu`'s own outbound-HTTP audit trail — see "Netflow ledger retention" below),
+`.rupu/config.toml`, and the sample set also seeds `.rupu/contracts/`.
 
 ### 2. Authenticate at least one model provider
 

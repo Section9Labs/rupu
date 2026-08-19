@@ -44,11 +44,17 @@ pub fn global_netflow_dir(global: &Path) -> PathBuf {
 /// project-local `<project_root>/.rupu/netflow/` when that directory
 /// ALREADY EXISTS, the global `<global>/netflow/` fallback otherwise.
 /// Mirrors `transcripts_dir`'s existing-only gate — the load-bearing
-/// property that keeps ledgers out of repos that never opted in (an
-/// un-`rupu init`'d project, or one initialised before this directory
-/// existed, gets no ledger written inside it; `rupu init` only ever adds
-/// a `.gitignore` entry, it does not create this directory, so "never
-/// opted in" is the common case, not the edge case).
+/// property that keeps ledgers out of repos that never opted in.
+///
+/// `rupu init` now creates this directory itself (`ensure_netflow_dir`,
+/// called from `crates/rupu-cli/src/cmd/init.rs`'s `init_inner`, in the
+/// same breath as the `.gitignore` entry that protects it) — so a project
+/// `rupu init`'d at or after that change routes locally from its very
+/// first run. "Never opted in" is still the reality for every project
+/// initialised before that change, or never `rupu init`'d at all (there is
+/// no way to retroactively create the directory short of re-running
+/// `init`), so this gate still exists and still matters; it just isn't
+/// the universal case it used to be.
 ///
 /// Both `rupu-cli` (every agent-driven entry point: `rupu run`, `rupu
 /// session`, `rupu workflow`, sub-agent dispatch) and `rupu-orchestrator`
@@ -57,7 +63,10 @@ pub fn global_netflow_dir(global: &Path) -> PathBuf {
 /// the write side's routing decision can never drift into two competing
 /// copies of the same rule. `rupu-cp`'s read side
 /// (`crates/rupu-cp/src/api/netflow.rs`) must mirror this same rule on
-/// the read path — see that module's fallback-to-global handling.
+/// the read path — see that module's `project_scoped_flows_and_dropped`,
+/// which additionally recovers a PRE-EXISTING project's global-fallback
+/// ledgers that this write-side gate alone cannot route locally after the
+/// fact.
 pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
     if let Some(p) = project_root {
         let local = project_local_netflow_dir(p);
