@@ -154,6 +154,41 @@ P0/P1/P2, and a fix closes an issue only when it is observed at the consumer.
 
 ## Open
 
+### I-90 — a sub-agent's ledger has no transcript fallback if its ledger degrades
+
+**Where.** `crates/rupu-cp/src/api/netflow.rs`'s `merge_with_transcript` — the recovery
+path that lets a run's netflow view survive `netflow_sink::for_run` degrading to
+transcript-only capture (a ledger file that can't be opened is not fatal; "capture must
+never break a run"). Its `transcript_paths` come from `usage::run_transcript_paths`,
+which is driven entirely by `step_results.jsonl` — it does not consult
+`RunStore::sub_run_ids_recursive`.
+
+**Effect.** A normal run's own ledger-open failure is recoverable: its transcript
+(written by the same `FanoutSink` regardless of the ledger's fate) still carries every
+`NetFlow` event, so the merge fills the gap. A dispatched sub-agent's ledger-open failure
+is NOT recoverable the same way — its own transcript is never added to
+`transcript_paths`, so if its ledger fails to open, its flows (and its `Dropped` count,
+which per the netflow-per-run design has no transcript fallback anywhere) are simply
+gone from every scope, not just under-reported.
+
+**Why not fixed alongside the sub-agent-ledger-reachability fix** (the task that reached
+`RunStore::sub_run_ids`/`sub_run_ids_recursive` and folded sub-agent ids into
+`run_and_unit_ids`, landed on `netflow-followups`): out of scope for that task, which was
+specifically "make a sub-agent's OWN ledger reachable from its parent's netflow view",
+not "extend the ledger-degrade transcript-recovery mechanism to cover sub-agents too".
+Fixing it would mean exposing `RunStore::sub_run_transcript` publicly (currently private)
+and threading `(parent_id, sub_id)` pairs through the recursive walk (or a parallel
+lookup) rather than the flat id list `sub_run_ids_recursive` returns today, since
+`run_transcript_paths`-style transcript resolution needs to know each sub-run's own
+transcript path, not just its id.
+
+**Narrower than it sounds**: this is a double-failure case (sub-agent dispatched, AND
+its own ledger specifically fails to open) — a normal sub-agent dispatch is unaffected,
+since its ledger opens fine and its flows/`Dropped` count are already reachable via the
+fix above. Recorded here so the gap is durable rather than living only in a task report.
+
+---
+
 ### I-89 — `rupu-config --test parse` fails intermittently under parallel load
 
 **Symptom.** One test in `crates/rupu-config/tests/parse.rs` reportedly fails during a
