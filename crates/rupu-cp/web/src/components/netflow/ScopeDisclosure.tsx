@@ -85,6 +85,20 @@ export function netflowCoverageList(_scope: NetflowScope): string {
   return NETFLOW_COVERAGE_LIST;
 }
 
+/** Run scope's own addendum: sub-agent flows are FOLDED into the parent
+ *  run's total, the same way a dispatched workflow step's already were —
+ *  see `rupu-cp::api::netflow::run_and_unit_ids`'s "Attribution decision"
+ *  note for the full reasoning. Said explicitly, on the same surface
+ *  every other scope-limit sentence lives on, so "this run's netflow"
+ *  is never silently read as "only what this run's own provider calls
+ *  did" — the merged `flows`/`dropped_total` carry no marker that would
+ *  let a reader tell a sub-agent's traffic apart from the run's own
+ *  otherwise (`FlowCtx.agent`/`run_id` are unset on every production
+ *  flow). */
+const RUN_SCOPE_SUB_AGENT_NOTE =
+  ' Includes any sub-agents this run dispatched — at any depth, not just the first level — ' +
+  'folded into the same totals, not shown as a separate scope.';
+
 function disclosureText(scope: NetflowScope): string {
   const coverage = netflowCoverageList(scope);
   return (
@@ -92,7 +106,8 @@ function disclosureText(scope: NetflowScope): string {
     `subprocess. It also can't see non-HTTP egress: git2 clones (often a run's ` +
     `largest byte volume), object_store bucket traffic, and the node WebSocket are invisible ` +
     `here too. Ledgers are kept indefinitely unless an operator runs rupu netflow prune — ` +
-    `nothing here expires or rotates on its own.`
+    `nothing here expires or rotates on its own.` +
+    (scope === 'run' ? RUN_SCOPE_SUB_AGENT_NOTE : '')
   );
 }
 

@@ -110,6 +110,32 @@ describe('netflowSystemSourceHint', () => {
   });
 });
 
+describe('NetflowScopeDisclosure sub-agent note', () => {
+  // Run scope's flows/dropped_total now fold in every sub-agent this run
+  // dispatched, at any depth (`RunStore::sub_run_ids_recursive`) — the
+  // operator-facing text must say so on THIS surface, the one place every
+  // netflow scope-limit sentence is authored, or "this run's netflow"
+  // silently reads as "only this run's own provider calls" while actually
+  // including everything its sub-agents did too.
+  it('names sub-agent dispatch at run scope', () => {
+    render(<NetflowScopeDisclosure scope="run" />);
+    expect(screen.getByText(/sub-agents/i)).toBeInTheDocument();
+  });
+
+  it.each(['project', 'global'] as NetflowScope[])(
+    'does not repeat the run-scope sub-agent note at %s scope',
+    (scope) => {
+      // Project/global scope already union every contributing run's own
+      // ledger directory-wide (`read_all_run_ledgers_in_dir`) — a
+      // sub-agent's ledger file is just one more file in that union, with
+      // no separate "folded from a parent" wrinkle to call out there the
+      // way run scope's id-driven fold needs explaining.
+      render(<NetflowScopeDisclosure scope={scope} />);
+      expect(screen.queryByText(/sub-agents/i)).not.toBeInTheDocument();
+    },
+  );
+});
+
 describe('NetflowScopeDisclosure', () => {
   it.each(SCOPES)('never claims MCP or webhook coverage at %s scope', (scope) => {
     render(<NetflowScopeDisclosure scope={scope} />);
