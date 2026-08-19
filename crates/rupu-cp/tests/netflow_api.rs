@@ -730,13 +730,18 @@ async fn project_netflow_does_not_leak_a_legacy_daemon_wide_ledger_file() {
 
 // ── Critical-fix regression tests: global-fallback routing ────────────────
 //
-// On a fresh install `<project>/.rupu/netflow/` never gets created (`rupu
-// init` only ever adds a `.gitignore` entry there -- see `rupu_netflow::
-// netflow_dir`'s doc comment), so EVERY run's ledger actually lands in
+// `rupu init` now creates `<project>/.rupu/netflow/` for a NEW project
+// (`crates/rupu-cli/src/cmd/init.rs`'s `ensure_netflow_dir`), but every
+// project initialised before that change -- or never `rupu init`'d at all
+// -- still has `<project>/.rupu/netflow/` missing, and there is no way to
+// retroactively create it for old runs short of re-running `init` (which
+// only helps runs dispatched AFTER it runs). These fixtures below
+// deliberately don't call `init` at all, simulating exactly that
+// pre-existing-project shape: EVERY run's ledger lands in
 // `<global_dir>/netflow/<run_id>.jsonl`, not under any registered
-// workspace. These prove the read side now mirrors that write-side
-// routing rule, rather than only ever finding project-rooted ledgers a
-// fresh install never produces.
+// workspace's own directory. These prove the read side mirrors that
+// write-side routing rule, rather than only ever finding project-rooted
+// ledgers such a project never produces.
 
 #[tokio::test]
 async fn global_netflow_includes_a_run_that_fell_back_to_the_global_netflow_dir() {
@@ -1252,6 +1257,75 @@ async fn project_netflow_recovers_a_project_local_run_whose_ledger_fell_back_to_
             .iter()
             .any(|f| f["host"] == "api.project-local.example"),
         "a project-local-store run's global-fallback ledger must surface too: {body}"
+    );
+}
+
+/// Fix round 1, Important 1: the dispatched-step counterpart of the test
+/// above. A run recorded in the PROJECT-LOCAL store dispatches a step
+/// whose own id gets a SEPARATE global-fallback ledger — the parent run's
+/// own id has no ledger at all, so this only passes if the step's id is
+/// looked up via `run_and_unit_ids` against the PROJECT-LOCAL store's own
+/// `step_results.jsonl`, not the global store's (which has no record of
+/// this run and would silently resolve to nothing beyond the parent id).
+#[tokio::test]
+async fn project_netflow_recovers_a_project_local_runs_dispatched_step_global_fallback_ledger() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_project_local_with_step";
+    let step_run_id = "run_project_local_step_own_id";
+
+    // Deliberately NO ledger for `run_id` itself -- only the dispatched
+    // step's own id has one. If the id-driven pass fell back to
+    // resolving units against the wrong store, it would find zero units
+    // for this run and this flow would never surface.
+    write_global_ledger(
+        global.path(),
+        step_run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(step_run_id),
+            "api.project-local-step.example",
+            Origin::Scm("github".into()),
+        )))],
+    );
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+
+    let local_store =
+        rupu_orchestrator::runs::RunStore::new(project.path().join(".rupu").join("runs"));
+    local_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let step_transcript = project
+        .path()
+        .join(".rupu")
+        .join("transcripts")
+        .join("s1.jsonl");
+    JsonlWriter::create(&step_transcript).unwrap();
+    local_store
+        .append_step_result(run_id, &seed_step(step_run_id, step_transcript))
+        .unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows
+            .iter()
+            .any(|f| f["host"] == "api.project-local-step.example"),
+        "a project-local run's dispatched step's own global-fallback ledger \
+         must surface -- units must be resolved against the store the run id \
+         actually came from: {body}"
     );
 }
 
