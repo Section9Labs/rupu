@@ -63,12 +63,16 @@ describe('netflowCoverageList', () => {
 });
 
 describe('netflowEmptyStateHint', () => {
-  // Blocker 1, whole-branch review: nothing creates
-  // `<workspace>/.rupu/netflow/` on `rupu init`, so on a default install a
-  // project's own scope is empty even for a project with real, captured
-  // runs — the flows landed at global scope instead. Only project scope's
-  // hint may point the operator at the global Network view; run and
-  // global scope have no such gap to disclose.
+  // FIXED (previously Blocker 1, whole-branch review): `get_project_netflow`
+  // now recovers a project's own runs whose ledgers fell back to the
+  // global directory (`project_scoped_flows_and_dropped`), on top of
+  // `rupu init` creating `.rupu/netflow/` for new projects
+  // (`cmd/init.rs`'s `ensure_netflow_dir`) — so an empty project scope no
+  // longer means "check global scope instead". Only project scope's hint
+  // still names "global scope" at all, but now to explain WHAT the empty
+  // result already covers (both its own directory and the recovered
+  // fallback), not to send the operator elsewhere; run and global scope
+  // have no such distinction to draw.
   it.each(SCOPES)('names the global-scope fallback only at project scope, not %s', (scope) => {
     if (scope === 'project') {
       expect(netflowEmptyStateHint(scope)).toMatch(/global scope/i);
