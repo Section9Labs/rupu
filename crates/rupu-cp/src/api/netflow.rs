@@ -1,5 +1,7 @@
 //! Netflow API — run-scoped read of the run's own per-run ledger file(s)
-//! plus its transcript, merged, with read-time ASN enrichment.
+//! — including every sub-agent it dispatched, at any depth, folded in
+//! (see [`run_and_unit_ids`]'s doc for the attribution decision) — plus
+//! its transcript, merged, with read-time ASN enrichment.
 //!
 //! ASN is resolved HERE, at render time, not stamped into the record (spec
 //! §6.2). A table that arrives later therefore improves every historical
@@ -559,6 +561,21 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// no indication from the parent run's own netflow view that any
 /// traffic — or any loss — was missing.
 ///
+/// Critically, this recursion is applied to EVERY id already collected
+/// above — the run's own id AND every step/item id — not just the run's
+/// own id. `for_each`/`parallel`/panel each mint a fresh unit run id and
+/// hand it down as `ToolContext.parent_run_id` for that unit's own agent
+/// run (`step_factory.rs`), so a `dispatch_agent` call made from inside a
+/// fan-out unit calls `create_sub_run(unit_id, ...)`, never
+/// `create_sub_run(run_id, ...)` — its sub-run lives at
+/// `<root>/<unit_id>/sub/`, a directory that recursing from `run_id`
+/// alone would never visit. Anchoring the fold only at the top-level id
+/// (an earlier version of this function did exactly that) would have
+/// left a sub-agent dispatched from inside a fan-out unit exactly as
+/// invisible as before this fix — the ids are snapshotted into a
+/// `Vec` first specifically so the loop below can iterate them without
+/// also iterating the ids `sub_run_ids_recursive` appends as it goes.
+///
 /// **Attribution decision**: sub-agent flows are FOLDED into the
 /// dispatching run's view, the same way a dispatched step's already are
 /// — not kept as a separate scope. Both are "this run's own dispatch,
@@ -578,7 +595,16 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
             ids.push(item.run_id);
         }
     }
-    ids.extend(store.sub_run_ids_recursive(run_id));
+    // Snapshot before extending: sub-agent recursion must run once PER id
+    // already collected (the run itself and every step/fan-out-item id),
+    // not just the run's own id — see the doc comment above.
+    let base_ids = ids.clone();
+    for id in &base_ids {
+        if id.is_empty() {
+            continue;
+        }
+        ids.extend(store.sub_run_ids_recursive(id));
+    }
     ids.retain(|id| !id.is_empty());
     ids.sort();
     ids.dedup();
@@ -761,6 +787,17 @@ fn read_all_run_ledgers_in_dir(
 /// `read_step_results` call (a small `step_results.jsonl` read, `Ok(vec![])`
 /// if the run never dispatched a step) discovers its units' own ids — see
 /// the caller's doc comment for what happens to the ids after this.
+///
+/// On top of that (added when [`run_and_unit_ids`] started folding in
+/// sub-agent ids): `run_and_unit_ids` now issues one `sub_run_ids`
+/// directory listing (a `read_dir`, cheap and Ok(empty)-on-missing) per id
+/// it already has — the run itself, plus every step/item id — and
+/// `sub_run_ids_recursive` issues one more per sub-agent id it discovers
+/// while walking that run's dispatch tree. So the true cost is the above
+/// PLUS one `read_dir` per (run, step/item, sub-agent-at-any-depth) id
+/// across this project's own k runs — bounded in practice by how deep/wide
+/// any one run's dispatch tree actually grew (`MAX_SUB_RUN_RECURSION_DEPTH`
+/// backstops the pathological case), not by the total run count.
 fn project_run_and_unit_ids(global_store: &RunStore, workspace: &StdPath) -> Vec<String> {
     let workspace = canonicalize_or_self(workspace);
     let mut ids: Vec<String> = Vec::new();

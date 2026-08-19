@@ -1109,6 +1109,87 @@ async fn run_netflow_includes_a_dispatched_sub_agents_flows_and_dropped_count() 
     );
 }
 
+/// The Critical fix-round-1 case: a sub-agent dispatched from INSIDE a
+/// fan-out unit. `for_each`/`parallel`/panel each mint a fresh unit run
+/// id (`step_factory.rs` hands it down as `ToolContext.parent_run_id`),
+/// so a `dispatch_agent` call made from within that unit's own agent run
+/// calls `create_sub_run(unit_id, ...)`, not `create_sub_run(run_id, ...)`
+/// — the sub-run lives at `<root>/<unit_id>/sub/`, a directory
+/// `sub_run_ids_recursive(run_id)` alone never visits (it only starts
+/// from the TOP-level run id). `run_and_unit_ids` must recurse from
+/// EVERY id it already collects (the run id AND each step/item id), not
+/// just the run id, or a sub-agent dispatched from a fan-out unit keeps
+/// exactly the invisibility this task exists to remove.
+#[tokio::test]
+async fn run_netflow_includes_a_sub_agent_dispatched_from_a_fan_out_unit() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_fan_out_sub_agent";
+    let unit_run_id = "run_fan_out_unit";
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let unit_transcript = project
+        .path()
+        .join(".rupu")
+        .join("transcripts")
+        .join("unit.jsonl");
+    JsonlWriter::create(&unit_transcript).unwrap();
+    state
+        .run_store
+        .append_step_result(run_id, &seed_step(unit_run_id, unit_transcript))
+        .unwrap();
+
+    // The unit's OWN agent run dispatches a sub-agent — parented on the
+    // UNIT's id, exactly as `step_factory.rs`'s `ToolContext.parent_run_id`
+    // wiring does for a real `for_each`/`parallel`/panel unit.
+    let (sub_of_unit, _) = state
+        .run_store
+        .create_sub_run(unit_run_id, "fixer")
+        .unwrap();
+
+    write_ledger(
+        project.path(),
+        &sub_of_unit,
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some(&sub_of_unit),
+                "api.fanout-sub.example",
+                Origin::Provider("anthropic".into()),
+            ))),
+            LedgerLine::Dropped {
+                count: 4,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.fanout-sub.example"),
+        "a sub-agent dispatched from inside a fan-out unit must surface at \
+         the top-level run's netflow view: {body}"
+    );
+    assert_eq!(
+        body["dropped_total"], 4,
+        "its ledger-only Dropped count, which has no transcript fallback, \
+         must also surface: {body}"
+    );
+}
+
 /// The decisive nested case: a sub-agent that itself dispatches a
 /// sub-agent (two levels deep). Both levels' flows AND drop counts must
 /// surface at the top parent's run scope.
