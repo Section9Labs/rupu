@@ -124,12 +124,12 @@ from the app.
 
 | Phase | Delivers | API modules covered |
 |---|---|---|
-| 1 Foundation | XcodeGen scaffold, RupuDesign tokens, window/sidebar/toolbar shell + routing, onboarding, backend manager, CPClient + SSE + fixture rig; **rupu-app deletion** | `host_info`, `events`, `config` (read) |
+| 1 Foundation | XcodeGen scaffold, RupuDesign tokens, window/sidebar/toolbar shell + routing, onboarding, backend manager, CPClient + SSE + fixture rig; **rupu-app deletion** | `host_info`, `events` |
 | 2 Read path | Activity table (kind/status filters, live tail, saved views), Run detail (step graph, transcript feed, netflow + findings rails), Session detail | `runs`, `run_streams`, `transcript`, `transcripts`, `sessions` (read), `graph`, `netflow` (per-run), `findings` (per-run), `run_resolve` |
 | 3 Write path | Launcher sheet (agent run / session / workflow, host chips + fan-out), Approve/Reject everywhere gates appear, cancel/pause/resume, session send, archive/restore | `agents` (run/session), `workflows` (run/validate), `host_fanout`, run mutations, `sessions` (send), `tools` |
 | 4 Dashboard | Overview widgets read-only → edit mode → WidgetConfig persistence (UserDefaults JSON per HANDOFF) | `dashboard` |
 | 5 Breadth | Projects, Security (findings/coverage/catalog), Library, Fleet, Usage screens | `projects`, `coverage`, `findings` (global), `agents`/`workflows`/`autoflows` (definitions), `hosts`, `workers`, `usage`, `usage_outliers`, `repos`, `repo_scope` |
-| 6 Ambient | Menu bar extra, ⌘K palette, Situation Room, UNUserNotificationCenter notifications, full Settings (incl. config write), workspace delta/stage/discard, source/code viewers | `config` (write), `workspace`, `source`, `code`, `fs`, `autoflow_claims`, `fleet_inventory` |
+| 6 Ambient | Menu bar extra, ⌘K palette, Situation Room, UNUserNotificationCenter notifications, full Settings (incl. config read + write), workspace delta/stage/discard, source/code viewers | `config` (read + write), `workspace`, `source`, `code`, `fs`, `autoflow_claims`, `fleet_inventory` |
 | 7 Ship | CI release lane, signing + notarization, DMG/zip distribution; post-parity backlog seeded | — |
 
 **Parity checklist discipline:** API surface not in the prototype (e.g. coverage
