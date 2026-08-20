@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates app-smoke app-run cp cp-web clean help macos-gen macos-build macos-test macos-run
+.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates app-smoke app-run cp cp-web clean help macos-gen macos-build macos-test macos-run macos-fixtures
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -152,6 +152,14 @@ macos-test:
 macos-run: macos-build
 	open apps/rupu-macos/DerivedData/Build/Products/Debug/rupu.app
 
+# Regenerate the golden JSON fixtures the Swift app's decode tests check
+# against (apps/rupu-macos/Fixtures/*.json). Run this after changing
+# rupu_orchestrator::executor::Event or HostInfoResponse, then update the
+# Swift models to match.
+macos-fixtures:
+	REGEN_FIXTURES=1 cargo test -p rupu-cp --test macos_fixtures
+	REGEN_FIXTURES=1 cargo test -p rupu-cp host_info_fixture_is_current
+
 help:
 	@echo "rupu Makefile targets:"
 	@echo ""
@@ -174,6 +182,7 @@ help:
 	@echo "  macos-build    macos-gen + xcodebuild the rupu scheme (Debug, unsigned)"
 	@echo "  macos-test     swift test the RupuKit package"
 	@echo "  macos-run      macos-build + open the built rupu.app"
+	@echo "  macos-fixtures regenerate apps/rupu-macos/Fixtures/*.json golden fixtures"
 	@echo ""
 	@echo "Refresh-my-install flow:  make sync && make install"
 	@echo ""
