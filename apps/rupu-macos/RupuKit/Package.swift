@@ -19,6 +19,6 @@ let package = Package(
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
-        .testTarget(name: "RupuStoreTests", dependencies: ["RupuStore"]),
+        .testTarget(name: "RupuStoreTests", dependencies: ["RupuStore", "RupuBackend", "RupuAPI"]),
     ]
 )

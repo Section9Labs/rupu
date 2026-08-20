@@ -9,6 +9,7 @@ public struct SettingsView: View {
     @AppStorage("appearance") private var appearance: String = "system"
     @AppStorage("embedded.port") private var embeddedPort: Int = 7420
     @AppStorage("rupu.binaryPath") private var binaryPathOverride: String = ""
+    @AppStorage("keepServerRunning") private var keepServerRunning: Bool = false
 
     public init() {}
 
@@ -40,6 +41,7 @@ public struct SettingsView: View {
                     text: $binaryPathOverride,
                     prompt: Text("Auto-detected")
                 )
+                Toggle("Keep server running when app quits", isOn: $keepServerRunning)
             }
         }
         .padding(.top, 12)

@@ -75,7 +75,13 @@ public actor EmbeddedServer {
     private func spawn() throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
-        process.arguments = ["cp", "serve", "--port", String(port)]
+        // `rupu cp serve` takes `--bind <addr:port>`, not a standalone
+        // `--port` flag (confirmed against the installed 0.74.0-beta.3
+        // CLI's `--help` during Task 9's integration smoke — the app never
+        // spawned a reachable server without this). `--no-open` keeps a
+        // headlessly-spawned server from popping a browser tab: the app is
+        // the UI here, not the served web UI.
+        process.arguments = ["cp", "serve", "--bind", "127.0.0.1:\(port)", "--no-open"]
         try process.run()
 
         let pid = process.processIdentifier

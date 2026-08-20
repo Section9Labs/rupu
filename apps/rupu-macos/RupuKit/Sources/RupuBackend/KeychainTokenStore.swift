@@ -1,11 +1,23 @@
 import Foundation
 import Security
 
+/// Port for storing/retrieving/deleting a bearer token keyed by an
+/// account identifier (the remote host's base URL string). `KeychainTokenStore`
+/// is the real Keychain-backed adapter; callers that need to test token
+/// handling without touching the real Keychain (Keychain access in CI/test
+/// sandboxes is flaky — see `KeychainTokenStoreTests`' absence) inject an
+/// in-memory fake conforming to this instead.
+public protocol TokenStoring: Sendable {
+    func save(token: String, account: String) throws
+    func load(account: String) -> String?
+    func delete(account: String) throws
+}
+
 /// Stores remote-backend bearer tokens as generic-password Keychain items.
 ///
 /// `account` is the remote base URL string, so each remote host the user
 /// has authenticated against gets its own item under the same `service`.
-public struct KeychainTokenStore {
+public struct KeychainTokenStore: TokenStoring, Sendable {
     private let service: String
 
     public init(service: String = "com.section9labs.rupu") {
