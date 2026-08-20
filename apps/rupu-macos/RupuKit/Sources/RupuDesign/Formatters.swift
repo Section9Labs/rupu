@@ -23,9 +23,16 @@ public enum Fmt {
     /// Uses integer (deci-second / second) arithmetic throughout rather than `Double` formatting:
     /// `%.1f` on a raw `ms / 1000.0` double rounds 850ms to "0.8s" (0.85 isn't exactly
     /// representable in binary floating point and lands a hair under it), not the expected "0.9s".
+    ///
+    /// The unit branch is chosen on the *rounded* value, not the raw `ms`, so a duration that
+    /// rounds up to the next unit cascades into that unit's format instead of overflowing the
+    /// current one (e.g. 59_950ms rounds to 60.0s, which must render "1m 0s", not "60.0s").
+    /// `deciseconds` and `totalSeconds` are each rounded independently from `ms` — not chained
+    /// through one another — so a value near the 1h boundary doesn't pick up a second helping of
+    /// rounding error from an intermediate decisecond rounding it never needed.
     public static func duration(ms: UInt64) -> String {
-        if ms < 60_000 {
-            let deciseconds = (ms + 50) / 100
+        let deciseconds = (ms + 50) / 100
+        if deciseconds < 600 {
             let whole = deciseconds / 10
             let frac = deciseconds % 10
             return "\(whole).\(frac)s"
