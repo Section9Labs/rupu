@@ -30,8 +30,17 @@ public final class HealthMonitor {
     public func start() {
         guard task == nil else { return }
         task = Task { [weak self] in
-            guard let self else { return }
             while !Task.isCancelled {
+                // Re-acquire `self` weakly on every iteration rather than
+                // binding it once above the loop: a loop-scoped `let self`
+                // releases its strong reference at the end of each
+                // iteration, so a caller that drops its last strong
+                // reference to this monitor without calling `stop()`
+                // still lets this task see `self` go nil and unwind on
+                // its next tick, instead of the task/self pair keeping
+                // each other alive forever. `stop()` remains the primary,
+                // immediate way to tear this down — this is a backstop.
+                guard let self else { return }
                 await self.pollOnce()
                 try? await Task.sleep(for: self.interval)
             }

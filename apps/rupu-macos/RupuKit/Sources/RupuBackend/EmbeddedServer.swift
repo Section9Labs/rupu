@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Attaches to (or, failing that, spawns) a `rupu cp serve` instance on
 /// localhost.
@@ -9,10 +10,12 @@ import Foundation
 /// instance itself spawned (`.spawned`) is eligible for termination, and
 /// only when the caller doesn't ask to keep it running.
 public actor EmbeddedServer {
-    public enum Origin: Equatable {
+    public enum Origin: Equatable, Sendable {
         case attached
         case spawned(pid: Int32)
     }
+
+    private static let logger = Logger(subsystem: "com.section9labs.rupu", category: "backend")
 
     private let binaryPath: String
     private let port: Int
@@ -26,7 +29,14 @@ public actor EmbeddedServer {
         self.probe = probe
     }
 
+    /// Idempotent: once this instance has attached to or spawned a
+    /// server, a repeat call just returns the same `Origin` rather than
+    /// re-probing (a re-probe after a successful spawn would hit this
+    /// instance's own child and misclassify it as `.attached`, orphaning
+    /// it from `stop()`).
     public func start() async throws -> Origin {
+        if let origin { return origin }
+
         if await probe(probeURL) {
             origin = .attached
             return .attached
@@ -56,6 +66,12 @@ public actor EmbeddedServer {
     /// Launches `binaryPath cp serve --port <port>` in its own process
     /// group so `stop()` can tear down the whole tree (the server may fork
     /// helper processes) without touching the app's own group.
+    ///
+    /// `process` is intentionally not stored on `self`: once `run()`
+    /// succeeds, Foundation's `Process` keeps the underlying task alive
+    /// until it terminates even after the local value goes out of scope
+    /// (Darwin's `Process` self-retains for the life of the child), so we
+    /// only need the `pid` going forward.
     private func spawn() throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
@@ -77,8 +93,20 @@ public actor EmbeddedServer {
         return false
     }
 
+    /// Terminates the process group `spawn()` put the child in. Falls back
+    /// to signaling just the pid if the group signal fails — e.g. if the
+    /// `setpgid` in `spawn()` lost its race with the child's `exec` and
+    /// the child ended up in some other group, `killpg` targeting an
+    /// empty/wrong group would otherwise no-op silently and leak the
+    /// spawned server.
     private func terminateProcessGroup(pid: Int32) {
-        killpg(pid, SIGTERM)
+        if killpg(pid, SIGTERM) != 0 {
+            let groupErrno = errno
+            Self.logger.error("killpg(\(pid, privacy: .public)) failed (errno \(groupErrno, privacy: .public)); falling back to kill(pid)")
+            if kill(pid, SIGTERM) != 0 {
+                Self.logger.error("kill(\(pid, privacy: .public)) also failed (errno \(errno, privacy: .public)); spawned rupu cp serve process may have leaked")
+            }
+        }
     }
 }
 
