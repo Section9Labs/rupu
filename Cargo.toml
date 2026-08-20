@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/rupu-ast",
     "crates/rupu-app-canvas",
-    "crates/rupu-app",
     "crates/rupu-coverage",
     "crates/rupu-transcript",
     "crates/rupu-runtime",
@@ -95,12 +94,10 @@ owo-colors = { version = "4", features = ["supports-colors"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
-notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 insta = { version = "1", features = ["yaml"] }
 
 minijinja = { version = "2", features = ["json"] }
 dirs = "5"
-unicode-segmentation = "1.10"
 walkdir = "2"
 which = "6"
 whoami = "1"
@@ -157,14 +154,6 @@ httpmock = "0.7"
 serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-
-# Native macOS app (Slice D)
-gpui = { git = "https://github.com/zed-industries/zed.git", rev = "1a2e50e3f222ae7d223acf718d2e8384a9b7fbe6" }
-gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "1a2e50e3f222ae7d223acf718d2e8384a9b7fbe6" }
-directories = "5"
-objc2 = "0.5"
-objc2-app-kit = "0.2"
-objc2-foundation = "0.2"
 
 # Network egress observability (netflow)
 rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
