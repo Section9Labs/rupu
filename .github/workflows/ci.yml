@@ -346,3 +346,20 @@ jobs:
       # counter regression here silently republishes an old version, so they
       # are gated on every PR rather than trusted.
       - run: scripts/tests/release-cadence-tests.sh
+
+  # rupu.app (SwiftUI macOS, apps/rupu-macos/). Swift-only: no cargo build
+  # here. The Swift fixture-decoding tests read apps/rupu-macos/Fixtures/
+  # from the checkout; the Rust side of that contract (drift between those
+  # fixtures and rupu-cp's serde types) is asserted by the existing
+  # linux-musl-test job's `cargo test --workspace`, which includes rupu-cp.
+  macos-app:
+    name: macos-app (swift test + xcodebuild)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+      - name: RupuKit tests
+        run: make macos-test
+      - name: App target builds
+        run: make macos-build
