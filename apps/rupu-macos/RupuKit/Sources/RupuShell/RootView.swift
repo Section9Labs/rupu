@@ -53,42 +53,54 @@ public struct RootView: View {
         .sheet(isPresented: onboardingSheetBinding) {
             OnboardingView(backend: backend, model: model)
         }
+        .interactiveDismissDisabled()
         .onChange(of: backend.health) { _, newHealth in
             handleHealthChange(newHealth)
         }
     }
 
-    /// `true` while onboarding isn't complete; writing `false` back (a
-    /// user-driven sheet dismissal) marks it complete too, so there's no
-    /// path that leaves the sheet closed but the flag unset.
-    private var onboardingSheetBinding: Binding<Bool> {
+    /// `true` while onboarding isn't complete. The setter is intentionally
+    /// a no-op: the only path that's allowed to complete onboarding is
+    /// `OnboardingView`'s own `.onChange(of: backend.health)`, which sets
+    /// `model.onboardingComplete = true` explicitly once the connection is
+    /// actually healthy. Esc / Cmd-. are blocked from reaching this sheet
+    /// at all by `.interactiveDismissDisabled()` above; this setter being a
+    /// no-op is the defense in depth — even if some future SwiftUI
+    /// dismissal path reaches here, it can never strand the app in
+    /// "onboarded" state with nothing actually connected (no reconnect
+    /// path, no re-present, no Settings recovery until Phase 6).
+    var onboardingSheetBinding: Binding<Bool> {
         Binding(
             get: { !model.onboardingComplete },
-            set: { isPresented in
-                if !isPresented { model.onboardingComplete = true }
-            }
+            set: { _ in }
         )
     }
 
     /// Mirrors backend health into the model the existing sidebar
     /// footer/toolbar pill already read (Task 8), and — the Phase 1
     /// end-to-end proof — starts exactly one task consuming the live event
-    /// stream the first time health reaches `.healthy`. Health flapping
-    /// back down is a backstop that also flips `liveConnected` false (the
-    /// stream client itself keeps reconnecting, and normally
-    /// `backend.onLiveConnectionChange` — set in `init`, connection-level,
-    /// not frame-level — already caught the disconnect); it does not tear
-    /// down or respawn the consumer, per the brief's "don't spawn a second
-    /// consumer on re-health" — `liveEventTask == nil` is the guard.
-    /// `liveConnected` itself is owned by `onLiveConnectionChange`; this
-    /// loop only counts frames.
-    private func handleHealthChange(_ health: BackendHealth) {
+    /// stream the first time health reaches `.healthy`. Dropping all the
+    /// way to `.down`/`.incompatible` is a backstop that also flips
+    /// `liveConnected` false (the stream client itself keeps reconnecting,
+    /// and normally `backend.onLiveConnectionChange` — set in `init`,
+    /// connection-level, not frame-level — already caught the disconnect);
+    /// `.degraded` (a single failed health poll) deliberately does NOT
+    /// force it false, since the SSE stream can still be connected against
+    /// a momentarily-flaky health endpoint — forcing it here would fight
+    /// `onLiveConnectionChange`'s ownership of that signal. None of this
+    /// tears down or respawns the consumer, per the brief's "don't spawn a
+    /// second consumer on re-health" — `liveEventTask == nil` is the guard.
+    func handleHealthChange(_ health: BackendHealth) {
         model.backendHealth = health
 
-        guard case .healthy = health else {
+        switch health {
+        case .down, .incompatible:
             model.liveConnected = false
-            return
+        case .starting, .degraded, .healthy:
+            break
         }
+
+        guard case .healthy = health else { return }
 
         guard liveEventTask == nil, let stream = backend.eventStream() else { return }
         liveEventTask = Task { @MainActor in

@@ -49,7 +49,7 @@ public struct OnboardingView: View {
         .padding(28)
         .frame(width: 580)
         .task(id: binaryPathOverride) {
-            discoveredPath = discoverBinary()
+            discoveredPath = await discoverBinary()
         }
         .onChange(of: backend.health) { _, newValue in
             if case .healthy = newValue {
@@ -162,8 +162,15 @@ public struct OnboardingView: View {
         .panelStyle()
     }
 
-    private func discoverBinary() -> String? {
-        RupuDiscovery.find(override: binaryPathOverride.isEmpty ? nil : binaryPathOverride)
+    /// `RupuDiscovery.find` is synchronous and, via `loginShellWhich`,
+    /// shells out to `/bin/zsh -lc which rupu` — a slow login shell profile
+    /// can take 0.5-2s+. `.task`'s closure runs on the MainActor, so this
+    /// hops the call to a detached task rather than blocking the view.
+    private func discoverBinary() async -> String? {
+        let override = binaryPathOverride.isEmpty ? nil : binaryPathOverride
+        return await Task.detached(priority: .userInitiated) {
+            RupuDiscovery.find(override: override)
+        }.value
     }
 
     private var discoveryStatusLine: String {

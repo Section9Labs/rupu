@@ -138,5 +138,43 @@ fn events_fixture_is_current() {
             tokens_out: 200,
         },
     ];
+    assert_events_cover_every_variant(&events);
     check_fixture("events.json", &events);
+}
+
+/// Exhaustiveness guard for the hand-enumerated `events` vec above: the
+/// vec alone catches field changes on an *existing* variant (drift shows
+/// up as a fixture diff), but a brand-new `Event` variant compiles fine
+/// without ever being added to it — Swift then decodes that variant only
+/// as `.unknown`. Matching each already-constructed element against every
+/// current variant with NO wildcard arm turns that into a compile error
+/// instead: the match's exhaustiveness is checked against the `Event`
+/// type itself, not against what happens to be in the vec, so a new
+/// variant fails to compile here until a case is added.
+///
+/// adding a variant? extend events_fixture_is_current and regenerate via
+/// make macos-fixtures
+fn assert_events_cover_every_variant(events: &[Event]) {
+    for event in events {
+        match event {
+            Event::RunStarted { .. } => {}
+            Event::StepStarted { .. } => {}
+            Event::StepWorking { .. } => {}
+            Event::StepAwaitingApproval { .. } => {}
+            Event::StepCompleted { .. } => {}
+            Event::StepFailed { .. } => {}
+            Event::StepSkipped { .. } => {}
+            Event::UnitStarted { .. } => {}
+            Event::UnitCompleted { .. } => {}
+            Event::PanelRound { .. } => {}
+            Event::RunCompleted { .. } => {}
+            Event::RunFailed { .. } => {}
+            Event::RunPaused { .. } => {}
+            Event::RunResumed { .. } => {}
+            Event::StepPaused { .. } => {}
+            Event::StepResumed { .. } => {}
+            Event::DispatchStarted { .. } => {}
+            Event::DispatchCompleted { .. } => {}
+        }
+    }
 }

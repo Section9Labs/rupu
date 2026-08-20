@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import RupuShell
 import RupuStore
+import RupuDesign
 import os
 
 /// Routes app termination through `BackendController.shutdown` on both
@@ -84,12 +85,14 @@ struct RupuApp: App {
             RootView(model: model, backend: backend)
                 .frame(minWidth: 1150, minHeight: 760)
                 .preferredColorScheme(preferredColorScheme)
+                .tint(Color.rupuBrand)
                 .onAppear { appDelegate.backend = backend }
         }
         .defaultSize(width: 1440, height: 900)
 
         Settings {
             SettingsView()
+                .tint(Color.rupuBrand)
         }
     }
 

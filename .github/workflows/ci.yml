@@ -355,8 +355,9 @@ jobs:
   macos-app:
     name: macos-app (swift test + xcodebuild)
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install XcodeGen
         run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
       - name: RupuKit tests

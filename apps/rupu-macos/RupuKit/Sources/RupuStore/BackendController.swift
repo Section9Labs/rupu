@@ -71,13 +71,24 @@ public final class BackendController {
     /// health. A missing binary never touches `EmbeddedServer` — it sets
     /// `.down` directly with an install hint and leaves `mode`/`origin` nil
     /// so the caller knows nothing is configured.
+    ///
+    /// `discoverBinary` is synchronous and, in production, shells out to
+    /// the user's login shell (`RupuDiscovery.loginShellWhich`) — a slow
+    /// shell profile can take 0.5-2s+. This class is `@MainActor`, so
+    /// calling it inline would hang the UI for that long; `Task.detached`
+    /// hops it off the main actor while keeping the injected closure
+    /// itself unchanged (tests still pass a fast synchronous fake).
     public func configureEmbedded(port: Int) async {
         await tearDownEmbeddedServer(keepRunning: false)
         healthMonitor?.stop()
         healthMonitor = nil
 
         let override = defaults.string(forKey: Self.binaryPathOverrideKey).flatMap { $0.isEmpty ? nil : $0 }
-        guard let binaryPath = discoverBinary(override) else {
+        let discoverBinary = discoverBinary
+        let discovered = await Task.detached(priority: .userInitiated) {
+            discoverBinary(override)
+        }.value
+        guard let binaryPath = discovered else {
             mode = nil
             origin = nil
             health = .down("rupu not found — install rupu or set the path in Settings")
