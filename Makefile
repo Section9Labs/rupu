@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates app-smoke app-run cp cp-web clean help
+.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -101,40 +101,6 @@ gates: fmt lint test
 clean:
 	cargo clean
 
-# rupu.app — headless smoke test. Builds the binary, launches it
-# against the bundled fixture workspace, waits 4 seconds for the
-# window to render, then SIGTERMs. Asserts no panic on stderr.
-app-smoke:
-	@cargo build --release -p rupu-app
-	@echo "  · launcher_state test"
-	@cargo test -p rupu-app --test launcher_state
-	@echo "  · clone helper test"
-	@cargo test -p rupu-scm --test clone
-	@FIXTURE="$$(pwd)/crates/rupu-app/tests/fixtures/sample-workspace"; \
-	OUTPUT=$$(sh -c './target/release/rupu-app "'"$$FIXTURE"'" & sleep 4; kill $$! 2>/dev/null' 2>&1 || true); \
-	if echo "$$OUTPUT" | grep -qE 'panic|panicked'; then \
-		echo "app-smoke FAIL — panic in output:"; \
-		echo "$$OUTPUT"; \
-		exit 1; \
-	fi; \
-	if ! echo "$$OUTPUT" | grep -q 'opened workspace'; then \
-		echo "app-smoke FAIL — expected 'opened workspace' log line missing:"; \
-		echo "$$OUTPUT"; \
-		exit 1; \
-	fi
-	@echo "app-smoke OK"
-
-app-run:
-	@cargo build --release -p rupu-app
-	@echo "Running rupu-app against the rupu repo; stderr → /tmp/rupu-app-run.log"
-	@sh -c 'RUST_LOG=info,rupu_app=debug,gpui=warn ./target/release/rupu-app . & PID=$$!; sleep 8; kill $$PID 2>/dev/null || true; wait $$PID 2>/dev/null' 2>/tmp/rupu-app-run.log; true
-	@if grep -q 'RefCell already borrowed' /tmp/rupu-app-run.log; then \
-		echo "FAIL: RefCell errors detected in /tmp/rupu-app-run.log"; \
-		grep -c 'RefCell already borrowed' /tmp/rupu-app-run.log; \
-		exit 1; \
-	fi
-	@echo "app-run OK — no RefCell errors during 8s smoke"
-
 help:
 	@echo "rupu Makefile targets:"
 	@echo ""
@@ -150,7 +116,6 @@ help:
 	@echo "  lint           cargo clippy --workspace --all-targets -D warnings"
 	@echo "  test           cargo test --workspace"
 	@echo "  gates          fmt + lint + test (same as the release-ready check)"
-	@echo "  app-smoke      headless 4-second app smoke against bundled fixture"
 	@echo "  clean          cargo clean"
 	@echo ""
 	@echo "Refresh-my-install flow:  make sync && make install"

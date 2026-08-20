@@ -221,16 +221,13 @@ jobs:
           cache-directories: ".cargo-musl"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # rupu-app is macOS-only (GPUI + objc2). The workspace declares no
-      # default-members, so this must be scoped explicitly or it tries to
-      # compile GPUI.
       - name: Test
         run: |
           mkdir -p .cargo-musl
           docker run --rm -v "$PWD":/work -w /work \
             -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
             rupu-linux-build \
-            cargo test --workspace --exclude rupu-app --locked
+            cargo test --workspace --locked
 
       - name: Hand the artifacts back to the runner user
         if: always()
@@ -292,7 +289,7 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work \
             -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
             rupu-linux-build \
-            cargo clippy --workspace --exclude rupu-app --all-targets --locked -- -D warnings
+            cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Informational only: `main` carries a large number of rustfmt diff
       # sites predating this workflow. Promote to blocking once a dedicated
