@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// One dispatched Server-Sent Events frame: an optional `event:` name plus
 /// the (possibly multi-line, `\n`-joined) accumulated `data:` payload.
@@ -82,6 +83,8 @@ public struct SSELineParser: Sendable {
 /// is retried with capped exponential backoff on stream end or error, and
 /// torn down when the consuming task is cancelled.
 public final class EventStreamClient: Sendable {
+    private static let logger = Logger(subsystem: "com.section9labs.rupu", category: "sse")
+
     private let url: URL
     private let token: String?
     private let session: URLSession
@@ -137,7 +140,15 @@ public final class EventStreamClient: Sendable {
         var parser = SSELineParser()
 
         do {
-            let (bytes, _) = try await session.bytes(for: request)
+            let (bytes, response) = try await session.bytes(for: request)
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200..<300).contains(httpResponse.statusCode) {
+                // A non-2xx response (e.g. 401 on a bad token) is not a
+                // healthy attempt — surface it visibly rather than silently
+                // retrying forever indistinguishably from a network blip.
+                Self.logger.error("SSE connect failed: HTTP \(httpResponse.statusCode, privacy: .public) for \(self.url, privacy: .public)")
+                return false
+            }
             for try await line in bytes.lines {
                 if Task.isCancelled { return sawHealthyFrame }
                 guard let frame = parser.feed(line: line) else { continue }
@@ -149,8 +160,16 @@ public final class EventStreamClient: Sendable {
                 continuation.yield(event)
             }
         } catch {
-            // Transport error or cancellation — fall through to the caller's
-            // backoff/reconnect loop (or exit if cancelled).
+            // Fall through to the caller's backoff/reconnect loop (or exit
+            // if cancelled). A `CancellationError` here means the consumer
+            // tore the connection down deliberately — that's expected
+            // shutdown, not a failure, so it's excluded from the error log.
+            // Genuine transport errors are logged so failure modes are
+            // visible in Console/log stream even though no user-facing
+            // health surface exists yet (that's Task 9's HealthMonitor).
+            if !Task.isCancelled {
+                Self.logger.error("SSE connection error for \(self.url, privacy: .public): \(String(describing: error), privacy: .public)")
+            }
         }
         return sawHealthyFrame
     }
