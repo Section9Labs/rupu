@@ -31,11 +31,13 @@ public struct HostCapabilities: Decodable, Equatable, Sendable {
 
 /// One row from `GET /api/events`: the endpoint injects a stream position
 /// (`pos`) and timestamp (`ts`) into the same JSON object as the event
-/// payload, so this decodes both from that shared object.
+/// payload, so this decodes both from that shared object. The server
+/// injects both fields into every row unconditionally, so a row missing
+/// either one fails to decode rather than silently defaulting.
 public struct CPEventRow: Decodable, Equatable, Sendable {
     public let event: CPEvent
-    public let ts: Int64?
-    public let pos: Int?
+    public let ts: Int64
+    public let pos: Int
 
     private enum CodingKeys: String, CodingKey {
         case ts
@@ -44,8 +46,8 @@ public struct CPEventRow: Decodable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.ts = try container.decodeIfPresent(Int64.self, forKey: .ts)
-        self.pos = try container.decodeIfPresent(Int.self, forKey: .pos)
+        self.ts = try container.decode(Int64.self, forKey: .ts)
+        self.pos = try container.decode(Int.self, forKey: .pos)
         self.event = try CPEvent(from: decoder)
     }
 }

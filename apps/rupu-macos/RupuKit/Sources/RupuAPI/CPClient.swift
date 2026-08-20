@@ -18,6 +18,33 @@ public actor CPClient {
         try await get("api/events", query: [URLQueryItem(name: "limit", value: String(limit))])
     }
 
+    public func runs(offset: Int, limit: Int) async throws -> [APIRunListRow] {
+        try await get("api/runs", query: offsetLimitQuery(offset: offset, limit: limit))
+    }
+
+    public func workflowRuns(offset: Int, limit: Int) async throws -> [APIRunListRow] {
+        try await get("api/runs/workflows", query: offsetLimitQuery(offset: offset, limit: limit))
+    }
+
+    public func agentRuns(offset: Int, limit: Int) async throws -> [APIAgentRunRow] {
+        try await get("api/runs/agents", query: offsetLimitQuery(offset: offset, limit: limit))
+    }
+
+    public func autoflowEvents(offset: Int, limit: Int) async throws -> [APIAutoflowEventRow] {
+        try await get("api/runs/autoflows/events", query: offsetLimitQuery(offset: offset, limit: limit))
+    }
+
+    public func sessions(offset: Int, limit: Int) async throws -> [APISessionRow] {
+        try await get("api/sessions", query: offsetLimitQuery(offset: offset, limit: limit))
+    }
+
+    private func offsetLimitQuery(offset: Int, limit: Int) -> [URLQueryItem] {
+        [
+            URLQueryItem(name: "offset", value: String(offset)),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+    }
+
     func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
         guard var components = URLComponents(url: config.baseURL, resolvingAgainstBaseURL: false) else {
             throw CPError.transport("invalid base URL: \(config.baseURL)")

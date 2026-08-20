@@ -104,4 +104,23 @@ struct CPClientTests {
             _ = try await client.hostInfo()
         }
     }
+
+    @Test func runsHitsExpectedPathAndQueryAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("run_list_row.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let rows = try await client.runs(offset: 0, limit: 50)
+
+        #expect(rows.count == 2)
+        let url = StubURLProtocol.lastRequest?.url
+        #expect(url?.path == "/api/runs")
+        let query = url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "offset", value: "0")) == true)
+        #expect(query?.contains(URLQueryItem(name: "limit", value: "50")) == true)
+    }
 }
