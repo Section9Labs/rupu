@@ -1,0 +1,29 @@
+name: rupu
+options:
+  bundleIdPrefix: com.section9labs
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  RupuKit:
+    path: RupuKit
+targets:
+  rupu:
+    type: application
+    platform: macOS
+    sources: [App]
+    dependencies:
+      - package: RupuKit
+        product: RupuKit
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: rupu
+        LSMinimumSystemVersion: "14.0"
+        NSHumanReadableCopyright: "© Section9Labs"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.section9labs.rupu
+        SWIFT_VERSION: "6.0"
+        ENABLE_HARDENED_RUNTIME: NO   # signing/hardening is Phase 7
+        ENABLE_APP_SANDBOX: NO        # spawns the installed rupu binary

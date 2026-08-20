@@ -1,0 +1,121 @@
+[
+  {
+    "type": "run_started",
+    "event_version": 1,
+    "run_id": "run-01",
+    "workflow_path": "wf/x.yaml",
+    "started_at": "2026-08-20T12:00:00Z"
+  },
+  {
+    "type": "step_started",
+    "run_id": "run-01",
+    "step_id": "plan",
+    "kind": "linear",
+    "agent": "rupuso"
+  },
+  {
+    "type": "step_working",
+    "run_id": "run-01",
+    "step_id": "plan",
+    "note": "thinking",
+    "transcript_path": "t/plan.jsonl"
+  },
+  {
+    "type": "step_awaiting_approval",
+    "run_id": "run-01",
+    "step_id": "gate",
+    "reason": "manual gate"
+  },
+  {
+    "type": "step_completed",
+    "run_id": "run-01",
+    "step_id": "plan",
+    "success": true,
+    "duration_ms": 4200,
+    "host": "mini"
+  },
+  {
+    "type": "step_failed",
+    "run_id": "run-01",
+    "step_id": "build",
+    "error": "exit 1"
+  },
+  {
+    "type": "step_skipped",
+    "run_id": "run-01",
+    "step_id": "deploy",
+    "reason": "branch untaken"
+  },
+  {
+    "type": "unit_started",
+    "run_id": "run-01",
+    "step_id": "fan",
+    "index": 0,
+    "unit_key": "crates/a",
+    "agent": null,
+    "transcript_path": "t/u0.jsonl"
+  },
+  {
+    "type": "unit_completed",
+    "run_id": "run-01",
+    "step_id": "fan",
+    "index": 0,
+    "unit_key": "crates/a",
+    "success": true,
+    "tokens_in": 0,
+    "tokens_out": 0
+  },
+  {
+    "type": "panel_round",
+    "run_id": "run-01",
+    "step_id": "review",
+    "round": 2,
+    "max_iterations": 5,
+    "max_severity_remaining": "high"
+  },
+  {
+    "type": "run_completed",
+    "run_id": "run-01",
+    "status": "completed",
+    "finished_at": "2026-08-20T12:00:00Z"
+  },
+  {
+    "type": "run_failed",
+    "run_id": "run-01",
+    "error": "step build failed",
+    "finished_at": "2026-08-20T12:00:00Z"
+  },
+  {
+    "type": "run_paused",
+    "run_id": "run-01"
+  },
+  {
+    "type": "run_resumed",
+    "run_id": "run-01"
+  },
+  {
+    "type": "step_paused",
+    "run_id": "run-01",
+    "step_id": "plan"
+  },
+  {
+    "type": "step_resumed",
+    "run_id": "run-01",
+    "step_id": "plan"
+  },
+  {
+    "type": "dispatch_started",
+    "run_id": "run-01",
+    "sub_run_id": "run-02",
+    "agent": "reviewer",
+    "transcript_path": "t/d.jsonl"
+  },
+  {
+    "type": "dispatch_completed",
+    "run_id": "run-01",
+    "sub_run_id": "run-02",
+    "success": true,
+    "tokens_in": 1000,
+    "tokens_out": 200
+  }
+]

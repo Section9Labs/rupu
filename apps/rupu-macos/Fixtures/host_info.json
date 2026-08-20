@@ -1,0 +1,17 @@
+{
+  "version": "0.71.0",
+  "capabilities": {
+    "backends": [
+      "claude",
+      "codex"
+    ],
+    "scm_hosts": [
+      "github.com"
+    ],
+    "permission_modes": [
+      "ask",
+      "bypass",
+      "readonly"
+    ]
+  }
+}
