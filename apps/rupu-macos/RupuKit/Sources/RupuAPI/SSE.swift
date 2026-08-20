@@ -88,11 +88,28 @@ public final class EventStreamClient: Sendable {
     private let url: URL
     private let token: String?
     private let session: URLSession
+    private let onConnectionChange: (@Sendable (Bool) -> Void)?
 
-    public init(url: URL, token: String?, session: URLSession = .shared) {
+    /// `onConnectionChange`, when provided, fires `true` the moment a
+    /// connection attempt gets a 2xx response (before any frame has
+    /// necessarily arrived) and `false` when that attempt ends for any
+    /// reason (stream end, error, or cancellation). This is additive to
+    /// the original frame-only `events()` stream: a server that's healthy
+    /// but idle (no events, only SSE keep-alive comments) never dispatches
+    /// a decodable frame, so a consumer that only watched `events()` for a
+    /// "connected" signal would show disconnected forever against a
+    /// perfectly good stream. `onConnectionChange` is the connection-level
+    /// signal; `events()` remains purely event-level and is unchanged.
+    public init(
+        url: URL,
+        token: String?,
+        session: URLSession = .shared,
+        onConnectionChange: (@Sendable (Bool) -> Void)? = nil
+    ) {
         self.url = url
         self.token = token
         self.session = session
+        self.onConnectionChange = onConnectionChange
     }
 
     public func events() -> AsyncStream<CPEvent> {
@@ -138,6 +155,16 @@ public final class EventStreamClient: Sendable {
 
         var sawHealthyFrame = false
         var parser = SSELineParser()
+        // Tracks whether this attempt fired `onConnectionChange(true)`, so
+        // the matching `false` only fires for an attempt that actually
+        // connected — never for one that failed before ever reaching a 2xx
+        // response.
+        var didSignalConnected = false
+        defer {
+            if didSignalConnected {
+                onConnectionChange?(false)
+            }
+        }
 
         do {
             let (bytes, response) = try await session.bytes(for: request)
@@ -149,6 +176,8 @@ public final class EventStreamClient: Sendable {
                 Self.logger.error("SSE connect failed: HTTP \(httpResponse.statusCode, privacy: .public) for \(self.url, privacy: .public)")
                 return false
             }
+            didSignalConnected = true
+            onConnectionChange?(true)
             for try await line in bytes.lines {
                 if Task.isCancelled { return sawHealthyFrame }
                 guard let frame = parser.feed(line: line) else { continue }

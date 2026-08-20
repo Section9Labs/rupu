@@ -24,6 +24,18 @@ public struct RootView: View {
     public init(model: AppModel, backend: BackendController) {
         self.model = model
         self.backend = backend
+        // Set before any `configureEmbedded`/`configureRemote`/
+        // `reconnectIfNeeded` call can run (those all happen later, from
+        // `.task`/`OnboardingView`'s buttons), so the very first
+        // `EventStreamClient` this controller creates already has it.
+        // Connection-level signal, not frame-level: a healthy-but-idle
+        // stream (no events, only SSE keep-alives) never decodes a frame,
+        // so this is what actually lights the pill up in that case.
+        backend.onLiveConnectionChange = { connected in
+            Task { @MainActor in
+                model.liveConnected = connected
+            }
+        }
     }
 
     public var body: some View {
@@ -62,10 +74,14 @@ public struct RootView: View {
     /// footer/toolbar pill already read (Task 8), and — the Phase 1
     /// end-to-end proof — starts exactly one task consuming the live event
     /// stream the first time health reaches `.healthy`. Health flapping
-    /// back down just flips `liveConnected` false (the stream client
-    /// itself keeps reconnecting); it does not tear down or respawn the
-    /// consumer, per the brief's "don't spawn a second consumer on
-    /// re-health" — `liveEventTask == nil` is the guard.
+    /// back down is a backstop that also flips `liveConnected` false (the
+    /// stream client itself keeps reconnecting, and normally
+    /// `backend.onLiveConnectionChange` — set in `init`, connection-level,
+    /// not frame-level — already caught the disconnect); it does not tear
+    /// down or respawn the consumer, per the brief's "don't spawn a second
+    /// consumer on re-health" — `liveEventTask == nil` is the guard.
+    /// `liveConnected` itself is owned by `onLiveConnectionChange`; this
+    /// loop only counts frames.
     private func handleHealthChange(_ health: BackendHealth) {
         model.backendHealth = health
 
@@ -77,7 +93,6 @@ public struct RootView: View {
         guard liveEventTask == nil, let stream = backend.eventStream() else { return }
         liveEventTask = Task { @MainActor in
             for await _ in stream.events() {
-                model.liveConnected = true
                 model.liveEventCount += 1
             }
         }

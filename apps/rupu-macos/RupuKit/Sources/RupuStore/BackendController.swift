@@ -26,6 +26,17 @@ public final class BackendController {
     /// write failure) that never get as far as starting one.
     public private(set) var health: BackendHealth = .starting
 
+    /// Fired (via each `EventStreamClient` this controller creates) on
+    /// HTTP-2xx connect and on disconnect. `RootView` sets this once, at
+    /// launch, before calling `reconnectIfNeeded`/`configureEmbedded`/
+    /// `configureRemote`, to drive the toolbar's live pill from actual
+    /// connection state rather than from decoded frames alone — a healthy
+    /// but idle server (SSE keep-alives only, no events) never dispatches
+    /// a frame, so a frame-only signal would show "offline" against a
+    /// perfectly good stream. `client()`/`eventStream()`'s existing
+    /// backward-compatible API is unaffected; this is purely additive.
+    public var onLiveConnectionChange: (@Sendable (Bool) -> Void)?
+
     private let defaults: UserDefaults
     private let tokenStore: any TokenStoring
     private let discoverBinary: @Sendable (String?) -> String?
@@ -92,21 +103,7 @@ public final class BackendController {
     /// Stores `token` in Keychain (via `tokenStore`), persists `.remote(url:)`
     /// (never the token) to UserDefaults, and starts polling health.
     public func configureRemote(url: URL, token: String) async {
-        await tearDownEmbeddedServer(keepRunning: false)
-        healthMonitor?.stop()
-        healthMonitor = nil
-
-        do {
-            try tokenStore.save(token: token, account: url.absoluteString)
-        } catch {
-            health = .down("failed to store token in Keychain: \(error)")
-            return
-        }
-
-        let newMode = BackendMode.remote(url: url)
-        mode = newMode
-        persist(newMode)
-        startHealthMonitor(config: CPConfig(baseURL: url, token: token))
+        await connectRemote(url: url, token: token, persistToken: true)
     }
 
     /// Re-establishes the connection implied by a mode `init` restored from
@@ -115,15 +112,52 @@ public final class BackendController {
     /// wiring) + health-monitor start so a relaunch with a persisted mode
     /// skips onboarding entirely. `RootView` calls this once at launch. A
     /// no-op if nothing is persisted or a connection is already live.
+    ///
+    /// The `.remote` branch deliberately never re-saves the token it reads:
+    /// a Keychain read failure (locked keychain, a cross-process access
+    /// prompt that can't be answered, ...) must never be allowed to
+    /// overwrite a real stored token with an empty string, which is what
+    /// unconditionally forwarding into `configureRemote` used to do. A read
+    /// failure surfaces as `.down` instead and leaves both `mode` and the
+    /// Keychain untouched, so the next launch attempt (or a manual retry)
+    /// can still succeed.
     public func reconnectIfNeeded() async {
         guard healthMonitor == nil, let mode else { return }
         switch mode {
         case .embedded(let port):
             await configureEmbedded(port: port)
         case .remote(let url):
-            let token = tokenStore.load(account: url.absoluteString) ?? ""
-            await configureRemote(url: url, token: token)
+            guard let token = tokenStore.load(account: url.absoluteString) else {
+                health = .down("keychain unavailable — token could not be read")
+                return
+            }
+            await connectRemote(url: url, token: token, persistToken: false)
         }
+    }
+
+    /// Shared remote-connect path for `configureRemote` (explicit user
+    /// action — always persists the token) and `reconnectIfNeeded`
+    /// (restoring an already-persisted mode — never re-persists, since the
+    /// token it read already came from Keychain and re-saving on every
+    /// launch is both unnecessary and, on a `load` failure, unsafe).
+    private func connectRemote(url: URL, token: String, persistToken: Bool) async {
+        await tearDownEmbeddedServer(keepRunning: false)
+        healthMonitor?.stop()
+        healthMonitor = nil
+
+        if persistToken {
+            do {
+                try tokenStore.save(token: token, account: url.absoluteString)
+            } catch {
+                health = .down("failed to store token in Keychain: \(error)")
+                return
+            }
+        }
+
+        let newMode = BackendMode.remote(url: url)
+        mode = newMode
+        persist(newMode)
+        startHealthMonitor(config: CPConfig(baseURL: url, token: token))
     }
 
     public func client() -> CPClient? {
@@ -155,7 +189,8 @@ public final class BackendController {
         activeClient = client
         activeEventStream = EventStreamClient(
             url: config.baseURL.appendingPathComponent("api/events/stream"),
-            token: config.token
+            token: config.token,
+            onConnectionChange: onLiveConnectionChange
         )
 
         let monitor = HealthMonitor(probe: { try await client.hostInfo() }, interval: healthInterval)
