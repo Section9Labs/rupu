@@ -14,12 +14,12 @@ let package = Package(
         .target(name: "RupuAPI"),
         .target(name: "RupuBackend", dependencies: ["RupuAPI"]),
         .target(name: "RupuDesign"),
-        .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend"]),
+        .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign"]),
         .target(name: "RupuShell", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign"]),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
-        .testTarget(name: "RupuStoreTests", dependencies: ["RupuStore", "RupuBackend", "RupuAPI"]),
+        .testTarget(name: "RupuStoreTests", dependencies: ["RupuStore", "RupuBackend", "RupuAPI", "RupuDesign"]),
         .testTarget(
             name: "RupuShellTests",
             dependencies: ["RupuShell", "RupuStore", "RupuBackend", "RupuAPI", "RupuDesign"]
