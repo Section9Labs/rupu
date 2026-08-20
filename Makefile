@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates app-smoke app-run cp cp-web clean help
+.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates app-smoke app-run cp cp-web clean help macos-gen macos-build macos-test macos-run
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -135,6 +135,23 @@ app-run:
 	fi
 	@echo "app-run OK — no RefCell errors during 8s smoke"
 
+# rupu.app (macOS, Swift) — XcodeGen scaffold under apps/rupu-macos/.
+# macos-gen regenerates the gitignored .xcodeproj from project.yml;
+# macos-build/-run depend on it so the project is always fresh.
+macos-gen:
+	xcodegen generate --spec apps/rupu-macos/project.yml
+
+macos-build: macos-gen
+	xcodebuild -project apps/rupu-macos/rupu.xcodeproj -scheme rupu \
+		-configuration Debug -derivedDataPath apps/rupu-macos/DerivedData \
+		CODE_SIGNING_ALLOWED=NO build
+
+macos-test:
+	swift test --package-path apps/rupu-macos/RupuKit
+
+macos-run: macos-build
+	open apps/rupu-macos/DerivedData/Build/Products/Debug/rupu.app
+
 help:
 	@echo "rupu Makefile targets:"
 	@echo ""
@@ -152,6 +169,11 @@ help:
 	@echo "  gates          fmt + lint + test (same as the release-ready check)"
 	@echo "  app-smoke      headless 4-second app smoke against bundled fixture"
 	@echo "  clean          cargo clean"
+	@echo ""
+	@echo "  macos-gen      xcodegen generate apps/rupu-macos/project.yml"
+	@echo "  macos-build    macos-gen + xcodebuild the rupu scheme (Debug, unsigned)"
+	@echo "  macos-test     swift test the RupuKit package"
+	@echo "  macos-run      macos-build + open the built rupu.app"
 	@echo ""
 	@echo "Refresh-my-install flow:  make sync && make install"
 	@echo ""
