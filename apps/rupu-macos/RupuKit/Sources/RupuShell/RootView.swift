@@ -52,8 +52,8 @@ public struct RootView: View {
         }
         .sheet(isPresented: onboardingSheetBinding) {
             OnboardingView(backend: backend, model: model)
+                .interactiveDismissDisabled()
         }
-        .interactiveDismissDisabled()
         .onChange(of: backend.health) { _, newHealth in
             handleHealthChange(newHealth)
         }
@@ -64,8 +64,11 @@ public struct RootView: View {
     /// `OnboardingView`'s own `.onChange(of: backend.health)`, which sets
     /// `model.onboardingComplete = true` explicitly once the connection is
     /// actually healthy. Esc / Cmd-. are blocked from reaching this sheet
-    /// at all by `.interactiveDismissDisabled()` above; this setter being a
-    /// no-op is the defense in depth — even if some future SwiftUI
+    /// at all by `.interactiveDismissDisabled()` on the sheet's content in
+    /// the `.sheet` closure above (it must be applied to the presented
+    /// content, not chained after `.sheet` itself — chaining it after
+    /// `.sheet` has no effect on the sheet's own dismissal); this setter
+    /// being a no-op is the defense in depth — even if some future SwiftUI
     /// dismissal path reaches here, it can never strand the app in
     /// "onboarded" state with nothing actually connected (no reconnect
     /// path, no re-present, no Settings recovery until Phase 6).
