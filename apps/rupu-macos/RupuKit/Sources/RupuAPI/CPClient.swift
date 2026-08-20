@@ -38,11 +38,49 @@ public actor CPClient {
         try await get("api/sessions", query: offsetLimitQuery(offset: offset, limit: limit))
     }
 
+    public func runDetail(id: String, host: String? = nil) async throws -> APIRunDetail {
+        try await get("api/runs/\(id)", query: hostQuery(host))
+    }
+
+    public func runGraph(id: String, host: String? = nil) async throws -> APIRunGraph {
+        try await get("api/runs/\(id)/graph", query: hostQuery(host))
+    }
+
+    /// `path` is the transcript file's full path (from a step result / run
+    /// record / unit row / agent-run row), sent as a query parameter —
+    /// `/api/transcript`, never a URL path segment.
+    public func transcript(path: String, host: String? = nil) async throws -> APITranscriptPage {
+        var query = [URLQueryItem(name: "path", value: path)]
+        query.append(contentsOf: hostQuery(host))
+        return try await get("api/transcript", query: query)
+    }
+
+    public func runNetflow(id: String) async throws -> APINetflow {
+        try await get("api/runs/\(id)/netflow")
+    }
+
+    public func runFindings(id: String) async throws -> APIFindings {
+        try await get("api/findings", query: [URLQueryItem(name: "run_id", value: id)])
+    }
+
+    public func sessionDetail(id: String) async throws -> APISessionRow {
+        try await get("api/sessions/\(id)")
+    }
+
+    public func sessionRuns(id: String) async throws -> [APISessionRunRow] {
+        try await get("api/sessions/\(id)/runs")
+    }
+
     private func offsetLimitQuery(offset: Int, limit: Int) -> [URLQueryItem] {
         [
             URLQueryItem(name: "offset", value: String(offset)),
             URLQueryItem(name: "limit", value: String(limit)),
         ]
+    }
+
+    private func hostQuery(_ host: String?) -> [URLQueryItem] {
+        guard let host else { return [] }
+        return [URLQueryItem(name: "host", value: host)]
     }
 
     func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {

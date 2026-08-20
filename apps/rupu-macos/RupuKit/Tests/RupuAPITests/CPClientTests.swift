@@ -123,4 +123,112 @@ struct CPClientTests {
         #expect(query?.contains(URLQueryItem(name: "offset", value: "0")) == true)
         #expect(query?.contains(URLQueryItem(name: "limit", value: "50")) == true)
     }
+
+    @Test func runDetailHitsRunIDPathAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("run_detail.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let detail = try await client.runDetail(id: "run-01")
+
+        #expect(detail.run.id == "run-01")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/runs/run-01")
+    }
+
+    @Test func runGraphHitsGraphSubpathAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("run_graph.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let graph = try await client.runGraph(id: "run-02", host: "mini")
+
+        #expect(graph.run.id == "run-02")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/runs/run-02/graph")
+        let query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "host", value: "mini")) == true)
+    }
+
+    @Test func transcriptSendsPathAsQueryParameterNotURLSegment() async throws {
+        let fixture = Data(#"{"events":[],"summary":null}"#.utf8)
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let page = try await client.transcript(path: "t/plan.jsonl")
+
+        #expect(page.events.isEmpty)
+        #expect(page.summary == nil)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/transcript")
+        let query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "path", value: "t/plan.jsonl")) == true)
+    }
+
+    @Test func runFindingsSendsRunIDAsQueryParameter() async throws {
+        let fixture = try Fixtures.data("findings_run.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let findings = try await client.runFindings(id: "run-40")
+
+        #expect(findings.findings.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/findings")
+        let query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "run_id", value: "run-40")) == true)
+    }
+
+    @Test func runNetflowHitsNetflowSubpathAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("netflow_run.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let netflow = try await client.runNetflow(id: "run-40")
+
+        #expect(netflow.flows.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/runs/run-40/netflow")
+    }
+
+    @Test func sessionDetailAndSessionRunsHitExpectedPaths() async throws {
+        // `GET /api/sessions/:id` returns a bare object in the same
+        // `SessionDto` shape as the list endpoint (session_rows.json),
+        // just not wrapped in an array.
+        let singleSession = Data(#"{"session_id":"sess-1","agent_name":"rupuso","model":"claude","provider_name":"anthropic","total_turns":1,"total_tokens_in":1,"total_tokens_out":1,"total_tokens_cached":0,"created_at":"2026-08-20T12:00:00Z","updated_at":"2026-08-20T12:00:00Z","workspace_id":"ws-1"}"#.utf8)
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], singleSession) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let detail = try await client.sessionDetail(id: "sess-1")
+        #expect(detail.sessionID == "sess-1")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/sessions/sess-1")
+
+        let runsBody = Data(#"[{"run_id":"run-1","prompt":"do x","transcript_path":"t/r1.jsonl","status":"completed","started_at":"2026-08-20T12:00:00Z","completed_at":"2026-08-20T12:05:00Z","tokens_in":100,"tokens_out":50,"duration_ms":5000,"error":null}]"#.utf8)
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], runsBody) }
+        let runs = try await client.sessionRuns(id: "sess-1")
+        #expect(runs.count == 1)
+        #expect(runs[0].runID == "run-1")
+        #expect(runs[0].tokensIn == 100)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/sessions/sess-1/runs")
+    }
 }

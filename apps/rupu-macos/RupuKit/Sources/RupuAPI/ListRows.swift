@@ -301,3 +301,55 @@ public struct APISessionRow: Decodable, Equatable, Sendable {
         case hostID = "host_id"
     }
 }
+
+/// Row from `GET /api/sessions/:id/runs` (`SessionRunRow` on the Rust
+/// side) — one prior run launched from this session.
+public struct APISessionRunRow: Decodable, Equatable, Sendable {
+    public let runID: String
+    public let prompt: String
+    public let transcriptPath: String
+    public let status: String?
+    public let startedAt: String?
+    public let completedAt: String?
+    public let tokensIn: UInt64
+    public let tokensOut: UInt64
+    public let durationMS: UInt64
+    public let error: String?
+
+    public init(
+        runID: String,
+        prompt: String,
+        transcriptPath: String,
+        status: String?,
+        startedAt: String?,
+        completedAt: String?,
+        tokensIn: UInt64,
+        tokensOut: UInt64,
+        durationMS: UInt64,
+        error: String?
+    ) {
+        self.runID = runID
+        self.prompt = prompt
+        self.transcriptPath = transcriptPath
+        self.status = status
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.tokensIn = tokensIn
+        self.tokensOut = tokensOut
+        self.durationMS = durationMS
+        self.error = error
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runID = "run_id"
+        case prompt
+        case transcriptPath = "transcript_path"
+        case status
+        case startedAt = "started_at"
+        case completedAt = "completed_at"
+        case tokensIn = "tokens_in"
+        case tokensOut = "tokens_out"
+        case durationMS = "duration_ms"
+        case error
+    }
+}
