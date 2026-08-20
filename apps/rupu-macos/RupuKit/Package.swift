@@ -17,7 +17,7 @@ let package = Package(
         .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend"]),
         .target(name: "RupuShell", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign"]),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
-        .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend"]),
+        .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
         .testTarget(name: "RupuStoreTests", dependencies: ["RupuStore"]),
     ]
