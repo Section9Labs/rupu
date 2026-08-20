@@ -123,8 +123,7 @@ macos-run: macos-build
 # rupu_orchestrator::executor::Event or HostInfoResponse, then update the
 # Swift models to match.
 macos-fixtures:
-	REGEN_FIXTURES=1 cargo test -p rupu-cp --test macos_fixtures
-	REGEN_FIXTURES=1 cargo test -p rupu-cp host_info_fixture_is_current
+	REGEN_FIXTURES=1 cargo test -p rupu-cp fixture_is_current
 
 help:
 	@echo "rupu Makefile targets:"

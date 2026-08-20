@@ -1,0 +1,28 @@
+[
+  {
+    "event_version": 1,
+    "pos": 0,
+    "run_id": "run-01",
+    "started_at": "2026-08-20T12:00:00Z",
+    "ts": 1755691200000,
+    "type": "run_started",
+    "workflow_path": "wf/x.yaml"
+  },
+  {
+    "duration_ms": 4200,
+    "pos": 1,
+    "run_id": "run-01",
+    "step_id": "plan",
+    "success": true,
+    "ts": 1755691200000,
+    "type": "step_completed"
+  },
+  {
+    "finished_at": "2026-08-20T12:00:00Z",
+    "pos": 2,
+    "run_id": "run-01",
+    "status": "completed",
+    "ts": 1755691200000,
+    "type": "run_completed"
+  }
+]

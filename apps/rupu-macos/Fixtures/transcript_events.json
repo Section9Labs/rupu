@@ -1,0 +1,227 @@
+[
+  {
+    "type": "run_start",
+    "data": {
+      "run_id": "run-01",
+      "workspace_id": "ws-1",
+      "agent": "rupuso",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "started_at": "2026-08-20T12:00:00Z",
+      "mode": "ask"
+    }
+  },
+  {
+    "type": "turn_start",
+    "data": {
+      "turn_idx": 0
+    }
+  },
+  {
+    "type": "assistant_delta",
+    "data": {
+      "content": "Thinking"
+    }
+  },
+  {
+    "type": "assistant_message",
+    "data": {
+      "content": "Here is the plan",
+      "thinking": "reasoning trace"
+    }
+  },
+  {
+    "type": "assistant_message",
+    "data": {
+      "content": "Done"
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "call_id": "call-1",
+      "tool": "Read",
+      "input": {
+        "file_path": "src/a.rs"
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "call_id": "call-2",
+      "output": "error output",
+      "error": "boom",
+      "duration_ms": 5,
+      "structured": {
+        "matchCount": 2,
+        "tool": "ast_grep"
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "call_id": "call-1",
+      "output": "ok",
+      "duration_ms": 12
+    }
+  },
+  {
+    "type": "file_edit",
+    "data": {
+      "path": "src/a.rs",
+      "kind": "modify",
+      "diff": "@@ -1 +1 @@\n-old\n+new\n"
+    }
+  },
+  {
+    "type": "command_run",
+    "data": {
+      "argv": [
+        "cargo",
+        "test"
+      ],
+      "cwd": "/repo",
+      "exit_code": 0,
+      "stdout_bytes": 100,
+      "stderr_bytes": 0
+    }
+  },
+  {
+    "type": "action_emitted",
+    "data": {
+      "kind": "issues.create",
+      "payload": {
+        "title": "x"
+      },
+      "allowed": true,
+      "applied": true,
+      "reason": "auto-approved"
+    }
+  },
+  {
+    "type": "action_emitted",
+    "data": {
+      "kind": "issues.create",
+      "payload": {
+        "title": "y"
+      },
+      "allowed": false,
+      "applied": false
+    }
+  },
+  {
+    "type": "gate_requested",
+    "data": {
+      "gate_id": "gate-1",
+      "prompt": "Deploy to prod?",
+      "decision": "approved",
+      "decided_by": "matt"
+    }
+  },
+  {
+    "type": "gate_requested",
+    "data": {
+      "gate_id": "gate-2",
+      "prompt": "Deploy to staging?"
+    }
+  },
+  {
+    "type": "turn_end",
+    "data": {
+      "turn_idx": 0,
+      "tokens_in": 500,
+      "tokens_out": 120
+    }
+  },
+  {
+    "type": "turn_end",
+    "data": {
+      "turn_idx": 1
+    }
+  },
+  {
+    "type": "usage",
+    "data": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "served_model": "claude-sonnet-4-6-20260201",
+      "input_tokens": 1000,
+      "output_tokens": 200,
+      "cached_tokens": 50
+    }
+  },
+  {
+    "type": "usage",
+    "data": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "input_tokens": 10,
+      "output_tokens": 5,
+      "cached_tokens": 0
+    }
+  },
+  {
+    "type": "run_complete",
+    "data": {
+      "run_id": "run-01",
+      "status": "error",
+      "total_tokens": 1200,
+      "duration_ms": 42000,
+      "error": "step build failed"
+    }
+  },
+  {
+    "type": "run_complete",
+    "data": {
+      "run_id": "run-01",
+      "status": "ok",
+      "total_tokens": 1200,
+      "duration_ms": 42000
+    }
+  },
+  {
+    "type": "tool_audit",
+    "data": {
+      "tool": "issues.create",
+      "declared": true,
+      "granted": true,
+      "blocked": false,
+      "restricted": true
+    }
+  },
+  {
+    "type": "net_flow",
+    "data": {
+      "flow": {
+        "id": "00000000010000000000000001",
+        "ts": "2026-08-20T12:00:00Z",
+        "ctx": {
+          "run_id": "run-01",
+          "step_id": "plan",
+          "agent": "rupuso",
+          "workspace_id": "ws-1",
+          "origin": {
+            "kind": "provider",
+            "name": "anthropic"
+          }
+        },
+        "fidelity": "http",
+        "method": "POST",
+        "scheme": "https",
+        "host": "api.anthropic.com",
+        "port": 443,
+        "path": "/v1/messages",
+        "http_version": "HTTP/1.1",
+        "status": 200,
+        "outcome": "ok",
+        "bytes_out": 512,
+        "bytes_in": 2048,
+        "body_complete": true,
+        "ttfb_ms": 120,
+        "duration_ms": 430
+      }
+    }
+  }
+]

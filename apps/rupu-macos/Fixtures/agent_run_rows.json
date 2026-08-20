@@ -1,0 +1,45 @@
+[
+  {
+    "run_id": "run-10",
+    "source": "session",
+    "agent": "rupuso",
+    "session_id": "sess-1",
+    "trigger_source": "session_turn",
+    "status": "running",
+    "started_at": "2026-08-20T12:00:00Z",
+    "transcript_path": "/global/transcripts/run-10.jsonl",
+    "usage": {
+      "input_tokens": 800,
+      "output_tokens": 150,
+      "cached_tokens": 20,
+      "total_tokens": 950,
+      "cost_usd": 0.09,
+      "priced": true,
+      "runs": 1
+    },
+    "turns": 3,
+    "duration_ms": 12500,
+    "host_id": "local"
+  },
+  {
+    "run_id": "run-11",
+    "source": "standalone",
+    "agent": null,
+    "session_id": null,
+    "trigger_source": null,
+    "status": null,
+    "started_at": null,
+    "transcript_path": null,
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "total_tokens": 0,
+      "cost_usd": null,
+      "priced": false,
+      "runs": 0
+    },
+    "turns": 0,
+    "duration_ms": null
+  }
+]

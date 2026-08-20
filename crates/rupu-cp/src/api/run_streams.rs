@@ -1147,6 +1147,123 @@ mod tests {
     use rupu_runtime::{AutoflowCycleEvent, AutoflowCycleMode, AutoflowHistoryEventRecord};
     use std::fs;
 
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────────
+    //
+    // `AgentRunRow`/`AutoflowEventRow` are private to this module — the
+    // integration test (`tests/macos_fixtures.rs`) can't build them, so their
+    // fixtures live here instead. Same `check_fixture` contract as that file
+    // (duplicated: a unit test can't share code with an integration test
+    // without a public module) — see `api/host_info.rs`'s test module for the
+    // established pattern.
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures");
+        let path = dir.join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    #[test]
+    fn agent_run_rows_fixture_is_current() {
+        let rows = vec![
+            AgentRunRow {
+                run_id: "run-10".into(),
+                source: "session",
+                agent: Some("rupuso".into()),
+                session_id: Some("sess-1".into()),
+                trigger_source: Some("session_turn".into()),
+                status: Some("running".into()),
+                started_at: Some("2026-08-20T12:00:00Z".into()),
+                transcript_path: Some("/global/transcripts/run-10.jsonl".into()),
+                usage: crate::usage::UsageSummary {
+                    input_tokens: 800,
+                    output_tokens: 150,
+                    cached_tokens: 20,
+                    total_tokens: 950,
+                    cost_usd: Some(0.09),
+                    priced: true,
+                    runs: 1,
+                },
+                turns: 3,
+                duration_ms: Some(12_500),
+                host_id: Some("local".into()),
+            },
+            AgentRunRow {
+                run_id: "run-11".into(),
+                source: "standalone",
+                agent: None,
+                session_id: None,
+                trigger_source: None,
+                status: None,
+                started_at: None,
+                transcript_path: None,
+                usage: crate::usage::UsageSummary::default(),
+                turns: 0,
+                duration_ms: None,
+                host_id: None,
+            },
+        ];
+        check_fixture("agent_run_rows.json", &rows);
+    }
+
+    #[test]
+    fn autoflow_event_rows_fixture_is_current() {
+        let rows = vec![
+            AutoflowEventRow {
+                event_id: "evt-1".into(),
+                cycle_id: "cycle-1".into(),
+                at: "2026-08-20T12:00:00Z".into(),
+                kind: "run_launched".into(),
+                workflow: Some("nightly-health".into()),
+                issue_display_ref: Some("#42".into()),
+                run_id: Some("run-20".into()),
+                status: Some("running".into()),
+                worker_name: Some("worker-a".into()),
+                usage: crate::usage::UsageSummary {
+                    input_tokens: 400,
+                    output_tokens: 90,
+                    cached_tokens: 0,
+                    total_tokens: 490,
+                    cost_usd: Some(0.04),
+                    priced: true,
+                    runs: 1,
+                },
+                turns: Some(2),
+                duration_ms: Some(8_000),
+                detail: None,
+                host_id: Some("local".into()),
+            },
+            AutoflowEventRow {
+                event_id: "evt-2".into(),
+                cycle_id: "cycle-1".into(),
+                at: "2026-08-20T12:05:00Z".into(),
+                kind: "cycle_failed".into(),
+                workflow: Some("nightly-health".into()),
+                issue_display_ref: None,
+                run_id: None,
+                status: None,
+                worker_name: Some("worker-a".into()),
+                usage: crate::usage::UsageSummary::default(),
+                turns: None,
+                duration_ms: None,
+                detail: Some("worker crashed".into()),
+                host_id: Some("local".into()),
+            },
+        ];
+        check_fixture("autoflow_event_rows.json", &rows);
+    }
+
     #[test]
     fn agent_lifecycle_classifies() {
         assert!(agent_in_lifecycle(Some("running"), Some("active")));
