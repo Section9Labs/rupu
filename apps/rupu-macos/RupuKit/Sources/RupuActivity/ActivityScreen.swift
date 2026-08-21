@@ -1,5 +1,4 @@
 import SwiftUI
-import Observation
 import RupuAPI
 import RupuStore
 import RupuDesign
@@ -16,7 +15,6 @@ public struct ActivityScreen: View {
     let backend: BackendController
 
     @State private var store: ActivityStore?
-    @State private var connectivity: LiveConnectivityBridge?
 
     public init(model: AppModel, backend: BackendController) {
         self.model = model
@@ -124,14 +122,9 @@ public struct ActivityScreen: View {
             activeStore = existing
         } else {
             guard let client = backend.client() else { return }
-            let bridge = LiveConnectivityBridge(model: model)
-            connectivity = bridge
             let newStore = ActivityStore(
                 client: client,
-                signalsFactory: Self.makeSignalsFactory(
-                    eventStream: backend.eventStream(),
-                    connectivity: bridge
-                )
+                signalsFactory: Self.makeSignalsFactory(backend: backend)
             )
             store = newStore
             activeStore = newStore
@@ -150,124 +143,69 @@ public struct ActivityScreen: View {
         }
     }
 
-    /// Composes `ActivityStore`'s required `signalsFactory` from the app's
-    /// existing plumbing, without touching `BackendController`/`CPClient`
-    /// (out of this task's scope) to add a second `onConnectionChange`
-    /// subscriber slot:
+    /// Composes `ActivityStore`'s required `signalsFactory` around the
+    /// store's **own**, fully independent connection — not `RootView`'s
+    /// shared `eventStream()` firehose. `BackendController.eventStream()`'s
+    /// `EventStreamClient` has its `onConnectionChange` fixed at
+    /// construction (already claimed by `RootView`, forwarded into
+    /// `model.liveConnected`), so a consumer that just pumped that
+    /// instance's `.events()` a second time would ride a *different*
+    /// physical SSE connection than the one `onConnectionChange` is
+    /// actually reporting on — this store's own stream could drop and
+    /// reconnect while `model.liveConnected` stays blissfully true, and
+    /// `freshness` would never notice.
     ///
-    /// - Events: pumps `backend.eventStream()`'s (Phase 1's shared firehose
-    ///   client) `.events()` into `.event(...)` signals. `.events()` spins
-    ///   up an independent reconnecting SSE connection each time it's
-    ///   called, so re-invoking this on every `activate()` (kind switch,
-    ///   screen revisit) is safe — it doesn't reuse or interfere with
-    ///   `RootView`'s own separate `.events()` consumer.
-    /// - Connection state: `JSONEventStream`'s `onConnectionChange` closure
-    ///   is fixed at construction (already claimed by `RootView`, forwarded
-    ///   into `model.liveConnected`) — there's no slot left to attach a
-    ///   second one for this screen's own `.events()` call. Rather than
-    ///   silently never emitting `.connection(false)` (which would make
-    ///   `freshness` incapable of ever showing `.stale`), `.connection(_:)`
-    ///   signals are sourced from `model.liveConnected` itself via
-    ///   `LiveConnectivityBridge` — the exact same connectivity truth
-    ///   already driving the toolbar's live pill, so Activity's staleness
-    ///   banner and the toolbar dot can never disagree.
+    /// Fix: `backend.makeFirehoseStream(onConnectionChange:)` builds a
+    /// brand-new `JSONEventStream<CPEvent>` end-to-end for this store —
+    /// same endpoint/credentials, its own connection, its own callback —
+    /// bridged through `StreamLifecycle.makeSignalBridge`'s documented
+    /// two-phase recipe: `onChange` is threaded straight into that new
+    /// stream's `init`, so every connect/disconnect for *this specific*
+    /// connection lands in the same ordered `continuation` as that
+    /// connection's own frames, with the synchronous-yield ordering
+    /// `makeSignalBridge` guarantees (a connection signal for a given
+    /// attempt is always yielded before any frame of that same attempt).
+    /// No coalescing, no second independently-scheduled observer to race.
     ///
-    /// Captures only `Sendable` values (`EventStreamClient` is
-    /// unconditionally `Sendable`; `LiveConnectivityBridge` is
-    /// `@unchecked Sendable` by construction, see its doc comment) —
-    /// `model`/`backend` themselves are `@MainActor` reference types and
-    /// cannot be captured directly in this `@Sendable` closure.
+    /// This does not add a connection versus a naive "just reuse
+    /// eventStream()" approach — pumping `eventStream()`'s `.events()` a
+    /// second time (the prior design) already opened its own independent
+    /// underlying SSE connection; that connection is now just honestly
+    /// paired with its own connection-state callback instead of borrowing
+    /// `model.liveConnected` (which describes `RootView`'s connection).
+    ///
+    /// `store.freshness` (the staleness banner) and `model.liveConnected`
+    /// (the toolbar pill) can therefore disagree briefly — they now
+    /// describe two different physical connections to the same endpoint,
+    /// not one shared truth. That's intentional, not a bug: each is
+    /// truthful about the connection it actually owns.
+    ///
+    /// Captures only `backend` (a `@MainActor` reference) inside this
+    /// `@Sendable` closure; every access to it is wrapped in
+    /// `MainActor.assumeIsolated`, safe because the only real caller,
+    /// `ActivityStore.restartStream()`, is itself `@MainActor`.
     private static func makeSignalsFactory(
-        eventStream: EventStreamClient?,
-        connectivity: LiveConnectivityBridge
+        backend: BackendController
     ) -> @Sendable () -> AsyncStream<StreamSignal<CPEvent>> {
         {
-            // `makeSignalBridge` is declared on `StreamLifecycle`
-            // (`@MainActor`) even though its body touches no actor-isolated
-            // state — it's a pure `AsyncStream.makeStream()` factory. This
-            // closure's own type (`@Sendable () -> ...`) can't carry
-            // isolation, but every real caller (`ActivityStore.
-            // restartStream()`) is itself `@MainActor`, so this assumption
-            // always holds in practice.
-            let (_, continuation, signals) = MainActor.assumeIsolated {
+            let (onChange, continuation, signals) = MainActor.assumeIsolated {
                 StreamLifecycle.makeSignalBridge(CPEvent.self)
             }
-            guard let eventStream else {
+            guard let stream = MainActor.assumeIsolated({
+                backend.makeFirehoseStream(onConnectionChange: onChange)
+            }) else {
                 continuation.finish()
                 return signals
             }
 
-            let eventPump = Task {
-                for await event in eventStream.events() {
+            let pump = Task {
+                for await event in stream.events() {
                     continuation.yield(.event(event))
                 }
+                continuation.finish()
             }
-            let connectionPump = Task {
-                for await connected in connectivity.stream() {
-                    continuation.yield(.connection(connected))
-                }
-            }
-            continuation.onTermination = { _ in
-                eventPump.cancel()
-                connectionPump.cancel()
-            }
+            continuation.onTermination = { _ in pump.cancel() }
             return signals
-        }
-    }
-}
-
-/// Bridges `AppModel.liveConnected` (an `@Observable`, `@MainActor`
-/// property) into a `Sendable`-capturable factory of `AsyncStream<Bool>`,
-/// so `ActivityScreen`'s `@Sendable` `signalsFactory` closure can observe
-/// it without capturing the non-`Sendable` `AppModel` class directly.
-///
-/// `@unchecked Sendable`: the only stored state is a `weak` reference to a
-/// `@MainActor`-isolated class, and every access to it — both the initial
-/// read and the `withObservationTracking` re-subscribe loop — happens
-/// inside an explicit `Task { @MainActor in ... }` hop (`stream()`'s
-/// producer closure, and `observe`'s `onChange` continuation). Nothing here
-/// ever reads or writes `model` from off the main actor.
-final class LiveConnectivityBridge: @unchecked Sendable {
-    private weak var model: AppModel?
-
-    init(model: AppModel) {
-        self.model = model
-    }
-
-    /// A fresh stream each call — mirrors `ActivityStore`'s own
-    /// `signalsFactory` contract (single-consumption `AsyncStream`, called
-    /// fresh on every `activate()`), so a kind switch or screen revisit
-    /// that rebuilds the whole `signals` stream also gets a fresh
-    /// connectivity feed rather than reusing an already-terminated one.
-    func stream() -> AsyncStream<Bool> {
-        AsyncStream { continuation in
-            let task = Task { @MainActor [weak model] in
-                guard let model else {
-                    continuation.finish()
-                    return
-                }
-                Self.observe(model: model, continuation: continuation)
-            }
-            continuation.onTermination = { _ in
-                task.cancel()
-            }
-        }
-    }
-
-    @MainActor
-    private static func observe(model: AppModel, continuation: AsyncStream<Bool>.Continuation) {
-        continuation.yield(model.liveConnected)
-        withObservationTracking {
-            _ = model.liveConnected
-        } onChange: { [weak model] in
-            Task { @MainActor in
-                guard let model else {
-                    continuation.finish()
-                    return
-                }
-                continuation.yield(model.liveConnected)
-                observe(model: model, continuation: continuation)
-            }
         }
     }
 }

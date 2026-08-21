@@ -3,6 +3,20 @@ import AppKit
 import RupuStore
 import RupuDesign
 
+/// Column widths shared by `ActivityTable`'s header row and every
+/// `ActivityTableRow` — declared once so the two can never drift out of
+/// alignment with each other.
+private enum ActivityTableLayout {
+    static let status: CGFloat = 100
+    static let kind: CGFloat = 84
+    static let project: CGFloat = 120
+    static let host: CGFloat = 96
+    static let trigger: CGFloat = 92
+    static let duration: CGFloat = 64
+    static let cost: CGFloat = 64
+    static let started: CGFloat = 88
+}
+
 /// The merged execution table. Built on `List` rather than SwiftUI's stock
 /// `Table`: this screen needs a per-row background tint (`.awaiting` rows)
 /// and a per-row conditional tap affordance (`.none`-navigation rows are
@@ -13,16 +27,7 @@ struct ActivityTable: View {
     let rows: [ActivityRow]
     let onSelect: (ActivityRow) -> Void
 
-    private enum Layout {
-        static let status: CGFloat = 100
-        static let kind: CGFloat = 84
-        static let project: CGFloat = 120
-        static let host: CGFloat = 96
-        static let trigger: CGFloat = 92
-        static let duration: CGFloat = 64
-        static let cost: CGFloat = 64
-        static let started: CGFloat = 88
-    }
+    private typealias Layout = ActivityTableLayout
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -85,16 +90,7 @@ private struct ActivityTableRow: View {
     let row: ActivityRow
     let onSelect: (ActivityRow) -> Void
 
-    private enum Layout {
-        static let status: CGFloat = 100
-        static let kind: CGFloat = 84
-        static let project: CGFloat = 120
-        static let host: CGFloat = 96
-        static let trigger: CGFloat = 92
-        static let duration: CGFloat = 64
-        static let cost: CGFloat = 64
-        static let started: CGFloat = 88
-    }
+    private typealias Layout = ActivityTableLayout
 
     private var isClickable: Bool { row.navigation != .none }
 
@@ -173,8 +169,7 @@ private struct ActivityTableRow: View {
     }
 
     private var costLabel: String {
-        guard let cost = row.costUSD else { return "—" }
-        return String(format: "$%.2f", cost)
+        Fmt.cost(row.costUSD)
     }
 
     private var startedLabel: String {
