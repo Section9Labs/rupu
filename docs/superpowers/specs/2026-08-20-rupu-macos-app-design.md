@@ -138,10 +138,13 @@ disposition at the owning phase's planning time: *shipped*, *deferred (tracked)*
 *intentionally CLI-only*. No silent gaps.
 
 **Phase 2 disposition** (`docs/superpowers/specs/2026-08-20-rupu-macos-phase-2-read-path-design.md`,
-complete): `runs`, `run_streams`, `transcript`/`transcripts`, `sessions` (read), `graph`,
-`netflow` (per-run), `findings` (per-run) — shipped. `run_resolve` — deferred (tracked);
-no consumer in the strict-read-only Phase 2 scope (spec §1.1), revisit when a screen
-needs resolved-entity display beyond what `/api/runs` already carries. `usage-timeline`
+complete): `runs`, `run_streams`, `transcript` (singular — `GET /api/transcript` +
+`/stream`), `sessions` (read), `graph`, `netflow` (per-run), `findings` (per-run) —
+shipped. `transcripts` (plural — archive/delete mutations) — deferred (tracked);
+mutation-only, no consumer in the strict-read-only Phase 2 scope, lands with Phase 3
+write-path mutations. `run_resolve` — deferred (tracked); no consumer in the
+strict-read-only Phase 2 scope (spec §1.1), revisit when a screen needs
+resolved-entity display beyond what `/api/runs` already carries. `usage-timeline`
 — deferred (tracked); belongs to the Usage screen, Phase 5.
 
 ## 9. Error handling, loading, validation
