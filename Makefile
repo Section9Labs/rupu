@@ -118,12 +118,14 @@ macos-test:
 macos-run: macos-build
 	open apps/rupu-macos/DerivedData/Build/Products/Debug/rupu.app
 
-# Regenerate the golden JSON fixtures the Swift app's decode tests check
-# against (apps/rupu-macos/Fixtures/*.json). Run this after changing
-# rupu_orchestrator::executor::Event or HostInfoResponse, then update the
-# Swift models to match.
+# Regenerate the golden JSON fixtures the Swift app's decode/encode tests
+# check against (apps/rupu-macos/Fixtures/*.json,
+# apps/rupu-macos/Fixtures/requests/*.json). Run this after changing
+# rupu_orchestrator::executor::Event, HostInfoResponse, or any of the
+# write-path DTOs/request bodies, then update the Swift models to match.
 macos-fixtures:
 	REGEN_FIXTURES=1 cargo test -p rupu-cp fixture_is_current
+	REGEN_FIXTURES=1 cargo test -p rupu-cp request_fixture_roundtrips
 
 help:
 	@echo "rupu Makefile targets:"

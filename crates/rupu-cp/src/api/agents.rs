@@ -2274,4 +2274,128 @@ mod tests {
         assert_eq!(rows[0].name, "code-reviewer");
         assert_eq!(rows[0].slug, "my-file-stem");
     }
+
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────
+    //
+    // `AgentDto`/`AgentRunBody`/`SessionStartBody` are private to this
+    // module — the integration test (`tests/macos_fixtures.rs`) can't build
+    // them, so their fixtures live here instead. Same `check_fixture`
+    // contract as that file (duplicated: a unit test can't share code with
+    // an integration test without a public module) — see `api/host_info.rs`'s
+    // test module for the established pattern.
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/rupu-macos/Fixtures")
+    }
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let path = fixtures_dir().join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    /// Reads the checked-in `apps/rupu-macos/Fixtures/requests/<name>` and
+    /// returns its contents. `REGEN_FIXTURES=1` first (re)writes `raw` (the
+    /// hand-authored canonical JSON — these body types are Deserialize-only,
+    /// so there's no `Serialize` impl to render from) verbatim to disk, so
+    /// this always ends up reading back exactly what's checked in.
+    fn check_request_fixture(name: &str, raw: &str) -> String {
+        let path = fixtures_dir().join("requests").join(name);
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, raw).expect("write request fixture");
+        }
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing request fixture {name}; run `make macos-fixtures`"))
+    }
+
+    #[test]
+    fn agent_defs_fixture_is_current() {
+        let global = AgentDto {
+            name: "code-reviewer".into(),
+            slug: "code-reviewer".into(),
+            description: Some("Reviews code for correctness and style".into()),
+            provider: Some("anthropic".into()),
+            model: Some("claude-sonnet-4-6".into()),
+            effort: Some("Medium".into()),
+            max_tokens: Some(8192),
+            tools: vec!["Read".into(), "Grep".into(), "Edit".into()],
+            scope: "global".into(),
+            scope_kind: ScopeKind::Global,
+            scope_id: None,
+            usage: crate::usage::UsageSummary {
+                input_tokens: 5000,
+                output_tokens: 1200,
+                cached_tokens: 300,
+                total_tokens: 6500,
+                cost_usd: Some(0.42),
+                priced: true,
+                runs: 3,
+            },
+            run_count: 3,
+            last_run: Some("2026-08-20T12:00:00+00:00".into()),
+        };
+        let project = AgentDto {
+            name: "triage".into(),
+            slug: "triage".into(),
+            description: None,
+            provider: None,
+            model: None,
+            effort: None,
+            max_tokens: None,
+            tools: vec![],
+            scope: "widgets".into(),
+            scope_kind: ScopeKind::Project,
+            scope_id: Some("ws_a".into()),
+            usage: crate::usage::UsageSummary::default(),
+            run_count: 0,
+            last_run: None,
+        };
+        check_fixture("agent_defs.json", &vec![global, project]);
+    }
+
+    #[test]
+    fn agent_run_body_request_fixture_roundtrips() {
+        // Locks `AgentRunBody`'s wire shape (`POST /api/agents/:name/run`) —
+        // every field optional, `host` in the BODY (unlike the run-control
+        // routes, which take it as a query param — see the API facts doc).
+        let raw = check_request_fixture(
+            "agent_run_body.json",
+            "{\n  \"prompt\": \"investigate the failing test\",\n  \"mode\": \"bypass\",\n  \"target\": \"main\",\n  \"working_dir\": \"/tmp/project\",\n  \"host\": \"mini\"\n}\n",
+        );
+        let body: AgentRunBody = serde_json::from_str(&raw).expect("deserialize AgentRunBody");
+        assert_eq!(body.prompt.as_deref(), Some("investigate the failing test"));
+        assert_eq!(body.mode.as_deref(), Some("bypass"));
+        assert_eq!(body.target.as_deref(), Some("main"));
+        assert_eq!(body.working_dir.as_deref(), Some("/tmp/project"));
+        assert_eq!(body.host.as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn session_start_body_request_fixture_roundtrips() {
+        // Locks `SessionStartBody`'s wire shape (`POST
+        // /api/agents/:name/session`) — identical field set to
+        // `AgentRunBody`, kept as a distinct fixture since it's a distinct
+        // (Deserialize-only) type the app must encode separately.
+        let raw = check_request_fixture(
+            "session_start_body.json",
+            "{\n  \"prompt\": \"start reviewing\",\n  \"mode\": \"ask\",\n  \"target\": \"main\",\n  \"working_dir\": \"/tmp/project\",\n  \"host\": \"local\"\n}\n",
+        );
+        let body: SessionStartBody =
+            serde_json::from_str(&raw).expect("deserialize SessionStartBody");
+        assert_eq!(body.prompt.as_deref(), Some("start reviewing"));
+        assert_eq!(body.mode.as_deref(), Some("ask"));
+        assert_eq!(body.target.as_deref(), Some("main"));
+        assert_eq!(body.working_dir.as_deref(), Some("/tmp/project"));
+        assert_eq!(body.host.as_deref(), Some("local"));
+    }
 }

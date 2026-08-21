@@ -1,0 +1,11 @@
+[
+  {
+    "error": "run x not found"
+  },
+  {
+    "error": "ambiguous gate: candidates [a, b]"
+  },
+  {
+    "error": "session s is stopped"
+  }
+]

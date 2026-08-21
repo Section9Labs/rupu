@@ -2689,4 +2689,52 @@ mod tests {
         let err = map_host_mutate_err(HostConnectorError::Remote(500, "boom".into()));
         assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/requests/) ────────
+    //
+    // `ApproveBody`/`RejectBody`/`CancelBody` are private to this module —
+    // the integration test (`tests/macos_fixtures.rs`) can't build them, so
+    // their request round-trip fixtures live here instead. These are
+    // Deserialize-only types (no `Serialize` impl to render a canonical JSON
+    // from), so — per the established request-fixture contract — the
+    // checked-in JSON is a hand-authored raw string constant; the test reads
+    // it back off disk and asserts the parsed fields.
+
+    fn check_request_fixture(name: &str, raw: &str) -> String {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures/requests");
+        let path = dir.join(name);
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, raw).expect("write request fixture");
+        }
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing request fixture {name}; run `make macos-fixtures`"))
+    }
+
+    #[test]
+    fn approve_body_request_fixture_roundtrips() {
+        let raw = check_request_fixture("approve_body.json", "{\n  \"mode\": \"bypass\"\n}\n");
+        let body: ApproveBody = serde_json::from_str(&raw).expect("deserialize ApproveBody");
+        assert_eq!(body.mode.as_deref(), Some("bypass"));
+    }
+
+    #[test]
+    fn reject_body_request_fixture_roundtrips() {
+        let raw = check_request_fixture(
+            "reject_body.json",
+            "{\n  \"reason\": \"needs another look\"\n}\n",
+        );
+        let body: RejectBody = serde_json::from_str(&raw).expect("deserialize RejectBody");
+        assert_eq!(body.reason.as_deref(), Some("needs another look"));
+    }
+
+    #[test]
+    fn cancel_body_request_fixture_roundtrips() {
+        let raw = check_request_fixture(
+            "cancel_body.json",
+            "{\n  \"reason\": \"operator cancelled\"\n}\n",
+        );
+        let body: CancelBody = serde_json::from_str(&raw).expect("deserialize CancelBody");
+        assert_eq!(body.reason.as_deref(), Some("operator cancelled"));
+    }
 }

@@ -1,0 +1,38 @@
+[
+  {
+    "name": "nightly-health",
+    "scope": "global",
+    "scope_kind": "global",
+    "scope_id": null,
+    "usage": {
+      "input_tokens": 5000,
+      "output_tokens": 1200,
+      "cached_tokens": 300,
+      "total_tokens": 6500,
+      "cost_usd": 0.42,
+      "priced": true,
+      "runs": 5
+    },
+    "run_count": 5,
+    "last_run": "2026-08-20T12:00:00+00:00",
+    "autoflow_enabled": true
+  },
+  {
+    "name": "adhoc-build",
+    "scope": "widgets",
+    "scope_kind": "project",
+    "scope_id": "ws_a",
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "total_tokens": 0,
+      "cost_usd": null,
+      "priced": false,
+      "runs": 0
+    },
+    "run_count": 0,
+    "last_run": null,
+    "autoflow_enabled": null
+  }
+]

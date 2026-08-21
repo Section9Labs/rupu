@@ -2044,4 +2044,143 @@ mod tests {
                 .join("issue-triage.yaml")
         );
     }
+
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────
+    //
+    // `WorkflowDto`/`LaunchBody`/`WorkflowWriteBody` are private to this
+    // module — the integration test (`tests/macos_fixtures.rs`) can't build
+    // them, so their fixtures live here instead. Same `check_fixture`
+    // contract as that file (duplicated: a unit test can't share code with
+    // an integration test without a public module) — see `api/host_info.rs`'s
+    // test module for the established pattern.
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/rupu-macos/Fixtures")
+    }
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let path = fixtures_dir().join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    /// Reads the checked-in `apps/rupu-macos/Fixtures/requests/<name>` and
+    /// returns its contents. `REGEN_FIXTURES=1` first (re)writes `raw` (the
+    /// hand-authored canonical JSON — these body types are Deserialize-only,
+    /// so there's no `Serialize` impl to render from) verbatim to disk, so
+    /// this always ends up reading back exactly what's checked in.
+    fn check_request_fixture(name: &str, raw: &str) -> String {
+        let path = fixtures_dir().join("requests").join(name);
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, raw).expect("write request fixture");
+        }
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing request fixture {name}; run `make macos-fixtures`"))
+    }
+
+    #[test]
+    fn workflow_defs_fixture_is_current() {
+        let global = WorkflowDto {
+            name: "nightly-health".into(),
+            scope: "global".into(),
+            scope_kind: ScopeKind::Global,
+            scope_id: None,
+            usage: crate::usage::UsageSummary {
+                input_tokens: 5000,
+                output_tokens: 1200,
+                cached_tokens: 300,
+                total_tokens: 6500,
+                cost_usd: Some(0.42),
+                priced: true,
+                runs: 5,
+            },
+            run_count: 5,
+            last_run: Some("2026-08-20T12:00:00+00:00".into()),
+            autoflow_enabled: Some(true),
+        };
+        let project = WorkflowDto {
+            name: "adhoc-build".into(),
+            scope: "widgets".into(),
+            scope_kind: ScopeKind::Project,
+            scope_id: Some("ws_a".into()),
+            usage: crate::usage::UsageSummary::default(),
+            run_count: 0,
+            last_run: None,
+            autoflow_enabled: None,
+        };
+        check_fixture("workflow_defs.json", &vec![global, project]);
+    }
+
+    /// Declares two inputs — one `required: true` with `enum` values (no
+    /// default), one defaulted (`required: false`, implicit) — to lock the
+    /// `InputDef` wire shape the Launcher's declared-input rows source.
+    const SAMPLE_WORKFLOW_YAML: &str = "name: nightly-health\nsteps:\n  - id: one\n    agent: x\n    prompt: hi\ninputs:\n  branch:\n    type: string\n    required: true\n    enum: [main, staging]\n  target:\n    type: string\n    default: production\n";
+
+    #[test]
+    fn workflow_detail_fixture_is_current() {
+        let workflow =
+            Workflow::parse(SAMPLE_WORKFLOW_YAML).expect("SAMPLE_WORKFLOW_YAML should parse");
+        let usage = crate::usage::UsageSummary {
+            input_tokens: 5000,
+            output_tokens: 1200,
+            cached_tokens: 300,
+            total_tokens: 6500,
+            cost_usd: Some(0.42),
+            priced: true,
+            runs: 5,
+        };
+        // Mirrors `load_detail`'s `json!` shape exactly.
+        let value = serde_json::json!({
+            "workflow": workflow,
+            "yaml": SAMPLE_WORKFLOW_YAML,
+            "usage": usage,
+            "scope": "global",
+            "scope_kind": ScopeKind::Global,
+            "scope_id": Option::<String>::None,
+        });
+        check_fixture("workflow_detail.json", &value);
+    }
+
+    #[test]
+    fn workflow_launch_body_request_fixture_roundtrips() {
+        // Locks `LaunchBody`'s wire shape (`POST /api/workflows/:name/run`) —
+        // `inputs` defaults to `{}`, `host` in the BODY (unlike the
+        // run-control routes, which take it as a query param).
+        let raw = check_request_fixture(
+            "workflow_launch_body.json",
+            "{\n  \"inputs\": {\n    \"branch\": \"main\"\n  },\n  \"mode\": \"ask\",\n  \"host\": \"mini\"\n}\n",
+        );
+        let body: LaunchBody = serde_json::from_str(&raw).expect("deserialize LaunchBody");
+        assert_eq!(body.inputs.get("branch").map(String::as_str), Some("main"));
+        assert_eq!(body.mode.as_deref(), Some("ask"));
+        assert_eq!(body.target, None);
+        assert_eq!(body.working_dir, None);
+        assert_eq!(body.host.as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn validate_body_request_fixture_roundtrips() {
+        // `POST /api/workflows/validate` shares `WorkflowWriteBody`'s shape
+        // (`{"raw": String}`) with `PUT /api/workflows/:name` — same type,
+        // separate fixture since the two are distinct call sites the app
+        // encodes independently.
+        let raw = check_request_fixture(
+            "validate_body.json",
+            "{\n  \"raw\": \"name: demo\\nsteps:\\n  - id: one\\n    agent: x\\n    prompt: hi\\n\"\n}\n",
+        );
+        let body: WorkflowWriteBody =
+            serde_json::from_str(&raw).expect("deserialize WorkflowWriteBody");
+        assert!(body.raw.contains("name: demo"));
+        assert!(body.raw.contains("agent: x"));
+    }
 }

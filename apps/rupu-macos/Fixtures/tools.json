@@ -1,0 +1,59 @@
+{
+  "tools": [
+    {
+      "name": "scm.repos.list",
+      "description": "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
+      "input_schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "platform": {
+            "description": "Platform to query (`github` | `gitlab`). Omit to use [scm.default].",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ListReposArgs",
+        "type": "object"
+      },
+      "kind": "read"
+    },
+    {
+      "name": "scm.branches.create",
+      "description": "Create a new branch from a given SHA. Returns the new branch.",
+      "input_schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "from_sha": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "platform": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from_sha",
+          "name",
+          "owner",
+          "repo"
+        ],
+        "title": "CreateBranchArgs",
+        "type": "object"
+      },
+      "kind": "write"
+    }
+  ]
+}

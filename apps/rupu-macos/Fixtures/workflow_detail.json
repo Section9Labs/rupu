@@ -1,0 +1,64 @@
+{
+  "scope": "global",
+  "scope_id": null,
+  "scope_kind": "global",
+  "usage": {
+    "cached_tokens": 300,
+    "cost_usd": 0.42,
+    "input_tokens": 5000,
+    "output_tokens": 1200,
+    "priced": true,
+    "runs": 5,
+    "total_tokens": 6500
+  },
+  "workflow": {
+    "autoflow": null,
+    "concerns": null,
+    "contracts": {
+      "outputs": {}
+    },
+    "defaults": {
+      "continue_on_error": null
+    },
+    "description": null,
+    "inputs": {
+      "branch": {
+        "default": null,
+        "enum": [
+          "main",
+          "staging"
+        ],
+        "required": true,
+        "type": "string"
+      },
+      "target": {
+        "default": "production",
+        "enum": [],
+        "required": false,
+        "type": "string"
+      }
+    },
+    "name": "nightly-health",
+    "notifyIssue": false,
+    "steps": [
+      {
+        "actions": [],
+        "agent": "x",
+        "continue_on_error": null,
+        "for_each": null,
+        "id": "one",
+        "max_parallel": null,
+        "parallel": null,
+        "prompt": "hi",
+        "when": null
+      }
+    ],
+    "trigger": {
+      "cron": null,
+      "event": null,
+      "filter": null,
+      "on": "manual"
+    }
+  },
+  "yaml": "name: nightly-health\nsteps:\n  - id: one\n    agent: x\n    prompt: hi\ninputs:\n  branch:\n    type: string\n    required: true\n    enum: [main, staging]\n  target:\n    type: string\n    default: production\n"
+}

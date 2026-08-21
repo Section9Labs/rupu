@@ -1,0 +1,26 @@
+{
+  "host_id": "local",
+  "run": {
+    "error_message": "Cancelled from control plane",
+    "finished_at": "2026-08-20T12:05:00Z",
+    "id": "run-01",
+    "inputs": {},
+    "permission_mode": "ask",
+    "started_at": "2026-08-20T12:00:00Z",
+    "status": "cancelled",
+    "transcript_dir": "/tmp/proj/.rupu/transcripts",
+    "workflow_name": "nightly-health",
+    "workspace_id": "ws-1",
+    "workspace_path": "/tmp/proj"
+  },
+  "steps": [],
+  "usage": {
+    "cached_tokens": 0,
+    "cost_usd": null,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "priced": false,
+    "runs": 0,
+    "total_tokens": 0
+  }
+}

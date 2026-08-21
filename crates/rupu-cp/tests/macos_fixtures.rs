@@ -756,3 +756,65 @@ fn run_graph_fixture_is_current() {
     });
     check_fixture("run_graph.json", &value);
 }
+
+// ── Write-path fixtures (Phase 3) ───────────────────────────────────────────
+//
+// Response shapes hand-built here (not behind a private DTO) — the launch
+// responses and the approve/reject/cancel error shapes are plain
+// `serde_json::json!` objects the handlers construct inline (see
+// `api/agents.rs::run_agent`/`start_session`, `api/workflows.rs::launch_run`,
+// `api/runs.rs::approve_run`/`reject_run`/`cancel_run`), so there's no DTO
+// type to import — mirroring them here locks the wire shape the Swift app
+// decodes. The request-body round-trip tests for the private `*Body` structs
+// live in-module next to their types instead (see `api/runs.rs`,
+// `api/agents.rs`, `api/workflows.rs`, `api/sessions.rs`).
+
+#[test]
+fn launch_responses_fixture_is_current() {
+    // Mirrors, in order: `run_agent`'s local-launch response
+    // (`{"run_id","host_id"}`), `start_session`'s local-start response
+    // (`{"session_id","host_id"}`), and any remote-proxied control response
+    // (`{"ok":true,"host_id"}` — shared by approve/reject/cancel/pause/
+    // resume/archive/restore/send when `?host=<remote>` is set).
+    let value = serde_json::json!([
+        { "run_id": "run-01", "host_id": "local" },
+        { "session_id": "ses-01", "host_id": "local" },
+        { "ok": true, "host_id": "mini" },
+    ]);
+    check_fixture("launch_responses.json", &value);
+}
+
+#[test]
+fn run_control_response_fixture_is_current() {
+    // The shape `run_response()` (api/runs.rs) produces for a local
+    // approve/reject/cancel — reload the record, attach steps + usage, then
+    // inject `host_id: "local"`. Reject/cancel are IMMEDIATE (status flips in
+    // the response, unlike approve's marker-only design — see the API facts
+    // doc) — a `cancelled` record models that.
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+    let record = RunRecord {
+        status: RunStatus::Cancelled,
+        finished_at: Some(t + chrono::Duration::minutes(5)),
+        error_message: Some("Cancelled from control plane".into()),
+        ..sample_run_record("run-01", t)
+    };
+    let steps: Vec<StepResultRecord> = Vec::new();
+    let usage = UsageSummary::default();
+    let mut value = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
+    value["host_id"] = serde_json::json!("local");
+    check_fixture("run_control_response.json", &value);
+}
+
+#[test]
+fn api_errors_fixture_is_current() {
+    // `{"error": "<message>"}` — the shape every 400/404/409/500/501
+    // `ApiError` serializes to. `AmbiguousGate`'s message embeds the parked
+    // gate candidates (see `ApprovalError::AmbiguousGate` / `map_approval_err`
+    // in api/runs.rs); `session ... is stopped` mirrors `send_session`'s 409.
+    let value = serde_json::json!([
+        { "error": "run x not found" },
+        { "error": "ambiguous gate: candidates [a, b]" },
+        { "error": "session s is stopped" },
+    ]);
+    check_fixture("api_errors.json", &value);
+}

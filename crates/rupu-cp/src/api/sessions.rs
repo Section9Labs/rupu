@@ -1253,4 +1253,32 @@ mod tests {
             map_host_session_mutate_err(HostConnectorError::Remote(409, "still running".into()));
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
+
+    // ── macOS golden fixture (apps/rupu-macos/Fixtures/requests/) ─────────
+    //
+    // `SendBody` is private to this module — the integration test
+    // (`tests/macos_fixtures.rs`) can't build it, so its request round-trip
+    // fixture lives here instead. Deserialize-only type (no `Serialize` impl
+    // to render a canonical JSON from), so — per the established
+    // request-fixture contract — the checked-in JSON is a hand-authored raw
+    // string constant; the test reads it back off disk and asserts the
+    // parsed fields.
+
+    fn check_request_fixture(name: &str, raw: &str) -> String {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures/requests");
+        let path = dir.join(name);
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, raw).expect("write request fixture");
+        }
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing request fixture {name}; run `make macos-fixtures`"))
+    }
+
+    #[test]
+    fn send_body_request_fixture_roundtrips() {
+        let raw = check_request_fixture("send_body.json", "{\n  \"prompt\": \"hello\"\n}\n");
+        let body: SendBody = serde_json::from_str(&raw).expect("deserialize SendBody");
+        assert_eq!(body.prompt, "hello");
+    }
 }
