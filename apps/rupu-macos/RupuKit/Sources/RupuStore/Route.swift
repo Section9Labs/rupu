@@ -9,9 +9,19 @@ public enum RunKindFilter: String, CaseIterable, Sendable {
 }
 
 /// Every screen the shell can show in its detail pane.
+///
+/// `.runDetail`/`.sessionDetail` (Phase 2) are *pushed* states reached from
+/// an `ActivityRow.Navigation` — not directly sidebar-selectable, unlike
+/// `.activity(_:)`. `AppModel.selectedSidebarItem`'s getter maps both to
+/// plain `.runs` (the sidebar keeps highlighting the Runs section rather
+/// than showing no selection or guessing a kind leaf), and
+/// `AppModel.navigateBack()` is how the shell returns from either of them
+/// to whichever `.activity(kind)` route was current before the push.
 public enum Route: Hashable, Sendable {
     case overview
     case activity(RunKindFilter)
+    case runDetail(id: String, host: String?)
+    case sessionDetail(id: String)
     case projects
     case security
     case library

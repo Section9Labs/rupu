@@ -14,7 +14,7 @@ public enum ActivityKindTag: String, Sendable {
 /// always one of these — never a raw server string — so every screen that
 /// renders status (filters, glyphs, `RunTone` color) shares one vocabulary
 /// regardless of which upstream endpoint the row came from.
-public enum ActivityStatus: Equatable, Sendable {
+public enum ActivityStatus: Hashable, Sendable {
     case pending, running, completed, failed, awaiting, rejected, cancelled, paused
     case unknown(String)
 
@@ -143,6 +143,46 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         costUSD = r.usage?.costUSD
         startedAt = Self.parseISO(r.createdAt)
         navigation = .session(id: r.sessionID)
+    }
+
+    /// Full-field memberwise initializer used only by
+    /// `patchingStatus(_:durationMS:)` below to rebuild a copy with an
+    /// updated `status`/`durationMS` after a live `ActivityDelta`. Deliberately
+    /// `internal` (not part of the public surface the Task 4 report
+    /// documents) — `ActivityStore`, the only caller, lives in this same
+    /// module.
+    init(
+        id: String, kind: ActivityKindTag, subject: String, project: String?, host: String,
+        trigger: String?, status: ActivityStatus, durationMS: UInt64?, costUSD: Double?,
+        startedAt: Date?, navigation: Navigation
+    ) {
+        self.id = id
+        self.kind = kind
+        self.subject = subject
+        self.project = project
+        self.host = host
+        self.trigger = trigger
+        self.status = status
+        self.durationMS = durationMS
+        self.costUSD = costUSD
+        self.startedAt = startedAt
+        self.navigation = navigation
+    }
+
+    /// Returns a copy with `status` (and, when provided, `durationMS`)
+    /// replaced — the write side of an `ActivityDelta.statusPatch` applied
+    /// directly to an already-merged row, without refetching it.
+    /// `newDurationMS` only overrides when non-nil: none of
+    /// `ActivityDelta.reduce`'s produced status patches currently carry a
+    /// duration (see `LiveReducer.swift`'s doc comment), so a `nil` here
+    /// keeps whatever REST-sourced duration the row already had rather than
+    /// clobbering it.
+    func patchingStatus(_ newStatus: ActivityStatus, durationMS newDurationMS: UInt64?) -> ActivityRow {
+        ActivityRow(
+            id: id, kind: kind, subject: subject, project: project, host: host,
+            trigger: trigger, status: newStatus, durationMS: newDurationMS ?? durationMS,
+            costUSD: costUSD, startedAt: startedAt, navigation: navigation
+        )
     }
 
     /// Parses an RFC3339 timestamp with or without fractional seconds

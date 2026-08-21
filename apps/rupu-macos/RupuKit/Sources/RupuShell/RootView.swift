@@ -120,6 +120,8 @@ public struct RootView: View {
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .activity:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
+        case .runDetail, .sessionDetail:
+            PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .projects:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .security:

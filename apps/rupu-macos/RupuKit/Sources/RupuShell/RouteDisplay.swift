@@ -9,6 +9,8 @@ extension Route {
         switch self {
         case .overview: "Overview"
         case .activity(let kind): kind.screenTitle
+        case .runDetail: "Run"
+        case .sessionDetail: "Session"
         case .projects: "Projects"
         case .security: "Security"
         case .library: "Library"
@@ -22,7 +24,7 @@ extension Route {
     var placeholderPhase: Int {
         switch self {
         case .overview: 4
-        case .activity: 2
+        case .activity, .runDetail, .sessionDetail: 2
         case .projects, .security, .library, .fleet, .usage: 5
         }
     }
