@@ -204,6 +204,33 @@ public final class BackendController {
         )
     }
 
+    /// Same rationale as `makeFirehoseStream` above, but scoped server-side
+    /// to one run's events (`/api/events/stream?run=<id>`) — `RunDetailStore`
+    /// (Task 8)'s own independent connection for the step graph's live
+    /// pulses, wired to its own `onConnectionChange`, never sharing
+    /// `eventStream()`'s single already-claimed callback slot.
+    public func makeRunEventStream(runID: String, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<CPEvent>? {
+        guard let config = activeConfig,
+              var components = URLComponents(url: config.baseURL.appendingPathComponent("api/events/stream"), resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.queryItems = [URLQueryItem(name: "run", value: runID)]
+        guard let url = components.url else { return nil }
+        return JSONEventStream<CPEvent>(url: url, token: config.token, onConnectionChange: onConnectionChange)
+    }
+
+    /// Same shape as `makeRunEventStream` above, for the transcript tail
+    /// (`/api/transcript/stream?path=<file>`) — `RunDetailStore.focusStep`
+    /// tears this down and rebuilds it against a new `path` every time focus
+    /// switches to a different step.
+    public func makeTranscriptStream(path: String, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<TranscriptEvent>? {
+        guard let config = activeConfig,
+              var components = URLComponents(url: config.baseURL.appendingPathComponent("api/transcript/stream"), resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components.url else { return nil }
+        return JSONEventStream<TranscriptEvent>(url: url, token: config.token, onConnectionChange: onConnectionChange)
+    }
+
     /// Stops health polling and tears down a *spawned* embedded server
     /// (never an attached one) unless `keepRunning` is set. Idempotent:
     /// safe to call more than once (e.g. a raw `SIGTERM` reroute racing an

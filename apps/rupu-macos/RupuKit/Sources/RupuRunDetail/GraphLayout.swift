@@ -1,22 +1,5 @@
 import RupuAPI
-
-/// The rendered state of one `GraphNodeVM` in the step graph.
-///
-/// `layoutGraph` itself only ever produces `.done`/`.skipped` (from a
-/// matching `APIStepResult`) or `.pending` (the "not reached yet, and we
-/// aren't guessing" default). `.running` and `.gatePending` are always
-/// supplied by the caller via `liveStates` — `.running` from the run's
-/// `activeStepID`, `.gatePending` from `RunRecord.awaiting` — because both
-/// require knowledge (which step is *currently* executing, whether the run
-/// itself is parked) that a pure function over the static DAG + finished
-/// results cannot derive on its own.
-public enum NodeState: Equatable, Sendable {
-    case done(success: Bool)
-    case running
-    case gatePending
-    case pending
-    case skipped
-}
+import RupuStore
 
 /// One node's render-ready view model for `StepGraphView`.
 public struct GraphNodeVM: Identifiable, Equatable, Sendable {

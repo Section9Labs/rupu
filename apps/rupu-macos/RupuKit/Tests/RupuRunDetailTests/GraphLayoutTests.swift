@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import RupuAPI
+import RupuStore
 @testable import RupuRunDetail
 
 /// Fixture-driven tests for `layoutGraph`. `run_graph.json` carries all

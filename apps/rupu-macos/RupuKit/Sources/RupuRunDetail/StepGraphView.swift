@@ -1,5 +1,6 @@
 import SwiftUI
 import RupuDesign
+import RupuStore
 
 /// Horizontal step graph: one capsule per `GraphNodeVM`, joined by thin
 /// connectors, scrollable when the workflow has more nodes than fit the
