@@ -218,6 +218,30 @@ private func makeStore(
     runBox.latest.finish()
 }
 
+// Review fix: `stepFailed` (dispatch-level failure — connector error,
+// timeout, panic; the step never got to report anything) is a distinct
+// `CPEvent` case from `stepCompleted{success:false}` (the step ran and
+// reported failure). Without reducing it, a dispatch-failed step stayed
+// visibly `.running` forever, since `graph` is never refetched on the
+// terminal event.
+@MainActor @Test func stepFailedEventMapsToDoneFailureNodeState() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepFailed(runID: "run-1", stepID: "build", error: "connector timeout")))
+    try? await Task.sleep(for: .milliseconds(30))
+
+    #expect(store.liveStates["build"] == .done(success: false))
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
 // MARK: - (c) terminal event stops the stream and refreshes once
 
 @MainActor @Test func terminalEventStopsStreamAndRefreshesDetailFindingsNetflowExactlyOnce() async {
@@ -351,6 +375,78 @@ private func makeStore(
 
     store.deactivate()
     runBox.latest.finish()
+}
+
+// Review fix: two overlapping `focusStep` calls — the first's fetch is
+// deliberately slow, so it's still in flight when the second call starts.
+// Before the generation-token fix, both calls would eventually reach
+// `startTail`, with the second's assignment silently dropping (never
+// stopping) the first's `StreamLifecycle` — an orphaned consumer that kept
+// appending the *first* (now unfocused) step's tail events into the shared
+// `transcript` array forever. With the fix, the first call's results are
+// discarded once it's confirmed stale (its captured generation no longer
+// matches), so it never reaches `startTail` at all: only the second call's
+// tail is ever created, and `transcript` ends up holding only the second
+// step's snapshot (plus, in this test, no tail events at all — proving the
+// point independently of tail-event ordering).
+@MainActor @Test func overlappingFocusStepCallsOnlyTheMostRecentOneAppliesItsResults() async {
+    let runBox = RunStreamBox()
+    let tailBox = TailStreamBox()
+
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(),
+                steps: [
+                    stepResult(stepID: "stepA", transcriptPath: "t/a.jsonl"),
+                    stepResult(stepID: "stepB", transcriptPath: "t/b.jsonl"),
+                ]
+            )
+        },
+        transcriptResult: { path in
+            if path == "t/a.jsonl" {
+                // Deliberately slow: still in flight when "stepB"'s call starts.
+                try? await Task.sleep(for: .milliseconds(80))
+                return APITranscriptPage(events: [.assistantMessage(content: "A snapshot", thinking: nil)], summary: nil)
+            }
+            return APITranscriptPage(events: [.assistantMessage(content: "B snapshot", thinking: nil)], summary: nil)
+        },
+        runStreamBox: runBox,
+        tailStreamBox: tailBox
+    )
+
+    // `runRecord()`'s default `activeStepID` is nil, so `activate()`'s own
+    // auto-focus (steps.last -> "stepB") runs once, fully, before it
+    // returns — no overlap yet, and `liveStates` is still empty at that
+    // point so no tail starts from it either.
+    await store.activate()
+    #expect(tailBox.callCount == 0)
+
+    // Mark both steps "running" so either is eligible to start a tail.
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "stepA", kind: "step", agent: nil, host: nil)))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "stepB", kind: "step", agent: nil, host: nil)))
+    try? await Task.sleep(for: .milliseconds(20))
+
+    async let first: Void = store.focusStep("stepA")
+    try? await Task.sleep(for: .milliseconds(10)) // let the first call actually begin its slow fetch
+    async let second: Void = store.focusStep("stepB")
+    _ = await (first, second)
+
+    // Outlive stepA's slow fetch, in case it's still resolving.
+    try? await Task.sleep(for: .milliseconds(120))
+
+    #expect(store.focusedTranscriptPath == "t/b.jsonl")
+    #expect(store.transcript == [.assistantMessage(content: "B snapshot", thinking: nil)])
+    #expect(store.transcriptTailActive == true)
+    // Only "stepB"'s tail was ever started — "stepA"'s stale call never
+    // reached `startTail` once it lost the race.
+    #expect(tailBox.callCount == 1)
+    #expect(tailBox.latestPath == "t/b.jsonl")
+
+    store.deactivate()
+    runBox.latest.finish()
+    tailBox.latest.finish()
 }
 
 // MARK: - (e) deactivate cancels everything

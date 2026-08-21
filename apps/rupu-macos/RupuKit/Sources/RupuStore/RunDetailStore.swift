@@ -16,10 +16,17 @@ import RupuAPI
 ///
 /// **Live semantics**: `stepStarted`→`.running`, `stepCompleted`→
 /// `.done(success:)`, `stepAwaitingApproval`→`.gatePending`, `stepSkipped`→
-/// `.skipped` (four `CPEvent` cases per the brief; every other case is
-/// ignored here — including `stepFailed`, which the brief doesn't ask this
-/// store to reduce, since `stepCompleted(success: false)` is the terminal
-/// signal for a failed step in this event stream). A terminal run event
+/// `.skipped`, and — corrected after review; the original brief's four-case
+/// list omitted this — `stepFailed`→`.done(success: false)` too.
+/// `stepCompleted{success:false}` and `stepFailed{error}` are **not** the
+/// same event: the Rust runner emits `stepCompleted{success:false}` when a
+/// step actually ran and *reported* failure, and a separate `stepFailed`
+/// for dispatch-level failure (connector error, timeout, panic — the step
+/// never got to report anything). Without reducing `stepFailed` too, a
+/// dispatch-failed step stayed visually `.running` in the graph forever —
+/// `graph` is deliberately never refetched on the terminal event (see
+/// below), so nothing else would ever correct it. Every other `CPEvent`
+/// case is ignored here. A terminal run event
 /// (`runCompleted`/`runFailed`) stops the run stream and refreshes
 /// `detail`/`findings`/`netflow` exactly once — `didHandleTerminal` guards
 /// against a duplicate terminal event (or an `.unknown` fallback racing a
@@ -35,8 +42,23 @@ import RupuAPI
 /// `stepID` is the run's current `activeStepID` — loads a snapshot via
 /// `fetchTranscript`, then (local, and the step reads as currently running)
 /// tails `/api/transcript/stream` for that path, appending events in
-/// arrival order. Switching focus always tears the previous tail down
-/// first, whether or not the new step gets one of its own.
+/// arrival order.
+///
+/// **Overlapping calls**: `focusStep` is Task 9's contractual interface for
+/// repeated click-to-focus, so two calls can legitimately overlap (a click
+/// while a slower prior fetch is still in flight). A monotonic
+/// `focusGeneration` token, bumped on entry and captured locally, makes
+/// "only the most recent call wins" true *by construction*: a call whose
+/// captured generation no longer matches `focusGeneration` by the time its
+/// `await fetchTranscript` resolves discards its results outright — it
+/// never touches `transcript`/`focusedTranscriptPath` and never starts a
+/// tail — rather than racing whichever `await` happens to resume first
+/// (which, before this fix, could leave an earlier, now-stale step's tail
+/// running forever, silently appending its events into the shared
+/// `transcript` array). Only the winning call tears down the previous tail
+/// and applies its own results; `startTail` also unconditionally stops any
+/// existing `tailLifecycle` before assigning a new one, as a second,
+/// construction-level guarantee against ever running two tails at once.
 ///
 /// **Deviation from the brief's literal
 /// `init(runID:host:client:backend:)`-only surface**: that convenience init
@@ -84,6 +106,10 @@ public final class RunDetailStore {
     private var runLifecycle: StreamLifecycle?
     private var tailLifecycle: StreamLifecycle?
     private var didHandleTerminal = false
+
+    /// Monotonic token guarding `focusStep` against overlapping calls — see
+    /// the type doc comment's "Overlapping calls" section.
+    private var focusGeneration = 0
 
     /// Production entry point — `RunDetailScreen` calls this. `isRemote` is
     /// derived once, here, from `host` (`nil` or `"local"` means the
@@ -168,31 +194,50 @@ public final class RunDetailStore {
         stopTail()
     }
 
-    /// Switches the transcript feed to `stepID`: tears down any prior tail
-    /// unconditionally (even if the new step never gets one of its own),
-    /// resolves and loads a fresh snapshot, then — local run, and the step
-    /// currently reads as running — starts tailing it.
+    /// Switches the transcript feed to `stepID`: resolves and loads a fresh
+    /// snapshot, then — local run, and the step currently reads as running —
+    /// starts tailing it. See the type doc comment's "Overlapping calls"
+    /// section for why this only tears down / applies state once it's
+    /// confirmed to still be the most recent call.
     public func focusStep(_ stepID: String) async {
-        stopTail()
+        focusGeneration += 1
+        let generation = focusGeneration
 
         guard let path = resolveTranscriptPath(stepID: stepID) else {
+            // Nothing here has awaited yet — this call ran fully
+            // synchronously up to this point, so it cannot have been
+            // superseded by a later call. Always safe to tear down whatever
+            // was focused before.
+            stopTail()
             focusedTranscriptPath = nil
             transcript = []
             return
         }
-        focusedTranscriptPath = path
 
+        let events: [TranscriptEvent]
         do {
-            transcript = try await fetchTranscript(path).events
+            events = try await fetchTranscript(path).events
         } catch {
             // No dedicated failure surface for the feed this phase — per
             // "per-block independence", a transcript-load failure for the
             // focused step must never blank the graph/rails, which don't
             // depend on it. Blanking `transcript` (rather than leaving a
             // stale prior step's events on screen under the new step's
-            // label) is the honest failure state here.
-            transcript = []
+            // label) is the honest failure state here — but only if this
+            // call is still the current one; see the generation check below.
+            events = []
         }
+
+        // A newer `focusStep` call started while this one was suspended
+        // awaiting `fetchTranscript` above — that later call owns the focus
+        // now. Discard these now-stale results rather than applying them:
+        // this is what guarantees only the most recent call ever mutates
+        // `transcript`/`focusedTranscriptPath` or starts a tail.
+        guard generation == focusGeneration else { return }
+
+        stopTail()
+        focusedTranscriptPath = path
+        transcript = events
 
         guard !isRemote, isStepRunning(stepID), let transcriptTailFactory else { return }
         startTail(path: path, factory: transcriptTailFactory)
@@ -264,6 +309,12 @@ public final class RunDetailStore {
             liveStates[stepID] = .gatePending
         case .stepSkipped(_, let stepID, _):
             liveStates[stepID] = .skipped
+        case .stepFailed(_, let stepID, _):
+            // Dispatch-level failure (connector error, timeout, panic) —
+            // distinct from `stepCompleted{success:false}`, which is only
+            // emitted when the step actually ran and reported failure. See
+            // the type doc comment's "Live semantics" section.
+            liveStates[stepID] = .done(success: false)
         case .runCompleted, .runFailed:
             handleTerminal()
         default:
@@ -296,6 +347,11 @@ public final class RunDetailStore {
     // MARK: - Transcript tail
 
     private func startTail(path: String, factory: @escaping @Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>>) {
+        // Defense in depth alongside `focusStep`'s generation-token guard:
+        // never let a new tail's assignment silently drop a still-running
+        // previous one without stopping it first.
+        tailLifecycle?.stop()
+
         let lifecycle = StreamLifecycle()
         tailLifecycle = lifecycle
         transcriptTailActive = true
