@@ -127,13 +127,19 @@ public final class AppModel {
     /// assignment since cleared it — see `route`'s `didSet`), falls back to
     /// whichever `.activity(kind)` route was current before that, same as
     /// the single-level contract this replaces.
+    ///
+    /// Review fix: the empty-stack fallback is still a `navigateBack()`
+    /// assignment, not a fresh sidebar-style context switch — it goes
+    /// through `isNavigatingViaStack` the same as the pop branch below, for
+    /// the same reason every other stack-driven `route` assignment does
+    /// (`route`'s `didSet`). Harmless today (`routeStack` is already empty
+    /// here, so clearing it either way is a no-op), but leaving this one
+    /// assignment inconsistent would be a trap for whatever this method
+    /// grows into next.
     public func navigateBack() {
-        guard let previous = routeStack.popLast() else {
-            route = lastActivityRoute
-            return
-        }
+        let target = routeStack.popLast() ?? lastActivityRoute
         isNavigatingViaStack = true
-        route = previous
+        route = target
         isNavigatingViaStack = false
     }
 }

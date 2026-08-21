@@ -381,19 +381,36 @@ public final class ActivityStore {
     private func recompute() {
         var merged = activeSnapshots().flatMap(\.rows)
         merged.append(contentsOf: activeSources().flatMap { remoteRowsBySource[$0.kind] ?? [] })
+
+        // Carry-over (Phase 3, Task 4; review fix): pruning must be
+        // order-independent. Two passes, not one: a single combined
+        // prune-or-patch pass over `merged.indices` makes the outcome
+        // depend on which row for a given runID is *encountered first* —
+        // if that row happens to already match the override, the override
+        // is removed before a later, still-mismatched row for the same
+        // runID ever gets patched, silently leaving it on stale raw data.
+        // (This was safe only because local rows precede remote rows in
+        // `merged` above — an undocumented invariant, not a guarantee this
+        // logic should lean on.) Pass 1 decides, for every overridden
+        // runID, whether *any* row already agrees with it — "server caught
+        // up" — and prunes exactly those, independent of row order. Pass 2
+        // then applies whatever overrides are left (i.e. weren't just
+        // pruned) to every row they match.
+        var runIDsToPrune: Set<String> = []
+        for row in merged {
+            guard case .run(let runID, _) = row.navigation,
+                  let override = statusOverrides[runID],
+                  row.status == override.status
+            else { continue }
+            runIDsToPrune.insert(runID)
+        }
+        for runID in runIDsToPrune {
+            statusOverrides.removeValue(forKey: runID)
+        }
         for index in merged.indices {
             guard case .run(let runID, _) = merged[index].navigation,
                   let override = statusOverrides[runID]
             else { continue }
-            // Carry-over (Phase 3, Task 4): the merged row's own (unpatched)
-            // status already agrees with the override — the server has
-            // caught up. Drop the override right here rather than let it
-            // keep redundantly shadowing agreeing data until the next full
-            // refresh; see `statusOverrides`'s doc comment.
-            if merged[index].status == override.status {
-                statusOverrides.removeValue(forKey: runID)
-                continue
-            }
             merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
         }
         if !statusFilter.isEmpty {

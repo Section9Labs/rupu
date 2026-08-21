@@ -861,11 +861,27 @@ struct ActivityStoreTests {
     // (which already clears every override unconditionally regardless of
     // this fix; see that method's doc comment). `loadRemoteHost`'s
     // merge-then-`recompute()` step is the one production path that calls
-    // `recompute()` without a full clear, so it's the vehicle here: the
-    // remote host's row for the same run id already reads "completed" by
-    // the time it merges in, which is exactly the case per-key pruning is
-    // for.
-    @MainActor @Test func statusOverridePrunedOncePerKeyMergedStatusMatchesWithoutAFullClear() async {
+    // `recompute()` without a full clear, so it's the vehicle here: one of
+    // the two rows sharing a run id (local vs. the remote host's own copy
+    // of it) already reads "completed" by the time they're both merged in —
+    // exactly the case per-key pruning is for.
+    //
+    // Review fix: which of the two rows already matches — `matchingRowIsLocal`
+    // — controls which one `recompute()`'s merge encounters *first* (local
+    // rows always precede remote rows in `merged`; see that method). Pruning
+    // must not depend on that order: a single combined prune-or-patch pass
+    // would prune as soon as it hit the matching row and, if that happened
+    // to be the *first* one, leave a later mismatched row for the same run
+    // id force-patched or not depending purely on which row won the race —
+    // this was previously masked entirely because the one committed test
+    // only ever exercised the remote-matches-last case. Returns the final
+    // set of statuses shown for `run-wf-1` and whether the override was
+    // pruned, so the caller can assert both orderings land on the identical
+    // outcome.
+    @MainActor
+    private func pruningOutcome(matchingRowIsLocal: Bool) async -> (statuses: Set<ActivityStatus>, overridePruned: Bool) {
+        let localStatus = matchingRowIsLocal ? "completed" : "running"
+        let remoteStatus = matchingRowIsLocal ? "running" : "completed"
         let (store, box) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
             if url.path == "/api/hosts" {
@@ -878,46 +894,66 @@ struct ActivityStoreTests {
                 // without this, `loadRemoteHosts`' background fetch (kicked
                 // off by `activate()`, no delay by default) can race ahead
                 // of the live-patch event below and prune the override
-                // before this test ever observes it standing. The remote
-                // host already reports "completed" — the "server caught up"
-                // state the override is standing in for.
+                // before this test ever observes it standing.
                 Thread.sleep(forTimeInterval: 0.08)
-                let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "completed")
+                let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: remoteStatus)
                 return (200, Data("[\(row)]".utf8))
             }
-            let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "running")
+            let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: localStatus)
             return (200, Data("[\(row)]".utf8))
         }
 
         await store.activate(kind: .workflows)
-        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running)
 
-        // Live patch: overlays "completed" ahead of the local snapshot's
-        // own (still "running") truth.
+        // Live patch: records the "completed" override ahead of whichever
+        // side (local or remote) hasn't caught up to it yet.
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
-        await expectEventually("run-wf-1 patches to .completed via the live override") {
-            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        await expectEventually("run-wf-1 has a standing .completed override") {
+            store.statusOverrides["run-wf-1"] != nil
         }
-        #expect(store.statusOverrides["run-wf-1"] != nil)
 
-        // The remote host answers with a row for the same run id, already
-        // "completed" — `loadRemoteHost`'s recompute() should notice the
-        // override is now redundant and drop it, without this being a full
-        // `refreshActiveSources()` clear.
+        // The remote host answers with its (deliberately delayed) row —
+        // `loadRemoteHost`'s recompute() is the non-full-clear vehicle this
+        // test exercises.
         await expectEventually("the remote host's row merges in and pendingHosts drains to 0") {
             store.pendingHosts == 0
         }
 
-        #expect(store.statusOverrides["run-wf-1"] == nil)
-        // Both the local row (still "running" underneath — shown as
-        // "completed" via the override still standing at the moment it was
-        // processed) and the remote row (already "completed" on its own)
-        // read correctly.
-        #expect(store.rows.filter { $0.id == "run-wf-1" }.allSatisfy { $0.status == .completed })
+        let statuses = Set(store.rows.filter { $0.id == "run-wf-1" }.map(\.status))
+        let overridePruned = store.statusOverrides["run-wf-1"] == nil
 
         store.deactivate()
         box.latest.finish()
+        return (statuses, overridePruned)
+    }
+
+    @MainActor @Test func statusOverridePrunedOncePerKeyMergedStatusMatchesWithoutAFullClear() async {
+        let outcome = await pruningOutcome(matchingRowIsLocal: false)
+
+        #expect(outcome.overridePruned)
+        // The row that already read "completed" on its own keeps doing so;
+        // the other (still raw "running" underneath) is no longer
+        // force-patched now that the override was pruned wholesale rather
+        // than selectively — see `recompute()`'s two-pass doc comment.
+        #expect(outcome.statuses == [.completed, .running])
+    }
+
+    // (r) Order independence (review fix): the matching row can be either
+    // side of the merge — the outcome must be identical either way. A
+    // single-pass prune-or-patch loop was safe only because local rows
+    // happen to precede remote rows in `merged`, an undocumented invariant;
+    // this asserts the fix no longer depends on it by running the exact
+    // same scenario with the matching row on the *other* side and comparing
+    // results directly.
+    @MainActor @Test func statusOverridePruningIsOrderIndependentAcrossWhichRowMatchesFirst() async {
+        let matchingLast = await pruningOutcome(matchingRowIsLocal: false) // remote (2nd in merge order) matches
+        let matchingFirst = await pruningOutcome(matchingRowIsLocal: true) // local (1st in merge order) matches
+
+        #expect(matchingLast.overridePruned)
+        #expect(matchingFirst.overridePruned)
+        #expect(matchingFirst.statuses == matchingLast.statuses)
+        #expect(matchingFirst.statuses == [.completed, .running])
     }
 
     // (r) A full `refreshActiveSources()` (here, `applyPendingRefresh()`)
