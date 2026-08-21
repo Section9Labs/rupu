@@ -247,3 +247,52 @@ private func makeStore(
     #expect(failed?.status == "error")
     #expect(failed?.error == "provider: API error 401")
 }
+
+// MARK: - (f) cancellation is benign (hotfix root cause B)
+
+/// `session`/`runs` each independently leave their `BlockState` untouched
+/// (still `.loading`, never `.failed`) when their fetch closure is
+/// cancelled — the shape a superseded `SessionDetailScreen.task(id:
+/// sessionID)` produces mid-load.
+@MainActor @Test func activateWithCancelledFetchesLeavesSessionAndRunsAsLoadingNeverFailed() async {
+    let store = makeStore(
+        sessionResult: { throw CancellationError() },
+        runsResult: { throw CancellationError() }
+    )
+
+    await store.activate()
+
+    guard case .loading = store.session else {
+        Issue.record("expected session to stay .loading through cancellation, got \(store.session)")
+        return
+    }
+    guard case .loading = store.runs else {
+        Issue.record("expected runs to stay .loading through cancellation, got \(store.runs)")
+        return
+    }
+}
+
+/// `focusRun`'s transcript fetch, cancelled, must leave
+/// `transcript`/`focusedRunID` exactly as they were.
+@MainActor @Test func focusRunWithCancelledTranscriptFetchLeavesTranscriptAndFocusedRunIDUntouched() async {
+    let store = makeStore(
+        sessionResult: { sessionRow() },
+        runsResult: { [] },
+        transcriptResult: { path in
+            if path == "t/a.jsonl" {
+                return APITranscriptPage(events: [.assistantMessage(content: "A snapshot", thinking: nil)], summary: nil)
+            }
+            throw CancellationError()
+        }
+    )
+    await store.activate()
+    await store.focusRun(runRow(runID: "a", transcriptPath: "t/a.jsonl"))
+    #expect(store.focusedRunID == "a")
+    #expect(store.transcript == [.assistantMessage(content: "A snapshot", thinking: nil)])
+
+    await store.focusRun(runRow(runID: "b", transcriptPath: "t/b.jsonl"))
+
+    // Cancellation left it exactly where it was — still "a".
+    #expect(store.focusedRunID == "a")
+    #expect(store.transcript == [.assistantMessage(content: "A snapshot", thinking: nil)])
+}

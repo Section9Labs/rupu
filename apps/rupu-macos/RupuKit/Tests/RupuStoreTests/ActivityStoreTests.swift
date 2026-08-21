@@ -15,6 +15,15 @@ import RupuAPI
 final class ActivityStubURLProtocol: URLProtocol {
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (status: Int, body: Data))?
     nonisolated(unsafe) static var requestCount = 0
+    /// Per-path hit counts, alongside the plain `requestCount` total —
+    /// `ActivityStore.activate(kind:)` now also fires a `GET /api/hosts`
+    /// discovery call in the background (progressive per-host loading; see
+    /// `ActivityStore.loadRemoteHosts`), so a test asserting "no refetch
+    /// happened" against the plain total would be racy against that
+    /// unrelated, independently-timed call. `requestCount(forPaths:)` below
+    /// lets a test scope its assertion to only the source endpoints it
+    /// actually cares about.
+    nonisolated(unsafe) static var pathHits: [String: Int] = [:]
 
     static func session() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
@@ -24,7 +33,13 @@ final class ActivityStubURLProtocol: URLProtocol {
 
     static func reset(handler: @escaping @Sendable (URLRequest) -> (status: Int, body: Data)) {
         requestCount = 0
+        pathHits = [:]
         self.handler = handler
+    }
+
+    /// Sum of hits across just `paths` — see `pathHits`'s doc comment.
+    static func requestCount(forPaths paths: Set<String>) -> Int {
+        pathHits.filter { paths.contains($0.key) }.values.reduce(0, +)
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -32,6 +47,9 @@ final class ActivityStubURLProtocol: URLProtocol {
 
     override func startLoading() {
         ActivityStubURLProtocol.requestCount += 1
+        if let path = request.url?.path {
+            ActivityStubURLProtocol.pathHits[path, default: 0] += 1
+        }
         guard let handler = ActivityStubURLProtocol.handler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
@@ -125,6 +143,15 @@ struct ActivityStoreTests {
     // server), so the stub bodies below are hand-written JSON text matching
     // each type's `CodingKeys`, not `JSONEncoder` output.
     private static let usageJSON = #"{"cached_tokens":0,"cost_usd":null,"input_tokens":0,"output_tokens":0,"priced":false,"runs":0,"total_tokens":0}"#
+
+    /// The four federated source endpoints — used with
+    /// `ActivityStubURLProtocol.requestCount(forPaths:)` to assert "no
+    /// refetch happened" without being racy against the independently-timed
+    /// `GET /api/hosts` background discovery call every `activate(kind:)`
+    /// also fires (see that type's `pathHits` doc comment).
+    private static let sourcePaths: Set<String> = [
+        "/api/runs/workflows", "/api/runs/agents", "/api/runs/autoflows/events", "/api/sessions",
+    ]
 
     private static func runListRowJSON(id: String, startedAt: String, status: String, durationMS: String = "null", turns: Int = 1) -> String {
         #"{"duration_ms":\#(durationMS),"finished_at":null,"host_id":"local","id":"\#(id)","started_at":"\#(startedAt)","status":"\#(status)","trigger":"cron","turns":\#(turns),"usage":\#(usageJSON),"workflow_name":"nightly-health"}"#
@@ -220,7 +247,7 @@ struct ActivityStoreTests {
         store.liveTail = false
         await store.activate(kind: .all)
         let before = store.rows
-        let requestsAfterActivate = ActivityStubURLProtocol.requestCount
+        let requestsAfterActivate = ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths)
 
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runStarted(runID: "run-new-1", workflowPath: "p.yml", startedAt: "2026-08-20T13:00:00Z")))
@@ -228,12 +255,16 @@ struct ActivityStoreTests {
 
         #expect(store.pendingNewRuns == 1)
         #expect(store.rows == before)
-        // No refetch happened purely from the newRun delta while liveTail is off.
-        #expect(ActivityStubURLProtocol.requestCount == requestsAfterActivate)
+        // No refetch happened purely from the newRun delta while liveTail is
+        // off. Scoped to the four source paths (not the plain global
+        // `requestCount`) so this isn't racy against the independently-timed
+        // `GET /api/hosts` background discovery call — see `sourcePaths`'s
+        // doc comment.
+        #expect(ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths) == requestsAfterActivate)
 
         await store.applyPendingRefresh()
         #expect(store.pendingNewRuns == 0)
-        #expect(ActivityStubURLProtocol.requestCount > requestsAfterActivate)
+        #expect(ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths) > requestsAfterActivate)
 
         store.deactivate()
         box.latest.finish()
@@ -245,7 +276,7 @@ struct ActivityStoreTests {
         let (store, box) = makeStore()
         store.liveTail = true
         await store.activate(kind: .all)
-        let requestsAfterActivate = ActivityStubURLProtocol.requestCount
+        let requestsAfterActivate = ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths)
         #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running)
 
         box.latest.yield(.connection(true))
@@ -255,7 +286,9 @@ struct ActivityStoreTests {
         #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
         // The other three rows are untouched by the patch.
         #expect(store.rows.filter { $0.id != "run-wf-1" }.count == 3)
-        #expect(ActivityStubURLProtocol.requestCount == requestsAfterActivate)
+        // Scoped to the four source paths — see `sourcePaths`'s doc comment
+        // on why the plain global `requestCount` would be racy here.
+        #expect(ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths) == requestsAfterActivate)
 
         store.deactivate()
         box.latest.finish()
@@ -584,6 +617,135 @@ struct ActivityStoreTests {
         #expect(store.rows.filter { $0.kind == .autoflow }.count == perSourceCount)
         #expect(store.rows.filter { $0.kind == .session }.count == perSourceCount)
         #expect(Set(store.rows.map(\.id)).count == store.rows.count) // no duplicate rows across pages
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // MARK: - Per-host progressive loading (hotfix: matt's fleet directive —
+    // "lazy load things as you gather them ... you should not fail all for
+    // a single host")
+
+    private static func hostsJSON(_ hosts: [(id: String, status: String)]) -> Data {
+        let items = hosts.map { #"{"id":"\#($0.id)","name":"\#($0.id)","transport_kind":"ssh","status":"\#($0.status)"}"# }
+        return Data("[\(items.joined(separator: ","))]".utf8)
+    }
+
+    private static func queryHost(_ req: URLRequest) -> String? {
+        guard let url = req.url else { return nil }
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "host" })?.value
+    }
+
+    // (n) `activate(kind:)` returns once the *local* load lands — `state`
+    // is already `.content` from `host=local` alone, before a slow online
+    // remote host has answered at all. `pendingHosts` then drains to 0 and
+    // the remote host's row merges in once its (artificially delayed)
+    // response actually arrives — proving the merge is progressive, not a
+    // single all-or-nothing wait.
+    @MainActor @Test func activateRendersLocalImmediatelyThenMergesSlowOnlineRemoteHostProgressively() async {
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                Thread.sleep(forTimeInterval: 0.08) // artificially slow remote host
+                let row = Self.runListRowJSON(id: "run-remote-1", startedAt: "2026-08-20T09:00:00Z", status: "running")
+                return (200, Data("[\(row)]".utf8))
+            }
+            let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "running")
+            return (200, Data("[\(row)]".utf8))
+        }
+
+        await store.activate(kind: .workflows)
+
+        // Local truth is already showing — the slow remote host hasn't
+        // been waited on at all.
+        guard case .content = store.state else {
+            Issue.record("expected .content from the local load alone, got \(store.state)")
+            return
+        }
+        #expect(store.rows.map(\.id) == ["run-wf-1"])
+
+        // Give the (fast, non-delayed) `GET /api/hosts` discovery call a
+        // moment to land and register the one online remote host as
+        // pending — well before the remote row fetch's artificial 80ms
+        // delay resolves.
+        try? await Task.sleep(for: .milliseconds(25))
+        #expect(store.pendingHosts == 1)
+        #expect(store.rows.map(\.id) == ["run-wf-1"]) // still local-only
+
+        // Wait past the remote host's artificial delay.
+        try? await Task.sleep(for: .milliseconds(120))
+
+        #expect(store.pendingHosts == 0)
+        #expect(Set(store.rows.map(\.id)) == Set(["run-wf-1", "run-remote-1"]))
+        // `state` never depended on the remote host at all — still `.content`.
+        guard case .content = store.state else {
+            Issue.record("expected .content to persist through the remote merge, got \(store.state)")
+            return
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (o) An erroring (or offline, or simply absent) remote host never
+    // fails the table — `state` stays `.content` from local truth alone,
+    // and `pendingHosts` still drains to 0 once the failure is known.
+    @MainActor @Test func failingRemoteHostNeverFailsTableAndPendingHostsStillDrains() async {
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                return (500, Data(#"{"error":"boom"}"#.utf8))
+            }
+            let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "running")
+            return (200, Data("[\(row)]".utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        guard case .content = store.state else {
+            Issue.record("expected .content from the local load, got \(store.state)")
+            return
+        }
+
+        try? await Task.sleep(for: .milliseconds(60))
+
+        #expect(store.pendingHosts == 0)
+        #expect(store.rows.map(\.id) == ["run-wf-1"]) // the failing host contributed nothing
+        guard case .content = store.state else {
+            Issue.record("a failing remote host must never flip state to .failed, got \(store.state)")
+            return
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (p) An offline host (status != "online") is skipped entirely — never
+    // fetched from, never counted in `pendingHosts`.
+    @MainActor @Test func offlineHostIsSkippedEntirelyAndNeverCountedAsPending() async {
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("kuki", "offline")]))
+            }
+            let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "running")
+            return (200, Data("[\(row)]".utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        try? await Task.sleep(for: .milliseconds(40))
+
+        #expect(store.pendingHosts == 0)
+        #expect(store.rows.map(\.id) == ["run-wf-1"])
+        // Never fetched from the offline host at all — only ever `host=local`.
+        #expect(ActivityStubURLProtocol.pathHits["/api/runs/workflows"] == 1)
 
         store.deactivate()
         box.latest.finish()

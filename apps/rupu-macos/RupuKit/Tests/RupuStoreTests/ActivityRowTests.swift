@@ -27,29 +27,54 @@ import RupuDesign
     #expect(awaiting.navigation == .run(id: "run-02", host: "mini"))
 }
 
+// Navigation (hotfix root cause C): an agent-run row is never an
+// orchestrator run, so `GET /api/runs/:id` can never serve it — 404
+// verified live. `source == "session"` with a `session_id` navigates to
+// that session instead (the honest destination the data supports);
+// everything else navigates to the standalone `.agentRun` screen, carrying
+// its own `transcript_path` straight through.
 @Test func mapsAgentRunRowFixtureToActivityRow() throws {
     let rows = try JSONDecoder().decode([APIAgentRunRow].self, from: Fixtures.data("agent_run_rows.json"))
     #expect(rows.count == 2)
 
-    let named = ActivityRow(rows[0])
-    #expect(named.id == "run-10")
-    #expect(named.kind == .agent)
-    #expect(named.subject == "rupuso")
-    #expect(named.host == "local")
-    #expect(named.trigger == "session_turn")
-    #expect(named.status == .running)
-    #expect(named.navigation == .run(id: "run-10", host: "local"))
+    // source: "session", session_id: "sess-1" -> navigates to that session,
+    // never to `.run` (which would 404) and never to a bare `.agentRun`.
+    let sessionSourced = ActivityRow(rows[0])
+    #expect(sessionSourced.id == "run-10")
+    #expect(sessionSourced.kind == .agent)
+    #expect(sessionSourced.subject == "rupuso")
+    #expect(sessionSourced.host == "local")
+    #expect(sessionSourced.trigger == "session_turn")
+    #expect(sessionSourced.status == .running)
+    #expect(sessionSourced.navigation == .session(id: "sess-1"))
 
-    // No `agent`/`host_id` on this row — subject falls back to "agent
-    // run", host falls back to "local", and a nil `status` normalizes to
-    // the explicit unknown placeholder rather than a guessed real case.
-    let unnamed = ActivityRow(rows[1])
-    #expect(unnamed.id == "run-11")
-    #expect(unnamed.subject == "agent run")
-    #expect(unnamed.host == "local")
-    #expect(unnamed.status == .unknown("—"))
-    #expect(unnamed.startedAt == nil)
-    #expect(unnamed.navigation == .run(id: "run-11", host: nil))
+    // source: "standalone", session_id: nil -> no session to navigate to,
+    // so this is a bare `.agentRun` carrying its own (here nil)
+    // transcript path. No `agent`/`host_id` on this row either — subject
+    // falls back to "agent run", host falls back to "local", and a nil
+    // `status` normalizes to the explicit unknown placeholder rather than a
+    // guessed real case.
+    let standalone = ActivityRow(rows[1])
+    #expect(standalone.id == "run-11")
+    #expect(standalone.subject == "agent run")
+    #expect(standalone.host == "local")
+    #expect(standalone.status == .unknown("—"))
+    #expect(standalone.startedAt == nil)
+    #expect(standalone.navigation == .agentRun(id: "run-11", transcriptPath: nil, host: nil))
+}
+
+// Coverage gap (hotfix): a standalone agent row that *does* carry a
+// transcript path must pass it through into `.agentRun` unchanged — this is
+// the row shape `AgentRunDetailStore` actually renders a transcript for.
+@Test func standaloneAgentRowWithTranscriptPathCarriesItIntoNavigation() {
+    let row = APIAgentRunRow(
+        runID: "run-99", source: "cron", agent: "nightly-audit", sessionID: nil,
+        triggerSource: "cron", status: "completed", startedAt: "2026-08-20T12:00:00Z",
+        transcriptPath: "/global/transcripts/run-99.jsonl",
+        usage: APIUsageSummary(inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0, costUSD: nil, priced: false, runs: 0),
+        turns: 1, durationMS: 4000, hostID: "mini"
+    )
+    #expect(ActivityRow(row).navigation == .agentRun(id: "run-99", transcriptPath: "/global/transcripts/run-99.jsonl", host: "mini"))
 }
 
 @Test func mapsAutoflowEventRowFixtureToActivityRow() throws {

@@ -670,3 +670,85 @@ private func makeStore(
 
     store.deactivate()
 }
+
+// MARK: - Cancellation is benign (hotfix root cause B)
+
+/// `detail`/`graph`/`netflow`/`findings` each independently leave their
+/// `BlockState` untouched (still `.loading`, never `.failed`) when their
+/// fetch closure is cancelled — the shape a superseded `RunDetailScreen
+/// .task(id: runID)` produces mid-load.
+@MainActor @Test func activateWithCancelledFetchesLeavesAllFourBlocksAsLoadingNeverFailed() async {
+    let store = makeStore(
+        detailResult: { throw CancellationError() },
+        graphResult: { throw CancellationError() },
+        netflowResult: { throw CancellationError() },
+        findingsResult: { throw CancellationError() }
+    )
+
+    await store.activate()
+
+    guard case .loading = store.detail else {
+        Issue.record("expected detail to stay .loading through cancellation, got \(store.detail)")
+        return
+    }
+    guard case .loading = store.graph else {
+        Issue.record("expected graph to stay .loading through cancellation, got \(store.graph)")
+        return
+    }
+    guard case .loading = store.netflow else {
+        Issue.record("expected netflow to stay .loading through cancellation, got \(store.netflow)")
+        return
+    }
+    guard case .loading = store.findings else {
+        Issue.record("expected findings to stay .loading through cancellation, got \(store.findings)")
+        return
+    }
+
+    store.deactivate()
+}
+
+/// `focusStep`'s transcript fetch, cancelled, must leave
+/// `transcript`/`focusedTranscriptPath` exactly as they were — not blanked
+/// (the fallback for a *real* failure) and not advanced to the new step's
+/// (never-received) content.
+@MainActor @Test func focusStepWithCancelledTranscriptFetchLeavesTranscriptAndFocusedPathUntouched() async {
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(activeStepID: "plan"),
+                steps: [stepResult(stepID: "plan", transcriptPath: "t/plan.jsonl", success: true)]
+            )
+        },
+        transcriptResult: { _ in APITranscriptPage(events: [.assistantMessage(content: "plan output", thinking: nil)], summary: nil) }
+    )
+    await store.activate()
+    #expect(store.focusedTranscriptPath == "t/plan.jsonl")
+    #expect(store.transcript == [.assistantMessage(content: "plan output", thinking: nil)])
+
+    let cancellingStore = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(activeStepID: "plan"),
+                steps: [
+                    stepResult(stepID: "plan", transcriptPath: "t/plan.jsonl", success: true),
+                    stepResult(stepID: "review", transcriptPath: "t/review.jsonl", success: true),
+                ]
+            )
+        },
+        transcriptResult: { path in
+            if path == "t/review.jsonl" { throw CancellationError() }
+            return APITranscriptPage(events: [.assistantMessage(content: "plan output", thinking: nil)], summary: nil)
+        }
+    )
+    await cancellingStore.activate()
+    #expect(cancellingStore.focusedTranscriptPath == "t/plan.jsonl")
+
+    await cancellingStore.focusStep("review")
+    // Cancellation left it exactly where it was before this call — still
+    // "plan", never blanked to nil and never advanced to "review".
+    #expect(cancellingStore.focusedTranscriptPath == "t/plan.jsonl")
+    #expect(cancellingStore.transcript == [.assistantMessage(content: "plan output", thinking: nil)])
+
+    store.deactivate()
+    cancellingStore.deactivate()
+}

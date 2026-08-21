@@ -11,6 +11,7 @@ extension Route {
         case .activity(let kind): kind.screenTitle
         case .runDetail: "Run"
         case .sessionDetail: "Session"
+        case .agentRunDetail: "Agent run"
         case .projects: "Projects"
         case .security: "Security"
         case .library: "Library"
@@ -24,7 +25,7 @@ extension Route {
     var placeholderPhase: Int {
         switch self {
         case .overview: 4
-        case .activity, .runDetail, .sessionDetail: 2
+        case .activity, .runDetail, .sessionDetail, .agentRunDetail: 2
         case .projects, .security, .library, .fleet, .usage: 5
         }
     }

@@ -9,6 +9,11 @@ import Foundation
 final class StubURLProtocol: URLProtocol {
     nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) -> (status: Int, headers: [String: String], body: Data))?
     nonisolated(unsafe) static var lastRequest: URLRequest?
+    /// When set, `startLoading()` fails the request with this error instead
+    /// of running `requestHandler` — used by the cancellation-mapping test
+    /// to simulate `URLSession` surfacing a cancelled request as
+    /// `URLError(.cancelled)`.
+    nonisolated(unsafe) static var failureError: Error?
 
     static func session() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
@@ -21,6 +26,10 @@ final class StubURLProtocol: URLProtocol {
 
     override func startLoading() {
         StubURLProtocol.lastRequest = request
+        if let failureError = StubURLProtocol.failureError {
+            client?.urlProtocol(self, didFailWithError: failureError)
+            return
+        }
         guard let handler = StubURLProtocol.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
@@ -230,5 +239,81 @@ struct CPClientTests {
         #expect(runs[0].runID == "run-1")
         #expect(runs[0].tokensIn == 100)
         #expect(StubURLProtocol.lastRequest?.url?.path == "/api/sessions/sess-1/runs")
+    }
+
+    // MARK: - Per-host progressive loading (hotfix)
+
+    /// The four federated list endpoints all accept an optional `host`,
+    /// sent as `host=<value>` when set and omitted entirely otherwise (an
+    /// omitted `host` fans the call out server-side to every registered
+    /// host — see each method's doc comment). One representative endpoint
+    /// (`workflowRuns`) proves the wiring; the other three share the exact
+    /// same `offsetLimitQuery(offset:limit:host:)` helper.
+    @Test func workflowRunsSendsHostQueryParameterOnlyWhenProvided() async throws {
+        let fixture = try Fixtures.data("run_list_row.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+
+        _ = try await client.workflowRuns(offset: 0, limit: 50)
+        var query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(where: { $0.name == "host" }) == false)
+
+        StubURLProtocol.lastRequest = nil
+        _ = try await client.workflowRuns(offset: 0, limit: 50, host: "mini")
+        query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "host", value: "mini")) == true)
+    }
+
+    @Test func hostsHitsExpectedPathAndDecodesInlineJSON() async throws {
+        // Fixture-free per the hotfix brief — matches the live `GET
+        // /api/hosts` shape observed against a real `rupu cp serve`
+        // (`{id, name, transport_kind, status, ...}`, extra fields ignored).
+        let body = Data(#"""
+        [
+            {"id":"local","name":"local","transport_kind":"embedded","status":"online","extra_field_ignored":true},
+            {"id":"mini","name":"mini","transport_kind":"ssh","status":"online"},
+            {"id":"kuki","name":"kuki","transport_kind":"tunnel","status":"offline"}
+        ]
+        """#.utf8)
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], body) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let hosts = try await client.hosts()
+
+        #expect(hosts.count == 3)
+        #expect(hosts[0] == APIHostRow(id: "local", name: "local", transportKind: "embedded", status: "online"))
+        #expect(hosts[1] == APIHostRow(id: "mini", name: "mini", transportKind: "ssh", status: "online"))
+        #expect(hosts[2] == APIHostRow(id: "kuki", name: "kuki", transportKind: "tunnel", status: "offline"))
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/hosts")
+    }
+
+    // MARK: - Cancellation mapping (hotfix)
+
+    /// `URLSession`'s async `data(for:)` surfaces a cancelled `Task` as
+    /// `URLError(.cancelled)` (not Swift's own `CancellationError`) — `get`
+    /// maps both to the same `CPError.cancelled`, so every store's load
+    /// path can treat cancellation uniformly regardless of which shape it
+    /// actually arrives as.
+    @Test func urlErrorCancelledMapsToCPErrorCancelled() async throws {
+        StubURLProtocol.failureError = URLError(.cancelled)
+        defer { StubURLProtocol.failureError = nil }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+
+        await #expect(throws: CPError.cancelled) {
+            _ = try await client.hostInfo()
+        }
     }
 }

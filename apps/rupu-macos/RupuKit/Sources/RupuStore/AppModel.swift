@@ -63,7 +63,7 @@ public final class AppModel {
             case .overview: .overview
             case .activity(.all): .runs
             case .activity(let kind): .runsLeaf(kind)
-            case .runDetail, .sessionDetail: .runs
+            case .runDetail, .sessionDetail, .agentRunDetail: .runs
             case .projects: .projects
             case .security: .security
             case .library: .library

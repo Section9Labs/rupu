@@ -251,6 +251,14 @@ public final class RunDetailStore {
         do {
             events = try await fetchTranscript(path).events
         } catch {
+            // Cancellation (a rapid re-focus, or the whole screen tearing
+            // down) is benign — leave `transcript`/`focusedTranscriptPath`
+            // exactly as they were rather than blanking them. See
+            // `isCancellation`'s doc comment. This is a plain early
+            // `return`, not just a `continue` into the catch's fallback:
+            // nothing below (including the generation check) should run
+            // for a call that never really produced a result.
+            guard !isCancellation(error) else { return }
             // No dedicated failure surface for the feed this phase — per
             // "per-block independence", a transcript-load failure for the
             // focused step must never blank the graph/rails, which don't
@@ -279,6 +287,11 @@ public final class RunDetailStore {
         do {
             detail = .content(try await fetchDetail())
         } catch {
+            // Cancellation (e.g. `RunDetailScreen`'s `.task(id: runID)`
+            // superseded by a `runID` change) is benign — leave `detail`
+            // untouched rather than surfacing `.failed`. See
+            // `isCancellation`'s doc comment.
+            guard !isCancellation(error) else { return }
             detail = .failed(String(describing: error))
         }
     }
@@ -287,6 +300,7 @@ public final class RunDetailStore {
         do {
             graph = .content(try await fetchGraph())
         } catch {
+            guard !isCancellation(error) else { return }
             graph = .failed(String(describing: error))
         }
     }
@@ -295,6 +309,7 @@ public final class RunDetailStore {
         do {
             netflow = .content(try await fetchNetflow())
         } catch {
+            guard !isCancellation(error) else { return }
             netflow = .failed(String(describing: error))
         }
     }
@@ -303,6 +318,7 @@ public final class RunDetailStore {
         do {
             findings = .content(try await fetchFindings())
         } catch {
+            guard !isCancellation(error) else { return }
             findings = .failed(String(describing: error))
         }
     }

@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import RupuAPI
 
 /// Generic loading/content/empty/failure state for a block of UI, keyed on
 /// its payload type `T`. `value` unwraps `.content` for callers that just
@@ -83,6 +84,13 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
             exhausted = page.count < pageSize
             state = page.isEmpty ? .empty : .content(())
         } catch {
+            // Cancellation (the fetch's owning `Task` was cancelled — most
+            // commonly a SwiftUI `.task(id:)` whose id changed mid-fetch)
+            // is benign: it ran, it just didn't get to finish. `state`
+            // stays whatever it already was (`.loading`, set just above)
+            // rather than flipping to `.failed` for something the user
+            // didn't cause. See `isCancellation`'s doc comment.
+            guard !isCancellation(error) else { return true }
             state = .failed(String(describing: error))
         }
         return true
@@ -103,6 +111,9 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
             exhausted = page.count < pageSize
             state = .content(())
         } catch {
+            // See `refresh()`'s matching comment — a cancelled fetch leaves
+            // `state`/`rows` exactly as they already were.
+            guard !isCancellation(error) else { return true }
             state = .failed(String(describing: error))
         }
         return true

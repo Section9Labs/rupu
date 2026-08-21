@@ -74,6 +74,16 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
     public enum Navigation: Equatable, Sendable {
         case run(id: String, host: String?)
         case session(id: String)
+        /// A standalone agent run (`GET /api/runs/agents` row with
+        /// `source != "session"`, or `source == "session"` but no
+        /// `session_id`) — **not** an orchestrator run: `GET /api/runs/:id`
+        /// can never serve it (verified 404 live against a real `rupu cp
+        /// serve` for exactly this row shape). `.run(id:host:)` must never
+        /// be used for these — see `ActivityRow.init(_:APIAgentRunRow)`.
+        /// `transcriptPath` is carried straight through (already `nil` when
+        /// the run never recorded one) so `AgentRunDetailStore` never has
+        /// to re-derive it.
+        case agentRun(id: String, transcriptPath: String?, host: String?)
         case none
     }
 
@@ -99,6 +109,17 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         navigation = .run(id: r.id, host: r.hostID)
     }
 
+    /// **Navigation (hotfix root cause C)**: an agent-run row is never an
+    /// orchestrator run, so it must never navigate via `.run(id:host:)` —
+    /// `GET /api/runs/:id` 404s for it every time, live-verified against a
+    /// real `rupu cp serve` for a `source:"session"` row with a
+    /// `transcript_path`. A `source == "session"` row *with* a `session_id`
+    /// really is one turn of a session (the same session detail screen
+    /// already renders for the session-list source), so it navigates there
+    /// instead — the honest destination this row's data actually supports.
+    /// Every other agent row (`source != "session"`, or `"session"` with no
+    /// `session_id`) is a standalone agent run with no richer destination
+    /// than its own transcript: `.agentRun(id:transcriptPath:host:)`.
     public init(_ r: APIAgentRunRow) {
         id = r.runID
         kind = .agent
@@ -110,7 +131,11 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         durationMS = r.durationMS
         costUSD = r.usage.costUSD
         startedAt = Self.parseISO(r.startedAt)
-        navigation = .run(id: r.runID, host: r.hostID)
+        if r.source == "session", let sessionID = r.sessionID {
+            navigation = .session(id: sessionID)
+        } else {
+            navigation = .agentRun(id: r.runID, transcriptPath: r.transcriptPath, host: r.hostID)
+        }
     }
 
     public init(_ r: APIAutoflowEventRow) {

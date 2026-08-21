@@ -68,4 +68,35 @@ public enum CPError: Error, Equatable {
     case transport(String)
     case decoding(String)
     case unauthorized
+    /// The underlying request was cancelled (a `CancellationError` or
+    /// `URLError(.cancelled)` from `URLSession`) — never a real transport
+    /// failure. Every store's load path checks for this specifically and
+    /// leaves its current state untouched rather than surfacing `.failed`.
+    case cancelled
+}
+
+/// One row from `GET /api/hosts`: the registered fleet (`local` plus every
+/// attached Fleet node). Only `id`/`name`/`transportKind`/`status` are
+/// decoded — the endpoint returns more fields, ignored here (`Decodable`'s
+/// default behavior already skips unknown keys, so no custom `init` is
+/// needed for that).
+public struct APIHostRow: Decodable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let transportKind: String
+    public let status: String
+
+    public init(id: String, name: String, transportKind: String, status: String) {
+        self.id = id
+        self.name = name
+        self.transportKind = transportKind
+        self.status = status
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case transportKind = "transport_kind"
+        case status
+    }
 }

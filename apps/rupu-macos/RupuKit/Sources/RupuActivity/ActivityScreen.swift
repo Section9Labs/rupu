@@ -38,6 +38,15 @@ public struct ActivityScreen: View {
                     MicroLabel("STREAM STALE — RECONNECTING")
                         .foregroundStyle(Color.rupuMute)
                 }
+                if store.pendingHosts > 0 {
+                    // Progressive per-host loading (hotfix): local rows are
+                    // already showing by the time this ever renders —
+                    // `store.state` never waits on remote hosts (see
+                    // `ActivityStore`'s doc comment) — this is purely an
+                    // "more may still show up" signal, never a blocking one.
+                    MicroLabel("+\(store.pendingHosts) HOST\(store.pendingHosts == 1 ? "" : "S") LOADING…")
+                        .foregroundStyle(Color.rupuMute)
+                }
                 stateBody(store: store)
             } else {
                 blockView(label: "BACKEND NOT CONNECTED")
@@ -138,6 +147,12 @@ public struct ActivityScreen: View {
             model.route = .runDetail(id: id, host: host)
         case .session(let id):
             model.route = .sessionDetail(id: id)
+        case .agentRun(let id, let transcriptPath, let host):
+            // Hotfix root cause C: a standalone agent run is never an
+            // orchestrator run — `.runDetail` would 404 against `GET
+            // /api/runs/:id`. `AgentRunDetailScreen` is the honest
+            // destination: transcript-only, via `GET /api/transcript`.
+            model.route = .agentRunDetail(id: id, transcriptPath: transcriptPath, host: host)
         case .none:
             break
         }

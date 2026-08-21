@@ -117,6 +117,11 @@ public final class SessionDetailStore {
         do {
             events = try await fetchTranscript(run.transcriptPath).events
         } catch {
+            // Cancellation is benign — see `isCancellation`'s doc comment
+            // and `RunDetailStore.focusStep`'s matching guard. A plain
+            // early `return`: nothing below, including the generation
+            // check, should run for a call that never produced a result.
+            guard !isCancellation(error) else { return }
             // No dedicated failure surface for the feed this phase — same
             // "per-block independence" call `RunDetailStore.focusStep` makes:
             // a transcript-load failure for the focused run must never
@@ -141,6 +146,7 @@ public final class SessionDetailStore {
         do {
             session = .content(try await fetchSession())
         } catch {
+            guard !isCancellation(error) else { return }
             session = .failed(String(describing: error))
         }
     }
@@ -150,6 +156,7 @@ public final class SessionDetailStore {
             let rows = try await fetchRuns()
             runs = rows.isEmpty ? .empty : .content(rows)
         } catch {
+            guard !isCancellation(error) else { return }
             runs = .failed(String(describing: error))
         }
     }

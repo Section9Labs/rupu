@@ -174,3 +174,47 @@ private final class CountBox: @unchecked Sendable {
 
     #expect(fetchCount.value == 2) // the initial refresh() + exactly one of {loadMore, refresh}
 }
+
+/// Hotfix root cause B: cancellation is benign. A `fetch` closure throwing
+/// `CancellationError` (the shape a superseded SwiftUI `.task(id:)`
+/// produces) must leave `state` exactly as it already was — `.loading`,
+/// set synchronously at the top of `refresh()` before this — never
+/// `.failed`. `rows` also stays untouched (still empty from before this
+/// call).
+@MainActor @Test func pagedSnapshotRefreshCancellationLeavesStateAsLoadingNeverFailed() async {
+    let snapshot = PagedSnapshot<FakeRow> { _, _ in throw CancellationError() }
+    await snapshot.refresh()
+    guard case .loading = snapshot.state else {
+        Issue.record("expected cancellation to leave state as .loading, got \(snapshot.state)")
+        return
+    }
+    #expect(snapshot.rows.isEmpty)
+}
+
+/// Same contract for `loadMore()`, against prior content that must survive
+/// untouched — proving cancellation never blanks or fails existing rows
+/// either.
+@MainActor @Test func pagedSnapshotLoadMoreCancellationLeavesPriorRowsAndStateUntouched() async {
+    let all = (0..<80).map { FakeRow(id: $0) }
+    let shouldCancel = FlagBox(false)
+    let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
+        if shouldCancel.value { throw CancellationError() }
+        guard offset < all.count else { return [] }
+        let end = min(offset + limit, all.count)
+        return Array(all[offset..<end])
+    }
+    await snapshot.refresh()
+    #expect(snapshot.rows.count == 50)
+    guard case .content = snapshot.state else {
+        Issue.record("expected .content after the successful refresh, got \(snapshot.state)")
+        return
+    }
+
+    shouldCancel.value = true
+    await snapshot.loadMore()
+    #expect(snapshot.rows.count == 50) // untouched — no partial append, no blanking
+    guard case .content = snapshot.state else {
+        Issue.record("expected state to stay .content through a cancelled loadMore, got \(snapshot.state)")
+        return
+    }
+}
