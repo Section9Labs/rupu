@@ -87,6 +87,10 @@ private let resolveCases: [ResolveCase] = [
     ResolveCase(verb: .approve, observedStatus: .completed, expectedConfirmed: true, label: "approve+completed"),
     ResolveCase(verb: .approve, observedStatus: .awaiting, expectedConfirmed: false, label: "approve+awaiting"),
     ResolveCase(verb: .approve, observedStatus: .pending, expectedConfirmed: false, label: "approve+pending"),
+    // regression: an unrecognized status must not fake-confirm approve —
+    // see `pendingActionResolveUnknownStatusNeverConfirmsAnyVerb` for the
+    // full per-verb sweep.
+    ResolveCase(verb: .approve, observedStatus: .unknown("—"), expectedConfirmed: false, label: "approve+unknown"),
 
     // reject: confirmed on either terminal outcome a reject can produce.
     ResolveCase(verb: .reject, observedStatus: .rejected, expectedConfirmed: true, label: "reject+rejected"),
@@ -106,6 +110,7 @@ private let resolveCases: [ResolveCase] = [
     ResolveCase(verb: .resume, observedStatus: .running, expectedConfirmed: true, label: "resume+running"),
     ResolveCase(verb: .resume, observedStatus: .paused, expectedConfirmed: false, label: "resume+paused"),
     ResolveCase(verb: .resume, observedStatus: .pending, expectedConfirmed: false, label: "resume+pending"),
+    ResolveCase(verb: .resume, observedStatus: .unknown("—"), expectedConfirmed: false, label: "resume+unknown"),
 
     // archive/restore/send/launch: never resolved by status — status-based
     // resolution must leave these pending no matter what arrives; only an
@@ -132,6 +137,31 @@ private let resolveCases: [ResolveCase] = [
                 Issue.record("\(c.label) should remain pending, got \(actions.state(key))")
                 continue
             }
+        }
+    }
+}
+
+/// Regression for the coordinator's review finding: `.unknown` must never
+/// satisfy approve/resume's exclusion-shaped confirmation (it's neither
+/// `.awaiting`/`.paused` nor `.pending`, so a naive two-exclusion test
+/// would wrongly treat an unrecognized/transient status as proof the run
+/// left the gate or the pause). reject/cancel/pause are exact-match against
+/// known values, so `.unknown` was never a risk there — asserted here too,
+/// to pin that it stays that way.
+@MainActor @Test func pendingActionResolveUnknownStatusNeverConfirmsAnyVerb() {
+    let unknown = ActivityStatus.unknown("—")
+    let verbsThatResolveByStatus: [ActionVerb] = [.approve, .reject, .cancel, .pause, .resume]
+
+    for verb in verbsThatResolveByStatus {
+        let actions = PendingActions(now: { Date() })
+        let key = ActionKey("run-1", verb)
+        actions.begin(key)
+
+        actions.resolve(runID: "run-1", observedStatus: unknown)
+
+        guard case .pending = actions.state(key) else {
+            Issue.record("\(verb) against .unknown should remain pending, got \(actions.state(key))")
+            continue
         }
     }
 }

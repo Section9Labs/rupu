@@ -48,10 +48,11 @@ public enum ActionState: Equatable, Sendable {
 /// **Confirmation table** (`resolve(runID:observedStatus:)`): for every
 /// key belonging to `runID` that is currently `.pending`,
 /// - `approve` confirms once `observedStatus` is neither `.awaiting` (the
-///   run hasn't left the gate yet) nor `.pending` (still queued, never
-///   having reached the gate at all);
+///   run hasn't left the gate yet), `.pending` (still queued, never having
+///   reached the gate at all), nor `.unknown` (an unrecognized status
+///   proves nothing — see below);
 /// - `resume` confirms once `observedStatus` is neither `.paused` (the run
-///   hasn't left the pause) nor `.pending`;
+///   hasn't left the pause), `.pending`, nor `.unknown`;
 /// - `reject` confirms on `.rejected` or `.cancelled` — both are terminal
 ///   outcomes a reject can produce depending on the workflow's `on_reject`
 ///   routing;
@@ -60,6 +61,20 @@ public enum ActionState: Equatable, Sendable {
 /// - `archive`/`restore`/`send`/`launch` are never confirmed by `resolve` —
 ///   their effects are response-visible or navigation-visible, not a run
 ///   status transition, so only an explicit `confirm(_:)` moves them.
+///
+/// **`.unknown` is never confirming for approve/resume.** Those two verbs
+/// are defined by *exclusion* (confirm once the status has moved off one
+/// specific blocking value), and `.unknown(_)` is neither `.awaiting` nor
+/// `.paused` nor `.pending` — so a naive two-exclusion test would treat an
+/// unrecognized/transient status string as proof the run left the gate or
+/// the pause. It proves nothing of the kind: `.unknown` covers both a
+/// genuinely novel server status *and* a transient feed glitch (a dropped
+/// field, a race with the row not existing yet), and confirming a marker
+/// verb on it would silently defeat the exact guarantee `PendingActions`
+/// exists to give the approve/reject/pause/resume gate flow. `reject`/
+/// `cancel`/`pause` are exact-match against one or two known values, so
+/// `.unknown` was never at risk there — this exclusion only needed adding
+/// to the two exclusion-shaped verbs.
 ///
 /// `resolve` only ever touches keys that are currently `.pending` — a key
 /// that's `.idle`, `.confirmed`, or `.failed` is left exactly as it is,
@@ -119,6 +134,12 @@ public final class PendingActions {
     }
 
     private static func confirms(_ verb: ActionVerb, _ status: ActivityStatus) -> Bool {
+        if case .unknown = status, verb == .approve || verb == .resume {
+            // An unrecognized status proves nothing — see this type's
+            // doc-comment note on why `.unknown` must not satisfy either
+            // exclusion-shaped verb's confirmation.
+            return false
+        }
         switch verb {
         case .approve:
             return status != .awaiting && status != .pending
