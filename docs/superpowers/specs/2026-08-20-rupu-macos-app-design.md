@@ -104,8 +104,11 @@ Per-host freshness is tracked per host — never one global "live" (HANDOFF rule
   (`/api/events/stream`), run streams, transcript tail. On reconnect a store
   **re-snapshots via REST, then resumes deltas** — no gap-guessing.
 - **Stores:** each screen store owns snapshot (REST) + delta (SSE) reduction; views only
-  observe. Mutations (Approve/Reject, cancel/pause/resume) resolve optimistically with a
-  fade and roll back on failure.
+  observe. Mutations (Approve/Reject, cancel/pause/resume) use the **pending-state
+  contract** (amended by the Phase 3 spec, 2026-08-21): a POST's 200 means *recorded*
+  (approve is marker+sweep; cancel/pause travel by signal to a detached `runner_pid`), so
+  the UI shows pending until the observed status transition confirms the effect — never
+  an optimistic flip.
 
 ## 7. Contract tests (drift defense)
 
