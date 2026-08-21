@@ -124,8 +124,8 @@ public struct RootView: View {
             ActivityScreen(model: model, backend: backend)
         case .runDetail(let id, let host):
             RunDetailScreen(model: model, backend: backend, runID: id, host: host)
-        case .sessionDetail:
-            PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
+        case .sessionDetail(let id):
+            SessionDetailScreen(model: model, backend: backend, sessionID: id)
         case .projects:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .security:
