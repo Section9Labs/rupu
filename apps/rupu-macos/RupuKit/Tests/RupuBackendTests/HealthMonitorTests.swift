@@ -22,7 +22,7 @@ final class LockedBox: @unchecked Sendable {
 @MainActor @Test func healthMonitorTransitions() async {
     let flag = LockedBox(false)
     let monitor = HealthMonitor(probe: {
-        if flag.value { return HostInfo(version: "0.71.0", capabilities: .init(backends: [], scmHosts: [], permissionModes: [])) }
+        if flag.value { return HostInfo(version: "0.75.0", capabilities: .init(backends: [], scmHosts: [], permissionModes: [])) }
         throw CPError.transport("refused")
     })
     #expect(monitor.health == .starting)
@@ -30,7 +30,7 @@ final class LockedBox: @unchecked Sendable {
     #expect(monitor.health == .down("refused"))
     flag.value = true
     await monitor.pollOnce()
-    #expect(monitor.health == .healthy(version: "0.71.0"))
+    #expect(monitor.health == .healthy(version: "0.75.0"))
     flag.value = false
     await monitor.pollOnce()
     if case .degraded = monitor.health {} else { Issue.record("healthy → failure should be degraded, got \(monitor.health)") }
@@ -48,7 +48,7 @@ final class LockedBox: @unchecked Sendable {
 
     do {
         let monitor = HealthMonitor(
-            probe: { HostInfo(version: "0.71.0", capabilities: .init(backends: [], scmHosts: [], permissionModes: [])) },
+            probe: { HostInfo(version: "0.75.0", capabilities: .init(backends: [], scmHosts: [], permissionModes: [])) },
             interval: .milliseconds(5)
         )
         weakMonitor = monitor

@@ -30,6 +30,28 @@ public enum Fmt {
     /// `deciseconds` and `totalSeconds` are each rounded independently from `ms` — not chained
     /// through one another — so a value near the 1h boundary doesn't pick up a second helping of
     /// rounding error from an intermediate decisecond rounding it never needed.
+    /// Renders `nil` as an em dash and otherwise a fixed-point USD amount
+    /// (`"$0.12"`, `"$12.50"`). Locale-independent by construction: a plain
+    /// `String(format: "$%.2f", ...)` (or a `NumberFormatter` left on the
+    /// user's current locale) renders the decimal separator as `,` under
+    /// most EU locales — `"$0,12"` — which is wrong for a USD literal
+    /// regardless of the reader's region. `NumberFormatter` pinned to
+    /// `en_US_POSIX` (Apple's documented recipe for locale-invariant fixed
+    /// formats — see the "POSIX" note in `Locale` docs) sidesteps that
+    /// rather than depending on `%f`'s own locale sensitivity.
+    public static func cost(_ usd: Double?) -> String {
+        guard let usd else { return "—" }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.decimalSeparator = "."
+        formatter.usesGroupingSeparator = false
+        let digits = formatter.string(from: NSNumber(value: usd)) ?? String(format: "%.2f", usd)
+        return "$\(digits)"
+    }
+
     public static func duration(ms: UInt64) -> String {
         let deciseconds = (ms + 50) / 100
         if deciseconds < 600 {

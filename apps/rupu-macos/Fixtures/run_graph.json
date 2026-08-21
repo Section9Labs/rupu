@@ -1,0 +1,146 @@
+{
+  "run": {
+    "active_step_id": "review",
+    "active_step_kind": "panel",
+    "id": "run-02",
+    "inputs": {},
+    "permission_mode": "ask",
+    "started_at": "2026-08-20T12:00:00Z",
+    "status": "running",
+    "transcript_dir": "/tmp/proj/.rupu/transcripts",
+    "workflow_name": "nightly-health",
+    "workspace_id": "ws-1",
+    "workspace_path": "/tmp/proj"
+  },
+  "step_results": [
+    {
+      "finished_at": "2026-08-20T12:00:00Z",
+      "kind": "linear",
+      "output": "plan complete",
+      "rendered_prompt": "Plan the work",
+      "run_id": "run-02",
+      "skipped": false,
+      "step_id": "plan",
+      "success": true,
+      "transcript_path": "t/plan.jsonl"
+    }
+  ],
+  "units": [
+    {
+      "finished_at": "2026-08-20T12:00:00Z",
+      "index": 0,
+      "item": "crates/a",
+      "output": "reviewed",
+      "run_id": "sub_01",
+      "step_id": "fan",
+      "success": true,
+      "transcript_path": "t/u0.jsonl"
+    },
+    {
+      "index": 1,
+      "item": "crates/b",
+      "step_id": "fan",
+      "success": null,
+      "transcript_path": "t/u1.jsonl"
+    }
+  ],
+  "usage": {
+    "cached_tokens": 100,
+    "cost_usd": 0.42,
+    "input_tokens": 3000,
+    "output_tokens": 700,
+    "priced": true,
+    "runs": 1,
+    "total_tokens": 3700
+  },
+  "workflow": {
+    "steps": [
+      {
+        "agent": "rupuso",
+        "for_each": null,
+        "gate": null,
+        "id": "plan",
+        "kind": "step",
+        "panelists": null,
+        "parallel": null
+      },
+      {
+        "agent": "reviewer",
+        "for_each": "{{ files }}",
+        "gate": null,
+        "id": "fan",
+        "kind": "for_each",
+        "panelists": null,
+        "parallel": null
+      },
+      {
+        "agent": null,
+        "for_each": null,
+        "gate": null,
+        "id": "par",
+        "kind": "parallel",
+        "panelists": null,
+        "parallel": [
+          {
+            "agent": "alpha",
+            "id": "par_a"
+          },
+          {
+            "agent": "beta",
+            "id": "par_b"
+          }
+        ]
+      },
+      {
+        "agent": null,
+        "for_each": null,
+        "gate": {
+          "fix_with": "fixer",
+          "max_iterations": 5,
+          "until_severity": "high"
+        },
+        "id": "review",
+        "kind": "panel",
+        "panelists": [
+          "panelist-a",
+          "panelist-b"
+        ],
+        "parallel": null
+      },
+      {
+        "agent": null,
+        "approval_gate": {
+          "auto_approve": true,
+          "has_on_reject": true,
+          "timeout_seconds": 3600
+        },
+        "for_each": null,
+        "gate": null,
+        "id": "approve",
+        "kind": "gate",
+        "panelists": null,
+        "parallel": null
+      },
+      {
+        "action": "scm.prs.create",
+        "agent": null,
+        "for_each": null,
+        "gate": null,
+        "id": "create_pr",
+        "kind": "action",
+        "panelists": null,
+        "parallel": null
+      },
+      {
+        "action": "cargo build",
+        "agent": null,
+        "for_each": "{{ targets }}",
+        "gate": null,
+        "id": "build",
+        "kind": "run",
+        "panelists": null,
+        "parallel": null
+      }
+    ]
+  }
+}

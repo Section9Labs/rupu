@@ -1,0 +1,79 @@
+{
+  "flows": [
+    {
+      "id": "00000000010000000000000001",
+      "ts": "2025-08-20T12:00:00Z",
+      "ctx": {
+        "run_id": "run-40",
+        "origin": {
+          "kind": "provider",
+          "name": "anthropic"
+        }
+      },
+      "fidelity": "http",
+      "method": "POST",
+      "scheme": "https",
+      "host": "api.anthropic.com",
+      "port": 443,
+      "path": "/v1/messages",
+      "peer_ip": "142.250.72.14",
+      "status": 200,
+      "outcome": "ok",
+      "bytes_out": 10,
+      "bytes_in": 20,
+      "body_complete": true,
+      "duration_ms": 30,
+      "asn": {
+        "asn": 15169,
+        "org": "Google LLC"
+      }
+    },
+    {
+      "id": "00000000010000000000000002",
+      "ts": "2025-08-20T12:01:00Z",
+      "ctx": {
+        "run_id": "run-40",
+        "origin": {
+          "kind": "provider",
+          "name": "anthropic"
+        }
+      },
+      "fidelity": "http",
+      "method": "POST",
+      "scheme": "https",
+      "host": "api.github.com",
+      "port": 443,
+      "path": "/v1/messages",
+      "outcome": "transport_error",
+      "error": "connection reset",
+      "body_complete": false,
+      "duration_ms": 30
+    }
+  ],
+  "hosts": [
+    {
+      "host": "api.anthropic.com",
+      "port": 443,
+      "calls": 1,
+      "bytes_in": 20,
+      "bytes_out": 10,
+      "errors": 0,
+      "p50_ms": 30,
+      "p95_ms": 30
+    },
+    {
+      "host": "api.github.com",
+      "port": 443,
+      "calls": 3,
+      "bytes_in": null,
+      "bytes_out": null,
+      "errors": 3
+    }
+  ],
+  "window": {
+    "from": null,
+    "to": null
+  },
+  "dropped_total": 0,
+  "asn_loaded": true
+}

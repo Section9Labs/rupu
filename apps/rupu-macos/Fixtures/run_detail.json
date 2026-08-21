@@ -1,0 +1,69 @@
+{
+  "run": {
+    "active_step_id": "gate",
+    "active_step_kind": "approval_gate",
+    "approval_prompt": "deploy?",
+    "awaiting": [
+      {
+        "expires_at": "2026-08-20T13:00:00Z",
+        "prompt": "deploy?",
+        "since": "2026-08-20T12:00:00Z",
+        "step_id": "gate"
+      }
+    ],
+    "awaiting_since": "2026-08-20T12:00:00Z",
+    "awaiting_step_id": "gate",
+    "expires_at": "2026-08-20T13:00:00Z",
+    "id": "run-01",
+    "inputs": {},
+    "permission_mode": "ask",
+    "started_at": "2026-08-20T12:00:00Z",
+    "status": "awaiting_approval",
+    "transcript_dir": "/tmp/proj/.rupu/transcripts",
+    "workflow_name": "nightly-health",
+    "workspace_id": "ws-1",
+    "workspace_path": "/tmp/proj"
+  },
+  "steps": [
+    {
+      "finished_at": "2026-08-20T12:00:00Z",
+      "kind": "linear",
+      "output": "plan complete",
+      "rendered_prompt": "Plan the work",
+      "run_id": "run-01",
+      "skipped": false,
+      "step_id": "plan",
+      "success": true,
+      "transcript_path": "t/plan.jsonl"
+    },
+    {
+      "findings": [
+        {
+          "body": "Potential panic on None",
+          "severity": "high",
+          "source": "panelist-a",
+          "title": "Missing null check"
+        }
+      ],
+      "finished_at": "2026-08-20T12:00:00Z",
+      "iterations": 2,
+      "kind": "panel",
+      "output": "panel review complete",
+      "rendered_prompt": "Review the change",
+      "run_id": "run-01",
+      "skipped": false,
+      "step_id": "review",
+      "success": true,
+      "transcript_path": "t/review.jsonl"
+    }
+  ],
+  "usage": {
+    "cached_tokens": 300,
+    "cost_usd": 0.85,
+    "input_tokens": 5000,
+    "output_tokens": 1200,
+    "priced": true,
+    "runs": 2,
+    "total_tokens": 6200
+  }
+}

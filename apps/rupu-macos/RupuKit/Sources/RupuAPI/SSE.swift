@@ -1,6 +1,8 @@
 import Foundation
 import os
 
+private let sseLogger = Logger(subsystem: "com.section9labs.rupu", category: "sse")
+
 /// One dispatched Server-Sent Events frame: an optional `event:` name plus
 /// the (possibly multi-line, `\n`-joined) accumulated `data:` payload.
 public struct SSEFrame: Equatable, Sendable {
@@ -79,11 +81,18 @@ public struct SSELineParser: Sendable {
 }
 
 /// Reconnecting SSE client that decodes each dispatched frame's `data` as a
-/// `CPEvent`. Undecodable frames are skipped (never fatal); the connection
-/// is retried with capped exponential backoff on stream end or error, and
-/// torn down when the consuming task is cancelled.
-public final class EventStreamClient: Sendable {
-    private static let logger = Logger(subsystem: "com.section9labs.rupu", category: "sse")
+/// `T`. Undecodable frames are skipped (never fatal); the connection is
+/// retried with capped exponential backoff on stream end or error, and torn
+/// down when the consuming task is cancelled.
+///
+/// Generalized from the original `CPEvent`-only `EventStreamClient` so the
+/// same reconnect/backoff/logging machinery backs any JSON-over-SSE feed
+/// (e.g. `TranscriptEvent` from `/api/transcript/stream`). `EventStreamClient`
+/// lives on as a type alias for source compatibility.
+public final class JSONEventStream<T: Decodable & Sendable>: Sendable {
+    // A generic type can't hold a static stored property, so the logger
+    // lives at file scope instead (shared across every `T` specialization).
+    private static var logger: Logger { sseLogger }
 
     private let url: URL
     private let token: String?
@@ -112,7 +121,7 @@ public final class EventStreamClient: Sendable {
         self.onConnectionChange = onConnectionChange
     }
 
-    public func events() -> AsyncStream<CPEvent> {
+    public func events() -> AsyncStream<T> {
         AsyncStream { continuation in
             let task = Task {
                 var backoffSeconds: UInt64 = 1
@@ -143,22 +152,24 @@ public final class EventStreamClient: Sendable {
     }
 
     /// Runs one connection attempt to completion (stream ends, errors, or
-    /// the task is cancelled). Returns `true` if at least one frame decoded
-    /// successfully into a `CPEvent` during this attempt, so the caller can
-    /// reset its backoff.
-    private func runOnce(continuation: AsyncStream<CPEvent>.Continuation) async -> Bool {
+    /// the task is cancelled). Returns `true` if this attempt successfully
+    /// established a connection (2xx response), so the caller can reset its
+    /// backoff. Backoff resets the moment the connection is established —
+    /// not only on the first decoded frame — so a healthy-but-idle stream
+    /// (keep-alive comments only, no dispatchable frames yet) doesn't keep
+    /// climbing backoff on every reconnect of an otherwise-fine connection.
+    private func runOnce(continuation: AsyncStream<T>.Continuation) async -> Bool {
         var request = URLRequest(url: url)
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        var sawHealthyFrame = false
         var parser = SSELineParser()
         // Tracks whether this attempt fired `onConnectionChange(true)`, so
         // the matching `false` only fires for an attempt that actually
         // connected — never for one that failed before ever reaching a 2xx
-        // response.
+        // response. Also doubles as this attempt's "healthy" return value.
         var didSignalConnected = false
         defer {
             if didSignalConnected {
@@ -179,13 +190,12 @@ public final class EventStreamClient: Sendable {
             didSignalConnected = true
             onConnectionChange?(true)
             for try await line in bytes.lines {
-                if Task.isCancelled { return sawHealthyFrame }
+                if Task.isCancelled { return didSignalConnected }
                 guard let frame = parser.feed(line: line) else { continue }
                 guard let data = frame.data.data(using: .utf8),
-                      let event = try? JSONDecoder().decode(CPEvent.self, from: data) else {
+                      let event = try? JSONDecoder().decode(T.self, from: data) else {
                     continue // Undecodable frame — skip, not fatal.
                 }
-                sawHealthyFrame = true
                 continuation.yield(event)
             }
         } catch {
@@ -200,6 +210,9 @@ public final class EventStreamClient: Sendable {
                 Self.logger.error("SSE connection error for \(self.url, privacy: .public): \(String(describing: error), privacy: .public)")
             }
         }
-        return sawHealthyFrame
+        return didSignalConnected
     }
 }
+
+/// Source-compatible alias for the original `CPEvent`-only stream client.
+public typealias EventStreamClient = JSONEventStream<CPEvent>

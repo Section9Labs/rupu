@@ -8,7 +8,27 @@ import RupuBackend
 @MainActor
 @Observable
 public final class AppModel {
-    public var route: Route = .overview
+    public var route: Route = .overview {
+        didSet {
+            // Tracks the most recent `.activity(kind)` route so
+            // `navigateBack()` can return to it after a push to
+            // `.runDetail`/`.sessionDetail`. A stored-property initializer
+            // (see `lastActivityRoute` below) never runs observers, so this
+            // deliberately doesn't fire for the `.overview` starting value —
+            // `lastActivityRoute`'s own default (`.activity(.all)`) is what
+            // backs a `navigateBack()` called before the user ever visits
+            // Activity.
+            if case .activity = route {
+                lastActivityRoute = route
+            }
+        }
+    }
+
+    /// The last `.activity(kind)` route visited — restored by
+    /// `navigateBack()`. Defaults to `.activity(.all)` so a `navigateBack()`
+    /// called with no prior Activity visit still lands somewhere sensible.
+    public private(set) var lastActivityRoute: Route = .activity(.all)
+
     public var range: TimeRange = .d7
     public var backendHealth: BackendHealth = .starting
     public var liveConnected: Bool = false
@@ -43,6 +63,7 @@ public final class AppModel {
             case .overview: .overview
             case .activity(.all): .runs
             case .activity(let kind): .runsLeaf(kind)
+            case .runDetail, .sessionDetail, .agentRunDetail: .runs
             case .projects: .projects
             case .security: .security
             case .library: .library
@@ -62,5 +83,13 @@ public final class AppModel {
             case .usage: route = .usage
             }
         }
+    }
+
+    /// Returns from a pushed `.runDetail`/`.sessionDetail` route to
+    /// whichever `.activity(kind)` route was current before the push (or
+    /// `.activity(.all)`, `lastActivityRoute`'s default, if Activity was
+    /// never visited this session).
+    public func navigateBack() {
+        route = lastActivityRoute
     }
 }

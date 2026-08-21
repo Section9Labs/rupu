@@ -348,6 +348,86 @@ mod tests {
         f
     }
 
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────────
+    //
+    // `FindingsResponse`/`FindingOut` are `pub`, but this fixture lives here
+    // (rather than the integration test) per the Phase 2 plan, reusing the
+    // `attribution()`/`at()` helpers above. Same `check_fixture` contract as
+    // `tests/macos_fixtures.rs` (duplicated: a unit test can't share code
+    // with an integration test without a public module) — see
+    // `api/host_info.rs`'s test module for the established pattern.
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures");
+        let path = dir.join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    #[test]
+    fn findings_run_fixture_is_current() {
+        let response = build_response(vec![
+            FindingOut {
+                ws_id: "ws1".into(),
+                project: "rupu".into(),
+                target_id: "tgt1".into(),
+                workflow_name: Some("nightly-health".into()),
+                permalink: Some("https://github.com/o/r/blob/main/src/a.rs#L17-L19".into()),
+                record: FindingRecord {
+                    id: "fnd_1".into(),
+                    file_path: Some("src/a.rs".into()),
+                    line_range: Some([17, 19]),
+                    scope: FindingScope::Line,
+                    summary: "Potential panic on unwrap".into(),
+                    severity: Severity::Critical,
+                    concern_id: Some("no-unwrap".into()),
+                    evidence: FindingEvidence {
+                        code_excerpt: Some("let x = opt.unwrap();".into()),
+                        rationale: "unwrap on an Option that can be None in production".into(),
+                        references: vec!["https://doc.rust-lang.org/std/option".into()],
+                    },
+                    declared_by: attribution(),
+                    declared_at: at("2026-08-20T12:00:00Z"),
+                },
+            },
+            FindingOut {
+                ws_id: "ws1".into(),
+                project: "rupu".into(),
+                target_id: "tgt1".into(),
+                workflow_name: None,
+                permalink: None,
+                record: FindingRecord {
+                    id: "fnd_2".into(),
+                    file_path: None,
+                    line_range: None,
+                    scope: FindingScope::Repo,
+                    summary: "No CI workflow configured".into(),
+                    severity: Severity::Info,
+                    concern_id: None,
+                    evidence: FindingEvidence {
+                        code_excerpt: None,
+                        rationale: "repository has no .github/workflows directory".into(),
+                        references: vec![],
+                    },
+                    declared_by: attribution(),
+                    declared_at: at("2026-08-20T11:00:00Z"),
+                },
+            },
+        ]);
+        check_fixture("findings_run.json", &response);
+    }
+
     #[test]
     fn sorts_critical_to_info() {
         let input = vec![

@@ -9,9 +9,25 @@ public enum RunKindFilter: String, CaseIterable, Sendable {
 }
 
 /// Every screen the shell can show in its detail pane.
+///
+/// `.runDetail`/`.sessionDetail`/`.agentRunDetail` (Phase 2 / hotfix) are
+/// *pushed* states reached from an `ActivityRow.Navigation` — not directly
+/// sidebar-selectable, unlike `.activity(_:)`. `AppModel.selectedSidebarItem`'s
+/// getter maps all three to plain `.runs` (the sidebar keeps highlighting
+/// the Runs section rather than showing no selection or guessing a kind
+/// leaf), and `AppModel.navigateBack()` is how the shell returns from any of
+/// them to whichever `.activity(kind)` route was current before the push.
 public enum Route: Hashable, Sendable {
     case overview
     case activity(RunKindFilter)
+    case runDetail(id: String, host: String?)
+    case sessionDetail(id: String)
+    /// A standalone agent run (hotfix root cause C: `ActivityRow.Navigation
+    /// .agentRun` — a row `GET /api/runs/:id` can never serve, so this
+    /// route never reaches `RunDetailScreen`). `transcriptPath` is carried
+    /// straight from the row that navigated here; `nil` renders an honest
+    /// "no transcript recorded" state rather than attempting a fetch.
+    case agentRunDetail(id: String, transcriptPath: String?, host: String?)
     case projects
     case security
     case library

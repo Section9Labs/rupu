@@ -17,6 +17,8 @@
 - Workflow triggers spec: `docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md`
 - Workflow triggers Plan 1 (polled events on cron tick): `docs/superpowers/plans/2026-05-07-rupu-workflow-triggers-plan-1-polled-events.md`
 - rupu.app (macOS) umbrella spec: `docs/superpowers/specs/2026-08-20-rupu-macos-app-design.md`
+- rupu.app (macOS) Phase 2 spec (read path, complete): `docs/superpowers/specs/2026-08-20-rupu-macos-phase-2-read-path-design.md`
+- rupu.app (macOS) Phase 2 plan (read path, complete): `docs/superpowers/plans/2026-08-20-rupu-macos-phase-2-read-path.md`
 
 ## Architecture rules (enforced)
 1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` only knows traits.
@@ -40,10 +42,10 @@
 Native macOS control-plane client, replacing the GPUI `rupu-app` (deletion tracked separately). Lives at `apps/rupu-macos/`; umbrella spec is the first "Read first" entry above.
 1. **XcodeGen owns the project file.** `make macos-gen` regenerates `apps/rupu-macos/rupu.xcodeproj` from `project.yml`. The `.xcodeproj` is gitignored — never edit or commit it; change `project.yml` and regenerate.
 2. **Thin app target.** `App/` is scenes + wiring only. All logic lives in RupuKit modules (Swift package at `apps/rupu-macos/RupuKit/`).
-3. **Module map:** `RupuAPI` (CPClient, CPEvent, SSE `EventStreamClient`) · `RupuBackend` (discovery, version gate, Keychain, `EmbeddedServer` attach-or-spawn, `HealthMonitor`) · `RupuStore` (`AppModel`, `BackendController`) · `RupuDesign` (programmatic design tokens — `HANDOFF.md` is the visual contract) · `RupuShell` (views). Later phases add one module per screen.
+3. **Module map:** `RupuAPI` (CPClient, CPEvent, SSE `EventStreamClient`) · `RupuBackend` (discovery, version gate, Keychain, `EmbeddedServer` attach-or-spawn, `HealthMonitor`) · `RupuStore` (`AppModel`, `BackendController`, `PagedSnapshot`/`LiveReducer`/`StreamLifecycle` primitives) · `RupuDesign` (programmatic design tokens — `HANDOFF.md` is the visual contract) · `RupuShell` (views) · `RupuActivity` (Activity table — kind/status filters, live tail, new-run pill) · `RupuRunDetail` (run detail — step graph, transcript feed, netflow/findings rails — and read-only session detail). Later phases add one module per screen.
 4. **No third-party Swift dependencies.** Swift Testing (not XCTest) for all tests.
 5. **Fixture rig.** `make macos-fixtures` regenerates `apps/rupu-macos/Fixtures/*.json` from `rupu-cp`'s serde types. Run it after changing any serde type the app consumes — drift fails `cargo test -p rupu-cp`.
-6. **Embedded backend.** Discovers an installed `rupu` on `PATH` (overridable in Settings); attach-or-spawn on port 7420, spawning `cp serve --bind 127.0.0.1:<port>`. `VersionGate.minimum` is currently `"0.71.0"` — bump it consciously, never ambiently.
+6. **Embedded backend.** Discovers an installed `rupu` on `PATH` (overridable in Settings); attach-or-spawn on port 7420, spawning `cp serve --bind 127.0.0.1:<port>`. `VersionGate.minimum` is currently `"0.74.0"` — bump it consciously, never ambiently.
 7. **GUI validation rule.** `make macos-test` + `make macos-build` green ≠ rendering green; matt runs the app before any UI-affecting PR merges.
 8. Make targets: `macos-gen` / `macos-build` / `macos-test` / `macos-run` / `macos-fixtures`. CI job `macos-app` (`.github/workflows/ci.yml`, `macos-15` runner) runs `macos-test` + `macos-build` on every PR.
 

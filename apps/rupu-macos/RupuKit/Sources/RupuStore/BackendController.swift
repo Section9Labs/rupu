@@ -47,6 +47,7 @@ public final class BackendController {
     private var healthMonitor: HealthMonitor?
     private var activeClient: CPClient?
     private var activeEventStream: EventStreamClient?
+    private var activeConfig: CPConfig?
 
     private static let modeKey = "backend.mode"
     private static let binaryPathOverrideKey = "rupu.binaryPath"
@@ -179,6 +180,57 @@ public final class BackendController {
         activeEventStream
     }
 
+    /// Builds a brand-new `JSONEventStream<CPEvent>` against the same
+    /// `/api/events/stream` endpoint and credentials as the shared
+    /// `eventStream()` firehose — but as its own independent connection,
+    /// wired to the caller's own `onConnectionChange`. `eventStream()`'s
+    /// `EventStreamClient` has its `onConnectionChange` fixed at
+    /// construction (already claimed by `RootView`, forwarded into
+    /// `model.liveConnected`); there's no second slot on that instance for
+    /// another consumer's own connection-state tracking. A caller (e.g.
+    /// `ActivityStore`'s live tail) that needs its own honest
+    /// connect/disconnect signal — not `eventStream()`'s frames blindly
+    /// pumped through with someone else's connection state bolted on —
+    /// gets a fresh, fully independent stream from here instead.
+    ///
+    /// `nil` when nothing is configured yet (mirrors `client()`/
+    /// `eventStream()`'s own "nothing connected" behavior).
+    public func makeFirehoseStream(onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> EventStreamClient? {
+        guard let config = activeConfig else { return nil }
+        return EventStreamClient(
+            url: config.baseURL.appendingPathComponent("api/events/stream"),
+            token: config.token,
+            onConnectionChange: onConnectionChange
+        )
+    }
+
+    /// Same rationale as `makeFirehoseStream` above, but scoped server-side
+    /// to one run's events (`/api/events/stream?run=<id>`) — `RunDetailStore`
+    /// (Task 8)'s own independent connection for the step graph's live
+    /// pulses, wired to its own `onConnectionChange`, never sharing
+    /// `eventStream()`'s single already-claimed callback slot.
+    public func makeRunEventStream(runID: String, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<CPEvent>? {
+        guard let config = activeConfig,
+              var components = URLComponents(url: config.baseURL.appendingPathComponent("api/events/stream"), resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.queryItems = [URLQueryItem(name: "run", value: runID)]
+        guard let url = components.url else { return nil }
+        return JSONEventStream<CPEvent>(url: url, token: config.token, onConnectionChange: onConnectionChange)
+    }
+
+    /// Same shape as `makeRunEventStream` above, for the transcript tail
+    /// (`/api/transcript/stream?path=<file>`) — `RunDetailStore.focusStep`
+    /// tears this down and rebuilds it against a new `path` every time focus
+    /// switches to a different step.
+    public func makeTranscriptStream(path: String, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<TranscriptEvent>? {
+        guard let config = activeConfig,
+              var components = URLComponents(url: config.baseURL.appendingPathComponent("api/transcript/stream"), resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components.url else { return nil }
+        return JSONEventStream<TranscriptEvent>(url: url, token: config.token, onConnectionChange: onConnectionChange)
+    }
+
     /// Stops health polling and tears down a *spawned* embedded server
     /// (never an attached one) unless `keepRunning` is set. Idempotent:
     /// safe to call more than once (e.g. a raw `SIGTERM` reroute racing an
@@ -198,6 +250,7 @@ public final class BackendController {
     private func startHealthMonitor(config: CPConfig) {
         let client = CPClient(config: config)
         activeClient = client
+        activeConfig = config
         activeEventStream = EventStreamClient(
             url: config.baseURL.appendingPathComponent("api/events/stream"),
             token: config.token,

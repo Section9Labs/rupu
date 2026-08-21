@@ -78,6 +78,11 @@ public final class HealthMonitor {
             case .decoding(let message): return message
             case .http(let status, let body): return "http \(status): \(body)"
             case .unauthorized: return "unauthorized"
+            // A cancelled poll (e.g. `stop()` racing an in-flight probe) —
+            // not a real health signal, but `message(for:)` only formats a
+            // string for whatever `pollOnce()`'s catch already decided to
+            // do with it; it doesn't decide health state itself.
+            case .cancelled: return "cancelled"
             }
         default:
             return String(describing: error)

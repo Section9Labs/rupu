@@ -776,6 +776,71 @@ async fn delete_session(
 mod tests {
     use super::*;
 
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────────
+    //
+    // `SessionDto` is private to this module — the integration test
+    // (`tests/macos_fixtures.rs`) can't build it, so its fixture lives here
+    // instead. Same `check_fixture` contract as that file (duplicated: a unit
+    // test can't share code with an integration test without a public
+    // module) — see `api/host_info.rs`'s test module for the established
+    // pattern.
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures");
+        let path = dir.join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    #[test]
+    fn session_rows_fixture_is_current() {
+        let dto = SessionDto {
+            session_id: "sess-1".into(),
+            agent_name: "rupuso".into(),
+            model: "claude-sonnet-4-6".into(),
+            provider_name: "anthropic".into(),
+            status: serde_json::Value::String("active".into()),
+            total_turns: 6,
+            total_tokens_in: 5000,
+            total_tokens_out: 1200,
+            total_tokens_cached: 300,
+            created_at: "2026-08-20T11:00:00Z".into(),
+            updated_at: "2026-08-20T12:00:00Z".into(),
+            active_run_id: Some("run-30".into()),
+            last_error: None,
+            target: Some("main".into()),
+            workspace_id: "ws-1".into(),
+        };
+        let usage = session_usage(&dto, &rupu_config::PricingConfig::default());
+        let mut v = serde_json::to_value(&dto).expect("serialize SessionDto");
+        if let serde_json::Value::Object(ref mut map) = v {
+            map.insert(
+                "scope".to_string(),
+                serde_json::Value::String("active".to_string()),
+            );
+            map.insert(
+                "usage".to_string(),
+                serde_json::to_value(&usage).expect("serialize usage"),
+            );
+            map.insert(
+                "host_id".to_string(),
+                serde_json::Value::String("local".to_string()),
+            );
+        }
+        check_fixture("session_rows.json", &vec![v]);
+    }
+
     #[test]
     fn session_usage_from_dto_prices_known_model() {
         let dto = SessionDto {

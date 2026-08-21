@@ -10,6 +10,13 @@ import Testing
     #expect(Fmt.partial(12, isPartial: true) == "12+")
     #expect(Fmt.partial(12, isPartial: false) == "12")
 }
+@Test func cost() {
+    #expect(Fmt.cost(nil) == "—")
+    #expect(Fmt.cost(0.12) == "$0.12")
+    #expect(Fmt.cost(12.5) == "$12.50")
+    #expect(Fmt.cost(0) == "$0.00")
+}
+
 @Test func durations() {
     #expect(Fmt.duration(ms: 850) == "0.9s")
     #expect(Fmt.duration(ms: 4_200) == "4.2s")

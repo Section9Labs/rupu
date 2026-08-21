@@ -1460,6 +1460,91 @@ mod tests {
         w.flush().unwrap();
     }
 
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────────
+    //
+    // `NetflowResponse`/`FlowView` are `pub`, but this fixture lives here
+    // (rather than the integration test) per the Phase 2 plan, alongside the
+    // `flow()` helper above. Same `check_fixture` contract as
+    // `tests/macos_fixtures.rs` (duplicated: a unit test can't share code with
+    // an integration test without a public module) — see `api/host_info.rs`'s
+    // test module for the established pattern.
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures");
+        let path = dir.join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    #[test]
+    fn netflow_run_fixture_is_current() {
+        let mut flow_ok = flow(FlowId::from_parts(1, 1), Some("run-40"), "api.anthropic.com");
+        flow_ok.peer_ip = Some("142.250.72.14".parse().unwrap());
+        flow_ok.ts = chrono::DateTime::from_timestamp(1_755_691_200, 0).unwrap();
+
+        let mut flow_err = flow(FlowId::from_parts(1, 2), Some("run-40"), "api.github.com");
+        flow_err.outcome = Outcome::TransportError;
+        flow_err.error = Some("connection reset".into());
+        flow_err.status = None;
+        flow_err.bytes_in = None;
+        flow_err.bytes_out = None;
+        flow_err.body_complete = false;
+        flow_err.ts = chrono::DateTime::from_timestamp(1_755_691_260, 0).unwrap();
+
+        let response = NetflowResponse {
+            flows: vec![
+                FlowView {
+                    flow: flow_ok,
+                    asn: Some(AsnInfo {
+                        asn: 15169,
+                        org: "Google LLC".into(),
+                    }),
+                },
+                FlowView {
+                    flow: flow_err,
+                    asn: None,
+                },
+            ],
+            hosts: vec![
+                rupu_netflow::ledger::HostRollup {
+                    host: "api.anthropic.com".into(),
+                    port: 443,
+                    calls: 1,
+                    bytes_in: Some(20),
+                    bytes_out: Some(10),
+                    errors: 0,
+                    p50_ms: Some(30),
+                    p95_ms: Some(30),
+                },
+                rupu_netflow::ledger::HostRollup {
+                    host: "api.github.com".into(),
+                    port: 443,
+                    calls: 3,
+                    bytes_in: None,
+                    bytes_out: None,
+                    errors: 3,
+                    p50_ms: None,
+                    p95_ms: None,
+                },
+            ],
+            window: WindowEcho::default(),
+            dropped_total: 0,
+            asn_loaded: true,
+        };
+        check_fixture("netflow_run.json", &response);
+    }
+
     #[test]
     fn build_response_wires_a_server_computed_host_rollup() {
         let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");

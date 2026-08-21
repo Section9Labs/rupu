@@ -1,0 +1,47 @@
+[
+  {
+    "event_id": "evt-1",
+    "cycle_id": "cycle-1",
+    "at": "2026-08-20T12:00:00Z",
+    "kind": "run_launched",
+    "workflow": "nightly-health",
+    "issue_display_ref": "#42",
+    "run_id": "run-20",
+    "status": "running",
+    "worker_name": "worker-a",
+    "usage": {
+      "input_tokens": 400,
+      "output_tokens": 90,
+      "cached_tokens": 0,
+      "total_tokens": 490,
+      "cost_usd": 0.04,
+      "priced": true,
+      "runs": 1
+    },
+    "turns": 2,
+    "duration_ms": 8000,
+    "host_id": "local"
+  },
+  {
+    "event_id": "evt-2",
+    "cycle_id": "cycle-1",
+    "at": "2026-08-20T12:05:00Z",
+    "kind": "cycle_failed",
+    "workflow": "nightly-health",
+    "issue_display_ref": null,
+    "run_id": null,
+    "status": null,
+    "worker_name": "worker-a",
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "total_tokens": 0,
+      "cost_usd": null,
+      "priced": false,
+      "runs": 0
+    },
+    "detail": "worker crashed",
+    "host_id": "local"
+  }
+]
