@@ -171,7 +171,14 @@ public struct SessionDetailScreen: View {
     private func runRow(_ run: APISessionRunRow, focused: Bool) -> some View {
         let status = ActivityStatus.normalize(run.status)
         return Button {
-            model.route = .runDetail(id: run.runID, host: nil)
+            // Hotfix root cause C (second path): a session's child runs are
+            // session-turn agent runs, not orchestrator runs — `GET
+            // /api/runs/:id` 404s for them, verified live for exactly this
+            // row shape (`run_01M0H2AJA1J0T0JH0ZEAW1YAM7`, source
+            // "session", 404 on both hosts). `.agentRunDetail` is the
+            // destination that's actually addressable: one REST transcript
+            // fetch, same as `ActivityRow`'s own session-turn agent rows.
+            model.route = .agentRunDetail(id: run.runID, transcriptPath: run.transcriptPath, host: nil)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {

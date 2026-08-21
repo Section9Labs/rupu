@@ -562,12 +562,20 @@ public final class ActivityStore {
     /// Matched by `navigation`'s run id, not `row.id`: an autoflow row's
     /// `id` is its *event* id (`eventID`), not the run id a `CPEvent`
     /// carries. `navigation`'s `.run(id:host:)` case is the one field every
-    /// run-bearing row kind (workflow/agent/autoflow) populates with the
-    /// actual run id, so it's the only key that's correct across all three.
-    /// Session rows never carry `.run` navigation, so they're correctly
-    /// excluded — a session's status is derived from its
-    /// `activeRunID`/`lastError` at fetch time, not live-patched from run
-    /// events.
+    /// *orchestrator*-run-bearing row kind (workflow/autoflow) populates
+    /// with the actual run id, so it's the only key that's correct across
+    /// both.
+    ///
+    /// Agent rows are deliberately excluded (hotfix root cause C): an agent
+    /// row is never an orchestrator run — `ActivityRow.init(_:
+    /// APIAgentRunRow)` navigates it to `.session`/`.agentRun`, never
+    /// `.run` — so it's correctly unreachable here too. That's not just
+    /// harmless; it's *correct*: `CPEvent.runStarted`/`runCompleted` (what
+    /// this patches from) describe orchestrator runs, and an agent row's
+    /// run id was never guaranteed to line up with one of those anyway.
+    /// Session rows likewise never carry `.run` navigation — a session's
+    /// status is derived from its `activeRunID`/`lastError` at fetch time,
+    /// not live-patched from run events.
     private func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
         statusOverrides[runID] = (status, durationMS)
         guard let index = rows.firstIndex(where: {

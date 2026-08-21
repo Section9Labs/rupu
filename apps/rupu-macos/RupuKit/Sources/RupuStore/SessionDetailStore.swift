@@ -18,9 +18,12 @@ import RupuAPI
 /// `host` parameter — there is no host-scoped session API yet — so every
 /// session in this phase is local by construction, and `focusRun`'s
 /// transcript fetch always passes `host: nil`, the same convention
-/// `RunDetailStore` uses for its own local-run fetches. Child-run rows
-/// still navigate to `.runDetail(id:host:)` with `host: nil` for the same
-/// reason (`SessionDetailScreen`'s job, not this store's).
+/// `RunDetailStore` uses for its own local-run fetches. Child-run rows are
+/// session-turn agent runs, not orchestrator runs — `GET /api/runs/:id`
+/// 404s for them (hotfix root cause C, verified live) — so
+/// `SessionDetailScreen` navigates them to `.agentRunDetail(id:
+/// transcriptPath:host:)` with `host: nil`, never `.runDetail` (that's
+/// `SessionDetailScreen`'s job, not this store's).
 ///
 /// **Default focus**: `GET /api/sessions/:id/runs` returns a session's
 /// turns in chronological (recorded) order, oldest first — mirrored by
