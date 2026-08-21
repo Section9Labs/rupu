@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import RupuAPI
 import RupuStore
 import RupuDesign
 
@@ -15,6 +16,10 @@ private enum ActivityTableLayout {
     static let duration: CGFloat = 64
     static let cost: CGFloat = 64
     static let started: CGFloat = 88
+    /// Phase 3, Task 5: the compact Approve/Reject column for `.awaiting`
+    /// rows — empty (but still width-reserved, so every row stays aligned)
+    /// for every other status.
+    static let actions: CGFloat = 52
 }
 
 /// The merged execution table. Built on `List` rather than SwiftUI's stock
@@ -25,6 +30,8 @@ private enum ActivityTableLayout {
 /// `.onHover` per row).
 struct ActivityTable: View {
     let rows: [ActivityRow]
+    let store: ActivityStore
+    let backend: BackendController
     let onSelect: (ActivityRow) -> Void
 
     private typealias Layout = ActivityTableLayout
@@ -34,7 +41,7 @@ struct ActivityTable: View {
             header
             Divider()
             List(rows) { row in
-                ActivityTableRow(row: row, onSelect: onSelect)
+                ActivityTableRow(row: row, store: store, backend: backend, onSelect: onSelect)
                     .listRowBackground(rowBackground(row))
                     .listRowSeparator(.visible)
                     .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
@@ -60,6 +67,7 @@ struct ActivityTable: View {
             headerCell("Dur", width: Layout.duration, alignment: .trailing)
             headerCell("Cost", width: Layout.cost, alignment: .trailing)
             headerCell("Started", width: Layout.started, alignment: .trailing)
+            headerCell("", width: Layout.actions, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -88,6 +96,8 @@ struct ActivityTable: View {
 /// handler and no hover cursor, per the brief's "no dead controls" rule.
 private struct ActivityTableRow: View {
     let row: ActivityRow
+    let store: ActivityStore
+    let backend: BackendController
     let onSelect: (ActivityRow) -> Void
 
     private typealias Layout = ActivityTableLayout
@@ -136,6 +146,8 @@ private struct ActivityTableRow: View {
                 .font(.numeral(size: 11))
                 .foregroundStyle(Color.rupuDim)
                 .frame(width: Layout.started, alignment: .trailing)
+            awaitingActions
+                .frame(width: Layout.actions, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -152,6 +164,86 @@ private struct ActivityTableRow: View {
                 NSCursor.pop()
             }
         }
+    }
+
+    // MARK: - Awaiting-row inline actions (Phase 3, Task 5)
+
+    /// Compact ✓/✕ pair for an `.awaiting` row — `.none` for every other
+    /// status, still occupying `Layout.actions`' width so every row stays
+    /// column-aligned. Only rendered when `row.navigation` is `.run` (an
+    /// orchestrator run — the only kind this phase's approve/reject routes
+    /// can target); an autoflow row with no run materialized yet
+    /// (`.none` navigation) can read `.awaiting` from its own source but
+    /// has nothing to approve/reject against.
+    @ViewBuilder
+    private var awaitingActions: some View {
+        if row.status == .awaiting, case .run(let runID, let host) = row.navigation {
+            let approveKey = ActionKey(runID, .approve)
+            let rejectKey = ActionKey(runID, .reject)
+            let approvePending = isPending(store.pendingActions.state(approveKey))
+            let rejectPending = isPending(store.pendingActions.state(rejectKey))
+            let anyPending = approvePending || rejectPending
+
+            HStack(spacing: 6) {
+                Button {
+                    Task { await resolveGateAndApprove(runID: runID, host: host) }
+                } label: {
+                    if approvePending {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "checkmark.circle.fill")
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.status(.done))
+                .disabled(anyPending)
+                .help("Approve")
+
+                Button {
+                    Task { await resolveGateAndReject(runID: runID, host: host) }
+                } label: {
+                    if rejectPending {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.status(.fail))
+                .disabled(anyPending)
+                .help("Reject")
+            }
+        }
+    }
+
+    private func isPending(_ state: ActionState) -> Bool {
+        if case .pending = state { return true }
+        return false
+    }
+
+    /// `GET /api/runs/workflows` (the source this row came from) carries no
+    /// `awaiting[]` detail — only `GET /api/runs/:id` does — so a compact
+    /// row's tap resolves the gate id itself before calling
+    /// `store.approve`, same "gate targeting always explicit" contract
+    /// every write route in this phase follows (never omitted, never
+    /// guessed). A run with no resolvable single gate (already resolved
+    /// server-side by the time this lands, or the API otherwise disagrees
+    /// with the row's own `.awaiting` status) is a silent no-op — the row's
+    /// next live-patch or refresh will correct its status either way.
+    private func resolveGateAndApprove(runID: String, host: String?) async {
+        guard let gate = await resolveSoleAwaitingGate(runID: runID, host: host) else { return }
+        await store.approve(runID: runID, gate: gate, host: host)
+    }
+
+    private func resolveGateAndReject(runID: String, host: String?) async {
+        guard let gate = await resolveSoleAwaitingGate(runID: runID, host: host) else { return }
+        await store.reject(runID: runID, gate: gate, host: host)
+    }
+
+    private func resolveSoleAwaitingGate(runID: String, host: String?) async -> String? {
+        guard let client = backend.client() else { return nil }
+        guard let detail = try? await client.runDetail(id: runID, host: host) else { return nil }
+        return detail.run.awaiting.first?.stepID
     }
 
     private var statusCell: some View {

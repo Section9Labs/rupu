@@ -74,7 +74,7 @@ public struct RunDetailScreen: View {
         VStack(alignment: .leading, spacing: 16) {
             header(store: store)
             if case .content(let detail) = store.detail {
-                awaitingBanner(detail: detail)
+                awaitingBanner(store: store, detail: detail)
             }
             stepGraphSection(store: store)
                 .frame(height: 140)
@@ -108,6 +108,7 @@ public struct RunDetailScreen: View {
                         .foregroundStyle(Color.rupuDim)
                     Spacer(minLength: 0)
                     statusPill(detail.run.status)
+                    actionControls(store: store)
                 } else {
                     MicroLabel("Activity ▸ \(runID)")
                         .foregroundStyle(Color.rupuDim)
@@ -118,6 +119,72 @@ public struct RunDetailScreen: View {
                 factsRow(detail: detail)
             }
         }
+    }
+
+    // MARK: - Header mutations (Phase 3, Task 5)
+
+    /// Renders strictly from `store.availableVerbs` — no dead controls, per
+    /// the brief. Cancel/Pause/Resume are plain buttons (their own tap is
+    /// the retry — a failed one can just be tapped again); Archive/Restore
+    /// live behind an overflow menu since at most one of them is ever
+    /// available at once and neither is a frequent action.
+    @ViewBuilder
+    private func actionControls(store: RunDetailStore) -> some View {
+        let verbs = store.availableVerbs
+        HStack(spacing: 6) {
+            if verbs.contains(.cancel) {
+                mutationButton(store: store, title: "Cancel", verb: .cancel) { await store.cancel() }
+            }
+            if verbs.contains(.pause) {
+                mutationButton(store: store, title: "Pause", verb: .pause) { await store.pause() }
+            }
+            if verbs.contains(.resume) {
+                mutationButton(store: store, title: "Resume", verb: .resume) { await store.resume() }
+            }
+            if verbs.contains(.archive) || verbs.contains(.restore) {
+                Menu {
+                    if verbs.contains(.archive) {
+                        Button("Archive") { Task { await store.archive() } }
+                            .disabled(isPending(store.pendingActions.state(ActionKey(runID, .archive))))
+                    }
+                    if verbs.contains(.restore) {
+                        Button("Restore") { Task { await store.restore() } }
+                            .disabled(isPending(store.pendingActions.state(ActionKey(runID, .restore))))
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .foregroundStyle(Color.rupuDim)
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 20)
+            }
+        }
+    }
+
+    /// One header mutation button: `verb`'s own key drives the
+    /// spinner-while-pending + disabled state (shared across every control
+    /// keyed to it — an Activity-row tap for the same run would disable
+    /// this one too, via the shared `pendingActions` ledger).
+    private func mutationButton(store: RunDetailStore, title: String, verb: ActionVerb, action: @escaping () async -> Void) -> some View {
+        let key = ActionKey(runID, verb)
+        let state = store.pendingActions.state(key)
+        let pending = isPending(state)
+        return Button {
+            Task { await action() }
+        } label: {
+            HStack(spacing: 4) {
+                if pending {
+                    ProgressView().controlSize(.mini)
+                }
+                Text(title)
+            }
+        }
+        .disabled(pending)
+    }
+
+    private func isPending(_ state: ActionState) -> Bool {
+        if case .pending = state { return true }
+        return false
     }
 
     private func statusPill(_ rawStatus: String) -> some View {
@@ -195,32 +262,98 @@ public struct RunDetailScreen: View {
         return formatter
     }()
 
-    // MARK: - Awaiting banner
+    // MARK: - Awaiting banner (Phase 3, Task 5)
 
-    /// Strict read-only: the gate's prompt renders as plain text, with an
-    /// honest label instead of a dead approve/reject control — Phase 3 adds
-    /// the real actions.
-    private func awaitingBanner(detail: APIRunDetail) -> some View {
+    /// One row per parked gate — `gate.stepID` from `detail.run.awaiting` is
+    /// always what's sent as the mutation's `gate:` (gate targeting is
+    /// always explicit; never omitted even when there's only one).
+    private func awaitingBanner(store: RunDetailStore, detail: APIRunDetail) -> some View {
         Group {
             if !detail.run.awaiting.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 10) {
                     ForEach(detail.run.awaiting, id: \.stepID) { gate in
-                        VStack(alignment: .leading, spacing: 4) {
-                            MicroLabel("Awaiting — \(gate.stepID)")
-                                .foregroundStyle(Color.status(.waiting))
-                            Text(gate.prompt ?? "Approval requested")
-                                .font(.system(size: 12.5))
-                                .foregroundStyle(Color.rupuInk)
-                        }
+                        gateRow(store: store, gate: gate)
                     }
-                    MicroLabel("AWAITING APPROVAL — ACTIONS ARRIVE IN PHASE 3")
-                        .foregroundStyle(Color.rupuMute)
                 }
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.status(.waiting).opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.status(.waiting).opacity(0.3), lineWidth: 1))
+            }
+        }
+    }
+
+    private func gateRow(store: RunDetailStore, gate: APIAwaitingGate) -> some View {
+        let approveKey = ActionKey(runID, .approve)
+        let rejectKey = ActionKey(runID, .reject)
+        let approveState = store.pendingActions.state(approveKey)
+        let rejectState = store.pendingActions.state(rejectKey)
+        let approvePending = isPending(approveState)
+        let rejectPending = isPending(rejectState)
+        let anyPending = approvePending || rejectPending
+
+        return VStack(alignment: .leading, spacing: 6) {
+            MicroLabel("Awaiting — \(gate.stepID)")
+                .foregroundStyle(Color.status(.waiting))
+            Text(gate.prompt ?? "Approval requested")
+                .font(.system(size: 12.5))
+                .foregroundStyle(Color.rupuInk)
+
+            HStack(spacing: 8) {
+                Button {
+                    Task { await store.approve(gate: gate.stepID) }
+                } label: {
+                    HStack(spacing: 5) {
+                        if approvePending {
+                            ProgressView().controlSize(.mini)
+                        }
+                        Text("Approve")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.rupuBrand)
+                .disabled(anyPending)
+
+                Button {
+                    Task { await store.reject(gate: gate.stepID) }
+                } label: {
+                    HStack(spacing: 5) {
+                        if rejectPending {
+                            ProgressView().controlSize(.mini)
+                        }
+                        Text("Reject")
+                    }
+                }
+                .disabled(anyPending)
+            }
+
+            gateFailureNote(state: approveState) { await store.approve(gate: gate.stepID) }
+            gateFailureNote(state: rejectState) { await store.reject(gate: gate.stepID) }
+
+            if store.pendingActions.isStale(approveKey) || store.pendingActions.isStale(rejectKey) {
+                MicroLabel("STILL PENDING — THIS MAY BE STUCK")
+                    .foregroundStyle(Color.rupuMute)
+            }
+        }
+    }
+
+    /// Inline failure text + retry for one gate control — only renders when
+    /// `state` is `.failed`, so a fresh/pending/confirmed key shows nothing.
+    @ViewBuilder
+    private func gateFailureNote(state: ActionState, retry: @escaping () async -> Void) -> some View {
+        if case .failed(let message) = state {
+            HStack(spacing: 6) {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.status(.fail))
+                    .lineLimit(2)
+                Button("Retry") {
+                    Task { await retry() }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.rupuBrandHi)
+                .font(.system(size: 11, weight: .semibold))
             }
         }
     }

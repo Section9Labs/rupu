@@ -137,6 +137,16 @@ private func findings() -> APIFindings {
     APIFindings(findings: [], summary: APIFindingsSummary(total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0))
 }
 
+/// Fixture builder for `RunControlResponse` — mirrors the local-response
+/// shape (`run` present, carrying whatever post-mutation `status` the test
+/// wants `confirmedStatus` to surface) by default; a test that wants the
+/// remote-proxy shape (`{ok, host_id}`, no `run`) passes `status: nil`
+/// explicitly.
+private func runControlResponse(status: String? = "running", archived: Bool? = nil, ok: Bool = true) -> RunControlResponse {
+    let run: APIRunRecord? = status.map { runRecord(status: $0) }
+    return RunControlResponse(run: run, ok: ok, hostID: "local", archived: archived)
+}
+
 @MainActor
 private func makeStore(
     isRemote: Bool = false,
@@ -145,8 +155,16 @@ private func makeStore(
     netflowResult: @escaping @Sendable () async throws -> APINetflow = { netflow() },
     findingsResult: @escaping @Sendable () async throws -> APIFindings = { findings() },
     transcriptResult: @escaping @Sendable (String) async throws -> APITranscriptPage = { _ in APITranscriptPage(events: [], summary: nil) },
+    approveResult: @escaping @Sendable (String, String?) async throws -> RunControlResponse = { _, _ in runControlResponse() },
+    rejectResult: @escaping @Sendable (String, String?) async throws -> RunControlResponse = { _, _ in runControlResponse() },
+    cancelResult: @escaping @Sendable (String?) async throws -> RunControlResponse = { _ in runControlResponse() },
+    pauseResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse() },
+    resumeResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse() },
+    archiveResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse(status: nil, archived: true) },
+    restoreResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse(status: nil, archived: false) },
     runStreamBox: RunStreamBox? = nil,
-    tailStreamBox: TailStreamBox? = nil
+    tailStreamBox: TailStreamBox? = nil,
+    pendingActions: PendingActions = PendingActions()
 ) -> RunDetailStore {
     var runSignalsFactory: (@Sendable () -> AsyncStream<StreamSignal<CPEvent>>)?
     if let runStreamBox {
@@ -165,8 +183,16 @@ private func makeStore(
         fetchNetflow: netflowResult,
         fetchFindings: findingsResult,
         fetchTranscript: transcriptResult,
+        postApprove: approveResult,
+        postReject: rejectResult,
+        postCancel: cancelResult,
+        postPause: pauseResult,
+        postResume: resumeResult,
+        postArchive: archiveResult,
+        postRestore: restoreResult,
         runSignalsFactory: runSignalsFactory,
-        transcriptTailFactory: transcriptTailFactory
+        transcriptTailFactory: transcriptTailFactory,
+        pendingActions: pendingActions
     )
 }
 
@@ -837,4 +863,174 @@ private func makeStore(
 
     store.deactivate()
     cancellingStore.deactivate()
+}
+
+// MARK: - (g) Mutations: pending-state contract (Phase 3, Task 5)
+
+/// Approve is marker-only: the POST's 200 leaves the key `.pending` — only
+/// an observed status transition (here, a live `runResumed` event) confirms
+/// it. Condition-polled per this session's global timing constraint.
+@MainActor @Test func approveStaysPendingUntilRunResumedEventThenConfirms() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(status: "awaiting_approval", awaiting: [
+                APIAwaitingGate(stepID: "gate-1", prompt: "deploy?", since: "2026-08-20T12:00:00Z"),
+            ]))
+        },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    let key = ActionKey("run-1", .approve)
+    #expect(store.pendingActions.state(key) == .idle)
+
+    await store.approve(gate: "gate-1")
+    guard case .pending = store.pendingActions.state(key) else {
+        Issue.record("expected .pending immediately after approve(), got \(store.pendingActions.state(key))")
+        return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.runResumed(runID: "run-1")))
+
+    let confirmed = await pollUntil { store.pendingActions.state(key) == .confirmed }
+    #expect(confirmed, "expected approve to confirm once runResumed proved the run left the gate")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// Cancel is immediate: the response's own `run.status` already proves the
+/// effect, so it confirms right away (no need to wait for a live event) and
+/// also triggers a `detail` refresh.
+@MainActor @Test func cancelConfirmsFromResponseStatusAndRefreshesDetail() async {
+    let detailCalls = Counter()
+    let store = makeStore(
+        detailResult: {
+            detailCalls.increment()
+            return detail(run: runRecord(status: "running"))
+        },
+        cancelResult: { _ in runControlResponse(status: "cancelled") }
+    )
+    await store.activate()
+    #expect(detailCalls.value == 1)
+
+    let key = ActionKey("run-1", .cancel)
+    await store.cancel()
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+    #expect(detailCalls.value == 2)
+
+    store.deactivate()
+}
+
+/// A 409 (run already terminal/not running) surfaces as a plain `.failed`
+/// state with a non-empty message — never silently dropped.
+@MainActor @Test func pause409SurfacesAsFailedWithMessage() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "completed")) },
+        pauseResult: { throw CPError.http(status: 409, body: #"{"error":"run is not running"}"#) }
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .pause)
+    await store.pause()
+
+    guard case .failed(let message) = store.pendingActions.state(key) else {
+        Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+        return
+    }
+    #expect(!message.isEmpty)
+
+    store.deactivate()
+}
+
+/// A 501 (no launcher runtime configured on this host) gets the specific
+/// "start with `rupu cp serve`" message, not the raw HTTP body — same
+/// mapping every marker-only write route shares.
+@MainActor @Test func resume501SurfacesTheLaunchRuntimeMessage() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "paused")) },
+        resumeResult: { throw CPError.http(status: 501, body: #"{"error":"agent_launcher not configured"}"#) }
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .resume)
+    await store.resume()
+
+    guard case .failed(let message) = store.pendingActions.state(key) else {
+        Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+        return
+    }
+    #expect(message.contains("rupu cp serve"))
+
+    store.deactivate()
+}
+
+/// Reject is immediate too — confirms straight from the response, same as
+/// cancel, and its two possible terminal outcomes (rejected/cancelled, per
+/// `on_reject` routing) both confirm via `PendingActions`' confirmation
+/// table.
+@MainActor @Test func rejectConfirmsFromResponseStatus() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "awaiting_approval")) },
+        rejectResult: { _, _ in runControlResponse(status: "rejected") }
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .reject)
+    await store.reject(gate: "gate-1")
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+
+    store.deactivate()
+}
+
+/// Archive/restore never confirm via `PendingActions.resolve` (they're not
+/// a run-status transition) — they confirm directly off `response.archived`
+/// matching the expected direction, and flip the store's own local
+/// `isArchived` flag, which `availableVerbs` then reads.
+@MainActor @Test func archiveConfirmsFromResponseArchivedFlagAndFlipsAvailableVerbs() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "completed")) },
+        archiveResult: { runControlResponse(status: nil, archived: true) }
+    )
+    await store.activate()
+    #expect(store.availableVerbs == [.archive])
+
+    let key = ActionKey("run-1", .archive)
+    await store.archive()
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+    #expect(store.availableVerbs == [.restore])
+
+    store.deactivate()
+}
+
+// MARK: - (h) availableVerbs derives strictly from current status
+
+@MainActor @Test func availableVerbsDerivesFromCurrentStatusPerStatusTable() async {
+    @MainActor func verbs(for status: String) async -> Set<ActionVerb> {
+        let store = makeStore(detailResult: { detail(run: runRecord(status: status)) })
+        await store.activate()
+        let result = store.availableVerbs
+        store.deactivate()
+        return result
+    }
+
+    #expect(await verbs(for: "running") == [.cancel, .pause])
+    #expect(await verbs(for: "awaiting_approval") == [.cancel])
+    #expect(await verbs(for: "pending") == [.cancel])
+    #expect(await verbs(for: "paused") == [.resume])
+    #expect(await verbs(for: "completed") == [.archive])
+    #expect(await verbs(for: "failed") == [.archive])
+    #expect(await verbs(for: "rejected") == [.archive])
+    #expect(await verbs(for: "cancelled") == [.archive])
+}
+
+@MainActor @Test func availableVerbsIsEmptyBeforeDetailLoads() async {
+    let store = makeStore(detailResult: { throw StubError(description: "still loading") })
+    // Deliberately never activated — `detail` stays `.loading`.
+    #expect(store.availableVerbs == [])
+    store.deactivate()
 }

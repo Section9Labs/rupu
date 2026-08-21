@@ -73,7 +73,7 @@ public struct ActivityScreen: View {
         case .empty:
             blockView(label: "NO EXECUTIONS IN RANGE")
         case .content:
-            ActivityTable(rows: store.rows, onSelect: handleSelect)
+            ActivityTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
         }
     }
 
@@ -133,7 +133,8 @@ public struct ActivityScreen: View {
             guard let client = backend.client() else { return }
             let newStore = ActivityStore(
                 client: client,
-                signalsFactory: Self.makeSignalsFactory(backend: backend)
+                signalsFactory: Self.makeSignalsFactory(backend: backend),
+                pendingActions: backend.pendingActions
             )
             store = newStore
             activeStore = newStore

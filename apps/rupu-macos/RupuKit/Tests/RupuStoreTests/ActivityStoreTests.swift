@@ -982,4 +982,170 @@ struct ActivityStoreTests {
         store.deactivate()
         box.latest.finish()
     }
+
+    // MARK: - Mutations (Phase 3, Task 5)
+
+    /// `approve(runID:gate:host:)` begins the pending key, POSTs, and
+    /// schedules a debounced refresh on success — the row's own status
+    /// column catches up once that refresh lands (here, simulated by the
+    /// stub returning a different status on the second hit), and the key
+    /// itself confirms via the live-tail `.statusPatch` reduction once a
+    /// matching event arrives, not from the refresh directly.
+    @MainActor @Test func activityApprovePatchesRowStatusAfterDebouncedRefreshAndConfirmsViaLiveEvent() async {
+        let workflowHits = Counter()
+        let (store, box) = makeStore(
+            debounceInterval: .milliseconds(20),
+            respond: { req in
+                if req.url?.path == "/api/runs/run-wf-1/approve" {
+                    // Marker-only response — no `run` body, so `approve`
+                    // never auto-confirms from it; it stays `.pending`
+                    // until the live `runResumed` event below.
+                    return (200, Data(#"{"ok":true,"host_id":"local"}"#.utf8))
+                }
+                guard req.url?.path == "/api/runs/workflows" else {
+                    return (200, Data("[]".utf8))
+                }
+                workflowHits.increment()
+                let status = workflowHits.value == 1 ? "awaiting_approval" : "running"
+                let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: status)
+                return (200, Data("[\(row)]".utf8))
+            }
+        )
+        await store.activate(kind: .workflows)
+        #expect(store.rows.first?.status == .awaiting)
+
+        let key = ActionKey("run-wf-1", .approve)
+        await store.approve(runID: "run-wf-1", gate: "gate-1", host: "local")
+        guard case .pending = store.pendingActions.state(key) else {
+            Issue.record("expected .pending immediately after approve(), got \(store.pendingActions.state(key))")
+            return
+        }
+
+        // The debounced refresh (20ms) lands the row's fresh "running"
+        // status from the stub.
+        await expectEventually("row status becomes running after approve's debounced refresh") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running
+        }
+
+        // The key itself only confirms off an observed live event — the
+        // refresh alone (REST, no event) never touches `pendingActions`.
+        #expect(store.pendingActions.state(key) != .confirmed)
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runResumed(runID: "run-wf-1")))
+        await expectEventually("approve confirms once the live runResumed event lands") {
+            store.pendingActions.state(key) == .confirmed
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// `reject(runID:gate:host:)` fails cleanly on a POST error, same
+    /// `mutationErrorMessage` mapping every mutation method shares.
+    @MainActor @Test func activityRejectFailsWithMessageOnPOSTError() async {
+        let (store, box) = makeStore(respond: { req in
+            if req.url?.path == "/api/runs/run-wf-1/reject" {
+                return (409, Data(#"{"error":"gate already resolved"}"#.utf8))
+            }
+            return (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+        })
+        await store.activate(kind: .workflows)
+
+        let key = ActionKey("run-wf-1", .reject)
+        await store.reject(runID: "run-wf-1", gate: "gate-1", host: "local")
+
+        guard case .failed(let message) = store.pendingActions.state(key) else {
+            Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+            return
+        }
+        #expect(!message.isEmpty)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// Cross-store shared-key visibility: `BackendController.pendingActions`
+    /// is ONE instance both `ActivityStore` and `RunDetailStore` are handed
+    /// at construction — a key one store begins must read as `.pending` to
+    /// the other immediately, with no refetch or event needed to see it.
+    @MainActor @Test func activityStoreApproveIsVisibleAsPendingToASeparateRunDetailStoreSharingTheSameLedger() async {
+        let shared = PendingActions()
+        let (store, box) = makeStore(
+            pendingActions: shared,
+            respond: { req in
+                if req.url?.path == "/api/runs/run-wf-1/approve" {
+                    // Marker-only response, remote-proxy shape — no `run`
+                    // body, so this never auto-confirms via
+                    // `handleImmediateResponse`-style logic (approve doesn't
+                    // have one; it stays `.pending` unconditionally).
+                    return (200, Data(#"{"ok":true,"host_id":"local"}"#.utf8))
+                }
+                return (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+            }
+        )
+
+        // A second, independent `RunDetailStore` for the same run — built
+        // directly against the shared ledger rather than through
+        // `ActivityStore`'s own HTTP-backed `client`, matching the "fake
+        // client closures" seam `RunDetailStoreTests` already establishes.
+        let runDetailStore = RunDetailStore(
+            runID: "run-wf-1",
+            host: nil,
+            isRemote: false,
+            fetchDetail: { throw StubHTTPError() },
+            fetchGraph: { throw StubHTTPError() },
+            fetchNetflow: { throw StubHTTPError() },
+            fetchFindings: { throw StubHTTPError() },
+            fetchTranscript: { _ in throw StubHTTPError() },
+            runSignalsFactory: nil,
+            transcriptTailFactory: nil,
+            pendingActions: shared
+        )
+
+        await store.activate(kind: .workflows)
+
+        let key = ActionKey("run-wf-1", .approve)
+        #expect(runDetailStore.pendingActions.state(key) == .idle)
+
+        await store.approve(runID: "run-wf-1", gate: "gate-1", host: "local")
+
+        guard case .pending = runDetailStore.pendingActions.state(key) else {
+            Issue.record("expected the RunDetailStore's view of the shared ledger to read .pending too, got \(runDetailStore.pendingActions.state(key))")
+            return
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// Overload of `makeStore` accepting an explicit `pendingActions` — kept
+    /// separate from the file's primary `makeStore` (used by every other
+    /// test) rather than adding yet another optional parameter there, since
+    /// this is the only test in the file that cares about sharing the
+    /// ledger with a second, independently-constructed store.
+    @MainActor
+    private func makeStore(
+        debounceInterval: Duration = .milliseconds(500),
+        pendingActions: PendingActions,
+        respond: @escaping @Sendable (URLRequest) -> (status: Int, body: Data) = { req in
+            (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+        }
+    ) -> (store: ActivityStore, box: SignalsFactoryBox) {
+        ActivityStubURLProtocol.reset(handler: respond)
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: ActivityStubURLProtocol.session()
+        )
+        let box = SignalsFactoryBox()
+        let store = ActivityStore(client: client, signalsFactory: { box.factory() }, debounceInterval: debounceInterval, pendingActions: pendingActions)
+        return (store, box)
+    }
+}
+
+/// Stand-in error for `RunDetailStore` fetch closures that must never
+/// actually be called in a test scoped purely to `PendingActions` sharing —
+/// see `activityStoreApproveIsVisibleAsPendingToASeparateRunDetailStoreSharingTheSameLedger`.
+private struct StubHTTPError: Error, CustomStringConvertible {
+    let description = "unused in this test"
 }

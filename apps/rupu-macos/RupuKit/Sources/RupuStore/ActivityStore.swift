@@ -89,6 +89,14 @@ public final class ActivityStore {
     /// only — see that property's doc comment.
     public private(set) var pendingHosts: Int = 0
 
+    /// Phase 3, Task 5: the shared pending-mutation ledger — see
+    /// `BackendController.pendingActions`'s doc comment for why this is
+    /// shared with `RunDetailStore` rather than private to each screen.
+    /// Defaults to a fresh private instance so every pre-Task-5 test is
+    /// unaffected; `ActivityScreen` passes `backend.pendingActions`
+    /// explicitly.
+    public let pendingActions: PendingActions
+
     private let client: CPClient
     private let signalsFactory: @Sendable () -> AsyncStream<StreamSignal<CPEvent>>
     private var lifecycle: StreamLifecycle?
@@ -183,11 +191,13 @@ public final class ActivityStore {
     public init(
         client: CPClient,
         signalsFactory: @escaping @Sendable () -> AsyncStream<StreamSignal<CPEvent>>,
-        debounceInterval: Duration = .milliseconds(500)
+        debounceInterval: Duration = .milliseconds(500),
+        pendingActions: PendingActions = PendingActions()
     ) {
         self.client = client
         self.signalsFactory = signalsFactory
         self.debounceInterval = debounceInterval
+        self.pendingActions = pendingActions
         self.sources = [
             Source(
                 kind: .workflow,
@@ -299,6 +309,51 @@ public final class ActivityStore {
     public func applyPendingRefresh() async {
         await refreshActiveSources()
         pendingNewRuns = 0
+    }
+
+    // MARK: - Mutations (Phase 3, Task 5)
+
+    /// **Marker-only** (same contract as `RunDetailStore.approve(gate:mode:)`)
+    /// — the POST's 200 leaves the key `.pending`; a later `.statusPatch`
+    /// from the live-tail stream (`apply(_:)` below) is what actually
+    /// confirms it, once the row's status is observed to have left the
+    /// gate. `gate` must be the exact `step_id` this row is currently
+    /// parked on — this store has no per-row `awaiting[]` data of its own
+    /// (`GET /api/runs/workflows` doesn't carry gate detail; only
+    /// `GET /api/runs/:id` does), so resolving it is the caller's
+    /// responsibility, same "gate targeting always explicit" contract
+    /// every write route in this phase follows.
+    public func approve(runID: String, gate: String, host: String?) async {
+        let key = ActionKey(runID, .approve)
+        pendingActions.begin(key)
+        do {
+            _ = try await client.approveRun(id: runID, host: host, gate: gate)
+            // Debounced (not immediate) — coalesces a burst of taps/events
+            // the same way a `newRun` burst already does, and the eventual
+            // status change is what confirms the key anyway (via the live
+            // `.statusPatch` path), not this refresh.
+            scheduleDebouncedRefresh()
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// **Immediate** server-side, but this store confirms it the same way
+    /// as approve — via the live `.statusPatch` reduction below — rather
+    /// than inspecting the response directly (unlike
+    /// `RunDetailStore.reject(gate:reason:)`, which has a richer
+    /// `RunControlResponse` seam to read from). A rejected/cancelled row's
+    /// status still lands here promptly off the same `runCompleted`/
+    /// `runFailed` event the row's status column already live-patches from.
+    public func reject(runID: String, gate: String, host: String?) async {
+        let key = ActionKey(runID, .reject)
+        pendingActions.begin(key)
+        do {
+            _ = try await client.rejectRun(id: runID, host: host, gate: gate)
+            scheduleDebouncedRefresh()
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
     }
 
     // MARK: - Sources
@@ -562,6 +617,16 @@ public final class ActivityStore {
             // the currently-scoped `rows`, so a patch for a run outside
             // the active kind is already a harmless no-op.
             patchRow(runID: runID, status: status, durationMS: durationMS)
+            // Phase 3, Task 5: the confirmation half of `approve(runID:gate:
+            // host:)`/`reject(runID:gate:host:)` above — every observed
+            // status patch (not just ones this store happened to fire
+            // itself) resolves any currently-pending key for that run, per
+            // `PendingActions.resolve`'s confirmation table. Unconditional,
+            // same as `patchRow` above — a patch for a run this store isn't
+            // currently showing is still a real observation of that run's
+            // status, and `resolve` itself only ever touches keys that are
+            // actually `.pending`.
+            pendingActions.resolve(runID: runID, observedStatus: status)
         case .newRun(let runID):
             guard canReceiveNewRunNotifications else { break }
             // Review fix: the server firehose replays every active run's

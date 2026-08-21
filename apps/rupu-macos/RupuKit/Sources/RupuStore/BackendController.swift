@@ -21,6 +21,22 @@ public final class BackendController {
     public private(set) var mode: BackendMode?
     public private(set) var origin: EmbeddedServer.Origin?
 
+    /// The app-wide pending-mutation ledger (Phase 3, Task 5): every screen
+    /// that can fire a run-control mutation (`RunDetailStore`'s
+    /// approve/reject/cancel/pause/resume/archive/restore,
+    /// `ActivityStore`'s awaiting-row approve/reject) shares this ONE
+    /// instance rather than owning a private one — a key `ActivityStore`
+    /// begins (e.g. an Activity-row Approve tap) must read as `.pending` to
+    /// `RunDetailStore` too if the operator navigates to that same run's
+    /// detail screen mid-flight, and vice versa. Both stores' designated
+    /// inits take a `pendingActions: PendingActions` parameter defaulted to
+    /// a fresh private instance (keeps every existing unit test — which
+    /// never cares about cross-screen sharing — unchanged); production call
+    /// sites (`RunDetailScreen`/`ActivityScreen`) pass this instance
+    /// explicitly, same DI seam already used for `client()`/
+    /// `makeFirehoseStream()`.
+    public let pendingActions = PendingActions()
+
     /// Forwarded from the active `HealthMonitor` while one is running;
     /// explicitly set on the failure paths below (missing binary, Keychain
     /// write failure) that never get as far as starting one.
