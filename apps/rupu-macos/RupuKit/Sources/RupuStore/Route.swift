@@ -15,8 +15,11 @@ public enum RunKindFilter: String, CaseIterable, Sendable {
 /// sidebar-selectable, unlike `.activity(_:)`. `AppModel.selectedSidebarItem`'s
 /// getter maps all three to plain `.runs` (the sidebar keeps highlighting
 /// the Runs section rather than showing no selection or guessing a kind
-/// leaf), and `AppModel.navigateBack()` is how the shell returns from any of
-/// them to whichever `.activity(kind)` route was current before the push.
+/// leaf). Row activation pushes via `AppModel.navigate(to:)`, so a chain of
+/// pushes (e.g. session → run) can nest; `AppModel.navigateBack()` pops one
+/// level at a time, falling back to whichever `.activity(kind)` route was
+/// current before the first push once `routeStack` is empty (Phase 3, Task
+/// 4 — replaces the earlier single-level `navigateBack()`).
 public enum Route: Hashable, Sendable {
     case overview
     case activity(RunKindFilter)

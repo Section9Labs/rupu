@@ -178,7 +178,10 @@ public struct SessionDetailScreen: View {
             // "session", 404 on both hosts). `.agentRunDetail` is the
             // destination that's actually addressable: one REST transcript
             // fetch, same as `ActivityRow`'s own session-turn agent rows.
-            model.route = .agentRunDetail(id: run.runID, transcriptPath: run.transcriptPath, host: nil)
+            // `navigate(to:)`, not a direct `route =` assignment (Phase 3,
+            // Task 4): pushes this session detail onto the stack so the
+            // pushed screen's back-chevron returns here, not past it.
+            model.navigate(to: .agentRunDetail(id: run.runID, transcriptPath: run.transcriptPath, host: nil))
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {

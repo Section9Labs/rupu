@@ -124,6 +124,22 @@ public final class RunDetailStore {
     /// the type doc comment's "Overlapping calls" section.
     private var focusGeneration = 0
 
+    /// Carry-over (Phase 3, Task 4): closes the "known parked residual" the
+    /// final review flagged — `StreamLifecycle.stop()`'s cancellation is
+    /// cooperative (see that type's doc comment), so a tail `apply` already
+    /// mid-flight, or even one merely *queued* on the underlying
+    /// `AsyncStream` when `stopTail()` runs, can still fire afterward and
+    /// silently re-append into `transcript` after `handleTerminal`'s
+    /// `reloadTranscriptSnapshot` has already replaced it wholesale with the
+    /// run's final snapshot. Bumped in `stopTail()`; `startTail`'s `apply`
+    /// closure captures the generation current at the moment its tail
+    /// started and discards its own callback once that no longer matches,
+    /// and `reloadTranscriptSnapshot` captures it before its `await` and
+    /// discards a now-stale result the same way `focusStep`'s
+    /// `focusGeneration` already does for overlapping `focusStep` calls —
+    /// same recipe, different seam.
+    private var tailTeardownGeneration = 0
+
     /// Production entry point — `RunDetailScreen` calls this. `isRemote` is
     /// derived once, here, from `host` (`nil` or `"local"` means the
     /// embedded/attached local backend; anything else is a Fleet node, REST
@@ -406,9 +422,19 @@ public final class RunDetailStore {
     private func startTail(path: String, factory: @escaping @Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>>) {
         // Defense in depth alongside `focusStep`'s generation-token guard:
         // never let a new tail's assignment silently drop a still-running
-        // previous one without stopping it first.
-        tailLifecycle?.stop()
+        // previous one without stopping it first. Routing through
+        // `stopTail()` (rather than `tailLifecycle?.stop()` alone) also
+        // bumps `tailTeardownGeneration` here, so a straggling `apply` from
+        // the tail just torn down is discarded the same way one from an
+        // explicit `stopTail()` call (e.g. `handleTerminal`) is — see that
+        // property's doc comment.
+        stopTail()
 
+        // Captured now, not read fresh inside `apply` below: this tail's own
+        // callback must keep comparing against the generation *it* started
+        // under, not whatever `tailTeardownGeneration` happens to be by the
+        // time a given event fires.
+        let generation = tailTeardownGeneration
         let lifecycle = StreamLifecycle()
         tailLifecycle = lifecycle
         transcriptTailActive = true
@@ -432,9 +458,23 @@ public final class RunDetailStore {
                 await self.clearTranscriptForTailReconnect()
             },
             apply: { [weak self] event in
-                self?.transcript.append(event)
+                self?.applyTailEvent(event, generation: generation)
             }
         )
+    }
+
+    /// `StreamLifecycle.stop()`'s cancellation is cooperative, not
+    /// preemptive (see that type's doc comment) — a signal already queued
+    /// on the underlying `AsyncStream`, or an `apply` call already
+    /// dispatched, can still land after `stopTail()` runs. Comparing the
+    /// generation captured when this tail started against the current
+    /// `tailTeardownGeneration` is what makes discarding that straggler true
+    /// *by construction* rather than a timing accident: `stopTail()` always
+    /// runs (directly, or via `startTail`'s own teardown-then-restart) at
+    /// every point this tail could become stale, and always bumps it first.
+    private func applyTailEvent(_ event: TranscriptEvent, generation: Int) {
+        guard generation == tailTeardownGeneration else { return }
+        transcript.append(event)
     }
 
     private func clearTranscriptForTailReconnect() async {
@@ -444,13 +484,23 @@ public final class RunDetailStore {
     /// REST reload, replacing `transcript` wholesale (never appended) —
     /// used by `handleTerminal` to leave the feed showing a complete final
     /// snapshot once the run (and any tail of it) is over.
+    ///
+    /// Captures `tailTeardownGeneration` before the `await` and discards its
+    /// own result if it no longer matches by the time the fetch resolves —
+    /// same "most recent teardown wins" guarantee `applyTailEvent` gives the
+    /// tail side of this race, applied to the reload itself: a `focusStep`
+    /// call (or another `stopTail()`) that lands while this fetch is still
+    /// in flight owns the feed now, and this now-stale snapshot must not
+    /// clobber it.
     private func reloadTranscriptSnapshot(path: String) async {
-        if let page = try? await fetchTranscript(path) {
-            transcript = page.events
-        }
+        let generation = tailTeardownGeneration
+        guard let page = try? await fetchTranscript(path) else { return }
+        guard generation == tailTeardownGeneration else { return }
+        transcript = page.events
     }
 
     private func stopTail() {
+        tailTeardownGeneration += 1
         tailLifecycle?.stop()
         tailLifecycle = nil
         transcriptTailActive = false

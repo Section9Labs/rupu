@@ -142,17 +142,21 @@ public struct ActivityScreen: View {
     }
 
     private func handleSelect(_ row: ActivityRow) {
+        // Row activation pushes onto `AppModel`'s navigation stack (Phase 3,
+        // Task 4) rather than assigning `route` directly — so a chevron back
+        // from the pushed screen returns here, to Activity, not past an
+        // intermediate screen a later push might stack on top of this one.
         switch row.navigation {
         case .run(let id, let host):
-            model.route = .runDetail(id: id, host: host)
+            model.navigate(to: .runDetail(id: id, host: host))
         case .session(let id):
-            model.route = .sessionDetail(id: id)
+            model.navigate(to: .sessionDetail(id: id))
         case .agentRun(let id, let transcriptPath, let host):
             // Hotfix root cause C: a standalone agent run is never an
             // orchestrator run — `.runDetail` would 404 against `GET
             // /api/runs/:id`. `AgentRunDetailScreen` is the honest
             // destination: transcript-only, via `GET /api/transcript`.
-            model.route = .agentRunDetail(id: id, transcriptPath: transcriptPath, host: host)
+            model.navigate(to: .agentRunDetail(id: id, transcriptPath: transcriptPath, host: host))
         case .none:
             break
         }

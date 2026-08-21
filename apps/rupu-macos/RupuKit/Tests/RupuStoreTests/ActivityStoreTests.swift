@@ -851,4 +851,99 @@ struct ActivityStoreTests {
         store.deactivate()
         box.latest.finish()
     }
+
+    // MARK: - statusOverrides pruning (Phase 3, Task 4 carry-over)
+
+    // (q) A live status-patch override for a runID is dropped once the
+    // freshly *merged* (unpatched) data for that same runID already shows
+    // the identical status — "server caught up" — even when the
+    // `recompute()` that notices this isn't a full `refreshActiveSources()`
+    // (which already clears every override unconditionally regardless of
+    // this fix; see that method's doc comment). `loadRemoteHost`'s
+    // merge-then-`recompute()` step is the one production path that calls
+    // `recompute()` without a full clear, so it's the vehicle here: the
+    // remote host's row for the same run id already reads "completed" by
+    // the time it merges in, which is exactly the case per-key pruning is
+    // for.
+    @MainActor @Test func statusOverridePrunedOncePerKeyMergedStatusMatchesWithoutAFullClear() async {
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                // Artificially slow — same rationale as
+                // `activateRendersLocalImmediatelyThenMergesSlowOnlineRemoteHostProgressively`:
+                // without this, `loadRemoteHosts`' background fetch (kicked
+                // off by `activate()`, no delay by default) can race ahead
+                // of the live-patch event below and prune the override
+                // before this test ever observes it standing. The remote
+                // host already reports "completed" — the "server caught up"
+                // state the override is standing in for.
+                Thread.sleep(forTimeInterval: 0.08)
+                let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "completed")
+                return (200, Data("[\(row)]".utf8))
+            }
+            let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "running")
+            return (200, Data("[\(row)]".utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running)
+
+        // Live patch: overlays "completed" ahead of the local snapshot's
+        // own (still "running") truth.
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 patches to .completed via the live override") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
+        #expect(store.statusOverrides["run-wf-1"] != nil)
+
+        // The remote host answers with a row for the same run id, already
+        // "completed" — `loadRemoteHost`'s recompute() should notice the
+        // override is now redundant and drop it, without this being a full
+        // `refreshActiveSources()` clear.
+        await expectEventually("the remote host's row merges in and pendingHosts drains to 0") {
+            store.pendingHosts == 0
+        }
+
+        #expect(store.statusOverrides["run-wf-1"] == nil)
+        // Both the local row (still "running" underneath — shown as
+        // "completed" via the override still standing at the moment it was
+        // processed) and the remote row (already "completed" on its own)
+        // read correctly.
+        #expect(store.rows.filter { $0.id == "run-wf-1" }.allSatisfy { $0.status == .completed })
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (r) A full `refreshActiveSources()` (here, `applyPendingRefresh()`)
+    // still clears every override wholesale, matching status or not — the
+    // per-key pruning above is additive, not a replacement for this.
+    @MainActor @Test func fullRefreshStillClearsOverridesRegardlessOfMatchingStatus() async {
+        let (store, box) = makeStore()
+        store.liveTail = false
+        await store.activate(kind: .all)
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "failed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 patches to .failed via the live override") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .failed
+        }
+        #expect(store.statusOverrides["run-wf-1"] != nil)
+
+        // The stub's own REST truth is still "running" (never "failed") —
+        // a full refresh must clear the override even though it doesn't
+        // match, not just leave it standing because nothing "caught up".
+        await store.applyPendingRefresh()
+
+        #expect(store.statusOverrides.isEmpty)
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running)
+
+        store.deactivate()
+        box.latest.finish()
+    }
 }

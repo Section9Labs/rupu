@@ -161,10 +161,24 @@ public final class ActivityStore {
     /// id, the same key `patchRow` already resolves rows by), and
     /// `recompute()` reapplies every recorded override on top of the fresh
     /// merge — so a live patch survives any number of filter-driven or
-    /// otherwise-triggered recomputes. Cleared on every real REST refresh
-    /// (`refreshActiveSources()`): fresh server data is definitionally
-    /// current, so a stale override must not go on shadowing it forever.
-    private var statusOverrides: [String: (status: ActivityStatus, durationMS: UInt64?)] = [:]
+    /// otherwise-triggered recomputes. Cleared wholesale on every real REST
+    /// refresh (`refreshActiveSources()`): fresh server data is
+    /// definitionally current, so a stale override must not go on shadowing
+    /// it forever.
+    ///
+    /// Carry-over (Phase 3, Task 4): `recompute()` also prunes *individual*
+    /// entries — an override whose runID appears in the freshly merged rows
+    /// with the identical status is dropped right there, not just on the
+    /// next full refresh. This matters for the recompute() call sites that
+    /// aren't a full refresh (`loadMore()`, `loadRemoteHost`, `statusFilter`'s
+    /// `didSet`): without per-key pruning, an override could keep shadowing
+    /// (redundantly, but indefinitely) fresher merged data that already
+    /// agrees with it, right up until the next `refreshActiveSources()`
+    /// call happens to clear everything. `internal`, not `private` — reached
+    /// directly from `ActivityStoreTests` via `@testable import RupuStore`,
+    /// same seam `RunDetailStore`'s doc comment documents for its own
+    /// designated init.
+    internal var statusOverrides: [String: (status: ActivityStatus, durationMS: UInt64?)] = [:]
 
     public init(
         client: CPClient,
@@ -371,6 +385,15 @@ public final class ActivityStore {
             guard case .run(let runID, _) = merged[index].navigation,
                   let override = statusOverrides[runID]
             else { continue }
+            // Carry-over (Phase 3, Task 4): the merged row's own (unpatched)
+            // status already agrees with the override — the server has
+            // caught up. Drop the override right here rather than let it
+            // keep redundantly shadowing agreeing data until the next full
+            // refresh; see `statusOverrides`'s doc comment.
+            if merged[index].status == override.status {
+                statusOverrides.removeValue(forKey: runID)
+                continue
+            }
             merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
         }
         if !statusFilter.isEmpty {

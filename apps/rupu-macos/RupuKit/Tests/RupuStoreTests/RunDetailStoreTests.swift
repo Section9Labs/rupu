@@ -74,6 +74,26 @@ private struct StubError: Error, CustomStringConvertible {
     let description: String
 }
 
+/// De-flakes "wait for an async outcome to settle" assertions — same
+/// rationale and shape as `ActivityStoreTests.pollUntil`/`expectEventually`
+/// (a private helper per file, this codebase's established convention;
+/// see `Counter`'s doc comment above for the same reasoning applied to test
+/// doubles). Polls `condition` every `interval` until it's `true` or
+/// `timeout` elapses.
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
 // MARK: - Fixture builders (hand-rolled, not golden-JSON: each test needs
 // precise control over stepIDs / activeStepID / awaiting to exercise one
 // specific code path in `RunDetailStore`).
@@ -329,6 +349,72 @@ private func makeStore(
     #expect(tailTerminated.value == true)
     #expect(store.transcriptTailActive == false)
     #expect(transcriptCalls.value == 1)
+    #expect(store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)])
+
+    store.deactivate()
+    runBox.latest.finish()
+    tailBox.latest.finish()
+}
+
+// Task 4 (Phase 3 carry-over): closes the "known parked residual" the
+// final-review flagged — `StreamLifecycle.stop()`'s cancellation is
+// cooperative, not preemptive (see that type's doc comment), so a tail
+// `apply` already queued on the scripted stream when `stopTail()` fires can
+// still land afterward. Without `tailTeardownGeneration`, that straggler
+// would silently re-append into `transcript` even after `handleTerminal`'s
+// `reloadTranscriptSnapshot` has already replaced it wholesale with the
+// run's final snapshot.
+@MainActor @Test func straggingTailApplyAfterStopTailNeverLandsAfterTheTerminalSnapshot() async {
+    let runBox = RunStreamBox()
+    let tailBox = TailStreamBox()
+    let transcriptCalls = Counter()
+
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl"), steps: [])
+        },
+        transcriptResult: { _ in
+            transcriptCalls.increment()
+            // Deliberately slow: widens the window for the straggler
+            // (yielded right after the terminal event below) to actually
+            // race the reload, rather than merely preceding it by
+            // construction.
+            try? await Task.sleep(for: .milliseconds(40))
+            return APITranscriptPage(events: [.assistantMessage(content: "final snapshot", thinking: nil)], summary: nil)
+        },
+        runStreamBox: runBox,
+        tailStreamBox: tailBox
+    )
+
+    // "build" is active with no result yet -> a tail starts for it.
+    await store.activate()
+    #expect(store.transcriptTailActive == true)
+
+    runBox.latest.yield(.connection(true))
+    tailBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.runCompleted(runID: "run-1", status: "completed", finishedAt: "2026-08-20T13:00:00Z")))
+
+    // Simulate an `apply` already mid-flight (or merely still queued) when
+    // `stopTail()` fired: the old tail's continuation is still open (never
+    // `.finish()`ed), so this stray event still reaches the same consumer
+    // task's `apply` closure — cooperative cancellation doesn't stop it from
+    // being picked up.
+    tailBox.latest.yield(.event(.assistantDelta(content: "straggler — must never appear")))
+
+    let settled = await pollUntil {
+        store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)]
+    }
+    #expect(settled, "expected transcript to settle to exactly the terminal snapshot")
+
+    #expect(transcriptCalls.value == 1)
+    #expect(store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)])
+    #expect(store.transcriptTailActive == false)
+
+    // A straggler landing even later — well after the snapshot has already
+    // settled — still never appends: the generation check is unconditional,
+    // not a one-shot race window.
+    tailBox.latest.yield(.event(.assistantDelta(content: "second straggler — must never appear either")))
+    try? await Task.sleep(for: .milliseconds(20))
     #expect(store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)])
 
     store.deactivate()
