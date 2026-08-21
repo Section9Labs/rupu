@@ -108,6 +108,44 @@ private final class Counter: @unchecked Sendable {
     var value: Int { lock.withLock { v } }
 }
 
+/// De-flakes "wait a fixed duration, then assert something async landed"
+/// (CI regression: two tests below asserted right after a fixed
+/// `Task.sleep`, which was long enough on a fast dev machine but too short
+/// on the slower `macos-15` CI runner). Polls `condition` every `interval`
+/// until it returns `true` or `timeout` elapses, checking `condition` once
+/// more at the deadline in case it just became true. `timeout` defaults
+/// generously relative to every debounce/settle window in this file (all
+/// well under a second) without risking a genuinely-stuck condition hanging
+/// a test run forever.
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
+/// `pollUntil` plus a descriptive failure on timeout, so a genuine
+/// regression reads as "timed out waiting for: ..." rather than a bare
+/// boolean mismatch at some unrelated line below.
+@MainActor
+private func expectEventually(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ description: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: () -> Bool
+) async {
+    let succeeded = await pollUntil(timeout: timeout, interval: interval, condition)
+    #expect(succeeded, "timed out waiting for: \(description)", sourceLocation: sourceLocation)
+}
+
 /// Fakes `ActivityStore`'s `signalsFactory` seam: each call builds and
 /// records a brand-new `AsyncStream<StreamSignal<CPEvent>>` +
 /// `Continuation` pair, so a test can assert how many times `activate()`
@@ -251,7 +289,7 @@ struct ActivityStoreTests {
 
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runStarted(runID: "run-new-1", workflowPath: "p.yml", startedAt: "2026-08-20T13:00:00Z")))
-        try? await Task.sleep(for: .milliseconds(30))
+        await expectEventually("pendingNewRuns reaches 1 after the newRun delta") { store.pendingNewRuns == 1 }
 
         #expect(store.pendingNewRuns == 1)
         #expect(store.rows == before)
@@ -281,7 +319,9 @@ struct ActivityStoreTests {
 
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
-        try? await Task.sleep(for: .milliseconds(30))
+        await expectEventually("run-wf-1's status patches to .completed") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
 
         #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
         // The other three rows are untouched by the patch.
@@ -307,7 +347,9 @@ struct ActivityStoreTests {
         #expect(terminated.value == false)
 
         store.deactivate()
-        try? await Task.sleep(for: .milliseconds(20))
+        await expectEventually("the scripted stream's consumer task terminates after deactivate()") {
+            terminated.value == true
+        }
 
         #expect(terminated.value == true)
 
@@ -362,7 +404,15 @@ struct ActivityStoreTests {
         box.latest.yield(.connection(false))
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
-        try? await Task.sleep(for: .milliseconds(80))
+        // CI regression (macos-15 runner, slower than a dev machine): a
+        // fixed post-event sleep here wasn't always long enough for the
+        // resnapshot's deliberately-slow (30ms `Thread.sleep`) fetch plus
+        // the trailing patch to land — poll for the fully-settled end
+        // state instead of asserting at one fixed instant.
+        await expectEventually("run-wf-1 reflects both the resnapshot's fresh row and the trailing patch") {
+            let row = store.rows.first(where: { $0.id == "run-wf-1" })
+            return row?.durationMS == 9999 && row?.status == .completed
+        }
 
         // The resnapshot's fresh row content (durationMS: 9999) must be
         // visible, proving the refresh actually ran and completed ...
@@ -390,7 +440,9 @@ struct ActivityStoreTests {
         #expect(box.callCount == 1)
         box.continuation(at: 0).yield(.connection(true))
         box.continuation(at: 0).yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "x")))
-        try? await Task.sleep(for: .milliseconds(30))
+        await expectEventually("run-wf-1 patches to .completed on the first stream") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
         #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
 
         store.deactivate()
@@ -408,7 +460,9 @@ struct ActivityStoreTests {
         // no-op against an already-consumed stream.
         box.continuation(at: 1).yield(.connection(true))
         box.continuation(at: 1).yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "x")))
-        try? await Task.sleep(for: .milliseconds(30))
+        await expectEventually("run-wf-1 patches to .completed on the second (rebuilt) stream") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
         #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
 
         store.deactivate()
@@ -449,14 +503,33 @@ struct ActivityStoreTests {
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runStarted(runID: "run-new-1", workflowPath: "p.yml", startedAt: "2026-08-20T13:00:00Z")))
 
-        // Wait past: manualTask's fetch, the first (colliding, skipped)
-        // debounce fire, and the retry's (successful) fetch.
-        try? await Task.sleep(for: .milliseconds(headStartMS + 2 * debounceMS + slowFetchMS + 60))
+        // `manualTask`'s own completion is a real signal (not a fixed
+        // sleep) that fetch #2's collision window has closed.
         _ = await manualTask.value
+
+        // CI regression (macos-15 runner, slower than a dev machine — final
+        // review already called this the flakiest wait in the file): the
+        // collision-retried debounced refresh still needs its own
+        // wall-clock time (another `debounceMS` wait plus its own
+        // `slowFetchMS` fetch) after `manualTask` resolves, and a fixed
+        // total-duration sleep sized for a fast machine wasn't always long
+        // enough on a slower one. Poll for the exact landed count instead —
+        // burst/collision *timing* (headStartMS, the debounce/slow-fetch
+        // sizing above) stays exactly as adversarial as before; only the
+        // final "did it land yet" wait is condition-based now.
+        await expectEventually("the collision-retried debounced refresh lands (exactly 3 fetches)") {
+            workflowFetches.value == 3
+        }
 
         // Exactly 3 fetches: activate's, manualTask's, and the debounce
         // retry's. The *first* debounce attempt contributes 0 — it was
         // skipped (in-flight collision) before ever calling `fetch`.
+        #expect(workflowFetches.value == 3)
+
+        // Settle past the retry's own `isRetry` guard (it gives up after
+        // one attempt — see `ActivityStore.scheduleDebouncedRefresh`) and
+        // confirm the count never overshoots to a runaway 4th fetch.
+        try? await Task.sleep(for: .milliseconds(100))
         #expect(workflowFetches.value == 3)
 
         store.deactivate()
@@ -502,13 +575,27 @@ struct ActivityStoreTests {
         await store.activate(kind: .workflows)
         #expect(fetches.value == 1)
 
+        // The burst itself stays back-to-back with zero delay between
+        // events — that tight timing is the scenario under test (proving
+        // coalescing, not just eventual consistency).
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runStarted(runID: "run-a", workflowPath: "p.yml", startedAt: "2026-08-20T13:00:00Z")))
         box.latest.yield(.event(.runStarted(runID: "run-b", workflowPath: "p.yml", startedAt: "2026-08-20T13:00:01Z")))
         box.latest.yield(.event(.runStarted(runID: "run-c", workflowPath: "p.yml", startedAt: "2026-08-20T13:00:02Z")))
-        try? await Task.sleep(for: .milliseconds(80))
+
+        // CI regression (macos-15 runner): a fixed post-burst sleep here
+        // wasn't always long enough for the debounced refresh to have
+        // fired yet. Poll for it to land instead of asserting at one fixed
+        // instant.
+        await expectEventually("the burst's single coalesced debounced refresh lands") { fetches.value == 2 }
 
         // One coalesced refresh from the burst, on top of activate's own.
+        #expect(fetches.value == 2)
+
+        // Settle further and confirm it never overshoots — the whole point
+        // of coalescing is that three rapid `newRun`s produce exactly one
+        // extra fetch, not three.
+        try? await Task.sleep(for: .milliseconds(100))
         #expect(fetches.value == 2)
 
         store.deactivate()
@@ -528,7 +615,9 @@ struct ActivityStoreTests {
 
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
-        try? await Task.sleep(for: .milliseconds(30))
+        await expectEventually("run-wf-1 patches to .completed before the filter toggle") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
         #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
 
         // Toggling `statusFilter` recomputes `rows` from scratch. (Not
@@ -670,14 +759,22 @@ struct ActivityStoreTests {
 
         // Give the (fast, non-delayed) `GET /api/hosts` discovery call a
         // moment to land and register the one online remote host as
-        // pending — well before the remote row fetch's artificial 80ms
-        // delay resolves.
-        try? await Task.sleep(for: .milliseconds(25))
+        // pending — polled, but bounded well under the remote row fetch's
+        // artificial 80ms delay, so a slow discovery response is a real
+        // failure rather than something this poll silently waits out.
+        await expectEventually(
+            timeout: .milliseconds(60),
+            "GET /api/hosts discovery lands and registers the one online remote host as pending"
+        ) { store.pendingHosts == 1 }
         #expect(store.pendingHosts == 1)
         #expect(store.rows.map(\.id) == ["run-wf-1"]) // still local-only
 
-        // Wait past the remote host's artificial delay.
-        try? await Task.sleep(for: .milliseconds(120))
+        // Poll past the remote host's artificial delay — bounded generously
+        // (default 5s) rather than a fixed sleep sized only for a fast dev
+        // machine.
+        await expectEventually("the slow remote host's row merges in and pendingHosts drains to 0") {
+            store.pendingHosts == 0 && store.rows.count == 2
+        }
 
         #expect(store.pendingHosts == 0)
         #expect(Set(store.rows.map(\.id)) == Set(["run-wf-1", "run-remote-1"]))
@@ -714,7 +811,9 @@ struct ActivityStoreTests {
             return
         }
 
-        try? await Task.sleep(for: .milliseconds(60))
+        await expectEventually("the failing remote host's fetch resolves and pendingHosts drains to 0") {
+            store.pendingHosts == 0
+        }
 
         #expect(store.pendingHosts == 0)
         #expect(store.rows.map(\.id) == ["run-wf-1"]) // the failing host contributed nothing
@@ -740,7 +839,9 @@ struct ActivityStoreTests {
         }
 
         await store.activate(kind: .workflows)
-        try? await Task.sleep(for: .milliseconds(40))
+        await expectEventually("host discovery completes and finds nothing pending (offline host skipped)") {
+            store.pendingHosts == 0
+        }
 
         #expect(store.pendingHosts == 0)
         #expect(store.rows.map(\.id) == ["run-wf-1"])
