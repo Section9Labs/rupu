@@ -137,8 +137,12 @@ private final class CountBox: @unchecked Sendable {
     #expect(snapshot.rows.count == 50)
     #expect(fetchCount.value == 1)
 
-    async let first: Void = snapshot.loadMore()
-    async let second: Void = snapshot.loadMore()
+    // `loadMore()` is now `@discardableResult Bool` (review fix: it reports
+    // performed-vs-skipped for `ActivityStore`'s debounce-retry logic) —
+    // the annotation just needs to match that; this test still only cares
+    // about the row/fetch-count side effects, not the returned Bools.
+    async let first: Bool = snapshot.loadMore()
+    async let second: Bool = snapshot.loadMore()
     _ = await (first, second)
 
     #expect(fetchCount.value == 2) // one for refresh() above, one for whichever loadMore() won
@@ -164,8 +168,8 @@ private final class CountBox: @unchecked Sendable {
     await snapshot.refresh()
     #expect(fetchCount.value == 1)
 
-    async let loading: Void = snapshot.loadMore()
-    async let refreshing: Void = snapshot.refresh()
+    async let loading: Bool = snapshot.loadMore()
+    async let refreshing: Bool = snapshot.refresh()
     _ = await (loading, refreshing)
 
     #expect(fetchCount.value == 2) // the initial refresh() + exactly one of {loadMore, refresh}

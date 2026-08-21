@@ -63,8 +63,16 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
         self.fetch = fetch
     }
 
-    public func refresh() async {
-        guard !inFlight else { return }
+    /// Returns whether the fetch actually ran (`true`) or was skipped
+    /// because a call was already in flight (`false`) — both a successful
+    /// fetch and one that threw (surfaced via `state = .failed`) count as
+    /// "ran". `@discardableResult` so existing call sites that don't care
+    /// keep compiling unchanged; `ActivityStore`'s debounced live-tail
+    /// refresh reads it to detect a collision and retry once (see that
+    /// type's `scheduleDebouncedRefresh`).
+    @discardableResult
+    public func refresh() async -> Bool {
+        guard !inFlight else { return false }
         inFlight = true
         defer { inFlight = false }
 
@@ -77,10 +85,15 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
         } catch {
             state = .failed(String(describing: error))
         }
+        return true
     }
 
-    public func loadMore() async {
-        guard !inFlight, !exhausted else { return }
+    /// Same "ran vs skipped" contract as `refresh()` above — `false` covers
+    /// both reasons a call can be skipped (already in flight, or already
+    /// `exhausted`).
+    @discardableResult
+    public func loadMore() async -> Bool {
+        guard !inFlight, !exhausted else { return false }
         inFlight = true
         defer { inFlight = false }
 
@@ -92,5 +105,6 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
         } catch {
             state = .failed(String(describing: error))
         }
+        return true
     }
 }

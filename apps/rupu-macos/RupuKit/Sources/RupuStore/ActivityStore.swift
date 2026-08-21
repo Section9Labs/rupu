@@ -47,6 +47,20 @@ import RupuAPI
 /// `onConnectionChange` on `JSONEventStream` doesn't compile under Swift 6
 /// strict concurrency (see that report's "Streaming seam decision"). This
 /// type's `init` compiles against the shape Task 4 actually shipped.
+///
+/// **`activate`/`deactivate` are fully symmetric and repeatable**
+/// (review fix): `init` takes a `signalsFactory` — not a single
+/// already-built `AsyncStream` — because an `AsyncStream` can only be
+/// consumed once. Task 6's natural `.onAppear`/`.onDisappear` wiring calls
+/// `activate`/`deactivate` every time the screen appears/disappears, not
+/// just once per store lifetime; a single-consumption stream would make
+/// the *second* `activate()` a silent no-op (no stream, no live patches,
+/// `freshness` stuck wherever it was left). Every `activate(kind:)` call —
+/// not just the first — calls `signalsFactory()` for a fresh stream and
+/// builds a fresh `StreamLifecycle` around it, stopping any prior one
+/// first (so calling `activate` again *without* an intervening
+/// `deactivate` — e.g. switching `kind` while the screen stays visible —
+/// is also safe, not just the deactivate-then-reactivate case).
 @MainActor
 @Observable
 public final class ActivityStore {
@@ -67,8 +81,8 @@ public final class ActivityStore {
     public private(set) var freshness: StreamLifecycle.Freshness = .idle
 
     private let client: CPClient
-    private var pendingSignals: AsyncStream<StreamSignal<CPEvent>>?
-    private let lifecycle = StreamLifecycle()
+    private let signalsFactory: @Sendable () -> AsyncStream<StreamSignal<CPEvent>>
+    private var lifecycle: StreamLifecycle?
     private let debounceInterval: Duration
     private var debounceTask: Task<Void, Never>?
 
@@ -86,11 +100,11 @@ public final class ActivityStore {
 
     public init(
         client: CPClient,
-        signals: AsyncStream<StreamSignal<CPEvent>>,
+        signalsFactory: @escaping @Sendable () -> AsyncStream<StreamSignal<CPEvent>>,
         debounceInterval: Duration = .milliseconds(500)
     ) {
         self.client = client
-        self.pendingSignals = signals
+        self.signalsFactory = signalsFactory
         self.debounceInterval = debounceInterval
         self.workflowSnapshot = PagedSnapshot { offset, limit in
             try await client.workflowRuns(offset: offset, limit: limit).map(ActivityRow.init)
@@ -107,21 +121,25 @@ public final class ActivityStore {
     }
 
     /// Sets `kind`, refreshes page 0 of the sources it implies, recomputes
-    /// the merged `rows`, and (the first time only — `signals` can only be
-    /// consumed once) starts the live-patch stream.
+    /// the merged `rows`, and (re)starts the live-patch stream from a fresh
+    /// `signalsFactory()` call — every call, not just the first; see the
+    /// type's doc comment on why `activate`/`deactivate` must be repeatable.
     public func activate(kind: RunKindFilter) async {
         self.kind = kind
         await refreshActiveSources()
-        startStreamIfNeeded()
+        restartStream()
     }
 
-    /// Stops the live-patch stream and cancels any pending debounced
-    /// refresh. Idempotent — safe to call more than once, or before
-    /// `activate(kind:)` ever ran.
+    /// Stops the live-patch stream, cancels any pending debounced refresh,
+    /// and resets `freshness` to `.idle` (there's no stream to be live or
+    /// stale about anymore). Idempotent — safe to call more than once, or
+    /// before `activate(kind:)` ever ran.
     public func deactivate() {
         debounceTask?.cancel()
         debounceTask = nil
-        lifecycle.stop()
+        lifecycle?.stop()
+        lifecycle = nil
+        freshness = .idle
     }
 
     public func loadMore() async {
@@ -154,15 +172,27 @@ public final class ActivityStore {
     /// Refreshes page 0 of every currently-active source and recomputes the
     /// merged view. Shared by `activate(kind:)`, `applyPendingRefresh()`,
     /// the debounced live-tail refresh, and `StreamLifecycle`'s reconnect
-    /// resnapshot — one path, four callers. Each underlying
-    /// `PagedSnapshot.refresh()` already no-ops if it's mid-fetch (Task 4's
-    /// `inFlight` guard), so an overlapping caller here just accepts the
-    /// skip rather than double-fetching or queuing.
-    private func refreshActiveSources() async {
+    /// resnapshot — one path, four callers.
+    ///
+    /// Returns `true` only if *every* active source's `refresh()` actually
+    /// ran — `false` if any of them were skipped because they were already
+    /// mid-fetch (Task 4's `PagedSnapshot.inFlight` guard). Most callers
+    /// (`activate`, `applyPendingRefresh`, the resnapshot closure) ignore
+    /// this and just accept the skip — a concurrent caller's in-flight
+    /// fetch will land soon enough. The debounced live-tail refresh is the
+    /// one caller that acts on it: a skip there means the burst of
+    /// `newRun`s it was trying to materialize would otherwise go
+    /// unrefreshed with zero signal, so it retries once (see
+    /// `scheduleDebouncedRefresh`).
+    @discardableResult
+    private func refreshActiveSources() async -> Bool {
+        var allPerformed = true
         for snapshot in activeSnapshots() {
-            await snapshot.refresh()
+            let performed = await snapshot.refresh()
+            allPerformed = allPerformed && performed
         }
         recompute()
+        return allPerformed
     }
 
     private func recompute() {
@@ -201,11 +231,18 @@ public final class ActivityStore {
 
     // MARK: - Live stream
 
-    private func startStreamIfNeeded() {
-        guard let signals = pendingSignals else { return } // already started by an earlier activate()
-        pendingSignals = nil
-        lifecycle.start(
-            signals: signals,
+    /// Stops any lifecycle from a previous `activate()` (a no-op the very
+    /// first time), builds a fresh one around a fresh `signalsFactory()`
+    /// stream, and starts it. Called unconditionally from every
+    /// `activate(kind:)` — see the type's doc comment.
+    private func restartStream() {
+        lifecycle?.stop()
+        freshness = .idle
+
+        let newLifecycle = StreamLifecycle()
+        lifecycle = newLifecycle
+        newLifecycle.start(
+            signals: signalsFactory(),
             resnapshot: { [weak self] in
                 guard let self else { return }
                 await self.refreshActiveSources()
@@ -214,14 +251,18 @@ public final class ActivityStore {
                 self?.apply(event)
             }
         )
-        observeFreshness()
+        observeFreshness(newLifecycle)
     }
 
     private func apply(_ event: CPEvent) {
         switch ActivityDelta.reduce(event) {
         case .statusPatch(let runID, let status, let durationMS):
+            // Not kind-guarded: `patchRow` only ever finds a match inside
+            // the currently-scoped `rows`, so a patch for a run outside
+            // the active kind is already a harmless no-op.
             patchRow(runID: runID, status: status, durationMS: durationMS)
         case .newRun:
+            guard canReceiveNewRunNotifications else { break }
             if liveTail {
                 scheduleDebouncedRefresh()
             } else {
@@ -229,6 +270,23 @@ public final class ActivityStore {
             }
         case .none:
             break
+        }
+    }
+
+    /// `CPEvent.runStarted` describes an orchestrator-executed run — it
+    /// carries no kind tag, so there is no way to tell from the event
+    /// itself whether the new run belongs to a source this store's current
+    /// `kind` even includes. Scoping honestly to the sources a
+    /// `runStarted` event *can* describe (`.all`/`.workflows`/
+    /// `.autoflows` — all backed by the orchestrator) rather than guessing
+    /// keeps the "N new" pill honest: an `.agents`/`.sessions`-scoped view
+    /// would otherwise count (or refresh for) a run that can never appear
+    /// in it, and `applyPendingRefresh()` would then zero the counter
+    /// while visibly changing nothing — breaking the pill's promise.
+    private var canReceiveNewRunNotifications: Bool {
+        switch kind {
+        case .all, .workflows, .autoflows: true
+        case .agents, .sessions: false
         }
     }
 
@@ -252,26 +310,44 @@ public final class ActivityStore {
     /// Coalesces a burst of `.newRun` deltas into one refresh: each new
     /// delta cancels and restarts the wait, so only the burst's last event
     /// actually pays for a round trip.
-    private func scheduleDebouncedRefresh() {
+    ///
+    /// `isRetry` guards against an unbounded retry loop: if the debounced
+    /// refresh collides with some other concurrent refresh already in
+    /// flight (`refreshActiveSources()` returns `false` — see that
+    /// method's doc comment), the burst it was trying to materialize would
+    /// otherwise be silently dropped, so it's rescheduled once more. If
+    /// *that* retry also collides, this gives up rather than retrying
+    /// forever — the next `newRun`/reconnect/manual refresh self-heals
+    /// beyond that, and an unbounded retry loop against a source that's
+    /// somehow always busy would be worse than one stale pill.
+    private func scheduleDebouncedRefresh(isRetry: Bool = false) {
         debounceTask?.cancel()
         debounceTask = Task { [weak self, debounceInterval] in
             try? await Task.sleep(for: debounceInterval)
             guard !Task.isCancelled, let self else { return }
-            await self.refreshActiveSources()
+            let allPerformed = await self.refreshActiveSources()
+            if !allPerformed && !isRetry {
+                self.scheduleDebouncedRefresh(isRetry: true)
+            }
         }
     }
 
     /// Bridges `StreamLifecycle`'s own `@Observable` `freshness` into this
     /// store's — same `withObservationTracking` re-subscribe pattern as
-    /// `BackendController.observe(_:)`.
-    private func observeFreshness() {
+    /// `BackendController.observe(_:)`. Takes the specific instance to
+    /// track (rather than reading `self.lifecycle` inside the tracked
+    /// closure) and re-checks `self.lifecycle === lc` before each
+    /// re-subscribe, so a `deactivate()`/`activate()` cycle that replaces
+    /// `lifecycle` out from under an in-flight observation doesn't leave a
+    /// stale subscription forwarding a now-defunct instance's changes.
+    private func observeFreshness(_ lc: StreamLifecycle) {
         withObservationTracking {
-            _ = lifecycle.freshness
-        } onChange: { [weak self] in
+            _ = lc.freshness
+        } onChange: { [weak self, weak lc] in
             Task { @MainActor in
-                guard let self else { return }
-                self.freshness = self.lifecycle.freshness
-                self.observeFreshness()
+                guard let self, let lc, self.lifecycle === lc else { return }
+                self.freshness = lc.freshness
+                self.observeFreshness(lc)
             }
         }
     }
