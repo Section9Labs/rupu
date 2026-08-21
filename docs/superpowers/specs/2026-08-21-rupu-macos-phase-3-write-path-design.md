@@ -75,8 +75,12 @@ Sheet from toolbar "+ New run" and ⌘N:
 5. **Host chips, resilient** (Phase 2 lesson is binding): populated progressively
    from `/api/hosts` — online hosts appear as they're known, load figures shown
    only if the API already provides them cheaply, offline/faulted chips disabled;
-   the sheet NEVER blocks on a slow host. Plus "fan out: all healthy" via
-   `host_fanout`.
+   the sheet NEVER blocks on a slow host. Plus "fan out: all healthy" —
+   **client-side**: there is no `POST /api/host_fanout` endpoint (that module is an
+   internal list-fan-in helper, verified at plan time); the Launcher loops over
+   healthy hosts and issues one launch per host via the launch body's `host` field,
+   reporting per-host results (each success navigable, each failure inline). The
+   umbrella §8 ledger row's `host_fanout` entry is corrected accordingly.
 6. Footer: Launch with PendingAction feedback; workflow `validate` runs before
    launch and renders errors inline. On success, navigate to the new run detail /
    session detail — Phase 2's live machinery takes over from there.
