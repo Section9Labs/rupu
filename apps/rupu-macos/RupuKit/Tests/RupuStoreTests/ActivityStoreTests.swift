@@ -482,6 +482,58 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // (l) review fix: a live status patch (`patchRow`) must survive an
+    // unrelated `recompute()` — here, toggling `statusFilter`, which calls
+    // `recompute()` synchronously from its `didSet`. Before the
+    // `statusOverrides` overlay fix, `recompute()` rebuilt `rows` straight
+    // from the (unpatched) `PagedSnapshot`s, silently reverting the patch
+    // back to "running" the moment anything re-triggered it.
+    @MainActor @Test func statusPatchSurvivesRecomputeTriggeredByStatusFilterToggle() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running)
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
+
+        // Toggling `statusFilter` recomputes `rows` from scratch. (Not
+        // asserting the exact filtered set here — the fixture's agent/
+        // session rows are already `.completed` by default, independent of
+        // this patch — just that the patched row survives the recompute.)
+        store.statusFilter = [.completed]
+        #expect(store.rows.contains { $0.id == "run-wf-1" })
+
+        store.statusFilter = []
+        // The patch must still be visible — not reverted to the
+        // snapshot's original "running" truth.
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (m) review fix: the server firehose replays every active run's
+    // `events.jsonl` from offset 0 on each (re)connect, so a `.newRun` for a
+    // run that's already visible in `rows` must not inflate
+    // `pendingNewRuns` — it isn't actually new.
+    @MainActor @Test func newRunEventForAlreadyVisibleRowDoesNotInflatePendingNewRuns() async {
+        let (store, box) = makeStore()
+        store.liveTail = false
+        await store.activate(kind: .all)
+        #expect(store.rows.contains { $0.id == "run-wf-1" })
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runStarted(runID: "run-wf-1", workflowPath: "p.yml", startedAt: "2026-08-20T10:00:00Z")))
+        try? await Task.sleep(for: .milliseconds(30))
+
+        #expect(store.pendingNewRuns == 0)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // (k) coverage gap: `loadMore()` advances every active source
     // independently (each keeps its own offset) with no duplicate rows
     // across pages, for a merged `.all` view.

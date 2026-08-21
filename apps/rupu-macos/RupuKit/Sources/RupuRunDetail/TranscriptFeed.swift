@@ -10,15 +10,26 @@ import RupuDesign
 /// Task 9 (Session detail) is expected to reuse this exact view unchanged
 /// for a session's own transcript.
 ///
-/// Per the brief's render list: `assistant_message`/`assistant_delta` become
-/// prose blocks; `tool_call` pairs with its matching `tool_result` (by
-/// `call_id`) into one collapsed row; `gate_requested` gets a 2px
-/// `Color.status(.waiting)` left edge; `command_run`/`file_edit` render as
-/// one-line summaries; `run_complete` is a terminal row. Every other variant
-/// (`turn_start`/`turn_end`/`usage`/`action_emitted`/`tool_audit`/`net_flow`/
-/// `.unknown`) — and an orphaned `tool_result` with no matching `tool_call`
-/// still renders standalone rather than vanishing silently) — is skipped:
-/// nothing in this phase's design renders them yet.
+/// Per the brief's render list: `assistant_message` becomes a prose block;
+/// `tool_call` pairs with its matching `tool_result` (by `call_id`) into one
+/// collapsed row; `gate_requested` gets a 2px `Color.status(.waiting)` left
+/// edge; `command_run`/`file_edit` render as one-line summaries;
+/// `run_complete` is a terminal row.
+///
+/// **`assistant_delta` is deliberately never rendered** (review fix, web-
+/// viewer parity): the transcript JSONL persists both per-chunk
+/// `assistant_delta` events *and* the consolidated `assistant_message` for
+/// the same turn, so rendering both would show every assistant turn twice —
+/// once streamed in pieces, once again whole. The CP web viewer already
+/// made this call; this feed matches it. The `.assistantDelta` case stays
+/// in `TranscriptEvent`'s decode enum (the JSONL still carries the events,
+/// and other consumers may still want them) — it's filtered out here, in
+/// the view layer, not at decode time.
+///
+/// Every other variant (`turn_start`/`turn_end`/`usage`/`action_emitted`/
+/// `tool_audit`/`net_flow`/`.unknown`) — and an orphaned `tool_result` with
+/// no matching `tool_call` still renders standalone rather than vanishing
+/// silently) — is skipped: nothing in this phase's design renders them yet.
 public struct TranscriptFeed: View {
     private let events: [TranscriptEvent]
 
@@ -76,14 +87,18 @@ public struct TranscriptFeed: View {
         var built: [TranscriptRow] = []
         for event in events {
             switch event {
-            case .assistantMessage, .assistantDelta, .gateRequested, .commandRun, .fileEdit, .runComplete:
+            case .assistantMessage, .gateRequested, .commandRun, .fileEdit, .runComplete:
                 built.append(.single(event))
             case .toolCall(let callID, _, _):
                 built.append(.toolPair(call: event, result: resultsByCallID[callID]))
             case .toolResult(let callID, _, _, _, _):
                 guard !callIDsWithCall.contains(callID) else { continue } // folded into its pair above
                 built.append(.single(event))
-            case .runStart, .turnStart, .turnEnd, .usage, .actionEmitted, .toolAudit, .netFlow, .unknown:
+            // `assistant_delta` is never rendered — see the type doc
+            // comment's "assistant_delta is deliberately never rendered"
+            // section; the turn's `assistant_message` already carries the
+            // same text as one consolidated block.
+            case .assistantDelta, .runStart, .turnStart, .turnEnd, .usage, .actionEmitted, .toolAudit, .netFlow, .unknown:
                 continue
             }
         }
@@ -115,8 +130,6 @@ private struct TranscriptRowView: View {
         switch event {
         case .assistantMessage(let content, let thinking):
             ProseRow(content: content, thinking: thinking)
-        case .assistantDelta(let content):
-            ProseRow(content: content, thinking: nil)
         case .gateRequested(let gateID, let prompt, let decision, let decidedBy):
             GateRequestedRow(gateID: gateID, prompt: prompt, decision: decision, decidedBy: decidedBy)
         case .commandRun(let argv, let cwd, let exitCode, let stdoutBytes, let stderrBytes):
@@ -125,7 +138,7 @@ private struct TranscriptRowView: View {
             FileEditRow(path: path, kind: kind, diff: diff)
         case .runComplete(let runID, let status, let totalTokens, let durationMS, let error):
             RunCompleteRow(runID: runID, status: status, totalTokens: totalTokens, durationMS: durationMS, error: error)
-        case .toolCall, .toolResult, .runStart, .turnStart, .turnEnd, .usage, .actionEmitted, .toolAudit, .netFlow, .unknown:
+        case .assistantDelta, .toolCall, .toolResult, .runStart, .turnStart, .turnEnd, .usage, .actionEmitted, .toolAudit, .netFlow, .unknown:
             EmptyView()
         }
     }

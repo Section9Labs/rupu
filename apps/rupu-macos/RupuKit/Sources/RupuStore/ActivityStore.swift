@@ -98,6 +98,22 @@ public final class ActivityStore {
     private let autoflowSnapshot: PagedSnapshot<ActivityRow>
     private let sessionSnapshot: PagedSnapshot<ActivityRow>
 
+    /// Review fix: an in-place live patch (`patchRow`) was being silently
+    /// reverted the next time anything called `recompute()` for an
+    /// unrelated reason (e.g. `statusFilter`'s `didSet`) — `recompute()`
+    /// rebuilds `rows` from scratch via `activeSnapshots().flatMap(\.rows)`,
+    /// which are the *unpatched* `PagedSnapshot` rows; the direct mutation
+    /// `rows[index] = ...` in `patchRow` only ever touched that one
+    /// already-materialized `rows` array, not the snapshots underneath it.
+    /// This overlay is the fix: `patchRow` records into it (keyed by run
+    /// id, the same key `patchRow` already resolves rows by), and
+    /// `recompute()` reapplies every recorded override on top of the fresh
+    /// merge — so a live patch survives any number of filter-driven or
+    /// otherwise-triggered recomputes. Cleared on every real REST refresh
+    /// (`refreshActiveSources()`): fresh server data is definitionally
+    /// current, so a stale override must not go on shadowing it forever.
+    private var statusOverrides: [String: (status: ActivityStatus, durationMS: UInt64?)] = [:]
+
     public init(
         client: CPClient,
         signalsFactory: @escaping @Sendable () -> AsyncStream<StreamSignal<CPEvent>>,
@@ -191,12 +207,26 @@ public final class ActivityStore {
             let performed = await snapshot.refresh()
             allPerformed = allPerformed && performed
         }
+        // Real REST data supersedes any live-patch overlay standing in for
+        // it — clear before recomputing so a stale override can't shadow
+        // fresh server truth.
+        statusOverrides.removeAll()
         recompute()
         return allPerformed
     }
 
+    /// Rebuilds `rows` from the active `PagedSnapshot`s and reapplies
+    /// `statusOverrides` on top — every caller of `recompute()` (not just
+    /// the live-patch path itself) must see patched rows stay patched; see
+    /// `statusOverrides`'s doc comment for why the overlay exists at all.
     private func recompute() {
         var merged = activeSnapshots().flatMap(\.rows)
+        for index in merged.indices {
+            guard case .run(let runID, _) = merged[index].navigation,
+                  let override = statusOverrides[runID]
+            else { continue }
+            merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
+        }
         if !statusFilter.isEmpty {
             merged = merged.filter { statusFilter.contains($0.status) }
         }
@@ -261,8 +291,16 @@ public final class ActivityStore {
             // the currently-scoped `rows`, so a patch for a run outside
             // the active kind is already a harmless no-op.
             patchRow(runID: runID, status: status, durationMS: durationMS)
-        case .newRun:
+        case .newRun(let runID):
             guard canReceiveNewRunNotifications else { break }
+            // Review fix: the server firehose replays every active run's
+            // `events.jsonl` from offset 0 on each (re)connect, so a
+            // `.newRun` routinely fires for a run this store already has —
+            // most obviously right after `StreamLifecycle`'s own reconnect
+            // resnapshot, which just re-fetched it honestly. Without this
+            // guard, that replay inflates `pendingNewRuns`/re-triggers a
+            // refresh for a run that was never actually new.
+            guard !isRunAlreadyVisible(runID) else { break }
             if liveTail {
                 scheduleDebouncedRefresh()
             } else {
@@ -300,11 +338,27 @@ public final class ActivityStore {
     /// `activeRunID`/`lastError` at fetch time, not live-patched from run
     /// events.
     private func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
+        statusOverrides[runID] = (status, durationMS)
         guard let index = rows.firstIndex(where: {
             if case .run(let id, _) = $0.navigation { return id == runID }
             return false
         }) else { return }
         rows[index] = rows[index].patchingStatus(status, durationMS: durationMS)
+    }
+
+    /// True if `runID` is already represented in this store — either in the
+    /// current (possibly `statusFilter`-narrowed) `rows`, or in one of the
+    /// active snapshots' unfiltered rows (a run the filter is currently
+    /// hiding is still one this store has, just not one it's showing).
+    /// Matched by the same `.run(id:_)` navigation key `patchRow` resolves
+    /// rows by.
+    private func isRunAlreadyVisible(_ runID: String) -> Bool {
+        func matches(_ row: ActivityRow) -> Bool {
+            if case .run(let id, _) = row.navigation { return id == runID }
+            return false
+        }
+        if rows.contains(where: matches) { return true }
+        return activeSnapshots().contains { $0.rows.contains(where: matches) }
     }
 
     /// Coalesces a burst of `.newRun` deltas into one refresh: each new

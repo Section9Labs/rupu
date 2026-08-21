@@ -111,16 +111,47 @@ private struct StatusGlyph: View {
             }
         }
         .onAppear {
-            guard !reduceMotion, isAnimatedState else { return }
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                isPulsing = true
-            }
+            updatePulse()
+        }
+        // Review fix (minor rider): the pulse used to only ever start in
+        // `.onAppear` — a node that was `.pending` when this view first
+        // appeared and later transitions to `.running`/`.gatePending` in
+        // place (the graph updates `NodeState`s live; this view isn't
+        // re-created per state) never got the animation, since `.onAppear`
+        // doesn't fire again. Re-running the same start/stop decision on
+        // every `state` change covers that transition, and on every
+        // `reduceMotion` change covers the flip-mid-animation edge (motion
+        // getting reduced while a node is mid-pulse, or un-reduced while
+        // one is still animated, in either case landing on the correct
+        // resting/animating form rather than whatever `.onAppear` last
+        // decided).
+        .onChange(of: state) { _, _ in
+            updatePulse()
+        }
+        .onChange(of: reduceMotion) { _, _ in
+            updatePulse()
         }
     }
 
     /// Pulse only fires when motion isn't reduced; otherwise the glyph
     /// renders in its resting (non-scaled, fully opaque) form.
     private var pulseActive: Bool { isPulsing && !reduceMotion }
+
+    /// Starts (or restarts) the repeating pulse animation for an animated
+    /// state, or immediately resets to the resting form otherwise. Safe to
+    /// call redundantly — e.g. a `state` change between two animated states
+    /// (`.running` -> `.gatePending`) leaves an already-running pulse alone
+    /// rather than restarting its cycle.
+    private func updatePulse() {
+        guard !reduceMotion, isAnimatedState else {
+            isPulsing = false
+            return
+        }
+        guard !isPulsing else { return }
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+            isPulsing = true
+        }
+    }
 
     private var isAnimatedState: Bool {
         switch state {

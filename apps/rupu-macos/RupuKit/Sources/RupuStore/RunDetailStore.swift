@@ -39,10 +39,23 @@ import RupuAPI
 /// `APIStepResult` first, else a matching `APIUnitRow` (first match; a
 /// fan-out step's units each have their own path, and this phase has no
 /// per-unit focus UI yet), else `RunRecord.active_step_transcript_path` when
-/// `stepID` is the run's current `activeStepID` — loads a snapshot via
-/// `fetchTranscript`, then (local, and the step reads as currently running)
-/// tails `/api/transcript/stream` for that path, appending events in
-/// arrival order.
+/// `stepID` is the run's current `activeStepID`.
+///
+/// **REST snapshot vs. tail — never both** (review fix): `/api/transcript/
+/// stream` (`TranscriptTail` on the server) replays the *entire* transcript
+/// JSONL from byte 0 on every connection, then tails new lines — so its
+/// backlog is already a strict superset of any REST snapshot taken just
+/// before it. When the step will be tailed (local run, and the step reads
+/// as currently running), `focusStep` skips the REST `fetchTranscript` call
+/// outright and lets `startTail` clear `transcript` and let the tail's own
+/// byte-0 replay repopulate it from scratch — fetching the snapshot first
+/// would just leave a duplicate prefix once the replay landed on top of it.
+/// The REST snapshot path is still used for every non-tailing case: a
+/// completed step, or any step on a remote run (remote is REST-only this
+/// phase; see `isRemote` above). The same "clear, don't refetch" contract
+/// covers `startTail`'s `resnapshot` closure — every tail *reconnect*
+/// replays the whole transcript again, so clearing and letting the replay
+/// repopulate is what avoids duplicating it a second time.
 ///
 /// **Overlapping calls**: `focusStep` is Task 9's contractual interface for
 /// repeated click-to-focus, so two calls can legitimately overlap (a click
@@ -177,8 +190,15 @@ public final class RunDetailStore {
         async let findingsLoad: Void = loadFindings()
         _ = await (detailLoad, graphLoad, netflowLoad, findingsLoad)
 
-        guard !isRemote else { return }
-        startRunStream()
+        // Review fix: a remote run still gets its initial focus — `GET
+        // /api/transcript?host=` works for remote same as local, and
+        // `focusStep` itself already guards the *tail* on `isRemote` (see
+        // its doc comment above). Only the run-scoped event stream is
+        // local-only; skip that alone rather than the whole tail of
+        // `activate()`.
+        if !isRemote {
+            startRunStream()
+        }
 
         if let stepID = initialFocusStepID() {
             await focusStep(stepID)
@@ -214,6 +234,19 @@ public final class RunDetailStore {
             return
         }
 
+        // Review fix: when this step is about to be tailed, skip the REST
+        // snapshot entirely — `/api/transcript/stream`'s byte-0 replay is
+        // already a superset of it (see the type doc comment's "REST
+        // snapshot vs. tail" section). This branch never awaits, so — same
+        // reasoning as the `guard let path` branch above — it cannot have
+        // been superseded by a later call either; always safe to apply.
+        let willTail = !isRemote && isStepRunning(stepID) && transcriptTailFactory != nil
+        if willTail, let transcriptTailFactory {
+            focusedTranscriptPath = path
+            startTail(path: path, factory: transcriptTailFactory)
+            return
+        }
+
         let events: [TranscriptEvent]
         do {
             events = try await fetchTranscript(path).events
@@ -238,9 +271,6 @@ public final class RunDetailStore {
         stopTail()
         focusedTranscriptPath = path
         transcript = events
-
-        guard !isRemote, isStepRunning(stepID), let transcriptTailFactory else { return }
-        startTail(path: path, factory: transcriptTailFactory)
     }
 
     // MARK: - REST loads
@@ -329,11 +359,18 @@ public final class RunDetailStore {
     /// comment — in one fire-and-forget `Task` (an event's `apply` callback
     /// itself is synchronous, so the refresh can't be `await`ed inline
     /// here).
+    /// Review fix: a terminal run event also stops any live transcript tail
+    /// and reloads the focused step's transcript once via REST — the run is
+    /// over, so there's nothing left to tail, and without this the feed
+    /// could be left showing a truncated view (whatever arrived before the
+    /// tail's underlying connection tore down) with `transcriptTailActive`
+    /// stuck `true` forever.
     private func handleTerminal() {
         guard !didHandleTerminal else { return }
         didHandleTerminal = true
         runLifecycle?.stop()
         runLifecycle = nil
+        stopTail()
 
         Task { [weak self] in
             guard let self else { return }
@@ -341,6 +378,10 @@ public final class RunDetailStore {
             async let findingsLoad: Void = self.loadFindings()
             async let netflowLoad: Void = self.loadNetflow()
             _ = await (detailLoad, findingsLoad, netflowLoad)
+
+            if let path = self.focusedTranscriptPath {
+                await self.reloadTranscriptSnapshot(path: path)
+            }
         }
     }
 
@@ -355,15 +396,24 @@ public final class RunDetailStore {
         let lifecycle = StreamLifecycle()
         tailLifecycle = lifecycle
         transcriptTailActive = true
+        // `/api/transcript/stream` replays the entire transcript JSONL from
+        // byte 0 on every connection — including this very first one — so
+        // starting from an empty `transcript` and letting that replay (plus
+        // whatever's tailed live after it) repopulate it is what avoids a
+        // duplicate on top of any REST snapshot `focusStep` might have left
+        // behind for a *previous* step's focus.
+        transcript = []
         lifecycle.start(
             signals: factory(path),
             resnapshot: { [weak self] in
                 guard let self else { return }
-                // A reconnect may have missed events — reload the whole
-                // snapshot and replace `transcript` wholesale (never
-                // append), the same "resnapshot before any further delta"
-                // contract `StreamLifecycle` gives every other consumer.
-                await self.reloadTranscriptSnapshot(path: path)
+                // A reconnect's new connection replays the whole transcript
+                // from byte 0 again — the exact same contract as the initial
+                // connection above, not a partial "missed events" catch-up.
+                // Clearing (never refetching via REST) is what lets that
+                // replay repopulate `transcript` from scratch instead of
+                // duplicating whatever was already showing.
+                await self.clearTranscriptForTailReconnect()
             },
             apply: { [weak self] event in
                 self?.transcript.append(event)
@@ -371,6 +421,13 @@ public final class RunDetailStore {
         )
     }
 
+    private func clearTranscriptForTailReconnect() async {
+        transcript = []
+    }
+
+    /// REST reload, replacing `transcript` wholesale (never appended) —
+    /// used by `handleTerminal` to leave the feed showing a complete final
+    /// snapshot once the run (and any tail of it) is over.
     private func reloadTranscriptSnapshot(path: String) async {
         if let page = try? await fetchTranscript(path) {
             transcript = page.events

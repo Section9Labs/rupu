@@ -292,14 +292,67 @@ private func makeStore(
     runBox.latest.finish()
 }
 
-// MARK: - (d) focusStep resolves the right path and tails events in order
-
-@MainActor @Test func focusStepLoadsSnapshotThenAppendsTailEventsInOrder() async {
+// Review fix: a terminal run event also stops any live transcript tail and
+// reloads the focused step's transcript once via REST, so the feed ends up
+// showing a complete final snapshot rather than whatever partial state the
+// tail's connection happened to be in when the run ended.
+@MainActor @Test func terminalEventStopsTailAndReloadsFocusedTranscriptSnapshotOnce() async {
     let runBox = RunStreamBox()
     let tailBox = TailStreamBox()
-    let snapshotEvents: [TranscriptEvent] = [.assistantMessage(content: "snapshot line", thinking: nil)]
+    let tailTerminated = FlagBox()
+    let transcriptCalls = Counter()
+
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl"), steps: [])
+        },
+        transcriptResult: { _ in
+            transcriptCalls.increment()
+            return APITranscriptPage(events: [.assistantMessage(content: "final snapshot", thinking: nil)], summary: nil)
+        },
+        runStreamBox: runBox,
+        tailStreamBox: tailBox
+    )
+
+    // "build" is active with no result yet -> activate()'s initial focus
+    // starts a tail for it, with no REST fetch (per the tail-skip fix).
+    await store.activate()
+    #expect(transcriptCalls.value == 0)
+    #expect(store.transcriptTailActive == true)
+
+    tailBox.latest.onTermination = { _ in tailTerminated.value = true }
+    runBox.latest.yield(.connection(true))
+    tailBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.runCompleted(runID: "run-1", status: "completed", finishedAt: "2026-08-20T13:00:00Z")))
+    try? await Task.sleep(for: .milliseconds(60))
+
+    #expect(tailTerminated.value == true)
+    #expect(store.transcriptTailActive == false)
+    #expect(transcriptCalls.value == 1)
+    #expect(store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)])
+
+    store.deactivate()
+    runBox.latest.finish()
+    tailBox.latest.finish()
+}
+
+// MARK: - (d) focusStep on a tailing step skips the REST snapshot and lets
+// the tail's byte-0 replay populate `transcript`
+//
+// Review fix: `/api/transcript/stream` (`TranscriptTail` on the server)
+// replays the ENTIRE transcript JSONL from byte 0 on every connection, then
+// tails — a strict superset of any REST snapshot taken just before it. The
+// old test here asserted a REST fetch *and* a tail both landing in
+// `transcript`, which is exactly the duplication bug: a real connection
+// would have delivered the snapshot's own events again as part of the
+// tail's replay, on top of what REST already put there. The fixed contract
+// is: no REST fetch at all for a step about to be tailed; `transcript`
+// starts empty and is populated purely from whatever the tail delivers.
+
+@MainActor @Test func focusStepOnATailingStepSkipsRESTAndPopulatesTranscriptFromTheTailAlone() async {
+    let runBox = RunStreamBox()
+    let tailBox = TailStreamBox()
     let requestedPaths = Counter() // used purely to record how many transcript() calls fired
-    let lastRequestedPath = PathBox()
 
     let store = makeStore(
         detailResult: {
@@ -310,8 +363,7 @@ private func makeStore(
         },
         transcriptResult: { path in
             requestedPaths.increment()
-            lastRequestedPath.value = path
-            return APITranscriptPage(events: snapshotEvents, summary: nil)
+            return APITranscriptPage(events: [.assistantMessage(content: "REST snapshot — must never appear", thinking: nil)], summary: nil)
         },
         runStreamBox: runBox,
         tailStreamBox: tailBox
@@ -320,20 +372,76 @@ private func makeStore(
     // activate() itself resolves initial focus (activeStepID) and starts the tail.
     await store.activate()
 
-    #expect(requestedPaths.value == 1)
-    #expect(lastRequestedPath.value == "t/build.jsonl")
+    #expect(requestedPaths.value == 0)
     #expect(store.focusedTranscriptPath == "t/build.jsonl")
-    #expect(store.transcript == snapshotEvents)
+    #expect(store.transcript == [])
     #expect(store.transcriptTailActive == true)
     #expect(tailBox.callCount == 1)
     #expect(tailBox.latestPath == "t/build.jsonl")
 
+    // Simulate the real contract: the tail's first connection replays the
+    // whole transcript from byte 0 (here: one line that predates focus),
+    // then tails new lines as they arrive — all as plain `.event`s, since
+    // `TranscriptTail` doesn't distinguish "replay" from "live" at the
+    // protocol level.
     tailBox.latest.yield(.connection(true))
+    tailBox.latest.yield(.event(.assistantMessage(content: "replayed from byte 0", thinking: nil)))
     tailBox.latest.yield(.event(.assistantDelta(content: "first")))
     tailBox.latest.yield(.event(.assistantDelta(content: "second")))
     try? await Task.sleep(for: .milliseconds(30))
 
-    #expect(store.transcript == snapshotEvents + [.assistantDelta(content: "first"), .assistantDelta(content: "second")])
+    #expect(store.transcript == [
+        .assistantMessage(content: "replayed from byte 0", thinking: nil),
+        .assistantDelta(content: "first"),
+        .assistantDelta(content: "second"),
+    ])
+    // Still never fetched via REST at any point.
+    #expect(requestedPaths.value == 0)
+
+    store.deactivate()
+    runBox.latest.finish()
+    tailBox.latest.finish()
+}
+
+// Review fix: a tail *reconnect* replays the whole transcript from byte 0
+// again (the identical contract as the first connection) — so the
+// `resnapshot` closure `startTail` wires up must CLEAR `transcript`, never
+// refetch it via REST, or the replay lands on top of what's already there
+// and duplicates every line.
+@MainActor @Test func tailReconnectReplayClearsTranscriptRatherThanDuplicatingIt() async {
+    let runBox = RunStreamBox()
+    let tailBox = TailStreamBox()
+
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl"), steps: [])
+        },
+        runStreamBox: runBox,
+        tailStreamBox: tailBox
+    )
+
+    await store.activate()
+    tailBox.latest.yield(.connection(true)) // pristine first connect -> no resnapshot
+    tailBox.latest.yield(.event(.assistantMessage(content: "line 1", thinking: nil)))
+    tailBox.latest.yield(.event(.assistantDelta(content: "line 2")))
+    try? await Task.sleep(for: .milliseconds(20))
+    #expect(store.transcript.count == 2)
+
+    // Disconnect then reconnect: `StreamLifecycle` awaits `resnapshot()` to
+    // completion before applying any further event on this same
+    // continuation.
+    tailBox.latest.yield(.connection(false))
+    tailBox.latest.yield(.connection(true))
+    try? await Task.sleep(for: .milliseconds(20))
+    #expect(store.transcript.isEmpty) // cleared by the resnapshot closure, replay not yet arrived
+
+    // The new connection's own replay, from byte 0, same content as before.
+    tailBox.latest.yield(.event(.assistantMessage(content: "line 1", thinking: nil)))
+    tailBox.latest.yield(.event(.assistantDelta(content: "line 2")))
+    try? await Task.sleep(for: .milliseconds(20))
+
+    // Landed exactly once — not appended on top of a stale prior copy.
+    #expect(store.transcript == [.assistantMessage(content: "line 1", thinking: nil), .assistantDelta(content: "line 2")])
 
     store.deactivate()
     runBox.latest.finish()
@@ -377,18 +485,18 @@ private func makeStore(
     runBox.latest.finish()
 }
 
-// Review fix: two overlapping `focusStep` calls — the first's fetch is
-// deliberately slow, so it's still in flight when the second call starts.
-// Before the generation-token fix, both calls would eventually reach
-// `startTail`, with the second's assignment silently dropping (never
-// stopping) the first's `StreamLifecycle` — an orphaned consumer that kept
-// appending the *first* (now unfocused) step's tail events into the shared
-// `transcript` array forever. With the fix, the first call's results are
-// discarded once it's confirmed stale (its captured generation no longer
-// matches), so it never reaches `startTail` at all: only the second call's
-// tail is ever created, and `transcript` ends up holding only the second
-// step's snapshot (plus, in this test, no tail events at all — proving the
-// point independently of tail-event ordering).
+// Review fix: two overlapping `focusStep` calls — "stepA" stays a finished,
+// non-tailing step (so its call awaits the REST snapshot, deliberately
+// slow, and is still in flight when the second call starts), while "stepB"
+// is marked running (tail-eligible) before either call fires. Since a
+// tailing `focusStep` call never awaits (it skips the REST fetch entirely —
+// see the "REST snapshot vs. tail" fix above), "stepB"'s call runs fully to
+// completion, synchronously, before "stepA"'s slow fetch ever resolves.
+// Before the generation-token fix, "stepA"'s eventually-resolving fetch
+// would still have gone on to overwrite `transcript`/`focusedTranscriptPath`
+// out from under "stepB" once it finally completed — this proves the fix
+// discards it instead, and that only "stepB" (the tailing step) ever starts
+// a tail.
 @MainActor @Test func overlappingFocusStepCallsOnlyTheMostRecentOneAppliesItsResults() async {
     let runBox = RunStreamBox()
     let tailBox = TailStreamBox()
@@ -407,9 +515,9 @@ private func makeStore(
             if path == "t/a.jsonl" {
                 // Deliberately slow: still in flight when "stepB"'s call starts.
                 try? await Task.sleep(for: .milliseconds(80))
-                return APITranscriptPage(events: [.assistantMessage(content: "A snapshot", thinking: nil)], summary: nil)
+                return APITranscriptPage(events: [.assistantMessage(content: "A snapshot — must never win", thinking: nil)], summary: nil)
             }
-            return APITranscriptPage(events: [.assistantMessage(content: "B snapshot", thinking: nil)], summary: nil)
+            return APITranscriptPage(events: [], summary: nil)
         },
         runStreamBox: runBox,
         tailStreamBox: tailBox
@@ -418,18 +526,20 @@ private func makeStore(
     // `runRecord()`'s default `activeStepID` is nil, so `activate()`'s own
     // auto-focus (steps.last -> "stepB") runs once, fully, before it
     // returns — no overlap yet, and `liveStates` is still empty at that
-    // point so no tail starts from it either.
+    // point, so this first focus takes the REST path too (0 tails so far).
     await store.activate()
     #expect(tailBox.callCount == 0)
 
-    // Mark both steps "running" so either is eligible to start a tail.
+    // Mark only "stepB" running: "stepA" stays a finished step, so its
+    // `focusStep` call below awaits the REST snapshot (the race this test
+    // exercises); "stepB" is tail-eligible, so its call skips REST
+    // entirely and starts a tail with no await to race at all.
     runBox.latest.yield(.connection(true))
-    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "stepA", kind: "step", agent: nil, host: nil)))
     runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "stepB", kind: "step", agent: nil, host: nil)))
     try? await Task.sleep(for: .milliseconds(20))
 
     async let first: Void = store.focusStep("stepA")
-    try? await Task.sleep(for: .milliseconds(10)) // let the first call actually begin its slow fetch
+    try? await Task.sleep(for: .milliseconds(10)) // let stepA's slow fetch actually begin
     async let second: Void = store.focusStep("stepB")
     _ = await (first, second)
 
@@ -437,10 +547,14 @@ private func makeStore(
     try? await Task.sleep(for: .milliseconds(120))
 
     #expect(store.focusedTranscriptPath == "t/b.jsonl")
-    #expect(store.transcript == [.assistantMessage(content: "B snapshot", thinking: nil)])
+    // stepB's tail owns `transcript` (cleared, then never fed any events in
+    // this test); stepA's now-stale REST result — which would otherwise
+    // have overwritten it 80ms later — was discarded by the generation
+    // check before it ever touched `transcript`.
+    #expect(store.transcript == [])
     #expect(store.transcriptTailActive == true)
-    // Only "stepB"'s tail was ever started — "stepA"'s stale call never
-    // reached `startTail` once it lost the race.
+    // Only "stepB"'s tail was ever started — "stepA" never reaches
+    // `startTail` at all (non-tailing steps never do).
     #expect(tailBox.callCount == 1)
     #expect(tailBox.latestPath == "t/b.jsonl")
 
@@ -521,6 +635,38 @@ private func makeStore(
     #expect(store.isRemote == true)
     // REST blocks still populate normally for a remote run.
     #expect(store.detail.value != nil)
+
+    store.deactivate()
+}
+
+// Review fix: the old `guard !isRemote else { return }` in `activate()`
+// skipped BOTH the run stream AND the initial `focusStep` call for a remote
+// store — but `GET /api/transcript?host=` works fine for a remote run (only
+// the *tail* is local-only, and `focusStep` already guards that separately
+// via `isRemote`). A remote run detail screen should still show its active
+// step's transcript, fetched via REST, on first load.
+@MainActor @Test func remoteStoreStillRunsInitialFocusStepViaRESTOnly() async {
+    let transcriptCalls = Counter()
+    let store = makeStore(
+        isRemote: true,
+        detailResult: {
+            detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl"), steps: [])
+        },
+        transcriptResult: { _ in
+            transcriptCalls.increment()
+            return APITranscriptPage(events: [.assistantMessage(content: "remote snapshot", thinking: nil)], summary: nil)
+        }
+        // No runStreamBox/tailStreamBox supplied -> `makeStore` passes `nil`
+        // factories, matching production's `isRemote ? nil : ...`.
+    )
+
+    await store.activate()
+
+    #expect(transcriptCalls.value == 1)
+    #expect(store.focusedTranscriptPath == "t/build.jsonl")
+    #expect(store.transcript == [.assistantMessage(content: "remote snapshot", thinking: nil)])
+    #expect(store.transcriptTailActive == false)
+    #expect(store.isRemote == true)
 
     store.deactivate()
 }

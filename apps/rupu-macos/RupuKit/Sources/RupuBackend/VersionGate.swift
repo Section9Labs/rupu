@@ -5,7 +5,7 @@
 /// `0.72.0`). Anything that doesn't parse as at least three numeric
 /// segments is treated as incompatible.
 public enum VersionGate {
-    public static let minimum = "0.71.0"
+    public static let minimum = "0.74.0"
 
     public static func compatible(_ version: String) -> Bool {
         guard let candidate = numericSegments(of: version) else { return false }
