@@ -7,7 +7,7 @@ let package = Package(
     products: [
         .library(
             name: "RupuKit",
-            targets: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuShell"]
+            targets: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuShell"]
         )
     ],
     targets: [
@@ -15,14 +15,18 @@ let package = Package(
         .target(name: "RupuBackend", dependencies: ["RupuAPI"]),
         .target(name: "RupuDesign"),
         .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign"]),
-        .target(name: "RupuShell", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign"]),
+        .target(name: "RupuActivity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(
+            name: "RupuShell",
+            dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity"]
+        ),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
         .testTarget(name: "RupuStoreTests", dependencies: ["RupuStore", "RupuBackend", "RupuAPI", "RupuDesign"]),
         .testTarget(
             name: "RupuShellTests",
-            dependencies: ["RupuShell", "RupuStore", "RupuBackend", "RupuAPI", "RupuDesign"]
+            dependencies: ["RupuShell", "RupuStore", "RupuBackend", "RupuAPI", "RupuDesign", "RupuActivity"]
         ),
     ]
 )

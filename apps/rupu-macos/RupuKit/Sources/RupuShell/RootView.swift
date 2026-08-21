@@ -2,6 +2,7 @@ import SwiftUI
 import RupuStore
 import RupuBackend
 import RupuDesign
+import RupuActivity
 
 /// The app's window content: fixed sidebar + detail pane that switches on
 /// `model.route`. Phase 2+ swaps each `PlaceholderScreen` branch for a real
@@ -119,7 +120,7 @@ public struct RootView: View {
         case .overview:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .activity:
-            PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
+            ActivityScreen(model: model, backend: backend)
         case .runDetail, .sessionDetail:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .projects:
