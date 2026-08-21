@@ -22,6 +22,14 @@ private final class FlagBox: @unchecked Sendable {
     }
 }
 
+/// Thread-safe call counter, same rationale as `FlagBox` above.
+private final class CountBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
+}
+
 @MainActor @Test func pagedSnapshotPagesThroughAllRowsAndMarksExhausted() async {
     let all = (0..<120).map { FakeRow(id: $0) }
     let snapshot = PagedSnapshot<FakeRow> { offset, limit in
@@ -106,4 +114,59 @@ private final class FlagBox: @unchecked Sendable {
         Issue.record("expected .failed, got \(snapshot.state)")
         return
     }
+}
+
+/// Reentrancy regression: two `loadMore()` calls started concurrently (e.g.
+/// two views both triggering a load) used to each read the same stale
+/// `rows.count` and both append their own page, duplicating rows. `fetch`
+/// sleeps briefly to widen the window a real double-invocation would race
+/// in; `inFlight` must make the second call a no-op regardless of which one
+/// happens to win the MainActor scheduling race.
+@MainActor @Test func pagedSnapshotConcurrentLoadMoreCallsDoNotDuplicateRowsOrDoubleFetch() async {
+    let all = (0..<80).map { FakeRow(id: $0) }
+    let fetchCount = CountBox()
+    let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
+        fetchCount.increment()
+        try? await Task.sleep(for: .milliseconds(20))
+        guard offset < all.count else { return [] }
+        let end = min(offset + limit, all.count)
+        return Array(all[offset..<end])
+    }
+
+    await snapshot.refresh()
+    #expect(snapshot.rows.count == 50)
+    #expect(fetchCount.value == 1)
+
+    async let first: Void = snapshot.loadMore()
+    async let second: Void = snapshot.loadMore()
+    _ = await (first, second)
+
+    #expect(fetchCount.value == 2) // one for refresh() above, one for whichever loadMore() won
+    #expect(snapshot.rows.count == 80)
+    #expect(Set(snapshot.rows.map(\.id)).count == snapshot.rows.count) // no duplicate rows
+}
+
+/// `refresh()` and `loadMore()` share the same `inFlight` guard: a
+/// `refresh()` that arrives while a `loadMore()` is still in flight is also
+/// a no-op, not a queued/coalesced follow-up — documenting that choice
+/// concretely rather than just in a comment.
+@MainActor @Test func pagedSnapshotRefreshWhileLoadMoreInFlightIsANoOp() async {
+    let all = (0..<80).map { FakeRow(id: $0) }
+    let fetchCount = CountBox()
+    let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
+        fetchCount.increment()
+        try? await Task.sleep(for: .milliseconds(20))
+        guard offset < all.count else { return [] }
+        let end = min(offset + limit, all.count)
+        return Array(all[offset..<end])
+    }
+
+    await snapshot.refresh()
+    #expect(fetchCount.value == 1)
+
+    async let loading: Void = snapshot.loadMore()
+    async let refreshing: Void = snapshot.refresh()
+    _ = await (loading, refreshing)
+
+    #expect(fetchCount.value == 2) // the initial refresh() + exactly one of {loadMore, refresh}
 }

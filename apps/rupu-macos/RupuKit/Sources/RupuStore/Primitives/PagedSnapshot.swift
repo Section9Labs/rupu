@@ -34,6 +34,19 @@ public enum BlockState<T: Sendable>: Sendable {
 /// `exhausted`. A `fetch` failure on either call sets `state = .failed(...)`
 /// and leaves `rows` untouched — the recovery path is calling `refresh()`
 /// again.
+///
+/// **Reentrancy:** `refresh()`/`loadMore()` are `async` and this class is
+/// `@MainActor`, not actor-isolated-per-call — a second call can start
+/// while the first is still suspended inside `await fetch(...)` (e.g. two
+/// views both triggering a load on appear). Without a guard, both calls
+/// would read the same `rows.count` before either finishes and each append
+/// its own page, duplicating rows. `inFlight` closes that window: whichever
+/// call sets it first proceeds: any other `refresh()`/`loadMore()` call
+/// that arrives before it clears is a **no-op** (returns immediately,
+/// `state`/`rows` untouched) rather than queueing or cancelling the
+/// in-progress one. A caller that truly needs "refresh after this load
+/// finishes" should await the in-flight call itself rather than fire a
+/// second one — `PagedSnapshot` doesn't coalesce for you.
 @MainActor
 @Observable
 public final class PagedSnapshot<Row: Sendable & Identifiable> {
@@ -43,6 +56,7 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
 
     private let pageSize: Int
     private let fetch: @Sendable (_ offset: Int, _ limit: Int) async throws -> [Row]
+    private var inFlight = false
 
     public init(pageSize: Int = 50, fetch: @escaping @Sendable (_ offset: Int, _ limit: Int) async throws -> [Row]) {
         self.pageSize = pageSize
@@ -50,6 +64,10 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
     }
 
     public func refresh() async {
+        guard !inFlight else { return }
+        inFlight = true
+        defer { inFlight = false }
+
         state = .loading
         do {
             let page = try await fetch(0, pageSize)
@@ -62,7 +80,10 @@ public final class PagedSnapshot<Row: Sendable & Identifiable> {
     }
 
     public func loadMore() async {
-        guard !exhausted else { return }
+        guard !inFlight, !exhausted else { return }
+        inFlight = true
+        defer { inFlight = false }
+
         do {
             let page = try await fetch(rows.count, pageSize)
             rows.append(contentsOf: page)
