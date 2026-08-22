@@ -160,6 +160,25 @@ extension CPClientTests {
         #expect(!q.contains(where: { $0.name == "host" }))
     }
 
+    /// Phase 3, Task 6 addition — `archiveSession`/`restoreSession` weren't
+    /// part of Task 2's original write surface (its brief only covered run
+    /// archive/restore). Stub coverage mirrors `pauseResumeArchiveRestoreHitExpectedSubpaths`
+    /// above: expected subpath, plus the `host` query placement.
+    @Test func archiveSessionAndRestoreSessionHitExpectedSubpathsAndHostQuery() async throws {
+        let fixture = try Fixtures.data("run_control_response.json")
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        StubURLProtocol.lastRequest = nil
+        _ = try await client().archiveSession(id: "sess-1", host: "mini")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/sessions/sess-1/archive")
+        #expect(query(of: StubURLProtocol.lastRequest).contains(URLQueryItem(name: "host", value: "mini")))
+
+        StubURLProtocol.lastRequest = nil
+        _ = try await client().restoreSession(id: "sess-1")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/sessions/sess-1/restore")
+        #expect(!query(of: StubURLProtocol.lastRequest).contains(where: { $0.name == "host" }))
+    }
+
     // MARK: - Validate
 
     @Test func validateWorkflowReturnsTrueOn200() async throws {

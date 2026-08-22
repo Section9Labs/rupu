@@ -194,6 +194,26 @@ public actor CPClient {
         try await post("api/sessions/\(id)/send", query: writeHostQuery(host), body: body)
     }
 
+    /// Phase 3, Task 6 addition (not in Task 2's original write surface —
+    /// its brief only covered run archive/restore). `POST
+    /// /api/sessions/:id/archive[?host=]`. Immediate filesystem move, same
+    /// as `archiveRun`, but the **local** response shape here is `{ok:
+    /// true, id}` — no `archived` field at all (verified against
+    /// `mutate_session` in `crates/rupu-cp/src/api/sessions.rs`, unlike
+    /// `archiveRun`/`restoreRun`'s local `RunRecord`-carrying response,
+    /// which does carry one). A remote proxy adds `host_id`. Reuses
+    /// `RunControlResponse` purely for its `ok`/`hostID` fields — callers
+    /// must confirm off `response.ok`, never `response.archived` (always
+    /// `nil` here).
+    public func archiveSession(id: String, host: String? = nil) async throws -> RunControlResponse {
+        try await post("api/sessions/\(id)/archive", query: writeHostQuery(host), body: EmptyBody?.none)
+    }
+
+    /// Symmetric with `archiveSession` above.
+    public func restoreSession(id: String, host: String? = nil) async throws -> RunControlResponse {
+        try await post("api/sessions/\(id)/restore", query: writeHostQuery(host), body: EmptyBody?.none)
+    }
+
     // MARK: - Query helpers
 
     private func offsetLimitQuery(offset: Int, limit: Int, host: String? = nil) -> [URLQueryItem] {
