@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Multi-host</title>
+<meta name="description" content="Control rupu agents and workflows running on other machines from one central Control Plane. Slice 1 federates over HTTP to remote hosts running rupu cp serve.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item active" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Multi-host</h1>
+    <p class="intro">Control rupu agents and workflows running on <em>other machines</em> from one central Control Plane — register remote hosts, launch work on the host you choose, and watch it stream back, all in a single browser tab.</p>
+
+    <h2>What it is</h2>
+    <p>
+      Multi-host is a <strong>hub model</strong>. One central Control Plane
+      federates out to a fleet of <strong>remote hosts</strong>, each running its
+      own <a class="link" href="/docs/control-plane.html">control plane</a>
+      (<code class="inline">rupu cp serve</code>). A <strong>Host</strong> is a
+      top-level peer in rupu — it sits alongside your Projects, not underneath
+      them. The machine the central CP runs on is itself just a host:
+      <strong>host[0], "this host"</strong>, always present and always first.
+    </p>
+    <p>
+      The <strong>remote is always the source of truth</strong> — the central CP
+      keeps <strong>no authoritative copy</strong> of a host's run state, and tags
+      every run with the host it came from. How it reaches that state depends on
+      the transport: directly-reachable hosts (<strong>HTTP</strong>,
+      <strong>SSH</strong>) are <strong>live-queried</strong> on demand — open a
+      run list and the CP fans out to each host, merges the results, and proxies
+      straight through to a run's detail / event stream / transcript; hosts that
+      can't be reached inbound (<strong>tunnel</strong>, <strong>bucket</strong>)
+      <strong>mirror</strong> their run artifacts back to the central CP as they
+      change. Either way you get one merged fleet view, and no host's state is
+      duplicated as a second source of truth.
+    </p>
+    <div class="callout">
+      <strong>No new inbound surface.</strong> The central CP is purely a
+      <em>client</em> this slice — it adds no new way in. Each remote host's API
+      is already token-gated by its own <code class="inline">rupu cp serve</code>,
+      and that token is what the center authenticates with.
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 680 320" role="img" aria-label="A central control plane reaching host[0] in-process, host A over HTTP, and host B over SSH — with tunnel and bucket transports for hosts it can't reach directly.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- hub -->
+        <rect class="d-box-accent" x="255" y="40" width="170" height="60" rx="12"></rect>
+        <text class="d-label" x="340" y="66" text-anchor="middle">central control plane</text>
+        <text class="d-sub" x="340" y="84" text-anchor="middle">the hub / client</text>
+
+        <!-- hosts -->
+        <rect class="d-box" x="30" y="230" width="180" height="56" rx="10"></rect>
+        <text class="d-label" x="120" y="253" text-anchor="middle">host[0] (local)</text>
+        <text class="d-sub" x="120" y="271" text-anchor="middle">in-process</text>
+        <line class="d-edge" x1="290" y1="102" x2="150" y2="226" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="250" y="230" width="180" height="56" rx="10"></rect>
+        <text class="d-label" x="340" y="253" text-anchor="middle">host A</text>
+        <text class="d-sub" x="340" y="271" text-anchor="middle">rupu cp serve</text>
+        <line class="d-edge" x1="340" y1="102" x2="340" y2="226" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="470" y="230" width="180" height="56" rx="10"></rect>
+        <text class="d-label" x="560" y="253" text-anchor="middle">host B</text>
+        <text class="d-sub" x="560" y="271" text-anchor="middle">system ssh</text>
+        <line class="d-edge" x1="390" y1="102" x2="530" y2="226" marker-end="url(#ar)"></line>
+
+        <text class="d-sub" x="205" y="160" text-anchor="middle">local</text>
+        <text class="d-sub" x="356" y="160" text-anchor="middle">HTTP</text>
+        <text class="d-sub" x="475" y="160" text-anchor="middle">SSH</text>
+      </svg>
+      <figcaption>One central control plane reaching each host through whichever transport fits — in-process for host[0], HTTP and SSH here, plus dial-home <strong>tunnel</strong> and dead-drop <strong>bucket</strong> for hosts it can't connect to directly.</figcaption>
+    </figure>
+
+    <h2>Connection types</h2>
+    <p>
+      Every host is reached through a single transport port
+      (<code class="inline">HostConnector</code>), so the Fleet surface, host
+      attribution, launcher, and live streams work the same no matter how a host
+      is wired up. <strong>Five transports ship today</strong>, covering hosts
+      you can reach directly, hosts behind a NAT or firewall, and hosts you can't
+      reach at all:
+    </p>
+    <table>
+      <thead>
+        <tr><th>Transport</th><th>How the host is reached</th><th>How to register</th><th>Best for</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Local</strong></td>
+          <td>In-process — no network hop. This is host[0], "this host," always present.</td>
+          <td>Built in (the <code class="inline">local</code> host). Nothing to register.</td>
+          <td>The machine the central CP runs on.</td>
+        </tr>
+        <tr>
+          <td><strong>HTTP</strong> (federation)</td>
+          <td>The central CP is a <strong>client of the remote's <code class="inline">rupu cp serve</code></strong>, over its token-gated HTTP API.</td>
+          <td><code class="inline">rupu host add &lt;name&gt; --url https://… --token …</code></td>
+          <td>A remote that can expose a reachable, TLS-fronted server.</td>
+        </tr>
+        <tr>
+          <td><strong>SSH</strong></td>
+          <td>The CP connects <strong>out over SSH</strong> and runs <code class="inline">rupu</code> on the remote; auth is delegated to the system <code class="inline">ssh</code>.</td>
+          <td><code class="inline">rupu host add &lt;name&gt; --ssh user@host</code></td>
+          <td>A host you can already <code class="inline">ssh</code> to but that runs no server.</td>
+        </tr>
+        <tr>
+          <td><strong>Tunnel</strong> (dial-home)</td>
+          <td>The remote <strong>dials home</strong> over an outbound WebSocket; the CP reaches it via its node registry. Works behind NAT / firewalls.</td>
+          <td><code class="inline">rupu node enroll &lt;name&gt;</code>, then run <code class="inline">rupu node</code> on the box.</td>
+          <td>A NAT'd / firewalled box that can't expose any inbound port.</td>
+        </tr>
+        <tr>
+          <td><strong>Bucket</strong> (pull / dead-drop)</td>
+          <td>The CP and the worker <strong>exchange jobs + results through an object store</strong>. Neither side connects to the other.</td>
+          <td><code class="inline">rupu host add &lt;name&gt; --bucket s3://…</code>, then run <code class="inline">rupu node pull</code>.</td>
+          <td>Air-gapped / fully disconnected / batch hosts.</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Where hosts persist.</strong> Every host is a TOML record under
+      <code class="inline">~/.rupu/hosts/&lt;id&gt;.toml</code> holding only its name
+      and transport metadata. HTTP bearer tokens live in the
+      <strong>system keychain</strong>, referenced by host id; tunnel hosts store
+      only the <strong>SHA-256 hash</strong> of the enrollment token; SSH and
+      bucket hosts store <strong>no secret at all</strong> (auth is delegated to
+      the system <code class="inline">ssh</code> and the cloud credential chain).
+    </div>
+
+    <h3>Local — host[0]</h3>
+    <p>
+      The machine running the central CP is itself a host: the built-in
+      <code class="inline">local</code> entry, always present and always first.
+      It needs no registration and can't be removed. Single-host setups never
+      touch any of the transports below — everything just runs on
+      <code class="inline">local</code>.
+    </p>
+
+    <h3>HTTP federation</h3>
+    <p>
+      Federation has two sides. On the <strong>remote machine</strong>, run the
+      control plane so it's reachable from the center and guarded by a bearer
+      token. Bind to an address other than loopback, and set
+      <code class="inline">--token</code> so <code class="inline">/api/*</code>
+      requires <code class="inline">Authorization: Bearer &lt;token&gt;</code>:
+    </p>
+    <pre class="code"><span class="c"># on the REMOTE machine — serve the control plane, bound + token-guarded</span>
+$ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class="s">0.0.0.0:7878</span> <span class="v">--token</span> <span class="s">"$RUPU_CP_TOKEN"</span> <span class="v">--no-open</span></pre>
+    <p>
+      Put a TLS-terminating reverse proxy in front for a real
+      <code class="inline">https://</code> URL — remote base URLs are expected to
+      be HTTPS so the token is protected in transit. Then, on the
+      <strong>central machine</strong>, register that host with a display name,
+      the remote's base <code class="inline">--url</code>, and the
+      <code class="inline">--token</code>:
+    </p>
+    <pre class="code"><span class="c"># on the CENTRAL machine — register the remote host</span>
+$ rupu host <span class="k">add</span> <span class="s">prod</span> <span class="v">--url</span> <span class="s">https://host.example.com</span> <span class="v">--token</span> <span class="s">"$REMOTE_TOKEN"</span>
+host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
+    <p>
+      To keep the token out of your shell history and process list, read it from
+      stdin instead with <code class="inline">--token-stdin</code>:
+    </p>
+    <pre class="code"><span class="c"># pipe the token in on stdin (mutually exclusive with --token)</span>
+$ pass show rupu/prod | rupu host <span class="k">add</span> <span class="s">prod</span> <span class="v">--url</span> <span class="s">https://host.example.com</span> <span class="v">--token-stdin</span></pre>
+
+    <h3>SSH</h3>
+    <p>
+      The SSH transport targets a host that runs a full rupu install but exposes
+      no <code class="inline">rupu cp serve</code> and runs no dial-home agent —
+      yet you can already <code class="inline">ssh</code> to it. The central CP
+      connects <strong>out over SSH</strong>: it dispatches a run with
+      <code class="inline">ssh host rupu workflow run …</code> (detached on the
+      remote so it survives the SSH session), then keeps a long-lived
+      <code class="inline">ssh … tail -f</code> pump that mirrors the run's
+      artifact files back into the central run store — so the run shows up in the
+      same host-aware lists, detail, and live events as any other. SSH hosts are
+      <strong>fully at parity</strong> with the other transports: they report the
+      remote rupu <strong>version</strong> and list <strong>sessions</strong>,
+      <strong>agent + autoflow runs</strong>, and <strong>events</strong> just like
+      HTTP hosts do. Register it with the <code class="inline">--ssh</code>
+      destination:
+    </p>
+    <pre class="code"><span class="c"># register an SSH host — destination is user@host or a ~/.ssh/config alias</span>
+$ rupu host <span class="k">add</span> <span class="s">build-box</span> <span class="v">--ssh</span> <span class="s">deploy@build.example.com</span> <span class="v">--port</span> <span class="s">22</span> <span class="v">--identity</span> <span class="s">~/.ssh/id_ed25519</span>
+host_01J9ZB3KQ8M2T0V4W6X8Y1A3C5</pre>
+    <div class="callout">
+      <strong>No secret stored.</strong> Authentication is delegated entirely to
+      the system <code class="inline">ssh</code> — ssh-agent,
+      <code class="inline">~/.ssh/config</code>, default keys. The host record
+      keeps only the destination, optional <code class="inline">--port</code>, and
+      optional <code class="inline">--identity</code> path. Because the
+      destination can be a <code class="inline">~/.ssh/config</code> alias,
+      ProxyJump / ControlMaster / keys all come for free from your SSH config.
+    </div>
+
+    <h3>Tunnel (dial-home)</h3>
+    <p>
+      When a host is behind a NAT or firewall and can't expose any inbound port,
+      invert the direction: a lightweight <code class="inline">rupu node</code>
+      agent on the box <strong>dials out</strong> to the CP over a persistent
+      WebSocket, executes dispatched runs locally, and streams their artifacts
+      back. The CP reaches the node through its node registry — no inbound ports,
+      no reachable server. Start on the <strong>central machine</strong> by
+      enrolling the node, which mints a one-time token and prints the exact
+      command to run on the box:
+    </p>
+    <pre class="code"><span class="c"># on the CENTRAL machine — mint a node + one-time token</span>
+$ rupu node <span class="k">enroll</span> <span class="s">build-box-01</span> <span class="v">--cp-url</span> <span class="s">wss://cp.example.com</span>
+enrolled: build-box-01 (host_01J9ZC4M0N1P2Q3R4S5T6U7V8W)
+
+⚠  token shown ONCE — copy it to the node now:
+
+  rupu node --cp-url wss://cp.example.com --token &lt;token&gt; --node-id host_01J9ZC4M0N1P2Q3R4S5T6U7V8W</pre>
+    <p>
+      Copy the token to the <strong>remote box</strong> and run the node agent
+      there, reading the token from stdin so it never lands in shell history. The
+      agent authenticates, stays connected, and reconnects with backoff if the
+      link drops:
+    </p>
+    <pre class="code"><span class="c"># on the REMOTE box — dial home and stay connected</span>
+$ rupu node <span class="v">--cp-url</span> <span class="s">wss://cp.example.com</span> <span class="v">--token-stdin</span> &lt; <span class="s">token.txt</span></pre>
+    <div class="callout">
+      <strong>The plaintext token is shown once.</strong> Only its
+      <strong>SHA-256 hash</strong> is stored in the tunnel host record — the CP
+      verifies an inbound node connection against the hash without ever keeping
+      the secret on disk. Tunnel-node runs are mirrored as first-class,
+      host-attributed runs in the central store, so they observe and control
+      exactly like local runs (launch, cancel, approve / reject / resume).
+    </div>
+
+    <h3>Bucket (pull / dead-drop)</h3>
+    <p>
+      The most decoupled transport: for a host the CP <em>can't reach at all</em>
+      and which can't reach the CP either. Both sides independently talk to a
+      shared <strong>object-store bucket</strong> that acts as the gateway. The
+      CP writes dispatched work into the bucket; the worker polls it, atomically
+      claims a job, runs it locally, and writes results back; a CP-side poller
+      reads those results and mirrors them in. Register the host on the
+      <strong>central machine</strong> with a bucket URL and optional prefix:
+    </p>
+    <pre class="code"><span class="c"># on the CENTRAL machine — register a bucket (dead-drop) host</span>
+$ rupu host <span class="k">add</span> <span class="s">nightly</span> <span class="v">--bucket</span> <span class="s">s3://my-bucket</span> <span class="v">--prefix</span> <span class="s">rupu/host-1</span>
+host_01J9ZD5N1P2Q3R4S5T6U7V8W9X</pre>
+    <p>
+      On the <strong>worker box</strong>, run the pull agent against the same
+      bucket and prefix. It claims jobs, runs them locally, and writes results
+      back — no inbound or outbound connectivity to the CP required. By default
+      it <strong>loops forever</strong>, polling on an interval; pass
+      <code class="inline">--once</code> to drain whatever is queued a single time
+      and exit (handy for cron / batch hosts):
+    </p>
+    <pre class="code"><span class="c"># on the WORKER box — poll the bucket, claim + run jobs, write results back</span>
+$ rupu node <span class="k">pull</span> <span class="v">--bucket</span> <span class="s">s3://my-bucket</span> <span class="v">--prefix</span> <span class="s">rupu/host-1</span>
+
+<span class="c"># or drain once and exit (cron / batch)</span>
+$ rupu node <span class="k">pull</span> <span class="v">--bucket</span> <span class="s">s3://my-bucket</span> <span class="v">--prefix</span> <span class="s">rupu/host-1</span> <span class="v">--once</span></pre>
+    <div class="callout">
+      <strong>Object stores + no stored secrets.</strong> Bucket URLs may be
+      <code class="inline">s3://</code>, <code class="inline">gs://</code>, or
+      <code class="inline">file://</code> (a shared filesystem on a local
+      network). Credentials are resolved from the standard cloud credential chain
+      / environment (<code class="inline">AWS_*</code>,
+      <code class="inline">GOOGLE_*</code>) — rupu stores none. Control messages
+      (cancel / approve / reject) are queued in the bucket and applied on the
+      worker's next poll, since a dead-drop is inherently asynchronous.
+    </div>
+
+    <h2>Manage hosts</h2>
+    <p>
+      <code class="inline">rupu host list</code> shows every configured host. The
+      built-in <code class="inline">local</code> host is <strong>always first and
+      can't be removed</strong> — it's host[0], "this host." Each row is the host
+      id, name, and a transport label (the base URL for HTTP, or
+      <code class="inline">ssh:…</code> / <code class="inline">tunnel:…</code> /
+      <code class="inline">bucket:…</code> for the others):
+    </p>
+    <pre class="code">$ rupu host <span class="k">list</span>
+local                              local         local
+host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8   prod          https://host.example.com
+host_01J9ZB3KQ8M2T0V4W6X8Y1A3C5   build-box     ssh:deploy@build.example.com:22
+host_01J9ZC4M0N1P2Q3R4S5T6U7V8W   build-box-01  tunnel:host_01J9ZC4M0N1P2Q3R4S5T6U7V8W
+host_01J9ZD5N1P2Q3R4S5T6U7V8W9X   nightly       bucket:s3://my-bucket</pre>
+    <p>
+      Remove a remote host by its id with <code class="inline">rupu host
+      remove</code>. This deletes the TOML record and any keychain token;
+      removing <code class="inline">local</code> is refused:
+    </p>
+    <pre class="code">$ rupu host <span class="k">remove</span> <span class="s">host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</span>
+removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
+    <p>
+      The same registry is exposed in the browser — adding and removing hosts in
+      the Control Plane writes the exact same TOML records and keychain entries,
+      so the CLI and the CP are always looking at one shared fleet.
+    </p>
+
+    <h2>In the Control Plane</h2>
+    <p>
+      With hosts registered, the central
+      <a class="link" href="/docs/control-plane.html">Control plane</a> becomes
+      fleet-aware. Everything you can do on the local host you can now do on a
+      remote one — whichever transport reaches it.
+    </p>
+    <ul>
+      <li>
+        <strong>Fleet &#8594; Hosts.</strong> A new top-level surface listing every
+        host (name, transport, status, version, active runs, last seen), with
+        <code class="inline">local</code> pinned first and an <strong>Add Host</strong>
+        form that registers <strong>HTTP, SSH, and bucket</strong> hosts right from
+        the browser (tunnel nodes enroll via the CLI). Each host's status is probed
+        live; a host's detail view scopes the
+        run list to that one host plus its connection and health info.
+      </li>
+      <li>
+        <strong>Host attribution + filtering.</strong> Run lists gain a
+        <strong>Host column and filter</strong> so you can see at a glance where
+        each run is executing. Runs are addressed by
+        <code class="inline">(host_id, run_id)</code>, so deep-links stay stable;
+        run detail shows the owning host. The default view stays "this host," so
+        single-host setups are completely unchanged.
+      </li>
+      <li>
+        <strong>Host selector in the launcher.</strong> The launcher gains a
+        host picker (defaulting to local). Launch a <strong>workflow run</strong>,
+        an <strong>agent run</strong>, or a <strong>session</strong> on whichever
+        host you choose — and send session turns to it — all proxied to that
+        host's launch endpoints.
+      </li>
+      <li>
+        <strong>Observe a host's runs.</strong> List, detail, the live event
+        stream, and the transcript of any remote run all surface in the central
+        CP — proxied straight through for HTTP hosts, mirrored into the central
+        run store for tunnel / SSH / bucket hosts. The same live view works
+        whether the run is local or three hosts away.
+      </li>
+      <li>
+        <strong>Control remote runs.</strong> Approve, reject, and cancel a
+        paused or in-flight run on the host that owns it — over whichever
+        transport that host uses (queued in the bucket for dead-drop hosts).
+      </li>
+      <li>
+        <strong>Graceful degradation.</strong> When a host is unreachable, the
+        run-list fan-out tolerates it per-host: that host shows an offline marker
+        and the rest of the page stays intact. Launch or control against an
+        offline host returns a clear error, and live streams auto-reconnect.
+      </li>
+    </ul>
+    <div class="callout">
+      <strong>Driving the fleet needs the full runtime.</strong> Controlling
+      remote hosts requires the central side to run the full
+      <code class="inline">rupu cp serve</code> runtime — that's what installs the
+      host registry with its transport connectors and the mirror / pull workers.
+      The read-only <code class="inline">rupu cp</code> can show hosts but cannot
+      control them.
+    </div>
+
+    <h2>Distribute work across the fleet</h2>
+    <p>
+      Beyond running a whole workflow on one host, a single workflow run can place
+      individual <a class="link" href="/docs/workflows.html">workflow</a> steps —
+      or spread one step's units — across the fleet. Three placement controls ship
+      today, and they all work over every transport (HTTP / SSH / tunnel / bucket):
+      <strong>fan-out units</strong>, <strong>per-step placement</strong>, and
+      <strong>workspace sync</strong> so a remotely-placed step can read and write
+      your real project files.
+    </p>
+
+    <h3>Fan-out units across hosts</h3>
+    <p>
+      A <code class="inline">for_each</code> step's units can be
+      <strong>spread across the fleet</strong>. Add a
+      <code class="inline">distribute:</code> block naming the hosts; rupu assigns
+      the units <strong>round-robin</strong>, dispatches each to its host,
+      attributes the unit's run to that host, and aggregates the results back into
+      the step — partial failures honored per
+      <code class="inline">continue_on_error</code>.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">review_each</span>
+    <span class="k">agent</span>: <span class="v">code-reviewer</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; inputs.files &#125;&#125;"</span>
+    <span class="k">distribute</span>:
+      <span class="k">hosts</span>: [<span class="v">gpu-box</span>, <span class="v">build-box</span>]
+    <span class="k">prompt</span>: <span class="s">"Review &#123;&#123; item &#125;&#125;."</span></pre>
+
+    <h3>Per-step host placement</h3>
+    <p>
+      A single <strong>linear step</strong> (one with an <code class="inline">agent</code>
+      and a <code class="inline">prompt</code>) can run on a named fleet host with a
+      <code class="inline">host:</code> field. The whole step's agent runs on that
+      host instead of locally, and its output feeds downstream steps exactly as a
+      local step would. <code class="inline">host:</code> is <strong>linear-only</strong> —
+      it's rejected on <code class="inline">for_each</code>,
+      <code class="inline">parallel</code>, and <code class="inline">panel</code>
+      steps (use <code class="inline">distribute:</code> to spread a
+      <code class="inline">for_each</code>), and it must name a non-empty host.
+      Absent, the step runs locally, exactly as before.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">train</span>
+    <span class="k">agent</span>: <span class="v">model-trainer</span>
+    <span class="k">host</span>: <span class="v">gpu-box</span>
+    <span class="k">prompt</span>: <span class="s">"Fine-tune on &#123;&#123; inputs.dataset &#125;&#125;."</span></pre>
+
+    <h3>Workspace sync for remote steps</h3>
+    <p>
+      By default a remotely-placed step is <strong>self-contained</strong> — it sees
+      only its rendered prompt plus prior steps' string outputs, not your files. Add
+      <code class="inline">workspace: sync</code> to a <strong>remote step</strong>
+      (one with <code class="inline">host:</code> or
+      <code class="inline">distribute:</code>) and the coordinator ships its
+      <strong>file workspace</strong> to the host: the step's agent reads and writes
+      the real project files, and the changed files are propagated back so
+      downstream steps see them. This is how <strong>file-mutating steps</strong> can
+      now run remotely.
+    </p>
+    <p>
+      The mechanism is <strong>auto git-or-tar</strong>: if the workspace is a git
+      repo it syncs via git (patch / 3-way merge on the return path); otherwise it
+      packs a gitignore-aware tar and returns a changed-files delta. Detection is
+      automatic — <strong>no extra config</strong>, and no git/tar tooling needs to
+      be installed on the host (rupu carries a vendored libgit2 and tar). It's
+      <strong>opt-in</strong> and only valid on a remote step; on a purely-local
+      step <code class="inline">workspace: sync</code> is rejected as a no-op.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">refactor</span>
+    <span class="k">agent</span>: <span class="v">refactorer</span>
+    <span class="k">host</span>: <span class="v">gpu-box</span>
+    <span class="k">workspace</span>: <span class="v">sync</span>
+    <span class="k">prompt</span>: <span class="s">"Apply the migration across the crate."</span></pre>
+    <p>See <a class="link" href="/docs/workflows.html">Workflows</a> for the full step format.</p>
+
+    <h2>Choosing a transport</h2>
+    <p>
+      All five transports satisfy the same port, so pick by how the host can be
+      reached on the network — not by what features you want:
+    </p>
+    <ul>
+      <li>
+        <strong>The CP can reach the host directly.</strong> If the host can run
+        a reachable, TLS-fronted server, use <strong>HTTP</strong>. If it can't
+        run a server but you can already <code class="inline">ssh</code> to it,
+        use <strong>SSH</strong> — no daemon to deploy, auth comes from your SSH
+        config.
+      </li>
+      <li>
+        <strong>The host is behind a NAT or firewall.</strong> It can't accept an
+        inbound connection but can dial out — use the <strong>Tunnel</strong>:
+        run <code class="inline">rupu node</code> on the box and it connects home.
+      </li>
+      <li>
+        <strong>Neither side can reach the other.</strong> Air-gapped, locked
+        down, or batch / cron hosts that only share an object store — use a
+        <strong>Bucket</strong> dead-drop and run <code class="inline">rupu node
+        pull</code> on the worker.
+      </li>
+    </ul>
+
+    <h2>Still coming</h2>
+    <p>
+      All five transports above are <strong>shipped today</strong>, as are the three
+      placement controls in <em>Distribute work across the fleet</em> (fan-out units,
+      per-step <code class="inline">host:</code>, and
+      <code class="inline">workspace: sync</code>). The architecture was built around
+      one transport port (<code class="inline">HostConnector</code>) so the remaining
+      work slots in without disturbing the surfaces above. These are genuinely
+      <strong>not done yet</strong>:
+    </p>
+    <table>
+      <thead>
+        <tr><th>Coming later</th><th>What it adds</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Auto-placement</td>
+          <td><strong>Capability-based scheduling</strong> — picking the host for a run automatically from its advertised backends and capabilities.</td>
+        </tr>
+        <tr>
+          <td>Remote sessions over the tunnel</td>
+          <td>Interactive, long-lived <strong>sessions</strong> dispatched to a tunnel node (a persistent session worker + reconnect-stable mapping). Today's tunnel covers workflow / agent runs and approve / reject / resume; sessions are deferred.</td>
+        </tr>
+        <tr>
+          <td>mTLS hardening</td>
+          <td><strong>Mutual-TLS</strong> node enrollment (cert CN = node id) on top of today's token-hash auth — the frame envelope already carries an <code class="inline">auth</code> block so it slots in with no protocol change.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/control-plane.html">&#8592; Control plane</a>
+      <a href="/docs/coverage.html">Coverage &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
