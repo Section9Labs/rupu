@@ -285,8 +285,16 @@ public struct RunDetailScreen: View {
     }
 
     private func gateRow(store: RunDetailStore, gate: APIAwaitingGate) -> some View {
-        let approveKey = ActionKey(runID, .approve)
-        let rejectKey = ActionKey(runID, .reject)
+        // Fix round 1: gate-scoped keys, not plain run-scoped ones — a run
+        // showing more than one parked gate at once (this `ForEach`) needs
+        // independent pending state per gate. A plain `ActionKey(runID,
+        // .approve)` collided across gates: approving gate A
+        // spinnered/disabled gate B's controls too, then silently
+        // un-disabled them the moment gate A's own confirmation landed,
+        // even though gate B's own mutation was never fired. See
+        // `ActionKey.gate`'s doc comment.
+        let approveKey = ActionKey.gate(runID: runID, stepID: gate.stepID, verb: .approve)
+        let rejectKey = ActionKey.gate(runID: runID, stepID: gate.stepID, verb: .reject)
         let approveState = store.pendingActions.state(approveKey)
         let rejectState = store.pendingActions.state(rejectKey)
         let approvePending = isPending(approveState)

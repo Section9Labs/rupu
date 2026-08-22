@@ -323,8 +323,15 @@ public final class ActivityStore {
     /// `GET /api/runs/:id` does), so resolving it is the caller's
     /// responsibility, same "gate targeting always explicit" contract
     /// every write route in this phase follows.
+    ///
+    /// **Gate-scoped key** (fix round 1): `ActionKey.gate(runID:stepID:verb:)`,
+    /// matching the exact composite convention `RunDetailStore.approve`
+    /// uses for the same gate — required for the two stores' shared
+    /// `pendingActions` ledger to actually agree on what a given mutation's
+    /// key is (a plain run-scoped key here would silently disagree with
+    /// `RunDetailStore`'s now-composite one for the same run/gate).
     public func approve(runID: String, gate: String, host: String?) async {
-        let key = ActionKey(runID, .approve)
+        let key = ActionKey.gate(runID: runID, stepID: gate, verb: .approve)
         pendingActions.begin(key)
         do {
             _ = try await client.approveRun(id: runID, host: host, gate: gate)
@@ -346,7 +353,7 @@ public final class ActivityStore {
     /// status still lands here promptly off the same `runCompleted`/
     /// `runFailed` event the row's status column already live-patches from.
     public func reject(runID: String, gate: String, host: String?) async {
-        let key = ActionKey(runID, .reject)
+        let key = ActionKey.gate(runID: runID, stepID: gate, verb: .reject)
         pendingActions.begin(key)
         do {
             _ = try await client.rejectRun(id: runID, host: host, gate: gate)

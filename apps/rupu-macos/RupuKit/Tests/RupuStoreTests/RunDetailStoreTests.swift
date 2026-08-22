@@ -288,6 +288,62 @@ private func makeStore(
     runBox.latest.finish()
 }
 
+// Fix round 1 (folded minor): `stepPaused`/`stepResumed` are the
+// step-scoped counterparts to `runPaused`/`runResumed` — a detached
+// runner's step-level pause/resume still implies the run itself is now
+// `.paused`/`.running` for this store's `pendingActions.resolve` purposes,
+// same fast-path confirmation `runPaused`/`runResumed` already give.
+@MainActor @Test func stepPausedEventResolvesPendingPauseKey() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "running")) },
+        pauseResult: { runControlResponse(status: "running") }, // response doesn't itself prove .paused
+        runStreamBox: runBox
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .pause)
+    await store.pause()
+    guard case .pending = store.pendingActions.state(key) else {
+        Issue.record("expected pause to still be .pending before the step-level event, got \(store.pendingActions.state(key))")
+        return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepPaused(runID: "run-1", stepID: "build")))
+
+    let confirmed = await pollUntil { store.pendingActions.state(key) == .confirmed }
+    #expect(confirmed, "expected pause to confirm off a step-scoped stepPaused event")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+@MainActor @Test func stepResumedEventResolvesPendingResumeKey() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "paused")) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .resume)
+    await store.resume()
+    guard case .pending = store.pendingActions.state(key) else {
+        Issue.record("expected resume to still be .pending before the step-level event, got \(store.pendingActions.state(key))")
+        return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepResumed(runID: "run-1", stepID: "build")))
+
+    let confirmed = await pollUntil { store.pendingActions.state(key) == .confirmed }
+    #expect(confirmed, "expected resume to confirm off a step-scoped stepResumed event")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
 // MARK: - (c) terminal event stops the stream and refreshes once
 
 @MainActor @Test func terminalEventStopsStreamAndRefreshesDetailFindingsNetflowExactlyOnce() async {
@@ -881,7 +937,7 @@ private func makeStore(
         runStreamBox: runBox
     )
     await store.activate()
-    let key = ActionKey("run-1", .approve)
+    let key = ActionKey.gate(runID: "run-1", stepID: "gate-1", verb: .approve)
     #expect(store.pendingActions.state(key) == .idle)
 
     await store.approve(gate: "gate-1")
@@ -920,6 +976,45 @@ private func makeStore(
 
     #expect(store.pendingActions.state(key) == .confirmed)
     #expect(detailCalls.value == 2)
+
+    store.deactivate()
+}
+
+/// Fix round 1 (Important, previously untested): the remote-proxy response
+/// shape (`{ok, host_id}`, no `run` body at all — see `RunControlResponse`'s
+/// doc comment) has nothing for `resolve(runID:observedStatus:)` to check,
+/// so `handleImmediateResponse` falls back to confirming directly off
+/// `ok == true`. This is the accepted behavior (the local host that ran the
+/// mutation never sent its record back across the proxy hop; a 2xx from an
+/// immediate route is itself the proof), not a gap — this test locks it in.
+@MainActor @Test func cancelConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "running")) },
+        cancelResult: { _ in RunControlResponse(run: nil, ok: true, hostID: "mini", archived: nil) }
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .cancel)
+    await store.cancel()
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+
+    store.deactivate()
+}
+
+/// Same remote-proxy `ok`-only fallback, exercised via reject's gate-scoped
+/// key.
+@MainActor @Test func rejectConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "awaiting_approval")) },
+        rejectResult: { _, _ in RunControlResponse(run: nil, ok: true, hostID: "mini", archived: nil) }
+    )
+    await store.activate()
+
+    let key = ActionKey.gate(runID: "run-1", stepID: "gate-1", verb: .reject)
+    await store.reject(gate: "gate-1")
+
+    #expect(store.pendingActions.state(key) == .confirmed)
 
     store.deactivate()
 }
@@ -978,12 +1073,85 @@ private func makeStore(
     )
     await store.activate()
 
-    let key = ActionKey("run-1", .reject)
+    let key = ActionKey.gate(runID: "run-1", stepID: "gate-1", verb: .reject)
     await store.reject(gate: "gate-1")
 
     #expect(store.pendingActions.state(key) == .confirmed)
 
     store.deactivate()
+}
+
+/// Fix round 1 (Critical): two gates parked on the same run must track
+/// pending state fully independently — approving gate A must never
+/// spinner/disable gate B's controls, and must never silently confirm gate
+/// B's own key.
+@MainActor @Test func multiGateApproveKeepsEachGatesPendingStateIndependent() async {
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(status: "awaiting_approval", awaiting: [
+                APIAwaitingGate(stepID: "gate-a", prompt: "deploy a?", since: "2026-08-20T12:00:00Z"),
+                APIAwaitingGate(stepID: "gate-b", prompt: "deploy b?", since: "2026-08-20T12:00:00Z"),
+            ]))
+        },
+        approveResult: { _, _ in runControlResponse(status: "awaiting_approval") }
+    )
+    await store.activate()
+
+    let keyA = ActionKey.gate(runID: "run-1", stepID: "gate-a", verb: .approve)
+    let keyB = ActionKey.gate(runID: "run-1", stepID: "gate-b", verb: .approve)
+    #expect(store.pendingActions.state(keyA) == .idle)
+    #expect(store.pendingActions.state(keyB) == .idle)
+
+    await store.approve(gate: "gate-a")
+
+    guard case .pending = store.pendingActions.state(keyA) else {
+        Issue.record("expected gate-a's key to be .pending, got \(store.pendingActions.state(keyA))")
+        return
+    }
+    #expect(store.pendingActions.state(keyB) == .idle, "gate-b's key must be untouched by gate-a's approve")
+
+    store.deactivate()
+}
+
+/// One run-level observed transition resolves EVERY gate's pending
+/// approve for that run — a run leaving `.awaiting` means every gate that
+/// was blocking it got settled one way or another. This is the accepted
+/// (per-review) trade-off of the composite-key `resolve` match: it can't
+/// distinguish which specific gate the observed event belongs to.
+@MainActor @Test func runLevelResolveConfirmsEveryGatesPendingApproveForThatRun() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(status: "awaiting_approval", awaiting: [
+                APIAwaitingGate(stepID: "gate-a", prompt: "deploy a?", since: "2026-08-20T12:00:00Z"),
+                APIAwaitingGate(stepID: "gate-b", prompt: "deploy b?", since: "2026-08-20T12:00:00Z"),
+            ]))
+        },
+        runStreamBox: runBox
+    )
+    await store.activate()
+
+    let keyA = ActionKey.gate(runID: "run-1", stepID: "gate-a", verb: .approve)
+    let keyB = ActionKey.gate(runID: "run-1", stepID: "gate-b", verb: .approve)
+    await store.approve(gate: "gate-a")
+    await store.approve(gate: "gate-b")
+    guard case .pending = store.pendingActions.state(keyA) else {
+        Issue.record("expected gate-a pending"); return
+    }
+    guard case .pending = store.pendingActions.state(keyB) else {
+        Issue.record("expected gate-b pending"); return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.runResumed(runID: "run-1")))
+
+    let bothConfirmed = await pollUntil {
+        store.pendingActions.state(keyA) == .confirmed && store.pendingActions.state(keyB) == .confirmed
+    }
+    #expect(bothConfirmed, "expected both gates' pending approve keys to confirm off one run-level transition")
+
+    store.deactivate()
+    runBox.latest.finish()
 }
 
 /// Archive/restore never confirm via `PendingActions.resolve` (they're not

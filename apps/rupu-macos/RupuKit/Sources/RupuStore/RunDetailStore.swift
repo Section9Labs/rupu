@@ -332,8 +332,12 @@ public final class RunDetailStore {
     /// gate can already have cleared it by the time this call returns, so
     /// the banner has a chance to catch up right away rather than waiting on
     /// this run's next unrelated refresh.
+    /// **Gate-scoped key** (fix round 1): `ActionKey.gate(runID:stepID:verb:)`,
+    /// not a plain run-scoped key — a run showing more than one parked gate
+    /// at once needs independent pending state per gate. See `ActionKey.gate`'s
+    /// doc comment.
     public func approve(gate stepID: String, mode: String? = nil) async {
-        let key = ActionKey(runID, .approve)
+        let key = ActionKey.gate(runID: runID, stepID: stepID, verb: .approve)
         pendingActions.begin(key)
         do {
             _ = try await postApprove(stepID, mode)
@@ -343,11 +347,12 @@ public final class RunDetailStore {
         }
     }
 
-    /// **Immediate**: the response record already reflects the rejection —
+    /// **Immediate**, **gate-scoped key** (same rationale as `approve`
+    /// above): the response record already reflects the rejection —
     /// `handleImmediateResponse` resolves the key from it right away rather
     /// than waiting for the next observed event.
     public func reject(gate stepID: String, reason: String? = nil) async {
-        let key = ActionKey(runID, .reject)
+        let key = ActionKey.gate(runID: runID, stepID: stepID, verb: .reject)
         pendingActions.begin(key)
         do {
             let response = try await postReject(stepID, reason)
@@ -439,12 +444,24 @@ public final class RunDetailStore {
     /// local response shape, which already carries the post-mutation
     /// `RunRecord`) via the same `PendingActions.resolve` confirmation table
     /// every live-event reduction uses — so, e.g., a reject that actually
-    /// routed to `on_reject` cancellation still confirms correctly. A remote
-    /// proxy response (`{ok, host_id}`, no `run` body — see
-    /// `RunControlResponse`'s doc comment) has no status to check against,
-    /// so a bare `ok == true` confirms directly instead. Refreshes `detail`
-    /// either way, so the header/awaiting-banner catch up to the mutation's
-    /// effect even on the remote-proxy path.
+    /// routed to `on_reject` cancellation still confirms correctly.
+    ///
+    /// **The `ok == true` fallback branch** (fix round 1: previously
+    /// untested): a remote-proxy response (`{ok, host_id}`, no `run` body —
+    /// see `RunControlResponse`'s doc comment) carries no post-mutation
+    /// status to check `resolve` against at all — the local host that
+    /// actually ran the mutation never sent its record back across the
+    /// proxy hop. This is accepted, not a gap to close: a 2xx from an
+    /// *immediate* route (reject/cancel/pause, never approve/resume) is
+    /// itself the server's proof the effect already happened, so confirming
+    /// `key` directly off `ok == true` is the honest reading of that
+    /// response shape, not a guess. Covered by
+    /// `cancelConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent`/
+    /// `rejectConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent` in
+    /// `RunDetailStoreTests`.
+    ///
+    /// Refreshes `detail` either way, so the header/awaiting-banner catch up
+    /// to the mutation's effect even on the remote-proxy path.
     private func handleImmediateResponse(_ key: ActionKey, _ response: RunControlResponse) async {
         if let confirmedStatus = response.confirmedStatus {
             pendingActions.resolve(runID: runID, observedStatus: .normalize(confirmedStatus))
@@ -628,6 +645,15 @@ public final class RunDetailStore {
             pendingActions.resolve(runID: runID, observedStatus: .running)
         case .runPaused(let runID):
             pendingActions.resolve(runID: runID, observedStatus: .paused)
+        case .stepPaused(let runID, _):
+            // Fix round 1 (folded minor): the step-scoped counterpart to
+            // `runPaused` — a detached/step-level pause still implies the
+            // run is now `.paused` for this store's confirmation purposes.
+            pendingActions.resolve(runID: runID, observedStatus: .paused)
+        case .stepResumed(let runID, _):
+            // Step-scoped counterpart to `runResumed` — same fast-path
+            // rationale.
+            pendingActions.resolve(runID: runID, observedStatus: .running)
         case .runCompleted(let runID, let status, _):
             pendingActions.resolve(runID: runID, observedStatus: .normalize(status))
             handleTerminal()

@@ -26,6 +26,35 @@ public struct ActionKey: Hashable, Sendable {
         self.entityID = entityID
         self.verb = verb
     }
+
+    /// **Composite-entity convention for gate verbs** (Phase 3, Task 5 fix
+    /// round 1): `approve`/`reject` target one specific parked gate, not
+    /// "the run" — a run can have more than one gate awaiting at once
+    /// (`RunRecord.awaiting` is a set), and `RunDetailScreen`'s banner
+    /// renders one control pair per gate, all at once. A plain
+    /// `ActionKey(runID, .approve)` collided across gates: approving gate A
+    /// spinnered/disabled gate B's controls too (same key, same state), and
+    /// then silently un-disabled them the moment gate A's own confirmation
+    /// landed — B's own mutation was never actually tracked.
+    ///
+    /// The fix is this composite `entityID`: `"\(runID):\(stepID)"`, built
+    /// only via this helper so every call site (`RunDetailStore`/
+    /// `ActivityStore`'s `approve`/`reject`, `RunDetailScreen`'s banner,
+    /// `ActivityTable`'s compact row) agrees on the exact same string.
+    /// **Every other verb stays run-scoped** (plain `ActionKey(runID, verb)`)
+    /// — cancel/pause/resume/archive/restore all act on the run as a whole,
+    /// with no per-gate ambiguity to disambiguate.
+    ///
+    /// `resolve(runID:observedStatus:)` below treats any key whose
+    /// `entityID` carries `runID` as this `"\(runID):"` prefix as belonging
+    /// to that run too, alongside an exact `entityID == runID` match — so
+    /// one observed run-level status transition still resolves every gate's
+    /// pending `approve`/`reject` for that run in one pass (a run leaving
+    /// `.awaiting` means every gate that was blocking it got settled one way
+    /// or another, whichever gate a given key names).
+    public static func gate(runID: String, stepID: String, verb: ActionVerb) -> ActionKey {
+        ActionKey("\(runID):\(stepID)", verb)
+    }
 }
 
 /// Lifecycle of one `ActionKey`. `.idle` is the default for a key that was
@@ -123,8 +152,17 @@ public final class PendingActions {
     /// or `.failed` — is never touched, and a verb this table doesn't cover
     /// for the given status is left `.pending` untouched too (still waiting
     /// for a later, more decisive status).
+    ///
+    /// "Belonging to `runID`" matches two shapes of `entityID`: an exact
+    /// `runID` (every run-scoped verb — cancel/pause/resume/archive/
+    /// restore), and a composite `"\(runID):<stepID>"` (a gate-scoped
+    /// approve/reject built via `ActionKey.gate(runID:stepID:verb:)` — see
+    /// that method's doc comment). One observed run-level status therefore
+    /// resolves every gate's pending key for this run in the same pass, not
+    /// just one arbitrarily-chosen gate.
     public func resolve(runID: String, observedStatus: ActivityStatus) {
-        let matchingKeys = states.keys.filter { $0.entityID == runID }
+        let gatePrefix = "\(runID):"
+        let matchingKeys = states.keys.filter { $0.entityID == runID || $0.entityID.hasPrefix(gatePrefix) }
         for key in matchingKeys {
             guard case .pending = states[key] else { continue }
             if Self.confirms(key.verb, observedStatus) {

@@ -220,6 +220,76 @@ private let resolveCases: [ResolveCase] = [
     #expect(actions.isStale(key, timeout: 30) == true)
 }
 
+// MARK: - ActionKey.gate composite convention (Phase 3, Task 5 fix round 1)
+
+/// Two gates on the same run must track independently — the bug the
+/// review's Critical finding flagged: a plain `ActionKey(runID, .approve)`
+/// gave every gate on a run the SAME key, so approving one gate
+/// spinnered/disabled another gate's controls too.
+@MainActor @Test func pendingActionGateKeyIsScopedByStepIDNotJustRunID() {
+    let actions = PendingActions(now: { Date() })
+    let gateA = ActionKey.gate(runID: "run-1", stepID: "gate-a", verb: .approve)
+    let gateB = ActionKey.gate(runID: "run-1", stepID: "gate-b", verb: .approve)
+
+    actions.begin(gateA)
+    #expect(actions.state(gateA) != .idle)
+    #expect(actions.state(gateB) == .idle)
+
+    actions.confirm(gateA)
+    #expect(actions.state(gateA) == .confirmed)
+    #expect(actions.state(gateB) == .idle)
+}
+
+/// `resolve(runID:observedStatus:)` must sweep every composite gate key
+/// belonging to `runID` — not just an exact `entityID == runID` match —
+/// since a gate-scoped key's `entityID` is `"\(runID):\(stepID)"`, never
+/// the bare `runID`. One observed run-level transition therefore resolves
+/// every gate's pending key for that run in the same pass.
+@MainActor @Test func pendingActionResolveSweepsEveryCompositeGateKeyForTheRun() {
+    let actions = PendingActions(now: { Date() })
+    let gateA = ActionKey.gate(runID: "run-1", stepID: "gate-a", verb: .approve)
+    let gateB = ActionKey.gate(runID: "run-1", stepID: "gate-b", verb: .reject)
+    let plainRunKey = ActionKey("run-1", .cancel)
+
+    actions.begin(gateA)
+    actions.begin(gateB)
+    actions.begin(plainRunKey)
+
+    // gateB is `.reject` — only `.rejected`/`.cancelled` confirm it, so
+    // `.running` resolves gateA and the plain key but leaves gateB pending;
+    // this also proves the sweep doesn't blindly confirm every matched key,
+    // only the ones whose own verb-specific rule says yes.
+    actions.resolve(runID: "run-1", observedStatus: .running)
+
+    #expect(actions.state(gateA) == .confirmed)
+    guard case .pending = actions.state(plainRunKey) else {
+        Issue.record("cancel should remain pending against .running, got \(actions.state(plainRunKey))")
+        return
+    }
+    guard case .pending = actions.state(gateB) else {
+        Issue.record("gateB's reject should remain pending against .running, got \(actions.state(gateB))")
+        return
+    }
+}
+
+/// Guards the prefix match itself against a false-positive on a numeric
+/// run-id collision: `"run-1"` must never be treated as a prefix-match for
+/// a DIFFERENT run's composite key `"run-12:gate-a"` — the match requires
+/// the full `"run-1:"` (with the trailing colon), which `"run-12:..."`
+/// does not start with.
+@MainActor @Test func pendingActionResolveDoesNotFalsePositiveOnANumericRunIDPrefixCollision() {
+    let actions = PendingActions(now: { Date() })
+    let otherRunsGate = ActionKey.gate(runID: "run-12", stepID: "gate-a", verb: .approve)
+
+    actions.begin(otherRunsGate)
+    actions.resolve(runID: "run-1", observedStatus: .running)
+
+    guard case .pending = actions.state(otherRunsGate) else {
+        Issue.record("run-12's gate key must be untouched by a resolve for run-1, got \(actions.state(otherRunsGate))")
+        return
+    }
+}
+
 @MainActor @Test func pendingActionIsStaleIsFalseForNonPendingStates() {
     let actions = PendingActions(now: { Date() })
     let idleKey = ActionKey("run-1", .approve)

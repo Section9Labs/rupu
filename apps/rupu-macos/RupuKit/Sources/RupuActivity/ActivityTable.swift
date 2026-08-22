@@ -100,6 +100,18 @@ private struct ActivityTableRow: View {
     let backend: BackendController
     let onSelect: (ActivityRow) -> Void
 
+    /// Local busy flag for the compact ✓/✕ pair — deliberately NOT read
+    /// from `store.pendingActions` (fix round 1): this row doesn't know
+    /// which gate it's targeting until `resolveSoleAwaitingGate` answers,
+    /// so there is no `ActionKey.gate(runID:stepID:verb:)` to look up yet
+    /// at the moment the button is tapped. This flag only covers the
+    /// resolve-then-post round trip's own UI feedback (spinner + disable,
+    /// double-tap guard); the mutation itself still lands in the shared
+    /// `pendingActions` ledger once `store.approve`/`store.reject` runs
+    /// with the now-known gate id, via the exact same composite key
+    /// `RunDetailStore`'s own banner uses for that gate.
+    @State private var isBusy = false
+
     private typealias Layout = ActivityTableLayout
 
     private var isClickable: Bool { row.navigation != .none }
@@ -178,17 +190,11 @@ private struct ActivityTableRow: View {
     @ViewBuilder
     private var awaitingActions: some View {
         if row.status == .awaiting, case .run(let runID, let host) = row.navigation {
-            let approveKey = ActionKey(runID, .approve)
-            let rejectKey = ActionKey(runID, .reject)
-            let approvePending = isPending(store.pendingActions.state(approveKey))
-            let rejectPending = isPending(store.pendingActions.state(rejectKey))
-            let anyPending = approvePending || rejectPending
-
             HStack(spacing: 6) {
                 Button {
                     Task { await resolveGateAndApprove(runID: runID, host: host) }
                 } label: {
-                    if approvePending {
+                    if isBusy {
                         ProgressView().controlSize(.mini)
                     } else {
                         Image(systemName: "checkmark.circle.fill")
@@ -196,13 +202,13 @@ private struct ActivityTableRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.status(.done))
-                .disabled(anyPending)
+                .disabled(isBusy)
                 .help("Approve")
 
                 Button {
                     Task { await resolveGateAndReject(runID: runID, host: host) }
                 } label: {
-                    if rejectPending {
+                    if isBusy {
                         ProgressView().controlSize(.mini)
                     } else {
                         Image(systemName: "xmark.circle.fill")
@@ -210,15 +216,10 @@ private struct ActivityTableRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.status(.fail))
-                .disabled(anyPending)
+                .disabled(isBusy)
                 .help("Reject")
             }
         }
-    }
-
-    private func isPending(_ state: ActionState) -> Bool {
-        if case .pending = state { return true }
-        return false
     }
 
     /// `GET /api/runs/workflows` (the source this row came from) carries no
@@ -230,12 +231,18 @@ private struct ActivityTableRow: View {
     /// server-side by the time this lands, or the API otherwise disagrees
     /// with the row's own `.awaiting` status) is a silent no-op — the row's
     /// next live-patch or refresh will correct its status either way.
+    /// `isBusy` brackets the whole resolve-then-post round trip so a
+    /// double-tap can't fire two overlapping gate lookups.
     private func resolveGateAndApprove(runID: String, host: String?) async {
+        isBusy = true
+        defer { isBusy = false }
         guard let gate = await resolveSoleAwaitingGate(runID: runID, host: host) else { return }
         await store.approve(runID: runID, gate: gate, host: host)
     }
 
     private func resolveGateAndReject(runID: String, host: String?) async {
+        isBusy = true
+        defer { isBusy = false }
         guard let gate = await resolveSoleAwaitingGate(runID: runID, host: host) else { return }
         await store.reject(runID: runID, gate: gate, host: host)
     }

@@ -1014,7 +1014,7 @@ struct ActivityStoreTests {
         await store.activate(kind: .workflows)
         #expect(store.rows.first?.status == .awaiting)
 
-        let key = ActionKey("run-wf-1", .approve)
+        let key = ActionKey.gate(runID: "run-wf-1", stepID: "gate-1", verb: .approve)
         await store.approve(runID: "run-wf-1", gate: "gate-1", host: "local")
         guard case .pending = store.pendingActions.state(key) else {
             Issue.record("expected .pending immediately after approve(), got \(store.pendingActions.state(key))")
@@ -1052,7 +1052,7 @@ struct ActivityStoreTests {
         })
         await store.activate(kind: .workflows)
 
-        let key = ActionKey("run-wf-1", .reject)
+        let key = ActionKey.gate(runID: "run-wf-1", stepID: "gate-1", verb: .reject)
         await store.reject(runID: "run-wf-1", gate: "gate-1", host: "local")
 
         guard case .failed(let message) = store.pendingActions.state(key) else {
@@ -1105,7 +1105,7 @@ struct ActivityStoreTests {
 
         await store.activate(kind: .workflows)
 
-        let key = ActionKey("run-wf-1", .approve)
+        let key = ActionKey.gate(runID: "run-wf-1", stepID: "gate-1", verb: .approve)
         #expect(runDetailStore.pendingActions.state(key) == .idle)
 
         await store.approve(runID: "run-wf-1", gate: "gate-1", host: "local")
