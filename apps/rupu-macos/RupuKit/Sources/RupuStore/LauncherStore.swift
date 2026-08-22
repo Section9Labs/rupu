@@ -12,27 +12,38 @@ public enum LaunchKind: String, CaseIterable, Sendable {
     case agentRun, session, workflow
 }
 
-/// `Result`'s `Failure` generic parameter requires `Error` conformance, but
-/// `LaunchOutcome.result` is specified (brief, Task 7) as plain
-/// `Result<Route, String>` — a bare message, not a typed error — matching
-/// every other mutation surface in this module (`mutationErrorMessage(_:)`
-/// already collapses every failure down to a `String`). This conformance
-/// exists solely to satisfy that generic constraint for this one type; nothing
-/// here throws a bare `String` as an `Error` elsewhere in the module.
-extension String: @retroactive Error {}
+/// `LaunchOutcome.result`'s failure payload — a bare message, not a typed
+/// taxonomy of failure modes (every mutation surface in this module already
+/// collapses failures down to one string via `mutationErrorMessage(_:)`).
+/// Review fix (fold 1): originally a plain `String` via a module-wide
+/// `extension String: Error`, which silently made *every* string in
+/// `RupuStore` throwable (`throw "typo"` would have type-checked anywhere in
+/// the module) — a foot-gun with no offsetting benefit. This one-case enum
+/// gets the same ergonomics (`Result<Route, LaunchError>`) without that
+/// blast radius.
+public enum LaunchError: Error, Equatable, Sendable {
+    case message(String)
+
+    public var text: String {
+        switch self {
+        case .message(let value): return value
+        }
+    }
+}
 
 /// One target host's launch attempt, recorded after `launch()`'s POST for
 /// it resolves — `host` is the target's id (`"local"` for the embedded
 /// backend, a Fleet node id otherwise), never the request's `nil`-for-local
 /// body encoding. `result` carries either the destination `Route` a
-/// successful launch reached, or the same `mutationErrorMessage(_:)`-mapped
-/// string every other mutation in this module surfaces on failure (a 501
-/// reads as "server lacks launch runtime — start with `rupu cp serve`").
+/// successful launch reached, or a `LaunchError` wrapping the same
+/// `mutationErrorMessage(_:)`-mapped string every other mutation in this
+/// module surfaces on failure (a 501 reads as "server lacks launch runtime —
+/// start with `rupu cp serve`").
 public struct LaunchOutcome: Equatable, Sendable {
     public let host: String
-    public let result: Result<Route, String>
+    public let result: Result<Route, LaunchError>
 
-    public init(host: String, result: Result<Route, String>) {
+    public init(host: String, result: Result<Route, LaunchError>) {
         self.host = host
         self.result = result
     }
@@ -88,6 +99,18 @@ public final class LauncherStore {
     public private(set) var workflowInputs: [String: WorkflowInputDef] = [:]
     public var inputValues: [String: String] = [:]
 
+    /// Review fix (fold 2): the previously-silent "fail open" on a
+    /// `workflowDetail` fetch failure now leaves a message here too, so
+    /// Task 8 can render "couldn't load declared inputs" instead of a
+    /// silently-empty input list that looks identical to a workflow with
+    /// genuinely no declared inputs. `selectDefinition` still fails open —
+    /// `workflowInputs`/`inputValues` end up `[:]` either way, so
+    /// `canLaunch`'s required-input check trivially passes with nothing to
+    /// require — this is purely an added surface for the message, not a
+    /// change to that behavior. Cleared on every new `selectDefinition`
+    /// call and on a subsequent success.
+    public private(set) var inputsLoadError: String?
+
     public var prompt: String = ""
     public var mode: String = "ask"
 
@@ -111,6 +134,15 @@ public final class LauncherStore {
 
     private let client: CPClient
     private var hostsGeneration = 0
+
+    /// Review fix (Important 1): guards against a stale `workflowDetail`
+    /// fetch clobbering a newer `selectDefinition` call's result — see
+    /// `selectDefinition`'s doc comment. Same recipe as `hostsGeneration`
+    /// one field above (and `RunDetailStore.focusGeneration`): incremented
+    /// synchronously on every call's entry, captured locally, and the
+    /// fetched result is discarded if the captured value no longer matches
+    /// by the time the `await` resolves.
+    private var selectDefinitionGeneration = 0
 
     public init(client: CPClient) {
         self.client = client
@@ -138,9 +170,28 @@ public final class LauncherStore {
     /// `workflowInputs`/`inputValues` are cleared instead, so switching
     /// `kind` (or selecting a different definition) never leaves a stale
     /// prior workflow's input rows showing.
+    ///
+    /// **Overlapping calls** (review fix, Important 1): a rapid A→B
+    /// selection — e.g. a fast typeahead, or a picker double-click — used to
+    /// be last-*resolved*-wins, not last-*called*-wins: if A's fetch was
+    /// slower than B's, A's stale result could land after B's and silently
+    /// overwrite `workflowInputs`/`inputValues` out from under the operator,
+    /// even though `selectedDefinition` correctly still read "B" — `launch()`
+    /// would then submit A-shaped inputs under B's name. `selectDefinitionGeneration`
+    /// closes that: bumped synchronously on every call's entry (before any
+    /// `await`), so a call's own generation is fixed the instant it's
+    /// invoked, independent of how long its fetch takes. A result is applied
+    /// only if the generation captured at entry still matches when the fetch
+    /// resolves — same "only the most recent call wins, by construction"
+    /// recipe `RunDetailStore.focusStep`'s `focusGeneration` already
+    /// documents.
     public func selectDefinition(_ name: String) async {
+        selectDefinitionGeneration += 1
+        let generation = selectDefinitionGeneration
+
         selectedDefinition = name
         validationError = nil
+        inputsLoadError = nil
 
         guard kind == .workflow else {
             workflowInputs = [:]
@@ -150,6 +201,7 @@ public final class LauncherStore {
 
         do {
             let detail = try await client.workflowDetail(name: name)
+            guard generation == selectDefinitionGeneration else { return }
             workflowInputs = detail.inputs
             var values: [String: String] = [:]
             for (key, input) in detail.inputs {
@@ -158,13 +210,15 @@ public final class LauncherStore {
             inputValues = values
         } catch {
             guard !isCancellation(error) else { return }
-            // No dedicated failure surface for this fetch this phase (same
-            // "fail open" reasoning `RunDetailStore.focusStep`'s transcript
-            // fallback uses) — an empty declared-input set just means the
-            // form shows no input rows, and `canLaunch`'s required-input
-            // check trivially passes with nothing to require.
+            guard generation == selectDefinitionGeneration else { return }
+            // Fail open (see `inputsLoadError`'s doc comment): an empty
+            // declared-input set just means the form shows no input rows,
+            // and `canLaunch`'s required-input check trivially passes with
+            // nothing to require — `inputsLoadError` is purely an added
+            // surface for the message, not a change to that behavior.
             workflowInputs = [:]
             inputValues = [:]
+            inputsLoadError = String(describing: error)
         }
     }
 
@@ -196,6 +250,23 @@ public final class LauncherStore {
     /// returns without firing any request — see the type doc comment's
     /// "No validate-on-launch" section for why this is the only validation
     /// `launch()` performs.
+    ///
+    /// **Concurrent fan-out** (review fix, Important 2): a multi-target
+    /// batch used to fire its POSTs one at a time in a plain `for` loop and
+    /// only publish `launchResults` once every one of them had finished —
+    /// so one slow or stuck host delayed every *later* target's request from
+    /// even being *sent*, and Task 8's per-host outcome rows couldn't update
+    /// progressively no matter how the view was built. Targets now launch
+    /// concurrently via a `TaskGroup`, and each `LaunchOutcome` is appended
+    /// to `launchResults` the moment its own POST resolves — a fast target's
+    /// row can appear while a slow one is still in flight. The published
+    /// order is completion order (not target order); once every task has
+    /// landed, `launchResults` is sorted by host for a stable, deterministic
+    /// final read. The batch's pending key follows the same "any success"
+    /// policy as before — `confirm`ed if at least one target succeeded, else
+    /// `fail`ed with the first (sorted) failure's message — but it now only
+    /// resolves after the *last* task completes, never before, so it can't
+    /// read as settled while a target is still outstanding.
     public func launch() async -> Route? {
         let missing = missingRequiredInputNames()
         guard missing.isEmpty else {
@@ -207,42 +278,53 @@ public final class LauncherStore {
 
         let key = ActionKey("launcher", .launch)
         pendingActions.begin(key)
+        launchResults = []
 
         let targets = resolvedTargets()
-        var outcomes: [LaunchOutcome] = []
-        for target in targets {
+
+        if targets.count == 1 {
+            let target = targets[0]
             let hostField = target == "local" ? nil : target
             do {
                 let route = try await performLaunch(hostField: hostField)
-                outcomes.append(LaunchOutcome(host: target, result: .success(route)))
-            } catch {
-                outcomes.append(LaunchOutcome(host: target, result: .failure(mutationErrorMessage(error))))
-            }
-        }
-        launchResults = outcomes
-
-        if outcomes.count == 1 {
-            switch outcomes[0].result {
-            case .success(let route):
+                launchResults = [LaunchOutcome(host: target, result: .success(route))]
                 pendingActions.confirm(key)
                 return route
-            case .failure(let message):
+            } catch {
+                let message = mutationErrorMessage(error)
+                launchResults = [LaunchOutcome(host: target, result: .failure(.message(message)))]
                 pendingActions.fail(key, message)
                 return nil
             }
         }
 
-        // Multi-target: the batch itself is "done" the moment every POST
-        // has resolved, whatever their individual outcomes — the caller
-        // renders `launchResults` per row rather than this method picking
-        // one aggregate verdict. `confirm` when at least one target
-        // succeeded; `fail` (with the first failure's message, as a
-        // representative summary) only when every target failed.
-        let anySucceeded = outcomes.contains { if case .success = $0.result { return true } else { return false } }
+        await withTaskGroup(of: Void.self) { group in
+            for target in targets {
+                group.addTask { [weak self] in
+                    guard let self else { return }
+                    let hostField = target == "local" ? nil : target
+                    do {
+                        let route = try await self.performLaunch(hostField: hostField)
+                        await self.recordOutcome(LaunchOutcome(host: target, result: .success(route)))
+                    } catch {
+                        let outcome = LaunchOutcome(host: target, result: .failure(.message(mutationErrorMessage(error))))
+                        await self.recordOutcome(outcome)
+                    }
+                }
+            }
+            await group.waitForAll()
+        }
+
+        // Every target has now landed (`waitForAll()` above only returns
+        // once the last child task's `recordOutcome` has run) — safe to
+        // resolve the batch's pending key and give callers a deterministic
+        // final order.
+        launchResults.sort { $0.host < $1.host }
+        let anySucceeded = launchResults.contains { if case .success = $0.result { return true } else { return false } }
         if anySucceeded {
             pendingActions.confirm(key)
-        } else if case .failure(let message) = outcomes.first?.result {
-            pendingActions.fail(key, message)
+        } else if case .failure(let error) = launchResults.first?.result {
+            pendingActions.fail(key, error.text)
         } else {
             pendingActions.fail(key, "no targets")
         }
@@ -288,6 +370,14 @@ public final class LauncherStore {
     }
 
     // MARK: - Launch mechanics
+
+    /// Appends one target's outcome to `launchResults` as soon as it lands —
+    /// called from each fan-out `TaskGroup` child task, hopping back onto
+    /// this `@MainActor` type to mutate observable state safely. See
+    /// `launch()`'s doc comment's "Concurrent fan-out" section.
+    private func recordOutcome(_ outcome: LaunchOutcome) {
+        launchResults.append(outcome)
+    }
 
     private func performLaunch(hostField: String?) async throws -> Route {
         guard let name = selectedDefinition else {

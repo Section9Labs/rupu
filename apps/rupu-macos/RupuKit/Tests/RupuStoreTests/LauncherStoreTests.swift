@@ -118,6 +118,18 @@ struct LauncherStoreTests {
         """#
     }
 
+    /// Minimal `workflowDetail` body whose single declared-input key is
+    /// derived from `name` (`"<name>_input"`) — used by the
+    /// `selectDefinition` race tests so the *content* of `workflowInputs`
+    /// unambiguously identifies which definition's fetch actually won,
+    /// independent of `selectedDefinition` (which is set synchronously and
+    /// so is never itself racy).
+    private static func racyWorkflowDetailJSON(name: String) -> String {
+        #"""
+        {"workflow":{"name":"\#(name)","inputs":{"\#(name)_input":{"type":"string","required":true,"enum":[]}}},"yaml":"name: \#(name)\n"}
+        """#
+    }
+
     private static func hostJSON(id: String, status: String) -> String {
         #"{"id":"\#(id)","name":"\#(id)","transport_kind":"ssh","status":"\#(status)"}"#
     }
@@ -171,7 +183,7 @@ struct LauncherStoreTests {
     // (b) `selectDefinition` for a workflow fetches its detail and seeds
     // `workflowInputs` + `inputValues` — required input with no default
     // seeds an empty string, non-required input with a default seeds that
-    // default.
+    // default. `inputsLoadError` stays `nil` on a successful fetch.
     @MainActor @Test func selectDefinitionForWorkflowSeedsInputsWithDefaults() async {
         let store = makeStore { req in
             guard req.url?.path == "/api/workflows/deploy" else { return (200, Data("[]".utf8)) }
@@ -186,6 +198,93 @@ struct LauncherStoreTests {
         #expect(store.workflowInputs["message"]?.required == false)
         #expect(store.inputValues["target"] == "")
         #expect(store.inputValues["message"] == "hello")
+        #expect(store.inputsLoadError == nil)
+    }
+
+    // (b2) Review fix (Important 1): a rapid A→B selection is
+    // last-*called*-wins, not last-*resolved*-wins — A's slower fetch
+    // landing after B's must never clobber B's already-applied inputs (nor
+    // leave a mix of the two). `selectedDefinition == "B"` reads correctly
+    // even without the fix (it's set synchronously); the fix is that
+    // `workflowInputs` agrees with it.
+    @MainActor @Test func rapidSelectDefinitionRaceOlderSlowerCallNeverClobbersNewerFasterOne() async {
+        let store = makeStore { req in
+            guard let path = req.url?.path else { return (200, Data("[]".utf8)) }
+            if path == "/api/workflows/A" {
+                Thread.sleep(forTimeInterval: 0.08) // artificially slow, the OLDER call
+                return (200, Data(Self.racyWorkflowDetailJSON(name: "A").utf8))
+            }
+            if path == "/api/workflows/B" {
+                return (200, Data(Self.racyWorkflowDetailJSON(name: "B").utf8)) // fast, the NEWER call
+            }
+            return (200, Data("[]".utf8))
+        }
+        store.kind = .workflow
+
+        async let first: Void = store.selectDefinition("A")
+        try? await Task.sleep(for: .milliseconds(10)) // let A's slow fetch actually begin
+        async let second: Void = store.selectDefinition("B")
+        _ = await (first, second)
+
+        // Outlive A's slow fetch, in case it's still resolving.
+        try? await Task.sleep(for: .milliseconds(120))
+
+        #expect(store.selectedDefinition == "B")
+        #expect(store.workflowInputs.keys.contains("B_input"))
+        #expect(!store.workflowInputs.keys.contains("A_input"))
+    }
+
+    // (b3) Same race, names/timing reversed — the newer call (this time
+    // "A", called second) still wins even though it's the fast one and the
+    // older call ("B") is the slow one. Rules out any accidental bias
+    // toward a specific name or call slot in the fix.
+    @MainActor @Test func rapidSelectDefinitionRaceReversedOrderStillLastCallWins() async {
+        let store = makeStore { req in
+            guard let path = req.url?.path else { return (200, Data("[]".utf8)) }
+            if path == "/api/workflows/B" {
+                Thread.sleep(forTimeInterval: 0.08) // artificially slow, the OLDER call this time
+                return (200, Data(Self.racyWorkflowDetailJSON(name: "B").utf8))
+            }
+            if path == "/api/workflows/A" {
+                return (200, Data(Self.racyWorkflowDetailJSON(name: "A").utf8)) // fast, the NEWER call this time
+            }
+            return (200, Data("[]".utf8))
+        }
+        store.kind = .workflow
+
+        async let first: Void = store.selectDefinition("B")
+        try? await Task.sleep(for: .milliseconds(10)) // let B's slow fetch actually begin
+        async let second: Void = store.selectDefinition("A")
+        _ = await (first, second)
+
+        try? await Task.sleep(for: .milliseconds(120))
+
+        #expect(store.selectedDefinition == "A")
+        #expect(store.workflowInputs.keys.contains("A_input"))
+        #expect(!store.workflowInputs.keys.contains("B_input"))
+    }
+
+    // (b4) Review fix (fold 2): a `workflowDetail` fetch failure sets
+    // `inputsLoadError` for the UI to render, while still failing open —
+    // `workflowInputs`/`inputValues` land empty (not left stale) and
+    // `canLaunch` is unaffected by the empty, unknown input set.
+    @MainActor @Test func workflowDetailFetchFailureSetsInputsLoadErrorAndFailsOpen() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/workflows/deploy" else { return (200, Data("[]".utf8)) }
+            return (500, Data(#"{"error":"boom"}"#.utf8))
+        }
+        store.kind = .workflow
+
+        await store.selectDefinition("deploy")
+
+        #expect(store.selectedDefinition == "deploy")
+        #expect(store.workflowInputs.isEmpty)
+        #expect(store.inputValues.isEmpty)
+        #expect(store.inputsLoadError != nil)
+        // Fail-open: no required inputs are known, so nothing blocks
+        // `canLaunch` besides having a definition and a target host — both
+        // satisfied by defaults (`selectedHosts == ["local"]`).
+        #expect(store.canLaunch == true)
     }
 
     // (c) `canLaunch` matrix: no definition blocks; a missing required
@@ -320,11 +419,102 @@ struct LauncherStoreTests {
             return
         }
         #expect(route == .runDetail(id: "run-local-1", host: nil))
-        guard case .failure(let message) = miniOutcome?.result else {
+        guard case .failure(let error) = miniOutcome?.result else {
             Issue.record("expected mini outcome to fail")
             return
         }
-        #expect(!message.isEmpty)
+        #expect(!error.text.isEmpty)
+    }
+
+    // (f2) Review fix (Important 2): a fast target's `LaunchOutcome` lands
+    // in `launchResults` while a slower target is still in flight — the
+    // fan-out publishes progressively, not all-at-once after the last one
+    // finishes. Uses a bounded `Thread.sleep` for "slow" (same recipe, and
+    // same rationale, as `ActivityStoreTests`'s slow-remote-host test) —
+    // an earlier version of this test used an indefinite
+    // `DispatchSemaphore.wait()` gate instead, which turned out to be
+    // genuinely flaky when run as part of the full suite: it can starve
+    // Swift Concurrency's cooperative thread pool (a thread parked forever
+    // in a blocking wait, rather than for a bounded interval, is a
+    // documented footgun), which stalled the *other* target's continuation
+    // resumption too, not just the deliberately-stuck one — a test
+    // artifact, not evidence the store itself was serializing.
+    @MainActor @Test func fastTargetOutcomeAppearsInLaunchResultsWhileSlowTargetStillInFlight() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            let json = LauncherStubURLProtocol.bodyJSON(req)
+            let host = (json?["host"] as? String) ?? "local"
+            if host == "slow" {
+                Thread.sleep(forTimeInterval: 0.08) // artificially slow
+                return (200, Data(#"{"run_id":"run-slow","host_id":"slow"}"#.utf8))
+            }
+            return (200, Data(#"{"run_id":"run-fast","host_id":"local"}"#.utf8))
+        }
+        store.kind = .agentRun
+        store.selectedDefinition = "rupuso"
+        store.prompt = "hi"
+        store.selectedHosts = ["local", "slow"]
+
+        let launchTask = Task { await store.launch() }
+
+        // Polled with a window (60ms) tighter than "slow"'s own artificial
+        // delay (80ms) — same margin `ActivityStoreTests`'s equivalent test
+        // uses — so this only passes if "local" genuinely lands before
+        // "slow" could possibly have finished sleeping.
+        await expectEventually(
+            timeout: .milliseconds(60),
+            "the fast target's outcome lands while the slow one is still stuck"
+        ) {
+            store.launchResults.contains { $0.host == "local" }
+        }
+        #expect(store.launchResults.count == 1) // "slow" hasn't landed yet
+        #expect(store.launchResults.first?.host == "local")
+
+        _ = await launchTask.value
+
+        #expect(store.launchResults.count == 2)
+        #expect(Set(store.launchResults.map(\.host)) == Set(["local", "slow"]))
+    }
+
+    // (f3) Review fix (Important 2): a slow target must never delay another
+    // target's own POST from being *sent* — proven here by both requests'
+    // path hit count reaching 2 (both dispatched) within a window tighter
+    // than the slow target's own artificial delay, not merely by favorable
+    // overall timing. See (f2)'s doc comment on why this uses a bounded
+    // `Thread.sleep` rather than an indefinite gate.
+    @MainActor @Test func slowTargetNeverDelaysAnotherTargetsPOSTFromBeingSent() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            let json = LauncherStubURLProtocol.bodyJSON(req)
+            let host = (json?["host"] as? String) ?? "local"
+            if host == "slow" {
+                Thread.sleep(forTimeInterval: 0.08) // artificially slow
+                return (200, Data(#"{"run_id":"run-slow","host_id":"slow"}"#.utf8))
+            }
+            return (200, Data(#"{"run_id":"run-fast","host_id":"local"}"#.utf8))
+        }
+        store.kind = .agentRun
+        store.selectedDefinition = "rupuso"
+        store.prompt = "hi"
+        store.selectedHosts = ["local", "slow"]
+
+        let launchTask = Task { await store.launch() }
+
+        // Both requests dispatched (hit count 2) well before "slow"'s 80ms
+        // sleep could have elapsed — proves sending isn't serialized behind
+        // another target's completion.
+        await expectEventually(
+            timeout: .milliseconds(60),
+            "both requests are sent even though \"slow\" hasn't answered yet"
+        ) {
+            LauncherStubURLProtocol.hitCount("/api/agents/rupuso/run") == 2
+        }
+        #expect(store.launchResults.contains { $0.host == "local" })
+        #expect(!store.launchResults.contains { $0.host == "slow" }) // still in flight
+
+        _ = await launchTask.value
+
+        #expect(store.launchResults.count == 2)
     }
 
     // (g) A 501 (no launch runtime configured) surfaces via the shared
@@ -344,11 +534,11 @@ struct LauncherStoreTests {
 
         #expect(route == nil)
         #expect(store.launchResults.count == 1)
-        guard case .failure(let message) = store.launchResults.first?.result else {
+        guard case .failure(let error) = store.launchResults.first?.result else {
             Issue.record("expected a failure outcome")
             return
         }
-        #expect(message == "server lacks launch runtime — start with `rupu cp serve`")
+        #expect(error == .message("server lacks launch runtime — start with `rupu cp serve`"))
     }
 
     // (h) The required-input client-side gap surfaces via `validationError`
