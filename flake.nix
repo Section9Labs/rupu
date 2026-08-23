@@ -13,7 +13,7 @@
     ] (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        version = "0.73.0";
+        version = "0.74.0";
         # Asset name per rupu's own convention — the same string
         # `rupu update --print-platform` prints on that platform.
         asset = {
@@ -22,9 +22,9 @@
           "aarch64-darwin" = "rupu-darwin-arm64";
         }.${system};
         sha256 = {
-          "x86_64-linux"   = "761790b876c58886b0d717e460c0ea0bfa9b63c72fc6d69581df0f9116bed08d";
-          "aarch64-linux"  = "476a5cf05d6250b7639a4fb6e68a6762e8de5bc68b9a3bc9e5e46e4a14eb8eec";
-          "aarch64-darwin" = "0a226a302920d55a515dfcac6dfb249252417e87fd50d26eb3ed99a23996a89d";
+          "x86_64-linux"   = "a2ca2d8dd4c5c1b89a4f81f30fa24d87efe01dcd02138d6d15e0a112a0bb8b9d";
+          "aarch64-linux"  = "7f1d9c68c94ec19b0863277691cb8440cb12231d314af6c71f63c720638da3c0";
+          "aarch64-darwin" = "b7c83ceaaff9db074cec6452d96df0a862389b52fd4cfa5e3ff840f328d298ff";
         }.${system};
       in {
         packages.default = pkgs.stdenv.mkDerivation {
