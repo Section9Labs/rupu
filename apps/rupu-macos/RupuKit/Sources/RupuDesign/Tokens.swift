@@ -84,3 +84,31 @@ public extension Color {
         }
     }
 }
+
+/// Trigger kind for a workflow run — `manual` | `cron` | `event`. Mirrors the
+/// web's `TriggerChip` tone mapping (`crates/rupu-cp/web/src/components/TriggerChip.tsx`:
+/// `manual` → neutral, `cron` → violet, `event` → sky).
+public enum TriggerKind: String, CaseIterable, Sendable {
+    case manual, cron, event
+}
+
+public extension Color {
+    /// Trigger palette, read from the web's CSS custom properties
+    /// (`crates/rupu-cp/web/src/styles.css`) at the exact channels
+    /// `TriggerChip`/`ThroughputChart` resolve to for each tone:
+    /// - `manual` = neutral = `--c-ink-dim` (`rupuDim` above — same RGB pair).
+    /// - `cron` = violet = `--c-brand-600` (`rupuBrand600` above — same RGB pair).
+    /// - `event` = sky = `--c-info` (`rupuInfo` above — same RGB pair; the web
+    ///   notes there is no dedicated "sky" token and `info` is the closest
+    ///   existing blue, kept distinct from `status.running`).
+    /// Both light (`:root`) and dark (`[data-theme="dark"]`) values are defined
+    /// on the web side, so both are ported here — no single-theme fallback
+    /// needed.
+    static func trigger(_ kind: TriggerKind) -> Color {
+        switch kind {
+        case .manual: rupuDim
+        case .cron: rupuBrand600
+        case .event: rupuInfo
+        }
+    }
+}
