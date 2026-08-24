@@ -110,6 +110,10 @@ struct ShellToolbar: ToolbarContent {
 
     private var newRunButton: some View {
         Button("+ New run") {
+            // Close the palette first (see the hidden ⌘N button in
+            // `RootView`) so a launcher sheet opened over it doesn't strand
+            // an unreachable Esc-close behind the sheet.
+            palette?.close()
             showLauncher = true
         }
         .buttonStyle(.bordered)

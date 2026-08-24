@@ -70,7 +70,11 @@ public struct RootView: View {
         // registrations intact.
         .background(
             Group {
-                Button("New run") { showLauncher = true }
+                // Close the palette first: a launcher sheet can open OVER
+                // an open palette, and the palette's own Esc monitor is
+                // app-wide while it's up — leaving it open would swallow
+                // the sheet's Esc on the buried palette instead.
+                Button("New run") { palette?.close(); showLauncher = true }
                     .keyboardShortcut("n", modifiers: .command)
                 Button("Command palette") { Task { await palette?.open() } }
                     .keyboardShortcut("k", modifiers: .command)
@@ -85,6 +89,17 @@ public struct RootView: View {
         .background(Color.rupuBg)
         .task {
             await backend.reconnectIfNeeded()
+        }
+        .onAppear {
+            // Re-activate on reappearance too, not just on a health
+            // transition below: a RootView that disappears/reappears
+            // without `backend.health` ever changing (still `.healthy`)
+            // would otherwise show "— hosts" until the next flap.
+            // `activate(client:)` is idempotent, so this is a no-op when
+            // already running.
+            if let client = backend.client() {
+                hostsFooter.activate(client: client)
+            }
         }
         .sheet(isPresented: onboardingSheetBinding) {
             OnboardingView(backend: backend, model: model)
