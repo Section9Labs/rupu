@@ -129,7 +129,7 @@ from the app.
 |---|---|---|
 | 1 Foundation | XcodeGen scaffold, RupuDesign tokens, window/sidebar/toolbar shell + routing, onboarding, backend manager, CPClient + SSE + fixture rig; **rupu-app deletion** | `host_info`, `events` |
 | 2 Read path | Activity table (kind/status filters, live tail, saved views), Run detail (step graph, transcript feed, netflow + findings rails), Session detail | `runs`, `run_streams`, `transcript`, `transcripts`, `sessions` (read), `graph`, `netflow` (per-run), `findings` (per-run), `run_resolve` |
-| 3 Write path | Launcher sheet (agent run / session / workflow, host chips + fan-out), Approve/Reject everywhere gates appear, cancel/pause/resume, session send, archive/restore | `agents` (run/session), `workflows` (run/validate), `host_fanout`, run mutations, `sessions` (send), `tools` |
+| 3 Write path | Launcher sheet (agent run / session / workflow, host chips + fan-out), Approve/Reject everywhere gates appear, cancel/pause/resume, session send, archive/restore | `agents` (run/session), `workflows` (run/validate), run mutations, `sessions` (send/archive/restore), `tools`, hosts (for launcher) |
 | 4 Dashboard | Overview widgets read-only → edit mode → WidgetConfig persistence (UserDefaults JSON per HANDOFF) | `dashboard` |
 | 5 Breadth | Projects, Security (findings/coverage/catalog), Library, Fleet, Usage screens | `projects`, `coverage`, `findings` (global), `agents`/`workflows`/`autoflows` (definitions), `hosts`, `workers`, `usage`, `usage_outliers`, `repos`, `repo_scope` |
 | 6 Ambient | Menu bar extra, ⌘K palette, Situation Room, UNUserNotificationCenter notifications, full Settings (incl. config read + write), workspace delta/stage/discard, source/code viewers | `config` (read + write), `workspace`, `source`, `code`, `fs`, `autoflow_claims`, `fleet_inventory` |
@@ -149,6 +149,24 @@ write-path mutations. `run_resolve` — deferred (tracked); no consumer in the
 strict-read-only Phase 2 scope (spec §1.1), revisit when a screen needs
 resolved-entity display beyond what `/api/runs` already carries. `usage-timeline`
 — deferred (tracked); belongs to the Usage screen, Phase 5.
+
+**Phase 3 disposition** (`docs/superpowers/specs/2026-08-21-rupu-macos-phase-3-write-path-design.md`,
+complete): `agents` (run/session), `workflows` (run/validate), run mutations
+(approve/reject/cancel/pause/resume/archive/restore), `sessions`
+(send/archive/restore), `tools`, hosts (for launcher host chips) — shipped, ahead
+of their nominal Phase 5 Library appearance since the Launcher's definition lists
+need them now. `host_fanout` — corrected: there is no `POST /api/host_fanout`
+endpoint; it's an internal server-side helper (`api/host_fanout.rs`) used for
+dashboard fan-in, not a write endpoint the app calls. The Launcher's "fan out: all
+healthy" is client-side instead — one launch POST per healthy host via the launch
+body's `host` field, with per-host outcomes reported individually. **Known gap**
+(surfaced building Phase 3's Launcher): the launch endpoints (`POST
+/api/agents/:name/run`, `/api/agents/:name/session`, `/api/workflows/:name/run`)
+key off `:name` alone, with project-first server-side resolution — a
+scope-ambiguous name (same name defined at both project and global scope) can
+launch a different definition than the one the operator picked in the Definition
+picker. No scope-aware launch parameter exists yet; needs a server-side fix.
+Tracked for Phase 5/parity.
 
 ## 9. Error handling, loading, validation
 
