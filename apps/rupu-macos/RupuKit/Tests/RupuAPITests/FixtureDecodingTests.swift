@@ -22,3 +22,12 @@ import Foundation
     let ev = try JSONDecoder().decode(CPEvent.self, from: json)
     #expect(ev == .unknown(type: "future_thing", runID: "r9"))
 }
+
+@Test func decodesProjectsFixture() throws {
+    let rows = try JSONDecoder().decode([APIProjectRow].self, from: Fixtures.data("projects.json"))
+    #expect(!rows.isEmpty)
+    #expect(rows[0].wsID == "ws-1")
+    #expect(rows[0].name == "rupu")
+    #expect(rows[0].runCount == 14)
+    #expect(rows[0].lastRunAt == "2026-08-20T12:00:00Z")
+}

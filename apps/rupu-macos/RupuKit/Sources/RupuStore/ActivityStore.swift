@@ -73,6 +73,21 @@ public final class ActivityStore {
         }
     }
 
+    /// The v2 top bar's project-scope selection, narrowed to here the same
+    /// way `statusFilter` is: a synchronous filter over rows already in
+    /// memory, no refetch. `nil` means "all projects" — every row passes.
+    /// A non-nil scope keeps only rows whose `ActivityRow.project` (the
+    /// table's PROJECT column source) equals it exactly; rows with no
+    /// workspace identifier at all (`project == nil` — every kind except
+    /// `.session` currently) never pass a non-nil scope, since there is no
+    /// honest basis to claim they belong to it.
+    public var scopeFilter: String? {
+        didSet {
+            guard scopeFilter != oldValue else { return }
+            recompute()
+        }
+    }
+
     public var liveTail: Bool = true
 
     public private(set) var rows: [ActivityRow] = []
@@ -477,6 +492,9 @@ public final class ActivityStore {
         }
         if !statusFilter.isEmpty {
             merged = merged.filter { statusFilter.contains($0.status) }
+        }
+        if let scopeFilter {
+            merged = merged.filter { $0.project == scopeFilter }
         }
         merged.sort(by: Self.isOrderedByStartedAtDescending)
         rows = merged

@@ -62,6 +62,12 @@ public actor CPClient {
         try await get("api/hosts")
     }
 
+    /// `GET /api/projects` — every registered workspace, newest-activity
+    /// first. Drives the v2 top bar's scope picker.
+    public func projects() async throws -> [APIProjectRow] {
+        try await get("api/projects")
+    }
+
     public func runDetail(id: String, host: String? = nil) async throws -> APIRunDetail {
         try await get("api/runs/\(id)", query: hostQuery(host))
     }

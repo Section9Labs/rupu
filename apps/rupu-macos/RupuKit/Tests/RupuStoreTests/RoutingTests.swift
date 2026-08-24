@@ -28,6 +28,28 @@ import Testing
     #expect(AppModel(defaults: d).onboardingComplete)
 }
 
+@MainActor @Test func rangeAndScopePersistAcrossAppModelInstances() {
+    let suite = "test-\(UUID())"
+    let d = UserDefaults(suiteName: suite)!
+
+    // Defaults before anything is ever written: no scope (all projects),
+    // whatever `range`'s own default is.
+    #expect(AppModel(defaults: d).scopeWsID == nil)
+
+    let first = AppModel(defaults: d)
+    first.range = .d30
+    first.scopeWsID = "ws-1"
+
+    let second = AppModel(defaults: d)
+    #expect(second.range == .d30)
+    #expect(second.scopeWsID == "ws-1")
+
+    // "All projects" (nil) persists too, not just a non-nil scope.
+    second.scopeWsID = nil
+    let third = AppModel(defaults: d)
+    #expect(third.scopeWsID == nil)
+}
+
 @MainActor @Test func runDetailAndSessionDetailKeepSidebarHighlightOnRuns() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
     model.route = .activity(.agents)

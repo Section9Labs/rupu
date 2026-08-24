@@ -53,7 +53,32 @@ public final class AppModel {
     /// the very push/pop that's updating it.
     private var isNavigatingViaStack = false
 
-    public var range: TimeRange = .d7
+    /// The time window applied to counts/aggregates across screens that
+    /// show them. Persisted (Flows-composition Task 2) the same manual way
+    /// as `onboardingComplete` — `TimeRange`'s `rawValue` is the stored
+    /// string; an unrecognized/missing stored value falls back to `.d7`.
+    /// No inline default (unlike its pre-Task-2 declaration): a stored
+    /// property with a declaration-site default already counts as
+    /// "initialized" by the time `init` reassigns it, so `didSet` would
+    /// fire a second, redundant (if harmless) write-back of the value
+    /// `init` just read — same reasoning `onboardingComplete` already
+    /// follows by leaving no default here either.
+    public var range: TimeRange {
+        didSet {
+            defaults.set(range.rawValue, forKey: Self.rangeKey)
+        }
+    }
+
+    /// The project the top bar's scope picker has narrowed to — `nil`
+    /// means "All projects". Persisted the same manual way as
+    /// `onboardingComplete`/`range`. Drives `ActivityStore.scopeFilter`
+    /// (client-side row narrowing, no refetch).
+    public var scopeWsID: String? {
+        didSet {
+            defaults.set(scopeWsID, forKey: Self.scopeWsIDKey)
+        }
+    }
+
     public var backendHealth: BackendHealth = .starting
     public var liveConnected: Bool = false
     public var liveEventCount: Int = 0
@@ -69,10 +94,14 @@ public final class AppModel {
     private let defaults: UserDefaults
 
     private static let onboardingCompleteKey = "onboarding.complete"
+    private static let rangeKey = "range"
+    private static let scopeWsIDKey = "scope.wsID"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.onboardingComplete = defaults.bool(forKey: Self.onboardingCompleteKey)
+        self.range = defaults.string(forKey: Self.rangeKey).flatMap(TimeRange.init(rawValue:)) ?? .d7
+        self.scopeWsID = defaults.string(forKey: Self.scopeWsIDKey)
     }
 
     /// The sidebar's selection, derived from/driving `route`. There is no
