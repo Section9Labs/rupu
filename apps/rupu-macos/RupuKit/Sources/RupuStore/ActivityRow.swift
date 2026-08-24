@@ -12,20 +12,23 @@ public enum ActivityKindTag: String, Sendable {
 
 /// Normalized run/agent/session lifecycle state. `ActivityRow.status` is
 /// always one of these — never a raw server string — so every screen that
-/// renders status (filters, glyphs, `RunTone` color) shares one vocabulary
+/// renders status (filters, glyphs, `StatusTone` color) shares one vocabulary
 /// regardless of which upstream endpoint the row came from.
 public enum ActivityStatus: Hashable, Sendable {
     case pending, running, completed, failed, awaiting, rejected, cancelled, paused
     case unknown(String)
 
-    public var tone: RunTone {
+    public var tone: StatusTone {
         switch self {
-        case .running: return .run
+        case .pending: return .pending
+        case .running: return .running
         case .completed: return .done
-        case .failed, .rejected: return .fail
-        case .awaiting: return .waiting
-        case .paused, .cancelled: return .pause
-        case .pending, .unknown: return .pause
+        case .failed: return .failed
+        case .awaiting: return .awaiting
+        case .rejected: return .rejected
+        case .cancelled: return .cancelled
+        case .paused: return .paused
+        case .unknown: return .pending
         }
     }
 

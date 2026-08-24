@@ -197,16 +197,16 @@ import RupuDesign
 }
 
 @Test func toneMapsEveryStatusCase() {
-    let table: [(ActivityStatus, RunTone)] = [
-        (.running, .run),
+    let table: [(ActivityStatus, StatusTone)] = [
+        (.pending, .pending),
+        (.running, .running),
         (.completed, .done),
-        (.failed, .fail),
-        (.rejected, .fail),
-        (.awaiting, .waiting),
-        (.paused, .pause),
-        (.cancelled, .pause),
-        (.pending, .pause),
-        (.unknown("x"), .pause),
+        (.failed, .failed),
+        (.awaiting, .awaiting),
+        (.rejected, .rejected),
+        (.cancelled, .cancelled),
+        (.paused, .paused),
+        (.unknown("x"), .pending),
     ]
     for (status, expected) in table {
         #expect(status.tone == expected, "tone(\(status))")

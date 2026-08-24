@@ -230,14 +230,14 @@ private struct LauncherForm: View {
                 dismiss()
             } label: {
                 HStack(spacing: 6) {
-                    Circle().fill(Color.status(.done)).frame(width: 6, height: 6)
+                    Circle().fill(Color.status(RunTone.done)).frame(width: 6, height: 6)
                     Text(outcome.host)
                         .font(.identifier)
                         .foregroundStyle(Color.rupuInk)
                     Spacer()
                     Text("view →")
                         .font(.system(size: 11))
-                        .foregroundStyle(Color.rupuBrandHi)
+                        .foregroundStyle(Color.rupuBrand600)
                 }
             }
             .buttonStyle(.plain)

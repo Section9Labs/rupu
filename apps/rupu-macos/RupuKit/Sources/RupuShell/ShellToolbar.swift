@@ -51,7 +51,7 @@ struct ShellToolbar: ToolbarContent {
                 .fill(model.liveConnected ? Color.rupuBrand : Color.rupuMute)
                 .frame(width: 6, height: 6)
             MicroLabel(model.liveConnected ? "Live" : "Offline")
-                .foregroundStyle(model.liveConnected ? Color.rupuBrandHi : Color.rupuMute)
+                .foregroundStyle(model.liveConnected ? Color.rupuBrand600 : Color.rupuMute)
         }
         .padding(.horizontal, 4)
     }
