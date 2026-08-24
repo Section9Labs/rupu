@@ -278,6 +278,35 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // (b2) scopeFilter narrows the merged view to rows whose `project`
+    // (the field `ActivityRow.project`/the table's PROJECT column reads)
+    // matches, synchronously, with no refetch — same mechanism as
+    // `statusFilter`. Of the four fixture-derived sources, only the session
+    // row carries a workspace id (`ActivityRow.init(_: APISessionRow)` is
+    // the only initializer that sets `project`), so scoping to that id
+    // narrows to exactly that row and every other row (whose `project` is
+    // `nil`) is excluded even though `scopeFilter` names a real project —
+    // "honest narrowing": a row with no provable workspace never passes a
+    // non-nil scope. `scopeFilter = nil` restores every row.
+    @MainActor @Test func scopeFilterNarrowsMergedRowsAndNilRestores() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        #expect(store.rows.count == 4)
+        let requestsAfterActivate = ActivityStubURLProtocol.requestCount
+
+        store.scopeFilter = "ws-1"
+
+        #expect(store.rows.map(\.id) == ["sess-1"])
+        #expect(store.rows.allSatisfy { $0.project == "ws-1" })
+        #expect(ActivityStubURLProtocol.requestCount == requestsAfterActivate)
+
+        store.scopeFilter = nil
+        #expect(store.rows.count == 4)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // (c) liveTail off: a runStarted event increments pendingNewRuns and
     // leaves rows untouched; applyPendingRefresh() refetches and zeroes it.
     @MainActor @Test func liveTailOffCountsPendingNewRunsWithoutMutatingRows() async {

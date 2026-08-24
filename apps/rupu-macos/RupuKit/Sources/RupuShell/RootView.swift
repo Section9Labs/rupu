@@ -49,7 +49,7 @@ public struct RootView: View {
                 .navigationSplitViewColumnWidth(204)
         } detail: {
             detail
-                .toolbar { ShellToolbar(model: model, showLauncher: $showLauncher) }
+                .toolbar { ShellToolbar(model: model, showLauncher: $showLauncher, backend: backend) }
         }
         // A hidden, zero-visual button rather than the toolbar button
         // itself carrying `.keyboardShortcut` — it keeps ⌘N live even when
