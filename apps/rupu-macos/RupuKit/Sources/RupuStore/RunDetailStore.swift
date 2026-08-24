@@ -684,8 +684,13 @@ public final class RunDetailStore {
         // Flows-composition Task 4: every event the run stream delivers is
         // recorded for the Events tab, independent of whether the `switch`
         // below reduces it into `liveStates` — a `runResumed`/`stepPaused`/
-        // ...event carries no `NodeState` transition but is still something
-        // the operator should be able to see in the raw feed. Capped at 500,
+        // ...event carries no `NodeState` transition but is still recorded
+        // here regardless. In practice `eventsForSelection()` only surfaces
+        // these run-level (no-step-id) events in the no-selection state,
+        // and `selectedStepID` is auto-set by `activate()`'s initial focus
+        // and has no "clear selection" affordance today, so that state is
+        // normally just the brief window before activation completes — a
+        // dedicated whole-run view is a Plan 3 candidate. Capped at 500,
         // dropping the OLDEST entry first so the feed always reflects the
         // most recent activity rather than truncating what just arrived.
         events.append(event)

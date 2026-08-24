@@ -8,8 +8,10 @@ import RupuDesign
 /// `RunDetailScreen` can never correctly show, because it isn't an
 /// orchestrator run and `GET /api/runs/:id` 404s for it. Header (back
 /// chevron, breadcrumb with the run id) plus a single `TranscriptFeed`, fed
-/// by one REST snapshot (`AgentRunDetailStore`). No step graph, no
-/// netflow/findings rails — this row's data doesn't support them.
+/// by one REST snapshot (`AgentRunDetailStore`). No step graph and none of
+/// `RunDetailScreen`'s tabbed panel (`RunDetailTabPanel`: Transcript ·
+/// Events · Findings · Netflow) either — this row's data doesn't support
+/// them.
 ///
 /// **Strict read-only**, same as every other Phase 2 detail screen this
 /// phase.

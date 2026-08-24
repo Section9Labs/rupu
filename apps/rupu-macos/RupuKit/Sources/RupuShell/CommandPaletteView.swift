@@ -100,18 +100,30 @@ public struct CommandPaletteView: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(store.results.enumerated()), id: \.element.id) { index, item in
-                        row(item, active: index == store.activeIndex)
-                            .onTapGesture {
-                                store.activeIndex = index
-                                Task { await store.execute(item) }
-                            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(store.results.enumerated()), id: \.element.id) { index, item in
+                            row(item, active: index == store.activeIndex)
+                                .id(item.id)
+                                .onTapGesture {
+                                    store.activeIndex = index
+                                    Task { await store.execute(item) }
+                                }
+                        }
+                    }
+                }
+                .frame(maxHeight: 360)
+                // Keyboard nav (↑/↓, wrapping — see `moveActive`) can move
+                // the active row off the visible 360pt window; keep it
+                // in view the same way arrowing through a menu does.
+                .onChange(of: store.activeIndex) { _, newIndex in
+                    guard store.results.indices.contains(newIndex) else { return }
+                    withAnimation(nil) {
+                        proxy.scrollTo(store.results[newIndex].id, anchor: .center)
                     }
                 }
             }
-            .frame(maxHeight: 360)
         }
     }
 
