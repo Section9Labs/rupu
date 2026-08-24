@@ -102,6 +102,28 @@ public final class RunDetailStore {
 
     public let isRemote: Bool
 
+    /// Phase 3, Task 5: the shared pending-mutation ledger — see
+    /// `BackendController.pendingActions`'s doc comment for why this is
+    /// shared rather than private. Defaults to a fresh private instance so
+    /// every pre-Task-5 test (and any test that genuinely doesn't care
+    /// about cross-screen sharing) is unaffected; `RunDetailScreen` passes
+    /// `backend.pendingActions` explicitly.
+    public let pendingActions: PendingActions
+
+    /// Whether this run currently reads as archived. Phase 3, Task 5:
+    /// `APIRunRecord` (and the server's `RunRecord` it decodes) carries no
+    /// `archived` field at all — "archived" is purely which directory a
+    /// run's `run.json` lives in, not a status on the record itself (see
+    /// `RunStore::archive`/`list_archived` on the Rust side) — so there is
+    /// no REST signal this store can read to learn a run's archived state.
+    /// This is therefore local, optimistic state: `false` at construction
+    /// (Task 8's `RunDetailScreen` never routes to an archived run from a
+    /// context that already knows otherwise this phase) and flipped by a
+    /// successful `archive()`/`restore()` call once its response proves the
+    /// effect (`response.archived` matching). `availableVerbs` reads this
+    /// to decide Archive vs. Restore.
+    public private(set) var isArchived = false
+
     private let runID: String
     private let host: String?
 
@@ -110,6 +132,20 @@ public final class RunDetailStore {
     private let fetchNetflow: @Sendable () async throws -> APINetflow
     private let fetchFindings: @Sendable () async throws -> APIFindings
     private let fetchTranscript: @Sendable (String) async throws -> APITranscriptPage
+
+    // MARK: - Mutations (Phase 3, Task 5)
+    //
+    // One closure per run-control route, mirroring the `fetchDetail`/
+    // `fetchGraph`/... seam above rather than storing a raw `CPClient` —
+    // same "fake client closures" testing seam this type's doc comment
+    // already documents for the REST reads, extended to the write side.
+    private let postApprove: @Sendable (_ gate: String, _ mode: String?) async throws -> RunControlResponse
+    private let postReject: @Sendable (_ gate: String, _ reason: String?) async throws -> RunControlResponse
+    private let postCancel: @Sendable (_ reason: String?) async throws -> RunControlResponse
+    private let postPause: @Sendable () async throws -> RunControlResponse
+    private let postResume: @Sendable () async throws -> RunControlResponse
+    private let postArchive: @Sendable () async throws -> RunControlResponse
+    private let postRestore: @Sendable () async throws -> RunControlResponse
 
     /// `nil` for a remote store (never called) or when `backend` has no live
     /// connection configured yet — both cases leave the run stream off.
@@ -123,6 +159,22 @@ public final class RunDetailStore {
     /// Monotonic token guarding `focusStep` against overlapping calls — see
     /// the type doc comment's "Overlapping calls" section.
     private var focusGeneration = 0
+
+    /// Carry-over (Phase 3, Task 4): closes the "known parked residual" the
+    /// final review flagged — `StreamLifecycle.stop()`'s cancellation is
+    /// cooperative (see that type's doc comment), so a tail `apply` already
+    /// mid-flight, or even one merely *queued* on the underlying
+    /// `AsyncStream` when `stopTail()` runs, can still fire afterward and
+    /// silently re-append into `transcript` after `handleTerminal`'s
+    /// `reloadTranscriptSnapshot` has already replaced it wholesale with the
+    /// run's final snapshot. Bumped in `stopTail()`; `startTail`'s `apply`
+    /// closure captures the generation current at the moment its tail
+    /// started and discards its own callback once that no longer matches,
+    /// and `reloadTranscriptSnapshot` captures it before its `await` and
+    /// discards a now-stale result the same way `focusStep`'s
+    /// `focusGeneration` already does for overlapping `focusStep` calls —
+    /// same recipe, different seam.
+    private var tailTeardownGeneration = 0
 
     /// Production entry point — `RunDetailScreen` calls this. `isRemote` is
     /// derived once, here, from `host` (`nil` or `"local"` means the
@@ -144,8 +196,16 @@ public final class RunDetailStore {
             fetchNetflow: { try await client.runNetflow(id: runID) },
             fetchFindings: { try await client.runFindings(id: runID) },
             fetchTranscript: { path in try await client.transcript(path: path, host: host) },
+            postApprove: { gate, mode in try await client.approveRun(id: runID, host: host, gate: gate, body: mode.map { ApproveBody(mode: $0) }) },
+            postReject: { gate, reason in try await client.rejectRun(id: runID, host: host, gate: gate, body: RejectBody(reason: reason)) },
+            postCancel: { reason in try await client.cancelRun(id: runID, host: host, body: reason.map { CancelBody(reason: $0) }) },
+            postPause: { try await client.pauseRun(id: runID, host: host) },
+            postResume: { try await client.resumeRun(id: runID, host: host) },
+            postArchive: { try await client.archiveRun(id: runID, host: host) },
+            postRestore: { try await client.restoreRun(id: runID, host: host) },
             runSignalsFactory: isRemote ? nil : RunDetailStore.makeRunSignalsFactory(backend: backend, runID: runID),
-            transcriptTailFactory: isRemote ? nil : RunDetailStore.makeTranscriptTailFactory(backend: backend)
+            transcriptTailFactory: isRemote ? nil : RunDetailStore.makeTranscriptTailFactory(backend: backend),
+            pendingActions: backend.pendingActions
         )
     }
 
@@ -158,8 +218,16 @@ public final class RunDetailStore {
         fetchNetflow: @escaping @Sendable () async throws -> APINetflow,
         fetchFindings: @escaping @Sendable () async throws -> APIFindings,
         fetchTranscript: @escaping @Sendable (String) async throws -> APITranscriptPage,
+        postApprove: @escaping @Sendable (_ gate: String, _ mode: String?) async throws -> RunControlResponse = { _, _ in throw CPError.transport("postApprove not wired") },
+        postReject: @escaping @Sendable (_ gate: String, _ reason: String?) async throws -> RunControlResponse = { _, _ in throw CPError.transport("postReject not wired") },
+        postCancel: @escaping @Sendable (_ reason: String?) async throws -> RunControlResponse = { _ in throw CPError.transport("postCancel not wired") },
+        postPause: @escaping @Sendable () async throws -> RunControlResponse = { throw CPError.transport("postPause not wired") },
+        postResume: @escaping @Sendable () async throws -> RunControlResponse = { throw CPError.transport("postResume not wired") },
+        postArchive: @escaping @Sendable () async throws -> RunControlResponse = { throw CPError.transport("postArchive not wired") },
+        postRestore: @escaping @Sendable () async throws -> RunControlResponse = { throw CPError.transport("postRestore not wired") },
         runSignalsFactory: (@Sendable () -> AsyncStream<StreamSignal<CPEvent>>)?,
-        transcriptTailFactory: (@Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>>)?
+        transcriptTailFactory: (@Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>>)?,
+        pendingActions: PendingActions = PendingActions()
     ) {
         self.runID = runID
         self.host = host
@@ -169,8 +237,16 @@ public final class RunDetailStore {
         self.fetchNetflow = fetchNetflow
         self.fetchFindings = fetchFindings
         self.fetchTranscript = fetchTranscript
+        self.postApprove = postApprove
+        self.postReject = postReject
+        self.postCancel = postCancel
+        self.postPause = postPause
+        self.postResume = postResume
+        self.postArchive = postArchive
+        self.postRestore = postRestore
         self.runSignalsFactory = runSignalsFactory
         self.transcriptTailFactory = transcriptTailFactory
+        self.pendingActions = pendingActions
     }
 
     /// Fires all four REST loads concurrently (independent `BlockState`s —
@@ -212,6 +288,187 @@ public final class RunDetailStore {
         runLifecycle?.stop()
         runLifecycle = nil
         stopTail()
+    }
+
+    // MARK: - Mutations (Phase 3, Task 5)
+
+    /// The verbs the header/overflow menu may render as live buttons for
+    /// the run's *current* status — never a fixed set. `.idle`/no `detail`
+    /// yet yields no verbs at all, matching every other block's "nothing to
+    /// show while loading" contract. Approve/reject are deliberately absent
+    /// here: they render from `detail.run.awaiting` directly (the awaiting
+    /// banner, one control pair per parked gate), not from this status-only
+    /// derivation.
+    public var availableVerbs: Set<ActionVerb> {
+        guard case .content(let d) = detail else { return [] }
+        let status = ActivityStatus.normalize(d.run.status)
+        var verbs: Set<ActionVerb> = []
+        switch status {
+        case .running:
+            verbs.insert(.cancel)
+            verbs.insert(.pause)
+        case .awaiting, .pending:
+            verbs.insert(.cancel)
+        case .paused:
+            verbs.insert(.resume)
+        case .completed, .failed, .rejected, .cancelled:
+            verbs.insert(isArchived ? .restore : .archive)
+        case .unknown:
+            break
+        }
+        return verbs
+    }
+
+    /// **Marker-only** (approve/resume never confirm here): the POST's 200
+    /// means "recorded", not "done" — the key stays `.pending` until an
+    /// observed status transition proves the run actually left the gate.
+    /// That observation arrives through `apply(_:)`'s live `runResumed`/
+    /// `stepStarted`/... reductions (fast path, local runs only) or the
+    /// `loadDetail()` refresh fired right after the POST below (slow path,
+    /// every run including remote) — both call
+    /// `pendingActions.resolve(runID:observedStatus:)`, which is what
+    /// actually flips this key to `.confirmed`. That immediate refresh also
+    /// re-checks `detail.run.awaiting` — a background worker on a very fast
+    /// gate can already have cleared it by the time this call returns, so
+    /// the banner has a chance to catch up right away rather than waiting on
+    /// this run's next unrelated refresh.
+    /// **Gate-scoped key** (fix round 1): `ActionKey.gate(runID:stepID:verb:)`,
+    /// not a plain run-scoped key — a run showing more than one parked gate
+    /// at once needs independent pending state per gate. See `ActionKey.gate`'s
+    /// doc comment.
+    public func approve(gate stepID: String, mode: String? = nil) async {
+        let key = ActionKey.gate(runID: runID, stepID: stepID, verb: .approve)
+        pendingActions.begin(key)
+        do {
+            _ = try await postApprove(stepID, mode)
+            await loadDetail()
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// **Immediate**, **gate-scoped key** (same rationale as `approve`
+    /// above): the response record already reflects the rejection —
+    /// `handleImmediateResponse` resolves the key from it right away rather
+    /// than waiting for the next observed event.
+    public func reject(gate stepID: String, reason: String? = nil) async {
+        let key = ActionKey.gate(runID: runID, stepID: stepID, verb: .reject)
+        pendingActions.begin(key)
+        do {
+            let response = try await postReject(stepID, reason)
+            await handleImmediateResponse(key, response)
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// **Immediate**: status flips in the response (and a live runner pid is
+    /// TERM'd server-side). 409 `AlreadyTerminal` surfaces as a normal
+    /// `.failed` state via `mutationErrorMessage`.
+    public func cancel(reason: String? = nil) async {
+        let key = ActionKey(runID, .cancel)
+        pendingActions.begin(key)
+        do {
+            let response = try await postCancel(reason)
+            await handleImmediateResponse(key, response)
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// **Immediate** plus a marker for detached runners. 409 when the run
+    /// isn't currently running.
+    public func pause() async {
+        let key = ActionKey(runID, .pause)
+        pendingActions.begin(key)
+        do {
+            let response = try await postPause()
+            await handleImmediateResponse(key, response)
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// **Marker-only**, same contract as `approve(gate:mode:)` above — stays
+    /// `.pending` until an observed status transition (off `.paused`)
+    /// resolves it. 501 without launcher runtime configured; 409 when the
+    /// run isn't currently `paused`.
+    public func resume() async {
+        let key = ActionKey(runID, .resume)
+        pendingActions.begin(key)
+        do {
+            _ = try await postResume()
+            await loadDetail()
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// Immediate filesystem move. `PendingActions.resolve(runID:observedStatus:)`
+    /// never confirms `.archive`/`.restore` (see that method's doc
+    /// comment — they're not a run-status transition), so this confirms
+    /// directly off `response.archived` rather than going through `resolve`.
+    public func archive() async {
+        let key = ActionKey(runID, .archive)
+        pendingActions.begin(key)
+        do {
+            let response = try await postArchive()
+            if response.archived == true {
+                isArchived = true
+                pendingActions.confirm(key)
+            }
+            await loadDetail()
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// Symmetric with `archive()` above.
+    public func restore() async {
+        let key = ActionKey(runID, .restore)
+        pendingActions.begin(key)
+        do {
+            let response = try await postRestore()
+            if response.archived == false {
+                isArchived = false
+                pendingActions.confirm(key)
+            }
+            await loadDetail()
+        } catch {
+            pendingActions.fail(key, mutationErrorMessage(error))
+        }
+    }
+
+    /// Shared by every *immediate* mutation (reject/cancel/pause): resolves
+    /// `key` off the response's own `confirmedStatus` when present (the
+    /// local response shape, which already carries the post-mutation
+    /// `RunRecord`) via the same `PendingActions.resolve` confirmation table
+    /// every live-event reduction uses — so, e.g., a reject that actually
+    /// routed to `on_reject` cancellation still confirms correctly.
+    ///
+    /// **The `ok == true` fallback branch** (fix round 1: previously
+    /// untested): a remote-proxy response (`{ok, host_id}`, no `run` body —
+    /// see `RunControlResponse`'s doc comment) carries no post-mutation
+    /// status to check `resolve` against at all — the local host that
+    /// actually ran the mutation never sent its record back across the
+    /// proxy hop. This is accepted, not a gap to close: a 2xx from an
+    /// *immediate* route (reject/cancel/pause, never approve/resume) is
+    /// itself the server's proof the effect already happened, so confirming
+    /// `key` directly off `ok == true` is the honest reading of that
+    /// response shape, not a guess. Covered by
+    /// `cancelConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent`/
+    /// `rejectConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent` in
+    /// `RunDetailStoreTests`.
+    ///
+    /// Refreshes `detail` either way, so the header/awaiting-banner catch up
+    /// to the mutation's effect even on the remote-proxy path.
+    private func handleImmediateResponse(_ key: ActionKey, _ response: RunControlResponse) async {
+        if let confirmedStatus = response.confirmedStatus {
+            pendingActions.resolve(runID: runID, observedStatus: .normalize(confirmedStatus))
+        } else if response.ok == true {
+            pendingActions.confirm(key)
+        }
+        await loadDetail()
     }
 
     /// Switches the transcript feed to `stepID`: resolves and loads a fresh
@@ -285,7 +542,18 @@ public final class RunDetailStore {
 
     private func loadDetail() async {
         do {
-            detail = .content(try await fetchDetail())
+            let d = try await fetchDetail()
+            detail = .content(d)
+            // Phase 3, Task 5: the "slow path" half of the pending-mutation
+            // contract — every successful detail refresh (initial
+            // `activate()`, a terminal-event refresh, an immediate
+            // mutation's own post-POST refresh, or just a screen
+            // re-appearing) re-checks every currently-`.pending` key for
+            // this run against the REST-observed status, so a marker verb
+            // (approve/resume) still confirms even for a remote run (no
+            // live stream at all) or if the live event that should have
+            // confirmed it faster never arrived.
+            pendingActions.resolve(runID: runID, observedStatus: .normalize(d.run.status))
         } catch {
             // Cancellation (e.g. `RunDetailScreen`'s `.task(id: runID)`
             // superseded by a `runID` change) is benign — leave `detail`
@@ -347,12 +615,20 @@ public final class RunDetailStore {
 
     private func apply(_ event: CPEvent) {
         switch event {
-        case .stepStarted(_, let stepID, _, _, _):
+        case .stepStarted(let runID, let stepID, _, _, _):
             liveStates[stepID] = .running
+            // Phase 3, Task 5: the "fast path" half of the pending-mutation
+            // contract. A step actually starting proves the run is
+            // `.running` right now — in particular, that it left an
+            // `.awaiting`/`.paused` gate — which is exactly what confirms a
+            // pending `approve`/`resume`. See `PendingActions.resolve`'s
+            // confirmation table.
+            pendingActions.resolve(runID: runID, observedStatus: .running)
         case .stepCompleted(_, let stepID, let success, _, _):
             liveStates[stepID] = .done(success: success)
-        case .stepAwaitingApproval(_, let stepID, _):
+        case .stepAwaitingApproval(let runID, let stepID, _):
             liveStates[stepID] = .gatePending
+            pendingActions.resolve(runID: runID, observedStatus: .awaiting)
         case .stepSkipped(_, let stepID, _):
             liveStates[stepID] = .skipped
         case .stepFailed(_, let stepID, _):
@@ -361,7 +637,28 @@ public final class RunDetailStore {
             // emitted when the step actually ran and reported failure. See
             // the type doc comment's "Live semantics" section.
             liveStates[stepID] = .done(success: false)
-        case .runCompleted, .runFailed:
+        case .runResumed(let runID):
+            // Same fast-path rationale as `stepStarted` above — the most
+            // direct signal a run left a pause or an approval gate, per the
+            // Rust runner's own doc comment ("resume emits RunResumed /
+            // StepResumed").
+            pendingActions.resolve(runID: runID, observedStatus: .running)
+        case .runPaused(let runID):
+            pendingActions.resolve(runID: runID, observedStatus: .paused)
+        case .stepPaused(let runID, _):
+            // Fix round 1 (folded minor): the step-scoped counterpart to
+            // `runPaused` — a detached/step-level pause still implies the
+            // run is now `.paused` for this store's confirmation purposes.
+            pendingActions.resolve(runID: runID, observedStatus: .paused)
+        case .stepResumed(let runID, _):
+            // Step-scoped counterpart to `runResumed` — same fast-path
+            // rationale.
+            pendingActions.resolve(runID: runID, observedStatus: .running)
+        case .runCompleted(let runID, let status, _):
+            pendingActions.resolve(runID: runID, observedStatus: .normalize(status))
+            handleTerminal()
+        case .runFailed(let runID, _, _):
+            pendingActions.resolve(runID: runID, observedStatus: .failed)
             handleTerminal()
         default:
             break
@@ -406,9 +703,19 @@ public final class RunDetailStore {
     private func startTail(path: String, factory: @escaping @Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>>) {
         // Defense in depth alongside `focusStep`'s generation-token guard:
         // never let a new tail's assignment silently drop a still-running
-        // previous one without stopping it first.
-        tailLifecycle?.stop()
+        // previous one without stopping it first. Routing through
+        // `stopTail()` (rather than `tailLifecycle?.stop()` alone) also
+        // bumps `tailTeardownGeneration` here, so a straggling `apply` from
+        // the tail just torn down is discarded the same way one from an
+        // explicit `stopTail()` call (e.g. `handleTerminal`) is — see that
+        // property's doc comment.
+        stopTail()
 
+        // Captured now, not read fresh inside `apply` below: this tail's own
+        // callback must keep comparing against the generation *it* started
+        // under, not whatever `tailTeardownGeneration` happens to be by the
+        // time a given event fires.
+        let generation = tailTeardownGeneration
         let lifecycle = StreamLifecycle()
         tailLifecycle = lifecycle
         transcriptTailActive = true
@@ -432,9 +739,23 @@ public final class RunDetailStore {
                 await self.clearTranscriptForTailReconnect()
             },
             apply: { [weak self] event in
-                self?.transcript.append(event)
+                self?.applyTailEvent(event, generation: generation)
             }
         )
+    }
+
+    /// `StreamLifecycle.stop()`'s cancellation is cooperative, not
+    /// preemptive (see that type's doc comment) — a signal already queued
+    /// on the underlying `AsyncStream`, or an `apply` call already
+    /// dispatched, can still land after `stopTail()` runs. Comparing the
+    /// generation captured when this tail started against the current
+    /// `tailTeardownGeneration` is what makes discarding that straggler true
+    /// *by construction* rather than a timing accident: `stopTail()` always
+    /// runs (directly, or via `startTail`'s own teardown-then-restart) at
+    /// every point this tail could become stale, and always bumps it first.
+    private func applyTailEvent(_ event: TranscriptEvent, generation: Int) {
+        guard generation == tailTeardownGeneration else { return }
+        transcript.append(event)
     }
 
     private func clearTranscriptForTailReconnect() async {
@@ -444,13 +765,23 @@ public final class RunDetailStore {
     /// REST reload, replacing `transcript` wholesale (never appended) —
     /// used by `handleTerminal` to leave the feed showing a complete final
     /// snapshot once the run (and any tail of it) is over.
+    ///
+    /// Captures `tailTeardownGeneration` before the `await` and discards its
+    /// own result if it no longer matches by the time the fetch resolves —
+    /// same "most recent teardown wins" guarantee `applyTailEvent` gives the
+    /// tail side of this race, applied to the reload itself: a `focusStep`
+    /// call (or another `stopTail()`) that lands while this fetch is still
+    /// in flight owns the feed now, and this now-stale snapshot must not
+    /// clobber it.
     private func reloadTranscriptSnapshot(path: String) async {
-        if let page = try? await fetchTranscript(path) {
-            transcript = page.events
-        }
+        let generation = tailTeardownGeneration
+        guard let page = try? await fetchTranscript(path) else { return }
+        guard generation == tailTeardownGeneration else { return }
+        transcript = page.events
     }
 
     private func stopTail() {
+        tailTeardownGeneration += 1
         tailLifecycle?.stop()
         tailLifecycle = nil
         transcriptTailActive = false

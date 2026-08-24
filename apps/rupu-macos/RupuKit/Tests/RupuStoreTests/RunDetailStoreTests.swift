@@ -74,6 +74,26 @@ private struct StubError: Error, CustomStringConvertible {
     let description: String
 }
 
+/// De-flakes "wait for an async outcome to settle" assertions — same
+/// rationale and shape as `ActivityStoreTests.pollUntil`/`expectEventually`
+/// (a private helper per file, this codebase's established convention;
+/// see `Counter`'s doc comment above for the same reasoning applied to test
+/// doubles). Polls `condition` every `interval` until it's `true` or
+/// `timeout` elapses.
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
 // MARK: - Fixture builders (hand-rolled, not golden-JSON: each test needs
 // precise control over stepIDs / activeStepID / awaiting to exercise one
 // specific code path in `RunDetailStore`).
@@ -117,6 +137,16 @@ private func findings() -> APIFindings {
     APIFindings(findings: [], summary: APIFindingsSummary(total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0))
 }
 
+/// Fixture builder for `RunControlResponse` — mirrors the local-response
+/// shape (`run` present, carrying whatever post-mutation `status` the test
+/// wants `confirmedStatus` to surface) by default; a test that wants the
+/// remote-proxy shape (`{ok, host_id}`, no `run`) passes `status: nil`
+/// explicitly.
+private func runControlResponse(status: String? = "running", archived: Bool? = nil, ok: Bool = true) -> RunControlResponse {
+    let run: APIRunRecord? = status.map { runRecord(status: $0) }
+    return RunControlResponse(run: run, ok: ok, hostID: "local", archived: archived)
+}
+
 @MainActor
 private func makeStore(
     isRemote: Bool = false,
@@ -125,8 +155,16 @@ private func makeStore(
     netflowResult: @escaping @Sendable () async throws -> APINetflow = { netflow() },
     findingsResult: @escaping @Sendable () async throws -> APIFindings = { findings() },
     transcriptResult: @escaping @Sendable (String) async throws -> APITranscriptPage = { _ in APITranscriptPage(events: [], summary: nil) },
+    approveResult: @escaping @Sendable (String, String?) async throws -> RunControlResponse = { _, _ in runControlResponse() },
+    rejectResult: @escaping @Sendable (String, String?) async throws -> RunControlResponse = { _, _ in runControlResponse() },
+    cancelResult: @escaping @Sendable (String?) async throws -> RunControlResponse = { _ in runControlResponse() },
+    pauseResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse() },
+    resumeResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse() },
+    archiveResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse(status: nil, archived: true) },
+    restoreResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse(status: nil, archived: false) },
     runStreamBox: RunStreamBox? = nil,
-    tailStreamBox: TailStreamBox? = nil
+    tailStreamBox: TailStreamBox? = nil,
+    pendingActions: PendingActions = PendingActions()
 ) -> RunDetailStore {
     var runSignalsFactory: (@Sendable () -> AsyncStream<StreamSignal<CPEvent>>)?
     if let runStreamBox {
@@ -145,8 +183,16 @@ private func makeStore(
         fetchNetflow: netflowResult,
         fetchFindings: findingsResult,
         fetchTranscript: transcriptResult,
+        postApprove: approveResult,
+        postReject: rejectResult,
+        postCancel: cancelResult,
+        postPause: pauseResult,
+        postResume: resumeResult,
+        postArchive: archiveResult,
+        postRestore: restoreResult,
         runSignalsFactory: runSignalsFactory,
-        transcriptTailFactory: transcriptTailFactory
+        transcriptTailFactory: transcriptTailFactory,
+        pendingActions: pendingActions
     )
 }
 
@@ -242,6 +288,62 @@ private func makeStore(
     runBox.latest.finish()
 }
 
+// Fix round 1 (folded minor): `stepPaused`/`stepResumed` are the
+// step-scoped counterparts to `runPaused`/`runResumed` — a detached
+// runner's step-level pause/resume still implies the run itself is now
+// `.paused`/`.running` for this store's `pendingActions.resolve` purposes,
+// same fast-path confirmation `runPaused`/`runResumed` already give.
+@MainActor @Test func stepPausedEventResolvesPendingPauseKey() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "running")) },
+        pauseResult: { runControlResponse(status: "running") }, // response doesn't itself prove .paused
+        runStreamBox: runBox
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .pause)
+    await store.pause()
+    guard case .pending = store.pendingActions.state(key) else {
+        Issue.record("expected pause to still be .pending before the step-level event, got \(store.pendingActions.state(key))")
+        return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepPaused(runID: "run-1", stepID: "build")))
+
+    let confirmed = await pollUntil { store.pendingActions.state(key) == .confirmed }
+    #expect(confirmed, "expected pause to confirm off a step-scoped stepPaused event")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+@MainActor @Test func stepResumedEventResolvesPendingResumeKey() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "paused")) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .resume)
+    await store.resume()
+    guard case .pending = store.pendingActions.state(key) else {
+        Issue.record("expected resume to still be .pending before the step-level event, got \(store.pendingActions.state(key))")
+        return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepResumed(runID: "run-1", stepID: "build")))
+
+    let confirmed = await pollUntil { store.pendingActions.state(key) == .confirmed }
+    #expect(confirmed, "expected resume to confirm off a step-scoped stepResumed event")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
 // MARK: - (c) terminal event stops the stream and refreshes once
 
 @MainActor @Test func terminalEventStopsStreamAndRefreshesDetailFindingsNetflowExactlyOnce() async {
@@ -329,6 +431,72 @@ private func makeStore(
     #expect(tailTerminated.value == true)
     #expect(store.transcriptTailActive == false)
     #expect(transcriptCalls.value == 1)
+    #expect(store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)])
+
+    store.deactivate()
+    runBox.latest.finish()
+    tailBox.latest.finish()
+}
+
+// Task 4 (Phase 3 carry-over): closes the "known parked residual" the
+// final-review flagged — `StreamLifecycle.stop()`'s cancellation is
+// cooperative, not preemptive (see that type's doc comment), so a tail
+// `apply` already queued on the scripted stream when `stopTail()` fires can
+// still land afterward. Without `tailTeardownGeneration`, that straggler
+// would silently re-append into `transcript` even after `handleTerminal`'s
+// `reloadTranscriptSnapshot` has already replaced it wholesale with the
+// run's final snapshot.
+@MainActor @Test func straggingTailApplyAfterStopTailNeverLandsAfterTheTerminalSnapshot() async {
+    let runBox = RunStreamBox()
+    let tailBox = TailStreamBox()
+    let transcriptCalls = Counter()
+
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl"), steps: [])
+        },
+        transcriptResult: { _ in
+            transcriptCalls.increment()
+            // Deliberately slow: widens the window for the straggler
+            // (yielded right after the terminal event below) to actually
+            // race the reload, rather than merely preceding it by
+            // construction.
+            try? await Task.sleep(for: .milliseconds(40))
+            return APITranscriptPage(events: [.assistantMessage(content: "final snapshot", thinking: nil)], summary: nil)
+        },
+        runStreamBox: runBox,
+        tailStreamBox: tailBox
+    )
+
+    // "build" is active with no result yet -> a tail starts for it.
+    await store.activate()
+    #expect(store.transcriptTailActive == true)
+
+    runBox.latest.yield(.connection(true))
+    tailBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.runCompleted(runID: "run-1", status: "completed", finishedAt: "2026-08-20T13:00:00Z")))
+
+    // Simulate an `apply` already mid-flight (or merely still queued) when
+    // `stopTail()` fired: the old tail's continuation is still open (never
+    // `.finish()`ed), so this stray event still reaches the same consumer
+    // task's `apply` closure — cooperative cancellation doesn't stop it from
+    // being picked up.
+    tailBox.latest.yield(.event(.assistantDelta(content: "straggler — must never appear")))
+
+    let settled = await pollUntil {
+        store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)]
+    }
+    #expect(settled, "expected transcript to settle to exactly the terminal snapshot")
+
+    #expect(transcriptCalls.value == 1)
+    #expect(store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)])
+    #expect(store.transcriptTailActive == false)
+
+    // A straggler landing even later — well after the snapshot has already
+    // settled — still never appends: the generation check is unconditional,
+    // not a one-shot race window.
+    tailBox.latest.yield(.event(.assistantDelta(content: "second straggler — must never appear either")))
+    try? await Task.sleep(for: .milliseconds(20))
     #expect(store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)])
 
     store.deactivate()
@@ -751,4 +919,286 @@ private func makeStore(
 
     store.deactivate()
     cancellingStore.deactivate()
+}
+
+// MARK: - (g) Mutations: pending-state contract (Phase 3, Task 5)
+
+/// Approve is marker-only: the POST's 200 leaves the key `.pending` — only
+/// an observed status transition (here, a live `runResumed` event) confirms
+/// it. Condition-polled per this session's global timing constraint.
+@MainActor @Test func approveStaysPendingUntilRunResumedEventThenConfirms() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(status: "awaiting_approval", awaiting: [
+                APIAwaitingGate(stepID: "gate-1", prompt: "deploy?", since: "2026-08-20T12:00:00Z"),
+            ]))
+        },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    let key = ActionKey.gate(runID: "run-1", stepID: "gate-1", verb: .approve)
+    #expect(store.pendingActions.state(key) == .idle)
+
+    await store.approve(gate: "gate-1")
+    guard case .pending = store.pendingActions.state(key) else {
+        Issue.record("expected .pending immediately after approve(), got \(store.pendingActions.state(key))")
+        return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.runResumed(runID: "run-1")))
+
+    let confirmed = await pollUntil { store.pendingActions.state(key) == .confirmed }
+    #expect(confirmed, "expected approve to confirm once runResumed proved the run left the gate")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// Cancel is immediate: the response's own `run.status` already proves the
+/// effect, so it confirms right away (no need to wait for a live event) and
+/// also triggers a `detail` refresh.
+@MainActor @Test func cancelConfirmsFromResponseStatusAndRefreshesDetail() async {
+    let detailCalls = Counter()
+    let store = makeStore(
+        detailResult: {
+            detailCalls.increment()
+            return detail(run: runRecord(status: "running"))
+        },
+        cancelResult: { _ in runControlResponse(status: "cancelled") }
+    )
+    await store.activate()
+    #expect(detailCalls.value == 1)
+
+    let key = ActionKey("run-1", .cancel)
+    await store.cancel()
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+    #expect(detailCalls.value == 2)
+
+    store.deactivate()
+}
+
+/// Fix round 1 (Important, previously untested): the remote-proxy response
+/// shape (`{ok, host_id}`, no `run` body at all — see `RunControlResponse`'s
+/// doc comment) has nothing for `resolve(runID:observedStatus:)` to check,
+/// so `handleImmediateResponse` falls back to confirming directly off
+/// `ok == true`. This is the accepted behavior (the local host that ran the
+/// mutation never sent its record back across the proxy hop; a 2xx from an
+/// immediate route is itself the proof), not a gap — this test locks it in.
+@MainActor @Test func cancelConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "running")) },
+        cancelResult: { _ in RunControlResponse(run: nil, ok: true, hostID: "mini", archived: nil) }
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .cancel)
+    await store.cancel()
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+
+    store.deactivate()
+}
+
+/// Same remote-proxy `ok`-only fallback, exercised via reject's gate-scoped
+/// key.
+@MainActor @Test func rejectConfirmsFromResponseOkAloneWhenNoRunBodyIsPresent() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "awaiting_approval")) },
+        rejectResult: { _, _ in RunControlResponse(run: nil, ok: true, hostID: "mini", archived: nil) }
+    )
+    await store.activate()
+
+    let key = ActionKey.gate(runID: "run-1", stepID: "gate-1", verb: .reject)
+    await store.reject(gate: "gate-1")
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+
+    store.deactivate()
+}
+
+/// A 409 (run already terminal/not running) surfaces as a plain `.failed`
+/// state with a non-empty message — never silently dropped.
+@MainActor @Test func pause409SurfacesAsFailedWithMessage() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "completed")) },
+        pauseResult: { throw CPError.http(status: 409, body: #"{"error":"run is not running"}"#) }
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .pause)
+    await store.pause()
+
+    guard case .failed(let message) = store.pendingActions.state(key) else {
+        Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+        return
+    }
+    #expect(!message.isEmpty)
+
+    store.deactivate()
+}
+
+/// A 501 (no launcher runtime configured on this host) gets the specific
+/// "start with `rupu cp serve`" message, not the raw HTTP body — same
+/// mapping every marker-only write route shares.
+@MainActor @Test func resume501SurfacesTheLaunchRuntimeMessage() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "paused")) },
+        resumeResult: { throw CPError.http(status: 501, body: #"{"error":"agent_launcher not configured"}"#) }
+    )
+    await store.activate()
+
+    let key = ActionKey("run-1", .resume)
+    await store.resume()
+
+    guard case .failed(let message) = store.pendingActions.state(key) else {
+        Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+        return
+    }
+    #expect(message.contains("rupu cp serve"))
+
+    store.deactivate()
+}
+
+/// Reject is immediate too — confirms straight from the response, same as
+/// cancel, and its two possible terminal outcomes (rejected/cancelled, per
+/// `on_reject` routing) both confirm via `PendingActions`' confirmation
+/// table.
+@MainActor @Test func rejectConfirmsFromResponseStatus() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "awaiting_approval")) },
+        rejectResult: { _, _ in runControlResponse(status: "rejected") }
+    )
+    await store.activate()
+
+    let key = ActionKey.gate(runID: "run-1", stepID: "gate-1", verb: .reject)
+    await store.reject(gate: "gate-1")
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+
+    store.deactivate()
+}
+
+/// Fix round 1 (Critical): two gates parked on the same run must track
+/// pending state fully independently — approving gate A must never
+/// spinner/disable gate B's controls, and must never silently confirm gate
+/// B's own key.
+@MainActor @Test func multiGateApproveKeepsEachGatesPendingStateIndependent() async {
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(status: "awaiting_approval", awaiting: [
+                APIAwaitingGate(stepID: "gate-a", prompt: "deploy a?", since: "2026-08-20T12:00:00Z"),
+                APIAwaitingGate(stepID: "gate-b", prompt: "deploy b?", since: "2026-08-20T12:00:00Z"),
+            ]))
+        },
+        approveResult: { _, _ in runControlResponse(status: "awaiting_approval") }
+    )
+    await store.activate()
+
+    let keyA = ActionKey.gate(runID: "run-1", stepID: "gate-a", verb: .approve)
+    let keyB = ActionKey.gate(runID: "run-1", stepID: "gate-b", verb: .approve)
+    #expect(store.pendingActions.state(keyA) == .idle)
+    #expect(store.pendingActions.state(keyB) == .idle)
+
+    await store.approve(gate: "gate-a")
+
+    guard case .pending = store.pendingActions.state(keyA) else {
+        Issue.record("expected gate-a's key to be .pending, got \(store.pendingActions.state(keyA))")
+        return
+    }
+    #expect(store.pendingActions.state(keyB) == .idle, "gate-b's key must be untouched by gate-a's approve")
+
+    store.deactivate()
+}
+
+/// One run-level observed transition resolves EVERY gate's pending
+/// approve for that run — a run leaving `.awaiting` means every gate that
+/// was blocking it got settled one way or another. This is the accepted
+/// (per-review) trade-off of the composite-key `resolve` match: it can't
+/// distinguish which specific gate the observed event belongs to.
+@MainActor @Test func runLevelResolveConfirmsEveryGatesPendingApproveForThatRun() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: {
+            detail(run: runRecord(status: "awaiting_approval", awaiting: [
+                APIAwaitingGate(stepID: "gate-a", prompt: "deploy a?", since: "2026-08-20T12:00:00Z"),
+                APIAwaitingGate(stepID: "gate-b", prompt: "deploy b?", since: "2026-08-20T12:00:00Z"),
+            ]))
+        },
+        runStreamBox: runBox
+    )
+    await store.activate()
+
+    let keyA = ActionKey.gate(runID: "run-1", stepID: "gate-a", verb: .approve)
+    let keyB = ActionKey.gate(runID: "run-1", stepID: "gate-b", verb: .approve)
+    await store.approve(gate: "gate-a")
+    await store.approve(gate: "gate-b")
+    guard case .pending = store.pendingActions.state(keyA) else {
+        Issue.record("expected gate-a pending"); return
+    }
+    guard case .pending = store.pendingActions.state(keyB) else {
+        Issue.record("expected gate-b pending"); return
+    }
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.runResumed(runID: "run-1")))
+
+    let bothConfirmed = await pollUntil {
+        store.pendingActions.state(keyA) == .confirmed && store.pendingActions.state(keyB) == .confirmed
+    }
+    #expect(bothConfirmed, "expected both gates' pending approve keys to confirm off one run-level transition")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// Archive/restore never confirm via `PendingActions.resolve` (they're not
+/// a run-status transition) — they confirm directly off `response.archived`
+/// matching the expected direction, and flip the store's own local
+/// `isArchived` flag, which `availableVerbs` then reads.
+@MainActor @Test func archiveConfirmsFromResponseArchivedFlagAndFlipsAvailableVerbs() async {
+    let store = makeStore(
+        detailResult: { detail(run: runRecord(status: "completed")) },
+        archiveResult: { runControlResponse(status: nil, archived: true) }
+    )
+    await store.activate()
+    #expect(store.availableVerbs == [.archive])
+
+    let key = ActionKey("run-1", .archive)
+    await store.archive()
+
+    #expect(store.pendingActions.state(key) == .confirmed)
+    #expect(store.availableVerbs == [.restore])
+
+    store.deactivate()
+}
+
+// MARK: - (h) availableVerbs derives strictly from current status
+
+@MainActor @Test func availableVerbsDerivesFromCurrentStatusPerStatusTable() async {
+    @MainActor func verbs(for status: String) async -> Set<ActionVerb> {
+        let store = makeStore(detailResult: { detail(run: runRecord(status: status)) })
+        await store.activate()
+        let result = store.availableVerbs
+        store.deactivate()
+        return result
+    }
+
+    #expect(await verbs(for: "running") == [.cancel, .pause])
+    #expect(await verbs(for: "awaiting_approval") == [.cancel])
+    #expect(await verbs(for: "pending") == [.cancel])
+    #expect(await verbs(for: "paused") == [.resume])
+    #expect(await verbs(for: "completed") == [.archive])
+    #expect(await verbs(for: "failed") == [.archive])
+    #expect(await verbs(for: "rejected") == [.archive])
+    #expect(await verbs(for: "cancelled") == [.archive])
+}
+
+@MainActor @Test func availableVerbsIsEmptyBeforeDetailLoads() async {
+    let store = makeStore(detailResult: { throw StubError(description: "still loading") })
+    // Deliberately never activated — `detail` stays `.loading`.
+    #expect(store.availableVerbs == [])
+    store.deactivate()
 }

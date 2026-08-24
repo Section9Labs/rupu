@@ -851,4 +851,301 @@ struct ActivityStoreTests {
         store.deactivate()
         box.latest.finish()
     }
+
+    // MARK: - statusOverrides pruning (Phase 3, Task 4 carry-over)
+
+    // (q) A live status-patch override for a runID is dropped once the
+    // freshly *merged* (unpatched) data for that same runID already shows
+    // the identical status — "server caught up" — even when the
+    // `recompute()` that notices this isn't a full `refreshActiveSources()`
+    // (which already clears every override unconditionally regardless of
+    // this fix; see that method's doc comment). `loadRemoteHost`'s
+    // merge-then-`recompute()` step is the one production path that calls
+    // `recompute()` without a full clear, so it's the vehicle here: one of
+    // the two rows sharing a run id (local vs. the remote host's own copy
+    // of it) already reads "completed" by the time they're both merged in —
+    // exactly the case per-key pruning is for.
+    //
+    // Review fix: which of the two rows already matches — `matchingRowIsLocal`
+    // — controls which one `recompute()`'s merge encounters *first* (local
+    // rows always precede remote rows in `merged`; see that method). Pruning
+    // must not depend on that order: a single combined prune-or-patch pass
+    // would prune as soon as it hit the matching row and, if that happened
+    // to be the *first* one, leave a later mismatched row for the same run
+    // id force-patched or not depending purely on which row won the race —
+    // this was previously masked entirely because the one committed test
+    // only ever exercised the remote-matches-last case. Returns the final
+    // set of statuses shown for `run-wf-1` and whether the override was
+    // pruned, so the caller can assert both orderings land on the identical
+    // outcome.
+    @MainActor
+    private func pruningOutcome(matchingRowIsLocal: Bool) async -> (statuses: Set<ActivityStatus>, overridePruned: Bool) {
+        let localStatus = matchingRowIsLocal ? "completed" : "running"
+        let remoteStatus = matchingRowIsLocal ? "running" : "completed"
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                // Artificially slow — same rationale as
+                // `activateRendersLocalImmediatelyThenMergesSlowOnlineRemoteHostProgressively`:
+                // without this, `loadRemoteHosts`' background fetch (kicked
+                // off by `activate()`, no delay by default) can race ahead
+                // of the live-patch event below and prune the override
+                // before this test ever observes it standing.
+                Thread.sleep(forTimeInterval: 0.08)
+                let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: remoteStatus)
+                return (200, Data("[\(row)]".utf8))
+            }
+            let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: localStatus)
+            return (200, Data("[\(row)]".utf8))
+        }
+
+        await store.activate(kind: .workflows)
+
+        // Live patch: records the "completed" override ahead of whichever
+        // side (local or remote) hasn't caught up to it yet.
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 has a standing .completed override") {
+            store.statusOverrides["run-wf-1"] != nil
+        }
+
+        // The remote host answers with its (deliberately delayed) row —
+        // `loadRemoteHost`'s recompute() is the non-full-clear vehicle this
+        // test exercises.
+        await expectEventually("the remote host's row merges in and pendingHosts drains to 0") {
+            store.pendingHosts == 0
+        }
+
+        let statuses = Set(store.rows.filter { $0.id == "run-wf-1" }.map(\.status))
+        let overridePruned = store.statusOverrides["run-wf-1"] == nil
+
+        store.deactivate()
+        box.latest.finish()
+        return (statuses, overridePruned)
+    }
+
+    @MainActor @Test func statusOverridePrunedOncePerKeyMergedStatusMatchesWithoutAFullClear() async {
+        let outcome = await pruningOutcome(matchingRowIsLocal: false)
+
+        #expect(outcome.overridePruned)
+        // The row that already read "completed" on its own keeps doing so;
+        // the other (still raw "running" underneath) is no longer
+        // force-patched now that the override was pruned wholesale rather
+        // than selectively — see `recompute()`'s two-pass doc comment.
+        #expect(outcome.statuses == [.completed, .running])
+    }
+
+    // (r) Order independence (review fix): the matching row can be either
+    // side of the merge — the outcome must be identical either way. A
+    // single-pass prune-or-patch loop was safe only because local rows
+    // happen to precede remote rows in `merged`, an undocumented invariant;
+    // this asserts the fix no longer depends on it by running the exact
+    // same scenario with the matching row on the *other* side and comparing
+    // results directly.
+    @MainActor @Test func statusOverridePruningIsOrderIndependentAcrossWhichRowMatchesFirst() async {
+        let matchingLast = await pruningOutcome(matchingRowIsLocal: false) // remote (2nd in merge order) matches
+        let matchingFirst = await pruningOutcome(matchingRowIsLocal: true) // local (1st in merge order) matches
+
+        #expect(matchingLast.overridePruned)
+        #expect(matchingFirst.overridePruned)
+        #expect(matchingFirst.statuses == matchingLast.statuses)
+        #expect(matchingFirst.statuses == [.completed, .running])
+    }
+
+    // (r) A full `refreshActiveSources()` (here, `applyPendingRefresh()`)
+    // still clears every override wholesale, matching status or not — the
+    // per-key pruning above is additive, not a replacement for this.
+    @MainActor @Test func fullRefreshStillClearsOverridesRegardlessOfMatchingStatus() async {
+        let (store, box) = makeStore()
+        store.liveTail = false
+        await store.activate(kind: .all)
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "failed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 patches to .failed via the live override") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .failed
+        }
+        #expect(store.statusOverrides["run-wf-1"] != nil)
+
+        // The stub's own REST truth is still "running" (never "failed") —
+        // a full refresh must clear the override even though it doesn't
+        // match, not just leave it standing because nothing "caught up".
+        await store.applyPendingRefresh()
+
+        #expect(store.statusOverrides.isEmpty)
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // MARK: - Mutations (Phase 3, Task 5)
+
+    /// `approve(runID:gate:host:)` begins the pending key, POSTs, and
+    /// schedules a debounced refresh on success — the row's own status
+    /// column catches up once that refresh lands (here, simulated by the
+    /// stub returning a different status on the second hit), and the key
+    /// itself confirms via the live-tail `.statusPatch` reduction once a
+    /// matching event arrives, not from the refresh directly.
+    @MainActor @Test func activityApprovePatchesRowStatusAfterDebouncedRefreshAndConfirmsViaLiveEvent() async {
+        let workflowHits = Counter()
+        let (store, box) = makeStore(
+            debounceInterval: .milliseconds(20),
+            respond: { req in
+                if req.url?.path == "/api/runs/run-wf-1/approve" {
+                    // Marker-only response — no `run` body, so `approve`
+                    // never auto-confirms from it; it stays `.pending`
+                    // until the live `runResumed` event below.
+                    return (200, Data(#"{"ok":true,"host_id":"local"}"#.utf8))
+                }
+                guard req.url?.path == "/api/runs/workflows" else {
+                    return (200, Data("[]".utf8))
+                }
+                workflowHits.increment()
+                let status = workflowHits.value == 1 ? "awaiting_approval" : "running"
+                let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: status)
+                return (200, Data("[\(row)]".utf8))
+            }
+        )
+        await store.activate(kind: .workflows)
+        #expect(store.rows.first?.status == .awaiting)
+
+        let key = ActionKey.gate(runID: "run-wf-1", stepID: "gate-1", verb: .approve)
+        await store.approve(runID: "run-wf-1", gate: "gate-1", host: "local")
+        guard case .pending = store.pendingActions.state(key) else {
+            Issue.record("expected .pending immediately after approve(), got \(store.pendingActions.state(key))")
+            return
+        }
+
+        // The debounced refresh (20ms) lands the row's fresh "running"
+        // status from the stub.
+        await expectEventually("row status becomes running after approve's debounced refresh") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .running
+        }
+
+        // The key itself only confirms off an observed live event — the
+        // refresh alone (REST, no event) never touches `pendingActions`.
+        #expect(store.pendingActions.state(key) != .confirmed)
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runResumed(runID: "run-wf-1")))
+        await expectEventually("approve confirms once the live runResumed event lands") {
+            store.pendingActions.state(key) == .confirmed
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// `reject(runID:gate:host:)` fails cleanly on a POST error, same
+    /// `mutationErrorMessage` mapping every mutation method shares.
+    @MainActor @Test func activityRejectFailsWithMessageOnPOSTError() async {
+        let (store, box) = makeStore(respond: { req in
+            if req.url?.path == "/api/runs/run-wf-1/reject" {
+                return (409, Data(#"{"error":"gate already resolved"}"#.utf8))
+            }
+            return (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+        })
+        await store.activate(kind: .workflows)
+
+        let key = ActionKey.gate(runID: "run-wf-1", stepID: "gate-1", verb: .reject)
+        await store.reject(runID: "run-wf-1", gate: "gate-1", host: "local")
+
+        guard case .failed(let message) = store.pendingActions.state(key) else {
+            Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+            return
+        }
+        #expect(!message.isEmpty)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// Cross-store shared-key visibility: `BackendController.pendingActions`
+    /// is ONE instance both `ActivityStore` and `RunDetailStore` are handed
+    /// at construction — a key one store begins must read as `.pending` to
+    /// the other immediately, with no refetch or event needed to see it.
+    @MainActor @Test func activityStoreApproveIsVisibleAsPendingToASeparateRunDetailStoreSharingTheSameLedger() async {
+        let shared = PendingActions()
+        let (store, box) = makeStore(
+            pendingActions: shared,
+            respond: { req in
+                if req.url?.path == "/api/runs/run-wf-1/approve" {
+                    // Marker-only response, remote-proxy shape — no `run`
+                    // body, so this never auto-confirms via
+                    // `handleImmediateResponse`-style logic (approve doesn't
+                    // have one; it stays `.pending` unconditionally).
+                    return (200, Data(#"{"ok":true,"host_id":"local"}"#.utf8))
+                }
+                return (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+            }
+        )
+
+        // A second, independent `RunDetailStore` for the same run — built
+        // directly against the shared ledger rather than through
+        // `ActivityStore`'s own HTTP-backed `client`, matching the "fake
+        // client closures" seam `RunDetailStoreTests` already establishes.
+        let runDetailStore = RunDetailStore(
+            runID: "run-wf-1",
+            host: nil,
+            isRemote: false,
+            fetchDetail: { throw StubHTTPError() },
+            fetchGraph: { throw StubHTTPError() },
+            fetchNetflow: { throw StubHTTPError() },
+            fetchFindings: { throw StubHTTPError() },
+            fetchTranscript: { _ in throw StubHTTPError() },
+            runSignalsFactory: nil,
+            transcriptTailFactory: nil,
+            pendingActions: shared
+        )
+
+        await store.activate(kind: .workflows)
+
+        let key = ActionKey.gate(runID: "run-wf-1", stepID: "gate-1", verb: .approve)
+        #expect(runDetailStore.pendingActions.state(key) == .idle)
+
+        await store.approve(runID: "run-wf-1", gate: "gate-1", host: "local")
+
+        guard case .pending = runDetailStore.pendingActions.state(key) else {
+            Issue.record("expected the RunDetailStore's view of the shared ledger to read .pending too, got \(runDetailStore.pendingActions.state(key))")
+            return
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// Overload of `makeStore` accepting an explicit `pendingActions` — kept
+    /// separate from the file's primary `makeStore` (used by every other
+    /// test) rather than adding yet another optional parameter there, since
+    /// this is the only test in the file that cares about sharing the
+    /// ledger with a second, independently-constructed store.
+    @MainActor
+    private func makeStore(
+        debounceInterval: Duration = .milliseconds(500),
+        pendingActions: PendingActions,
+        respond: @escaping @Sendable (URLRequest) -> (status: Int, body: Data) = { req in
+            (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+        }
+    ) -> (store: ActivityStore, box: SignalsFactoryBox) {
+        ActivityStubURLProtocol.reset(handler: respond)
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: ActivityStubURLProtocol.session()
+        )
+        let box = SignalsFactoryBox()
+        let store = ActivityStore(client: client, signalsFactory: { box.factory() }, debounceInterval: debounceInterval, pendingActions: pendingActions)
+        return (store, box)
+    }
+}
+
+/// Stand-in error for `RunDetailStore` fetch closures that must never
+/// actually be called in a test scoped purely to `PendingActions` sharing —
+/// see `activityStoreApproveIsVisibleAsPendingToASeparateRunDetailStoreSharingTheSameLedger`.
+private struct StubHTTPError: Error, CustomStringConvertible {
+    let description = "unused in this test"
 }

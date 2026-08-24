@@ -1,0 +1,41 @@
+[
+  {
+    "id": "local",
+    "name": "local",
+    "transport_kind": "local",
+    "status": "online",
+    "version": "0.74.0",
+    "active_run_count": 2
+  },
+  {
+    "id": "mini",
+    "name": "mini",
+    "transport_kind": "ssh",
+    "base_url": "mini.local:22",
+    "status": "online",
+    "version": "0.74.0",
+    "capabilities": {
+      "backends": [
+        "claude"
+      ],
+      "scm_hosts": [
+        "github.com"
+      ],
+      "permission_modes": [
+        "ask",
+        "bypass"
+      ]
+    },
+    "active_run_count": 0,
+    "last_seen_at": "2026-08-20T12:00:00Z"
+  },
+  {
+    "id": "node_1",
+    "name": "kuki",
+    "transport_kind": "tunnel",
+    "base_url": "node_1",
+    "status": "offline",
+    "active_run_count": 0,
+    "last_seen_at": "2026-08-19T09:00:00Z"
+  }
+]

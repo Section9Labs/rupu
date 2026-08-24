@@ -89,4 +89,64 @@ mod tests {
         let has_read = tools.iter().any(|t| t["kind"] == "read");
         assert!(has_read, "at least one read tool expected");
     }
+
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────
+    //
+    // `ToolSpecDto`/`ToolsResponse` are private to this module — the
+    // integration test (`tests/macos_fixtures.rs`) can't build them, so
+    // their fixture lives here instead. Same `check_fixture` contract as
+    // that file (duplicated: a unit test can't share code with an
+    // integration test without a public module) — see `api/host_info.rs`'s
+    // test module for the established pattern.
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures");
+        let path = dir.join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    #[test]
+    fn tools_fixture_is_current() {
+        // Pulled from the REAL catalog (not hand-authored) so the fixture
+        // can never silently drift from `tool_catalog()`'s actual shape —
+        // `tool_catalog`'s own doc comment guarantees stable ordering.
+        let catalog = tool_catalog();
+        let read = catalog
+            .iter()
+            .find(|t| t.kind == ToolKind::Read)
+            .expect("at least one read tool in the catalog");
+        let write = catalog
+            .iter()
+            .find(|t| t.kind == ToolKind::Write)
+            .expect("at least one write tool in the catalog");
+        let response = ToolsResponse {
+            tools: vec![
+                ToolSpecDto {
+                    name: read.name,
+                    description: read.description,
+                    input_schema: read.input_schema.clone(),
+                    kind: kind_str(read.kind),
+                },
+                ToolSpecDto {
+                    name: write.name,
+                    description: write.description,
+                    input_schema: write.input_schema.clone(),
+                    kind: kind_str(write.kind),
+                },
+            ],
+        };
+        check_fixture("tools.json", &response);
+    }
 }

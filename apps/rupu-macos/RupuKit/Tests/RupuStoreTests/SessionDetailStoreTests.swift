@@ -56,17 +56,39 @@ private func runRow(
     )
 }
 
+/// Fixture builder for `LaunchResponse` — `sendToSession`'s success shape.
+private func launchResponse(runID: String? = "run-new", sessionID: String? = nil, ok: Bool? = nil, hostID: String = "local") -> LaunchResponse {
+    LaunchResponse(runID: runID, sessionID: sessionID, ok: ok, hostID: hostID)
+}
+
+/// Fixture builder for `RunControlResponse` — reused by `archiveSession`/
+/// `restoreSession`'s response shape too (see `CPClient.archiveSession`'s
+/// doc comment: the real local session-archive response is `{ok, id}`, no
+/// `archived` field at all, unlike run archive/restore's `RunRecord`-backed
+/// one — so tests here only ever set `ok`, never `archived`).
+private func runControlResponse(ok: Bool = true) -> RunControlResponse {
+    RunControlResponse(run: nil, ok: ok, hostID: "local", archived: nil)
+}
+
 @MainActor
 private func makeStore(
     sessionResult: @escaping @Sendable () async throws -> APISessionRow,
     runsResult: @escaping @Sendable () async throws -> [APISessionRunRow] = { [] },
-    transcriptResult: @escaping @Sendable (String) async throws -> APITranscriptPage = { _ in APITranscriptPage(events: [], summary: nil) }
+    transcriptResult: @escaping @Sendable (String) async throws -> APITranscriptPage = { _ in APITranscriptPage(events: [], summary: nil) },
+    sendResult: @escaping @Sendable (String) async throws -> LaunchResponse = { _ in launchResponse() },
+    archiveResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse() },
+    restoreResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse() },
+    pendingActions: PendingActions = PendingActions()
 ) -> SessionDetailStore {
     SessionDetailStore(
         sessionID: "sess-1",
         fetchSession: sessionResult,
         fetchRuns: runsResult,
-        fetchTranscript: transcriptResult
+        fetchTranscript: transcriptResult,
+        postSend: sendResult,
+        postArchive: archiveResult,
+        postRestore: restoreResult,
+        pendingActions: pendingActions
     )
 }
 
@@ -295,4 +317,144 @@ private func makeStore(
     // Cancellation left it exactly where it was — still "a".
     #expect(store.focusedRunID == "a")
     #expect(store.transcript == [.assistantMessage(content: "A snapshot", thinking: nil)])
+}
+
+// MARK: - (g) send — Phase 3, Task 6
+
+/// Happy path: `begin` → POST succeeds with `{run_id}` → `confirm`, `runs`
+/// refreshed, and the store focuses the newly-sent run — its transcript is
+/// the reply surface, per the store's doc comment.
+@MainActor @Test func sendHappyPathConfirmsRefreshesRunsAndFocusesTheNewRun() async {
+    let runsBox = FlagBox()
+    let store = makeStore(
+        sessionResult: { sessionRow() },
+        runsResult: {
+            if runsBox.value {
+                return [runRow(runID: "run-1", transcriptPath: "t/run-1.jsonl"), runRow(runID: "run-new", transcriptPath: "t/run-new.jsonl")]
+            }
+            return [runRow(runID: "run-1", transcriptPath: "t/run-1.jsonl")]
+        },
+        transcriptResult: { path in APITranscriptPage(events: [.assistantMessage(content: "content at \(path)", thinking: nil)], summary: nil) },
+        sendResult: { prompt in
+            #expect(prompt == "hello there")
+            runsBox.value = true
+            return launchResponse(runID: "run-new")
+        }
+    )
+    await store.activate()
+    #expect(store.focusedRunID == "run-1")
+
+    await store.send("  hello there  ")
+
+    let key = ActionKey("sess-1", .send)
+    #expect(store.pendingActions.state(key) == .confirmed)
+    #expect(store.runs.value?.map(\.runID) == ["run-1", "run-new"])
+    #expect(store.focusedRunID == "run-new")
+    #expect(store.transcript == [.assistantMessage(content: "content at t/run-new.jsonl", thinking: nil)])
+}
+
+private final class FlagBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = false
+    var value: Bool {
+        get { lock.withLock { v } }
+        set { lock.withLock { v = newValue } }
+    }
+}
+
+/// Empty (or whitespace-only) prompt is a no-op — no POST fires, no key is
+/// ever `begin()`-ed.
+@MainActor @Test func sendWithEmptyOrWhitespaceOnlyPromptIsANoOp() async {
+    let sendCalls = Counter()
+    let store = makeStore(
+        sessionResult: { sessionRow() },
+        sendResult: { _ in
+            sendCalls.increment()
+            return launchResponse()
+        }
+    )
+    await store.activate()
+
+    await store.send("")
+    await store.send("   \n\t  ")
+
+    #expect(sendCalls.value == 0)
+    let key = ActionKey("sess-1", .send)
+    #expect(store.pendingActions.state(key) == .idle)
+}
+
+/// A 409 "session ... is stopped" failure fails the pending key with the
+/// server's message surfaced verbatim (not paraphrased into a canned
+/// string — that's the 501 launch-runtime case only, see
+/// `mutationErrorMessage`).
+@MainActor @Test func sendFailureFromAStoppedSessionFailsTheKeyWithTheServerMessage() async {
+    let store = makeStore(
+        sessionResult: { sessionRow() },
+        sendResult: { _ in throw CPError.http(status: 409, body: #"{"error":"session sess-1 is stopped"}"#) }
+    )
+    await store.activate()
+
+    await store.send("hello")
+
+    let key = ActionKey("sess-1", .send)
+    guard case .failed(let message) = store.pendingActions.state(key) else {
+        Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+        return
+    }
+    #expect(message.contains("is stopped"))
+}
+
+// MARK: - (h) archive/restore — Phase 3, Task 6, mirrors `RunDetailStore`
+
+/// The real local session-archive response carries no `archived` field
+/// (`{ok: true, id}` — see `CPClient.archiveSession`'s doc comment), so
+/// confirmation here is off `response.ok`, not `response.archived`.
+@MainActor @Test func archiveConfirmsFromResponseOkAndFlipsIsArchived() async {
+    let store = makeStore(
+        sessionResult: { sessionRow() },
+        archiveResult: { runControlResponse(ok: true) }
+    )
+    await store.activate()
+    #expect(!store.isArchived)
+
+    await store.archive()
+
+    let key = ActionKey("sess-1", .archive)
+    #expect(store.pendingActions.state(key) == .confirmed)
+    #expect(store.isArchived)
+}
+
+@MainActor @Test func restoreConfirmsFromResponseOkAndFlipsIsArchivedBack() async {
+    let store = makeStore(
+        sessionResult: { sessionRow() },
+        archiveResult: { runControlResponse(ok: true) },
+        restoreResult: { runControlResponse(ok: true) }
+    )
+    await store.activate()
+    await store.archive()
+    #expect(store.isArchived)
+
+    await store.restore()
+
+    let key = ActionKey("sess-1", .restore)
+    #expect(store.pendingActions.state(key) == .confirmed)
+    #expect(!store.isArchived)
+}
+
+@MainActor @Test func archiveFailureFailsTheKeyAndLeavesIsArchivedFalse() async {
+    let store = makeStore(
+        sessionResult: { sessionRow() },
+        archiveResult: { throw StubError(description: "archive endpoint down") }
+    )
+    await store.activate()
+
+    await store.archive()
+
+    let key = ActionKey("sess-1", .archive)
+    guard case .failed(let message) = store.pendingActions.state(key) else {
+        Issue.record("expected .failed, got \(store.pendingActions.state(key))")
+        return
+    }
+    #expect(message.contains("archive endpoint down"))
+    #expect(!store.isArchived)
 }

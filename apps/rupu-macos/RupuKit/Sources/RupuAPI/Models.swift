@@ -85,12 +85,26 @@ public struct APIHostRow: Decodable, Equatable, Sendable {
     public let name: String
     public let transportKind: String
     public let status: String
+    public let version: String?
+    public let activeRunCount: Int?
+    public let lastSeenAt: String?
 
-    public init(id: String, name: String, transportKind: String, status: String) {
+    public init(
+        id: String,
+        name: String,
+        transportKind: String,
+        status: String,
+        version: String? = nil,
+        activeRunCount: Int? = nil,
+        lastSeenAt: String? = nil
+    ) {
         self.id = id
         self.name = name
         self.transportKind = transportKind
         self.status = status
+        self.version = version
+        self.activeRunCount = activeRunCount
+        self.lastSeenAt = lastSeenAt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -98,5 +112,8 @@ public struct APIHostRow: Decodable, Equatable, Sendable {
         case name
         case transportKind = "transport_kind"
         case status
+        case version
+        case activeRunCount = "active_run_count"
+        case lastSeenAt = "last_seen_at"
     }
 }

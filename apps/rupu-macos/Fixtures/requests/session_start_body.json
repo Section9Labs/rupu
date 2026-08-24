@@ -1,0 +1,7 @@
+{
+  "prompt": "start reviewing",
+  "mode": "ask",
+  "target": "main",
+  "working_dir": "/tmp/project",
+  "host": "local"
+}

@@ -21,6 +21,16 @@ public final class AppModel {
             if case .activity = route {
                 lastActivityRoute = route
             }
+            // Carry-over (Phase 3, Task 4): a *direct* `route =` assignment
+            // (sidebar click, tab switch) is a new context, not a step
+            // deeper into the current one — it clears whatever `navigate
+            // (to:)` had pushed. `navigate(to:)`/`navigateBack()` below set
+            // `route` too, but through this same `didSet`, so they flip
+            // `isNavigatingViaStack` first to opt out of the clear for the
+            // duration of their own assignment.
+            if !isNavigatingViaStack {
+                routeStack.removeAll()
+            }
         }
     }
 
@@ -28,6 +38,20 @@ public final class AppModel {
     /// `navigateBack()`. Defaults to `.activity(.all)` so a `navigateBack()`
     /// called with no prior Activity visit still lands somewhere sensible.
     public private(set) var lastActivityRoute: Route = .activity(.all)
+
+    /// Carry-over (Phase 3, Task 4): the real navigation stack `navigate
+    /// (to:)` pushes onto and `navigateBack()` pops from — closes the
+    /// single-level `navigateBack()` quirk matt flagged (a run pushed atop
+    /// a session detail used to skip straight past it back to Activity).
+    /// A direct `route =` assignment (sidebar/tab switch) clears this —
+    /// see `route`'s `didSet`.
+    public private(set) var routeStack: [Route] = []
+
+    /// Set for the duration of a `navigate(to:)`/`navigateBack()`-driven
+    /// `route` assignment so `route`'s `didSet` doesn't treat it as a fresh
+    /// sidebar-style context switch and clear `routeStack` out from under
+    /// the very push/pop that's updating it.
+    private var isNavigatingViaStack = false
 
     public var range: TimeRange = .d7
     public var backendHealth: BackendHealth = .starting
@@ -85,11 +109,37 @@ public final class AppModel {
         }
     }
 
-    /// Returns from a pushed `.runDetail`/`.sessionDetail` route to
-    /// whichever `.activity(kind)` route was current before the push (or
-    /// `.activity(.all)`, `lastActivityRoute`'s default, if Activity was
-    /// never visited this session).
+    /// Pushes the *current* `route` onto `routeStack`, then sets `route` to
+    /// `newRoute` — the row-activation half of the stack (`ActivityTable`/
+    /// `SessionDetailScreen`'s child rows call this instead of assigning
+    /// `route` directly, so a chain of pushes — e.g. session → run — pops
+    /// back through each intermediate stop rather than jumping straight to
+    /// Activity).
+    public func navigate(to newRoute: Route) {
+        isNavigatingViaStack = true
+        routeStack.append(route)
+        route = newRoute
+        isNavigatingViaStack = false
+    }
+
+    /// Pops the most recently pushed route and returns to it. With nothing
+    /// on `routeStack` (either nothing was ever pushed, or a direct `route =`
+    /// assignment since cleared it — see `route`'s `didSet`), falls back to
+    /// whichever `.activity(kind)` route was current before that, same as
+    /// the single-level contract this replaces.
+    ///
+    /// Review fix: the empty-stack fallback is still a `navigateBack()`
+    /// assignment, not a fresh sidebar-style context switch — it goes
+    /// through `isNavigatingViaStack` the same as the pop branch below, for
+    /// the same reason every other stack-driven `route` assignment does
+    /// (`route`'s `didSet`). Harmless today (`routeStack` is already empty
+    /// here, so clearing it either way is a no-op), but leaving this one
+    /// assignment inconsistent would be a trap for whatever this method
+    /// grows into next.
     public func navigateBack() {
-        route = lastActivityRoute
+        let target = routeStack.popLast() ?? lastActivityRoute
+        isNavigatingViaStack = true
+        route = target
+        isNavigatingViaStack = false
     }
 }

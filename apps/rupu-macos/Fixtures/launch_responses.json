@@ -1,0 +1,14 @@
+[
+  {
+    "host_id": "local",
+    "run_id": "run-01"
+  },
+  {
+    "host_id": "local",
+    "session_id": "ses-01"
+  },
+  {
+    "host_id": "mini",
+    "ok": true
+  }
+]

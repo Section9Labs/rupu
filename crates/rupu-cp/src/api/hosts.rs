@@ -683,4 +683,73 @@ mod tests {
             assert!(!ip.is_loopback(), "detected loopback: {ip}");
         }
     }
+
+    // ── macOS golden fixtures (apps/rupu-macos/Fixtures/) ─────────────────
+    //
+    // `HostView` is public, but its fixture lives here (rather than
+    // `tests/macos_fixtures.rs`) alongside the other in-module fixtures for
+    // this crate's write-path types — same `check_fixture` contract as that
+    // file (duplicated: a unit test can't share code with an integration
+    // test without a public module) — see `api/host_info.rs`'s test module
+    // for the established pattern.
+
+    fn check_fixture(name: &str, value: &impl serde::Serialize) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/rupu-macos/Fixtures");
+        let path = dir.join(name);
+        let rendered = serde_json::to_string_pretty(value).expect("serialize fixture");
+        if std::env::var_os("REGEN_FIXTURES").is_some() {
+            std::fs::write(&path, rendered + "\n").expect("write fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture {name}; run `make macos-fixtures`"));
+        assert_eq!(
+            on_disk.trim_end(),
+            rendered,
+            "fixture {name} drifted from the Rust types; run `make macos-fixtures`"
+        );
+    }
+
+    #[test]
+    fn hosts_fixture_is_current() {
+        let local = HostView {
+            id: "local".into(),
+            name: "local".into(),
+            transport_kind: "local".into(),
+            base_url: None,
+            status: "online".into(),
+            version: Some("0.74.0".into()),
+            capabilities: None,
+            active_run_count: 2,
+            last_seen_at: None,
+        };
+        let ssh = HostView {
+            id: "mini".into(),
+            name: "mini".into(),
+            transport_kind: "ssh".into(),
+            base_url: Some("mini.local:22".into()),
+            status: "online".into(),
+            version: Some("0.74.0".into()),
+            capabilities: Some(HostCapabilities {
+                backends: vec!["claude".into()],
+                scm_hosts: vec!["github.com".into()],
+                permission_modes: vec!["ask".into(), "bypass".into()],
+            }),
+            active_run_count: 0,
+            last_seen_at: Some("2026-08-20T12:00:00Z".into()),
+        };
+        let tunnel = HostView {
+            id: "node_1".into(),
+            name: "kuki".into(),
+            transport_kind: "tunnel".into(),
+            base_url: Some("node_1".into()),
+            status: "offline".into(),
+            version: None,
+            capabilities: None,
+            active_run_count: 0,
+            last_seen_at: Some("2026-08-19T09:00:00Z".into()),
+        };
+        check_fixture("hosts.json", &vec![local, ssh, tunnel]);
+    }
 }

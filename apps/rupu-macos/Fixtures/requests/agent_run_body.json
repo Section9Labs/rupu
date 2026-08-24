@@ -1,0 +1,7 @@
+{
+  "prompt": "investigate the failing test",
+  "mode": "bypass",
+  "target": "main",
+  "working_dir": "/tmp/project",
+  "host": "mini"
+}
