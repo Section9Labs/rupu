@@ -20,9 +20,11 @@ public struct ActivitySort: Equatable, Sendable {
 
 extension ActivitySort.Key {
     /// First-tap direction when a header is newly selected (the column
-    /// wasn't already the active sort) — matches the web `SortableTable`'s
-    /// `defaultDirFor`: numeric/time columns start descending (biggest /
-    /// most-recent first), text columns start ascending (A→Z).
+    /// wasn't already the active sort). Deliberate macOS-native divergence
+    /// from the web `SortableTable` (whose `toggleSort` always starts a new
+    /// column ascending): numeric/time columns start descending (biggest /
+    /// most-recent first) the way Finder and Mail date/size columns do,
+    /// text columns start ascending (A→Z). "Web look, native feel."
     public var defaultAscending: Bool {
         switch self {
         case .duration, .cost, .started: return false
