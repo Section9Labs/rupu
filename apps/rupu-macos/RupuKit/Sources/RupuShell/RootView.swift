@@ -4,6 +4,7 @@ import RupuBackend
 import RupuDesign
 import RupuActivity
 import RupuRunDetail
+import RupuLauncher
 
 /// The app's window content: fixed sidebar + detail pane that switches on
 /// `model.route`. Phase 2+ swaps each `PlaceholderScreen` branch for a real
@@ -22,6 +23,7 @@ public struct RootView: View {
     @Bindable var backend: BackendController
 
     @State private var liveEventTask: Task<Void, Never>?
+    @State private var showLauncher = false
 
     public init(model: AppModel, backend: BackendController) {
         self.model = model
@@ -46,8 +48,19 @@ public struct RootView: View {
                 .navigationSplitViewColumnWidth(216)
         } detail: {
             detail
-                .toolbar { ShellToolbar(model: model) }
+                .toolbar { ShellToolbar(model: model, showLauncher: $showLauncher) }
         }
+        // A hidden, zero-visual button rather than the toolbar button
+        // itself carrying `.keyboardShortcut` — it keeps ⌘N live even when
+        // the toolbar isn't the responder chain's target, the same trick
+        // `NavigationSplitView`/menu-command apps use for shortcuts that
+        // must work window-wide. `.hidden()` removes it from layout/paint
+        // but leaves its action and shortcut registration intact.
+        .background(
+            Button("New run") { showLauncher = true }
+                .keyboardShortcut("n", modifiers: .command)
+                .hidden()
+        )
         .background(Color.rupuBg)
         .task {
             await backend.reconnectIfNeeded()
@@ -55,6 +68,10 @@ public struct RootView: View {
         .sheet(isPresented: onboardingSheetBinding) {
             OnboardingView(backend: backend, model: model)
                 .interactiveDismissDisabled()
+        }
+        .sheet(isPresented: $showLauncher) {
+            LauncherSheet(model: model, backend: backend)
+                .interactiveDismissDisabled(false)
         }
         .onChange(of: backend.health) { _, newHealth in
             handleHealthChange(newHealth)
