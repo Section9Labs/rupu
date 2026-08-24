@@ -99,7 +99,7 @@ public struct OnboardingView: View {
     private var embeddedCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             MicroLabel("Recommended")
-                .foregroundStyle(Color.rupuBrand600)
+                .foregroundStyle(Color.rupuBrand700)
             Text("Run it here")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(Color.rupuInk)

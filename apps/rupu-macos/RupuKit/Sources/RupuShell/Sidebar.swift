@@ -70,7 +70,7 @@ struct Sidebar: View {
 
     private var healthDotColor: Color {
         switch model.backendHealth {
-        case .healthy: .status(RunTone.done)
+        case .healthy: .status(StatusTone.done)
         case .degraded: .status(.waiting)
         case .down, .incompatible: .status(.fail)
         case .starting: .status(.pause)
