@@ -13,6 +13,20 @@ public struct CommandPaletteView: View {
 
     @FocusState private var searchFocused: Bool
 
+    /// Local key monitor that answers Escape while the palette is up.
+    /// Chosen over `.onKeyPress(.escape)` / `.onExitCommand` because a
+    /// focused `NSTextField` field editor can claim modifier-less Escape
+    /// (completion trigger) before either SwiftUI mechanism sees it, and a
+    /// local `NSEvent` monitor runs before window dispatch — immune to that
+    /// ordering by construction. (Automated validation can't exercise this
+    /// key: synthetic Escape events are not delivered to the app, verified
+    /// by this very monitor logging arrows but never Escape — so the belt
+    /// chosen here is the one that cannot lose the race, pending a
+    /// real-keyboard check.) Umbrella spec sanctions AppKit interop where
+    /// needed. Installed `.onAppear`/removed `.onDisappear`, so it exists
+    /// only while the palette is on screen.
+    @State private var escMonitor: Any?
+
     public init(store: PaletteStore) {
         self.store = store
     }
@@ -28,31 +42,31 @@ public struct CommandPaletteView: View {
             card
                 .frame(maxWidth: 640)
                 .padding(.top, 96)
+
+        }
+        .onAppear {
+            // See `escMonitor`'s doc comment for why this is an NSEvent
+            // monitor and not a SwiftUI key handler.
+            escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard event.keyCode == 53 else { return event }  // 53 = Escape
+                store.close()
+                return nil
+            }
+        }
+        .onDisappear {
+            if let escMonitor {
+                NSEvent.removeMonitor(escMonitor)
+                self.escMonitor = nil
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onKeyPress(.upArrow) { moveActive(by: -1); return .handled }
         .onKeyPress(.downArrow) { moveActive(by: 1); return .handled }
         .onKeyPress(.return) { executeActive(); return .handled }
-        // Escape is deliberately NOT wired via `.onKeyPress(.escape)` — live
-        // GUI validation found it dead: the `TextField` above is always
-        // focused the instant this view appears (`card`'s `.onAppear` sets
-        // `searchFocused = true`, and there is no other path to seeing this
-        // view at all), and on macOS a focused `NSTextField`'s field editor
-        // consumes the Escape *key event* for its own text-editing purposes
-        // before SwiftUI's `onKeyPress` (which reads raw key events) ever
-        // sees it. ↑/↓/Return above are unaffected because AppKit's field
-        // editor only intercepts Escape, not arrow/Return.
-        //
-        // `.onExitCommand` sidesteps this because it isn't a raw-key-event
-        // handler at all — it binds to AppKit's `cancelOperation:`
-        // responder *action message*, which `NSTextView`/`NSTextField`
-        // explicitly forward up the responder chain once they've decided
-        // Escape isn't theirs to consume as text editing (same mechanism
-        // that makes a dialog's Cancel button respond to Escape regardless
-        // of which control has focus). Attached here, at the view's root,
-        // rather than on the `TextField` itself, so it also covers a future
-        // focus target inside `results` without needing to move.
-        .onExitCommand { store.close() }
+        // Escape is handled by the NSEvent monitor installed `.onAppear`
+        // below — see `escMonitor`'s doc comment. ↑/↓/Return stay as plain
+        // key handlers: the field editor doesn't contest arrows or Return
+        // (verified live — they move the selection and execute).
     }
 
     private var card: some View {
