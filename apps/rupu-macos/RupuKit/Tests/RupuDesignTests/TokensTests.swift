@@ -89,6 +89,18 @@ private let severityBgRGB: [Severity: (light: (Int, Int, Int), dark: (Int, Int, 
     .info: ((248, 250, 252), (30, 31, 35)),
 ]
 
+/// Trigger palette — same RGB pairs as `rupuDim`/`rupuBrand600`/`rupuInfo`
+/// above, transcribed from the web's `TriggerChip`/`ThroughputChart` tone
+/// mapping (manual=neutral, cron=violet, event=sky) resolved against the CSS
+/// custom properties those tones read from: `--c-ink-dim`, `--c-brand-600`,
+/// `--c-info` (`crates/rupu-cp/web/src/styles.css` lines 28/33/59 light,
+/// 71/76/102 dark).
+private let triggerRGB: [TriggerKind: (light: (Int, Int, Int), dark: (Int, Int, Int))] = [
+    .manual: ((100, 116, 139), (161, 161, 170)),
+    .cron: ((109, 40, 217), (124, 58, 237)),
+    .event: ((37, 99, 235), (96, 165, 250)),
+]
+
 @Test func baseTokensResolvePerAppearance() {
     for token in baseTokens {
         expectMatches(token.color, light: token.light, dark: token.dark, name: token.name)
@@ -126,5 +138,16 @@ private let severityBgRGB: [Severity: (light: (Int, Int, Int), dark: (Int, Int, 
         }
         expectMatches(Color.severityBg(severity), light: expected.light, dark: expected.dark,
                       name: "severityBg(.\(severity))")
+    }
+}
+
+@Test func triggerColorsResolvePerAppearance() {
+    for kind in TriggerKind.allCases {
+        guard let expected = triggerRGB[kind] else {
+            Issue.record("no expected RGB recorded for TriggerKind.\(kind)")
+            continue
+        }
+        expectMatches(Color.trigger(kind), light: expected.light, dark: expected.dark,
+                      name: "trigger(.\(kind))")
     }
 }
