@@ -6,11 +6,22 @@ import RupuStore
 /// connectors, scrollable when the workflow has more nodes than fit the
 /// window. No unit tests here by design (per the brief) — `GraphLayoutTests`
 /// covers the pure logic this view only renders.
+///
+/// Flows-composition Task 4: each capsule is now tappable — `onSelect` fires
+/// with the tapped node's `id` (a step id), which `RunDetailScreen` wires to
+/// `RunDetailStore.select(step:)` — and the node matching `selectedID` (the
+/// store's `selectedStepID`) renders a 1px `Color.rupuBrand` ring so the tab
+/// panel's "which step is this following" stays visually anchored to the
+/// graph.
 public struct StepGraphView: View {
     private let nodes: [GraphNodeVM]
+    private let selectedID: String?
+    private let onSelect: (String) -> Void
 
-    public init(nodes: [GraphNodeVM]) {
+    public init(nodes: [GraphNodeVM], selectedID: String? = nil, onSelect: @escaping (String) -> Void = { _ in }) {
         self.nodes = nodes
+        self.selectedID = selectedID
+        self.onSelect = onSelect
     }
 
     public var body: some View {
@@ -20,7 +31,9 @@ public struct StepGraphView: View {
                     if index > 0 {
                         Connector()
                     }
-                    GraphNodeCapsule(node: node)
+                    GraphNodeCapsule(node: node, isSelected: node.id == selectedID)
+                        .contentShape(Rectangle())
+                        .onTapGesture { onSelect(node.id) }
                 }
             }
             .padding(16)
@@ -39,6 +52,7 @@ private struct Connector: View {
 
 private struct GraphNodeCapsule: View {
     let node: GraphNodeVM
+    let isSelected: Bool
 
     var body: some View {
         VStack(spacing: 6) {
@@ -63,6 +77,10 @@ private struct GraphNodeCapsule: View {
         .frame(minWidth: 84)
         .opacity(node.state == .skipped ? 0.4 : 1)
         .panelStyle(.innerCard)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.rupuBrand, lineWidth: isSelected ? 1 : 0)
+        )
     }
 }
 

@@ -3,16 +3,21 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// The Run Detail screen (Task 8, write path added Phase 3 Task 5): header
-/// (back chevron, breadcrumb, status pill, facts row, run-control buttons),
-/// an awaiting banner with live Approve/Reject controls per parked gate, the
-/// live step graph, the transcript feed for whichever step is currently
-/// focused, and the netflow/findings rails. Owns a `RunDetailStore` lifecycle
-/// the same
-/// way `ActivityScreen` owns an `ActivityStore` — built lazily on first
-/// appearance (once `backend.client()` exists), rebuilt whenever `runID`
-/// changes (navigating from one run's detail straight to another's), and
-/// `deactivate()`d `.onDisappear`.
+/// The Run Detail screen (Task 8, write path added Phase 3 Task 5; recomposed
+/// to a single vertical stack in flows-composition Task 4): header (back
+/// chevron, breadcrumb, status pill, facts row + a second identity meta
+/// line, run-control buttons), an awaiting banner with live Approve/Reject
+/// controls per parked gate, the live step graph — each node tappable,
+/// driving `RunDetailStore.select(step:)` — and a selection-following tab
+/// panel (`RunDetailTabPanel`: Transcript · Events · Findings · Netflow,
+/// `RunDetailTabs.swift`) beneath it. The old fixed-width `RailColumn`
+/// (`RailViews.swift`, deleted) is gone; `FactsCard`'s identity rows folded
+/// into the header, `NetflowCard`/`FindingsCard` became tab content. Owns a
+/// `RunDetailStore` lifecycle the same way `ActivityScreen` owns an
+/// `ActivityStore` — built lazily on first appearance (once
+/// `backend.client()` exists), rebuilt whenever `runID` changes (navigating
+/// from one run's detail straight to another's), and `deactivate()`d
+/// `.onDisappear`.
 ///
 /// **Write path (Phase 3, Task 5)**: the header renders live Cancel/Pause/
 /// Resume buttons plus an Archive/Restore overflow menu, driven strictly
@@ -33,6 +38,7 @@ public struct RunDetailScreen: View {
 
     @State private var store: RunDetailStore?
     @State private var storeRunID: String?
+    @State private var selectedTab: RunDetailTab = .transcript
 
     public init(model: AppModel, backend: BackendController, runID: String, host: String?) {
         self.model = model
@@ -86,14 +92,7 @@ public struct RunDetailScreen: View {
             }
             stepGraphSection(store: store)
                 .frame(height: 140)
-            HStack(alignment: .top, spacing: 12) {
-                transcriptColumn(store: store)
-                ScrollView {
-                    RailColumn(detail: store.detail, netflow: store.netflow, findings: store.findings)
-                }
-                .frame(width: RailColumn.width)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            RunDetailTabPanel(store: store, tab: $selectedTab)
         }
         .padding(16)
     }
@@ -128,8 +127,23 @@ public struct RunDetailScreen: View {
             runVerbFailureNotes(store: store)
             if case .content(let detail) = store.detail {
                 factsRow(detail: detail)
+                identityMetaLine(detail: detail)
             }
         }
+    }
+
+    /// Flows-composition Task 4: absorbs the old rail-side `FactsCard`'s
+    /// identifier rows (run id, workspace, permission mode) as a second mono
+    /// meta line beneath the header's token/cost `factsRow` — a detail
+    /// expansion of the header, not a duplicate of it. Middle-truncated
+    /// (`.truncationMode(.middle)`) same as `FactsCard.factRow` used to be,
+    /// since a run/workspace id can run long.
+    private func identityMetaLine(detail: APIRunDetail) -> some View {
+        Text("RUN \(detail.run.id)  ·  WS \(detail.run.workspaceID)  ·  \(detail.run.permissionMode ?? "—")")
+            .font(.dataMono(10))
+            .foregroundStyle(Color.rupuDim)
+            .lineLimit(1)
+            .truncationMode(.middle)
     }
 
     // MARK: - Header mutations (Phase 3, Task 5)
@@ -457,12 +471,16 @@ public struct RunDetailScreen: View {
         case .empty:
             blockShell { Text("No workflow steps").font(.noteText).foregroundStyle(Color.rupuMute) }
         case .content(let g):
-            StepGraphView(nodes: layoutGraph(
-                nodes: g.workflow.steps,
-                results: g.stepResults,
-                units: g.units,
-                liveStates: effectiveLiveStates(store: store)
-            ))
+            StepGraphView(
+                nodes: layoutGraph(
+                    nodes: g.workflow.steps,
+                    results: g.stepResults,
+                    units: g.units,
+                    liveStates: effectiveLiveStates(store: store)
+                ),
+                selectedID: store.selectedStepID,
+                onSelect: { stepID in Task { await store.select(step: stepID) } }
+            )
             .panelStyle(.panel)
         }
     }
@@ -482,38 +500,6 @@ public struct RunDetailScreen: View {
             states[gate.stepID] = .gatePending
         }
         return states
-    }
-
-    // MARK: - Transcript
-
-    private func transcriptColumn(store: RunDetailStore) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Eyebrow("Transcript")
-                Spacer(minLength: 0)
-                transcriptLiveIndicator(store: store)
-            }
-            TranscriptFeed(events: store.transcript)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .panelStyle(.panel)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    @ViewBuilder
-    private func transcriptLiveIndicator(store: RunDetailStore) -> some View {
-        if store.isRemote {
-            Text("Remote streaming lands with Fleet (Phase 5)")
-                .font(.metaText)
-                .foregroundStyle(Color.rupuMute)
-        } else if store.transcriptTailActive {
-            HStack(spacing: 6) {
-                Circle().fill(Color.status(.running)).frame(width: 6, height: 6)
-                Text("Live")
-                    .font(.metaText)
-                    .foregroundStyle(Color.status(.running))
-            }
-        }
     }
 
     // MARK: - Shared shells

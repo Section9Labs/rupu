@@ -100,6 +100,23 @@ public final class RunDetailStore {
     public private(set) var transcriptTailActive: Bool = false
     public private(set) var focusedTranscriptPath: String?
 
+    /// Flows-composition Task 4: the step the tab panel currently follows —
+    /// set by `select(step:)`, and by `activate()`'s own initial focus (via
+    /// the same `select(step:)` call, so the two never drift). `nil` only
+    /// when the workflow has no steps to focus at all (`initialFocusStepID()`
+    /// returned `nil`).
+    public private(set) var selectedStepID: String?
+
+    /// Flows-composition Task 4: every `CPEvent` the run stream has
+    /// delivered this activation, oldest first, capped at 500 (drop
+    /// oldest — see `apply(_:)`) — the Events tab's raw feed. Cleared on
+    /// `activate()`, same "repeatable" contract `didHandleTerminal`'s own
+    /// reset already documents. Never populated for a remote run (no run
+    /// stream at all — see `isRemote`).
+    public private(set) var events: [CPEvent] = []
+
+    private static let eventsCap = 500
+
     public let isRemote: Bool
 
     /// Phase 3, Task 5: the shared pending-mutation ledger — see
@@ -259,6 +276,7 @@ public final class RunDetailStore {
     /// again rather than staying silently latched from a previous visit.
     public func activate() async {
         didHandleTerminal = false
+        events = []
 
         async let detailLoad: Void = loadDetail()
         async let graphLoad: Void = loadGraph()
@@ -277,7 +295,7 @@ public final class RunDetailStore {
         }
 
         if let stepID = initialFocusStepID() {
-            await focusStep(stepID)
+            await select(step: stepID)
         }
     }
 
@@ -538,6 +556,55 @@ public final class RunDetailStore {
         transcript = events
     }
 
+    // MARK: - Selection (Task 4, flows-composition)
+
+    /// Sets `selectedStepID` then awaits the existing `focusStep` machinery
+    /// — the tab panel's Events/Transcript content both follow whatever this
+    /// leaves in `selectedStepID`/`transcript`. `focusStep`'s own
+    /// `focusGeneration` token already guards two overlapping calls (a rapid
+    /// re-selection while a slower prior focus is still resolving), so this
+    /// adds no guarding of its own — `selectedStepID` itself is a plain,
+    /// synchronous assignment with nothing to race.
+    public func select(step stepID: String) async {
+        selectedStepID = stepID
+        await focusStep(stepID)
+    }
+
+    /// The Events tab's filtered feed: with a step selected, only events
+    /// whose `CPEvent.stepID` (see the static helper below) matches it — a
+    /// run-level event (no step id at all) drops out, same as a step-scoped
+    /// event for a *different* step. Web parity: `RunDetail.tsx:726-731`.
+    /// With nothing selected, every accumulated event is returned as-is.
+    public func eventsForSelection() -> [CPEvent] {
+        guard let selectedStepID else { return events }
+        return events.filter { Self.stepID(for: $0) == selectedStepID }
+    }
+
+    /// The step id a given `CPEvent` is scoped to, or `nil` for a run-level
+    /// event (`runStarted`/`runCompleted`/.../`dispatchStarted`/
+    /// `dispatchCompleted`/`.unknown`) that carries no step id at all.
+    /// `public static` (not private) so `RupuRunDetail`'s Events tab content
+    /// can reuse this exact mapping to render each row's step `Badge`
+    /// instead of maintaining a second, driftable copy of this switch.
+    public static func stepID(for event: CPEvent) -> String? {
+        switch event {
+        case .stepStarted(_, let stepID, _, _, _): return stepID
+        case .stepWorking(_, let stepID, _, _): return stepID
+        case .stepAwaitingApproval(_, let stepID, _): return stepID
+        case .stepCompleted(_, let stepID, _, _, _): return stepID
+        case .stepFailed(_, let stepID, _): return stepID
+        case .stepSkipped(_, let stepID, _): return stepID
+        case .unitStarted(_, let stepID, _, _, _, _, _): return stepID
+        case .unitCompleted(_, let stepID, _, _, _, _, _, _): return stepID
+        case .panelRound(_, let stepID, _, _, _): return stepID
+        case .stepPaused(_, let stepID): return stepID
+        case .stepResumed(_, let stepID): return stepID
+        case .runStarted, .runCompleted, .runFailed, .runPaused, .runResumed,
+             .dispatchStarted, .dispatchCompleted, .unknown:
+            return nil
+        }
+    }
+
     // MARK: - REST loads
 
     private func loadDetail() async {
@@ -614,6 +681,18 @@ public final class RunDetailStore {
     }
 
     private func apply(_ event: CPEvent) {
+        // Flows-composition Task 4: every event the run stream delivers is
+        // recorded for the Events tab, independent of whether the `switch`
+        // below reduces it into `liveStates` — a `runResumed`/`stepPaused`/
+        // ...event carries no `NodeState` transition but is still something
+        // the operator should be able to see in the raw feed. Capped at 500,
+        // dropping the OLDEST entry first so the feed always reflects the
+        // most recent activity rather than truncating what just arrived.
+        events.append(event)
+        if events.count > Self.eventsCap {
+            events.removeFirst(events.count - Self.eventsCap)
+        }
+
         switch event {
         case .stepStarted(let runID, let stepID, _, _, _):
             liveStates[stepID] = .running
