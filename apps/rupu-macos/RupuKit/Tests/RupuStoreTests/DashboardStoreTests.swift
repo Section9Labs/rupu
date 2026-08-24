@@ -805,7 +805,13 @@ struct DashboardStoreTests {
     // duplicated, never-cancelled first loop would roughly DOUBLE the
     // `/api/hosts` hit rate during the observation window.
     @MainActor @Test func activateTwiceReplacesTheReconcileLoopRatherThanRunningItTwice() async {
-        let intervalMS = 25
+        // Margins deliberately wide (interval 60ms / window 900ms): tighter
+        // values (25/260) are correct on an idle machine but this suite has
+        // twice been bitten by Task.sleep under-scheduling during parallel
+        // full-suite runs (see 67085ede) — the discriminator here is the
+        // ~2x hit-rate gap between one loop and two, which survives wide
+        // margins just as well.
+        let intervalMS = 60
         let (store, box) = makeStore(reconcileInterval: .milliseconds(intervalMS)) { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
             if url.path == "/api/hosts" {
@@ -821,17 +827,17 @@ struct DashboardStoreTests {
         #expect(store.reconcileTask != nil)
 
         let hitsBefore = DashboardStubURLProtocol.hits("/api/hosts")
-        let windowMS = 260 // ~10.4 intervals at 25ms for a single surviving loop
+        let windowMS = 900 // ~15 intervals at 60ms for a single surviving loop
         try? await Task.sleep(for: .milliseconds(windowMS))
         let hits = DashboardStubURLProtocol.hits("/api/hosts") - hitsBefore
 
         #expect(hits >= 1, "the surviving loop must still be ticking")
         // A single loop fires ~windowMS/intervalMS times over the window; a
         // duplicated, uncancelled first loop would fire roughly TWICE that.
-        // 14 sits well above the single-loop expectation (~10-11, allowing
-        // for scheduler jitter) and well below the ~20+ a real duplicate
-        // would produce.
-        #expect(hits <= 14, "hit rate (\(hits) hits in \(windowMS)ms at a \(intervalMS)ms interval) suggests a duplicated, uncancelled first reconcile loop")
+        // 22 sits well above the single-loop expectation (~15, allowing for
+        // scheduler jitter) and well below the ~30 a real duplicate would
+        // produce.
+        #expect(hits <= 22, "hit rate (\(hits) hits in \(windowMS)ms at a \(intervalMS)ms interval) suggests a duplicated, uncancelled first reconcile loop")
 
         store.deactivate()
         box.latest.finish()
