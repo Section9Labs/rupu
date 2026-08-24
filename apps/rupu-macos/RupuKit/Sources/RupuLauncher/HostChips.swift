@@ -65,7 +65,7 @@ struct HostChips: View {
         } label: {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(isOnline ? Color.status(RunTone.done) : Color.rupuMute)
+                    .fill(isOnline ? Color.status(StatusTone.done) : Color.rupuMute)
                     .frame(width: 5, height: 5)
                 Text(host.name)
                     .font(.system(size: 11.5))
@@ -92,7 +92,7 @@ struct HostChips: View {
             store.fanOutAllHealthy.toggle()
         } label: {
             MicroLabel("Fan out: all healthy")
-                .foregroundStyle(store.fanOutAllHealthy ? Color.rupuBrand600 : Color.rupuMute)
+                .foregroundStyle(store.fanOutAllHealthy ? Color.rupuBrand700 : Color.rupuMute)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(store.fanOutAllHealthy ? Color.rupuBrand.opacity(0.15) : Color.rupuSurface)

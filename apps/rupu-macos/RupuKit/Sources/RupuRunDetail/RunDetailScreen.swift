@@ -237,7 +237,7 @@ public struct RunDetailScreen: View {
                             Task { await failure.retry() }
                         }
                         .buttonStyle(.plain)
-                        .foregroundStyle(Color.rupuBrand600)
+                        .foregroundStyle(Color.rupuBrand700)
                         .font(.system(size: 11, weight: .semibold))
                     }
                 }
@@ -418,7 +418,7 @@ public struct RunDetailScreen: View {
                     Task { await retry() }
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(Color.rupuBrand600)
+                .foregroundStyle(Color.rupuBrand700)
                 .font(.system(size: 11, weight: .semibold))
             }
         }

@@ -205,7 +205,7 @@ public struct SessionDetailScreen: View {
                             Task { await failure.retry() }
                         }
                         .buttonStyle(.plain)
-                        .foregroundStyle(Color.rupuBrand600)
+                        .foregroundStyle(Color.rupuBrand700)
                         .font(.system(size: 11, weight: .semibold))
                     }
                 }
