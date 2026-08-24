@@ -294,23 +294,7 @@ extension ActivityKindTag {
     }
 }
 
-extension ActivityStatus {
-    /// Display text for both the table's status cell and `FilterBar`'s
-    /// chips. `.unknown` renders its carried raw string directly —
-    /// `ActivityStatus.normalize` already puts an explicit `"—"` there for a
-    /// genuinely absent status, so there's nothing further to null-guard
-    /// here.
-    var displayLabel: String {
-        switch self {
-        case .pending: "Pending"
-        case .running: "Running"
-        case .completed: "Completed"
-        case .failed: "Failed"
-        case .awaiting: "Awaiting"
-        case .rejected: "Rejected"
-        case .cancelled: "Cancelled"
-        case .paused: "Paused"
-        case .unknown(let raw): raw
-        }
-    }
-}
+// `ActivityStatus.displayLabel` moved to `RupuStore/ActivityRow.swift`
+// (flows-composition Task 3): the command palette's run search needed it
+// too, and RupuStore is the shared base both this module and `PaletteStore`
+// depend on.

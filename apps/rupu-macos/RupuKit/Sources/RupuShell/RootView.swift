@@ -26,6 +26,16 @@ public struct RootView: View {
     @State private var showLauncher = false
     @State private var hostsFooter = HostsFooterStore()
 
+    /// Flows-composition Task 3: built lazily in `handleHealthChange`, the
+    /// first time `backend.client()` exists — `PaletteStore`'s designated
+    /// init takes a concrete `CPClient`, unlike `HostsFooterStore`'s
+    /// two-phase `activate(client:)`, so this can't be built eagerly in
+    /// `init`. `nil` until then; `ShellToolbar`'s search button and the
+    /// hidden ⌘K button below both tolerate that (silent no-op), same
+    /// "no client yet" degrade every other backend-dependent affordance in
+    /// this view already uses.
+    @State private var palette: PaletteStore?
+
     public init(model: AppModel, backend: BackendController) {
         self.model = model
         self.backend = backend
@@ -49,19 +59,29 @@ public struct RootView: View {
                 .navigationSplitViewColumnWidth(204)
         } detail: {
             detail
-                .toolbar { ShellToolbar(model: model, showLauncher: $showLauncher, backend: backend) }
+                .toolbar { ShellToolbar(model: model, showLauncher: $showLauncher, backend: backend, palette: palette) }
         }
-        // A hidden, zero-visual button rather than the toolbar button
-        // itself carrying `.keyboardShortcut` — it keeps ⌘N live even when
-        // the toolbar isn't the responder chain's target, the same trick
-        // `NavigationSplitView`/menu-command apps use for shortcuts that
-        // must work window-wide. `.hidden()` removes it from layout/paint
-        // but leaves its action and shortcut registration intact.
+        // Hidden, zero-visual buttons rather than the toolbar controls
+        // themselves carrying `.keyboardShortcut` — this keeps ⌘N/⌘K live
+        // even when the toolbar isn't the responder chain's target, the
+        // same trick `NavigationSplitView`/menu-command apps use for
+        // shortcuts that must work window-wide. `.hidden()` removes them
+        // from layout/paint but leaves their actions and shortcut
+        // registrations intact.
         .background(
-            Button("New run") { showLauncher = true }
-                .keyboardShortcut("n", modifiers: .command)
-                .hidden()
+            Group {
+                Button("New run") { showLauncher = true }
+                    .keyboardShortcut("n", modifiers: .command)
+                Button("Command palette") { Task { await palette?.open() } }
+                    .keyboardShortcut("k", modifiers: .command)
+            }
+            .hidden()
         )
+        .overlay {
+            if let palette, palette.isOpen {
+                CommandPaletteView(store: palette)
+            }
+        }
         .background(Color.rupuBg)
         .task {
             await backend.reconnectIfNeeded()
@@ -138,6 +158,11 @@ public struct RootView: View {
         // blip just refreshes the client rather than spawning a second loop.
         if let client = backend.client() {
             hostsFooter.activate(client: client)
+            if palette == nil {
+                palette = PaletteStore(client: client, pendingActions: backend.pendingActions, onNavigate: { [model] route in
+                    model.navigate(to: route)
+                })
+            }
         }
 
         guard liveEventTask == nil, let stream = backend.eventStream() else { return }
