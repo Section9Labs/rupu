@@ -85,15 +85,17 @@ public struct OnboardingView: View {
     }
 
     private func errorBanner(_ message: String) -> some View {
+        // Fix round 1: no `Icon` here (matches the `InputsForm` precedent) —
+        // `.xCircle` is `StatusDescriptor`'s `.failed` glyph, and this banner
+        // is `.awaiting` amber, not `.failed` red; pairing that glyph with a
+        // different tone would make the same icon mean two severities
+        // across this view (see `incompatibleBanner` just above, which *is*
+        // `.failed` and rightly keeps it).
         TintBanner(tone: Color.status(.awaiting), toneBg: Color.status(.awaiting).opacity(0.08)) {
-            HStack(alignment: .top, spacing: 8) {
-                Icon(.xCircle, size: 14)
-                    .foregroundStyle(Color.status(.awaiting))
-                Text(message)
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Color.rupuInk)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(message)
+                .font(.system(size: 11.5))
+                .foregroundStyle(Color.rupuInk)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

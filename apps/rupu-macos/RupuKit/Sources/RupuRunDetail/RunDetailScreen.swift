@@ -252,8 +252,55 @@ public struct RunDetailScreen: View {
     /// exactly the "run-detail pill" the v2 chrome sweep replaces with the
     /// shared `StatusPill` — label vocabulary now comes from
     /// `StatusDescriptor` (Task 4) instead of this screen's own copy.
+    ///
+    /// Fix round 1: `StatusPill` only ever knows how to render the 9
+    /// `StatusTone` cases — for a raw server status it doesn't recognize,
+    /// `ActivityStatus.normalize` still maps the *tone* to `.pending` (per
+    /// its own doc comment) but carries the original string in
+    /// `.unknown(raw)`. Rendering straight through `StatusPill` would
+    /// silently swap that diagnostic string for the generic "Pending"
+    /// label — the same raw-string fallback `ActivityTable`/`FilterBar`
+    /// preserve via `ActivityStatus.displayLabel` (module-private to
+    /// `RupuActivity`, so not reachable here; see that type's own doc
+    /// comment on why `RupuRunDetail` keeps a small local copy instead of a
+    /// cross-module dependency edge). `unrecognizedStatusRaw` is the pure
+    /// seam that decides this — unit-tested in `RunDetailScreenStatusTests`.
+    @ViewBuilder
     private func statusPill(_ rawStatus: String) -> some View {
-        StatusPill(ActivityStatus.normalize(rawStatus).tone)
+        if let raw = Self.unrecognizedStatusRaw(rawStatus) {
+            unknownStatusPill(raw)
+        } else {
+            StatusPill(ActivityStatus.normalize(rawStatus).tone)
+        }
+    }
+
+    /// `nil` for any raw status `ActivityStatus.normalize` recognizes
+    /// (render via `StatusPill`); the original raw string for one it
+    /// doesn't (`.unknown(raw)`) — the pure decision `statusPill` renders
+    /// from. Free of `self`/view state so it's directly testable.
+    static func unrecognizedStatusRaw(_ rawStatus: String) -> String? {
+        if case .unknown(let raw) = ActivityStatus.normalize(rawStatus) { return raw }
+        return nil
+    }
+
+    /// Fallback pill for a status `StatusDescriptor` has no vocabulary
+    /// for — same chrome as `StatusPill` (icon + mono label, 12%-fill
+    /// capsule with a 30% ring, `.pending` tone since that's what an
+    /// unrecognized status tone-maps to) but with the raw server string as
+    /// the label instead of a synthesized one.
+    private func unknownStatusPill(_ raw: String) -> some View {
+        HStack(spacing: 4) {
+            Icon(StatusDescriptor.descriptor(for: .pending).icon, size: 11)
+                .foregroundStyle(Color.status(.pending))
+            Text(raw)
+                .font(.dataMono(10))
+                .foregroundStyle(Color.status(.pending))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.status(.pending).opacity(0.12))
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Color.status(.pending).opacity(0.3), lineWidth: 1))
     }
 
     private func factsRow(detail: APIRunDetail) -> some View {
