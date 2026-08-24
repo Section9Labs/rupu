@@ -189,6 +189,25 @@ public enum LucideIconData {
                 "M16 13H8",
                 "M16 17H8",
             ]
+        case .chevronUp:
+            return [
+                "m18 15-6-6-6 6",
+            ]
+        case .chevronDown:
+            return [
+                "m6 9 6 6 6-6",
+            ]
+        case .moreHorizontal:
+            return [
+                "M11 12A1 1 0 1 0 13 12A1 1 0 1 0 11 12",
+                "M18 12A1 1 0 1 0 20 12A1 1 0 1 0 18 12",
+                "M4 12A1 1 0 1 0 6 12A1 1 0 1 0 4 12",
+            ]
+        case .search:
+            return [
+                "M3 11A8 8 0 1 0 19 11A8 8 0 1 0 3 11",
+                "m21 21-4.3-4.3",
+            ]
         }
     }
 }

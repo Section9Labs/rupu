@@ -82,16 +82,13 @@ struct ShellToolbar: ToolbarContent {
     }
 
     /// Search-field-styled button: magnifier + "Search…" + a ⌘K badge.
-    /// **No magnifier glyph**: `LucideIcon` (the pinned extracted set) has
-    /// no search/magnifying-glass case yet — per the brief, this task
-    /// doesn't hand-author path data or extend the extractor (Task 5 owns
-    /// extractor changes and can add `search` there); the badge renders
-    /// text-only until that lands.
     private var searchButton: some View {
         Button {
             Task { await palette?.open() }
         } label: {
             HStack(spacing: 8) {
+                Icon(.search, size: 12)
+                    .foregroundStyle(Color.rupuMute)
                 Text("Search…")
                     .font(.uiText)
                     .foregroundStyle(Color.rupuMute)

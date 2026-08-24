@@ -54,7 +54,7 @@ if (!existsSync(lucideIconsDir)) {
 //   keep the two in sync when editing this table).
 // asset: kebab-case name used for the committed `svg/<asset>.svg` file.
 // source: kebab-case lucide-react module (under dist/esm/icons/) whose element array we read.
-//   Equal to `asset` except for the four documented alias remaps below.
+//   Equal to `asset` except for the five documented alias remaps below.
 const ICONS = [
   { enumCase: "layoutDashboard", asset: "layout-dashboard", source: "layout-dashboard" },
   { enumCase: "activity", asset: "activity", source: "activity" },
@@ -90,6 +90,11 @@ const ICONS = [
   { enumCase: "gitBranch", asset: "git-branch", source: "git-branch" },
   { enumCase: "listOrdered", asset: "list-ordered", source: "list-ordered" },
   { enumCase: "fileText", asset: "file-text", source: "file-text" },
+  { enumCase: "chevronUp", asset: "chevron-up", source: "chevron-up" },
+  { enumCase: "chevronDown", asset: "chevron-down", source: "chevron-down" },
+  // REMAP: more-horizontal.js is an alias re-exporting ellipsis.js's default.
+  { enumCase: "moreHorizontal", asset: "more-horizontal", source: "ellipsis" },
+  { enumCase: "search", asset: "search", source: "search" },
 ];
 
 // --- number formatting: deterministic, minimal-digit output -----------------------------------
