@@ -3,7 +3,8 @@
 **Date:** 2026-08-20
 **Status:** Approved (matt, 2026-08-20)
 **Companion documents:**
-- `docs/macOS_design/HANDOFF.md` — visual/interaction contract from the Claude Design mockups (tokens, window model, per-screen layouts, widget model). This spec defers to it for all visual detail, with the amendments in §2.
+- `docs/macOS_design/V2-CONTRACT.md` — the visual contract (CP v2 design system) since the 2026-08-24 design-alignment phase (`docs/superpowers/specs/2026-08-24-rupu-macos-design-alignment-design.md`). Supersedes HANDOFF.md for all visual detail.
+- `docs/macOS_design/HANDOFF.md` — the Phase 1–3 visual/interaction contract from the Claude Design mockups (window model, per-screen layouts, widget model). Superseded as visual authority; still describes screen inventory + interaction intent where V2-CONTRACT is silent, with the amendments in §2.
 - `docs/macOS_design/rupu.app macOS.dc.html` — interactive prototype.
 
 This is the **umbrella architecture spec** for a multi-phase program. Each phase gets its
