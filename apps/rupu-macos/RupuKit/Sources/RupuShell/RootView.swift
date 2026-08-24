@@ -24,6 +24,7 @@ public struct RootView: View {
 
     @State private var liveEventTask: Task<Void, Never>?
     @State private var showLauncher = false
+    @State private var hostsFooter = HostsFooterStore()
 
     public init(model: AppModel, backend: BackendController) {
         self.model = model
@@ -44,8 +45,8 @@ public struct RootView: View {
 
     public var body: some View {
         NavigationSplitView {
-            Sidebar(model: model)
-                .navigationSplitViewColumnWidth(216)
+            Sidebar(model: model, hostsFooter: hostsFooter)
+                .navigationSplitViewColumnWidth(204)
         } detail: {
             detail
                 .toolbar { ShellToolbar(model: model, showLauncher: $showLauncher) }
@@ -75,6 +76,9 @@ public struct RootView: View {
         }
         .onChange(of: backend.health) { _, newHealth in
             handleHealthChange(newHealth)
+        }
+        .onDisappear {
+            hostsFooter.deactivate()
         }
     }
 
@@ -123,6 +127,18 @@ public struct RootView: View {
         }
 
         guard case .healthy = health else { return }
+
+        // `CPClient` is only available once `backend` has an active
+        // connection (`BackendController.client()` is `nil` until then), so
+        // the sidebar's `HostsFooterStore` is activated here — the first
+        // healthy transition — rather than from an `.onAppear`, mirroring
+        // how `ActivityScreen` waits on `backend.client()` before building
+        // its own store. `activate(client:)` is idempotent (guards its own
+        // poll task), so a later re-healthy transition after a `.degraded`
+        // blip just refreshes the client rather than spawning a second loop.
+        if let client = backend.client() {
+            hostsFooter.activate(client: client)
+        }
 
         guard liveEventTask == nil, let stream = backend.eventStream() else { return }
         liveEventTask = Task { @MainActor in

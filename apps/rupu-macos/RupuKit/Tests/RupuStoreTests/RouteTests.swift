@@ -14,13 +14,13 @@ struct RouteTests {
         AppModel(defaults: UserDefaults(suiteName: "test-\(UUID())")!)
     }
 
-    // (a) `.agentRunDetail` keeps the sidebar highlighting the Runs section,
-    // same as `.runDetail`/`.sessionDetail` — never "no selection", never a
-    // guessed kind leaf.
+    // (a) `.agentRunDetail` keeps the sidebar highlighting the single
+    // Activity row, same as `.runDetail`/`.sessionDetail` — never "no
+    // selection", never a guessed kind leaf.
     @MainActor @Test func agentRunDetailKeepsSidebarHighlightingRuns() {
         let model = makeModel()
         model.route = .agentRunDetail(id: "run-11", transcriptPath: nil, host: nil)
-        #expect(model.selectedSidebarItem == .runs)
+        #expect(model.selectedSidebarItem == .activity)
     }
 
     // (b) navigateBack() from a pushed `.agentRunDetail` returns to whichever
