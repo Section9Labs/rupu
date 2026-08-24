@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The lucide icons rupu.app uses. Case names mirror lucide's own component names (camelCased);
-/// where lucide's *filename* has since diverged from that name (four aliases in lucide-react
+/// where lucide's *filename* has since diverged from that name (five aliases in lucide-react
 /// 0.468.0 — see `apps/rupu-macos/scripts/extract-lucide.mjs`), the case name and glyph are kept
 /// stable here regardless — web parity is by glyph, not by lucide's current filename.
 ///
@@ -39,6 +39,10 @@ public enum LucideIcon: String, CaseIterable, Sendable {
     case gitBranch
     case listOrdered
     case fileText
+    case chevronUp
+    case chevronDown
+    case moreHorizontal
+    case search
 }
 
 /// Renders a `LucideIcon` by stroking its constituent SVG paths (`LucideIconData.paths(for:)`,

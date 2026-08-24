@@ -21,10 +21,10 @@ import Testing
 }
 
 @Test func iconCaseCountMatchesExtractorTable() {
-    // 30 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
+    // 34 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
     // pinning the count here means an enum case silently dropped from that table (rather than
     // failing to parse) still fails a test.
-    #expect(LucideIcon.allCases.count == 30)
+    #expect(LucideIcon.allCases.count == 34)
 }
 
 @Test func repeatIconRawValueIsRepeat() {
