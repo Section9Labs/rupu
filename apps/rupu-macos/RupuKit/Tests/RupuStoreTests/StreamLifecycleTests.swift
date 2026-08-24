@@ -24,8 +24,56 @@ private final class EventLog: @unchecked Sendable {
     }
 }
 
+/// Same pattern as `ActivityStoreTests`/`PagedSnapshotTests`' `FlagBox`: a
+/// lock-protected boolean a `@Sendable` closure (here, an `AsyncStream`
+/// continuation's `onTermination`) can flip from off the main actor.
+private final class FlagBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    var value: Bool {
+        get { lock.withLock { flag } }
+        set { lock.withLock { flag = newValue } }
+    }
+}
+
 private struct FakeEvent: Sendable, Equatable {
     let id: String
+}
+
+/// De-flakes "wait for an async background effect to land" — same recipe
+/// (and rationale) as `ActivityStoreTests.pollUntil`/`expectEventually`.
+/// Fixed-duration sleeps raced the consumer task under this suite's full
+/// parallel run (316 tests): `timeout` is generous precisely so a slow
+/// scheduler still passes, while a genuinely stuck condition still fails
+/// instead of hanging forever.
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
+/// `pollUntil` plus a descriptive failure on timeout, so a genuine
+/// regression reads as "timed out waiting for: ..." rather than a bare
+/// boolean mismatch at some unrelated line below.
+@MainActor
+private func expectEventually(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ description: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: () -> Bool
+) async {
+    let succeeded = await pollUntil(timeout: timeout, interval: interval, condition)
+    #expect(succeeded, "timed out waiting for: \(description)", sourceLocation: sourceLocation)
 }
 
 @MainActor @Test func firstConnectDoesNotResnapshot() async {
@@ -41,7 +89,9 @@ private struct FakeEvent: Sendable, Equatable {
 
     continuation.yield(.connection(true))
     continuation.yield(.event(FakeEvent(id: "e1")))
-    try? await Task.sleep(for: .milliseconds(30))
+    await expectEventually("the lone event is applied, with no resnapshot ever recorded in front of it") {
+        log.snapshot == ["apply:e1"]
+    }
 
     #expect(log.snapshot == ["apply:e1"])
     #expect(lifecycle.freshness == .live)
@@ -83,9 +133,13 @@ private struct FakeEvent: Sendable, Equatable {
     continuation.yield(.connection(false))
     continuation.yield(.connection(true))
     continuation.yield(.event(FakeEvent(id: "e1")))
-    try? await Task.sleep(for: .milliseconds(60))
 
-    #expect(log.snapshot == ["disconnect", "resnapshot-start", "resnapshot-end", "apply:e1"])
+    let expected = ["disconnect", "resnapshot-start", "resnapshot-end", "apply:e1"]
+    await expectEventually("resnapshot (including its 20ms sleep) completes before the trailing event is applied") {
+        log.snapshot == expected
+    }
+
+    #expect(log.snapshot == expected)
     #expect(lifecycle.freshness == .live)
 
     lifecycle.stop()
@@ -112,9 +166,13 @@ private struct FakeEvent: Sendable, Equatable {
     continuation.yield(.connection(false))
     continuation.yield(.connection(true)) // reconnect #2: resnapshot
     continuation.yield(.event(FakeEvent(id: "e1")))
-    try? await Task.sleep(for: .milliseconds(30))
 
-    #expect(log.snapshot == ["resnapshot", "resnapshot", "apply:e1"])
+    let expected = ["resnapshot", "resnapshot", "apply:e1"]
+    await expectEventually("both reconnects resnapshot before the trailing event is applied") {
+        log.snapshot == expected
+    }
+
+    #expect(log.snapshot == expected)
 
     lifecycle.stop()
     continuation.finish()
@@ -123,6 +181,8 @@ private struct FakeEvent: Sendable, Equatable {
 @MainActor @Test func stopCancelsConsumption() async {
     let log = EventLog()
     let (signals, continuation) = AsyncStream<StreamSignal<FakeEvent>>.makeStream()
+    let terminated = FlagBox()
+    continuation.onTermination = { _ in terminated.value = true }
 
     let lifecycle = StreamLifecycle()
     lifecycle.start(
@@ -132,11 +192,31 @@ private struct FakeEvent: Sendable, Equatable {
     )
 
     continuation.yield(.connection(true))
-    try? await Task.sleep(for: .milliseconds(20))
+    await expectEventually("the pristine first connect reaches .live before stop() is called") {
+        lifecycle.freshness == .live
+    }
+    #expect(terminated.value == false)
+
     lifecycle.stop()
+    // `stop()`'s `Task.cancel()` only *records* cancellation — Swift's
+    // cooperative cancellation means the consumer loop doesn't actually
+    // unwind until its next suspension point notices it, which is exactly
+    // the "stop/send race" this test regresses on: a fixed sleep here could
+    // still lose the race under load. `onTermination` fires precisely when
+    // the stream's consumer really is gone — this codebase's established
+    // observable for that (cribbed from
+    // `ActivityStoreTests.deactivateStopsTheStream`, which polls the same
+    // signal for `deactivate()`) — so polling it is a genuine proof, not a
+    // longer guess.
+    await expectEventually("the consumer task's loop actually unwinds after stop()") {
+        terminated.value == true
+    }
 
     continuation.yield(.event(FakeEvent(id: "after-stop")))
     continuation.yield(.connection(false))
+    // Short settle: `onTermination` already proves no consumer remains to
+    // call `apply`, so nothing here is load-bearing for correctness — it's
+    // just deliberate margin before reading the log.
     try? await Task.sleep(for: .milliseconds(20))
 
     #expect(log.snapshot == [])
@@ -158,16 +238,18 @@ private struct FakeEvent: Sendable, Equatable {
         weakLifecycle = lifecycle
         lifecycle.start(signals: signals, resnapshot: {}, apply: { _ in })
         continuation.yield(.connection(true))
-        try? await Task.sleep(for: .milliseconds(20))
+        await expectEventually("the pristine first connect is processed while `lifecycle` is still in scope") {
+            lifecycle.freshness == .live
+        }
     }
     // `lifecycle` just went out of scope with no `stop()` call. Nudge the
     // stream so the consumer task's next loop iteration notices `self` is
     // nil.
     continuation.yield(.connection(false))
     continuation.yield(.event(FakeEvent(id: "nudge")))
-    try? await Task.sleep(for: .milliseconds(50))
 
-    #expect(weakLifecycle == nil)
+    let deallocated = await pollUntil { weakLifecycle == nil }
+    #expect(deallocated, "expected `lifecycle` to deallocate once its consumer task's weak `self` capture noticed it was gone")
 
     continuation.finish()
 }
