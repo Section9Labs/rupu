@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use chrono::{TimeZone, Utc};
 use rupu_cp::api::graph::{ApprovalGateDto, GateDto, StepDag, StepNodeDto, SubStepDto};
+use rupu_cp::api::projects::ProjectRow;
 use rupu_cp::api::runs::RunListRow;
 use rupu_cp::usage::UsageSummary;
 use rupu_netflow::{Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome};
@@ -817,4 +818,36 @@ fn api_errors_fixture_is_current() {
         { "error": "session s is stopped" },
     ]);
     check_fixture("api_errors.json", &value);
+}
+
+// ── Flows & composition (v2 top bar) ────────────────────────────────────────
+
+#[test]
+fn projects_fixture_is_current() {
+    // `GET /api/projects` (`list_projects` in api/projects.rs) returns
+    // `Vec<ProjectRow>` directly — this mirrors the exact type, not a
+    // hand-built `json!`, so drift on `ProjectRow` itself always shows up
+    // here rather than only surfacing in a live `cp serve` response.
+    let row = ProjectRow {
+        ws_id: "ws-1".into(),
+        name: "rupu".into(),
+        path: "/Users/matt/Code/rupu".into(),
+        repo_remote: Some("git@github.com:section9labs/rupu.git".into()),
+        branch: Some("main".into()),
+        repo_home_url: Some("https://github.com/section9labs/rupu".into()),
+        created_at: "2026-08-01T09:00:00Z".into(),
+        last_run_at: Some("2026-08-20T12:00:00Z".into()),
+        usage: UsageSummary {
+            input_tokens: 5000,
+            output_tokens: 1200,
+            cached_tokens: 300,
+            total_tokens: 6200,
+            cost_usd: Some(0.85),
+            priced: true,
+            runs: 2,
+        },
+        run_count: 14,
+        last_active: Some("2026-08-20T12:00:00Z".into()),
+    };
+    check_fixture("projects.json", &vec![row]);
 }
