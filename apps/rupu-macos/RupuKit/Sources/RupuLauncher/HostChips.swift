@@ -5,7 +5,7 @@ import RupuDesign
 
 /// One chip per `store.hosts` row plus a standalone "FAN OUT: ALL HEALTHY"
 /// toggle chip. A host chip shows its name and, when the server reported
-/// one, its `activeRunCount` in `Font.numeral` — omitted entirely rather
+/// one, its `activeRunCount` in `Font.dataMono` — omitted entirely rather
 /// than showing a placeholder when `nil` (null discipline: "unknown" and
 /// "zero" are different facts). Offline/stale hosts render dim and
 /// disabled — never a dead-looking-but-tappable control. `fanOutAllHealthy`
@@ -20,7 +20,7 @@ import RupuDesign
 /// session API yet; see `SessionDetailStore`'s doc comment). Every non-local
 /// chip, plus the fan-out toggle (which could only ever resolve to
 /// non-local targets alongside "local", or to nothing at all), renders
-/// dim/disabled and a `MicroLabel` explains why — the operator should never
+/// dim/disabled and a caption explains why — the operator should never
 /// be able to select a target this launch kind can't honestly reach.
 /// `LauncherStore.resolvedTargets()` hard-filters to `"local"` for
 /// `.session` too, as defense in depth independent of this view.
@@ -30,16 +30,17 @@ struct HostChips: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            MicroLabel("Targets")
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow("Targets")
 
             if localOnly {
-                MicroLabel("REMOTE SESSIONS LAND WITH FLEET (PHASE 5)")
+                Text("Remote sessions land with Fleet (Phase 5)")
+                    .font(.metaText)
                     .foregroundStyle(Color.rupuMute)
             }
 
             if store.hosts.isEmpty {
-                MicroLabel("LOADING HOSTS…")
+                Text("Loading hosts…")
+                    .font(.metaText)
                     .foregroundStyle(Color.rupuMute)
             }
 
@@ -72,7 +73,7 @@ struct HostChips: View {
                     .foregroundStyle(isOnline ? Color.rupuInk : Color.rupuMute)
                 if let count = host.activeRunCount {
                     Text("\(count)")
-                        .font(.numeral(size: 10))
+                        .font(.dataMono(10))
                         .foregroundStyle(Color.rupuDim)
                 }
             }
@@ -91,7 +92,8 @@ struct HostChips: View {
         Button {
             store.fanOutAllHealthy.toggle()
         } label: {
-            MicroLabel("Fan out: all healthy")
+            Text("Fan out: all healthy")
+                .font(.metaText)
                 .foregroundStyle(store.fanOutAllHealthy ? Color.rupuBrand700 : Color.rupuMute)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)

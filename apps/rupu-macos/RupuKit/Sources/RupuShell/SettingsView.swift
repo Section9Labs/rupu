@@ -16,7 +16,13 @@ public struct SettingsView: View {
     public var body: some View {
         TabView {
             generalTab
-                .tabItem { Label("General", systemImage: "gearshape") }
+                .tabItem {
+                    Label {
+                        Text("General")
+                    } icon: {
+                        Icon(.settings)
+                    }
+                }
         }
         .frame(width: 420)
         .padding(20)

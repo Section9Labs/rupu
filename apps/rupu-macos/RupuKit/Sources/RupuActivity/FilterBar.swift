@@ -66,7 +66,8 @@ struct FilterBar: View {
         Button {
             Task { await store.applyPendingRefresh() }
         } label: {
-            MicroLabel("\(store.pendingNewRuns) new runs")
+            Text("\(store.pendingNewRuns) new runs")
+                .font(.metaText)
                 .foregroundStyle(Color.rupuBrand700)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -92,7 +93,8 @@ struct FilterBar: View {
         return Button {
             toggle(status)
         } label: {
-            MicroLabel(status.displayLabel)
+            Text(status.displayLabel)
+                .font(.metaText)
                 .foregroundStyle(isOn ? Color.rupuInk : Color.rupuDim)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)

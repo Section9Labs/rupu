@@ -5,7 +5,7 @@ import RupuDesign
 
 /// Definition list for the Launcher's `kind` — `agents` for
 /// `.agentRun`/`.session`, `workflows` for `.workflow`. Each row shows the
-/// definition's name plus MicroLabel tags (an agent's `model`/`scope`, a
+/// definition's name plus `Eyebrow` tags (an agent's `model`/`scope`, a
 /// workflow's `scope` — workflows have no `model` field). Tapping a row
 /// calls `store.selectDefinition(_:)`, which for a workflow also fetches
 /// its declared inputs in the background (see `LauncherStore`'s doc
@@ -17,8 +17,7 @@ struct DefinitionPicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            MicroLabel(store.kind == .workflow ? "Workflow" : "Agent")
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow(store.kind == .workflow ? "Workflow" : "Agent")
 
             switch store.kind {
             case .agentRun, .session:
@@ -37,7 +36,7 @@ struct DefinitionPicker: View {
         case .failed(let message):
             failedRow(message)
         case .empty:
-            emptyRow("NO AGENTS DEFINED")
+            emptyRow("No agents defined")
         case .content(let agents):
             // Indexed IDs, not `id: \.name` — definition names are only
             // unique per scope, and the flat list can carry the same name
@@ -67,7 +66,7 @@ struct DefinitionPicker: View {
         case .failed(let message):
             failedRow(message)
         case .empty:
-            emptyRow("NO WORKFLOWS DEFINED")
+            emptyRow("No workflows defined")
         case .content(let workflows):
             // Indexed IDs for the same duplicate-name reason as `agentList`
             // above (observed live: `dispatch-demo` exists in two scopes).
@@ -104,8 +103,7 @@ struct DefinitionPicker: View {
                 Spacer(minLength: 8)
                 HStack(spacing: 6) {
                     ForEach(tags, id: \.self) { tag in
-                        MicroLabel(tag)
-                            .foregroundStyle(Color.rupuMute)
+                        Eyebrow(tag)
                     }
                 }
             }
@@ -131,8 +129,9 @@ struct DefinitionPicker: View {
 
     private func failedRow(_ message: String) -> some View {
         listShell {
-            MicroLabel("FAILED TO LOAD")
-                .foregroundStyle(Color.status(.fail))
+            Text("Failed to load")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
                 .padding(10)
             Text(message)
                 .font(.system(size: 11))
@@ -143,7 +142,8 @@ struct DefinitionPicker: View {
 
     private func emptyRow(_ label: String) -> some View {
         listShell {
-            MicroLabel(label)
+            Text(label)
+                .font(.noteText)
                 .foregroundStyle(Color.rupuMute)
                 .padding(10)
         }

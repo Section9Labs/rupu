@@ -35,7 +35,8 @@ public struct ActivityScreen: View {
             if let store {
                 FilterBar(model: model, store: store)
                 if store.freshness == .stale {
-                    MicroLabel("STREAM STALE — RECONNECTING")
+                    Text("Stream stale — reconnecting")
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuMute)
                 }
                 if store.pendingHosts > 0 {
@@ -44,12 +45,13 @@ public struct ActivityScreen: View {
                     // `store.state` never waits on remote hosts (see
                     // `ActivityStore`'s doc comment) — this is purely an
                     // "more may still show up" signal, never a blocking one.
-                    MicroLabel("+\(store.pendingHosts) HOST\(store.pendingHosts == 1 ? "" : "S") LOADING…")
+                    Text("+\(store.pendingHosts) host\(store.pendingHosts == 1 ? "" : "s") loading…")
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuMute)
                 }
                 stateBody(store: store)
             } else {
-                blockView(label: "BACKEND NOT CONNECTED")
+                blockView(label: "Backend not connected")
             }
         }
         .padding(16)
@@ -71,7 +73,7 @@ public struct ActivityScreen: View {
         case .failed(let message):
             failedView(message: message, store: store)
         case .empty:
-            blockView(label: "NO EXECUTIONS IN RANGE")
+            blockView(label: "No executions in range")
         case .content:
             ActivityTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
         }
@@ -91,8 +93,9 @@ public struct ActivityScreen: View {
     private func failedView(message: String, store: ActivityStore) -> some View {
         VStack(spacing: 10) {
             Spacer(minLength: 0)
-            MicroLabel("FAILED TO LOAD ACTIVITY")
-                .foregroundStyle(Color.status(.fail))
+            Text("Failed to load activity")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
             Text(message)
                 .font(.system(size: 12))
                 .foregroundStyle(Color.rupuDim)
@@ -110,7 +113,8 @@ public struct ActivityScreen: View {
     private func blockView(label: String) -> some View {
         VStack {
             Spacer(minLength: 0)
-            MicroLabel(label)
+            Text(label)
+                .font(.noteText)
                 .foregroundStyle(Color.rupuMute)
             Spacer(minLength: 0)
         }

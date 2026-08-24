@@ -26,16 +26,6 @@ import Testing
     }
 }
 
-/// `Font.identifier`/`Font.numeral` are pre-v2 shims kept alive (deprecated) purely so Task 5 has
-/// a mechanical sweep target — both must be exact `dataMono` aliases, not a separately-maintained
-/// font spec that could silently drift.
-@available(*, deprecated, message: "exercises the deprecated Font.identifier/numeral shims intentionally")
-@Test func deprecatedIdentifierAndNumeralAliasDataMono() {
-    #expect(Font.identifier == Font.dataMono(11.5))
-    #expect(Font.numeral(size: 11) == Font.dataMono(11))
-    #expect(Font.numeral(size: 10) == Font.dataMono(10))
-}
-
 @Test func eyebrowUppercasesDisplayText() {
     #expect(Eyebrow("mixed Case Text").displayText == "MIXED CASE TEXT")
     #expect(Eyebrow("already upper").displayText == "ALREADY UPPER")

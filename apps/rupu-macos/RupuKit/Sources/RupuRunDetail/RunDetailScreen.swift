@@ -46,7 +46,7 @@ public struct RunDetailScreen: View {
             if let store {
                 content(store: store)
             } else {
-                centeredLabel("BACKEND NOT CONNECTED")
+                centeredLabel("Backend not connected")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -106,19 +106,21 @@ public struct RunDetailScreen: View {
                 Button {
                     model.navigateBack()
                 } label: {
-                    Image(systemName: "chevron.left")
+                    Icon(.arrowLeft)
                         .foregroundStyle(Color.rupuDim)
                 }
                 .buttonStyle(.plain)
 
                 if case .content(let detail) = store.detail {
-                    MicroLabel("Activity ▸ \(detail.run.workflowName)")
+                    Text("Activity ▸ \(detail.run.workflowName)")
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuDim)
                     Spacer(minLength: 0)
                     statusPill(detail.run.status)
                     actionControls(store: store)
                 } else {
-                    MicroLabel("Activity ▸ \(runID)")
+                    Text("Activity ▸ \(runID)")
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuDim)
                     Spacer(minLength: 0)
                 }
@@ -161,7 +163,7 @@ public struct RunDetailScreen: View {
                             .disabled(isPending(store.pendingActions.state(ActionKey(runID, .restore))))
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Icon(.archive)
                         .foregroundStyle(Color.rupuDim)
                 }
                 .menuStyle(.borderlessButton)
@@ -188,6 +190,7 @@ public struct RunDetailScreen: View {
                 Text(title)
             }
         }
+        .buttonStyle(RupuButtonStyle.outline)
         .disabled(pending)
     }
 
@@ -228,10 +231,10 @@ public struct RunDetailScreen: View {
                     HStack(spacing: 6) {
                         Text("\(failure.title) failed:")
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(Color.status(.fail))
+                            .foregroundStyle(Color.status(.failed))
                         Text(failure.message)
                             .font(.system(size: 11))
-                            .foregroundStyle(Color.status(.fail))
+                            .foregroundStyle(Color.status(.failed))
                             .lineLimit(2)
                         Button("Retry") {
                             Task { await failure.retry() }
@@ -245,38 +248,12 @@ public struct RunDetailScreen: View {
         }
     }
 
+    /// Web-parity status pill (Step 1 sweep): the header's status readout is
+    /// exactly the "run-detail pill" the v2 chrome sweep replaces with the
+    /// shared `StatusPill` — label vocabulary now comes from
+    /// `StatusDescriptor` (Task 4) instead of this screen's own copy.
     private func statusPill(_ rawStatus: String) -> some View {
-        let status = ActivityStatus.normalize(rawStatus)
-        return HStack(spacing: 6) {
-            Circle()
-                .fill(Color.status(status.tone))
-                .frame(width: 6, height: 6)
-            MicroLabel(statusLabel(status))
-                .foregroundStyle(Color.rupuDim)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.status(status.tone).opacity(0.12))
-        .clipShape(Capsule())
-    }
-
-    /// Local vocabulary rather than reusing `RupuActivity`'s
-    /// `ActivityStatus.displayLabel` — that extension lives in a module this
-    /// target has no dependency edge to (`RupuRunDetail` depends on
-    /// `RupuAPI`/`RupuStore`/`RupuDesign` only, per `Package.swift`), and one
-    /// small switch isn't worth adding one.
-    private func statusLabel(_ status: ActivityStatus) -> String {
-        switch status {
-        case .pending: "Pending"
-        case .running: "Running"
-        case .completed: "Completed"
-        case .failed: "Failed"
-        case .awaiting: "Awaiting"
-        case .rejected: "Rejected"
-        case .cancelled: "Cancelled"
-        case .paused: "Paused"
-        case .unknown(let raw): raw
-        }
+        StatusPill(ActivityStatus.normalize(rawStatus).tone)
     }
 
     private func factsRow(detail: APIRunDetail) -> some View {
@@ -291,9 +268,9 @@ public struct RunDetailScreen: View {
 
     private func factItem(_ label: String, _ value: String) -> some View {
         HStack(spacing: 6) {
-            MicroLabel(label).foregroundStyle(Color.rupuMute)
+            Eyebrow(label)
             Text(value)
-                .font(.numeral(size: 11.5))
+                .font(.dataMono(11.5))
                 .foregroundStyle(Color.rupuInk)
         }
     }
@@ -328,16 +305,14 @@ public struct RunDetailScreen: View {
     private func awaitingBanner(store: RunDetailStore, detail: APIRunDetail) -> some View {
         Group {
             if !detail.run.awaiting.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(detail.run.awaiting, id: \.stepID) { gate in
-                        gateRow(store: store, gate: gate)
+                TintBanner(tone: Color.status(.awaiting), toneBg: Color.status(.awaiting).opacity(0.08)) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(detail.run.awaiting, id: \.stepID) { gate in
+                            gateRow(store: store, gate: gate)
+                        }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.status(.waiting).opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.status(.waiting).opacity(0.3), lineWidth: 1))
             }
         }
     }
@@ -360,8 +335,9 @@ public struct RunDetailScreen: View {
         let anyPending = approvePending || rejectPending
 
         return VStack(alignment: .leading, spacing: 6) {
-            MicroLabel("Awaiting — \(gate.stepID)")
-                .foregroundStyle(Color.status(.waiting))
+            Text("Awaiting — \(gate.stepID)")
+                .font(.metaText)
+                .foregroundStyle(Color.status(.awaiting))
             Text(gate.prompt ?? "Approval requested")
                 .font(.system(size: 12.5))
                 .foregroundStyle(Color.rupuInk)
@@ -377,8 +353,7 @@ public struct RunDetailScreen: View {
                         Text("Approve")
                     }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Color.rupuBrand)
+                .buttonStyle(RupuButtonStyle.primaryOk)
                 .disabled(anyPending)
 
                 Button {
@@ -391,6 +366,7 @@ public struct RunDetailScreen: View {
                         Text("Reject")
                     }
                 }
+                .buttonStyle(RupuButtonStyle.dangerOutline)
                 .disabled(anyPending)
             }
 
@@ -398,7 +374,8 @@ public struct RunDetailScreen: View {
             gateFailureNote(state: rejectState) { await store.reject(gate: gate.stepID) }
 
             if store.pendingActions.isStale(approveKey) || store.pendingActions.isStale(rejectKey) {
-                MicroLabel("STILL PENDING — THIS MAY BE STUCK")
+                Text("Still pending — this may be stuck")
+                    .font(.noteText)
                     .foregroundStyle(Color.rupuMute)
             }
         }
@@ -412,7 +389,7 @@ public struct RunDetailScreen: View {
             HStack(spacing: 6) {
                 Text(message)
                     .font(.system(size: 11))
-                    .foregroundStyle(Color.status(.fail))
+                    .foregroundStyle(Color.status(.failed))
                     .lineLimit(2)
                 Button("Retry") {
                     Task { await retry() }
@@ -434,7 +411,7 @@ public struct RunDetailScreen: View {
         case .failed(let message):
             blockShell { failedContent(message) }
         case .empty:
-            blockShell { MicroLabel("NO WORKFLOW STEPS").foregroundStyle(Color.rupuMute) }
+            blockShell { Text("No workflow steps").font(.noteText).foregroundStyle(Color.rupuMute) }
         case .content(let g):
             StepGraphView(nodes: layoutGraph(
                 nodes: g.workflow.steps,
@@ -468,7 +445,7 @@ public struct RunDetailScreen: View {
     private func transcriptColumn(store: RunDetailStore) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                MicroLabel("TRANSCRIPT").foregroundStyle(Color.rupuMute)
+                Eyebrow("Transcript")
                 Spacer(minLength: 0)
                 transcriptLiveIndicator(store: store)
             }
@@ -482,12 +459,15 @@ public struct RunDetailScreen: View {
     @ViewBuilder
     private func transcriptLiveIndicator(store: RunDetailStore) -> some View {
         if store.isRemote {
-            MicroLabel("REMOTE STREAMING LANDS WITH FLEET (PHASE 5)")
+            Text("Remote streaming lands with Fleet (Phase 5)")
+                .font(.metaText)
                 .foregroundStyle(Color.rupuMute)
         } else if store.transcriptTailActive {
             HStack(spacing: 6) {
-                Circle().fill(Color.status(.run)).frame(width: 6, height: 6)
-                MicroLabel("LIVE").foregroundStyle(Color.status(.run))
+                Circle().fill(Color.status(.running)).frame(width: 6, height: 6)
+                Text("Live")
+                    .font(.metaText)
+                    .foregroundStyle(Color.status(.running))
             }
         }
     }
@@ -506,7 +486,9 @@ public struct RunDetailScreen: View {
 
     private func failedContent(_ message: String) -> some View {
         VStack(spacing: 4) {
-            MicroLabel("FAILED TO LOAD").foregroundStyle(Color.status(.fail))
+            Text("Failed to load")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
             Text(message)
                 .font(.system(size: 11))
                 .foregroundStyle(Color.rupuDim)
@@ -518,7 +500,7 @@ public struct RunDetailScreen: View {
     private func centeredLabel(_ label: String) -> some View {
         VStack {
             Spacer(minLength: 0)
-            MicroLabel(label).foregroundStyle(Color.rupuMute)
+            Text(label).font(.noteText).foregroundStyle(Color.rupuMute)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -45,7 +45,7 @@ public struct SessionDetailScreen: View {
             if let store {
                 content(store: store)
             } else {
-                centeredLabel("BACKEND NOT CONNECTED")
+                centeredLabel("Backend not connected")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -96,22 +96,23 @@ public struct SessionDetailScreen: View {
                 Button {
                     model.navigateBack()
                 } label: {
-                    Image(systemName: "chevron.left")
+                    Icon(.arrowLeft)
                         .foregroundStyle(Color.rupuDim)
                 }
                 .buttonStyle(.plain)
 
                 if case .content(let session) = store.session {
-                    MicroLabel("Activity ▸ Session ▸ \(session.agentName)")
+                    Text("Activity ▸ Session ▸ \(session.agentName)")
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuDim)
                 } else {
-                    MicroLabel("Activity ▸ Session ▸ \(sessionID)")
+                    Text("Activity ▸ Session ▸ \(sessionID)")
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuDim)
                 }
                 Spacer(minLength: 0)
                 if store.isArchived {
-                    MicroLabel("ARCHIVED")
-                        .foregroundStyle(Color.rupuMute)
+                    Eyebrow("Archived")
                 }
                 overflowMenu(store: store)
             }
@@ -158,7 +159,7 @@ public struct SessionDetailScreen: View {
                     .disabled(isPending(store.pendingActions.state(ActionKey(sessionID, .archive))))
             }
         } label: {
-            Image(systemName: "ellipsis.circle")
+            Icon(.archive)
                 .foregroundStyle(Color.rupuDim)
         }
         .menuStyle(.borderlessButton)
@@ -196,10 +197,10 @@ public struct SessionDetailScreen: View {
                     HStack(spacing: 6) {
                         Text("\(failure.title) failed:")
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(Color.status(.fail))
+                            .foregroundStyle(Color.status(.failed))
                         Text(failure.message)
                             .font(.system(size: 11))
-                            .foregroundStyle(Color.status(.fail))
+                            .foregroundStyle(Color.status(.failed))
                             .lineLimit(2)
                         Button("Retry") {
                             Task { await failure.retry() }
@@ -215,9 +216,9 @@ public struct SessionDetailScreen: View {
 
     private func factItem(_ label: String, _ value: String) -> some View {
         HStack(spacing: 6) {
-            MicroLabel(label).foregroundStyle(Color.rupuMute)
+            Eyebrow(label)
             Text(value)
-                .font(.numeral(size: 11.5))
+                .font(.dataMono(11.5))
                 .foregroundStyle(Color.rupuInk)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -229,14 +230,14 @@ public struct SessionDetailScreen: View {
     @ViewBuilder
     private func runsColumn(store: SessionDetailStore) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            MicroLabel("RUNS").foregroundStyle(Color.rupuMute)
+            Eyebrow("Runs")
             switch store.runs {
             case .loading:
                 blockShell { ProgressView().controlSize(.small) }
             case .failed(let message):
                 blockShell { failedContent(message) }
             case .empty:
-                blockShell { MicroLabel("NO RUNS YET").foregroundStyle(Color.rupuMute) }
+                blockShell { Text("No runs yet").font(.noteText).foregroundStyle(Color.rupuMute) }
             case .content(let rows):
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 6) {
@@ -278,17 +279,20 @@ public struct SessionDetailScreen: View {
                         .truncationMode(.tail)
                 }
                 HStack(spacing: 10) {
-                    MicroLabel(relativeLabel(run.startedAt))
+                    Text(relativeLabel(run.startedAt))
+                        .font(.dataMono(10))
                         .foregroundStyle(Color.rupuDim)
-                    MicroLabel(Fmt.duration(ms: run.durationMS))
+                    Text(Fmt.duration(ms: run.durationMS))
+                        .font(.dataMono(10))
                         .foregroundStyle(Color.rupuDim)
-                    MicroLabel("\(Fmt.count(Int(run.tokensIn + run.tokensOut))) tok")
+                    Text("\(Fmt.count(Int(run.tokensIn + run.tokensOut))) tok")
+                        .font(.dataMono(10))
                         .foregroundStyle(Color.rupuDim)
                 }
                 if let error = run.error {
                     Text(error)
                         .font(.system(size: 10.5))
-                        .foregroundStyle(Color.status(.fail))
+                        .foregroundStyle(Color.status(.failed))
                         .lineLimit(2)
                 }
             }
@@ -316,7 +320,7 @@ public struct SessionDetailScreen: View {
     private func transcriptColumn(store: SessionDetailStore) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                MicroLabel(transcriptLabel(store: store)).foregroundStyle(Color.rupuMute)
+                Eyebrow(transcriptLabel(store: store))
                 Spacer(minLength: 0)
             }
             TranscriptFeed(events: store.transcript)
@@ -346,16 +350,17 @@ public struct SessionDetailScreen: View {
     @ViewBuilder
     private func sendBox(store: SessionDetailStore) -> some View {
         if store.isStopped {
-            statusOnlyBox("SESSION STOPPED")
+            statusOnlyBox("Session stopped")
         } else if store.isArchived {
-            statusOnlyBox("ARCHIVED")
+            statusOnlyBox("Archived")
         } else {
             sendInputBox(store: store)
         }
     }
 
     private func statusOnlyBox(_ label: String) -> some View {
-        MicroLabel(label)
+        Text(label)
+            .font(.noteText)
             .foregroundStyle(Color.rupuMute)
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -391,8 +396,7 @@ public struct SessionDetailScreen: View {
                         Text("Send")
                     }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Color.rupuBrand)
+                .buttonStyle(RupuButtonStyle.primary)
                 .disabled(pending || trimmedEmpty)
             }
             .padding(10)
@@ -401,7 +405,7 @@ public struct SessionDetailScreen: View {
             if case .failed(let message) = state {
                 Text(message)
                     .font(.system(size: 11))
-                    .foregroundStyle(Color.status(.fail))
+                    .foregroundStyle(Color.status(.failed))
                     .lineLimit(2)
             }
         }
@@ -430,7 +434,9 @@ public struct SessionDetailScreen: View {
 
     private func failedContent(_ message: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            MicroLabel("FAILED TO LOAD").foregroundStyle(Color.status(.fail))
+            Text("Failed to load")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
             Text(message)
                 .font(.system(size: 11))
                 .foregroundStyle(Color.rupuDim)
@@ -441,7 +447,7 @@ public struct SessionDetailScreen: View {
     private func centeredLabel(_ label: String) -> some View {
         VStack {
             Spacer(minLength: 0)
-            MicroLabel(label).foregroundStyle(Color.rupuMute)
+            Text(label).font(.noteText).foregroundStyle(Color.rupuMute)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

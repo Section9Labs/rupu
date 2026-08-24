@@ -44,8 +44,7 @@ private struct GraphNodeCapsule: View {
         VStack(spacing: 6) {
             StatusGlyph(state: node.state)
             VStack(spacing: 2) {
-                MicroLabel(node.kindLabel)
-                    .foregroundStyle(Color.rupuDim)
+                Eyebrow(node.kindLabel)
                 if let agentLabel = node.agentLabel {
                     Text(agentLabel)
                         .font(.system(size: 11))
@@ -54,7 +53,7 @@ private struct GraphNodeCapsule: View {
                 }
                 if let unitProgress = node.unitProgress {
                     Text("\(unitProgress.done)/\(unitProgress.total)")
-                        .font(.numeral(size: 11))
+                        .font(.dataMono(11))
                         .foregroundStyle(Color.rupuDim)
                 }
             }
@@ -82,21 +81,18 @@ private struct StatusGlyph: View {
         ZStack {
             switch state {
             case .done(let success):
-                Circle()
-                    .fill(Color.status(success ? .done : .fail))
-                    .frame(width: diameter, height: diameter)
-                Image(systemName: success ? "checkmark" : "xmark")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(.white)
+                let tone: StatusTone = success ? .done : .failed
+                Icon(StatusDescriptor.descriptor(for: tone).icon, size: diameter)
+                    .foregroundStyle(Color.status(tone))
             case .running:
                 Circle()
-                    .fill(Color.status(.run))
+                    .fill(Color.status(.running))
                     .frame(width: diameter, height: diameter)
                     .scaleEffect(pulseActive ? 1.3 : 1)
                     .opacity(pulseActive ? 0.5 : 1)
             case .gatePending:
                 Circle()
-                    .strokeBorder(Color.status(.waiting), lineWidth: 2)
+                    .strokeBorder(Color.status(.awaiting), lineWidth: 2)
                     .frame(width: diameter, height: diameter)
                     .scaleEffect(pulseActive ? 1.3 : 1)
                     .opacity(pulseActive ? 0.5 : 1)

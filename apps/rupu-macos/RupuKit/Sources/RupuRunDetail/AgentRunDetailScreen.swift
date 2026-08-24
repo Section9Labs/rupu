@@ -47,7 +47,7 @@ public struct AgentRunDetailScreen: View {
             if let store {
                 content(store: store)
             } else {
-                centeredLabel("BACKEND NOT CONNECTED")
+                centeredLabel("Backend not connected")
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -90,16 +90,16 @@ public struct AgentRunDetailScreen: View {
             Button {
                 model.navigateBack()
             } label: {
-                Image(systemName: "chevron.left")
+                Icon(.arrowLeft)
                     .foregroundStyle(Color.rupuDim)
             }
             .buttonStyle(.plain)
 
-            MicroLabel("Activity ▸ Agent run ▸ \(runID)")
+            Text("Activity ▸ Agent run ▸ \(runID)")
+                .font(.noteText)
                 .foregroundStyle(Color.rupuDim)
             Spacer(minLength: 0)
-            MicroLabel("READ-ONLY")
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow("Read-only")
         }
     }
 
@@ -108,14 +108,14 @@ public struct AgentRunDetailScreen: View {
     @ViewBuilder
     private func transcriptColumn(store: AgentRunDetailStore) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            MicroLabel("TRANSCRIPT").foregroundStyle(Color.rupuMute)
+            Eyebrow("Transcript")
             switch store.transcript {
             case .loading:
                 blockShell { ProgressView().controlSize(.small) }
             case .failed(let message):
                 blockShell { failedContent(message) }
             case .empty where store.resolvedPath == nil:
-                blockShell { MicroLabel("NO TRANSCRIPT RECORDED").foregroundStyle(Color.rupuMute) }
+                blockShell { Text("No transcript recorded").font(.noteText).foregroundStyle(Color.rupuMute) }
             case .empty:
                 TranscriptFeed(events: [])
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -143,7 +143,9 @@ public struct AgentRunDetailScreen: View {
 
     private func failedContent(_ message: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            MicroLabel("FAILED TO LOAD").foregroundStyle(Color.status(.fail))
+            Text("Failed to load")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
             Text(message)
                 .font(.system(size: 11))
                 .foregroundStyle(Color.rupuDim)
@@ -154,7 +156,7 @@ public struct AgentRunDetailScreen: View {
     private func centeredLabel(_ label: String) -> some View {
         VStack {
             Spacer(minLength: 0)
-            MicroLabel(label).foregroundStyle(Color.rupuMute)
+            Text(label).font(.noteText).foregroundStyle(Color.rupuMute)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
