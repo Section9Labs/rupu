@@ -93,7 +93,7 @@ private struct LauncherForm: View {
 
     private var header: some View {
         Text("New run")
-            .font(.system(size: 15, weight: .semibold))
+            .font(.sheetTitleText)
             .foregroundStyle(Color.rupuInk)
     }
 
@@ -133,7 +133,7 @@ private struct LauncherForm: View {
             VStack(alignment: .leading, spacing: 6) {
                 Eyebrow("Prompt")
                 TextEditor(text: $store.prompt)
-                    .font(.system(size: 12.5))
+                    .font(.leadText)
                     .scrollContentBackground(.hidden)
                     .frame(height: 90)
                     .padding(6)
@@ -164,11 +164,11 @@ private struct LauncherForm: View {
             store.mode = value
         } label: {
             Text(label)
-                .font(.system(size: 11.5, weight: loud ? .semibold : .regular))
+                .font(.uiText.weight(loud ? .semibold : .regular))
                 .foregroundStyle(labelColor(isSelected: isSelected, loud: loud))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
-                .background(isSelected ? tint : (loud ? Color.status(.failed).opacity(0.1) : Color.rupuSurface))
+                .background(isSelected ? tint : (loud ? Color.status(.failed).opacity(0.12) : Color.rupuSurface))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
@@ -186,13 +186,16 @@ private struct LauncherForm: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let error = store.validationError {
-                TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
+                // Fix wave: a launch-validation failure is an error, not a
+                // run/gate status — semantic `.rupuErr`/`.rupuErrBg`, same
+                // reasoning as `OnboardingView.incompatibleBanner`.
+                TintBanner(tone: .rupuErr, toneBg: .rupuErrBg) {
                     HStack(spacing: 6) {
                         Icon(.xCircle, size: 14)
                         Text(error)
-                            .font(.system(size: 11.5))
+                            .font(.uiText)
                     }
-                    .foregroundStyle(Color.status(.failed))
+                    .foregroundStyle(Color.rupuErr)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
@@ -236,7 +239,7 @@ private struct LauncherForm: View {
                         .foregroundStyle(Color.rupuInk)
                     Spacer()
                     Text("view →")
-                        .font(.system(size: 11))
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuBrand700)
                 }
             }
@@ -249,7 +252,7 @@ private struct LauncherForm: View {
                     .foregroundStyle(Color.rupuInk)
                 Spacer()
                 Text(error.text)
-                    .font(.system(size: 11))
+                    .font(.noteText)
                     .foregroundStyle(Color.status(.failed))
                     .multilineTextAlignment(.trailing)
             }

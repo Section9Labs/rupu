@@ -156,13 +156,13 @@ private struct ProseRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(content)
-                .font(.system(size: 12.5))
+                .font(.leadText)
                 .foregroundStyle(Color.rupuInk)
                 .textSelection(.enabled)
             if let thinking, !thinking.isEmpty {
                 DisclosureGroup(isExpanded: $thinkingExpanded) {
                     Text(thinking)
-                        .font(.system(size: 11.5))
+                        .font(.uiText)
                         .foregroundStyle(Color.rupuDim)
                         .padding(.top, 4)
                         .textSelection(.enabled)
@@ -304,11 +304,11 @@ private struct GateRequestedRow: View {
                         .foregroundStyle(Color.rupuMute)
                 }
                 Text(prompt)
-                    .font(.system(size: 12.5))
+                    .font(.leadText)
                     .foregroundStyle(Color.rupuInk)
                 if let decision {
                     Text(decidedBy.map { "\(decision) by \($0)" } ?? decision)
-                        .font(.system(size: 11))
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuDim)
                 }
             }
@@ -393,7 +393,7 @@ private struct RunCompleteRow: View {
             }
             if let error {
                 Text(error)
-                    .font(.system(size: 11.5))
+                    .font(.uiText)
                     .foregroundStyle(Color.status(.failed))
             }
         }

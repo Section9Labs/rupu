@@ -62,38 +62,50 @@ public struct OnboardingView: View {
     private var header: some View {
         VStack(spacing: 6) {
             Text("Where is your control plane?")
-                .font(.system(size: 17, weight: .semibold))
+                .font(.dialogTitleText)
                 .foregroundStyle(Color.rupuInk)
             Text("rupu.app can run everything itself, or attach to a control plane you already run.")
-                .font(.system(size: 12))
+                .font(.uiText)
                 .foregroundStyle(Color.rupuDim)
                 .multilineTextAlignment(.center)
         }
     }
 
+    /// Fix wave: an unrecoverable version-gate mismatch is an *error*, not a
+    /// run/gate *status* — it uses the semantic `.rupuErr`/`.rupuErrBg` pair
+    /// rather than borrowing `StatusTone.failed`'s color (those two happen
+    /// to render identically today, but they mean different things; the
+    /// semantic pair is the one this class of banner should actually cite).
     private func incompatibleBanner(serverVersion: String) -> some View {
-        TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
+        TintBanner(tone: .rupuErr, toneBg: .rupuErrBg) {
             HStack(alignment: .top, spacing: 8) {
                 Icon(.xCircle, size: 14)
-                    .foregroundStyle(Color.status(.failed))
+                    .foregroundStyle(Color.rupuErr)
                 Text("Server is rupu \(serverVersion); this app needs \(VersionGate.minimum) or newer. Run `rupu update` on the host, then try again.")
-                    .font(.system(size: 11.5))
+                    .font(.uiText)
                     .foregroundStyle(Color.rupuInk)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
+    /// Fix round 1: no `Icon` here (matches the `InputsForm` precedent) —
+    /// `.xCircle` is `StatusDescriptor`'s `.failed` glyph, and this banner
+    /// is `.awaiting` amber, not `.failed` red; pairing that glyph with a
+    /// different tone would make the same icon mean two severities across
+    /// this view (see `incompatibleBanner` just above, which now cites the
+    /// semantic `.rupuErr` pair for the same reason).
+    ///
+    /// Fix wave: this one genuinely IS a status readout (`backend.health ==
+    /// .down`), so it keeps `StatusTone.awaiting`'s tone/border — no
+    /// `-Bg` token in the semantic palette matches `.awaiting`'s RGB pair
+    /// (`.rupuWarnBg` is a close but distinct step), so the fill stays the
+    /// alpha synth rather than switching to a token that would be a
+    /// slightly-off color.
     private func errorBanner(_ message: String) -> some View {
-        // Fix round 1: no `Icon` here (matches the `InputsForm` precedent) —
-        // `.xCircle` is `StatusDescriptor`'s `.failed` glyph, and this banner
-        // is `.awaiting` amber, not `.failed` red; pairing that glyph with a
-        // different tone would make the same icon mean two severities
-        // across this view (see `incompatibleBanner` just above, which *is*
-        // `.failed` and rightly keeps it).
         TintBanner(tone: Color.status(.awaiting), toneBg: Color.status(.awaiting).opacity(0.08)) {
             Text(message)
-                .font(.system(size: 11.5))
+                .font(.uiText)
                 .foregroundStyle(Color.rupuInk)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -105,10 +117,10 @@ public struct OnboardingView: View {
                 .font(.metaText)
                 .foregroundStyle(Color.rupuBrand700)
             Text("Run it here")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.subheadText)
                 .foregroundStyle(Color.rupuInk)
             Text("rupu.app embeds cp serve and manages it for you.")
-                .font(.system(size: 11.5))
+                .font(.uiText)
                 .foregroundStyle(Color.rupuDim)
 
             Text(discoveryStatusLine)
@@ -127,7 +139,7 @@ public struct OnboardingView: View {
                 }
             }
             .disabled(discoveredPath == nil || isConnecting)
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(RupuButtonStyle.primary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
@@ -138,10 +150,10 @@ public struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 10) {
             Eyebrow("Remote")
             Text("Connect to one")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.subheadText)
                 .foregroundStyle(Color.rupuInk)
             Text("Attach to a rupu cp serve already running on a build box or server.")
-                .font(.system(size: 11.5))
+                .font(.uiText)
                 .foregroundStyle(Color.rupuDim)
 
             TextField("https://build-01.internal:7420", text: $remoteURLText)
@@ -158,7 +170,7 @@ public struct OnboardingView: View {
                 }
             }
             .disabled(URL(string: remoteURLText) == nil || isConnecting)
-            .buttonStyle(.bordered)
+            .buttonStyle(RupuButtonStyle.outline)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)

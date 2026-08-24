@@ -196,10 +196,10 @@ public struct SessionDetailScreen: View {
                 ForEach(failures, id: \.title) { failure in
                     HStack(spacing: 6) {
                         Text("\(failure.title) failed:")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.noteText.weight(.semibold))
                             .foregroundStyle(Color.status(.failed))
                         Text(failure.message)
-                            .font(.system(size: 11))
+                            .font(.noteText)
                             .foregroundStyle(Color.status(.failed))
                             .lineLimit(2)
                         Button("Retry") {
@@ -207,7 +207,7 @@ public struct SessionDetailScreen: View {
                         }
                         .buttonStyle(.plain)
                         .foregroundStyle(Color.rupuBrand700)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.noteText.weight(.semibold))
                     }
                 }
             }
@@ -273,7 +273,7 @@ public struct SessionDetailScreen: View {
                         .fill(Color.status(status.tone))
                         .frame(width: 6, height: 6)
                     Text(run.prompt)
-                        .font(.system(size: 12))
+                        .font(.uiText)
                         .foregroundStyle(Color.rupuInk)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -291,7 +291,7 @@ public struct SessionDetailScreen: View {
                 }
                 if let error = run.error {
                     Text(error)
-                        .font(.system(size: 10.5))
+                        .font(.noteText)
                         .foregroundStyle(Color.status(.failed))
                         .lineLimit(2)
                 }
@@ -404,7 +404,7 @@ public struct SessionDetailScreen: View {
 
             if case .failed(let message) = state {
                 Text(message)
-                    .font(.system(size: 11))
+                    .font(.noteText)
                     .foregroundStyle(Color.status(.failed))
                     .lineLimit(2)
             }
@@ -438,7 +438,7 @@ public struct SessionDetailScreen: View {
                 .font(.noteText)
                 .foregroundStyle(Color.status(.failed))
             Text(message)
-                .font(.system(size: 11))
+                .font(.noteText)
                 .foregroundStyle(Color.rupuDim)
                 .lineLimit(2)
         }

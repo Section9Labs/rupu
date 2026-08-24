@@ -147,7 +147,7 @@ public struct AgentRunDetailScreen: View {
                 .font(.noteText)
                 .foregroundStyle(Color.status(.failed))
             Text(message)
-                .font(.system(size: 11))
+                .font(.noteText)
                 .foregroundStyle(Color.rupuDim)
                 .lineLimit(2)
         }

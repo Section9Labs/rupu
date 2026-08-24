@@ -196,7 +196,7 @@ struct FindingsCard: View {
                 .frame(width: 2)
             VStack(alignment: .leading, spacing: 2) {
                 Text(finding.summary)
-                    .font(.system(size: 11.5))
+                    .font(.uiText)
                     .foregroundStyle(Color.rupuInk)
                     .lineLimit(2)
                 if let filePath = finding.filePath {
@@ -214,8 +214,33 @@ struct FindingsCard: View {
         return "\(path):\(lineRange[0])-\(lineRange[1])"
     }
 
+    /// `APIFinding.severity` carries the wire vocabulary rupu-coverage's
+    /// `Severity` enum serializes to (`#[serde(rename_all = "lowercase")]`
+    /// over `Info|Low|Medium|High|Critical` — see
+    /// `crates/rupu-coverage/src/catalog/types.rs`): "critical"/"medium",
+    /// not this app's own `crit`/`med` case names. `Severity(rawValue:)`
+    /// alone never matched those two (a pre-existing bug now in scope,
+    /// per coordinator ruling) — every finding silently fell back to
+    /// `.info` regardless of its real severity. `Self.severity(for:)` is
+    /// the pure, tested seam for this mapping.
     private func severity(for raw: String) -> Severity {
-        Severity(rawValue: raw) ?? .info
+        Self.severity(for: raw)
+    }
+
+    /// `nil`-free: an unrecognized wire string (future severity, decode
+    /// drift) falls back to `.info` — same "never crash on new data"
+    /// posture the rest of this screen takes — but every value
+    /// `rupu-coverage`'s `Severity` actually serializes today round-trips
+    /// exactly. `static`, not `self`-bound, so it's directly testable.
+    static func severity(for raw: String) -> Severity {
+        switch raw {
+        case "critical": .crit
+        case "high": .high
+        case "medium": .med
+        case "low": .low
+        case "info": .info
+        default: .info
+        }
     }
 }
 
@@ -244,7 +269,7 @@ private struct FailedRow: View {
                 .font(.noteText)
                 .foregroundStyle(Color.status(.failed))
             Text(message)
-                .font(.system(size: 10.5))
+                .font(.noteText)
                 .foregroundStyle(Color.rupuDim)
                 .lineLimit(3)
         }

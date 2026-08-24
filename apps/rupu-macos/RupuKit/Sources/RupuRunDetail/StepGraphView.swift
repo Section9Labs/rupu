@@ -47,7 +47,7 @@ private struct GraphNodeCapsule: View {
                 Eyebrow(node.kindLabel)
                 if let agentLabel = node.agentLabel {
                     Text(agentLabel)
-                        .font(.system(size: 11))
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuInk)
                         .lineLimit(1)
                 }
