@@ -9,6 +9,10 @@ use chrono::{TimeZone, Utc};
 use rupu_cp::api::graph::{ApprovalGateDto, GateDto, StepDag, StepNodeDto, SubStepDto};
 use rupu_cp::api::projects::ProjectRow;
 use rupu_cp::api::runs::RunListRow;
+use rupu_cp::host::dashboard_summary::{
+    ActiveCounts, ActiveLongest, CycleCounts, DashboardSummary, FleetCounts, TerminalBucket,
+    ThroughputBucket,
+};
 use rupu_cp::usage::UsageSummary;
 use rupu_netflow::{Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome};
 use rupu_orchestrator::executor::Event;
@@ -850,4 +854,122 @@ fn projects_fixture_is_current() {
         last_active: Some("2026-08-20T12:00:00Z".into()),
     };
     check_fixture("projects.json", &vec![row]);
+}
+
+// ── Overview dashboard (Phase 4) ────────────────────────────────────────────
+
+#[test]
+fn dashboard_fixture_is_current() {
+    // `GET /api/dashboard` (`get_dashboard` in api/dashboard.rs) returns a
+    // `DashboardResponse` that `#[serde(flatten)]`s a `DashboardSummary` at
+    // the top level alongside `hosts`/`findings_partial`/`cycles_partial`/
+    // `fleet_partial`. `DashboardResponse`/`HostFreshness` are private to
+    // that module (no DTO to import), so this builds the real, public
+    // `DashboardSummary` (and its nested pub types) and merges in the
+    // hand-built `hosts`/`*_partial` fields — mirroring the flatten exactly,
+    // the same approach `run_detail_fixture_is_current` above uses for
+    // private response shapes.
+    //
+    // Fixture shape: 2 hosts (one `ok`, one `offline`); `findings_open` is
+    // the poisoned field (`None` with `findings_partial: true`) while
+    // `cycles`/`fleet` are fully reported (`cycles_partial`/`fleet_partial:
+    // false`); non-empty terminal/throughput buckets; `active_longest`
+    // present; `fleet.issues_capped: true`.
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+
+    let summary = DashboardSummary {
+        active: ActiveCounts {
+            running: 3,
+            awaiting_approval: 1,
+            paused: 0,
+            pending: 2,
+        },
+        active_longest: Some(ActiveLongest {
+            run_id: "run-01".into(),
+            workflow_name: "nightly-health".into(),
+            age_ms: 120_000,
+        }),
+        terminal_buckets: vec![
+            TerminalBucket {
+                ts: t,
+                completed: 4,
+                failed: 1,
+                rejected: 0,
+                cancelled: 0,
+            },
+            TerminalBucket {
+                ts: t + chrono::Duration::days(1),
+                completed: 2,
+                failed: 0,
+                rejected: 1,
+                cancelled: 0,
+            },
+        ],
+        throughput_buckets: vec![
+            ThroughputBucket {
+                ts: t,
+                manual: 2,
+                cron: 3,
+                event: 0,
+            },
+            ThroughputBucket {
+                ts: t + chrono::Duration::days(1),
+                manual: 1,
+                cron: 1,
+                event: 1,
+            },
+        ],
+        cycles: CycleCounts {
+            total: 10,
+            clean: Some(8),
+            with_failures: Some(2),
+        },
+        // The poisoned field: this host merge omitted findings entirely.
+        findings_open: None,
+        fleet: FleetCounts {
+            repos: Some(5),
+            providers_configured: Some(2),
+            providers_unhealthy: Some(0),
+            autoflows_enabled: Some(3),
+            autoflows_disabled: Some(1),
+            workers: Some(2),
+            claims_active: Some(4),
+            issues_pending: Some(1),
+            issues_open: Some(120),
+            issues_capped: true,
+            inventory_captured_at: Some(t),
+        },
+        captured_at: t,
+    };
+
+    let mut value = serde_json::to_value(&summary).expect("serialize dashboard summary");
+    let obj = value
+        .as_object_mut()
+        .expect("DashboardSummary serializes to a JSON object");
+    obj.insert(
+        "hosts".into(),
+        serde_json::json!([
+            {
+                "host_id": "mini",
+                "name": "mini",
+                "transport_kind": "local",
+                "state": "ok",
+                "captured_at": t,
+                "reason": null,
+            },
+            {
+                "host_id": "kuki",
+                "name": "kuki",
+                "transport_kind": "ssh",
+                "state": "offline",
+                "captured_at": null,
+                "reason": "connection refused",
+            },
+        ]),
+    );
+    obj.insert("findings_partial".into(), serde_json::json!(true));
+    obj.insert("cycles_partial".into(), serde_json::json!(false));
+    obj.insert("fleet_partial".into(), serde_json::json!(false));
+
+    check_fixture("dashboard.json", &value);
 }

@@ -1,0 +1,84 @@
+{
+  "active": {
+    "awaiting_approval": 1,
+    "paused": 0,
+    "pending": 2,
+    "running": 3
+  },
+  "active_longest": {
+    "age_ms": 120000,
+    "run_id": "run-01",
+    "workflow_name": "nightly-health"
+  },
+  "captured_at": "2026-08-20T12:00:00Z",
+  "cycles": {
+    "clean": 8,
+    "total": 10,
+    "with_failures": 2
+  },
+  "cycles_partial": false,
+  "findings_open": null,
+  "findings_partial": true,
+  "fleet": {
+    "autoflows_disabled": 1,
+    "autoflows_enabled": 3,
+    "claims_active": 4,
+    "inventory_captured_at": "2026-08-20T12:00:00Z",
+    "issues_capped": true,
+    "issues_open": 120,
+    "issues_pending": 1,
+    "providers_configured": 2,
+    "providers_unhealthy": 0,
+    "repos": 5,
+    "workers": 2
+  },
+  "fleet_partial": false,
+  "hosts": [
+    {
+      "captured_at": "2026-08-20T12:00:00Z",
+      "host_id": "mini",
+      "name": "mini",
+      "reason": null,
+      "state": "ok",
+      "transport_kind": "local"
+    },
+    {
+      "captured_at": null,
+      "host_id": "kuki",
+      "name": "kuki",
+      "reason": "connection refused",
+      "state": "offline",
+      "transport_kind": "ssh"
+    }
+  ],
+  "terminal_buckets": [
+    {
+      "cancelled": 0,
+      "completed": 4,
+      "failed": 1,
+      "rejected": 0,
+      "ts": "2026-08-20T12:00:00Z"
+    },
+    {
+      "cancelled": 0,
+      "completed": 2,
+      "failed": 0,
+      "rejected": 1,
+      "ts": "2026-08-21T12:00:00Z"
+    }
+  ],
+  "throughput_buckets": [
+    {
+      "cron": 3,
+      "event": 0,
+      "manual": 2,
+      "ts": "2026-08-20T12:00:00Z"
+    },
+    {
+      "cron": 1,
+      "event": 1,
+      "manual": 1,
+      "ts": "2026-08-21T12:00:00Z"
+    }
+  ]
+}
