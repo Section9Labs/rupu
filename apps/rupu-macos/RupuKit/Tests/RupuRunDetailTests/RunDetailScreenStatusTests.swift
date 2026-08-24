@@ -8,7 +8,7 @@ import RupuStore
 /// `StatusPill` as usual (this returns `nil`); for one it doesn't, it
 /// returns the original raw string so the header can render it directly
 /// instead of silently discarding it behind a generic "Pending" pill.
-@Test func unrecognizedStatusRawIsNilForEveryKnownStatus() {
+@Test @MainActor func unrecognizedStatusRawIsNilForEveryKnownStatus() {
     // Exactly the raw vocabulary `ActivityStatus.normalize` switches on —
     // including its `ok`/`error`/`aborted` agent-row synonyms and
     // `awaiting_approval` (not the bare `"awaiting"` the run's own
@@ -22,12 +22,12 @@ import RupuStore
     }
 }
 
-@Test func unrecognizedStatusRawSurfacesTheOriginalStringForAnUnknownStatus() {
+@Test @MainActor func unrecognizedStatusRawSurfacesTheOriginalStringForAnUnknownStatus() {
     #expect(RunDetailScreen.unrecognizedStatusRaw("provisioning") == "provisioning")
     #expect(RunDetailScreen.unrecognizedStatusRaw("weird_new_status") == "weird_new_status")
 }
 
-@Test func unrecognizedStatusRawSurfacesTheAbsentMarkerTooRatherThanSwallowingIt() {
+@Test @MainActor func unrecognizedStatusRawSurfacesTheAbsentMarkerTooRatherThanSwallowingIt() {
     // `ActivityStatus.normalize` maps a `nil` raw status to `.unknown("—")`
     // (an explicit "genuinely absent" marker, per that type's own doc
     // comment). This helper only ever sees the non-optional `String` the

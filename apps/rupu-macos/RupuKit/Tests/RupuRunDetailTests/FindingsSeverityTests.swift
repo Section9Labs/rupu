@@ -17,7 +17,7 @@ import RupuDesign
 /// `RailViews.swift`'s `FindingsCard` into `RunDetailTabs.swift`'s
 /// `FindingsTabContent` — the Findings rail card became the Findings tab's
 /// content, single-vertical-stack recompose.
-@Test func severityForMapsEveryWireStringToItsSeverityCase() {
+@Test @MainActor func severityForMapsEveryWireStringToItsSeverityCase() {
     let table: [(wire: String, expected: Severity)] = [
         ("critical", .crit),
         ("high", .high),
@@ -30,7 +30,7 @@ import RupuDesign
     }
 }
 
-@Test func severityForFallsBackToInfoForAnUnrecognizedWireString() {
+@Test @MainActor func severityForFallsBackToInfoForAnUnrecognizedWireString() {
     #expect(FindingsTabContent.severity(for: "unknown_future_severity") == .info)
     #expect(FindingsTabContent.severity(for: "") == .info)
 }

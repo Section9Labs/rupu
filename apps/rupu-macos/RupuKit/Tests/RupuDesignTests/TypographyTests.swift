@@ -26,7 +26,11 @@ import Testing
     }
 }
 
-@Test func eyebrowUppercasesDisplayText() {
+// @MainActor: `Eyebrow` is a SwiftUI `View`, so its members are
+// MainActor-isolated on toolchains that infer isolation strictly (the CI
+// runner's Xcode rejects the nonisolated access; the local toolchain
+// accepts it). Annotating the test keeps both compilers happy.
+@Test @MainActor func eyebrowUppercasesDisplayText() {
     #expect(Eyebrow("mixed Case Text").displayText == "MIXED CASE TEXT")
     #expect(Eyebrow("already upper").displayText == "ALREADY UPPER")
     #expect(Eyebrow("").displayText == "")
