@@ -316,11 +316,17 @@ public struct RunDetailScreen: View {
         .overlay(Capsule().stroke(Color.status(.pending).opacity(0.3), lineWidth: 1))
     }
 
+    /// IN/OUT/CACHED are not redundant with TOKENS — that item is the
+    /// aggregate `totalTokens`; these three are the per-kind breakdown the
+    /// retired facts rail used to carry.
     private func factsRow(detail: APIRunDetail) -> some View {
         HStack(spacing: 20) {
             factItem("STARTED", relativeLabel(detail.run.startedAt))
             factItem("DURATION", durationLabel(detail.run))
             factItem("TOKENS", Fmt.count(Int(detail.usage.totalTokens)))
+            factItem("IN", Fmt.count(Int(detail.usage.inputTokens)))
+            factItem("OUT", Fmt.count(Int(detail.usage.outputTokens)))
+            factItem("CACHED", Fmt.count(Int(detail.usage.cachedTokens)))
             factItem("COST", Fmt.cost(detail.usage.costUSD))
             Spacer(minLength: 0)
         }
