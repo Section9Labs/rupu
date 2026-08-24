@@ -155,7 +155,7 @@ public final class DashboardStore {
     private let debounceInterval: Duration
     private let reconcileInterval: Duration
 
-    private var range = "7d"
+    private var range: TimeRange = .d7
 
     /// Bumped at the top of every `refetchAll()` (the shared engine behind
     /// `activate(range:)`, `setRange(_:)`, and the reconcile loop's tick)
@@ -216,7 +216,7 @@ public final class DashboardStore {
     /// host's fetch progressively in the background, then (re)starts the
     /// firehose consumer and the 60s reconcile loop. Safe to call more than
     /// once — every call fully rebuilds both.
-    public func activate(range: String) async {
+    public func activate(range: TimeRange) async {
         self.range = range
         await refetchAll()
         startSignalConsumer()
@@ -226,7 +226,7 @@ public final class DashboardStore {
     /// Sets the range and refetches every seeded host from scratch — the
     /// same full cycle `activate(range:)` runs, just without touching the
     /// firehose consumer or the reconcile loop (both already running).
-    public func setRange(_ newRange: String) async {
+    public func setRange(_ newRange: TimeRange) async {
         self.range = newRange
         await refetchAll()
     }
@@ -333,13 +333,54 @@ public final class DashboardStore {
             acc = (acc ?? 0) + value
         }
 
+        // Review fix (round 1, Important): raw `String` `<` comparison is
+        // WRONG for RFC 3339 timestamps of differing precision — chrono
+        // (server-side) emits a fractional-seconds suffix only when nanos
+        // are non-zero, and both shapes are real in this repo (the fixture
+        // uses whole-second `"...12:00:00Z"`; CLI logs show fractional
+        // `"...07:00:59.397407Z"`). Lexicographically `"12:00:00.5Z"` sorts
+        // BEFORE `"12:00:00Z"` (`.` < nothing, i.e. the shorter string wins
+        // a prefix tie) despite being chronologically LATER — the exact
+        // inversion that would make "oldest" silently wrong for a fleet
+        // mixing precisions. Parse both sides to `Date` and compare those
+        // instead.
+        func parseTimestamp(_ s: String) -> Date? {
+            let withFractional = ISO8601DateFormatter()
+            withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = withFractional.date(from: s) { return date }
+            // `.withFractionalSeconds` rejects a fractional-less string
+            // outright rather than tolerating a missing suffix, so a
+            // whole-second timestamp needs the plain formatter as a second
+            // attempt.
+            let plain = ISO8601DateFormatter()
+            plain.formatOptions = [.withInternetDateTime]
+            return plain.date(from: s)
+        }
+
+        // An unparseable candidate is treated as unknown and never WINS the
+        // comparison (never displaces whatever `acc` currently holds). The
+        // very first value ever seen (`acc == nil`) is seeded as-is with no
+        // comparison to make — including an unparseable one, since showing
+        // *something* honestly-first-seen beats fabricating `nil` when
+        // literally no host's timestamp parses. If `acc` itself is still
+        // that unparsed seed and a later candidate DOES parse, the
+        // well-formed value takes over (more informative than a raw,
+        // unorderable placeholder). Two unparseable values in a row fall
+        // through to "keep first" by construction: the second one's parse
+        // fails, so it never wins, leaving the first (already-unparseable)
+        // `acc` standing.
         func oldest(_ acc: inout String?, _ candidate: String?) {
             guard let candidate else { return }
             guard let current = acc else {
                 acc = candidate
                 return
             }
-            if candidate < current { acc = candidate }
+            guard let candidateDate = parseTimestamp(candidate) else { return }
+            guard let currentDate = parseTimestamp(current) else {
+                acc = candidate
+                return
+            }
+            if candidateDate < currentDate { acc = candidate }
         }
 
         for summary in summaries {
@@ -456,11 +497,31 @@ public final class DashboardStore {
 
     /// The shared engine behind `activate(range:)`, `setRange(_:)`, and the
     /// reconcile loop's tick: bumps `generation`, discovers the fleet
-    /// (`GET /api/hosts`), seeds `hostStates` fresh (`.loading` for every
-    /// row — a stale prior cycle's slices, including any `.ok`/`.offline`/
-    /// `.unavailable` state, must not linger across a full refetch), then
-    /// fetches `"local"` first (awaited — see the type's doc comment) and
-    /// every other seeded host as an independent background `Task`.
+    /// (`GET /api/hosts`), reseeds `hostStates` from the fresh host list,
+    /// then fetches `"local"` first (awaited — see the type's doc comment)
+    /// and every other seeded host as an independent background `Task`.
+    ///
+    /// Review fix (round 1, minor): a HOST ALREADY PRESENT in `hostStates`
+    /// keeps its current slice `state` across the reseed rather than being
+    /// reset to `.loading` — the original behavior made every periodic 60s
+    /// reconcile tick visibly flash every already-`.ok` host back to
+    /// "loading" for the duration of its refetch, even though nothing about
+    /// that host had actually changed yet. Only a host id that's genuinely
+    /// NEW to this cycle's `GET /api/hosts` response (never seen before, or
+    /// returning after having dropped out of a prior cycle) seeds as
+    /// `.loading`, since there's no prior state to preserve for it. Each
+    /// host's own fetch still updates its slice exactly as before once it
+    /// resolves; the `generation` guard in `performFetch` (checked BEFORE
+    /// `apply(_:hostID:)` ever runs) is what keeps a stale arrival from a
+    /// superseded cycle from clobbering a kept slice — verified, not just
+    /// assumed, by `setRangeRefetchesAllAndDropsStaleInFlightResults...`.
+    ///
+    /// `okResponses`/`merged` follow the same "no flash" principle: rather
+    /// than blanking them at the top of every cycle, only entries for a
+    /// host that fell OUT of the fleet (no longer present in this cycle's
+    /// host list) are pruned — a host that's still registered keeps
+    /// contributing its last-known-good numbers to `merged` until its own
+    /// fresh fetch lands and replaces them.
     private func refetchAll() async {
         generation += 1
         let currentGeneration = generation
@@ -469,12 +530,18 @@ public final class DashboardStore {
         let hosts = (try? await client.hosts()) ?? []
         guard currentGeneration == generation else { return }
 
-        hostStates = hosts.map {
-            HostSlice(id: $0.id, name: $0.name, transportKind: $0.transportKind, state: .loading)
+        let previousStates = Dictionary(uniqueKeysWithValues: hostStates.map { ($0.id, $0.state) })
+        hostStates = hosts.map { host in
+            HostSlice(
+                id: host.id, name: host.name, transportKind: host.transportKind,
+                state: previousStates[host.id] ?? .loading
+            )
         }
-        okResponses.removeAll()
-        pageError = nil
-        merged = nil
+
+        let currentIDs = Set(hostStates.map(\.id))
+        okResponses = okResponses.filter { currentIDs.contains($0.key) }
+        recomputeMerged()
+
         pendingFetchCount = hostStates.count
 
         guard !hostStates.isEmpty else {
@@ -527,7 +594,7 @@ public final class DashboardStore {
     /// server's own verdict for that host.
     private func fetchOutcome(hostID: String) async -> FetchOutcome {
         do {
-            let response = try await client.dashboard(range: range, host: hostID)
+            let response = try await client.dashboard(range: range.rawValue, host: hostID)
             let freshness = response.hosts.first(where: { $0.hostID == hostID }) ?? response.hosts.first
             switch freshness?.state {
             case "ok":

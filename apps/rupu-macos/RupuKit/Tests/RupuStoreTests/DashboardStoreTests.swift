@@ -74,6 +74,15 @@ private final class SignalsFactoryBox: @unchecked Sendable {
     }
 }
 
+/// Thread-safe call counter — same rationale as `ActivityStoreTests`'s own
+/// `Counter` (file-scoped `private`, so re-declared here rather than shared).
+private final class HitCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0
+    /// Increments and returns the NEW count (1 on the first call).
+    func incrementAndGet() -> Int { lock.withLock { v += 1; return v } }
+}
+
 /// De-flakes "wait for something async to land" — same rationale and shape
 /// as `ActivityStoreTests`'s own copy.
 @MainActor
@@ -273,6 +282,53 @@ struct DashboardMergeTests {
         #expect(allUnknown.capturedAt == nil, "must never fabricate a captured-at when no host reported one")
     }
 
+    // Review fix (round 1, Important): a raw `String` `<` comparison gets
+    // "oldest" backwards across mixed timestamp precision. The local
+    // connector (and this repo's own fixture) emits whole-second timestamps
+    // (`"...12:00:00Z"`); a remote host under real load can emit
+    // fractional-second ones (`"...12:00:00.500000Z"`, matching the shape
+    // CLI logs actually show, e.g. `"...07:00:59.397407Z"`). Lexicographically
+    // `"...12:00:00.500000Z"` sorts BEFORE `"...12:00:00Z"` (a `.` sorts
+    // before nothing at a shared prefix) despite being chronologically
+    // LATER by half a second — so a naive string comparison would pick the
+    // WRONG host as "oldest" here. Date-parsed comparison must get this
+    // right in both directions (fractional-first-in-the-array and
+    // whole-second-first).
+    @Test func mixedPrecisionTimestampsCompareByActualDateNotLexicographicStringOrder() {
+        let wholeSecond = "2026-08-20T12:00:00Z"
+        let fractionalHalfSecondLater = "2026-08-20T12:00:00.500000Z"
+
+        let a = DashboardStore.merge([
+            Self.response(hostID: "whole", capturedAt: wholeSecond),
+            Self.response(hostID: "fractional", capturedAt: fractionalHalfSecondLater),
+        ])
+        #expect(a.capturedAt == wholeSecond, "the whole-second timestamp is chronologically OLDER despite sorting lexicographically after the fractional one")
+
+        // Same pair, reversed input order — the result must not depend on
+        // which one happened to be merged first.
+        let b = DashboardStore.merge([
+            Self.response(hostID: "fractional", capturedAt: fractionalHalfSecondLater),
+            Self.response(hostID: "whole", capturedAt: wholeSecond),
+        ])
+        #expect(b.capturedAt == wholeSecond)
+
+        // Same regression for `fleet.inventoryCapturedAt`, which shares the
+        // `oldest(_:_:)` helper.
+        let c = DashboardStore.merge([
+            Self.response(fleet: APIFleetCounts(
+                repos: nil, providersConfigured: nil, providersUnhealthy: nil, autoflowsEnabled: nil, autoflowsDisabled: nil,
+                workers: nil, claimsActive: nil, issuesPending: nil, issuesOpen: nil, issuesCapped: false,
+                inventoryCapturedAt: fractionalHalfSecondLater
+            )),
+            Self.response(fleet: APIFleetCounts(
+                repos: nil, providersConfigured: nil, providersUnhealthy: nil, autoflowsEnabled: nil, autoflowsDisabled: nil,
+                workers: nil, claimsActive: nil, issuesPending: nil, issuesOpen: nil, issuesCapped: false,
+                inventoryCapturedAt: wholeSecond
+            )),
+        ])
+        #expect(c.fleet.inventoryCapturedAt == wholeSecond)
+    }
+
     // Terminal/throughput buckets for the SAME `ts` across two hosts must
     // merge into exactly one bucket, summed field by field — the client-side
     // analogue of `local_and_ssh_shaped_terminal_buckets_for_the_same_day_merge_into_one`.
@@ -438,7 +494,7 @@ struct DashboardStoreTests {
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", capturedAt: "2026-08-20T10:00:00Z", workers: 1))
         }
 
-        await store.activate(range: "7d")
+        await store.activate(range: .d7)
 
         // Local truth already showing; the slow remote host hasn't been
         // waited on at all.
@@ -477,7 +533,7 @@ struct DashboardStoreTests {
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", capturedAt: "2026-08-20T10:00:00Z", workers: 1))
         }
 
-        await store.activate(range: "7d")
+        await store.activate(range: .d7)
 
         await expectEventually("the failing remote host's slice resolves") {
             if case .unavailable = store.hostStates.first(where: { $0.id == "mini" })?.state { return true }
@@ -514,7 +570,7 @@ struct DashboardStoreTests {
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", capturedAt: "2026-08-20T10:00:00Z", workers: 1))
         }
 
-        await store.activate(range: "7d")
+        await store.activate(range: .d7)
 
         await expectEventually("kuki's slice resolves to offline") {
             store.hostStates.first(where: { $0.id == "kuki" })?.state == .offline
@@ -543,7 +599,7 @@ struct DashboardStoreTests {
             return (500, Data(#"{"error":"boom"}"#.utf8))
         }
 
-        await store.activate(range: "7d")
+        await store.activate(range: .d7)
 
         await expectEventually("both hosts resolve and pageError lands") {
             store.pageError != nil
@@ -581,10 +637,10 @@ struct DashboardStoreTests {
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", workers: 1))
         }
 
-        await store.activate(range: "7d") // fires mini's slow 7d fetch in the background
+        await store.activate(range: .d7) // fires mini's slow 7d fetch in the background
         #expect(store.merged?.fleet.workers == 1) // local only, so far
 
-        await store.setRange("30d") // bumps generation; local(30d) lands, returns once it does
+        await store.setRange(.d30) // bumps generation; local(30d) lands, returns once it does
         #expect(store.merged?.fleet.workers == 1, "still local-only immediately after setRange returns")
 
         await expectEventually("mini's 30d fetch merges in") {
@@ -614,7 +670,7 @@ struct DashboardStoreTests {
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", workers: 1))
         }
 
-        await store.activate(range: "7d")
+        await store.activate(range: .d7)
         #expect(store.reconcileTask != nil)
 
         store.deactivate()
@@ -641,7 +697,7 @@ struct DashboardStoreTests {
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", workers: 1))
         }
 
-        await store.activate(range: "7d")
+        await store.activate(range: .d7)
         await expectEventually("mini's first fetch lands") { store.merged?.fleet.workers == 6 }
         let localHitsAfterActivate = DashboardStubURLProtocol.hits("/api/dashboard")
 
@@ -659,6 +715,123 @@ struct DashboardStoreTests {
         // Settle further and confirm it never overshoots to a second hit.
         try? await Task.sleep(for: .milliseconds(100))
         #expect(DashboardStubURLProtocol.hits("/api/dashboard") == localHitsAfterActivate + 1)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (h) Review fix (round 1, minor): a host already `.ok` from a prior
+    // cycle must stay `.ok` (showing its LAST-known-good data) through a
+    // subsequent full refetch cycle — never flash back to `.loading` — and
+    // only actually change once that new cycle's own fetch for it lands.
+    // `setRange(_:)` (same range) drives the identical `refetchAll()` engine
+    // the 60s reconcile loop uses, so it stands in for "a reconcile tick
+    // fires" without needing to wait out a real interval.
+    @MainActor @Test func existingOkSliceStaysOkThroughARefetchCycleUntilItsNewResultLands() async {
+        let miniHits = HitCounter()
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("local", "online"), ("mini", "online")]))
+            }
+            guard url.path == "/api/dashboard" else { return (200, Data("{}".utf8)) }
+            let hostID = Self.queryValue("host", in: req) ?? ""
+            if hostID == "mini" {
+                let hit = miniHits.incrementAndGet()
+                if hit == 1 {
+                    return (200, Self.dashboardJSON(hostID: "mini", state: "ok", capturedAt: "2026-08-20T09:00:00Z", workers: 5))
+                }
+                // The second cycle's own fetch for mini: artificially slow,
+                // so the test can observe the slice mid-cycle before it
+                // lands.
+                Thread.sleep(forTimeInterval: 0.08)
+                return (200, Self.dashboardJSON(hostID: "mini", state: "ok", capturedAt: "2026-08-20T09:05:00Z", workers: 9))
+            }
+            return (200, Self.dashboardJSON(hostID: "local", state: "ok", workers: 1))
+        }
+
+        await store.activate(range: .d7)
+        await expectEventually("mini's first fetch lands") { store.merged?.fleet.workers == 6 }
+        guard case .ok(let firstCapturedAt) = store.hostStates.first(where: { $0.id == "mini" })?.state else {
+            Issue.record("expected mini to be .ok after the first cycle")
+            return
+        }
+        #expect(firstCapturedAt == "2026-08-20T09:00:00Z")
+
+        // A second full cycle — the same engine the 60s reconcile loop
+        // drives — fired but not yet awaited, so the test can inspect
+        // mid-flight state before mini's own (slow) refetch resolves.
+        let refetchTask = Task { await store.setRange(.d7) }
+
+        // Let the cycle actually start (host discovery + local's instant
+        // refetch) without waiting anywhere near mini's 80ms artificial
+        // delay.
+        try? await Task.sleep(for: .milliseconds(20))
+        guard case .ok(let midCycleCapturedAt) = store.hostStates.first(where: { $0.id == "mini" })?.state else {
+            Issue.record("mini's slice must stay .ok mid-cycle, got \(String(describing: store.hostStates.first(where: { $0.id == "mini" })?.state))")
+            return
+        }
+        #expect(midCycleCapturedAt == "2026-08-20T09:00:00Z", "must still show the FIRST cycle's data — never flash to .loading — until the new fetch actually lands")
+
+        // `setRange(_:)` itself already returned once LOCAL's (fast) refetch
+        // landed — mini's own fetch runs on independently, same
+        // local-first/remote-progressive shape `activate(range:)` uses — so
+        // wait for mini's slice specifically, not for `refetchTask` (which
+        // may already be done).
+        await expectEventually("mini's second cycle fetch lands") {
+            store.merged?.fleet.workers == 10
+        }
+        await refetchTask.value
+
+        guard case .ok(let secondCapturedAt) = store.hostStates.first(where: { $0.id == "mini" })?.state else {
+            Issue.record("expected mini to be .ok after the second cycle landed")
+            return
+        }
+        #expect(secondCapturedAt == "2026-08-20T09:05:00Z", "the new fetch's result must land once it resolves")
+        #expect(store.merged?.fleet.workers == 10, "1 (local) + 9 (mini's fresh value)")
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (i) Review fix (round 1, minor): calling `activate(range:)` a second
+    // time must CANCEL the first reconcile loop rather than run a second
+    // one alongside it — otherwise a screen re-appearing (calling
+    // `activate()` more than once) would silently accumulate duplicate
+    // background loops, each independently re-fetching the whole fleet on
+    // its own cadence. Proven via the reconcile loop's actual tick RATE
+    // over a short, overridden interval (not the loop's literal production
+    // timing, which stays untested per the type's doc comment) — a
+    // duplicated, never-cancelled first loop would roughly DOUBLE the
+    // `/api/hosts` hit rate during the observation window.
+    @MainActor @Test func activateTwiceReplacesTheReconcileLoopRatherThanRunningItTwice() async {
+        let intervalMS = 25
+        let (store, box) = makeStore(reconcileInterval: .milliseconds(intervalMS)) { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("local", "online")]))
+            }
+            return (200, Self.dashboardJSON(hostID: "local", state: "ok", workers: 1))
+        }
+
+        await store.activate(range: .d7)
+        #expect(store.reconcileTask != nil)
+
+        await store.activate(range: .d7) // must replace, not add, a second concurrent loop
+        #expect(store.reconcileTask != nil)
+
+        let hitsBefore = DashboardStubURLProtocol.hits("/api/hosts")
+        let windowMS = 260 // ~10.4 intervals at 25ms for a single surviving loop
+        try? await Task.sleep(for: .milliseconds(windowMS))
+        let hits = DashboardStubURLProtocol.hits("/api/hosts") - hitsBefore
+
+        #expect(hits >= 1, "the surviving loop must still be ticking")
+        // A single loop fires ~windowMS/intervalMS times over the window; a
+        // duplicated, uncancelled first loop would fire roughly TWICE that.
+        // 14 sits well above the single-loop expectation (~10-11, allowing
+        // for scheduler jitter) and well below the ~20+ a real duplicate
+        // would produce.
+        #expect(hits <= 14, "hit rate (\(hits) hits in \(windowMS)ms at a \(intervalMS)ms interval) suggests a duplicated, uncancelled first reconcile loop")
 
         store.deactivate()
         box.latest.finish()
