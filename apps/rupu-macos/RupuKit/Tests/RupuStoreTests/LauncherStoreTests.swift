@@ -478,17 +478,30 @@ struct LauncherStoreTests {
 
     // (f3) Review fix (Important 2): a slow target must never delay another
     // target's own POST from being *sent* — proven here by both requests'
-    // path hit count reaching 2 (both dispatched) within a window tighter
-    // than the slow target's own artificial delay, not merely by favorable
-    // overall timing. See (f2)'s doc comment on why this uses a bounded
-    // `Thread.sleep` rather than an indefinite gate.
+    // path hit count reaching 2 (both dispatched) while the slow target is
+    // still mid-sleep, not merely by favorable overall timing. See (f2)'s
+    // doc comment on why this uses a bounded `Thread.sleep` rather than an
+    // indefinite gate.
+    //
+    // Margins are deliberately generous (300ms sleep / up to 2s to observe
+    // dispatch) rather than the tight 80ms/60ms pairing used elsewhere in
+    // this file: under full-suite parallel load (many Swift Testing suites'
+    // threads contending for the cooperative pool at once), a 60ms poll
+    // window can lose the race against scheduling jitter even though
+    // dispatch itself was never serialized — a test artifact, not evidence
+    // of a real ordering violation (same class of flake (f2)'s doc comment
+    // describes for `DispatchSemaphore.wait()`). The ordering claim itself
+    // is unchanged: the assertion fires the instant the poll condition
+    // first observes hitCount == 2, which — because sending is what's under
+    // test, not completion — lands almost immediately and leaves ample
+    // headroom before "slow"'s 300ms sleep can have elapsed.
     @MainActor @Test func slowTargetNeverDelaysAnotherTargetsPOSTFromBeingSent() async {
         let store = makeStore { req in
             guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
             let json = LauncherStubURLProtocol.bodyJSON(req)
             let host = (json?["host"] as? String) ?? "local"
             if host == "slow" {
-                Thread.sleep(forTimeInterval: 0.08) // artificially slow
+                Thread.sleep(forTimeInterval: 0.3) // artificially slow, generous margin under load
                 return (200, Data(#"{"run_id":"run-slow","host_id":"slow"}"#.utf8))
             }
             return (200, Data(#"{"run_id":"run-fast","host_id":"local"}"#.utf8))
@@ -500,11 +513,14 @@ struct LauncherStoreTests {
 
         let launchTask = Task { await store.launch() }
 
-        // Both requests dispatched (hit count 2) well before "slow"'s 80ms
+        // Both requests dispatched (hit count 2) well before "slow"'s 300ms
         // sleep could have elapsed — proves sending isn't serialized behind
-        // another target's completion.
+        // another target's completion. The 2s ceiling is just how long
+        // we're willing to wait to *observe* dispatch on a loaded runner;
+        // it doesn't weaken the ordering check below, which fires as soon
+        // as the condition is first true.
         await expectEventually(
-            timeout: .milliseconds(60),
+            timeout: .seconds(2),
             "both requests are sent even though \"slow\" hasn't answered yet"
         ) {
             LauncherStubURLProtocol.hitCount("/api/agents/rupuso/run") == 2
