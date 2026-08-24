@@ -3,15 +3,20 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// The Session Detail screen (Task 9, write path added Task 6 of Phase 3):
-/// header (back chevron, breadcrumb, archive/restore overflow), a metadata
-/// facts row, the session's ordered runs (each row navigates to that run's
-/// own `RunDetailScreen`), a transcript feed for whichever run is currently
-/// focused — the newest run by default, per `SessionDetailStore.
-/// activate()` — and a send box pinned under it. Owns a `SessionDetailStore`
-/// lifecycle the same way `RunDetailScreen` owns a `RunDetailStore` — built
-/// lazily on first appearance (once `backend.client()` exists), rebuilt
-/// whenever `sessionID` changes.
+/// The Session Detail screen (Task 9, write path added Task 6 of Phase 3;
+/// recomposed to a single vertical stack in flows-composition Task 6,
+/// mirroring `RunDetailScreen`'s Task 4 recomposition): header (back
+/// chevron, breadcrumb, archive/restore overflow) + a mono identity meta
+/// line, the session's ordered runs as a full-width stacked panel section
+/// (each row navigates to that run's own `AgentRunDetailScreen`), then a
+/// transcript feed for whichever run is currently focused — the newest run
+/// by default, per `SessionDetailStore.activate()` — with a send box pinned
+/// under it. The old fixed-width `runsColumn` (280pt beside the transcript
+/// in an `HStack`) is gone; runs now sit above the transcript, full width,
+/// same as the graph-then-tabs stack `RunDetailScreen.content` uses. Owns a
+/// `SessionDetailStore` lifecycle the same way `RunDetailScreen` owns a
+/// `RunDetailStore` — built lazily on first appearance (once
+/// `backend.client()` exists), rebuilt whenever `sessionID` changes.
 ///
 /// **Write path (Phase 3, Task 6)**: `sendBox` renders one of three states —
 /// the normal TextField+Send box, `"SESSION STOPPED"` (`store.isStopped`),
@@ -76,17 +81,13 @@ public struct SessionDetailScreen: View {
     private func content(store: SessionDetailStore) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             header(store: store)
-            HStack(alignment: .top, spacing: 12) {
-                runsColumn(store: store)
-                    .frame(width: Self.runsColumnWidth)
-                transcriptColumn(store: store)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            runsSection(store: store)
+                .frame(height: 160)
+            transcriptColumn(store: store)
+                .frame(minHeight: 420)
         }
         .padding(16)
     }
-
-    private static let runsColumnWidth: CGFloat = 280
 
     // MARK: - Header
 
@@ -125,21 +126,31 @@ public struct SessionDetailScreen: View {
             case .empty:
                 EmptyView()
             case .content(let session):
-                factsRow(session: session)
+                identityMetaLine(session: session)
             }
         }
     }
 
-    private func factsRow(session: APISessionRow) -> some View {
-        HStack(spacing: 20) {
-            factItem("AGENT", session.agentName)
-            factItem("MODEL", session.model)
-            factItem("PROVIDER", session.providerName)
-            factItem("TURNS", Fmt.count(Int(session.totalTurns)))
-            factItem("TOKENS", Fmt.count(Int(session.totalTokensIn + session.totalTokensOut)))
-            factItem("COST", Fmt.cost(session.usage?.costUSD))
-            Spacer(minLength: 0)
-        }
+    /// Flows-composition Task 6: the old per-item `factsRow` (an `Eyebrow`
+    /// label beside a value, one `HStack` entry per field) is now a single
+    /// mono meta line — `AGENT · MODEL · PROVIDER · TURNS · TOKENS · COST`
+    /// — same idiom `RunDetailScreen.identityMetaLine` uses for its run/
+    /// workspace/permission-mode line: one `Text`, `dataMono(10)`,
+    /// `rupuDim`, single-line and truncating rather than wrapping or
+    /// overflowing a fixed-width column now that this header is full width.
+    private func identityMetaLine(session: APISessionRow) -> some View {
+        Text([
+            "AGENT \(session.agentName)",
+            "MODEL \(session.model)",
+            "PROVIDER \(session.providerName)",
+            "TURNS \(Fmt.count(Int(session.totalTurns)))",
+            "TOKENS \(Fmt.count(Int(session.totalTokensIn + session.totalTokensOut)))",
+            "COST \(Fmt.cost(session.usage?.costUSD))",
+        ].joined(separator: "  ·  "))
+            .font(.dataMono(10))
+            .foregroundStyle(Color.rupuDim)
+            .lineLimit(1)
+            .truncationMode(.tail)
     }
 
     // MARK: - Header mutations (Phase 3, Task 6)
@@ -205,30 +216,17 @@ public struct SessionDetailScreen: View {
                         Button("Retry") {
                             Task { await failure.retry() }
                         }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Color.rupuBrand700)
-                        .font(.noteText.weight(.semibold))
+                        .buttonStyle(RupuButtonStyle.outline)
                     }
                 }
             }
         }
     }
 
-    private func factItem(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 6) {
-            Eyebrow(label)
-            Text(value)
-                .font(.dataMono(11.5))
-                .foregroundStyle(Color.rupuInk)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-    }
-
-    // MARK: - Runs column
+    // MARK: - Runs section
 
     @ViewBuilder
-    private func runsColumn(store: SessionDetailStore) -> some View {
+    private func runsSection(store: SessionDetailStore) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Eyebrow("Runs")
             switch store.runs {
@@ -373,6 +371,13 @@ public struct SessionDetailScreen: View {
     /// so a failed attempt just shows its message inline and leaves `draft`
     /// exactly as the operator left it, ready to edit and resend. `draft`
     /// only clears once the key actually reads `.confirmed`.
+    ///
+    /// Chrome (flows-composition Task 6): the field itself — not the whole
+    /// row — carries the `rupuSurface`/1px-`rupuBorder`/radius-7 input
+    /// chrome, distinct from the `rupuPanel` the transcript/runs panels
+    /// above sit on; the Send button stands beside it, not inside a shared
+    /// card, so its `RupuButtonStyle.primary` chrome reads as its own
+    /// control.
     private func sendInputBox(store: SessionDetailStore) -> some View {
         let key = ActionKey(sessionID, .send)
         let state = store.pendingActions.state(key)
@@ -383,9 +388,14 @@ public struct SessionDetailScreen: View {
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Send a message…", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
+                    .font(.uiText)
                     .lineLimit(1...4)
                     .disabled(pending)
                     .onSubmit { submitDraft(store: store) }
+                    .padding(8)
+                    .background(Color.rupuSurface)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.rupuBorder, lineWidth: 1))
                 Button {
                     submitDraft(store: store)
                 } label: {
@@ -399,8 +409,6 @@ public struct SessionDetailScreen: View {
                 .buttonStyle(RupuButtonStyle.primary)
                 .disabled(pending || trimmedEmpty)
             }
-            .padding(10)
-            .panelStyle(.panel)
 
             if case .failed(let message) = state {
                 Text(message)

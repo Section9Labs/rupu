@@ -12,6 +12,10 @@ import RupuDesign
 /// comment) — this view never awaits that itself, it just fires the `Task`
 /// and lets `store.inputsLoadError`/`workflowInputs` update the form once
 /// it lands.
+///
+/// Chrome-only touch (flows-composition Task 6): the row selection
+/// highlight's corner radius was 5 — off the v2 scale (panel 7 / inner
+/// card 6) — now 6, matching every other nested-row radius in this module.
 struct DefinitionPicker: View {
     @Bindable var store: LauncherStore
 
@@ -111,7 +115,7 @@ struct DefinitionPicker: View {
             .padding(.vertical, 7)
             .frame(maxWidth: .infinity)
             .background(isSelected ? Color.rupuBrand.opacity(0.12) : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
     }
