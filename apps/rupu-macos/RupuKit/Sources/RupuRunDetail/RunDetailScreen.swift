@@ -177,7 +177,7 @@ public struct RunDetailScreen: View {
                             .disabled(isPending(store.pendingActions.state(ActionKey(runID, .restore))))
                     }
                 } label: {
-                    Icon(.archive)
+                    Icon(.moreHorizontal)
                         .foregroundStyle(Color.rupuDim)
                 }
                 .menuStyle(.borderlessButton)

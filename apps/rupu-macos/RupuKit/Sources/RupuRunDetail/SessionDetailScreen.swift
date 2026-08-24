@@ -159,7 +159,7 @@ public struct SessionDetailScreen: View {
                     .disabled(isPending(store.pendingActions.state(ActionKey(sessionID, .archive))))
             }
         } label: {
-            Icon(.archive)
+            Icon(.moreHorizontal)
                 .foregroundStyle(Color.rupuDim)
         }
         .menuStyle(.borderlessButton)
