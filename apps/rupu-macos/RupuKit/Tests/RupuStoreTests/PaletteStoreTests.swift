@@ -13,7 +13,7 @@ struct PaletteRankTests {
 
     @Test func titlePrefixOutranksWordBoundaryOutranksSubsequence() {
         let items = [
-            item("a", "quarterly review agent"), // subsequence only ("qr" -> q...r skips)
+            item("a", "quarterly review agent"), // drops entirely — no "night" subsequence in order
             item("b", "review nightly"), // word-boundary: second word starts with "night"? no—"nightly" starts query
             item("c", "nightly health check"), // title prefix
         ]
@@ -153,6 +153,17 @@ private final class NavLog: @unchecked Sendable {
     private var entries: [Route] = []
     func record(_ route: Route) { lock.withLock { entries.append(route) } }
     var snapshot: [Route] { lock.withLock { entries } }
+}
+
+/// Thread-safe call counter — same rationale as `ActivityStoreTests.Counter`
+/// (a plain captured `var` can't cross into the `@Sendable` handler closure
+/// under Swift 6 strict concurrency). Used by the overlapping-`open()` test
+/// below to tell the stub's first `/api/runs` hit (the stale, artificially
+/// slow call) from its second (the fresh, fast one).
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0
+    func next() -> Int { lock.withLock { v += 1; return v } }
 }
 
 @Suite(.serialized)
@@ -344,5 +355,66 @@ struct PaletteStoreTests {
         #expect(!store.isOpen)
         #expect(store.query == "")
         #expect(store.activeIndex == 0)
+    }
+
+    // (i) Fix round 1, finding 1: an overlapping second `open()` (fired
+    // while the first call's `/api/runs` fetch is still artificially slow)
+    // must not let the first, now-stale call's later-arriving result
+    // clobber the second, fresher call's already-applied `items` —
+    // `openGeneration`'s guard, mirroring `ActivityStore.remoteGeneration`/
+    // `RunDetailStore.focusGeneration`.
+    @MainActor @Test func overlappingOpenCallsOnlyApplyTheFresherResults() async {
+        let runsHitCount = Counter()
+        let store = makeStore { req in
+            guard req.url?.path == "/api/runs" else { return (200, Data("[]".utf8)) }
+            if runsHitCount.next() == 1 {
+                Thread.sleep(forTimeInterval: 0.08) // the older, slower call
+                return (200, Data("[\(Self.runListRowJSON(id: "run-stale", status: "running"))]".utf8))
+            }
+            return (200, Data("[\(Self.runListRowJSON(id: "run-fresh", status: "running"))]".utf8))
+        }
+
+        let staleTask = Task { await store.open() }
+        // Give the stale call's request time to actually fire (and enter
+        // its artificial 80ms sleep) before the fresher call starts — same
+        // "give the first async hop a moment to land" pattern
+        // `activateRendersLocalImmediatelyThenMergesSlowOnlineRemoteHostProgressively`
+        // uses in `ActivityStoreTests`.
+        try? await Task.sleep(for: .milliseconds(20))
+        await store.open() // the fresher, later-triggered call — completes fast
+
+        #expect(store.items.contains { $0.id == "run:run-fresh" })
+        #expect(!store.items.contains { $0.id == "run:run-stale" })
+
+        await staleTask.value // let the stale call's slow fetch finish too
+
+        // The stale call's late-arriving completion must still not have
+        // clobbered the fresh results already standing.
+        #expect(store.items.contains { $0.id == "run:run-fresh" })
+        #expect(!store.items.contains { $0.id == "run:run-stale" })
+    }
+
+    // (j) Fix round 1, finding 2: two rapid `execute()` calls on the same
+    // `.approveGate` item (e.g. a double-tap Return) must only ever POST
+    // approve once — `isApprovingGate`'s guard, mirroring
+    // `ActivityTable`'s per-row `isBusy` double-tap guard.
+    @MainActor @Test func executeApproveItemGuardsAgainstDoubleFire() async {
+        let store = makeStore { req in
+            switch (req.httpMethod, req.url?.path) {
+            case ("GET", "/api/runs/run-1"):
+                return (200, Self.runDetailJSON(id: "run-1", status: "awaiting_approval", awaiting: "[\(Self.awaitingGateJSON(stepID: "gate-1"))]"))
+            case ("POST", "/api/runs/run-1/approve"):
+                return (200, Data(#"{"ok":true}"#.utf8))
+            default:
+                return (500, Data("{}".utf8))
+            }
+        }
+        let item = PaletteItem(id: "approve:run-1", kind: .approve, title: "Approve: nightly-health", subtitle: "local", action: .approveGate(runID: "run-1", host: "local"))
+
+        async let first: Void = store.execute(item)
+        async let second: Void = store.execute(item)
+        _ = await (first, second)
+
+        #expect(PaletteStubURLProtocol.requestCount(forPath: "/api/runs/run-1/approve") == 1)
     }
 }
