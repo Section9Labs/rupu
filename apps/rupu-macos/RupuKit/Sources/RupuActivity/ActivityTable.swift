@@ -34,13 +34,25 @@ struct ActivityTable: View {
     let backend: BackendController
     let onSelect: (ActivityRow) -> Void
 
+    /// View-local sort state (Phase 3, Task 5) — applied over `rows` (which
+    /// is `store.rows`) in the body below, so a live-tail patch that
+    /// mutates `store.rows` re-sorts on the next render with no separate
+    /// trigger needed. Defaults to today's merge-time order
+    /// (`ActivityStore.isOrderedByStartedAtDescending`, reproduced exactly
+    /// by `sortActivityRows(_:by:)`'s `.started`/descending case).
+    @State private var sort = ActivitySort(key: .started, ascending: false)
+
     private typealias Layout = ActivityTableLayout
+
+    private var sortedRows: [ActivityRow] {
+        sortActivityRows(rows, by: sort)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            List(rows) { row in
+            List(sortedRows) { row in
                 ActivityTableRow(row: row, store: store, backend: backend, onSelect: onSelect)
                     .listRowBackground(rowBackground(row))
                     .listRowSeparator(.visible)
@@ -58,31 +70,74 @@ struct ActivityTable: View {
 
     private var header: some View {
         HStack(spacing: 0) {
-            headerCell("Status", width: Layout.status)
-            headerCell("Kind", width: Layout.kind)
-            headerCell("Subject", width: nil)
-            headerCell("Project", width: Layout.project)
-            headerCell("Host", width: Layout.host)
-            headerCell("Trigger", width: Layout.trigger)
-            headerCell("Dur", width: Layout.duration, alignment: .trailing)
-            headerCell("Cost", width: Layout.cost, alignment: .trailing)
-            headerCell("Started", width: Layout.started, alignment: .trailing)
+            headerCell("Status", width: Layout.status, key: .status)
+            headerCell("Kind", width: Layout.kind, key: .kind)
+            headerCell("Subject", width: nil, key: .subject)
+            headerCell("Project", width: Layout.project, key: .project)
+            headerCell("Host", width: Layout.host, key: .host)
+            headerCell("Trigger", width: Layout.trigger, key: .trigger)
+            headerCell("Dur", width: Layout.duration, alignment: .trailing, key: .duration)
+            headerCell("Cost", width: Layout.cost, alignment: .trailing, key: .cost)
+            headerCell("Started", width: Layout.started, alignment: .trailing, key: .started)
             headerCell("", width: Layout.actions, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
     }
 
+    /// A header cell, plain (`key == nil`, e.g. the actions column's blank
+    /// header) or sortable — tapping a sortable header makes it the active
+    /// sort key (first tap uses `key.defaultAscending`) or, if it's already
+    /// the active key, flips direction.
     @ViewBuilder
-    private func headerCell(_ title: String, width: CGFloat?, alignment: Alignment = .leading) -> some View {
+    private func headerCell(_ title: String, width: CGFloat?, alignment: Alignment = .leading, key: ActivitySort.Key? = nil) -> some View {
         if let width {
-            Eyebrow(title)
+            headerCellContent(title, alignment: alignment, key: key)
                 .frame(width: width, alignment: alignment)
                 .padding(.trailing, 8)
         } else {
-            Eyebrow(title)
+            headerCellContent(title, alignment: alignment, key: key)
                 .frame(maxWidth: .infinity, alignment: alignment)
                 .padding(.trailing, 8)
+        }
+    }
+
+    @ViewBuilder
+    private func headerCellContent(_ title: String, alignment: Alignment, key: ActivitySort.Key?) -> some View {
+        if let key {
+            Button {
+                toggleSort(key)
+            } label: {
+                HStack(spacing: 4) {
+                    if alignment == .trailing {
+                        sortIndicator(for: key)
+                        Eyebrow(title)
+                    } else {
+                        Eyebrow(title)
+                        sortIndicator(for: key)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+        } else {
+            Eyebrow(title)
+        }
+    }
+
+    /// The active header's direction chevron — space is always reserved
+    /// (an invisible chevron on every other sortable header) so toggling
+    /// the active column never jiggles the header row's layout.
+    private func sortIndicator(for key: ActivitySort.Key) -> some View {
+        Icon(sort.key == key && !sort.ascending ? .chevronDown : .chevronUp, size: 9)
+            .foregroundStyle(Color.rupuDim)
+            .opacity(sort.key == key ? 1 : 0)
+    }
+
+    private func toggleSort(_ key: ActivitySort.Key) {
+        if sort.key == key {
+            sort.ascending.toggle()
+        } else {
+            sort = ActivitySort(key: key, ascending: key.defaultAscending)
         }
     }
 }
@@ -128,6 +183,7 @@ private struct ActivityTableRow: View {
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.trailing, 8)
+                .help(row.subject)
             Text(row.project ?? "—")
                 .foregroundStyle(Color.rupuDim)
                 .lineLimit(1)
@@ -161,7 +217,7 @@ private struct ActivityTableRow: View {
                 .frame(width: Layout.actions, alignment: .trailing)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.vertical, 8)
         .contentShape(Rectangle())
         .onTapGesture {
             guard isClickable else { return }
