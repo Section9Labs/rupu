@@ -10,6 +10,20 @@ import RupuDesign
 /// (once `backend.client()` is available), `activate(kind:)`d on every kind
 /// change via `.task(id:)`, `deactivate()`d `.onDisappear` — matching the
 /// symmetric restart pair `ActivityStore` documents itself as needing.
+///
+/// Flows-composition Task 2: the top bar's `AppModel.scopeWsID` reaches
+/// `ActivityStore.scopeFilter` the same way `kind` reaches
+/// `activate(kind:)` — this screen is the single site that already owns
+/// both "read from `model`" and "drive the store", so it owns this
+/// relationship too rather than splitting it into `RootView` (which has no
+/// reason to know about `ActivityStore` at all) or `ShellToolbar` (which
+/// has no reference to the store — it only ever touches `model`). Unlike
+/// `kind`, `scopeFilter` needs no `.task(id:)`/async `activate` — it's a
+/// synchronous, no-refetch narrowing (see `ActivityStore.scopeFilter`'s
+/// doc comment) — so a plain `.onChange(of: model.scopeWsID)` is enough to
+/// keep it live; `activate(kind:)` additionally seeds a freshly-built
+/// store with the model's *current* value, since `.onChange` only fires on
+/// a change from here on, not on first appearance.
 public struct ActivityScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
@@ -59,6 +73,9 @@ public struct ActivityScreen: View {
         .background(Color.rupuBg)
         .task(id: kind) {
             await activate(kind: kind)
+        }
+        .onChange(of: model.scopeWsID) { _, newScope in
+            store?.scopeFilter = newScope
         }
         .onDisappear {
             store?.deactivate()
@@ -141,6 +158,13 @@ public struct ActivityScreen: View {
                 signalsFactory: Self.makeSignalsFactory(backend: backend),
                 pendingActions: backend.pendingActions
             )
+            // Seed the store's scope with whatever the top bar's picker
+            // already has selected (e.g. this is a relaunch that restored
+            // a persisted `scopeWsID`) — `.onChange(of: model.scopeWsID)`
+            // below only fires on a *change*, so a store built after the
+            // picker already has a non-nil selection needs this initial
+            // sync too.
+            newStore.scopeFilter = model.scopeWsID
             store = newStore
             activeStore = newStore
         }
