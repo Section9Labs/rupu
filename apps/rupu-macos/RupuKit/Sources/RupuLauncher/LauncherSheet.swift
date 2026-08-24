@@ -16,6 +16,16 @@ import RupuDesign
 /// exists, one instance per sheet presentation (never reused across
 /// re-opens — see `LauncherStore`'s doc comment on why that reset is
 /// deliberate).
+///
+/// **Width ruling (flows-composition Task 6, CONTROLLER RULING):** the
+/// content card holds at 560pt, wider than web's `max-w-md` (448px). A
+/// native macOS sheet doesn't reflow around a narrower dialog the way a
+/// browser viewport does, and 448pt starts crowding the definition list's
+/// name + model/scope badges and the host chip row — 560pt is chosen for
+/// input comfort on this platform, not for pixel parity with the web
+/// dialog's chrome (which the card styling below otherwise mirrors: a
+/// `Color.rupuPanel` surface, 1px `rupuBorder`, radius 7 — the native sheet
+/// itself still supplies the modal scrim).
 public struct LauncherSheet: View {
     @Bindable var model: AppModel
     let backend: BackendController
@@ -70,6 +80,13 @@ public struct LauncherSheet: View {
 /// hold a non-optional `@Bindable var store` (mirrors `ActivityScreen` /
 /// `FilterBar`'s split: the screen owns the optional, the content view
 /// underneath declares the unwrapped `@Bindable`).
+///
+/// **Chrome (flows-composition Task 6):** the whole scroll area is the web
+/// dialog's content card — `panelStyle(.panel)` gives it `Color.rupuPanel`,
+/// a 1px `rupuBorder`, radius 7 — and every field group header
+/// (`Kind`/`Prompt`/`Inputs`/`Mode`/`Results`) is an `Eyebrow`, matching
+/// `LauncherSheet.tsx`/`AgentLauncherSheet.tsx`'s uppercase-tracked field
+/// legends.
 private struct LauncherForm: View {
     @Bindable var model: AppModel
     @Bindable var store: LauncherStore
@@ -89,6 +106,7 @@ private struct LauncherForm: View {
             .padding(20)
         }
         .frame(width: 560, height: 600)
+        .panelStyle(.panel)
     }
 
     private var header: some View {
@@ -98,21 +116,24 @@ private struct LauncherForm: View {
     }
 
     private var kindPicker: some View {
-        Picker("Kind", selection: $store.kind) {
-            Text("Agent run").tag(LaunchKind.agentRun)
-            Text("Session").tag(LaunchKind.session)
-            Text("Workflow").tag(LaunchKind.workflow)
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .onChange(of: store.kind) { _, _ in
-            // A different kind means a different definition namespace
-            // (agents vs workflows) — the prior selection can never be
-            // valid for the new kind, so it's cleared rather than left
-            // dangling. `canLaunch` requiring a non-nil
-            // `selectedDefinition` means Launch stays disabled until the
-            // operator picks one from the now-current list.
-            store.selectedDefinition = nil
+        VStack(alignment: .leading, spacing: 6) {
+            Eyebrow("Kind")
+            Picker("Kind", selection: $store.kind) {
+                Text("Agent run").tag(LaunchKind.agentRun)
+                Text("Session").tag(LaunchKind.session)
+                Text("Workflow").tag(LaunchKind.workflow)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .onChange(of: store.kind) { _, _ in
+                // A different kind means a different definition namespace
+                // (agents vs workflows) — the prior selection can never be
+                // valid for the new kind, so it's cleared rather than left
+                // dangling. `canLaunch` requiring a non-nil
+                // `selectedDefinition` means Launch stays disabled until the
+                // operator picks one from the now-current list.
+                store.selectedDefinition = nil
+            }
         }
     }
 
@@ -204,11 +225,32 @@ private struct LauncherForm: View {
                 outcomesList
             }
 
-            HStack {
+            HStack(spacing: 8) {
                 Spacer()
+                cancelButton
                 launchButton
             }
         }
+    }
+
+    /// Chrome parity with the web dialog's footer (`Cancel` + `Launch`,
+    /// `LauncherSheet.tsx` lines ~234-240): the native sheet already allows
+    /// Esc/click-outside dismissal (`interactiveDismissDisabled(false)` at
+    /// the `RootView` call site), but an explicit `RupuButtonStyle.outline`
+    /// control gives the same discoverable escape hatch the web form shows.
+    /// Plain `dismiss()` — no store call, no confirmation needed, since
+    /// closing without launching commits nothing. Disabled while a launch
+    /// is pending, same as web's `disabled={launching}` — this store is
+    /// discarded on the next sheet open (per `LauncherSheet`'s doc comment),
+    /// so dismissing mid-launch would strand the in-flight outcome rows
+    /// nobody will ever see.
+    private var cancelButton: some View {
+        let pending = isPending(store.pendingActions.state(ActionKey("launcher", .launch)))
+        return Button("Cancel") {
+            dismiss()
+        }
+        .buttonStyle(RupuButtonStyle.outline)
+        .disabled(pending)
     }
 
     private var outcomesList: some View {
