@@ -40,7 +40,7 @@ struct FactsCard: View {
             case .failed(let message):
                 FailedRow(message: message)
             case .empty:
-                MicroLabel("NO DATA").foregroundStyle(Color.rupuMute)
+                Text("No data").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let value):
                 VStack(alignment: .leading, spacing: 6) {
                     factRow("Run ID", value.run.id)
@@ -58,10 +58,10 @@ struct FactsCard: View {
 
     private func factRow(_ label: String, _ value: String) -> some View {
         HStack {
-            MicroLabel(label).foregroundStyle(Color.rupuMute)
+            Eyebrow(label)
             Spacer(minLength: 8)
             Text(value)
-                .font(.identifier)
+                .font(.dataMono(11.5))
                 .foregroundStyle(Color.rupuInk)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -71,7 +71,7 @@ struct FactsCard: View {
 
 /// `HostRollup` rows. There is no server-side "unexpected host" flag (see
 /// api-facts.md's netflow section and `APINetflow`'s own doc comment) — a
-/// row renders in `Color.status(.fail)` when `errors > 0`, the only signal
+/// row renders in `Color.status(.failed)` when `errors > 0`, the only signal
 /// available this phase; a true allowlist diff is future work.
 struct NetflowCard: View {
     let netflow: BlockState<APINetflow>
@@ -84,17 +84,18 @@ struct NetflowCard: View {
             case .failed(let message):
                 FailedRow(message: message)
             case .empty:
-                MicroLabel("NO NETWORK CALLS").foregroundStyle(Color.rupuMute)
+                Text("No network calls").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let value):
                 if value.hosts.isEmpty {
-                    MicroLabel("NO NETWORK CALLS").foregroundStyle(Color.rupuMute)
+                    Text("No network calls").font(.noteText).foregroundStyle(Color.rupuMute)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(Array(value.hosts.enumerated()), id: \.offset) { _, host in
                             hostRow(host)
                         }
                         if value.droppedTotal > 0 {
-                            MicroLabel("\(Fmt.count(Int(value.droppedTotal))) DROPPED")
+                            Text("\(Fmt.count(Int(value.droppedTotal))) dropped")
+                                .font(.dataMono(10))
                                 .foregroundStyle(Color.rupuMute)
                         }
                     }
@@ -105,25 +106,28 @@ struct NetflowCard: View {
 
     private func hostRow(_ host: APIHostRollup) -> some View {
         let hasErrors = host.errors > 0
-        let tone: Color = hasErrors ? Color.status(.fail) : Color.rupuInk
+        let tone: Color = hasErrors ? Color.status(.failed) : Color.rupuInk
         return VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text("\(host.host):\(host.port)")
-                    .font(.identifier)
+                    .font(.dataMono(11.5))
                     .foregroundStyle(tone)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 8)
                 if hasErrors {
-                    MicroLabel("\(host.errors) ERR")
-                        .foregroundStyle(Color.status(.fail))
+                    Text("\(host.errors) ERR")
+                        .font(.dataMono(10))
+                        .foregroundStyle(Color.status(.failed))
                 }
             }
             HStack(spacing: 10) {
-                MicroLabel("\(Fmt.count(Int(host.calls))) calls")
+                Text("\(Fmt.count(Int(host.calls))) calls")
+                    .font(.dataMono(10))
                     .foregroundStyle(Color.rupuDim)
                 if let p95 = host.p95MS {
-                    MicroLabel("p95 \(Fmt.duration(ms: p95))")
+                    Text("p95 \(Fmt.duration(ms: p95))")
+                        .font(.dataMono(10))
                         .foregroundStyle(Color.rupuDim)
                 }
             }
@@ -146,10 +150,10 @@ struct FindingsCard: View {
             case .failed(let message):
                 FailedRow(message: message)
             case .empty:
-                MicroLabel("NO FINDINGS").foregroundStyle(Color.rupuMute)
+                Text("No findings").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let value):
                 if value.findings.isEmpty {
-                    MicroLabel("NO FINDINGS").foregroundStyle(Color.rupuMute)
+                    Text("No findings").font(.noteText).foregroundStyle(Color.rupuMute)
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
                         summaryBadges(value.summary)
@@ -176,10 +180,10 @@ struct FindingsCard: View {
     private func badge(_ label: String, _ count: Int, _ severity: Severity) -> some View {
         HStack(spacing: 3) {
             Text(label)
-                .font(.numeral(size: 10))
+                .font(.dataMono(10))
                 .foregroundStyle(Color.severity(severity))
             Text("\(count)")
-                .font(.numeral(size: 10))
+                .font(.dataMono(10))
                 .foregroundStyle(Color.rupuDim)
         }
         .opacity(count == 0 ? 0.35 : 1)
@@ -196,7 +200,8 @@ struct FindingsCard: View {
                     .foregroundStyle(Color.rupuInk)
                     .lineLimit(2)
                 if let filePath = finding.filePath {
-                    MicroLabel(fileLabel(filePath, finding.lineRange))
+                    Text(fileLabel(filePath, finding.lineRange))
+                        .font(.dataMono(10))
                         .foregroundStyle(Color.rupuMute)
                 }
             }
@@ -214,15 +219,14 @@ struct FindingsCard: View {
     }
 }
 
-/// Shared card chrome: `MicroLabel` title over `.innerCard`-styled content.
+/// Shared card chrome: `Eyebrow` title over `.innerCard`-styled content.
 private struct CardShell<Content: View>: View {
     let title: String
     @ViewBuilder let content: () -> Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            MicroLabel(title)
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow(title)
             content()
         }
         .padding(12)
@@ -236,8 +240,9 @@ private struct FailedRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            MicroLabel("FAILED TO LOAD")
-                .foregroundStyle(Color.status(.fail))
+            Text("Failed to load")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
             Text(message)
                 .font(.system(size: 10.5))
                 .foregroundStyle(Color.rupuDim)

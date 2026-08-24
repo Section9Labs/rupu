@@ -128,21 +128,3 @@ private let severityBgRGB: [Severity: (light: (Int, Int, Int), dark: (Int, Int, 
                       name: "severityBg(.\(severity))")
     }
 }
-
-/// The deprecated `RunTone` shim (Task 5 deletes both it and this test) must still resolve to
-/// the same colors as the `StatusTone` it maps onto — a regression guard while call sites migrate.
-@available(*, deprecated, message: "exercises the deprecated RunTone shim intentionally")
-@Test func deprecatedRunToneShimMapsToStatusTone() {
-    let table: [(RunTone, StatusTone)] = [
-        (.run, .running),
-        (.done, .done),
-        (.fail, .failed),
-        (.waiting, .awaiting),
-        (.pause, .paused),
-    ]
-    for (legacy, modern) in table {
-        let expected = statusRGB[modern]!
-        expectMatches(Color.status(legacy), light: expected.light, dark: expected.dark,
-                      name: "status(RunTone.\(legacy))")
-    }
-}

@@ -53,7 +53,7 @@ struct ActivityTable: View {
     }
 
     private func rowBackground(_ row: ActivityRow) -> Color {
-        row.status == .awaiting ? Color.status(.waiting).opacity(0.04) : .clear
+        row.status == .awaiting ? Color.status(.awaiting).opacity(0.04) : .clear
     }
 
     private var header: some View {
@@ -76,13 +76,11 @@ struct ActivityTable: View {
     @ViewBuilder
     private func headerCell(_ title: String, width: CGFloat?, alignment: Alignment = .leading) -> some View {
         if let width {
-            MicroLabel(title)
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow(title)
                 .frame(width: width, alignment: alignment)
                 .padding(.trailing, 8)
         } else {
-            MicroLabel(title)
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow(title)
                 .frame(maxWidth: .infinity, alignment: alignment)
                 .padding(.trailing, 8)
         }
@@ -119,7 +117,8 @@ private struct ActivityTableRow: View {
     var body: some View {
         HStack(spacing: 0) {
             statusCell.frame(width: Layout.status, alignment: .leading).padding(.trailing, 8)
-            MicroLabel(row.kind.displayLabel)
+            Text(row.kind.displayLabel)
+                .font(.metaText)
                 .foregroundStyle(Color.rupuDim)
                 .frame(width: Layout.kind, alignment: .leading)
                 .padding(.trailing, 8)
@@ -145,17 +144,17 @@ private struct ActivityTableRow: View {
                 .frame(width: Layout.trigger, alignment: .leading)
                 .padding(.trailing, 8)
             Text(durationLabel)
-                .font(.numeral(size: 11))
+                .font(.dataMono(11))
                 .foregroundStyle(Color.rupuInk)
                 .frame(width: Layout.duration, alignment: .trailing)
                 .padding(.trailing, 8)
             Text(costLabel)
-                .font(.numeral(size: 11))
+                .font(.dataMono(11))
                 .foregroundStyle(Color.rupuInk)
                 .frame(width: Layout.cost, alignment: .trailing)
                 .padding(.trailing, 8)
             Text(startedLabel)
-                .font(.numeral(size: 11))
+                .font(.dataMono(11))
                 .foregroundStyle(Color.rupuDim)
                 .frame(width: Layout.started, alignment: .trailing)
             awaitingActions
@@ -197,11 +196,11 @@ private struct ActivityTableRow: View {
                     if isBusy {
                         ProgressView().controlSize(.mini)
                     } else {
-                        Image(systemName: "checkmark.circle.fill")
+                        Icon(.checkCircle2, size: 14)
                     }
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(Color.status(StatusTone.done))
+                .foregroundStyle(Color.status(.done))
                 .disabled(isBusy)
                 .help("Approve")
 
@@ -211,11 +210,11 @@ private struct ActivityTableRow: View {
                     if isBusy {
                         ProgressView().controlSize(.mini)
                     } else {
-                        Image(systemName: "xmark.circle.fill")
+                        Icon(.xCircle, size: 14)
                     }
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(Color.status(.fail))
+                .foregroundStyle(Color.status(.failed))
                 .disabled(isBusy)
                 .help("Reject")
             }
@@ -258,7 +257,8 @@ private struct ActivityTableRow: View {
             Circle()
                 .fill(Color.status(row.status.tone))
                 .frame(width: 6, height: 6)
-            MicroLabel(row.status.displayLabel)
+            Text(row.status.displayLabel)
+                .font(.metaText)
                 .foregroundStyle(Color.rupuDim)
         }
     }

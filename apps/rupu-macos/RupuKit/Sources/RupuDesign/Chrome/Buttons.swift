@@ -10,6 +10,14 @@ public struct RupuButtonStyle {
         ChromeButtonStyle(fill: .rupuBrand, hoverFill: .rupuBrand600, textColor: .white, borderColor: nil)
     }
 
+    /// Same chrome as `primary`, tinted `.rupuOk` instead of brand — the
+    /// "primary, ok-filled" variant web's approve control uses (a positive,
+    /// confirming action gets the affirmative color rather than the generic
+    /// brand tint).
+    public static var primaryOk: some ButtonStyle {
+        ChromeButtonStyle(fill: .rupuOk, hoverFill: .rupuOk.opacity(0.85), textColor: .white, borderColor: nil)
+    }
+
     public static var outline: some ButtonStyle {
         ChromeButtonStyle(fill: .rupuPanel, hoverFill: .rupuSurfaceHover, textColor: .rupuInk, borderColor: .rupuBorderStrong)
     }

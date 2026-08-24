@@ -14,8 +14,7 @@ struct PlaceholderScreen: View {
                 Text(title)
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(Color.rupuInk)
-                MicroLabel("NOT BUILT YET \u{2014} PHASE \(phase)")
-                    .foregroundStyle(Color.rupuMute)
+                Eyebrow("Not built yet \u{2014} phase \(phase)")
             }
             .padding(40)
             .panelStyle(.panel)

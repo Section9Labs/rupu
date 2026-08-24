@@ -20,21 +20,22 @@ struct InputsForm: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let error = store.inputsLoadError {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(Color.status(.waiting))
+                TintBanner(tone: Color.status(.awaiting), toneBg: Color.status(.awaiting).opacity(0.08)) {
                     VStack(alignment: .leading, spacing: 2) {
-                        MicroLabel("COULDN'T LOAD DECLARED INPUTS")
-                            .foregroundStyle(Color.status(.waiting))
+                        Text("Couldn't load declared inputs")
+                            .font(.noteText)
+                            .foregroundStyle(Color.status(.awaiting))
                         Text(error)
                             .font(.system(size: 11))
                             .foregroundStyle(Color.rupuDim)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
 
             if sortedKeys.isEmpty {
-                MicroLabel("NO DECLARED INPUTS")
+                Text("No declared inputs")
+                    .font(.noteText)
                     .foregroundStyle(Color.rupuMute)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
@@ -55,12 +56,13 @@ struct InputsForm: View {
     private func inputRow(key: String, def: WorkflowInputDef) -> some View {
         HStack(alignment: .center, spacing: 10) {
             HStack(spacing: 3) {
-                MicroLabel(key)
+                Text(key)
+                    .font(.metaText)
                     .foregroundStyle(Color.rupuInk)
                 if def.required {
                     Text("*")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(Color.status(.fail))
+                        .foregroundStyle(Color.status(.failed))
                 }
             }
             .frame(width: 140, alignment: .leading)

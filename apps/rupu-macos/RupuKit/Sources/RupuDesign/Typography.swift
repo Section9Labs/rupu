@@ -17,15 +17,6 @@ public extension Font {
     static func dataMono(_ size: CGFloat) -> Font {
         Font.system(size: size, design: .monospaced).monospacedDigit()
     }
-
-    /// Body monospace used for run IDs, SHAs, and other identifiers.
-    @available(*, deprecated, message: "migrate to Font.dataMono (Task 5)")
-    static let identifier = Font.dataMono(11.5)
-    /// Monospaced-digit numeral for counters and durations, sized per call site.
-    @available(*, deprecated, message: "migrate to Font.dataMono (Task 5)")
-    static func numeral(size: CGFloat) -> Font {
-        dataMono(size)
-    }
 }
 
 /// Mono 10pt, uppercase, kerning 1.2, `.rupuMute` — the ONLY sanctioned uppercase-tracked
@@ -47,27 +38,6 @@ public struct Eyebrow: View {
             .font(.dataMono(10))
             .kerning(1.2)
             .foregroundStyle(Color.rupuMute)
-    }
-}
-
-/// Pre-v2 uppercase micro-caption. Deliberately NOT re-implemented in terms of `Eyebrow` — its
-/// render must stay byte-for-byte unchanged (mono 10 *medium* weight, uppercase via `.textCase`,
-/// kerning 1.2, no forced color) so the many existing call sites that rely on inheriting or
-/// overriding the ambient foreground don't shift before Task 5 sweeps each one onto `Eyebrow`
-/// (the call sites that are true eyebrow labels) or a plain sans `Text` (everything else).
-@available(*, deprecated, message: "migrate to Eyebrow or sans Text (Task 5)")
-public struct MicroLabel: View {
-    private let text: String
-
-    public init(_ text: String) {
-        self.text = text
-    }
-
-    public var body: some View {
-        Text(text)
-            .font(.system(size: 10, design: .monospaced).weight(.medium))
-            .textCase(.uppercase)
-            .kerning(1.2)
     }
 }
 

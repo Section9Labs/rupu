@@ -13,35 +13,35 @@ struct Sidebar: View {
     var body: some View {
         VStack(spacing: 0) {
             List(selection: $model.selectedSidebarItem) {
-                Label("Overview", systemImage: "square.grid.2x2")
+                sidebarLabel("Overview", icon: .layoutDashboard)
                     .tag(SidebarItem.overview)
 
                 Section("Runs") {
-                    Label("All runs", systemImage: "circle.grid.2x2")
+                    sidebarLabel("All runs", icon: .activity)
                         .tag(SidebarItem.runs)
-                    Label("Agent runs", systemImage: "person.crop.circle")
+                    sidebarLabel("Agent runs", icon: .sparkles)
                         .tag(SidebarItem.runsLeaf(.agents))
-                    Label("Workflows", systemImage: "arrow.triangle.branch")
+                    sidebarLabel("Workflows", icon: .workflow)
                         .tag(SidebarItem.runsLeaf(.workflows))
-                    Label("Autoflows", systemImage: "bolt.circle")
+                    sidebarLabel("Autoflows", icon: .repeatIcon)
                         .tag(SidebarItem.runsLeaf(.autoflows))
-                    Label("Sessions", systemImage: "terminal")
+                    sidebarLabel("Sessions", icon: .messageSquare)
                         .tag(SidebarItem.runsLeaf(.sessions))
                 }
 
                 Section("Subjects") {
-                    Label("Projects", systemImage: "folder")
+                    sidebarLabel("Projects", icon: .folderGit2)
                         .tag(SidebarItem.projects)
                 }
 
                 Section {
-                    Label("Security", systemImage: "checkmark.shield")
+                    sidebarLabel("Security", icon: .shieldCheck)
                         .tag(SidebarItem.security)
-                    Label("Library", systemImage: "books.vertical")
+                    sidebarLabel("Library", icon: .bookMarked)
                         .tag(SidebarItem.library)
-                    Label("Fleet", systemImage: "server.rack")
+                    sidebarLabel("Fleet", icon: .server)
                         .tag(SidebarItem.fleet)
-                    Label("Usage", systemImage: "chart.bar")
+                    sidebarLabel("Usage", icon: .dollarSign)
                         .tag(SidebarItem.usage)
                 }
             }
@@ -55,12 +55,23 @@ struct Sidebar: View {
         .background(VisualEffectView())
     }
 
+    /// A sidebar row's label — `Icon`, not `systemImage:`, per the v2 nav
+    /// icon contract (`Icon.swift`'s `LucideIcon` table).
+    private func sidebarLabel(_ title: String, icon: LucideIcon) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Icon(icon)
+        }
+    }
+
     private var footer: some View {
         HStack(spacing: 6) {
             Circle()
                 .fill(healthDotColor)
                 .frame(width: 6, height: 6)
-            MicroLabel(healthLabel)
+            Text(healthLabel)
+                .font(.metaText)
                 .foregroundStyle(Color.rupuDim)
             Spacer(minLength: 0)
         }
@@ -70,10 +81,10 @@ struct Sidebar: View {
 
     private var healthDotColor: Color {
         switch model.backendHealth {
-        case .healthy: .status(StatusTone.done)
-        case .degraded: .status(.waiting)
-        case .down, .incompatible: .status(.fail)
-        case .starting: .status(.pause)
+        case .healthy: .status(.done)
+        case .degraded: .status(.awaiting)
+        case .down, .incompatible: .status(.failed)
+        case .starting: .status(.paused)
         }
     }
 

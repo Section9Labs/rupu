@@ -43,7 +43,8 @@ public struct OnboardingView: View {
                 remoteCard
             }
 
-            MicroLabel("Tokens are stored in the macOS Keychain")
+            Text("Tokens are stored in the macOS Keychain")
+                .font(.noteText)
                 .foregroundStyle(Color.rupuMute)
         }
         .padding(28)
@@ -71,34 +72,35 @@ public struct OnboardingView: View {
     }
 
     private func incompatibleBanner(serverVersion: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(Color.status(.fail))
-            Text("Server is rupu \(serverVersion); this app needs \(VersionGate.minimum) or newer. Run `rupu update` on the host, then try again.")
-                .font(.system(size: 11.5))
-                .foregroundStyle(Color.rupuInk)
+        TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
+            HStack(alignment: .top, spacing: 8) {
+                Icon(.xCircle, size: 14)
+                    .foregroundStyle(Color.status(.failed))
+                Text("Server is rupu \(serverVersion); this app needs \(VersionGate.minimum) or newer. Run `rupu update` on the host, then try again.")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Color.rupuInk)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .panelStyle(.innerCard)
     }
 
     private func errorBanner(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundStyle(Color.status(.waiting))
-            Text(message)
-                .font(.system(size: 11.5))
-                .foregroundStyle(Color.rupuInk)
+        TintBanner(tone: Color.status(.awaiting), toneBg: Color.status(.awaiting).opacity(0.08)) {
+            HStack(alignment: .top, spacing: 8) {
+                Icon(.xCircle, size: 14)
+                    .foregroundStyle(Color.status(.awaiting))
+                Text(message)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Color.rupuInk)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .panelStyle(.innerCard)
     }
 
     private var embeddedCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            MicroLabel("Recommended")
+            Text("Recommended")
+                .font(.metaText)
                 .foregroundStyle(Color.rupuBrand700)
             Text("Run it here")
                 .font(.system(size: 14, weight: .semibold))
@@ -108,8 +110,8 @@ public struct OnboardingView: View {
                 .foregroundStyle(Color.rupuDim)
 
             Text(discoveryStatusLine)
-                .font(.identifier)
-                .foregroundStyle(discoveredPath == nil ? Color.status(.fail) : Color.rupuDim)
+                .font(.dataMono(11.5))
+                .foregroundStyle(discoveredPath == nil ? Color.status(.failed) : Color.rupuDim)
                 .fixedSize(horizontal: false, vertical: true)
 
             TextField("Port", value: $embeddedPort, format: .number.grouping(.never))
@@ -132,8 +134,7 @@ public struct OnboardingView: View {
 
     private var remoteCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            MicroLabel("Remote")
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow("Remote")
             Text("Connect to one")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(Color.rupuInk)

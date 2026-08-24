@@ -40,11 +40,6 @@ public extension Color {
     static let rupuInfoBg = dynamicColor((239, 246, 255), (20, 32, 54))
 }
 
-/// Legacy 5-tone status enum. Superseded by `StatusTone`; deleted in Task 5 once every call site
-/// migrates. Kept alive here only via the deprecated `Color.status(RunTone)` overload below.
-@available(*, deprecated, message: "migrate to StatusTone (Task 5)")
-public enum RunTone: String, CaseIterable, Sendable { case run, done, fail, waiting = "await", pause }
-
 public enum Severity: String, CaseIterable, Sendable { case crit, high, med, low, info }
 
 /// 9-state run/step/gate lifecycle tone. `rejected` is a distinct case from `failed` (different
@@ -65,19 +60,6 @@ public extension Color {
         case .skipped: dynamicColor((203, 213, 225), (82, 82, 91))
         case .cancelled: dynamicColor((100, 116, 139), (161, 161, 170))
         case .rejected: dynamicColor((239, 68, 68), (248, 113, 113)) // = failed
-        }
-    }
-
-    /// Compatibility shim for call sites not yet migrated off `RunTone` — maps onto the
-    /// equivalent `StatusTone` color. Deleted alongside `RunTone` in Task 5.
-    @available(*, deprecated, message: "migrate to StatusTone (Task 5)")
-    static func status(_ tone: RunTone) -> Color {
-        switch tone {
-        case .run: status(StatusTone.running)
-        case .done: status(StatusTone.done)
-        case .fail: status(StatusTone.failed)
-        case .waiting: status(StatusTone.awaiting)
-        case .pause: status(StatusTone.paused)
         }
     }
 

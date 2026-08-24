@@ -12,7 +12,7 @@ import RupuDesign
 ///
 /// Per the brief's render list: `assistant_message` becomes a prose block;
 /// `tool_call` pairs with its matching `tool_result` (by `call_id`) into one
-/// collapsed row; `gate_requested` gets a 2px `Color.status(.waiting)` left
+/// collapsed row; `gate_requested` gets a 2px `Color.status(.awaiting)` left
 /// edge; `command_run`/`file_edit` render as one-line summaries;
 /// `run_complete` is a terminal row.
 ///
@@ -46,7 +46,8 @@ public struct TranscriptFeed: View {
                             .id(index)
                     }
                     if rows.isEmpty {
-                        MicroLabel("NO TRANSCRIPT EVENTS YET")
+                        Text("No transcript events yet")
+                            .font(.noteText)
                             .foregroundStyle(Color.rupuMute)
                             .padding(.top, 24)
                     }
@@ -166,8 +167,7 @@ private struct ProseRow: View {
                         .padding(.top, 4)
                         .textSelection(.enabled)
                 } label: {
-                    MicroLabel("Thinking")
-                        .foregroundStyle(Color.rupuMute)
+                    Eyebrow("Thinking")
                 }
             }
         }
@@ -219,11 +219,12 @@ private struct ToolCallRow: View {
                     jsonBlock(label: "Input", json: input)
                 }
                 if let resultError {
-                    MicroLabel("Error")
-                        .foregroundStyle(Color.status(.fail))
+                    Text("Error")
+                        .font(.metaText)
+                        .foregroundStyle(Color.status(.failed))
                     Text(resultError)
-                        .font(.identifier)
-                        .foregroundStyle(Color.status(.fail))
+                        .font(.dataMono(11.5))
+                        .foregroundStyle(Color.status(.failed))
                         .textSelection(.enabled)
                 } else if let resultOutput {
                     jsonBlock(label: "Output", text: resultOutput)
@@ -232,7 +233,8 @@ private struct ToolCallRow: View {
                     jsonBlock(label: "Structured", json: resultStructured)
                 }
                 if result == nil {
-                    MicroLabel("AWAITING RESULT")
+                    Text("Awaiting result")
+                        .font(.noteText)
                         .foregroundStyle(Color.rupuMute)
                 }
             }
@@ -240,17 +242,18 @@ private struct ToolCallRow: View {
         } label: {
             HStack(spacing: 8) {
                 Text(tool)
-                    .font(.identifier)
+                    .font(.dataMono(11.5))
                     .foregroundStyle(Color.rupuInk)
                 Text("#\(callID)")
-                    .font(.identifier)
+                    .font(.dataMono(11.5))
                     .foregroundStyle(Color.rupuMute)
                 if let resultDurationMS {
-                    MicroLabel(Fmt.duration(ms: resultDurationMS))
+                    Text(Fmt.duration(ms: resultDurationMS))
+                        .font(.dataMono(10))
                         .foregroundStyle(Color.rupuDim)
                 }
                 if resultError != nil {
-                    Circle().fill(Color.status(.fail)).frame(width: 6, height: 6)
+                    Circle().fill(Color.status(.failed)).frame(width: 6, height: 6)
                 }
                 Spacer(minLength: 0)
             }
@@ -267,10 +270,9 @@ private struct ToolCallRow: View {
     @ViewBuilder
     private func jsonBlock(label: String, text: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            MicroLabel(label)
-                .foregroundStyle(Color.rupuMute)
+            Eyebrow(label)
             Text(text)
-                .font(.identifier)
+                .font(.dataMono(11.5))
                 .foregroundStyle(Color.rupuInk)
                 .textSelection(.enabled)
                 .padding(8)
@@ -290,14 +292,15 @@ private struct GateRequestedRow: View {
     var body: some View {
         HStack(spacing: 0) {
             Rectangle()
-                .fill(Color.status(.waiting))
+                .fill(Color.status(.awaiting))
                 .frame(width: 2)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    MicroLabel("Gate")
-                        .foregroundStyle(Color.status(.waiting))
+                    Text("Gate")
+                        .font(.metaText)
+                        .foregroundStyle(Color.status(.awaiting))
                     Text("#\(gateID)")
-                        .font(.identifier)
+                        .font(.dataMono(11.5))
                         .foregroundStyle(Color.rupuMute)
                 }
                 Text(prompt)
@@ -313,7 +316,7 @@ private struct GateRequestedRow: View {
             .padding(.vertical, 8)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.status(.waiting).opacity(0.06))
+        .background(Color.status(.awaiting).opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
@@ -328,16 +331,17 @@ private struct CommandRunRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(Color.status(exitCode == 0 ? .done : .fail))
+                .fill(Color.status(exitCode == 0 ? .done : .failed))
                 .frame(width: 6, height: 6)
             Text("$ \(argv.joined(separator: " "))")
-                .font(.identifier)
+                .font(.dataMono(11.5))
                 .foregroundStyle(Color.rupuInk)
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 0)
-            MicroLabel("exit \(exitCode)")
-                .foregroundStyle(exitCode == 0 ? Color.rupuDim : Color.status(.fail))
+            Text("exit \(exitCode)")
+                .font(.dataMono(10))
+                .foregroundStyle(exitCode == 0 ? Color.rupuDim : Color.status(.failed))
         }
         .padding(8)
         .panelStyle(.innerCard)
@@ -351,10 +355,11 @@ private struct FileEditRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            MicroLabel(kind)
+            Text(kind)
+                .font(.metaText)
                 .foregroundStyle(Color.rupuDim)
             Text(path)
-                .font(.identifier)
+                .font(.dataMono(11.5))
                 .foregroundStyle(Color.rupuInk)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -376,18 +381,20 @@ private struct RunCompleteRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(Color.status(status == "ok" ? .done : .fail))
+                    .fill(Color.status(status == "ok" ? .done : .failed))
                     .frame(width: 6, height: 6)
-                MicroLabel("Run complete — \(status)")
+                Text("Run complete — \(status)")
+                    .font(.noteText)
                     .foregroundStyle(Color.rupuInk)
                 Spacer(minLength: 0)
-                MicroLabel("\(Fmt.count(Int(totalTokens))) tok · \(Fmt.duration(ms: durationMS))")
+                Text("\(Fmt.count(Int(totalTokens))) tok · \(Fmt.duration(ms: durationMS))")
+                    .font(.dataMono(10))
                     .foregroundStyle(Color.rupuDim)
             }
             if let error {
                 Text(error)
                     .font(.system(size: 11.5))
-                    .foregroundStyle(Color.status(.fail))
+                    .foregroundStyle(Color.status(.failed))
             }
         }
         .padding(10)

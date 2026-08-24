@@ -53,8 +53,6 @@ public struct SVGPath {
 
     // MARK: - Parsing
 
-    private static let commandLetters = Set("MmLlHhVvCcSsQqTtAaZz")
-
     private static func parse(_ d: String) -> [DrawOp]? {
         var scanner = PathScanner(d)
         scanner.skipSeparators()
