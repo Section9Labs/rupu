@@ -176,20 +176,13 @@ public struct ActivityScreen: View {
         // Task 4) rather than assigning `route` directly — so a chevron back
         // from the pushed screen returns here, to Activity, not past an
         // intermediate screen a later push might stack on top of this one.
-        switch row.navigation {
-        case .run(let id, let host):
-            model.navigate(to: .runDetail(id: id, host: host))
-        case .session(let id):
-            model.navigate(to: .sessionDetail(id: id))
-        case .agentRun(let id, let transcriptPath, let host):
-            // Hotfix root cause C: a standalone agent run is never an
-            // orchestrator run — `.runDetail` would 404 against `GET
-            // /api/runs/:id`. `AgentRunDetailScreen` is the honest
-            // destination: transcript-only, via `GET /api/transcript`.
-            model.navigate(to: .agentRunDetail(id: id, transcriptPath: transcriptPath, host: host))
-        case .none:
-            break
-        }
+        // The kind-discrimination itself (hotfix root cause C: a standalone
+        // agent run is never an orchestrator run — `.runDetail` would 404
+        // against `GET /api/runs/:id`) now lives in
+        // `ActivityRow.Navigation.route` (flows-composition Task 3), shared
+        // with the command palette's run search.
+        guard let route = row.navigation.route else { return }
+        model.navigate(to: route)
     }
 
     /// Composes `ActivityStore`'s required `signalsFactory` around the

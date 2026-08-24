@@ -13,22 +13,20 @@ import RupuDesign
 /// `backend.client()?.projects()` once when it first appears — failure or
 /// no client yet leaves `projects` empty, so the picker silently, honestly
 /// shows only "All projects" rather than surfacing an error box for a
-/// toolbar affordance. The search button is composed here but hidden
-/// behind `paletteAvailable = false` (Task 3 flips it and wires the
-/// action) — with it false the bar is functionally identical to before
-/// this task.
+/// toolbar affordance.
+///
+/// Flows-composition Task 3: the search button opens `palette` (built
+/// lazily by `RootView` once a backend client exists — see that type's
+/// `handleHealthChange`). `palette` is `nil` for the brief window before
+/// the first healthy connection; the button silently no-ops then, same
+/// "no client yet" degrade `scopePicker`'s `loadProjects()` already uses.
 struct ShellToolbar: ToolbarContent {
     @Bindable var model: AppModel
     @Binding var showLauncher: Bool
     let backend: BackendController
+    let palette: PaletteStore?
     @AppStorage("appearance") private var appearance: String = "system"
     @State private var projects: [APIProjectRow] = []
-
-    /// Command palette isn't built yet (Task 3) — the search button's view
-    /// code lands now so the bar's final composition/order is already
-    /// correct, but it renders nothing until Task 3 flips this to `true`
-    /// and wires the tap action.
-    private let paletteAvailable = false
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
@@ -52,9 +50,7 @@ struct ShellToolbar: ToolbarContent {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
-            if paletteAvailable {
-                searchButton
-            }
+            searchButton
             newRunButton
             livePill
             appearancePicker
@@ -93,7 +89,7 @@ struct ShellToolbar: ToolbarContent {
     /// text-only until that lands.
     private var searchButton: some View {
         Button {
-            // Task 3 wires the palette-opening action.
+            Task { await palette?.open() }
         } label: {
             HStack(spacing: 8) {
                 Text("Search…")

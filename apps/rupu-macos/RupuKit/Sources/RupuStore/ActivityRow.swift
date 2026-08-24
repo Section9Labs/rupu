@@ -55,6 +55,28 @@ public enum ActivityStatus: Hashable, Sendable {
         default: return .unknown(raw)
         }
     }
+
+    /// Display text for the Activity table's status cell, `FilterBar`'s
+    /// chips, and the command palette's run subtitles (flows-composition
+    /// Task 3 — moved here from `RupuActivity/ActivityTable.swift` so
+    /// `PaletteStore`, which lives in this module, can share it rather than
+    /// duplicating the mapping). `.unknown` renders its carried raw string
+    /// directly — `ActivityStatus.normalize` already puts an explicit `"—"`
+    /// there for a genuinely absent status, so there's nothing further to
+    /// null-guard here.
+    public var displayLabel: String {
+        switch self {
+        case .pending: "Pending"
+        case .running: "Running"
+        case .completed: "Completed"
+        case .failed: "Failed"
+        case .awaiting: "Awaiting"
+        case .rejected: "Rejected"
+        case .cancelled: "Cancelled"
+        case .paused: "Paused"
+        case .unknown(let raw): raw
+        }
+    }
 }
 
 /// One row in the federated Activity feed — the normalized shape every
@@ -88,6 +110,25 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         /// to re-derive it.
         case agentRun(id: String, transcriptPath: String?, host: String?)
         case none
+
+        /// The `Route` this navigation is a request to push, or `nil` for
+        /// `.none` (nothing to navigate to). Lifted out of
+        /// `ActivityScreen.handleSelect` (flows-composition Task 3) so the
+        /// command palette's run search reuses the exact same
+        /// kind-discrimination rules a table-row click already uses, rather
+        /// than a second copy of this switch living in the view layer.
+        public var route: Route? {
+            switch self {
+            case .run(let id, let host):
+                return .runDetail(id: id, host: host)
+            case .session(let id):
+                return .sessionDetail(id: id)
+            case .agentRun(let id, let transcriptPath, let host):
+                return .agentRunDetail(id: id, transcriptPath: transcriptPath, host: host)
+            case .none:
+                return nil
+            }
+        }
     }
 
     /// Fallback host label for a row whose upstream `host_id` was never
