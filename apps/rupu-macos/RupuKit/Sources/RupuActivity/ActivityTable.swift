@@ -201,7 +201,7 @@ private struct ActivityTableRow: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(Color.status(.done))
+                .foregroundStyle(Color.status(RunTone.done))
                 .disabled(isBusy)
                 .help("Approve")
 
