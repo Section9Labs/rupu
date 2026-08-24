@@ -1202,3 +1202,133 @@ private func makeStore(
     #expect(store.availableVerbs == [])
     store.deactivate()
 }
+
+// MARK: - (i) Task 4 (flows-composition): selection + events accumulation
+
+/// `select(step:)` sets `selectedStepID` immediately, then awaits the
+/// existing `focusStep` machinery — proven here by the transcript path
+/// resolving exactly as `focusStep("other")` alone already does elsewhere in
+/// this file.
+@MainActor @Test func selectStepSetsSelectionAndFocuses() async {
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(activeStepID: "first"),
+                steps: [
+                    stepResult(stepID: "first", transcriptPath: "t/first.jsonl"),
+                    stepResult(stepID: "other", transcriptPath: "t/other.jsonl"),
+                ]
+            )
+        },
+        transcriptResult: { path in
+            path == "t/other.jsonl"
+                ? APITranscriptPage(events: [.assistantMessage(content: "other output", thinking: nil)], summary: nil)
+                : APITranscriptPage(events: [.assistantMessage(content: "first output", thinking: nil)], summary: nil)
+        }
+    )
+    await store.activate()
+    // `activate()`'s own initial focus (via `select(step:)`) already landed
+    // on "first" — proving `select` is what drives that too, not a separate
+    // code path.
+    #expect(store.selectedStepID == "first")
+    #expect(store.focusedTranscriptPath == "t/first.jsonl")
+
+    await store.select(step: "other")
+
+    #expect(store.selectedStepID == "other")
+    #expect(store.focusedTranscriptPath == "t/other.jsonl")
+    #expect(store.transcript == [.assistantMessage(content: "other output", thinking: nil)])
+
+    store.deactivate()
+}
+
+/// `events` accumulates every event delivered through the run stream
+/// (not just the subset `apply`'s `switch` reduces into `liveStates`), and
+/// is capped at 500 — dropping the OLDEST entries, not the newest, so the
+/// feed always reflects the most recent activity.
+@MainActor @Test func eventsAccumulateFromRunStreamAndCapAt500() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    #expect(store.events.isEmpty)
+
+    runBox.latest.yield(.connection(true))
+    for i in 0..<520 {
+        runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "step-\(i)", kind: "step", agent: nil, host: nil)))
+    }
+
+    let settled = await pollUntil(timeout: .seconds(10)) { store.events.count == 500 }
+    #expect(settled, "expected events to settle at the 500 cap, got \(store.events.count)")
+
+    // Oldest 20 were dropped: the first surviving event is "step-20", the
+    // last is "step-519" — proving the cap drops from the front, not a
+    // truncation of the newest arrivals.
+    #expect(store.events.first == .stepStarted(runID: "run-1", stepID: "step-20", kind: "step", agent: nil, host: nil))
+    #expect(store.events.last == .stepStarted(runID: "run-1", stepID: "step-519", kind: "step", agent: nil, host: nil))
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// `activate()` clears any events accumulated on a prior visit — same
+/// "repeatable" contract `didHandleTerminal`'s own reset already documents.
+@MainActor @Test func eventsClearOnActivate() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "plan", kind: "step", agent: nil, host: nil)))
+    let gotOne = await pollUntil { store.events.count == 1 }
+    #expect(gotOne)
+
+    store.deactivate()
+    runBox.latest.finish()
+
+    await store.activate()
+    #expect(store.events.isEmpty)
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// `eventsForSelection()` filters to the selected step's own events (a
+/// step-scoped event whose `stepID` doesn't match is excluded); a run-level
+/// event, which carries no `stepID` at all, drops out the moment any step is
+/// selected — web parity, `RunDetail.tsx:726-731`. With nothing selected,
+/// every event (step-scoped and run-level alike) is returned.
+@MainActor @Test func eventsForSelectionFiltersByStepAndKeepsAllWhenUnselected() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "plan", kind: "step", agent: nil, host: nil)))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: nil, host: nil)))
+    runBox.latest.yield(.event(.runResumed(runID: "run-1"))) // run-level, no stepID
+    let gotThree = await pollUntil { store.events.count == 3 }
+    #expect(gotThree)
+
+    // Nothing selected -> every event, in order, including the run-level one.
+    #expect(store.eventsForSelection() == store.events)
+
+    await store.select(step: "plan")
+    #expect(store.eventsForSelection() == [
+        .stepStarted(runID: "run-1", stepID: "plan", kind: "step", agent: nil, host: nil),
+    ])
+
+    await store.select(step: "build")
+    #expect(store.eventsForSelection() == [
+        .stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: nil, host: nil),
+    ])
+
+    store.deactivate()
+    runBox.latest.finish()
+}
