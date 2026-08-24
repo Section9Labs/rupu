@@ -220,6 +220,10 @@ public final class PaletteStore {
         isOpen = false
         query = ""
         activeIndex = 0
+        // Invalidate any in-flight open() fetch so it can't write items after
+        // the palette closed — same teardown-bump `ActivityStore.deactivate()`
+        // does with `remoteGeneration`.
+        openGeneration += 1
     }
 
     /// Runs `item`'s action. `.navigate` items push the route and close the
