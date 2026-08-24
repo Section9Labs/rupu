@@ -26,7 +26,7 @@ struct InputsForm: View {
                             .font(.noteText)
                             .foregroundStyle(Color.status(.awaiting))
                         Text(error)
-                            .font(.system(size: 11))
+                            .font(.noteText)
                             .foregroundStyle(Color.rupuDim)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -61,7 +61,7 @@ struct InputsForm: View {
                     .foregroundStyle(Color.rupuInk)
                 if def.required {
                     Text("*")
-                        .font(.system(size: 12, weight: .bold))
+                        .font(.uiText.weight(.bold))
                         .foregroundStyle(Color.status(.failed))
                 }
             }
@@ -70,7 +70,7 @@ struct InputsForm: View {
             if def.allowedValues.isEmpty {
                 TextField(def.type, text: valueBinding(key))
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12))
+                    .font(.uiText)
             } else {
                 Picker("", selection: valueBinding(key)) {
                     ForEach(def.allowedValues, id: \.self) { value in

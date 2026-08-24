@@ -230,18 +230,16 @@ public struct RunDetailScreen: View {
                 ForEach(failures, id: \.title) { failure in
                     HStack(spacing: 6) {
                         Text("\(failure.title) failed:")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.noteText.weight(.semibold))
                             .foregroundStyle(Color.status(.failed))
                         Text(failure.message)
-                            .font(.system(size: 11))
+                            .font(.noteText)
                             .foregroundStyle(Color.status(.failed))
                             .lineLimit(2)
                         Button("Retry") {
                             Task { await failure.retry() }
                         }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Color.rupuBrand700)
-                        .font(.system(size: 11, weight: .semibold))
+                        .buttonStyle(RupuButtonStyle.outline)
                     }
                 }
             }
@@ -386,7 +384,7 @@ public struct RunDetailScreen: View {
                 .font(.metaText)
                 .foregroundStyle(Color.status(.awaiting))
             Text(gate.prompt ?? "Approval requested")
-                .font(.system(size: 12.5))
+                .font(.leadText)
                 .foregroundStyle(Color.rupuInk)
 
             HStack(spacing: 8) {
@@ -435,15 +433,13 @@ public struct RunDetailScreen: View {
         if case .failed(let message) = state {
             HStack(spacing: 6) {
                 Text(message)
-                    .font(.system(size: 11))
+                    .font(.noteText)
                     .foregroundStyle(Color.status(.failed))
                     .lineLimit(2)
                 Button("Retry") {
                     Task { await retry() }
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(Color.rupuBrand700)
-                .font(.system(size: 11, weight: .semibold))
+                .buttonStyle(RupuButtonStyle.outline)
             }
         }
     }
@@ -537,7 +533,7 @@ public struct RunDetailScreen: View {
                 .font(.noteText)
                 .foregroundStyle(Color.status(.failed))
             Text(message)
-                .font(.system(size: 11))
+                .font(.noteText)
                 .foregroundStyle(Color.rupuDim)
                 .multilineTextAlignment(.center)
                 .lineLimit(2)

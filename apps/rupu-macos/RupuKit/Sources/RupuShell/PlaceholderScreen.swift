@@ -12,9 +12,11 @@ struct PlaceholderScreen: View {
             Spacer(minLength: 0)
             VStack(spacing: 8) {
                 Text(title)
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.placeholderTitleText)
                     .foregroundStyle(Color.rupuInk)
-                Eyebrow("Not built yet \u{2014} phase \(phase)")
+                Text("Not built yet \u{2014} phase \(phase)")
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuMute)
             }
             .padding(40)
             .panelStyle(.panel)

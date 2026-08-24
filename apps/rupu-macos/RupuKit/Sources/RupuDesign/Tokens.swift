@@ -2,7 +2,8 @@ import SwiftUI
 import AppKit
 
 /// Resolves to `l` under Aqua and `d` under Dark Aqua. RGB triples (not hex) so every value in
-/// this file reads directly off token-table.md's `r g b | r g b` rows without a hex-decode step.
+/// this file reads directly off `docs/macOS_design/V2-CONTRACT.md`'s `r g b | r g b` rows without
+/// a hex-decode step.
 func dynamicColor(_ l: (UInt8, UInt8, UInt8), _ d: (UInt8, UInt8, UInt8)) -> Color {
     Color(nsColor: NSColor(name: nil) { appearance in
         let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -12,7 +13,7 @@ func dynamicColor(_ l: (UInt8, UInt8, UInt8), _ d: (UInt8, UInt8, UInt8)) -> Col
 }
 
 /// v2 token set, ported verbatim from `crates/rupu-cp/web/src/styles.css` (lines 16-103) — see
-/// `.superpowers/sdd/2026-08-24-rupu-macos-design-language/token-table.md` for the source table.
+/// `docs/macOS_design/V2-CONTRACT.md` for the source table.
 public extension Color {
     static let rupuBg = dynamicColor((250, 250, 250), (10, 10, 10))
     static let rupuPanel = dynamicColor((255, 255, 255), (20, 20, 22))

@@ -13,6 +13,17 @@ public extension Font {
     /// Sans, 13pt — lead/emphasis text (titles, primary values).
     static let leadText = Font.system(size: 13)
 
+    /// Sans, 14pt semibold — card/section subheads one step above `leadText`
+    /// (e.g. the Launcher's onboarding-card titles).
+    static let subheadText = Font.system(size: 14, weight: .semibold)
+    /// Sans, 15pt semibold — sheet/dialog titles.
+    static let sheetTitleText = Font.system(size: 15, weight: .semibold)
+    /// Sans, 17pt semibold — the largest headline this app uses (onboarding's
+    /// primary question).
+    static let dialogTitleText = Font.system(size: 17, weight: .semibold)
+    /// Sans, 18pt semibold — placeholder-screen titles.
+    static let placeholderTitleText = Font.system(size: 18, weight: .semibold)
+
     /// Monospaced + monospaced-digit font for DATA, sized per call site.
     static func dataMono(_ size: CGFloat) -> Font {
         Font.system(size: size, design: .monospaced).monospacedDigit()

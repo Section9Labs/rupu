@@ -37,13 +37,20 @@ Dual-theme (light default, dark via appearance), matching the web's
 | ink | 15 23 42 | 245 245 245 |
 | ink-dim | 100 116 139 | 161 161 170 |
 | ink-mute (dimmest legal text) | 148 163 184 | 113 113 122 |
+| brand-50 | 245 243 255 | 33 23 56 |
+| brand-100 | 237 233 254 | 45 33 74 |
 | brand-500 | 124 58 237 | 124 58 237 |
-| brand-700 (note: dark is LIGHTER than 500) | per styles.css | per styles.css |
+| brand-600 | 109 40 217 | 124 58 237 |
+| brand-700 (note: dark is LIGHTER than 500) | 91 33 182 | 167 139 250 |
 
-Severity (critical/high/medium/low/info, light→dark):
-147 51 234→168 85 247 · 220 38 38→248 113 113 · 234 88 12→251 146 60 ·
-202 138 4→250 204 21 · 100 116 139→148 163 184 — each with a soft `-bg` tint pair
-per styles.css.
+Severity (light→dark RGB, each with a soft `-bg` tint pair):
+| Severity | fg light | fg dark | bg light | bg dark |
+|---|---|---|---|---|
+| critical | 147 51 234 | 168 85 247 | 250 245 255 | 42 28 56 |
+| high | 220 38 38 | 248 113 113 | 254 242 242 | 48 24 24 |
+| medium | 234 88 12 | 251 146 60 | 255 247 237 | 48 32 18 |
+| low | 202 138 4 | 250 204 21 | 254 252 232 | 46 40 16 |
+| info | 100 116 139 | 148 163 184 | 248 250 252 | 30 31 35 |
 
 Status palette (9 states, light→dark hex): running #3b82f6→#60a5fa ·
 done #22c55e→#4ade80 · failed #ef4444→#f87171 · awaiting #f59e0b→#fbbf24 ·
@@ -51,7 +58,13 @@ paused #06b6d4→#22d3ee · pending #94a3b8→#71717a · skipped #cbd5e1→#5252
 cancelled #64748b→#a1a1aa · rejected = failed. The Swift `ActivityStatus` maps to
 this palette 1:1 (no tone collapsing).
 
-Semantic pairs: err/ok/warn/info each with `-bg` tint, per styles.css §56-59/99-102.
+Semantic pairs (light→dark RGB):
+| Semantic | fg light | fg dark | bg light | bg dark |
+|---|---|---|---|---|
+| err | 220 38 38 | 248 113 113 | 254 242 242 | 43 22 22 |
+| ok | 22 163 74 | 74 222 128 | 240 253 244 | 18 40 27 |
+| warn | 217 119 6 | 251 191 36 | 255 251 235 | 48 36 12 |
+| info | 37 99 235 | 96 165 250 | 239 246 255 | 20 32 54 |
 
 ## Typography
 - **Sans (system) for ALL UI text** — labels, buttons, nav, prose.

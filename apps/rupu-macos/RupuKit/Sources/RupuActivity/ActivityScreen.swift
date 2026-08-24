@@ -97,13 +97,14 @@ public struct ActivityScreen: View {
                 .font(.noteText)
                 .foregroundStyle(Color.status(.failed))
             Text(message)
-                .font(.system(size: 12))
+                .font(.uiText)
                 .foregroundStyle(Color.rupuDim)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
             Button("Retry") {
                 Task { await store.activate(kind: kind) }
             }
+            .buttonStyle(RupuButtonStyle.outline)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

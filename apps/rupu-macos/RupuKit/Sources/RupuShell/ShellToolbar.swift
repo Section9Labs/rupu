@@ -16,7 +16,7 @@ struct ShellToolbar: ToolbarContent {
     var body: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
             Text(model.route.screenTitle)
-                .font(.system(size: 13, weight: .semibold))
+                .font(.leadText.weight(.semibold))
                 .foregroundStyle(Color.rupuInk)
         }
 

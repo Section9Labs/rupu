@@ -3,7 +3,7 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// One chip per `store.hosts` row plus a standalone "FAN OUT: ALL HEALTHY"
+/// One chip per `store.hosts` row plus a standalone "Fan out: all healthy"
 /// toggle chip. A host chip shows its name and, when the server reported
 /// one, its `activeRunCount` in `Font.dataMono` — omitted entirely rather
 /// than showing a placeholder when `nil` (null discipline: "unknown" and
@@ -66,10 +66,10 @@ struct HostChips: View {
         } label: {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(isOnline ? Color.status(StatusTone.done) : Color.rupuMute)
+                    .fill(isOnline ? Color.status(.done) : Color.rupuMute)
                     .frame(width: 5, height: 5)
                 Text(host.name)
-                    .font(.system(size: 11.5))
+                    .font(.uiText)
                     .foregroundStyle(isOnline ? Color.rupuInk : Color.rupuMute)
                 if let count = host.activeRunCount {
                     Text("\(count)")
@@ -79,7 +79,7 @@ struct HostChips: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(isSelected ? Color.rupuBrand.opacity(0.15) : Color.rupuSurface)
+            .background(isSelected ? Color.rupuBrand.opacity(0.12) : Color.rupuSurface)
             .clipShape(Capsule())
             .overlay(Capsule().stroke(Color.rupuBorder, lineWidth: 1))
         }
@@ -97,7 +97,7 @@ struct HostChips: View {
                 .foregroundStyle(store.fanOutAllHealthy ? Color.rupuBrand700 : Color.rupuMute)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .background(store.fanOutAllHealthy ? Color.rupuBrand.opacity(0.15) : Color.rupuSurface)
+                .background(store.fanOutAllHealthy ? Color.rupuBrand.opacity(0.12) : Color.rupuSurface)
                 .clipShape(Capsule())
                 .overlay(
                     Capsule().stroke(store.fanOutAllHealthy ? Color.rupuBrand : Color.rupuBorder, lineWidth: 1)

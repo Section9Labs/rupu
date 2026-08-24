@@ -5,7 +5,7 @@ import RupuDesign
 
 /// Definition list for the Launcher's `kind` — `agents` for
 /// `.agentRun`/`.session`, `workflows` for `.workflow`. Each row shows the
-/// definition's name plus `Eyebrow` tags (an agent's `model`/`scope`, a
+/// definition's name plus `Badge` tags (an agent's `model`/`scope`, a
 /// workflow's `scope` — workflows have no `model` field). Tapping a row
 /// calls `store.selectDefinition(_:)`, which for a workflow also fetches
 /// its declared inputs in the background (see `LauncherStore`'s doc
@@ -98,19 +98,19 @@ struct DefinitionPicker: View {
         } label: {
             HStack(spacing: 8) {
                 Text(name)
-                    .font(.system(size: 12.5))
+                    .font(.leadText)
                     .foregroundStyle(Color.rupuInk)
                 Spacer(minLength: 8)
                 HStack(spacing: 6) {
                     ForEach(tags, id: \.self) { tag in
-                        Eyebrow(tag)
+                        Badge(tag)
                     }
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 7)
             .frame(maxWidth: .infinity)
-            .background(isSelected ? Color.rupuBrand.opacity(0.15) : Color.clear)
+            .background(isSelected ? Color.rupuBrand.opacity(0.12) : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 5))
         }
         .buttonStyle(.plain)
@@ -134,7 +134,7 @@ struct DefinitionPicker: View {
                 .foregroundStyle(Color.status(.failed))
                 .padding(10)
             Text(message)
-                .font(.system(size: 11))
+                .font(.noteText)
                 .foregroundStyle(Color.rupuDim)
                 .padding(.horizontal, 10)
         }

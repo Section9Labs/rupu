@@ -28,7 +28,7 @@ public struct StatusDescriptor {
 /// Web-parity status pill: tone-colored icon + mono label, tone color at a
 /// 12% fill with a 30% ring — matches `StatusPill.tsx`'s `PillShell` (which
 /// uses `bg-status-x/10 ring-status-x/30`; 12% is this design's own fill step,
-/// see `token-table.md`). `compact` mirrors the web pill's `xs` size (9pt icon,
+/// see `docs/macOS_design/V2-CONTRACT.md`). `compact` mirrors the web pill's `xs` size (9pt icon,
 /// tighter label) vs. the default `sm` size (11pt icon).
 public struct StatusPill: View {
     private let tone: StatusTone

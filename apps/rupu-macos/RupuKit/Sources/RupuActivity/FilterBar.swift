@@ -71,7 +71,7 @@ struct FilterBar: View {
                 .foregroundStyle(Color.rupuBrand700)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(Color.rupuBrand.opacity(0.16))
+                .background(Color.rupuBrand.opacity(0.12))
                 .clipShape(Capsule())
                 .overlay(Capsule().stroke(Color.rupuBrand.opacity(0.4), lineWidth: 1))
         }
