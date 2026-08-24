@@ -68,6 +68,19 @@ public actor CPClient {
         try await get("api/projects")
     }
 
+    /// `GET /api/dashboard` — the ops-first Overview: one fleet-wide
+    /// aggregate plus per-host freshness. `range` is the wire vocabulary
+    /// (`"7d"` | `"30d"` | `"all"`) always sent explicitly (there is no
+    /// client-side default — the caller's segmented control drives it).
+    /// `host` (default `nil`) scopes to a single host, same param as
+    /// `runs(offset:limit:host:)`; omitting it fans the call out
+    /// server-side across every registered host.
+    public func dashboard(range: String, host: String? = nil) async throws -> APIDashboardResponse {
+        var query = [URLQueryItem(name: "range", value: range)]
+        query.append(contentsOf: hostQuery(host))
+        return try await get("api/dashboard", query: query)
+    }
+
     public func runDetail(id: String, host: String? = nil) async throws -> APIRunDetail {
         try await get("api/runs/\(id)", query: hostQuery(host))
     }
