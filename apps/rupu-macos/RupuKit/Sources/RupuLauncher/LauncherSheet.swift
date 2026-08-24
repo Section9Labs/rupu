@@ -82,7 +82,7 @@ private struct LauncherForm: View {
                 DefinitionPicker(store: store)
                 promptOrInputs
                 modePicker
-                HostChips(store: store)
+                HostChips(store: store, localOnly: store.kind == .session)
                 footer
             }
             .padding(20)

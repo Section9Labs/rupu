@@ -115,6 +115,7 @@ public struct SessionDetailScreen: View {
                 }
                 overflowMenu(store: store)
             }
+            overflowFailureNotes(store: store)
             switch store.session {
             case .loading:
                 ProgressView().controlSize(.small)
@@ -167,6 +168,49 @@ public struct SessionDetailScreen: View {
     private func isPending(_ state: ActionState) -> Bool {
         if case .pending = state { return true }
         return false
+    }
+
+    /// Final-review fix: `archive()`/`restore()` failures used to be
+    /// invisible the same way `RunDetailScreen`'s header mutations were —
+    /// the overflow button's own re-tap is the retry, so a `.failed` state
+    /// never rendered anything and the menu item just silently re-enabled.
+    /// Mirrors `RunDetailScreen.runVerbFailureNotes`'s message+Retry
+    /// convention (itself lifted from `gateFailureNote`), scoped to this
+    /// screen's two overflow verbs. At most one of the two keys is ever
+    /// relevant per `store.isArchived` (same "at most one at a time"
+    /// convention `overflowMenu` already uses), but both are checked here
+    /// unconditionally in case a failure lands just as `isArchived` flips.
+    @ViewBuilder
+    private func overflowFailureNotes(store: SessionDetailStore) -> some View {
+        let entries: [(title: String, key: ActionKey, retry: () async -> Void)] = [
+            ("Archive", ActionKey(sessionID, .archive), { await store.archive() }),
+            ("Restore", ActionKey(sessionID, .restore), { await store.restore() }),
+        ]
+        let failures = entries.compactMap { entry -> (title: String, message: String, retry: () async -> Void)? in
+            guard case .failed(let message) = store.pendingActions.state(entry.key) else { return nil }
+            return (entry.title, message, entry.retry)
+        }
+        if !failures.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(failures, id: \.title) { failure in
+                    HStack(spacing: 6) {
+                        Text("\(failure.title) failed:")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.status(.fail))
+                        Text(failure.message)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.status(.fail))
+                            .lineLimit(2)
+                        Button("Retry") {
+                            Task { await failure.retry() }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.rupuBrandHi)
+                        .font(.system(size: 11, weight: .semibold))
+                    }
+                }
+            }
+        }
     }
 
     private func factItem(_ label: String, _ value: String) -> some View {

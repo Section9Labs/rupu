@@ -9,7 +9,7 @@ import RupuAPI
 /// needed here too). Tests run `.serialized` because `handler`/
 /// `requestCount`/`pathHits` are class-level state shared across the whole
 /// `URLProtocol` subclass.
-final class LauncherStubURLProtocol: URLProtocol {
+final class LauncherStubURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (status: Int, body: Data))?
     nonisolated(unsafe) static var pathHits: [String: Int] = [:]
 
@@ -53,6 +53,23 @@ final class LauncherStubURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
+    /// Final-review fix (fold-in, minor 4): `pathHits` increments
+    /// synchronously, still on `startLoading()`'s own calling thread — the
+    /// "dispatched" signal `hitCount`-based tests (e.g. `slowTarget
+    /// NeverDelaysAnotherTargetsPOSTFromBeingSent`) poll for must land the
+    /// instant a request is *submitted*, not once it's answered. The
+    /// handler invocation itself, though, is dispatched onto a global
+    /// concurrent queue rather than run inline: `URLSession` funnels every
+    /// `startLoading()` call for a given custom `URLProtocol` class through
+    /// a single shared queue, so a `Thread.sleep`-based "slow target" handler
+    /// run *inline* here would block that shared queue from ever invoking
+    /// `startLoading()` for a concurrently in-flight *second* request — an
+    /// artifact of this stub's own delivery mechanism, not of
+    /// `LauncherStore.launch()`'s genuinely-concurrent `TaskGroup` dispatch.
+    /// Dispatching the handler (and thus any `Thread.sleep` inside it) off
+    /// that shared queue is what lets two concurrent requests' completions
+    /// actually race independently, matching what a real `URLSession` talking
+    /// to a real server would do.
     override func startLoading() {
         if let path = request.url?.path {
             LauncherStubURLProtocol.pathHits[path, default: 0] += 1
@@ -61,14 +78,18 @@ final class LauncherStubURLProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
         }
-        let (status, body) = handler(request)
-        let response = HTTPURLResponse(
-            url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: body)
-        client?.urlProtocolDidFinishLoading(self)
+        let capturedRequest = request
+        DispatchQueue.global().async { [weak self] in
+            guard let self else { return }
+            let (status, body) = handler(capturedRequest)
+            let response = HTTPURLResponse(
+                url: capturedRequest.url!, statusCode: status, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            self.client?.urlProtocol(self, didLoad: body)
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
     }
 
     override func stopLoading() {}
@@ -324,8 +345,12 @@ struct LauncherStoreTests {
     }
 
     // (d) A single-target launch POSTs once and returns the destination
-    // `Route` directly for auto-navigation.
-    @MainActor @Test func singleHostAgentLaunchReturnsRunDetailRoute() async {
+    // `Route` directly for auto-navigation. Final-review fix (Important 3):
+    // an agent-run launch now maps to `.agentRunDetail` with `transcriptPath:
+    // nil`, not `.runDetail` — a standalone agent run isn't an orchestrator
+    // run and `GET /api/runs/:id` 404s for it (hotfix root cause C), so
+    // `.runDetail` was a guaranteed dead end.
+    @MainActor @Test func singleHostAgentLaunchReturnsAgentRunDetailRoute() async {
         let store = makeStore { req in
             guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
             return (200, Data(#"{"run_id":"run-123","host_id":"local"}"#.utf8))
@@ -336,8 +361,8 @@ struct LauncherStoreTests {
 
         let route = await store.launch()
 
-        #expect(route == .runDetail(id: "run-123", host: nil))
-        #expect(store.launchResults == [LaunchOutcome(host: "local", result: .success(.runDetail(id: "run-123", host: nil)))])
+        #expect(route == .agentRunDetail(id: "run-123", transcriptPath: nil, host: nil))
+        #expect(store.launchResults == [LaunchOutcome(host: "local", result: .success(.agentRunDetail(id: "run-123", transcriptPath: nil, host: nil)))])
         #expect(LauncherStubURLProtocol.hitCount("/api/agents/rupuso/run") == 1)
     }
 
@@ -429,7 +454,7 @@ struct LauncherStoreTests {
     // (f2) Review fix (Important 2): a fast target's `LaunchOutcome` lands
     // in `launchResults` while a slower target is still in flight — the
     // fan-out publishes progressively, not all-at-once after the last one
-    // finishes. Uses a bounded `Thread.sleep` for "slow" (same recipe, and
+    // finishes. Uses a bounded `Thread.sleep` for "aslow" (same recipe, and
     // same rationale, as `ActivityStoreTests`'s slow-remote-host test) —
     // an earlier version of this test used an indefinite
     // `DispatchSemaphore.wait()` gate instead, which turned out to be
@@ -439,41 +464,52 @@ struct LauncherStoreTests {
     // documented footgun), which stalled the *other* target's continuation
     // resumption too, not just the deliberately-stuck one — a test
     // artifact, not evidence the store itself was serializing.
+    //
+    // Final-review fix (fold-in, minor 4): the slow host is named "aslow",
+    // not "slow" — `resolvedTargets()` returns `selectedHosts.sorted()`, so
+    // "aslow" sorts *before* "local" (`"a" < "l"`). If a future regression
+    // ever turned the fan-out back into a serial `for` loop over that sorted
+    // order, "aslow" would be the *first* target dispatched and its 0.08s
+    // sleep would block "local"'s request from ever being sent in time —
+    // this test would then fail outright instead of silently passing
+    // because the already-fast host happened to be visited first. Margins
+    // also widened to the 300ms sleep / 2s poll-ceiling pairing (f3)
+    // already uses, for the same de-flake rationale documented there — the
+    // tighter 80ms/60ms pairing lost races under full-suite parallel load.
     @MainActor @Test func fastTargetOutcomeAppearsInLaunchResultsWhileSlowTargetStillInFlight() async {
         let store = makeStore { req in
             guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
             let json = LauncherStubURLProtocol.bodyJSON(req)
             let host = (json?["host"] as? String) ?? "local"
-            if host == "slow" {
-                Thread.sleep(forTimeInterval: 0.08) // artificially slow
-                return (200, Data(#"{"run_id":"run-slow","host_id":"slow"}"#.utf8))
+            if host == "aslow" {
+                Thread.sleep(forTimeInterval: 0.3) // artificially slow, generous margin under load
+                return (200, Data(#"{"run_id":"run-slow","host_id":"aslow"}"#.utf8))
             }
             return (200, Data(#"{"run_id":"run-fast","host_id":"local"}"#.utf8))
         }
         store.kind = .agentRun
         store.selectedDefinition = "rupuso"
         store.prompt = "hi"
-        store.selectedHosts = ["local", "slow"]
+        store.selectedHosts = ["local", "aslow"]
 
         let launchTask = Task { await store.launch() }
 
-        // Polled with a window (60ms) tighter than "slow"'s own artificial
-        // delay (80ms) — same margin `ActivityStoreTests`'s equivalent test
-        // uses — so this only passes if "local" genuinely lands before
-        // "slow" could possibly have finished sleeping.
+        // Polled with a generous ceiling well short of "aslow"'s own 300ms
+        // artificial delay, so this only passes if "local" genuinely lands
+        // before "aslow" could possibly have finished sleeping.
         await expectEventually(
-            timeout: .milliseconds(60),
+            timeout: .seconds(2),
             "the fast target's outcome lands while the slow one is still stuck"
         ) {
             store.launchResults.contains { $0.host == "local" }
         }
-        #expect(store.launchResults.count == 1) // "slow" hasn't landed yet
+        #expect(store.launchResults.count == 1) // "aslow" hasn't landed yet
         #expect(store.launchResults.first?.host == "local")
 
         _ = await launchTask.value
 
         #expect(store.launchResults.count == 2)
-        #expect(Set(store.launchResults.map(\.host)) == Set(["local", "slow"]))
+        #expect(Set(store.launchResults.map(\.host)) == Set(["local", "aslow"]))
     }
 
     // (f3) Review fix (Important 2): a slow target must never delay another
@@ -481,7 +517,9 @@ struct LauncherStoreTests {
     // path hit count reaching 2 (both dispatched) while the slow target is
     // still mid-sleep, not merely by favorable overall timing. See (f2)'s
     // doc comment on why this uses a bounded `Thread.sleep` rather than an
-    // indefinite gate.
+    // indefinite gate, and on why the slow host is named "aslow" rather than
+    // "slow" (sorts first — a serial-loop regression must fail this test,
+    // not accidentally pass it).
     //
     // Margins are deliberately generous (300ms sleep / up to 2s to observe
     // dispatch) rather than the tight 80ms/60ms pairing used elsewhere in
@@ -494,26 +532,26 @@ struct LauncherStoreTests {
     // is unchanged: the assertion fires the instant the poll condition
     // first observes hitCount == 2, which — because sending is what's under
     // test, not completion — lands almost immediately and leaves ample
-    // headroom before "slow"'s 300ms sleep can have elapsed.
+    // headroom before "aslow"'s 300ms sleep can have elapsed.
     @MainActor @Test func slowTargetNeverDelaysAnotherTargetsPOSTFromBeingSent() async {
         let store = makeStore { req in
             guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
             let json = LauncherStubURLProtocol.bodyJSON(req)
             let host = (json?["host"] as? String) ?? "local"
-            if host == "slow" {
+            if host == "aslow" {
                 Thread.sleep(forTimeInterval: 0.3) // artificially slow, generous margin under load
-                return (200, Data(#"{"run_id":"run-slow","host_id":"slow"}"#.utf8))
+                return (200, Data(#"{"run_id":"run-slow","host_id":"aslow"}"#.utf8))
             }
             return (200, Data(#"{"run_id":"run-fast","host_id":"local"}"#.utf8))
         }
         store.kind = .agentRun
         store.selectedDefinition = "rupuso"
         store.prompt = "hi"
-        store.selectedHosts = ["local", "slow"]
+        store.selectedHosts = ["local", "aslow"]
 
         let launchTask = Task { await store.launch() }
 
-        // Both requests dispatched (hit count 2) well before "slow"'s 300ms
+        // Both requests dispatched (hit count 2) well before "aslow"'s 300ms
         // sleep could have elapsed — proves sending isn't serialized behind
         // another target's completion. The 2s ceiling is just how long
         // we're willing to wait to *observe* dispatch on a loaded runner;
@@ -521,12 +559,12 @@ struct LauncherStoreTests {
         // as the condition is first true.
         await expectEventually(
             timeout: .seconds(2),
-            "both requests are sent even though \"slow\" hasn't answered yet"
+            "both requests are sent even though \"aslow\" hasn't answered yet"
         ) {
             LauncherStubURLProtocol.hitCount("/api/agents/rupuso/run") == 2
         }
         #expect(store.launchResults.contains { $0.host == "local" })
-        #expect(!store.launchResults.contains { $0.host == "slow" }) // still in flight
+        #expect(!store.launchResults.contains { $0.host == "aslow" }) // still in flight
 
         _ = await launchTask.value
 
@@ -555,6 +593,56 @@ struct LauncherStoreTests {
             return
         }
         #expect(error == .message("server lacks launch runtime — start with `rupu cp serve`"))
+    }
+
+    // (g2) Final-review fix (Important 2): a `.session` launch never
+    // reaches a non-local target, even when `selectedHosts` explicitly
+    // includes one — `resolvedTargets()` hard-filters to `"local"` for this
+    // kind, defense in depth alongside `HostChips`'s `localOnly` mode (a
+    // view-level guard this store-level test can't exercise directly).
+    // Both an explicit multi-host selection and `fanOutAllHealthy` are
+    // covered — either path into `resolvedTargets()` must land on the same
+    // filtered result.
+    @MainActor @Test func sessionLaunchHardFiltersToLocalEvenWithNonLocalHostsSelected() async {
+        let store = makeStore { req in
+            switch req.url?.path {
+            case "/api/hosts":
+                let hosts = [
+                    Self.hostJSON(id: "local", status: "online"),
+                    Self.hostJSON(id: "mini", status: "online"),
+                ]
+                return (200, Data("[\(hosts.joined(separator: ","))]".utf8))
+            case "/api/agents/rupuso/session":
+                let json = LauncherStubURLProtocol.bodyJSON(req)
+                #expect(json?["host"] == nil) // "local" only, sent as nil
+                return (200, Data(#"{"session_id":"sess-1","host_id":"local"}"#.utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+        store.kind = .session
+        await store.activate()
+        await expectEventually("hosts load") { store.hosts.count == 2 }
+
+        store.selectedDefinition = "rupuso"
+        store.prompt = "hi"
+        store.selectedHosts = ["local", "mini"]
+
+        let route = await store.launch()
+
+        #expect(route == .sessionDetail(id: "sess-1"))
+        #expect(store.launchResults == [LaunchOutcome(host: "local", result: .success(.sessionDetail(id: "sess-1")))])
+        #expect(LauncherStubURLProtocol.hitCount("/api/agents/rupuso/session") == 1) // "mini" never targeted
+
+        // Same hard filter applies via the fan-out path.
+        LauncherStubURLProtocol.pathHits = [:]
+        store.selectedHosts = []
+        store.fanOutAllHealthy = true
+
+        let fanOutRoute = await store.launch()
+
+        #expect(fanOutRoute == .sessionDetail(id: "sess-1"))
+        #expect(LauncherStubURLProtocol.hitCount("/api/agents/rupuso/session") == 1) // still just "local"
     }
 
     // (h) The required-input client-side gap surfaces via `validationError`

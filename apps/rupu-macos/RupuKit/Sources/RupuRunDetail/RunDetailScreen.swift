@@ -3,20 +3,28 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// The Run Detail screen (Task 8): header (back chevron, breadcrumb, status
-/// pill, facts row), a strict-read-only awaiting banner, the live step
-/// graph, the transcript feed for whichever step is currently focused, and
-/// the netflow/findings rails. Owns a `RunDetailStore` lifecycle the same
+/// The Run Detail screen (Task 8, write path added Phase 3 Task 5): header
+/// (back chevron, breadcrumb, status pill, facts row, run-control buttons),
+/// an awaiting banner with live Approve/Reject controls per parked gate, the
+/// live step graph, the transcript feed for whichever step is currently
+/// focused, and the netflow/findings rails. Owns a `RunDetailStore` lifecycle
+/// the same
 /// way `ActivityScreen` owns an `ActivityStore` — built lazily on first
 /// appearance (once `backend.client()` exists), rebuilt whenever `runID`
 /// changes (navigating from one run's detail straight to another's), and
 /// `deactivate()`d `.onDisappear`.
 ///
-/// **Strict read-only**: the awaiting banner renders the gate's prompt and
-/// an honest "actions arrive in Phase 3" label — no approve/reject buttons,
-/// no dead controls. Every block below (`detail`/`graph`/`netflow`/
-/// `findings`) fails independently: one `.failed` block renders its own
-/// failure box without blanking the other three.
+/// **Write path (Phase 3, Task 5)**: the header renders live Cancel/Pause/
+/// Resume buttons plus an Archive/Restore overflow menu, driven strictly
+/// from `RunDetailStore.availableVerbs` for the run's current status — no
+/// dead controls. The awaiting banner renders one Approve/Reject control
+/// pair per parked gate. Every mutating control's own tap is its retry (see
+/// `mutationButton`'s doc comment) and a `.failed` outcome renders inline —
+/// `runVerbFailureNotes` below the header controls for cancel/pause/resume/
+/// archive/restore, `gateFailureNote` per gate for approve/reject. Every
+/// block below (`detail`/`graph`/`netflow`/`findings`) still fails
+/// independently: one `.failed` block renders its own failure box without
+/// blanking the other three.
 public struct RunDetailScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
@@ -115,6 +123,7 @@ public struct RunDetailScreen: View {
                     Spacer(minLength: 0)
                 }
             }
+            runVerbFailureNotes(store: store)
             if case .content(let detail) = store.detail {
                 factsRow(detail: detail)
             }
@@ -185,6 +194,55 @@ public struct RunDetailScreen: View {
     private func isPending(_ state: ActionState) -> Bool {
         if case .pending = state { return true }
         return false
+    }
+
+    /// Final-review fix: a run-level mutation's failure used to be
+    /// invisible — `mutationButton`'s own tap is the retry, so nothing ever
+    /// rendered `.failed` and the button just silently re-enabled with no
+    /// on-screen sign anything went wrong. This renders one compact note
+    /// area below the header controls, listing every one of the five
+    /// run-scoped verbs (cancel/pause/resume/archive/restore) currently
+    /// `.failed`, each with its own message and an explicit Retry — the
+    /// same message+Retry convention `gateFailureNote` already established
+    /// for the awaiting banner's approve/reject controls. Checked
+    /// unconditionally against `pendingActions` (not filtered through
+    /// `store.availableVerbs`) so a note stays visible even if the run's
+    /// status moved the verb out of `availableVerbs` after the failure —
+    /// the operator still needs to see what went wrong and retry it.
+    @ViewBuilder
+    private func runVerbFailureNotes(store: RunDetailStore) -> some View {
+        let entries: [(title: String, key: ActionKey, retry: () async -> Void)] = [
+            ("Cancel", ActionKey(runID, .cancel), { await store.cancel() }),
+            ("Pause", ActionKey(runID, .pause), { await store.pause() }),
+            ("Resume", ActionKey(runID, .resume), { await store.resume() }),
+            ("Archive", ActionKey(runID, .archive), { await store.archive() }),
+            ("Restore", ActionKey(runID, .restore), { await store.restore() }),
+        ]
+        let failures = entries.compactMap { entry -> (title: String, message: String, retry: () async -> Void)? in
+            guard case .failed(let message) = store.pendingActions.state(entry.key) else { return nil }
+            return (entry.title, message, entry.retry)
+        }
+        if !failures.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(failures, id: \.title) { failure in
+                    HStack(spacing: 6) {
+                        Text("\(failure.title) failed:")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.status(.fail))
+                        Text(failure.message)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.status(.fail))
+                            .lineLimit(2)
+                        Button("Retry") {
+                            Task { await failure.retry() }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.rupuBrandHi)
+                        .font(.system(size: 11, weight: .semibold))
+                    }
+                }
+            }
+        }
     }
 
     private func statusPill(_ rawStatus: String) -> some View {

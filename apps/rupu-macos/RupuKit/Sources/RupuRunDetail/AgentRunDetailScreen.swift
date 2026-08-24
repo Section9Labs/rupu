@@ -15,9 +15,15 @@ import RupuDesign
 /// phase.
 ///
 /// **`transcriptPath == nil`**: some agent runs never recorded a
-/// transcript at all. Rendered as an honest "NO TRANSCRIPT RECORDED" label
-/// rather than a spinner that would never resolve — `AgentRunDetailStore`
-/// never calls the network in that case either.
+/// transcript at all — and a just-launched run (Phase 3 final-review fix)
+/// may simply not have had a path handed to this screen yet, since
+/// `LauncherStore`'s `.agentRun` launch route only ever returns a `run_id`.
+/// `AgentRunDetailStore` makes one best-effort resolution attempt for the
+/// latter case (see that type's doc comment); this screen reads
+/// `store.resolvedPath`, not its own `transcriptPath` argument, to decide
+/// between the two — "genuinely no transcript" renders "NO TRANSCRIPT
+/// RECORDED" only once resolution has actually come up empty, never a
+/// spinner that would never resolve.
 public struct AgentRunDetailScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
@@ -58,7 +64,7 @@ public struct AgentRunDetailScreen: View {
     private func activate() async {
         guard let client = backend.client() else { return }
         if storeRunID != runID {
-            let newStore = AgentRunDetailStore(transcriptPath: transcriptPath, host: host, client: client)
+            let newStore = AgentRunDetailStore(runID: runID, transcriptPath: transcriptPath, host: host, client: client)
             store = newStore
             storeRunID = runID
         }
@@ -108,7 +114,7 @@ public struct AgentRunDetailScreen: View {
                 blockShell { ProgressView().controlSize(.small) }
             case .failed(let message):
                 blockShell { failedContent(message) }
-            case .empty where transcriptPath == nil:
+            case .empty where store.resolvedPath == nil:
                 blockShell { MicroLabel("NO TRANSCRIPT RECORDED").foregroundStyle(Color.rupuMute) }
             case .empty:
                 TranscriptFeed(events: [])

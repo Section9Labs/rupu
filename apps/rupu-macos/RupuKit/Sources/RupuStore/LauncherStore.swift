@@ -385,12 +385,24 @@ public final class LauncherStore {
         }
         switch kind {
         case .agentRun:
+            // Final-review fix (Important 3): a standalone agent run is not
+            // an orchestrator run — `GET /api/runs/:id` 404s for it, the
+            // same hotfix root cause C `AgentRunDetailStore`'s doc comment
+            // documents for session-turn rows. `.runDetail` was therefore a
+            // guaranteed dead end for a just-launched agent run; the
+            // addressable destination is `.agentRunDetail`, the same route
+            // `ActivityRow`/`SessionDetailScreen` already use for this row
+            // shape. `transcriptPath: nil` — the launch response only ever
+            // carries a `run_id`/`host_id`, never a transcript path — and
+            // `AgentRunDetailStore` now makes one best-effort attempt to
+            // resolve it (see that type's doc comment) before falling back
+            // to an honest empty state.
             let body = AgentLaunchBody(prompt: prompt, mode: mode, host: hostField)
             let response = try await client.launchAgentRun(name: name, body: body)
             guard let runID = response.runID else {
                 throw CPError.decoding("launchAgentRun response missing run_id")
             }
-            return .runDetail(id: runID, host: response.hostID == "local" ? nil : response.hostID)
+            return .agentRunDetail(id: runID, transcriptPath: nil, host: response.hostID == "local" ? nil : response.hostID)
         case .session:
             let body = AgentLaunchBody(prompt: prompt, mode: mode, host: hostField)
             let response = try await client.startAgentSession(name: name, body: body)
@@ -408,11 +420,30 @@ public final class LauncherStore {
         }
     }
 
+    /// Final-review fix (Important 2): `.session`'s launch route
+    /// (`POST /api/agents/:name/session`) is proxied server-side to whatever
+    /// host it targets, but `SessionDetailStore` — the screen a session
+    /// launch always navigates to — is local-only this phase (see that
+    /// type's doc comment's "Local by construction" section: no host-scoped
+    /// session read/write surface exists yet). Routing a session launch at
+    /// a non-local target is therefore a guaranteed dead end: a 404 on
+    /// every subsequent read, and a send box that can never work.
+    /// `HostChips`'s `localOnly` mode is the primary guard (it disables
+    /// every non-local chip and the fan-out toggle while `kind == .session`
+    /// so the operator can never select one), but this hard filter is
+    /// defense in depth — it keeps `.session` launches local-only even if
+    /// `selectedHosts`/`fanOutAllHealthy` end up set to something else
+    /// without going through the chips at all (e.g. a future call site, or
+    /// state left over from switching `kind` after selecting hosts).
     private func resolvedTargets() -> [String] {
+        let targets: [String]
         if fanOutAllHealthy {
-            return hosts.filter { $0.status == "online" }.map(\.id).sorted()
+            targets = hosts.filter { $0.status == "online" }.map(\.id).sorted()
+        } else {
+            targets = selectedHosts.sorted()
         }
-        return selectedHosts.sorted()
+        guard kind == .session else { return targets }
+        return targets.filter { $0 == "local" }
     }
 
     private func missingRequiredInputNames() -> [String] {

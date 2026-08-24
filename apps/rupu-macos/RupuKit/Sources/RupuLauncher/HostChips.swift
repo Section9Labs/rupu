@@ -13,13 +13,30 @@ import RupuDesign
 /// ignores `selectedHosts` while it's on), so every host chip is disabled
 /// too while the fan-out toggle is active — tapping one would silently do
 /// nothing otherwise.
+///
+/// **`localOnly`** (Phase 3 final-review fix, Important 2): `true` while
+/// `store.kind == .session` — a session launch always navigates to
+/// `SessionDetailScreen`, which is local-only this phase (no host-scoped
+/// session API yet; see `SessionDetailStore`'s doc comment). Every non-local
+/// chip, plus the fan-out toggle (which could only ever resolve to
+/// non-local targets alongside "local", or to nothing at all), renders
+/// dim/disabled and a `MicroLabel` explains why — the operator should never
+/// be able to select a target this launch kind can't honestly reach.
+/// `LauncherStore.resolvedTargets()` hard-filters to `"local"` for
+/// `.session` too, as defense in depth independent of this view.
 struct HostChips: View {
     @Bindable var store: LauncherStore
+    var localOnly: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             MicroLabel("Targets")
                 .foregroundStyle(Color.rupuMute)
+
+            if localOnly {
+                MicroLabel("REMOTE SESSIONS LAND WITH FLEET (PHASE 5)")
+                    .foregroundStyle(Color.rupuMute)
+            }
 
             if store.hosts.isEmpty {
                 MicroLabel("LOADING HOSTS…")
@@ -40,7 +57,8 @@ struct HostChips: View {
     private func hostChip(_ host: APIHostRow) -> some View {
         let isOnline = host.status == "online"
         let isSelected = store.selectedHosts.contains(host.id) && !store.fanOutAllHealthy
-        let disabled = !isOnline || store.fanOutAllHealthy
+        let isLocal = host.id == "local"
+        let disabled = !isOnline || store.fanOutAllHealthy || (localOnly && !isLocal)
 
         return Button {
             toggle(host.id)
@@ -84,6 +102,8 @@ struct HostChips: View {
                 )
         }
         .buttonStyle(.plain)
+        .disabled(localOnly)
+        .opacity(localOnly ? 0.45 : 1)
     }
 
     private func toggle(_ id: String) {
