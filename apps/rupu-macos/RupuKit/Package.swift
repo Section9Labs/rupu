@@ -13,7 +13,7 @@ let package = Package(
     targets: [
         .target(name: "RupuAPI"),
         .target(name: "RupuBackend", dependencies: ["RupuAPI"]),
-        .target(name: "RupuDesign"),
+        .target(name: "RupuDesign", exclude: ["Icons/svg"]),
         .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign"]),
         .target(name: "RupuActivity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(name: "RupuRunDetail", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
