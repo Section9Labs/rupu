@@ -7,8 +7,8 @@ import RupuAPI
 /// (`.run`/`.agent`/`.workflow`/`.approve`). `id` is namespaced per kind
 /// (`"page:overview"`, `"run:run-1"`, ...) so a run and an agent definition
 /// that happen to share a raw identifier never collide in a `ForEach`.
-public struct PaletteItem: Identifiable, Equatable {
-    public enum Kind: String, Equatable {
+public struct PaletteItem: Identifiable, Equatable, Sendable {
+    public enum Kind: String, Equatable, Sendable {
         case page, run, agent, workflow, approve
     }
 
@@ -31,7 +31,7 @@ public struct PaletteItem: Identifiable, Equatable {
 /// page and every fetched run/agent/workflow item; `.approveGate` is the
 /// one item kind (`.approve`) whose execution is a mutation, not a plain
 /// route push — see `PaletteStore.execute(_:)`.
-public enum PaletteAction: Equatable {
+public enum PaletteAction: Equatable, Sendable {
     case navigate(Route)
     case approveGate(runID: String, host: String?)
 }
@@ -149,6 +149,31 @@ public final class PaletteStore {
     private let pendingActions: PendingActions
     private let onNavigate: (Route) -> Void
 
+    /// Bumped on entry to `open()` and captured locally, same precedent as
+    /// `ActivityStore.remoteGeneration`/`RunDetailStore.focusGeneration`:
+    /// an overlapping second `open()` (e.g. a fast re-press of ⌘K while the
+    /// first call's fetch is still in flight) makes the first call's
+    /// captured generation stale, so its *later-arriving* fetch result is
+    /// discarded rather than clobbering the second, fresher call's
+    /// already-applied `items` — without this, whichever call's network
+    /// round trip happened to finish last would win, regardless of which
+    /// was triggered last. The early synchronous resets below (`isOpen`/
+    /// `query`/`activeIndex`/the page-only `items` seed) apply
+    /// unconditionally on every call, same reasoning
+    /// `RunDetailStore.focusStep`'s doc comment gives for its own
+    /// never-awaited branches: nothing has suspended yet at that point, so
+    /// there's no later call that could have superseded them.
+    private var openGeneration = 0
+
+    /// Guards `execute(_:)` against a double-fire on an `.approveGate` item
+    /// (e.g. a double-tap Return) — same rationale as
+    /// `ActivityTable.isBusy`, adapted from a per-row `@State` flag to one
+    /// store-wide flag: the palette only ever executes one selected item at
+    /// a time. `.navigate` items are left unguarded — pushing the same
+    /// route twice, or closing an already-closed palette, is idempotent, so
+    /// there is nothing here for a guard to protect.
+    private var isApprovingGate = false
+
     private static let localHost = "local"
     private static let runsFetchLimit = 50
 
@@ -163,8 +188,13 @@ public final class PaletteStore {
     /// session, then fetches the three live sources concurrently
     /// (`async let`) and folds in whatever came back. Safe to call again
     /// while already open (e.g. a second ⌘K while a slow fetch from the
-    /// first is still in flight) — it just restarts the same fetch.
+    /// first is still in flight) — it just restarts the same fetch; see
+    /// `openGeneration`'s doc comment for why the first call's fetch can
+    /// never clobber the second's.
     public func open() async {
+        openGeneration += 1
+        let generation = openGeneration
+
         isOpen = true
         query = ""
         activeIndex = 0
@@ -175,6 +205,13 @@ public final class PaletteStore {
         async let workflowsResult: [WorkflowDefinition] = (try? await client.workflowDefinitions()) ?? []
 
         let (runs, agents, workflows) = await (runsResult, agentsResult, workflowsResult)
+
+        // A newer `open()` call started while this one was suspended
+        // awaiting the three sources above — that later call already owns
+        // `items` (its own fetch may still be in flight, or may have
+        // already landed). Discard this now-stale result rather than
+        // applying it.
+        guard generation == openGeneration else { return }
 
         items = Self.pageItems + Self.runItems(from: runs) + Self.agentItems(from: agents) + Self.workflowItems(from: workflows)
     }
@@ -189,13 +226,19 @@ public final class PaletteStore {
     /// palette immediately; `.approveGate` items resolve the gate first
     /// (see this type's doc comment), then always navigate to the run —
     /// whether or not the approve POST itself fired — so the operator lands
-    /// somewhere that shows the pending/awaiting state either way.
+    /// somewhere that shows the pending/awaiting state either way. A second
+    /// `.approveGate` execution while one is already in flight is a no-op —
+    /// see `isApprovingGate`'s doc comment.
     public func execute(_ item: PaletteItem) async {
         switch item.action {
         case .navigate(let route):
             onNavigate(route)
             close()
         case .approveGate(let runID, let host):
+            guard !isApprovingGate else { return }
+            isApprovingGate = true
+            defer { isApprovingGate = false }
+
             await approveGate(runID: runID, host: host)
             onNavigate(.runDetail(id: runID, host: host))
             close()

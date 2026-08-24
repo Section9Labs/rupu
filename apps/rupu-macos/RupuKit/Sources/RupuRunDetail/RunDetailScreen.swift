@@ -257,12 +257,13 @@ public struct RunDetailScreen: View {
     /// its own doc comment) but carries the original string in
     /// `.unknown(raw)`. Rendering straight through `StatusPill` would
     /// silently swap that diagnostic string for the generic "Pending"
-    /// label — the same raw-string fallback `ActivityTable`/`FilterBar`
-    /// preserve via `ActivityStatus.displayLabel` (module-private to
-    /// `RupuActivity`, so not reachable here; see that type's own doc
-    /// comment on why `RupuRunDetail` keeps a small local copy instead of a
-    /// cross-module dependency edge). `unrecognizedStatusRaw` is the pure
-    /// seam that decides this — unit-tested in `RunDetailScreenStatusTests`.
+    /// label — the same raw-string fallback `ActivityStatus.displayLabel`
+    /// (now `public` in `RupuStore`, flows-composition Task 3) preserves
+    /// for `ActivityTable`/`FilterBar`. This screen doesn't reuse
+    /// `displayLabel` directly: it needs the *decision* of whether the
+    /// status is unrecognized at all (to choose between `StatusPill` and
+    /// `unknownStatusPill`), not just a label string — `unrecognizedStatusRaw`
+    /// is that pure seam, unit-tested in `RunDetailScreenStatusTests`.
     @ViewBuilder
     private func statusPill(_ rawStatus: String) -> some View {
         if let raw = Self.unrecognizedStatusRaw(rawStatus) {
