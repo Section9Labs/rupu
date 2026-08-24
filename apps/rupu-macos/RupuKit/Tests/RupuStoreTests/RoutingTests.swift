@@ -2,14 +2,25 @@ import Foundation
 import Testing
 @testable import RupuStore
 
-@MainActor @Test func sidebarLeavesAndKindFilterAreSameState() {
+@MainActor @Test func allActivityKindsMapToTheSingleActivitySidebarItem() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
     #expect(model.route == .overview)
-    model.route = .activity(.workflows)
-    #expect(model.selectedSidebarItem == SidebarItem.runsLeaf(.workflows))
-    model.route = .activity(.all)
-    #expect(model.selectedSidebarItem == SidebarItem.runs)
+    for kind in RunKindFilter.allCases {
+        model.route = .activity(kind)
+        #expect(model.selectedSidebarItem == SidebarItem.activity)
+    }
 }
+
+@MainActor @Test func selectingActivityRestoresLastActivityKind() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.route = .activity(.workflows)
+    model.route = .projects
+
+    model.selectedSidebarItem = .activity
+
+    #expect(model.route == .activity(.workflows))
+}
+
 @MainActor @Test func onboardingFlagPersists() {
     let suite = "test-\(UUID())"
     let d = UserDefaults(suiteName: suite)!
@@ -22,10 +33,10 @@ import Testing
     model.route = .activity(.agents)
 
     model.route = .runDetail(id: "run-1", host: "mini")
-    #expect(model.selectedSidebarItem == SidebarItem.runs)
+    #expect(model.selectedSidebarItem == SidebarItem.activity)
 
     model.route = .sessionDetail(id: "sess-1")
-    #expect(model.selectedSidebarItem == SidebarItem.runs)
+    #expect(model.selectedSidebarItem == SidebarItem.activity)
 }
 
 @MainActor @Test func navigateBackRestoresPriorActivityFilterDefaultingToAll() {

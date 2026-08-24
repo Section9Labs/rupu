@@ -1,9 +1,11 @@
 /// Which slice of run history the Activity screen (Phase 2) is filtered to.
 ///
-/// Doubles as the discriminator for the Runs section's sidebar leaves — see
-/// `SidebarItem.runsLeaf(_:)` — so the sidebar selection and the Activity
-/// screen's kind filter are always the same piece of state, never two that
-/// can drift apart.
+/// The Activity screen's own `FilterBar` segmented control is the only UI
+/// that picks a specific kind — the sidebar (v2 rail, flows-composition
+/// Task 1) collapsed to a single `SidebarItem.activity` entry that always
+/// selects whichever kind was last active (`AppModel.lastActivityRoute`),
+/// so this enum is no longer a sidebar discriminator, only the Activity
+/// screen's own filter state.
 public enum RunKindFilter: String, CaseIterable, Sendable {
     case all, agents, workflows, autoflows, sessions
 }
@@ -13,9 +15,10 @@ public enum RunKindFilter: String, CaseIterable, Sendable {
 /// `.runDetail`/`.sessionDetail`/`.agentRunDetail` (Phase 2 / hotfix) are
 /// *pushed* states reached from an `ActivityRow.Navigation` — not directly
 /// sidebar-selectable, unlike `.activity(_:)`. `AppModel.selectedSidebarItem`'s
-/// getter maps all three to plain `.runs` (the sidebar keeps highlighting
-/// the Runs section rather than showing no selection or guessing a kind
-/// leaf). Row activation pushes via `AppModel.navigate(to:)`, so a chain of
+/// getter maps all three (plus every `.activity(_:)` kind) to the single
+/// `SidebarItem.activity` (the sidebar keeps highlighting the Activity row
+/// rather than showing no selection or guessing a kind leaf). Row activation
+/// pushes via `AppModel.navigate(to:)`, so a chain of
 /// pushes (e.g. session → run) can nest; `AppModel.navigateBack()` pops one
 /// level at a time, falling back to whichever `.activity(kind)` route was
 /// current before the first push once `routeStack` is empty (Phase 3, Task
@@ -50,10 +53,14 @@ public enum TimeRange: String, CaseIterable, Sendable {
 /// `AppModel.selectedSidebarItem` — never stored independently, so a
 /// sidebar click and a programmatic `route` change can never disagree about
 /// what's selected.
+///
+/// Flows-composition Task 1 collapsed the old `.runs`/`.runsLeaf(_:)` pair
+/// (a "Runs" section with one row per `RunKindFilter`) into the single
+/// `.activity` row per the v2 flat rail — kind selection now lives entirely
+/// in the Activity screen's own `FilterBar`, not the sidebar.
 public enum SidebarItem: Hashable {
     case overview
-    case runs
-    case runsLeaf(RunKindFilter)
+    case activity
     case projects
     case security
     case library

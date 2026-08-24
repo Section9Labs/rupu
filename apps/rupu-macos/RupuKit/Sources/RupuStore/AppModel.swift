@@ -79,15 +79,21 @@ public final class AppModel {
     /// separate stored selection: a sidebar click writes `route` through
     /// this setter, and anything that changes `route` programmatically
     /// (deep links, Phase 2 navigation) is reflected back into the sidebar
-    /// through the getter. Sidebar selection and the Activity kind filter
-    /// are the same state by construction.
+    /// through the getter.
+    ///
+    /// Flows-composition Task 1: every `.activity(_:)` kind (and every
+    /// pushed detail route reached from one) maps to the single
+    /// `SidebarItem.activity` — the v2 rail no longer has a kind-per-row
+    /// "Runs" section, kind selection lives in the Activity screen's own
+    /// `FilterBar`. Selecting `.activity` from the rail restores
+    /// `lastActivityRoute` rather than forcing `.all`, so the user's kind
+    /// tab survives a round trip through another sidebar item.
     public var selectedSidebarItem: SidebarItem {
         get {
             switch route {
             case .overview: .overview
-            case .activity(.all): .runs
-            case .activity(let kind): .runsLeaf(kind)
-            case .runDetail, .sessionDetail, .agentRunDetail: .runs
+            case .activity: .activity
+            case .runDetail, .sessionDetail, .agentRunDetail: .activity
             case .projects: .projects
             case .security: .security
             case .library: .library
@@ -98,8 +104,7 @@ public final class AppModel {
         set {
             switch newValue {
             case .overview: route = .overview
-            case .runs: route = .activity(.all)
-            case .runsLeaf(let kind): route = .activity(kind)
+            case .activity: route = lastActivityRoute
             case .projects: route = .projects
             case .security: route = .security
             case .library: route = .library
