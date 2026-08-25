@@ -190,7 +190,9 @@ pub(crate) fn resolve_workflow_scoped_explicit(
             let scope_id = scope_id?;
             let workspaces = store(s).list().unwrap_or_default();
             let w = workspaces.into_iter().find(|w| w.id == scope_id)?;
-            let proj_dir = std::path::Path::new(&w.path).join(".rupu").join("workflows");
+            let proj_dir = std::path::Path::new(&w.path)
+                .join(".rupu")
+                .join("workflows");
             let candidate = proj_dir.join(format!("{name}.yaml"));
             if candidate.exists() {
                 Some((candidate, proj_dir, scope_name(&w), ScopeKind::Project))
@@ -339,7 +341,12 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
             .join(".rupu")
             .join("workflows");
         let scope_id = Some(r.workspace.id.clone());
-        project_rows.extend(scan_workflow_names(&dir, r.scope, ScopeKind::Project, scope_id));
+        project_rows.extend(scan_workflow_names(
+            &dir,
+            r.scope,
+            ScopeKind::Project,
+            scope_id,
+        ));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -607,6 +614,50 @@ struct LaunchBody {
     /// [`HostConnector::launch_run`] and returns `{ "run_id", "host_id" }`.
     #[serde(default)]
     host: Option<String>,
+    /// Optional scope selector — same shape/semantics as
+    /// `api::agents::AgentRunBody::scope_kind`/`scope_id`; see
+    /// [`resolve_launch_scope`].
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    scope_id: Option<String>,
+}
+
+/// Resolve an optional `scope_kind`/`scope_id` selector on [`LaunchBody`] to
+/// a working-dir override. The workflow-launch twin of
+/// `api::agents::resolve_launch_scope` — see that function's doc comment for
+/// the full contract (back-compat when both are absent, 400 on an
+/// unrecognized `scope_kind`, 404 naming the scope on any resolution
+/// mismatch, `Project` returns the workspace ROOT so `rupu workflow run`'s
+/// cwd-based discovery finds the SAME `.rupu/workflows/<name>.yaml` the
+/// picker resolved, `Global` has no project path to hand back). Applies here
+/// to [`resolve_workflow_scoped_explicit`] instead of the agent resolver.
+fn resolve_launch_scope(
+    s: &AppState,
+    name: &str,
+    scope_kind: Option<&str>,
+    scope_id: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, ApiError> {
+    let Some(raw_kind) = scope_kind else {
+        return Ok(None);
+    };
+    let kind: ScopeKind = raw_kind.parse().map_err(|_| {
+        ApiError::bad_request(format!(
+            "unknown scope_kind {raw_kind:?}; expected \"global\" or \"project\""
+        ))
+    })?;
+    let (_path, dir, _scope, resolved_kind) =
+        resolve_workflow_scoped_explicit(s, name, kind, scope_id).ok_or_else(|| {
+            ApiError::not_found(format!("workflow {name} not found in the requested scope"))
+        })?;
+    Ok(match resolved_kind {
+        // dir == <workspace root>/.rupu/workflows; strip both segments.
+        ScopeKind::Project => dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(std::path::PathBuf::from),
+        ScopeKind::Global => None,
+    })
 }
 
 /// Start a fresh run of `:name` via the configured [`RunLauncher`] (local) or
@@ -619,7 +670,14 @@ async fn launch_run(
     Path(name): Path<String>,
     body: Option<Json<LaunchBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let b = body.map(|j| j.0).unwrap_or_default();
+    let mut b = body.map(|j| j.0).unwrap_or_default();
+    // Scope validation always runs; the working_dir override it computes is
+    // applied only on the local branch below — see `resolve_launch_scope`'s
+    // doc comment (mirroring `resolve_workflow_scoped`'s host-unaware
+    // contract: this endpoint's scope machinery only ever inspects THIS
+    // process's own local workspace registry).
+    let scope_working_dir =
+        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
     let host = b.host.as_deref().unwrap_or("local").to_string();
 
     if host != "local" {
@@ -642,7 +700,12 @@ async fn launch_run(
         ));
     }
 
-    // Local path: unchanged (including the 501 when no launcher is installed).
+    // Local path: unchanged (including the 501 when no launcher is installed)
+    // except for the scope-driven working_dir override computed above, which
+    // only ever fills in a working_dir the body left unset.
+    if b.working_dir.is_none() {
+        b.working_dir = scope_working_dir.map(|p| p.display().to_string());
+    }
     let launcher = s
         .launcher
         .as_ref()
@@ -778,6 +841,8 @@ mod tests {
             target: None,
             working_dir: None,
             host: None,
+            scope_kind: None,
+            scope_id: None,
         };
 
         let resp = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
@@ -806,10 +871,163 @@ mod tests {
             target: None,
             working_dir: Some("/tmp/projX".into()),
             host: None,
+            scope_kind: None,
+            scope_id: None,
         };
         let _ = launch_run(State(s), Path("nightly".into()), Some(Json(body))).await;
         let got = mock.last.lock().unwrap().clone().unwrap();
         assert_eq!(got.working_dir.as_deref(), Some("/tmp/projX"));
+    }
+
+    // ── Scope-aware launch (Phase 5A Task 2) ────────────────────────────────
+    //
+    // `launch_run` used to resolve `:name` purely as a side effect of the
+    // spawned subprocess's cwd — completely independent of any scope a
+    // picker resolved. For a name defined BOTH globally AND in a project,
+    // that meant the WRONG definition could launch. See
+    // `resolve_launch_scope`'s doc comment for the full contract; mirrors
+    // `api::agents`'s identical fix for `run_agent`/`start_session`.
+
+    const VALID_NIGHTLY_YAML: &str =
+        "name: nightly\nsteps:\n  - id: one\n    agent: x\n    prompt: hi\n";
+
+    /// A global `nightly` AND a project `nightly` both exist. Passing the
+    /// project's explicit scope resolves to that ONE definition: proven by
+    /// the launcher receiving the PROJECT ROOT as `working_dir` (not
+    /// `.rupu/workflows` itself — `rupu workflow run` discovers
+    /// `.rupu/workflows/<name>.yaml` by walking UP from cwd).
+    #[tokio::test]
+    async fn launch_run_scope_kind_project_resolves_project_definition_over_global_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "run_scoped".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(workflows_dir(&s).join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: None, // NOT set — the scope override must fill this in.
+            host: None,
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_a".into()),
+        };
+        let _ = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect("project-scoped launch should resolve");
+
+        let got = mock.last.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            got.working_dir.as_deref(),
+            Some(proj.path().display().to_string().as_str())
+        );
+    }
+
+    /// No `scope_kind`/`scope_id` on the body → byte-for-byte unchanged
+    /// behavior: no working_dir is synthesized, even though a project
+    /// definition of the same name exists and could have been resolved.
+    #[tokio::test]
+    async fn launch_run_absent_scope_leaves_working_dir_untouched_back_compat() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "run_unscoped".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: None,
+            scope_id: None,
+        };
+        let _ = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect("no-scope launch should proceed exactly as before");
+
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            got.working_dir, None,
+            "absent scope must not synthesize a working_dir"
+        );
+    }
+
+    /// An unrecognized `scope_kind` string is a 400 the handler controls,
+    /// and nothing launches.
+    #[tokio::test]
+    async fn launch_run_scope_kind_unrecognized_value_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "unused".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: Some("bogus".into()),
+            scope_id: None,
+        };
+        let err = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect_err("unrecognized scope_kind must 400");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            mock.last.lock().unwrap().is_none(),
+            "must not launch on an invalid scope selector"
+        );
+    }
+
+    /// `scope_kind: project` with a `scope_id` naming no registered
+    /// workspace resolves to nothing → 404, never a silent fallback to
+    /// another layer, and nothing launches.
+    #[tokio::test]
+    async fn launch_run_scope_project_unresolvable_combo_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "unused".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_missing".into()),
+        };
+        let err = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect_err("unresolvable scope must 404");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+        assert!(mock.last.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -986,7 +1204,9 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
         let ws_id = "ws_a".to_string();
 
-        let edited = VALID_YAML.replace("demo", "nightly-sweep").replace("hi", "edited");
+        let edited = VALID_YAML
+            .replace("demo", "nightly-sweep")
+            .replace("hi", "edited");
         let resp = write_workflow(
             State(s.clone()),
             Path("nightly-sweep".into()),
@@ -1087,7 +1307,9 @@ mod tests {
                 scope_id: Some("no-such-workspace".to_string()),
             }),
             Json(WorkflowWriteBody {
-                raw: VALID_YAML.replace("demo", "shared-name").replace("hi", "should-not-land"),
+                raw: VALID_YAML
+                    .replace("demo", "shared-name")
+                    .replace("hi", "should-not-land"),
             }),
         )
         .await
@@ -1123,7 +1345,9 @@ mod tests {
         .unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
-        let edited = VALID_YAML.replace("demo", "nightly-sweep").replace("hi", "edited");
+        let edited = VALID_YAML
+            .replace("demo", "nightly-sweep")
+            .replace("hi", "edited");
         let resp = write_workflow(
             State(s.clone()),
             Path("nightly-sweep".into()),
@@ -1247,8 +1471,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
-        std::fs::write(wf_path(&s, "nightly-sweep"), VALID_YAML.replace("demo", "nightly-sweep"))
-            .unwrap();
+        std::fs::write(
+            wf_path(&s, "nightly-sweep"),
+            VALID_YAML.replace("demo", "nightly-sweep"),
+        )
+        .unwrap();
 
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
@@ -1316,8 +1543,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
-        std::fs::write(wf_path(&s, "shared-name"), VALID_YAML.replace("demo", "shared-name"))
-            .unwrap();
+        std::fs::write(
+            wf_path(&s, "shared-name"),
+            VALID_YAML.replace("demo", "shared-name"),
+        )
+        .unwrap();
 
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
@@ -1415,8 +1645,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
-        std::fs::write(wf_path(&s, "shared-name"), VALID_YAML.replace("demo", "shared-name"))
-            .unwrap();
+        std::fs::write(
+            wf_path(&s, "shared-name"),
+            VALID_YAML.replace("demo", "shared-name"),
+        )
+        .unwrap();
 
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
@@ -1587,8 +1820,11 @@ mod tests {
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
         std::fs::create_dir_all(&proj_workflows).unwrap();
-        std::fs::write(proj_workflows.join("nightly.yaml"), VALID_YAML.replace("demo", "nightly"))
-            .unwrap();
+        std::fs::write(
+            proj_workflows.join("nightly.yaml"),
+            VALID_YAML.replace("demo", "nightly"),
+        )
+        .unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
         let Json(rows) = list_workflows(State(s.clone())).await.expect("ok");
@@ -2017,12 +2253,7 @@ mod tests {
                 "name: issue-triage\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    prompt: p\n",
             )
             .unwrap();
-            register_workspace_with_remote(
-                &tmp,
-                &format!("ws_{name}"),
-                &root,
-                Some(remote),
-            );
+            register_workspace_with_remote(&tmp, &format!("ws_{name}"), &root, Some(remote));
         }
 
         // The list's row scope names the representative worktree...
@@ -2155,7 +2386,11 @@ mod tests {
     fn workflow_launch_body_request_fixture_roundtrips() {
         // Locks `LaunchBody`'s wire shape (`POST /api/workflows/:name/run`) —
         // `inputs` defaults to `{}`, `host` in the BODY (unlike the
-        // run-control routes, which take it as a query param).
+        // run-control routes, which take it as a query param). No
+        // `scope_kind`/`scope_id` in this payload — proves the Phase 5A
+        // Task 2 selector (see `resolve_launch_scope`) is absent-tolerant
+        // (defaults to `None`); `api::agents::agent_run_body_request_fixture_roundtrips`
+        // carries the "present" case for the same field pair.
         let raw = check_request_fixture(
             "workflow_launch_body.json",
             "{\n  \"inputs\": {\n    \"branch\": \"main\"\n  },\n  \"mode\": \"ask\",\n  \"host\": \"mini\"\n}\n",
@@ -2166,6 +2401,8 @@ mod tests {
         assert_eq!(body.target, None);
         assert_eq!(body.working_dir, None);
         assert_eq!(body.host.as_deref(), Some("mini"));
+        assert_eq!(body.scope_kind, None);
+        assert_eq!(body.scope_id, None);
     }
 
     #[test]

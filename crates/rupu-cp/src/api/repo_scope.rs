@@ -50,6 +50,26 @@ pub(crate) enum ScopeKind {
     Project,
 }
 
+/// Parses the same two lowercase tokens the `snake_case` `Deserialize` impl
+/// above accepts (`"global"` / `"project"`), for callers that receive
+/// `scope_kind` as a plain `Option<String>` JSON body field rather than
+/// through `axum::Query`'s enum deserialization — e.g. the launch bodies
+/// (`AgentRunBody`/`SessionStartBody`/`LaunchBody`) that thread scope
+/// resolution into `POST .../run` and `.../session`, where an unrecognized
+/// value must become a 400 the handler controls rather than a generic axum
+/// JSON-extraction rejection.
+impl std::str::FromStr for ScopeKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "global" => Ok(ScopeKind::Global),
+            "project" => Ok(ScopeKind::Project),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Query params accepted by `DELETE /api/agents/:name`, `DELETE
 /// /api/workflows/:name`, and `POST /api/autoflows/:name/enable|disable` to
 /// pin down EXACTLY which layer's file to act on, rather than trusting
