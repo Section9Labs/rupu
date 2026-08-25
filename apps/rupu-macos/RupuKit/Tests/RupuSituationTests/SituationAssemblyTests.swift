@@ -95,6 +95,57 @@ private func project(wsID: String, name: String) -> APIProjectRow {
     #expect(snapshot.vitals.errors == 1)
 }
 
+// MARK: - freshKeys (redesign pass, Task 4)
+
+@Test func freshEventsTranslateToTheMatchingCardsKey() {
+    let row = CPEventRow(event: .runPaused(runID: "run-1"), ts: 1_000, pos: 0)
+    let snapshot = assembleSituation(
+        eventRows: [row], findings: [], findingsSummary: nil, projects: [],
+        runToWorkspace: [:], runTerminalStatus: [:], dashboard: nil, eventsPerMin: 0,
+        freshEvents: [.runPaused(runID: "run-1")]
+    )
+    #expect(snapshot.freshKeys == Set([snapshot.cards[0].key]))
+}
+
+@Test func onlyTheEventsInFreshEventsAreMarkedFreshNotEveryCard() {
+    let rows = [
+        CPEventRow(event: .runPaused(runID: "fresh"), ts: 2_000, pos: 0),
+        CPEventRow(event: .runResumed(runID: "stale"), ts: 1_000, pos: 1),
+    ]
+    let snapshot = assembleSituation(
+        eventRows: rows, findings: [], findingsSummary: nil, projects: [],
+        runToWorkspace: [:], runTerminalStatus: [:], dashboard: nil, eventsPerMin: 0,
+        freshEvents: [.runPaused(runID: "fresh")]
+    )
+    #expect(snapshot.freshKeys.count == 1)
+    let freshCard = snapshot.cards.first { $0.runID == "fresh" }
+    #expect(freshCard != nil)
+    #expect(snapshot.freshKeys == Set([freshCard!.key]))
+}
+
+@Test func aFindingCardIsNeverMarkedFreshEvenIfFreshEventsIsNonEmpty() {
+    // `freshEvents` is keyed on `CPEvent` — a finding has no `CPEvent` of
+    // its own, so it can never appear here, matching `Events.tsx`'s own
+    // `freshKeys` (populated only from the live event stream, never from a
+    // finding).
+    let snapshot = assembleSituation(
+        eventRows: [], findings: [finding(id: "f1", declaredAt: "2026-01-01T00:00:00Z")],
+        findingsSummary: nil, projects: [],
+        runToWorkspace: [:], runTerminalStatus: [:], dashboard: nil, eventsPerMin: 0,
+        freshEvents: [.runPaused(runID: "unrelated")]
+    )
+    #expect(snapshot.freshKeys.isEmpty)
+}
+
+@Test func defaultFreshEventsIsEmptyAndProducesNoFreshKeys() {
+    let row = CPEventRow(event: .runPaused(runID: "run-1"), ts: 1_000, pos: 0)
+    let snapshot = assembleSituation(
+        eventRows: [row], findings: [], findingsSummary: nil, projects: [],
+        runToWorkspace: [:], runTerminalStatus: [:], dashboard: nil, eventsPerMin: 0
+    )
+    #expect(snapshot.freshKeys.isEmpty)
+}
+
 // MARK: - resolveCardProject
 
 @Test func resolveCardProjectPrefersTheCardsOwnProjectNameOverRunResolution() {

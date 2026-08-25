@@ -417,6 +417,74 @@ struct SituationStoreTests {
         box.latest.finish()
     }
 
+    // MARK: - Fresh-arrival tracking (redesign pass, Task 4)
+
+    /// The initial history backfill must NEVER mark anything fresh — only a
+    /// genuinely new LIVE event does (`Events.tsx`'s own trigger: `freshKeys`
+    /// is populated only inside `subscribeEvents`'s callback, never inside
+    /// the `getEvents` history-load effect). This test doesn't assert real-
+    /// time expiry (that's `foldFreshMarks`'s own table-tested contract in
+    /// `SituationSelectionTests.swift`, with an injected `now` and no real
+    /// sleeps — #611); it only proves the WIRING marks the right events at
+    /// all.
+    @MainActor @Test func historyBackfillNeverMarksAnythingFreshOnlyALiveArrivalDoes() async {
+        let backfillBody = Self.encodeEvents([["ts": 1_000, "pos": 0, "type": "run_paused", "run_id": "run-1"]])
+        let (store, box) = makeStore { req in
+            if let hit = Self.defaultAggregateResponse(req) { return hit }
+            guard req.url?.path == "/api/events" else { return (200, Data("[]".utf8)) }
+            return (200, backfillBody)
+        }
+
+        await store.activate()
+        #expect(store.eventRows.count == 1)
+        #expect(store.freshEvents.isEmpty, "the history backfill alone must never mark anything fresh")
+
+        box.latest.yield(.event(.runPaused(runID: "run-2")))
+        await expectEventually("the live-only event lands") { store.eventRows.count == 2 }
+
+        #expect(
+            store.freshEvents == Set([CPEvent.runPaused(runID: "run-2")]),
+            "only the genuinely new LIVE event is fresh — the backfilled row must stay absent"
+        )
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// A reconnect's re-fetched backfill page goes through the same
+    /// `mergeIncoming(_:)` path as the initial history load — it must not
+    /// mark its "gap" row fresh either, matching the web's own trigger
+    /// (`subscribeEvents`'s live callback only; `getEvents` never touches
+    /// `freshKeys`, and the web has no reconnect re-backfill at all to even
+    /// raise the question).
+    @MainActor @Test func reconnectBackfillNeverMarksItsRecoveredRowsFresh() async {
+        let firstPageRow: [String: Any] = ["ts": 1_000, "pos": 0, "type": "run_paused", "run_id": "run-first-page"]
+        let firstPageBody = Self.encodeEvents([firstPageRow])
+        let gapRow: [String: Any] = ["ts": 5_000, "pos": 0, "type": "run_paused", "run_id": "run-gap"]
+        let secondPageBody = Self.encodeEvents([gapRow, firstPageRow])
+
+        let eventsRequestCount = HitCounter()
+        let (store, box) = makeStore { req in
+            if let hit = Self.defaultAggregateResponse(req) { return hit }
+            guard req.url?.path == "/api/events" else { return (200, Data("[]".utf8)) }
+            return (200, eventsRequestCount.incrementAndGet() == 1 ? firstPageBody : secondPageBody)
+        }
+
+        await store.activate()
+        #expect(store.eventRows.count == 1)
+
+        box.latest.yield(.connection(false))
+        box.latest.yield(.connection(true))
+        await expectEventually("the reconnect backfill's gap row merges in") {
+            store.eventRows.contains { $0.event == .runPaused(runID: "run-gap") }
+        }
+
+        #expect(store.freshEvents.isEmpty, "a reconnect's recovered rows must not be marked fresh")
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // MARK: - Mutations
 
     /// `approve(runID:stepID:)` begins a gate-scoped pending key immediately

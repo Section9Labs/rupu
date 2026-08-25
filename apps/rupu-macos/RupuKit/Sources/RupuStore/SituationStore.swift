@@ -168,6 +168,21 @@ public final class SituationStore {
     /// `runStatus` map.
     public private(set) var runTerminalStatus: [String: String] = [:]
 
+    /// Fresh-arrival highlight ledger — see `foldFreshMarks`'s doc comment
+    /// (`SituationSelection.swift`) for the exact web citation and why this
+    /// lives store-side rather than in `RupuSituation`. Only a genuinely new
+    /// LIVE event (`applyLive(_:)` below) ever inserts into this — never the
+    /// initial history backfill, never a reconnect's re-fetched page (both
+    /// go through `mergeIncoming(_:)`, which never touches it).
+    public private(set) var freshEvents: Set<CPEvent> = []
+    private var freshMarks: [CPEvent: Date] = [:]
+    private var freshTickTask: Task<Void, Never>?
+    /// Real-time prune cadence for `freshMarks` — deliberately much finer
+    /// than `tickInterval`'s 5s (`Events.tsx` `SPARK_TICK_MS`): a highlight
+    /// is only supposed to last `freshHighlightSeconds` (2.5s), so pruning
+    /// only every 5s could leave a card visibly "fresh" for up to 7.5s.
+    private static let freshTickInterval: Duration = .milliseconds(250)
+
     /// Events-per-minute, sampled every `tickInterval` (5s, matching the
     /// web's `SPARK_TICK_MS`) via `sparkTick(current:eventsInWindow:
     /// windowMS:)` (`SituationSelection.swift`).
@@ -278,6 +293,7 @@ public final class SituationStore {
         guard generation == self.generation else { return } // ruling 9: torn down mid-await
         startPolling(generation: generation)
         startTicking(generation: generation)
+        startFreshTicking(generation: generation)
     }
 
     /// Stops the live tail, the poll loop, and the tick loop. Idempotent —
@@ -290,6 +306,8 @@ public final class SituationStore {
         pollTask = nil
         tickTask?.cancel()
         tickTask = nil
+        freshTickTask?.cancel()
+        freshTickTask = nil
         freshness = .idle
     }
 
@@ -399,6 +417,12 @@ public final class SituationStore {
         rows.insert(newRow, at: 0)
         trimAndAssign(rows)
         eventsSinceTick += 1
+
+        // Fresh-arrival highlight — ONLY a genuinely new live event marks
+        // one (never the history backfill, never a reconnect's re-fetched
+        // page — see `freshEvents`'s doc comment).
+        freshMarks = foldFreshMarks(freshMarks, arrivals: [event], now: Date())
+        freshEvents = Set(freshMarks.keys)
 
         // `resolveRuns` is NOT called here — throttled to the aggregate
         // poll tick (see the type's doc comment).
@@ -538,6 +562,31 @@ public final class SituationStore {
         let result = sparkTick(current: spark, eventsInWindow: n, windowMS: Self.tickIntervalMS)
         spark = result.spark
         eventsPerMin = result.eventsPerMin
+    }
+
+    // MARK: - Fresh-arrival prune ticker
+
+    /// Real-time pruning independent of any new arrival, so a highlight
+    /// still clears on schedule (`freshHighlightSeconds` after it landed)
+    /// even in a quiet stretch with no further live events to trigger
+    /// another `foldFreshMarks` call from `applyLive(_:)`. Same
+    /// start/stop/regeneration-guard shape as `startTicking(generation:)`
+    /// right above, just on `freshTickInterval`'s much finer cadence.
+    private func startFreshTicking(generation: Int) {
+        freshTickTask?.cancel()
+        freshTickTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.freshTickInterval)
+                guard !Task.isCancelled, let self, generation == self.generation else { return }
+                self.pruneFreshMarks()
+            }
+        }
+    }
+
+    private func pruneFreshMarks() {
+        guard !freshMarks.isEmpty else { return }
+        freshMarks = foldFreshMarks(freshMarks, arrivals: [], now: Date())
+        freshEvents = Set(freshMarks.keys)
     }
 
     // MARK: - Mutations (await-card Approve/Reject)
