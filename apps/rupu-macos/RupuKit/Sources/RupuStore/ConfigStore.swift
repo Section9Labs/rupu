@@ -82,8 +82,9 @@ public final class ConfigStore {
     /// read-side probe) returns 501 — see the type doc comment's
     /// "Read-only detection" section. Never reset back to `false`.
     public private(set) var readOnly = false
-    /// The last save attempt's error, verbatim for a 400 (the server's TOML/
-    /// policy validation message) or the fixed 501 message otherwise —
+    /// The last save attempt's error — for a 400, the `"error"` field
+    /// unwrapped from the server's `{"error": …}` envelope (falling back to
+    /// the raw body if it isn't that shape); the fixed 501 message otherwise —
     /// cleared at the START of the next save attempt (any of the three
     /// methods), not by `load`.
     public private(set) var saveError: String?
