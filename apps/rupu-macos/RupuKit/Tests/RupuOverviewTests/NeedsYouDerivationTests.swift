@@ -110,6 +110,15 @@ private let oneDay: TimeInterval = 86_400
     #expect(deriveNeedsYou(rows: rows, range: .d7, now: now).items.isEmpty)
 }
 
+@Test func failedRowExactlyAtTheD7WindowBoundaryIsIncluded() {
+    // Locks the documented inclusive `<=`: `now - 7d` is exactly on the
+    // boundary `fallsInsideRange` compares against, not one tick inside or
+    // outside it.
+    let rows = [row(id: "on-boundary", status: .failed, startedAt: now.addingTimeInterval(-7 * oneDay))]
+    let result = deriveNeedsYou(rows: rows, range: .d7, now: now)
+    #expect(result.items.map(\.row.id) == ["on-boundary"])
+}
+
 // MARK: - Cap + overflow
 
 @Test func capsAtSixItemsAndReportsOverflow() {
@@ -126,6 +135,21 @@ private let oneDay: TimeInterval = 86_400
     // the earliest), then the two newest failed rows (`failed-0`'s `-0*1d`
     // offset is the most recent).
     #expect(result.items.map(\.row.id) == ["gate-3", "gate-2", "gate-1", "gate-0", "failed-0", "failed-1"])
+}
+
+@Test func sevenGatesAloneFillTheCapAndExcludeEveryFailedRow() {
+    // Gates alone can exceed the cap: the failed side must be shut out
+    // entirely (not partially squeezed in), and `overflow` counts the
+    // excluded gate plus the entirely-excluded failed row.
+    let gates = (0..<7).map { i in
+        row(id: "gate-\(i)", status: .awaiting, startedAt: now.addingTimeInterval(-Double(i) * 60))
+    }
+    let failed = [row(id: "failed-0", status: .failed, startedAt: now)]
+    let result = deriveNeedsYou(rows: gates + failed, range: .d7, now: now)
+    #expect(result.items.count == 6)
+    #expect(result.items.allSatisfy { $0.kind == .gate })
+    #expect(!result.items.map(\.row.id).contains("failed-0"))
+    #expect(result.overflow == 2)
 }
 
 @Test func overflowIsZeroFlooredWhenTotalIsUnderTheCap() {
