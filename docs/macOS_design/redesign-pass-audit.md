@@ -1,0 +1,22 @@
+# Redesign-pass side-by-side audit
+
+**Date:** 2026-08-25 · **Method:** live side-by-side — the app (branch `feat/macos-redesign-pass`, = main post-#611, incl. the #607 toolbar) against the embedded web CP at `127.0.0.1:7420`, same backend/data, light theme (matt's current appearance selection; the web toggled to Light to match). Wording/tint findings additionally verified against source (`web/src/lib/status.ts`, `web/src/components/StatusPill.tsx`, `RupuDesign/Chrome/StatusPill.swift`). Spec: `docs/superpowers/specs/2026-08-25-rupu-macos-redesign-pass-design.md` §1.
+
+Dispositions: **T2** (chrome kit), **T6** (coherence batch), **park** (backlog with citation), **contracted** (deliberate per V2-CONTRACT — not a divergence).
+
+| # | Surface | Web | App | Divergence | Disposition |
+|---|---|---|---|---|---|
+| A1 | Status pill shape (run-detail header, and every StatusPill consumer) | `rounded` ring pill — 4px corner radius (`StatusPill.tsx:79`) | `Capsule` (fully round) | **Backlog nit 23 confirmed in situ** (run header "Failed" pill) | T2 |
+| A2 | Status pill tint policy | `pending`/`cancelled`/`skipped` FLAT: `bg-surface text-ink-dim/mute ring-border` (`status.ts:58-65,121-135`); all other statuses tinted `/10` bg + status ink + `/30` ring | All statuses tinted | **Backlog nit 24 confirmed**; the flat set is exactly those three | T2 |
+| A3 | Sidebar brand header | Purple rounded-square logo badge + "rupu" + "Control Plane" subtitle | Bare bold "rupu" wordmark | **Backlog nit 25 PINNED**: missing badge + subtitle | T6 |
+| A4 | "Awaiting" wording | Canonical label `Awaiting approval` (sentence case, `status.ts:95`) everywhere | Mixed: `Awaiting Approval` (Title Case — `RunDetailTabs.swift:232`), `Awaiting` (short — `ActivityRow.swift:73` status label + the Activity filter chip), `Awaiting approval` (StatusPill, correct) | **Backlog nit 26 PINNED**: casing/truncation inconsistency vs one canonical string. Chip context may justify the short form (chips are narrow) — fix the Title Case unconditionally; the table label adopts the full canonical string (room exists); the filter chip may keep the short form if T2's chip work finds width pressure, recorded either way | T6 |
+| A5 | Activity filter chips | Neutral outline chips; selected = solid brand | Every chip tinted by its status color, capsule | Chip treatment diverges (tint + shape) | T2 (shape rides the kit change; tint policy: match web's neutral-until-selected) |
+| A6 | Activity table status column | Tinted pill badges per row | Dot + plain text | Denser dot+text was the v2 table idiom — **contracted** (V2-CONTRACT density language); NOT changed. Recorded so nobody "fixes" it into pills later without a decision | contracted |
+| A7 | Overview tile labels | Sentence case ("Awaiting you") | Mono-caps eyebrows ("AWAITING YOU") | **Contracted** — V2-CONTRACT:75 sanctions the mono-caps eyebrow idiom for true captions | contracted |
+| A8 | Settings window vs appearance | n/a (web has one theme system) | Settings scene renders DARK content while the app appearance is Light — the scene never applies the `appearance` preference (observed live: Appearance=Light, Settings content dark) | **New finding, worse than the parked "tone" note**: the Settings scene ignores appearance entirely | T6 (apply the same preferredColorScheme mapping the main WindowGroup uses, plus token-palette content styling per spec §4) |
+| A9 | Top bar (Range presets, Customize, Search, New Run, Live) | — | #607's native toolbar landed; #612 (open) reworks it further | Region owned by PR #612 — including backlog nit 27 (scope-select thinness) | park (#612 pointer; spec §0) |
+| A10 | Menu bar "Awaiting" stat tile label | n/a (web has no menu bar) | `Awaiting` short form (`MenuBarView.swift:133`) | Consistent with tile-eyebrow idiom; acceptable short form in a 4-tile strip | contracted (recorded) |
+
+**Not audited screen-by-screen this pass** (no divergence hypothesis pending, and the fix tasks are code-contract-driven): Security/Library/Fleet/Usage/Projects table internals beyond the shared chrome above — the T2 kit change sweeps their pills/chips uniformly; any screen-specific fallout surfaces in T2's consumer sweep. The SR/Events comparison is owned by T4's behavior port (follow/pin + fresh), not a visual delta.
+
+**Fix-row assignment summary:** T2 ← A1, A2, A5. T6 ← A3, A4, A8 (+ the spec §4 dead-code riders). Parked ← A9 (with #612). Contracted (no action) ← A6, A7, A10.
