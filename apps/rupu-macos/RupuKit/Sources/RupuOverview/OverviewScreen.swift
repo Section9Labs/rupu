@@ -121,7 +121,10 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
 /// every other screen's initial-load state.
 public struct OverviewScreen: View {
     @Bindable var model: AppModel
-    let backend: BackendController
+    /// `@Bindable`, not a plain `let`, so `.onChange(of: backend.health)`
+    /// below observes it the same way `RootView`/`OnboardingView` already
+    /// do — see the cold-launch fix note on `body`.
+    @Bindable var backend: BackendController
 
     @State private var dashboardStore: DashboardStore?
     @State private var activityStore: ActivityStore?
@@ -147,13 +150,36 @@ public struct OverviewScreen: View {
             if let dashboardStore, let activityStore {
                 content(dashboardStore: dashboardStore, activityStore: activityStore)
             } else {
-                centeredLabel("Backend not connected")
+                notReadyView
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color.rupuBg)
         .task {
             await activate()
+        }
+        // Cold-launch fix: `.overview` is `AppModel.route`'s default and
+        // never persisted (see `AppModel.swift` — only `range`/`scopeWsID`/
+        // `onboardingComplete` are), so this is *always* the very first
+        // screen a launch renders — before onboarding has necessarily
+        // finished attaching/spawning the embedded server. The `.task`
+        // above fires immediately on that first render, while
+        // `backend.health` is still `.starting` and `backend.client()` is
+        // `nil` — `activate()` early-returns, and with no *second* trigger,
+        // this screen was stuck showing `notReadyView` forever even after
+        // health reached `.healthy` and the toolbar/footer went live
+        // (`ActivityScreen`/`RunDetailScreen` never surfaced this because
+        // neither can be the cold-launch screen — see their own doc
+        // comments — so their `.task` always ran again on a subsequent,
+        // already-connected navigation). Re-running `activate()` on every
+        // transition to `.healthy` closes the gap; `activate()`'s
+        // client-identity rebuild (fix round 1) already makes a repeat call
+        // idempotent (reuses the existing pair unless the client actually
+        // changed), so firing this on every healthy transition — not just
+        // the first — is safe.
+        .onChange(of: backend.health) { _, newHealth in
+            guard case .healthy = newHealth else { return }
+            Task { await activate() }
         }
         .onChange(of: model.range) { _, newRange in
             // Fix round 1: a bare `Task { await dashboardStore?.setRange(...) }`
@@ -304,6 +330,39 @@ public struct OverviewScreen: View {
         }
         .frame(maxWidth: .infinity, minHeight: 80)
         .panelStyle(.panel)
+    }
+
+    /// Pre-store placeholder, chosen from `backend.health` rather than a
+    /// single fixed string — a cold launch spends real, visible time with
+    /// `dashboardStore`/`activityStore` still `nil` while `configureEmbedded`/
+    /// `connectRemote` are attaching or spawning, and that is not the same
+    /// state as a genuinely failed connection. "Backend not connected" is
+    /// reserved for `.down`/`.incompatible` (health has actually resolved to
+    /// a failure); every other health value (`.starting`, `.degraded` — a
+    /// single flaky poll, not a verdict — and `.healthy` itself during the
+    /// brief window before `activate()`'s async work lands) shows the
+    /// standard connecting affordance instead, matching
+    /// `LauncherSheet.connectingView`'s spinner + "Connecting" (`RupuLauncher/
+    /// LauncherSheet.swift`) rather than this screen's own previously
+    /// invented, permanently-wrong-looking copy.
+    @ViewBuilder
+    private var notReadyView: some View {
+        switch backend.health {
+        case .down, .incompatible:
+            centeredLabel("Backend not connected")
+        case .starting, .degraded, .healthy:
+            connectingView
+        }
+    }
+
+    private var connectingView: some View {
+        VStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Connecting")
+                .font(.noteText)
+                .foregroundStyle(Color.rupuMute)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func centeredLabel(_ label: String) -> some View {

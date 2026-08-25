@@ -24,6 +24,20 @@ import RupuDesign
 /// keep it live; `activate(kind:)` additionally seeds a freshly-built
 /// store with the model's *current* value, since `.onChange` only fires on
 /// a change from here on, not on first appearance.
+///
+/// **Does NOT need `OverviewScreen`'s `.onChange(of: backend.health)`
+/// cold-launch fix**: that fix exists because `.overview` is
+/// `AppModel.route`'s default and never persisted, so it is *always* the
+/// very first screen a cold launch renders — sometimes before
+/// `backend.client()` resolves, with nothing to re-trigger `activate(kind:)`
+/// once it does. This screen can only ever be reached by navigating here
+/// (sidebar click, `AppModel.navigate(to:)`) — by the time that happens,
+/// the shell has already been up and running (and therefore already past
+/// its own connection attempt) for at least one prior screen's worth of
+/// time, so `.task(id: kind)`'s first run always finds `backend.client()`
+/// already resolved in practice. If `route` ever becomes persisted/restored
+/// across launches (it isn't today — see `AppModel.swift`), this reasoning
+/// would need revisiting.
 public struct ActivityScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
