@@ -60,11 +60,14 @@ func parseSpendDayKey(_ key: String) -> Date? {
 
 // MARK: - Series → color
 
-/// Fixed categorical palette, ported verbatim (same ten hex values, same
+/// Fixed MODEL-IDENTITY palette, ported verbatim (same ten hex values, same
 /// order) from the web's `MODEL_PALETTE` (`modelColors.ts`) — theme-
-/// invariant by design on both sides (a chart series color doesn't need to
-/// answer to light/dark the way semantic status tones do, and the web's own
-/// palette isn't defined as a light/dark pair either).
+/// invariant by design on both sides: a model's color here is meant to be
+/// the SAME color that model would wear anywhere else this app colored it
+/// (an identity, not an arbitrary category), and the web's own
+/// `MODEL_PALETTE` is likewise a single fixed hex list, not a light/dark
+/// pair. **`.model` pivot only** — see `assignSeriesColors`'s doc comment
+/// for the split.
 let spendSeriesPalette: [Color] = [
     Color(red: 0x18 / 255, green: 0x60 / 255, blue: 0xF2 / 255), // brand blue
     Color(red: 0x22 / 255, green: 0xC5 / 255, blue: 0x5E / 255), // green
@@ -78,22 +81,53 @@ let spendSeriesPalette: [Color] = [
     Color(red: 0x14 / 255, green: 0xB8 / 255, blue: 0xA6 / 255), // teal
 ]
 
-/// Assigns each distinct series label a stable color by cycling
-/// `spendSeriesPalette` over the SORTED label set — exact port of the web's
-/// `assignModelColors` (same "sort first, so the mapping is deterministic
-/// regardless of input order" contract, cycled with `%` past 10 distinct
-/// keys). Deliberately index-based over sorted labels, never a per-model or
-/// per-brand hardcode (there is no "claude = orange" table here, matching
-/// the web source, which reserves an actual identity palette for the model
-/// pivot specifically and uses this same generic cycle for the other five —
-/// this app doesn't distinguish the two, an honest simplification: an
-/// arbitrary stable categorical cycle for every pivot, not invented brand
-/// identity for one of them).
-func assignSeriesColors(_ labels: [String]) -> [String: Color] {
+/// Themed categorical ramp for the FIVE non-model pivots (provider/agent/
+/// workflow/host/project) — structural port of the web's `categoricalRamp`
+/// (`pivotColors.ts`): ten entries reusing `RupuDesign`'s own EXISTING
+/// theme-adaptive tokens (brand/status/severity/info families) rather than
+/// inventing new hex literals, in the same relative order the web source
+/// uses (`brand500, status.running, sev.high, info, status.awaiting,
+/// brand700, sev.medium, status.paused, sev.low, status.completed` — mapped
+/// onto this app's own case names, `status.completed` → `Color.status(.done)`).
+/// Unlike `spendSeriesPalette` above, every entry here IS theme-adaptive —
+/// each resolves to a different RGB pair under light vs dark Aqua via
+/// `dynamicColor`, same as `Color.status`/`Color.severity` do everywhere
+/// else in this app — because these five pivots have no identity of their
+/// own to color by (a `host` or `workflow` name isn't "a color", the way a
+/// model's brand-adjacent color arguably is), so there's no reason NOT to
+/// answer to the system theme the way every other semantic tone in this app
+/// does. Order is arbitrary but FIXED (a plain `let` constant, never
+/// reshuffled) so the mapping stays deterministic across renders of the
+/// same pivot's label set — matching the web source's identical "arbitrary
+/// but fixed" comment on its own ramp.
+let categoricalPivotRamp: [Color] = [
+    .rupuBrand,
+    .status(.running),
+    .severity(.high),
+    .rupuInfo,
+    .status(.awaiting),
+    .rupuBrand700,
+    .severity(.med),
+    .status(.paused),
+    .severity(.low),
+    .status(.done),
+]
+
+/// Assigns each distinct series label a stable color, cycling ONE OF TWO
+/// palettes depending on the active pivot — mirrors the web's own split
+/// (`UsageTimelineStacked.tsx`: `pivot === 'model' ? assignModelColors(...)
+/// : assignCategoricalColors(...)`, the same split `ModelBreakdownTable`
+/// makes on the web): `.model` uses `spendSeriesPalette` (fixed identity
+/// colors); every other pivot uses `categoricalPivotRamp` (theme-adaptive).
+/// Both branches sort the label set first — exact port of both web
+/// functions' shared "sort first, so the mapping is deterministic
+/// regardless of input order" contract.
+func assignSeriesColors(_ labels: [String], pivot: UsagePivot) -> [String: Color] {
     let sorted = Array(Set(labels)).sorted()
+    let palette = pivot == .model ? spendSeriesPalette : categoricalPivotRamp
     var map: [String: Color] = [:]
     for (index, label) in sorted.enumerated() {
-        map[label] = spendSeriesPalette[index % spendSeriesPalette.count]
+        map[label] = palette[index % palette.count]
     }
     return map
 }
@@ -164,22 +198,43 @@ public struct SpendChart: View {
     }
 
     public var body: some View {
-        let domain = seriesDomain
-        let colors = assignSeriesColors(domain)
-        Chart {
-            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                AreaMark(
-                    x: .value("Date", row.day),
-                    y: .value("Spend", row.value)
-                )
-                .foregroundStyle(by: .value("Series", row.series))
-                .opacity(spendChartFillOpacity)
+        if rows.isEmpty {
+            emptyBlock
+        } else {
+            let domain = seriesDomain
+            let colors = assignSeriesColors(domain, pivot: pivot)
+            Chart {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    AreaMark(
+                        x: .value("Date", row.day),
+                        y: .value("Spend", row.value)
+                    )
+                    .foregroundStyle(by: .value("Series", row.series))
+                    .opacity(spendChartFillOpacity)
+                }
             }
+            .chartForegroundStyleScale(
+                domain: domain,
+                range: domain.map { colors[$0] ?? Color.rupuDim }
+            )
+            .modifier(SpendChartChrome())
         }
-        .chartForegroundStyleScale(
-            domain: domain,
-            range: domain.map { colors[$0] ?? Color.rupuDim }
-        )
-        .modifier(SpendChartChrome())
+    }
+
+    /// Honest empty state — no axes, no legend, no zero-everywhere chart
+    /// pretending there's a shape to show. Mirrors the web's own
+    /// `UsageTimelineStacked` empty branch ("No usage recorded yet", quiet
+    /// centered text, no chart chrome) rather than rendering blank axes over
+    /// nothing, which `BreakdownTable`/`OutlierPanel` already avoid for
+    /// their own zero-row cases.
+    private var emptyBlock: some View {
+        VStack {
+            Spacer(minLength: 0)
+            Text("No usage recorded yet")
+                .font(.noteText)
+                .foregroundStyle(Color.rupuMute)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: spendChartPlotHeight)
     }
 }

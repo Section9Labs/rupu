@@ -299,6 +299,21 @@ public struct UsageScreen: View {
 /// back to `.unavailable(reason:)` carrying the raw wire string as the
 /// reason, rather than silently misreading it as `.offline` — an honest
 /// "don't know what this means yet" over a guessed tone.
+///
+/// **The `.ok` tone's 120s stale-cutoff doesn't carry its original
+/// justification over to this screen.** `FreshnessTone.tone(for:now:)`
+/// (`RupuOverview/FreshnessStrip.swift`) picks 120s specifically as "2x
+/// `DashboardStore`'s 60s reconcile cadence" — one missed/slow tick of
+/// slack before a host reads as questionable. `UsageStore` has no reconcile
+/// loop at all (see its own "NO reconcile loop" doc comment), so that
+/// rationale doesn't transfer: a host's `capturedAt` here only ever
+/// advances on an explicit window/pivot change, so it can honestly sit
+/// well past 120s old while an operator is still looking at the freshest
+/// data this screen has — the strip may read a host as stale sooner, and
+/// more often, than the reconcile-driven Dashboard would for the same
+/// underlying host. Reused as-is rather than forked with a different
+/// threshold, since a slightly pessimistic "stale" read is the honest
+/// failure direction here, not a wrong one.
 func usageHostSlice(_ freshness: APIHostFreshness) -> HostSlice {
     let state: SliceState
     switch freshness.state {
