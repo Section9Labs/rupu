@@ -110,9 +110,15 @@ public struct RootView: View {
             OnboardingView(backend: backend, model: model)
                 .interactiveDismissDisabled()
         }
+        // No `interactiveDismissDisabled` here, deliberately: the launcher
+        // gates its own dismissal (`LauncherSheet` applies
+        // `.interactiveDismissDisabled(store.isLaunchInFlight)` internally —
+        // Esc/click-outside stays available while idle but is blocked
+        // mid-launch, matching its Cancel button). An unconditional value at
+        // this call site would fight that store-aware gate, and the store it
+        // reads is the sheet's own `@State` — invisible from here.
         .sheet(isPresented: $model.showLauncher) {
             LauncherSheet(model: model, backend: backend)
-                .interactiveDismissDisabled(false)
         }
         .onChange(of: backend.health) { _, newHealth in
             handleHealthChange(newHealth)

@@ -48,6 +48,17 @@ public struct LauncherSheet: View {
             }
         }
         .frame(width: 560)
+        // Esc/click-outside dismissal is blocked exactly while a launch is
+        // in flight — the same `isLaunchInFlight` seam the explicit Cancel
+        // button already disables on. Without this the two were asymmetric:
+        // Cancel greyed out mid-launch, but Esc still tore the sheet down,
+        // completing `launch()`'s unstructured Task into a store nobody
+        // observes anymore and silently stranding its per-host outcome rows
+        // (this store is never reused across sheet presentations — see the
+        // type doc comment). Lives HERE rather than at `RootView`'s `.sheet`
+        // call site because the store the gate reads is this view's own
+        // lazily-built `@State`; `RootView` can't see it.
+        .interactiveDismissDisabled(store?.isLaunchInFlight ?? false)
         .task {
             await activate()
         }
@@ -264,22 +275,22 @@ private struct LauncherForm: View {
 
     /// Chrome parity with the web dialog's footer (`Cancel` + `Launch`,
     /// `LauncherSheet.tsx` lines ~234-240): the native sheet already allows
-    /// Esc/click-outside dismissal (`interactiveDismissDisabled(false)` at
-    /// the `RootView` call site), but an explicit `RupuButtonStyle.outline`
-    /// control gives the same discoverable escape hatch the web form shows.
-    /// Plain `dismiss()` — no store call, no confirmation needed, since
-    /// closing without launching commits nothing. Disabled while a launch
-    /// is pending, same as web's `disabled={launching}` — this store is
-    /// discarded on the next sheet open (per `LauncherSheet`'s doc comment),
-    /// so dismissing mid-launch would strand the in-flight outcome rows
-    /// nobody will ever see.
+    /// Esc/click-outside dismissal while idle, but an explicit
+    /// `RupuButtonStyle.outline` control gives the same discoverable escape
+    /// hatch the web form shows. Plain `dismiss()` — no store call, no
+    /// confirmation needed, since closing without launching commits nothing.
+    /// Disabled while a launch is pending, same as web's
+    /// `disabled={launching}` — and Esc/click-outside is blocked over the
+    /// same window via `LauncherSheet`'s `interactiveDismissDisabled(store.
+    /// isLaunchInFlight)` gate, so no dismissal path can strand the
+    /// in-flight outcome rows (this store is discarded on the next sheet
+    /// open, per `LauncherSheet`'s doc comment).
     private var cancelButton: some View {
-        let pending = isPending(store.pendingActions.state(ActionKey("launcher", .launch)))
-        return Button("Cancel") {
+        Button("Cancel") {
             dismiss()
         }
         .buttonStyle(RupuButtonStyle.outline)
-        .disabled(pending)
+        .disabled(store.isLaunchInFlight)
     }
 
     private var outcomesList: some View {
@@ -331,7 +342,7 @@ private struct LauncherForm: View {
     }
 
     private var launchButton: some View {
-        let pending = isPending(store.pendingActions.state(ActionKey("launcher", .launch)))
+        let pending = store.isLaunchInFlight
         return Button {
             Task {
                 if let route = await store.launch() {
@@ -355,10 +366,5 @@ private struct LauncherForm: View {
         }
         .buttonStyle(RupuButtonStyle.primary)
         .disabled(!store.canLaunch || pending)
-    }
-
-    private func isPending(_ state: ActionState) -> Bool {
-        if case .pending = state { return true }
-        return false
     }
 }
