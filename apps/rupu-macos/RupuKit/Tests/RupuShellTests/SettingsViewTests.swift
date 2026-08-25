@@ -13,14 +13,17 @@ private final class FakeTokenStore: TokenStoring, @unchecked Sendable {
     func delete(account: String) throws {}
 }
 
-/// `NotificationPosting` recorder — never touches `UNUserNotificationCenter`
-/// (no bundle context under `swift test`; see `RunNotifier`'s doc comment).
-/// These tests only render `SettingsView`'s tabs, so its methods are never
-/// actually called, but `RunNotifier`'s `poster` parameter has no default
-/// that's safe to lean on here the way `defaults: .standard` would be.
-private final class RecordingNotificationPoster: NotificationPosting, @unchecked Sendable {
+/// `NotificationPosting` fake — never touches `UNUserNotificationCenter`
+/// (no bundle context under `swift test`; see `RunNotifier`'s doc comment,
+/// and `RunNotifier.init`'s `poster` parameter has no default to lean on
+/// instead). These tests only render `SettingsView`'s tabs, so its methods
+/// are never actually called; a stateless `struct` (rather than a class
+/// needing `@unchecked Sendable`) is enough here since there's nothing to
+/// record.
+private struct StubNotificationPoster: NotificationPosting {
     func requestAuthorization() async -> Bool { true }
     func post(_ content: NotificationContent) async {}
+    func currentAuthorizationStatus() async -> NotificationAuthorizationStatus { .notDetermined }
 }
 
 @MainActor
@@ -33,7 +36,7 @@ private func makeSettingsView() -> (view: SettingsView, model: AppModel, backend
         discoverBinary: { _ in nil },
         embeddedProbe: { _ in false }
     )
-    let notifier = RunNotifier(defaults: defaults, poster: RecordingNotificationPoster())
+    let notifier = RunNotifier(defaults: defaults, poster: StubNotificationPoster())
     return (SettingsView(model: model, backend: backend, notifier: notifier), model, backend)
 }
 
