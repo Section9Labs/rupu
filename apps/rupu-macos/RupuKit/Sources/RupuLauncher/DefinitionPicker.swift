@@ -7,11 +7,15 @@ import RupuDesign
 /// `.agentRun`/`.session`, `workflows` for `.workflow`. Each row shows the
 /// definition's name plus `Badge` tags (an agent's `model`/`scope`, a
 /// workflow's `scope` — workflows have no `model` field). Tapping a row
-/// calls `store.selectDefinition(_:)`, which for a workflow also fetches
-/// its declared inputs in the background (see `LauncherStore`'s doc
-/// comment) — this view never awaits that itself, it just fires the `Task`
-/// and lets `store.inputsLoadError`/`workflowInputs` update the form once
-/// it lands.
+/// calls `store.selectDefinition(_:scopeKind:scopeID:)`, passing the tapped
+/// row's own `scopeKind`/`scopeID` (Phase 5A Task 4) so `launch()` can pin
+/// the launch to the exact definition this row displays — not a
+/// name-based re-lookup, which would be ambiguous for a name that exists in
+/// two scopes at once (see `agentList`'s indexed-ID comment below). For a
+/// workflow this also fetches its declared inputs in the background (see
+/// `LauncherStore`'s doc comment) — this view never awaits that itself, it
+/// just fires the `Task` and lets `store.inputsLoadError`/`workflowInputs`
+/// update the form once it lands.
 ///
 /// Chrome-only touch (flows-composition Task 6): the row selection
 /// highlight's corner radius was 5 — off the v2 scale (panel 7 / inner
@@ -55,7 +59,9 @@ struct DefinitionPicker: View {
                     row(
                         name: agent.name,
                         tags: [agent.model, agent.scope].compactMap { $0 },
-                        isSelected: store.selectedDefinition == agent.name
+                        isSelected: store.selectedDefinition == agent.name,
+                        scopeKind: agent.scopeKind,
+                        scopeID: agent.scopeID
                     )
                 }
             }
@@ -79,7 +85,9 @@ struct DefinitionPicker: View {
                     row(
                         name: workflow.name,
                         tags: [workflow.scope],
-                        isSelected: store.selectedDefinition == workflow.name
+                        isSelected: store.selectedDefinition == workflow.name,
+                        scopeKind: workflow.scopeKind,
+                        scopeID: workflow.scopeID
                     )
                 }
             }
@@ -96,9 +104,9 @@ struct DefinitionPicker: View {
         .panelStyle(.innerCard)
     }
 
-    private func row(name: String, tags: [String], isSelected: Bool) -> some View {
+    private func row(name: String, tags: [String], isSelected: Bool, scopeKind: String, scopeID: String?) -> some View {
         Button {
-            Task { await store.selectDefinition(name) }
+            Task { await store.selectDefinition(name, scopeKind: scopeKind, scopeID: scopeID) }
         } label: {
             HStack(spacing: 8) {
                 Text(name)
