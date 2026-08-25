@@ -17,6 +17,54 @@ private enum FindingsLayout {
     static let workflow: CGFloat = 128
 }
 
+/// The Findings table's client-side render cap (review fix — GUI validation
+/// on a real 385+-row workspace found the un-windowed table blowing past its
+/// scroll container; see `FindingsTabView`'s "Contained, lazy, windowed"
+/// doc-comment section for the full incident). `GET /api/findings` has no
+/// server-side pagination — every finding for every registered workspace
+/// comes back in one response — so "windowing" here is purely a render-time
+/// slice over data that's already fully in memory, not a second fetch the
+/// way `ProjectDetailStore`'s `windowSize`/`showAllLimit` are (that pair
+/// caps an actual re-fetch at a bigger limit; this one never re-fetches
+/// anything). Pure and tested (`FindingsWindowTests.swift`,
+/// `RupuSecurityTests`) — `window(_:showingAll:)` and `WindowFooter.resolve`
+/// below have no `View` dependency.
+enum FindingsWindow {
+    static let size = 200
+
+    /// `sorted` MUST already be sort-ordered — windowing always applies
+    /// AFTER `sortRows`, so the visible top-N respects whichever column/
+    /// direction is currently active rather than the server's insertion
+    /// order. `showingAll` bypasses the cap entirely: once the footer
+    /// button is tapped, every already-fetched row renders — safe because
+    /// the row list is `LazyVStack`-backed (only on-screen rows actually
+    /// instantiate), the same virtualization `ActivityTable`'s `List`
+    /// gets for free.
+    static func window<T>(_ sorted: [T], showingAll: Bool) -> [T] {
+        showingAll ? sorted : Array(sorted.prefix(size))
+    }
+}
+
+/// The windowed table's footer state — `.hidden` when there's nothing
+/// beyond the first `FindingsWindow.size` rows to reveal (or it's already
+/// revealed), `.button` otherwise. Only two states (unlike `ProjectDetail
+/// Screen`'s three-state `ShowAllFooterState`, which also has a `.note`
+/// "capped short of the real total" state): there is no unreachable data
+/// here — every finding is already client-side, so tapping the button can
+/// always show literally everything, never just a bigger-but-still-partial
+/// page.
+enum FindingsWindowFooterState: Equatable {
+    case hidden
+    case button(label: String)
+}
+
+enum FindingsWindowFooter {
+    static func resolve(total: Int, showingAll: Bool) -> FindingsWindowFooterState {
+        guard !showingAll, total > FindingsWindow.size else { return .hidden }
+        return .button(label: "Show all \(Fmt.count(total)) findings")
+    }
+}
+
 /// Maps a finding's `declaredBy.surface`/`runID` to the route its row
 /// should navigate to, if any. Pure, and the sole place this decision is
 /// made — see `FindingsTabView`'s doc comment for the full per-surface
@@ -74,10 +122,42 @@ func findingNavigationRoute(surface: String, runID: String) -> Route? {
 /// `findingNavigationRoute(surface:runID:)` is the pure, tested mapping this
 /// table's rows delegate to — a row only gets tap chrome (hover cursor,
 /// `onTapGesture`) when it returns non-`nil`.
+///
+/// **Contained, lazy, windowed (review fix)**: the first cut of this table
+/// had no `ScrollView` anywhere in its hierarchy at all — just a plain
+/// `VStack` wrapping a plain `ForEach`. A `VStack` reports its children's
+/// full natural (ideal) size upward regardless of what its ancestors
+/// propose, unlike a `ScrollView`, which accepts the proposed size and
+/// clips/scrolls its content internally — so on a real workspace with 385+
+/// findings, that `VStack` (with every row eagerly instantiated) blew past
+/// its window's bounds top and bottom, scrolling did nothing (there was no
+/// scroll region to scroll), and the oversized detail-pane content broke
+/// `RootView`'s `NavigationSplitView` layout badly enough that the sidebar
+/// rail painted blank. The fix has two parts, same "make the scroll region
+/// own the space" idiom `ProjectDetailScreen`'s per-tab `ScrollView`s
+/// already establish:
+/// - The row list (not the `SortableHeaderRow`, which stays pinned above
+///   it — better for a 385-row *sortable* table than letting column labels
+///   scroll away, the one deliberate deviation from `ProjectDetailScreen`'s
+///   "everything scrolls together" shape) now lives in a real `ScrollView`
+///   over a `LazyVStack`, matching the virtualization `ActivityTable`'s
+///   `List` gets natively — only on-screen rows actually instantiate.
+/// - `FindingsWindow`/`FindingsWindowFooter` additionally cap the render at
+///   `FindingsWindow.size` (200) rows until the footer's "Show all N
+///   findings" button is tapped — belt-and-suspenders on top of the lazy
+///   container, matching this app's established capped-list idiom
+///   (`ProjectDetailStore`'s Runs/Sessions windowing) rather than silently
+///   relying on virtualization alone for an unbounded render.
 struct FindingsTabView: View {
     let findings: BlockState<APIFindings>
     @Binding var sort: ListSort<FindingsSortKey>
     let onSelect: (Route) -> Void
+
+    /// See the type doc comment's "Contained, lazy, windowed" section.
+    /// Deliberately local `@State`, not routed through `SecurityStore` — a
+    /// pure render-time cap over data the store already fully holds, not
+    /// fetch state.
+    @State private var showAll = false
 
     var body: some View {
         Group {
@@ -99,6 +179,7 @@ struct FindingsTabView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     // MARK: - Summary strip
@@ -129,25 +210,50 @@ struct FindingsTabView: View {
 
     // MARK: - Table
 
+    /// Header pinned outside the scroll region (see the type doc comment's
+    /// "Contained, lazy, windowed" section); windowing is applied AFTER
+    /// `sortRows`, so the visible top-N always respects whichever column/
+    /// direction is currently active.
     private func table(_ rows: [APIFinding]) -> some View {
         let sorted = sortRows(rows, sort: sort, value: Self.sortValue)
+        let windowed = FindingsWindow.window(sorted, showingAll: showAll)
         return VStack(alignment: .leading, spacing: 0) {
             SortableHeaderRow(columns: columns, sort: $sort)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             Divider()
-            VStack(spacing: 0) {
-                ForEach(Array(sorted.enumerated()), id: \.offset) { _, row in
-                    FindingRow(
-                        finding: row,
-                        route: findingNavigationRoute(surface: row.declaredBy.surface, runID: row.declaredBy.runID),
-                        onSelect: onSelect
-                    )
-                    Divider()
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(windowed.enumerated()), id: \.offset) { _, row in
+                        FindingRow(
+                            finding: row,
+                            route: findingNavigationRoute(surface: row.declaredBy.surface, runID: row.declaredBy.runID),
+                            onSelect: onSelect
+                        )
+                        Divider()
+                    }
+                    windowFooter(total: sorted.count)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .panelStyle(.panel)
+    }
+
+    @ViewBuilder
+    private func windowFooter(total: Int) -> some View {
+        switch FindingsWindowFooter.resolve(total: total, showingAll: showAll) {
+        case .hidden:
+            EmptyView()
+        case .button(let label):
+            Button(label) { showAll = true }
+                .buttonStyle(.plain)
+                .font(.metaText.weight(.semibold))
+                .foregroundStyle(Color.rupuBrand)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+        }
     }
 
     private var columns: [SortableColumn<FindingsSortKey>] {

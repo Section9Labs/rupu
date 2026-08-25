@@ -28,6 +28,21 @@ private enum CoverageLayout {
 /// header without either duplicating the section label into every row or
 /// making the grouping itself feel like it silently changes when a column
 /// is tapped).
+///
+/// **Contained + lazy (review fix, same root cause `FindingsTable.swift`'s
+/// table hit — see that type's "Contained, lazy, windowed" doc-comment
+/// section for the full incident)**: this table had the identical missing-
+/// `ScrollView`/eager-`VStack` shape, checked for and fixed alongside it.
+/// No explicit numeric cap (`FindingsWindow`'s counterpart) was added here,
+/// deliberately: coverage targets are grouped by project, and a flat "first
+/// 200" cut would either truncate a project's targets mid-group or require
+/// group-aware truncation logic this table doesn't have proven scale to
+/// justify yet (unlike Findings' confirmed 385+-row workspace) — tracked as
+/// a follow-up if a fleet's registered-target count ever grows large enough
+/// to need it. The `LazyVStack`'s virtualization here is per-project-group,
+/// not per-row (each group's own `ForEach` is realized whole once that
+/// group scrolls into range) — acceptable at today's per-project target
+/// counts, which run far below the row count that broke Findings.
 struct CoverageTabView: View {
     let coverage: BlockState<[APICoverageSummary]>
     @Binding var sort: ListSort<CoverageSortKey>
@@ -46,8 +61,12 @@ struct CoverageTabView: View {
                 table(rows)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    /// Header pinned outside the scroll region, same "sortable column
+    /// labels shouldn't scroll away" reasoning `FindingsTable.swift`'s
+    /// table gives for its own pinned header.
     private func table(_ rows: [APICoverageSummary]) -> some View {
         let groups = Self.groupedByProject(rows, sort: sort)
         return VStack(alignment: .leading, spacing: 0) {
@@ -55,21 +74,25 @@ struct CoverageTabView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             Divider()
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(groups, id: \.project) { group in
-                    Eyebrow(group.project)
-                        .padding(.horizontal, 12)
-                        .padding(.top, 10)
-                        .padding(.bottom, 4)
-                    ForEach(Array(group.rows.enumerated()), id: \.offset) { _, row in
-                        CoverageRow(row: row, onSelect: {
-                            onSelect(.coverageDetail(target: row.targetID, wsID: row.wsID))
-                        })
-                        Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(groups, id: \.project) { group in
+                        Eyebrow(group.project)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 10)
+                            .padding(.bottom, 4)
+                        ForEach(Array(group.rows.enumerated()), id: \.offset) { _, row in
+                            CoverageRow(row: row, onSelect: {
+                                onSelect(.coverageDetail(target: row.targetID, wsID: row.wsID))
+                            })
+                            Divider()
+                        }
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .panelStyle(.panel)
     }
 
