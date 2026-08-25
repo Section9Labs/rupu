@@ -207,3 +207,31 @@ private func baseFinding(
     #expect(forward.map(\.key) == reversed.map(\.key))
     #expect(forward.map(\.key) == forward.map(\.key).sorted()) // key-ascending on a ts tie
 }
+
+// MARK: - Final-review fix, item 4: `contentIdentityKey` is delimiter-safe
+
+/// `StreamCard.key` IS `contentIdentityKey`'s output and is what
+/// `mergeStream` dedups on, so a key collision silently collapses two
+/// genuinely distinct rows into one on the live wall. A bare
+/// `joined(separator: "|")` allowed exactly that whenever a free-form field
+/// (`error`, `reason`, `note`, paths) contained the delimiter: the shifted
+/// boundary below produced the identical string both ways.
+@Test func contentIdentityKeyDoesNotCollideOnAShiftedDelimiterBoundary() {
+    let a = cardForEvent(.stepFailed(runID: "r1", stepID: "s|t", error: "u"), ts: ts1000)!
+    let b = cardForEvent(.stepFailed(runID: "r1", stepID: "s", error: "t|u"), ts: ts1000)!
+    #expect(a.key != b.key)
+    // ...and the dedup they feed must therefore keep both rows.
+    #expect(mergeStream([a, b], max: 10).count == 2)
+}
+
+/// The same hazard on an optional field: `nil` must stay distinguishable
+/// from the empty string and from a neighbouring value carrying the
+/// delimiter.
+@Test func contentIdentityKeyDistinguishesNilFromEmptyAndFromADelimiterValue() {
+    let nilAgent = cardForEvent(.stepStarted(runID: "r1", stepID: "s", kind: "agent", agent: nil, host: "h"), ts: ts1000)!
+    let emptyAgent = cardForEvent(.stepStarted(runID: "r1", stepID: "s", kind: "agent", agent: "", host: "h"), ts: ts1000)!
+    let shifted = cardForEvent(.stepStarted(runID: "r1", stepID: "s", kind: "agent|h", agent: nil, host: nil), ts: ts1000)!
+    #expect(nilAgent.key != emptyAgent.key)
+    #expect(nilAgent.key != shifted.key)
+    #expect(emptyAgent.key != shifted.key)
+}

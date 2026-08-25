@@ -35,6 +35,25 @@ import RupuAPI
 /// `runID` is a no-op (including for `host`) — in this app one route owns
 /// exactly one `(runID, host)` pair, so `host` never changes independently
 /// of `runID` (see `RunDetailScreen.init`).
+///
+/// **A cancelled fetch leaves its key re-dispatchable** (final-review fix,
+/// item 1). Both `SourcePreview` and `AstTreeView` mount their fetch from a
+/// `.task(id:)`, which SwiftUI CANCELS when the view goes away — i.e.
+/// exactly what a disclosure row does when the operator collapses it while
+/// the fetch is still in flight. The cancelled call's `catch` used to just
+/// early-return, leaving `.loading` latched in the cache; the `!= nil`
+/// presence guard in `loadSourceIfNeeded`/`loadAstIfNeeded` then read that
+/// stale `.loading` as "already handled", so RE-expanding the same row
+/// never re-fetched and the disclosure sat on "Loading source…" forever
+/// with no Retry (Retry only renders for `.failed`). On cancellation the
+/// key's `.loading` entry is therefore REMOVED rather than left in place —
+/// the same "cancellation always leaves the store re-dispatchable" ruling
+/// `CodeStore`'s own file header states. The removal is conditional on the
+/// entry still being `.loading`: a newer fetch for the same key that has
+/// already landed `.content`/`.failed` must never be clobbered by an older,
+/// cancelled call's late-running `catch` (removing a NEWER call's own
+/// `.loading` is harmless by contrast — that call still writes its own
+/// result when it lands).
 @MainActor
 @Observable
 public final class SourcePreviewStore {
@@ -114,8 +133,13 @@ public final class SourcePreviewStore {
             guard generation == runGeneration else { return }
             sourceCache[key] = .content(slice)
         } catch {
-            guard !isCancellation(error) else { return }
             guard generation == runGeneration else { return }
+            guard !isCancellation(error) else {
+                // See the type doc comment's "A cancelled fetch leaves its
+                // key re-dispatchable" section.
+                if case .loading? = sourceCache[key] { sourceCache.removeValue(forKey: key) }
+                return
+            }
             sourceCache[key] = .failed(String(describing: error))
         }
     }
@@ -140,8 +164,13 @@ public final class SourcePreviewStore {
             guard generation == runGeneration else { return }
             astCache[key] = .content(response)
         } catch {
-            guard !isCancellation(error) else { return }
             guard generation == runGeneration else { return }
+            guard !isCancellation(error) else {
+                // See the type doc comment's "A cancelled fetch leaves its
+                // key re-dispatchable" section.
+                if case .loading? = astCache[key] { astCache.removeValue(forKey: key) }
+                return
+            }
             astCache[key] = .failed(String(describing: error))
         }
     }

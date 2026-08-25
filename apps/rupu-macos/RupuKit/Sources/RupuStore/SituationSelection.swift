@@ -77,46 +77,84 @@ func sparkTick(current: [Int], eventsInWindow: Int, windowMS: Double) -> (spark:
 /// a sort tie inside a single process's memory); it never needs to match a
 /// key computed by different code, so nothing here needs to stay in
 /// lockstep with that other function's exact composition.
+///
+/// **Delimiter-safe composition** (final-review fix, item 4). An earlier
+/// revision joined raw field values with a bare `|`, which is not injective
+/// once a component can itself contain a `|` — and these are free-form
+/// server strings (`error`, `reason`, `note`, `unit_key`, paths). Two
+/// DIFFERENT events could then produce the identical key (classic shifted
+/// boundary: `stepFailed(stepID: "s|t", error: "u")` vs
+/// `stepFailed(stepID: "s", error: "t|u")`), which for a tie-break
+/// comparator means two distinct rows compare EQUAL and the sort's order
+/// between them falls back to whatever the unstable sort happens to do —
+/// re-introducing exactly the non-determinism round 2's ruling 1 fixed.
+/// Every component is therefore length-prefixed as `"<count>:<value>"`
+/// (`count` in `Character`s) before joining, with `nil` encoded as `"~"` (a
+/// marker no length-prefixed component can produce — those always start with
+/// a digit), making the concatenation uniquely decodable and hence
+/// injective. `RupuSituation`'s `contentIdentityKey` applies the same
+/// encoding for the same reason.
 func mergeSortKey(_ event: CPEvent) -> String {
     let runID = event.runID ?? ""
     switch event {
     case let .runStarted(_, workflowPath, startedAt):
-        return "runStarted|\(runID)|\(workflowPath)|\(startedAt)"
+        return joinKey("runStarted", runID, workflowPath, startedAt)
     case let .stepStarted(_, stepID, kind, agent, host):
-        return "stepStarted|\(runID)|\(stepID)|\(kind)|\(agent ?? "")|\(host ?? "")"
+        return joinKey("stepStarted", runID, stepID, kind, agent, host)
     case let .stepWorking(_, stepID, note, transcriptPath):
-        return "stepWorking|\(runID)|\(stepID)|\(note ?? "")|\(transcriptPath ?? "")"
+        return joinKey("stepWorking", runID, stepID, note, transcriptPath)
     case let .stepAwaitingApproval(_, stepID, reason):
-        return "stepAwaitingApproval|\(runID)|\(stepID)|\(reason)"
+        return joinKey("stepAwaitingApproval", runID, stepID, reason)
     case let .stepCompleted(_, stepID, success, durationMS, host):
-        return "stepCompleted|\(runID)|\(stepID)|\(success)|\(durationMS)|\(host ?? "")"
+        return joinKey("stepCompleted", runID, stepID, String(success), String(durationMS), host)
     case let .stepFailed(_, stepID, error):
-        return "stepFailed|\(runID)|\(stepID)|\(error)"
+        return joinKey("stepFailed", runID, stepID, error)
     case let .stepSkipped(_, stepID, reason):
-        return "stepSkipped|\(runID)|\(stepID)|\(reason)"
+        return joinKey("stepSkipped", runID, stepID, reason)
     case let .unitStarted(_, stepID, index, unitKey, agent, transcriptPath, host):
-        return "unitStarted|\(runID)|\(stepID)|\(index)|\(unitKey)|\(agent ?? "")|\(transcriptPath)|\(host ?? "")"
+        return joinKey(
+            "unitStarted", runID, stepID, String(index), unitKey, agent, transcriptPath, host
+        )
     case let .unitCompleted(_, stepID, index, unitKey, success, tokensIn, tokensOut, host):
-        return "unitCompleted|\(runID)|\(stepID)|\(index)|\(unitKey)|\(success)|\(tokensIn)|\(tokensOut)|\(host ?? "")"
+        return joinKey(
+            "unitCompleted", runID, stepID, String(index), unitKey, String(success),
+            String(tokensIn), String(tokensOut), host
+        )
     case let .panelRound(_, stepID, round, maxIterations, maxSeverityRemaining):
-        return "panelRound|\(runID)|\(stepID)|\(round)|\(maxIterations)|\(maxSeverityRemaining ?? "")"
+        return joinKey(
+            "panelRound", runID, stepID, String(round), String(maxIterations), maxSeverityRemaining
+        )
     case let .runCompleted(_, status, finishedAt):
-        return "runCompleted|\(runID)|\(status)|\(finishedAt)"
+        return joinKey("runCompleted", runID, status, finishedAt)
     case let .runFailed(_, error, finishedAt):
-        return "runFailed|\(runID)|\(error)|\(finishedAt)"
+        return joinKey("runFailed", runID, error, finishedAt)
     case .runPaused:
-        return "runPaused|\(runID)"
+        return joinKey("runPaused", runID)
     case .runResumed:
-        return "runResumed|\(runID)"
+        return joinKey("runResumed", runID)
     case let .stepPaused(_, stepID):
-        return "stepPaused|\(runID)|\(stepID)"
+        return joinKey("stepPaused", runID, stepID)
     case let .stepResumed(_, stepID):
-        return "stepResumed|\(runID)|\(stepID)"
+        return joinKey("stepResumed", runID, stepID)
     case let .dispatchStarted(_, subRunID, agent, transcriptPath):
-        return "dispatchStarted|\(runID)|\(subRunID)|\(agent ?? "")|\(transcriptPath)"
+        return joinKey("dispatchStarted", runID, subRunID, agent, transcriptPath)
     case let .dispatchCompleted(_, subRunID, success, tokensIn, tokensOut):
-        return "dispatchCompleted|\(runID)|\(subRunID)|\(success)|\(tokensIn)|\(tokensOut)"
+        return joinKey(
+            "dispatchCompleted", runID, subRunID, String(success), String(tokensIn), String(tokensOut)
+        )
     case let .unknown(type, _):
-        return "unknown|\(runID)|\(type)"
+        return joinKey("unknown", runID, type)
     }
+}
+
+/// Length-prefixed, delimiter-safe join — see `mergeSortKey`'s
+/// "Delimiter-safe composition" section for why a bare `|` join is not
+/// injective here. `nil` encodes as `"~"`, distinct from every
+/// length-prefixed value (which always begins with a digit) and therefore
+/// also distinct from the empty string (`"0:"`).
+private func joinKey(_ parts: String?...) -> String {
+    parts.map { part in
+        guard let part else { return "~" }
+        return "\(part.count):\(part)"
+    }.joined(separator: "|")
 }
