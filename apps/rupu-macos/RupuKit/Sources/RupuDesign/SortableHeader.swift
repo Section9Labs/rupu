@@ -1,12 +1,48 @@
 import SwiftUI
 
-/// One sortable column in a `SortableHeaderRow` — label + layout, plus the
-/// `Key` that identifies it in the row's `ListSort`. `width == nil` marks
-/// the ONE flexible column (it gets `.frame(maxWidth: .infinity, ...)`
-/// instead of a fixed width — mirrors `ActivityTable`'s `Subject` column,
-/// the only one passed `width: nil`); callers are responsible for marking
-/// exactly one column this way, same as `ActivityTable` does today.
-public typealias SortableColumn<Key: Hashable> = (key: Key, label: String, width: CGFloat?, alignment: Alignment)
+/// One column in a `SortableHeaderRow` — label + layout, plus (optionally)
+/// the `Key` that identifies it in the row's `ListSort`.
+///
+/// A struct with a memberwise-ish init rather than a 6-field tuple: once
+/// `key` went optional and `firstTapAscending` was added, a positional tuple
+/// stopped being legible at call sites (`(nil, "Actions", 52, .trailing,
+/// nil)` reads nothing like what it means) — named arguments do.
+///
+/// - `width == nil` marks the ONE flexible column (it gets
+///   `.frame(maxWidth: .infinity, ...)` instead of a fixed width — mirrors
+///   `ActivityTable`'s `Subject` column, the only one passed `width: nil`);
+///   callers are responsible for marking exactly one column this way, same
+///   as `ActivityTable` does today.
+/// - `key == nil` marks a plain, non-sortable column: it renders as a bare
+///   `Eyebrow` label with no button and no chevron — matching
+///   `ActivityTable`'s blank trailing Actions header precedent (its
+///   `headerCell("", width: Layout.actions, ...)` with no `key:` argument).
+/// - `firstTapAscending` is the first-tap direction override. When `nil`
+///   (the default), `SortableHeaderRow` falls back to the alignment
+///   heuristic documented on `SortableHeaderRow.defaultAscending(for:)`:
+///   trailing-aligned columns (numeric/date, right-aligned so their
+///   monospaced digits line up) default descending, everything else
+///   defaults ascending. An explicit `firstTapAscending` always wins over
+///   that heuristic — for a column whose alignment doesn't happen to match
+///   its data's natural default direction.
+public struct SortableColumn<Key: Hashable> {
+    public var key: Key?
+    public var label: String
+    public var width: CGFloat?
+    public var alignment: Alignment
+    public var firstTapAscending: Bool?
+
+    public init(
+        key: Key?, label: String, width: CGFloat? = nil, alignment: Alignment = .leading,
+        firstTapAscending: Bool? = nil
+    ) {
+        self.key = key
+        self.label = label
+        self.width = width
+        self.alignment = alignment
+        self.firstTapAscending = firstTapAscending
+    }
+}
 
 /// The shared header-row idiom lifted from `ActivityTable`'s `header`/
 /// `headerCell`/`headerCellContent`/`sortIndicator` (RupuActivity) — an
@@ -16,13 +52,14 @@ public typealias SortableColumn<Key: Hashable> = (key: Key, label: String, width
 /// `ActivityTable` itself is left as-is by this task — migrating it onto
 /// this type is not part of this change.
 ///
-/// Tapping a column header makes it the active sort key (first tap picks a
-/// direction from the column's `alignment` — see `defaultAscending(for:)`
-/// below) or, if it's already active, flips direction. `sort` is an
+/// Tapping a sortable column header (`key != nil`) makes it the active sort
+/// key (first tap picks a direction — see `defaultAscending(for:)` below) or,
+/// if it's already active, flips direction. A `key == nil` column (e.g. a
+/// trailing actions column) renders its label only, inert. `sort` is an
 /// external binding so the owning screen's `@State` (and any live-data
 /// re-sort-on-mutate behavior that follows from it, the same pattern
 /// `ActivityTable` uses) stays with the caller.
-public struct SortableHeaderRow<Key: Hashable & CaseIterable>: View {
+public struct SortableHeaderRow<Key: Hashable & CaseIterable & Sendable>: View {
     private let columns: [SortableColumn<Key>]
     @Binding private var sort: ListSort<Key>
 
@@ -33,7 +70,11 @@ public struct SortableHeaderRow<Key: Hashable & CaseIterable>: View {
 
     public var body: some View {
         HStack(spacing: 0) {
-            ForEach(columns, id: \.key) { column in
+            // Indexed rather than keyed by `column.key`: `key` is now
+            // optional and more than one column (e.g. multiple non-
+            // sortable columns) can legitimately be `nil`, so the key
+            // alone isn't a safe `ForEach` identity.
+            ForEach(Array(columns.enumerated()), id: \.offset) { _, column in
                 headerCell(column)
             }
         }
@@ -52,21 +93,26 @@ public struct SortableHeaderRow<Key: Hashable & CaseIterable>: View {
         }
     }
 
+    @ViewBuilder
     private func headerCellContent(_ column: SortableColumn<Key>) -> some View {
-        Button {
-            toggleSort(column)
-        } label: {
-            HStack(spacing: 4) {
-                if column.alignment == .trailing {
-                    sortIndicator(for: column.key)
-                    Eyebrow(column.label)
-                } else {
-                    Eyebrow(column.label)
-                    sortIndicator(for: column.key)
+        if let key = column.key {
+            Button {
+                toggleSort(column, key: key)
+            } label: {
+                HStack(spacing: 4) {
+                    if column.alignment == .trailing {
+                        sortIndicator(for: key)
+                        Eyebrow(column.label)
+                    } else {
+                        Eyebrow(column.label)
+                        sortIndicator(for: key)
+                    }
                 }
             }
+            .buttonStyle(.plain)
+        } else {
+            Eyebrow(column.label)
         }
-        .buttonStyle(.plain)
     }
 
     /// The active header's direction chevron — space is always reserved (an
@@ -79,17 +125,17 @@ public struct SortableHeaderRow<Key: Hashable & CaseIterable>: View {
             .opacity(sort.key == key ? 1 : 0)
     }
 
-    private func toggleSort(_ column: SortableColumn<Key>) {
-        if sort.key == column.key {
+    private func toggleSort(_ column: SortableColumn<Key>, key: Key) {
+        if sort.key == key {
             sort.ascending.toggle()
         } else {
-            sort = ListSort(key: column.key, ascending: Self.defaultAscending(for: column))
+            sort = ListSort(key: key, ascending: Self.defaultAscending(for: column))
         }
     }
 
     /// First-tap direction for a newly-selected column. `ActivitySort.Key`
     /// hand-writes this per case (`defaultAscending`); a generic `Key` has
-    /// no such per-case hook to call, so this reads the same signal
+    /// no such per-case hook to call, so the fallback reads the same signal
     /// `ActivityTable` already encodes in its header layout: every one of
     /// its trailing-aligned columns (`Dur`, `Cost`, `Started` — right-aligned
     /// so their monospaced digits line up) is also one of its
@@ -98,7 +144,11 @@ public struct SortableHeaderRow<Key: Hashable & CaseIterable>: View {
     /// biggest-or-most-recent-first" and non-trailing for "text, A→Z" — the
     /// same macOS-native convention (Finder/Mail date & size columns),
     /// derived from layout instead of restated per key.
+    ///
+    /// `column.firstTapAscending`, when set, always wins over this
+    /// heuristic — for the column whose alignment doesn't happen to match
+    /// its data's natural default direction.
     private static func defaultAscending(for column: SortableColumn<Key>) -> Bool {
-        column.alignment != .trailing
+        column.firstTapAscending ?? (column.alignment != .trailing)
     }
 }
