@@ -38,9 +38,14 @@ import RupuAPI
 /// `.task(id: runID)` superseded by navigating to a different run before
 /// the fetch lands) leaves `transcript` exactly as it was — never `.failed`.
 /// See `isCancellation`'s doc comment. `resolveTranscriptPath` itself is
-/// best-effort in the same spirit: any failure (cancellation included) is
-/// swallowed and treated as "couldn't resolve", falling through to `.empty`
-/// rather than surfacing `.failed` for what is, honestly, a bonus lookup.
+/// best-effort in the same spirit: a failure (cancellation included) is
+/// swallowed and treated as "couldn't resolve" — falling through to `.empty`
+/// on a first activate rather than surfacing `.failed` for what is,
+/// honestly, a bonus lookup. But "couldn't resolve" is not "resolved to
+/// nothing": on a re-activate, a throwing resolver falls back to the
+/// previously resolved path (see `activate()`), so a retry against a
+/// still-erroring backend keeps its `.failed` banner instead of silently
+/// rewriting the failure as "no transcript recorded".
 @MainActor
 @Observable
 public final class AgentRunDetailStore {
@@ -104,7 +109,18 @@ public final class AgentRunDetailStore {
     public func activate() async {
         var path = transcriptPath
         if path == nil, let resolveTranscriptPath {
-            path = try? await resolveTranscriptPath()
+            do {
+                path = try await resolveTranscriptPath()
+            } catch {
+                // A *thrown* resolution is "couldn't check", not "resolved
+                // to nothing" — keep whatever a prior activate resolved, so
+                // a retry while the backend is erroring can never rewrite a
+                // `.failed` transcript into the false "no transcript
+                // recorded" `.empty` (`resolvedPath == nil`) state. First
+                // activate (`resolvedPath` still nil) keeps the established
+                // best-effort fallback to `.empty`.
+                path = resolvedPath
+            }
         }
         resolvedPath = path
 
