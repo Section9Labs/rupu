@@ -266,4 +266,135 @@ struct ConfigTabTests {
 
         #expect(ConfigSaveGate.reason(readOnly: false, isDirty: true) == nil)
     }
+
+    // MARK: - Final-review fix (C1): draft adoption rule
+
+    /// The pure adoption table. An unseeded draft (`nil`) always adopts;
+    /// a draft still equal to the value this sync last handed it adopts;
+    /// a diverged draft never does.
+    @Test func draftAdoptionTableAdoptsWhenUnseededOrUntouchedAndKeepsADivergedDraft() {
+        // Unseeded — the first content load must always seed.
+        #expect(ConfigDrafts.shouldAdoptNewValue(draft: nil, previous: nil))
+        #expect(ConfigDrafts.shouldAdoptNewValue(draft: nil, previous: "anything"))
+
+        // Seeded, untouched (draft == the PREVIOUS store value).
+        #expect(ConfigDrafts.shouldAdoptNewValue(draft: "old", previous: "old"))
+        // A `nil` previous (the `.loading` bounce) reads as "".
+        #expect(ConfigDrafts.shouldAdoptNewValue(draft: "", previous: nil))
+
+        // Diverged — an in-progress edit must survive a background refresh.
+        #expect(!ConfigDrafts.shouldAdoptNewValue(draft: "operator edit", previous: "old"))
+        // Including a deliberately EMPTIED draft, which is exactly what the
+        // optional-vs-"" distinction buys: `Optional("")` is a real edit,
+        // unlike `nil`.
+        #expect(!ConfigDrafts.shouldAdoptNewValue(draft: "", previous: "old"))
+
+        // Lock-list analogue, order-insensitive.
+        #expect(ConfigDrafts.shouldAdoptNewLockList(draft: nil, previous: ["a"]))
+        #expect(ConfigDrafts.shouldAdoptNewLockList(draft: ["b", "a"], previous: ["a", "b"]))
+        #expect(!ConfigDrafts.shouldAdoptNewLockList(draft: ["a"], previous: ["a", "b"]))
+        #expect(!ConfigDrafts.shouldAdoptNewLockList(draft: [], previous: ["a"]))
+    }
+
+    /// **The regression this whole fix exists for.** The pre-fix closures
+    /// compared the draft against `store.view`'s CURRENT (already-new)
+    /// value, so adoption only ran when the draft ALREADY equaled what was
+    /// about to be adopted — a no-op. Cold-opening Raw/Policy therefore
+    /// rendered empty drafts with Save enabled, and saving PUT empty raw
+    /// TOML (wiping `config.toml`) or an empty lock list (deleting every
+    /// policy lock).
+    ///
+    /// This drives `ConfigDrafts` through the exact `onChange(...,
+    /// initial: true)` call `ConfigTab.content(store:)` makes on first
+    /// mount over real fixture content (SwiftUI passes `oldValue ==
+    /// newValue` for the initial invocation) and asserts every draft comes
+    /// out seeded with the FIXTURE's non-empty content.
+    @Test @MainActor func initialContentLoadSeedsEveryDraftFromTheFixtureNeverEmpty() async throws {
+        let store = try await loadedStore()
+        let view = try #require(store.view.value)
+
+        var drafts = ConfigDrafts()
+        // `initial: true` — SwiftUI hands the same value as both old and new.
+        drafts.syncGlobal(previous: view.rawGlobal, new: view.rawGlobal)
+        drafts.syncProject(previous: view.rawProject, new: view.rawProject)
+        let lockKeys = EffectiveConfigGrouping.policyLockKeys(for: view)
+        drafts.syncLock(previous: lockKeys, new: lockKeys)
+
+        #expect(drafts.global == view.rawGlobal)
+        #expect(drafts.global?.isEmpty == false, "an empty global draft is the data-loss bug: Save would PUT empty TOML")
+        #expect(drafts.project == view.rawProject)
+        #expect(drafts.lock == ["permission_mode", "policy.lock"])
+        #expect(drafts.lock?.isEmpty == false, "an empty lock draft is the data-loss bug: Save would delete every lock")
+
+        // And with everything freshly seeded from the server, nothing reads
+        // as dirty — so Save is correctly DISABLED rather than armed over
+        // an empty draft.
+        #expect(!drafts.hasUnsavedEdits(against: view))
+    }
+
+    /// The other half of the cold-open path: `content(store:)` mounts while
+    /// `store.view` is still `.loading` (no content at all), so the very
+    /// first `initial: true` invocation carries `nil` on both sides and the
+    /// real content arrives as a LATER change. Both legs must end with the
+    /// drafts holding the server's content.
+    @Test @MainActor func draftsSeedThroughTheLoadingBounceThatPrecedesFirstContent() async throws {
+        let store = try await loadedStore()
+        let view = try #require(store.view.value)
+
+        var drafts = ConfigDrafts()
+        // Leg 1 — mounted against `.loading`: no content yet.
+        drafts.syncGlobal(previous: nil, new: nil)
+        drafts.syncLock(previous: nil, new: nil)
+        #expect(drafts.global == "")
+
+        // Leg 2 — content lands. The draft still equals what leg 1 gave it,
+        // so it adopts.
+        drafts.syncGlobal(previous: nil, new: view.rawGlobal)
+        drafts.syncLock(previous: nil, new: EffectiveConfigGrouping.policyLockKeys(for: view))
+        #expect(drafts.global == view.rawGlobal)
+        #expect(drafts.lock == ["permission_mode", "policy.lock"])
+    }
+
+    /// A background reload (`.content` → `.loading` → `.content`) must never
+    /// swallow an in-progress edit — neither leg of the bounce may adopt.
+    @Test @MainActor func aDirtyDraftSurvivesABackgroundReloadBounce() async throws {
+        let store = try await loadedStore()
+        let view = try #require(store.view.value)
+
+        var drafts = ConfigDrafts()
+        drafts.syncGlobal(previous: view.rawGlobal, new: view.rawGlobal)
+        drafts.global = "# operator's in-progress edit\n"
+
+        drafts.syncGlobal(previous: view.rawGlobal, new: nil)   // → .loading
+        #expect(drafts.global == "# operator's in-progress edit\n")
+        drafts.syncGlobal(previous: nil, new: "server side changed\n") // → .content
+        #expect(drafts.global == "# operator's in-progress edit\n")
+        #expect(drafts.hasUnsavedEdits(against: view))
+    }
+
+    /// An all-`nil` (never-seeded) draft set has nothing to lose, so a
+    /// scope switch must not raise the "discard unsaved edits?" dialog.
+    @Test @MainActor func unseededDraftsAreNeverConsideredDirty() async throws {
+        let store = try await loadedStore()
+        let view = try #require(store.view.value)
+
+        #expect(!ConfigDrafts().hasUnsavedEdits(against: view))
+        #expect(!ConfigDrafts().hasUnsavedEdits(against: nil))
+    }
+
+    /// `adoptAll` is the confirmed-scope-switch bypass: it overwrites every
+    /// draft regardless of dirtiness (see `ConfigTab.performScopeSwitch(to:
+    /// store:)`'s doc comment for why that's correct there).
+    @Test @MainActor func adoptAllForcesEveryDraftToTheNewScopesContent() async throws {
+        let store = try await loadedStore()
+        let view = try #require(store.view.value)
+
+        var drafts = ConfigDrafts(global: "dirty", project: "dirty", lock: ["dirty"])
+        drafts.adoptAll(from: view)
+
+        #expect(drafts.global == view.rawGlobal)
+        #expect(drafts.project == view.rawProject)
+        #expect(drafts.lock == ["permission_mode", "policy.lock"])
+        #expect(!drafts.hasUnsavedEdits(against: view))
+    }
 }

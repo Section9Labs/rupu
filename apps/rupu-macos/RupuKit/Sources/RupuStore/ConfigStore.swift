@@ -33,21 +33,30 @@ import RupuAPI
 /// `saveError` is set to the server's own message text
 /// (`"editing config requires \`rupu cp serve\`"`, hard-coded here to match
 /// `require_writable`'s literal string rather than parsed out of the JSON
-/// body — see `handleSaveError`'s doc comment) rather than the raw
-/// `{"error": ...}` body a 400 surfaces verbatim.
+/// body — see `handleSaveError`'s doc comment).
 ///
-/// **400 (validation failure)**: `saveError` carries the response body
-/// verbatim — it's the server's own TOML/policy-lock validation error,
-/// meant to be shown to the operator as-is. `readOnly` stays `false`; a 400
-/// means the deployment CAN write config, this particular edit just didn't
-/// validate.
+/// **400 (validation failure)**: `saveError` carries the server's own TOML/
+/// policy-lock validation message, unwrapped from the `{"error": "..."}`
+/// JSON envelope every `ApiError` response body uses (final-review fix —
+/// M2; `crates/rupu-cp/src/error.rs`'s `IntoResponse` builds that envelope
+/// for EVERY status, 400 and 501 alike, so the previous claim that a 400
+/// body is bare message text while only 501 wraps it was simply wrong, and
+/// the inline error under the editor rendered literal JSON at the
+/// operator). `readOnly` stays `false`; a 400 means the deployment CAN
+/// write config, this particular edit just didn't validate.
 ///
 /// **Every successful save re-`load`s** — the server is the source of
 /// truth for `view` (resolved config, provenance, raw text); a save never
 /// patches `view` locally. `saveGlobalRaw`/`saveProjectRaw`/`savePolicy`
-/// all return `Bool` (`true` on a save that both wrote AND the following
-/// re-`load` succeeded) so the screen can drive a "saved" confirmation off
-/// one call.
+/// all return `Bool`, `true` only when the write AND the following
+/// re-`load` both succeeded (final-review fix — M3: they previously
+/// returned `true` on the strength of the write alone, so a save whose
+/// reload 500'd or timed out reported success to a caller that had just
+/// been left staring at `view == .failed`). "The reload succeeded" is read
+/// off `view` itself landing on `.content`, which also correctly returns
+/// `false` when a concurrent `load` superseded this one's reload — the
+/// value this call would have confirmed against is genuinely not the one
+/// on screen.
 @MainActor
 @Observable
 public final class ConfigStore {
@@ -116,11 +125,19 @@ public final class ConfigStore {
 
     // MARK: - Save
 
+    /// The message `saveProjectRaw` reports when it is called with no
+    /// project scope selected — see that method's doc comment. Public for
+    /// the same reason `readOnlyMessage` is: a UI surface (or a test)
+    /// asserting this state should quote the one string, not a copy.
+    nonisolated public static let noProjectScopeMessage =
+        "no project scope selected — choose a project above before saving its layer"
+
     /// `PUT /api/config/global`. On success, computes `lastSaveRestartKeys`
     /// (see `restartKeysIfChanged`'s doc comment) from the pre-save
     /// `view.value?.rawGlobal` vs. the just-saved `raw`, then re-`load`s.
     /// Returns `true` only if BOTH the write and the following re-`load`
-    /// succeeded.
+    /// succeeded (see the type doc comment's "Every successful save
+    /// re-`load`s" section).
     public func saveGlobalRaw(_ raw: String, client: CPClient) async -> Bool {
         beginSave()
         let previousRawGlobal = view.value?.rawGlobal ?? ""
@@ -132,7 +149,7 @@ public final class ConfigStore {
             )
             await load(client: client, project: selectedProject)
             saving = false
-            return true
+            return reloadSucceeded
         } catch {
             handleSaveError(error)
             saving = false
@@ -142,16 +159,29 @@ public final class ConfigStore {
 
     /// `PUT /api/config/project/:id` — requires `selectedProject` (set by a
     /// prior `load(client:project:)`); a `nil` `selectedProject` is a
-    /// caller error (no project scope to write into) and this is a no-op
-    /// returning `false` without ever reaching the network.
+    /// caller error (no project scope to write into) and this returns
+    /// `false` without ever reaching the network.
+    ///
+    /// **That refusal is reported, not silent** (final-review fix — I3):
+    /// the guard sets `saveError` to `noProjectScopeMessage` first. It used
+    /// to `return false` with nothing set anywhere, so the Raw tab's
+    /// Project-layer Save — reachable whenever `rawLayer` was left at
+    /// `.project` after the scope picker returned to "Global only" — looked
+    /// exactly like a successful save that simply hadn't refreshed. (The
+    /// same fix also stops `ConfigTab` from getting into that state at all;
+    /// this half is the honest failure for any other route into it.)
     public func saveProjectRaw(_ raw: String, client: CPClient) async -> Bool {
-        guard let project = selectedProject else { return false }
+        guard let project = selectedProject else {
+            saveError = Self.noProjectScopeMessage
+            lastSaveRestartKeys = []
+            return false
+        }
         beginSave()
         do {
             try await client.putConfigProject(id: project, raw: raw)
             await load(client: client, project: selectedProject)
             saving = false
-            return true
+            return reloadSucceeded
         } catch {
             handleSaveError(error)
             saving = false
@@ -169,12 +199,22 @@ public final class ConfigStore {
             try await client.putConfigPolicy(lock: lock)
             await load(client: client, project: selectedProject)
             saving = false
-            return true
+            return reloadSucceeded
         } catch {
             handleSaveError(error)
             saving = false
             return false
         }
+    }
+
+    /// Did the post-save re-`load` actually leave content on screen? Read
+    /// directly off `view` rather than tracked separately, so it can never
+    /// disagree with what the screen is rendering — including the
+    /// generation-guard case, where a concurrent `load` superseded this
+    /// one's reload and `view` reflects that other call instead.
+    private var reloadSucceeded: Bool {
+        if case .content = view { return true }
+        return false
     }
 
     /// Shared save-attempt prelude: clears the previous attempt's
@@ -197,11 +237,11 @@ public final class ConfigStore {
     /// show a message it already knows verbatim.
     ///
     /// Any other non-2xx (chiefly 400 — a TOML parse/policy-lock
-    /// validation failure) surfaces its body VERBATIM in `saveError`; the
-    /// server's 400 body IS the message meant for the operator to read
-    /// (the TOML validation error), unlike 501's generic JSON envelope.
-    /// `readOnly` is left untouched — a 400 means the deployment CAN write
-    /// config, this specific edit just didn't validate.
+    /// validation failure) surfaces the server's own message in
+    /// `saveError`, unwrapped from the `{"error": "..."}` envelope via
+    /// `displayMessage(forBody:)`. `readOnly` is left untouched — a 400
+    /// means the deployment CAN write config, this specific edit just
+    /// didn't validate.
     ///
     /// A transport/decoding/unauthorized failure (not `.http`) falls back
     /// to `String(describing: error)`, same as every other store's failure
@@ -213,11 +253,34 @@ public final class ConfigStore {
                 readOnly = true
                 saveError = Self.readOnlyMessage
             } else {
-                saveError = body
+                saveError = Self.displayMessage(forBody: body)
             }
             return
         }
         saveError = String(describing: error)
+    }
+
+    /// The operator-facing text inside a `cp` error response body.
+    ///
+    /// Every `ApiError` this app can provoke serializes as
+    /// `{"error": "<message>"}` — `crates/rupu-cp/src/error.rs`'s
+    /// `IntoResponse` builds that one envelope for every status it can
+    /// produce, so there is no status for which the body is bare message
+    /// text (final-review fix — M2: `saveError` used to be assigned the
+    /// whole body for any non-501 status, and the inline error under the
+    /// Raw/Policy editors rendered literal JSON braces and escaping at the
+    /// operator).
+    ///
+    /// Falls back to the body verbatim whenever it doesn't parse as that
+    /// exact shape — an unexpected body is still better shown raw than
+    /// swallowed, and this keeps the store from asserting a wire contract
+    /// it can't verify (e.g. a reverse proxy's own HTML error page).
+    nonisolated static func displayMessage(forBody body: String) -> String {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let message = object["error"] as? String
+        else { return body }
+        return message
     }
 
     /// **Heuristic restart-required banner (Task 4 brief, Step 2 ruling).**

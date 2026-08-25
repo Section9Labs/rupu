@@ -62,7 +62,7 @@ let package = Package(
         // — needs `RupuOverview` for `deriveNeedsYou`/`NeedsYouItem` (reused,
         // not duplicated) alongside the usual `RupuAPI`/`RupuStore`/
         // `RupuDesign` trio every other screen module depends on.
-        .target(name: "RupuMenuBar", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuOverview"]),
+        .target(name: "RupuMenuBar", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuOverview"]),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
@@ -94,7 +94,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RupuMenuBarTests",
-            dependencies: ["RupuMenuBar", "RupuAPI", "RupuStore", "RupuDesign", "RupuOverview"]
+            dependencies: ["RupuMenuBar", "RupuAPI", "RupuStore", "RupuBackend", "RupuDesign", "RupuOverview"]
         ),
     ]
 )

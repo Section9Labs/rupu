@@ -60,7 +60,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `userNotificationCenter(_:didReceive:)` below can route a notification
     /// tap through the same `AppModel.navigate(to:)` every other deep-link
     /// in this app uses.
-    var model: AppModel?
+    ///
+    /// The `didSet` drains `pendingNotificationRunID` (final-review fix —
+    /// M1): a notification tap that LAUNCHES the app delivers
+    /// `didReceive` before `RootView` has ever appeared, so `model` is
+    /// still `nil` at routing time and the deep link used to be dropped on
+    /// the floor — the app came forward on the default route with no
+    /// indication the tap had meant anything. Parking the run id and
+    /// replaying it the moment `model` is attached turns the launch path
+    /// into the same navigation the already-running path gets.
+    var model: AppModel? {
+        didSet { drainPendingNotificationRoute() }
+    }
+    /// The run id from a notification tap that arrived before `model`
+    /// existed — see `model`'s doc comment. Only ever the MOST RECENT such
+    /// tap: they all route to the same window, and landing on the last one
+    /// tapped is the least surprising outcome.
+    private var pendingNotificationRunID: String?
     /// Review fix (round 1): `frontMainWindow()` below could previously only
     /// front an ALREADY-EXISTING window — with the main window closed (the
     /// routine state for a menu-bar-capable app; closing the last window
@@ -148,10 +164,27 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
     /// always correct, not a shortcut.
     private func routeNotificationTap(runID: String?) {
         if let runID {
-            model?.navigate(to: .runDetail(id: runID, host: nil))
+            if let model {
+                model.navigate(to: .runDetail(id: runID, host: nil))
+            } else {
+                // Cold-launch tap: `RootView.onAppear` hasn't run yet, so
+                // there is nothing to navigate. Park it — `model`'s `didSet`
+                // replays it (final-review fix — M1).
+                pendingNotificationRunID = runID
+            }
         }
         NSApp.activate(ignoringOtherApps: true)
         frontMainWindow()
+    }
+
+    /// Replays a tap that arrived before `model` was attached. Runs from
+    /// `model`'s `didSet`, i.e. from `RootView.onAppear` — the same point
+    /// in the launch sequence at which any other deep link would be
+    /// honored.
+    private func drainPendingNotificationRoute() {
+        guard let model, let runID = pendingNotificationRunID else { return }
+        pendingNotificationRunID = nil
+        model.navigate(to: .runDetail(id: runID, host: nil))
     }
 
     /// `NSApp.windows.first` is unordered and is NOT guaranteed to be the
@@ -227,6 +260,21 @@ struct RupuApp: App {
     /// — see `MenuBarStore`'s own doc comment for why the attention dot
     /// needs live data even while the popover is closed.
     @State private var menuBarStore = MenuBarStore()
+    /// Identity of the `CPClient` `runNotifier`/`menuBarStore` are currently
+    /// bound to — the same `backend.clientIdentity()` seam every
+    /// store-owning screen uses to notice a client swap (see that method's
+    /// doc comment). Final-review fix (I1): without this, `RunNotifier` was
+    /// bound for the app's whole lifetime to whatever backend existed at
+    /// its FIRST activation. Its `activate(streamFactory:)` no-ops while
+    /// `task != nil`, and the running loop only re-enters `streamFactory()`
+    /// when the current stream's `events()` sequence ENDS — which
+    /// `JSONEventStream` never lets happen, since it reconnects internally,
+    /// forever, to its construction-time URL and token. So an
+    /// embedded→remote switch, a remote reconnect to a different CP, or a
+    /// token change left notifications wired to the abandoned backend with
+    /// nothing to notice. Comparing identity and forcing a
+    /// `deactivate()` + `activate()` is what actually re-enters the factory.
+    @State private var boundClientIdentity: ObjectIdentifier?
     @AppStorage("appearance") private var appearance: String = "system"
     /// SwiftUI's window-creation action — the only way to actually create a
     /// `WindowGroup`'s window from outside SwiftUI's own view hierarchy.
@@ -294,7 +342,34 @@ struct RupuApp: App {
         MenuBarExtra {
             MenuBarView(store: menuBarStore, model: model, backend: backend, openMainWindow: openMainWindow)
         } label: {
+            // **The activation observers live on the LABEL, deliberately**
+            // (final-review fix — I1). `runNotifier`/`menuBarStore` are
+            // app-lifetime subscribers that must notice a backend identity
+            // change no matter what the operator has open, and every other
+            // candidate host is conditionally alive: the `WindowGroup`'s
+            // observers below die with the main window (routinely closed —
+            // this app keeps running windowless), and the popover CONTENT
+            // above only exists while the menu is actually open. The
+            // `MenuBarExtra` label is the one view in this scene graph that
+            // is mounted for the entire life of the process, so it is the
+            // only place these observers can be attached and still fire
+            // during the exact states they exist to cover. The
+            // `WindowGroup`'s calls stay as they are — every activation
+            // path here is idempotent, so a duplicate is a no-op.
             MenuBarStatusLabel(hasAttention: (menuBarStore.counts?.awaitingApproval ?? 0) > 0)
+                .onChange(of: backend.health) { _, newHealth in
+                    guard case .healthy = newHealth else { return }
+                    activateHealthDependents()
+                }
+                // Reading `clientIdentity()` in the label's body registers
+                // `BackendController`'s client as an observed dependency, so
+                // this fires on the swap itself — not only when the swap
+                // happens to coincide with a health transition (a remote
+                // reconnect that stays healthy throughout produces no
+                // health change at all).
+                .onChange(of: backend.clientIdentity()) { _, _ in
+                    activateHealthDependents()
+                }
         }
         .menuBarExtraStyle(.window)
     }
@@ -326,7 +401,24 @@ struct RupuApp: App {
     /// signature takes one directly, unlike `RunNotifier`'s lazy factory
     /// seam), so it's gated the same way `RootView`'s own
     /// `hostsFooter.activate(client:)` `.onAppear` fallback is.
+    ///
+    /// **Rebinds on a client-identity change** (final-review fix — I1): see
+    /// `boundClientIdentity`'s doc comment for why `RunNotifier` needs an
+    /// explicit `deactivate()` before the re-`activate()` — its running
+    /// loop otherwise never re-enters `streamFactory()` and stays wired to
+    /// the abandoned backend forever. The factory handed to `activate` is
+    /// freshly built each time, so the new loop's first
+    /// `backend.makeFirehoseStream()` reads the CURRENT `activeConfig`
+    /// (URL + token), not the one captured at first launch.
+    /// `menuBarStore.activate(client:)` needs no such teardown — it takes
+    /// the client by parameter and its poll loop reads whatever `client`
+    /// currently holds on every tick.
     private func activateHealthDependents() {
+        let identity = backend.clientIdentity()
+        if identity != boundClientIdentity {
+            boundClientIdentity = identity
+            runNotifier.deactivate()
+        }
         // `MainActor.assumeIsolated` here matches `RunDetailStore.
         // makeRunSignalsFactory`/`OverviewScreen.makeSignalsFactory`'s own
         // bridging into `backend.make*Stream` from inside a factory

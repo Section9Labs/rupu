@@ -290,7 +290,12 @@ struct ConfigStoreTests {
 
     // MARK: - 400 (validation failure)
 
-    @Test func fourHundredWriteSurfacesBodyVerbatimAndReadOnlyStaysFalse() async {
+    /// Final-review fix (M2): every `ApiError` body — 400 and 501 alike —
+    /// is the `{"error": "..."}` envelope `crates/rupu-cp/src/error.rs`
+    /// builds, so `saveError` must carry the UNWRAPPED message. Assigning
+    /// the whole body (the pre-fix behavior) rendered literal JSON braces
+    /// and escaping in the inline error under the editor.
+    @Test func fourHundredWriteSurfacesTheUnwrappedErrorMessageAndReadOnlyStaysFalse() async {
         let errorBody = #"{"error":"invalid TOML at line 3: unexpected character"}"#
         let client = makeClient { req in
             if req.url?.path == "/api/config" {
@@ -307,9 +312,21 @@ struct ConfigStoreTests {
         let result = await store.saveGlobalRaw("not valid toml {{{", client: client)
 
         #expect(result == false)
-        #expect(store.saveError == errorBody)
+        #expect(store.saveError == "invalid TOML at line 3: unexpected character")
+        #expect(store.saveError?.contains("{") == false, "the raw JSON envelope must never reach the operator")
         #expect(store.readOnly == false)
         #expect(store.saving == false)
+    }
+
+    /// A body that ISN'T that envelope falls back verbatim — an unexpected
+    /// body (a reverse proxy's HTML error page, say) is still better shown
+    /// raw than swallowed.
+    @Test func nonEnvelopeErrorBodyFallsBackVerbatim() async {
+        #expect(ConfigStore.displayMessage(forBody: "<html>502 Bad Gateway</html>") == "<html>502 Bad Gateway</html>")
+        #expect(ConfigStore.displayMessage(forBody: "") == "")
+        // Valid JSON, wrong shape.
+        #expect(ConfigStore.displayMessage(forBody: #"{"message":"nope"}"#) == #"{"message":"nope"}"#)
+        #expect(ConfigStore.displayMessage(forBody: #"{"error":"real message"}"#) == "real message")
     }
 
     /// A second save attempt must clear the prior attempt's `saveError`
@@ -333,7 +350,8 @@ struct ConfigStoreTests {
         await store.load(client: client, project: nil)
 
         _ = await store.saveGlobalRaw("bad", client: client)
-        #expect(store.saveError == #"{"error":"first failure"}"#)
+        // Unwrapped from the `{"error": ...}` envelope — final-review fix (M2).
+        #expect(store.saveError == "first failure")
 
         let result = await store.saveGlobalRaw("original\n", client: client)
         #expect(result == true)
@@ -389,7 +407,11 @@ struct ConfigStoreTests {
         #expect(ConfigStubURLProtocol.hits("/api/config") == 2)
     }
 
-    @Test func saveProjectRawWithNoSelectedProjectIsANoOp() async {
+    /// Final-review fix (I3): the no-project-scope refusal must be VISIBLE.
+    /// It used to `return false` with nothing set anywhere, so the Raw
+    /// tab's Project-layer Save looked indistinguishable from a save that
+    /// worked.
+    @Test func saveProjectRawWithNoSelectedProjectFailsVisiblyWithoutTouchingTheNetwork() async {
         let client = makeClient { _ in (404, Data()) }
         let store = ConfigStore()
         // No `load` call — `selectedProject` stays nil.
@@ -397,7 +419,84 @@ struct ConfigStoreTests {
         let result = await store.saveProjectRaw("x = 1\n", client: client)
 
         #expect(result == false)
+        #expect(store.saveError == ConfigStore.noProjectScopeMessage)
+        #expect(store.saving == false)
         #expect(ConfigStubURLProtocol.hits("/api/config/project/ws-1") == 0)
+    }
+
+    // MARK: - Final-review fix (M3): `true` requires the reload to succeed
+
+    /// The documented contract is "`true` only if BOTH the write and the
+    /// following re-`load` succeeded" — but every save method used to
+    /// return `true` on the strength of the write alone, so a save whose
+    /// reload failed reported success to a caller looking at a `.failed`
+    /// view.
+    @Test func globalSaveWhoseReloadFailsReturnsFalse() async {
+        let getHits = Counter()
+        let client = makeClient { req in
+            if req.url?.path == "/api/config" {
+                // First GET (the initial `load`) succeeds; the post-save
+                // reload 500s.
+                return getHits.increment() == 1 ? (200, Self.configJSON(rawGlobal: "original\n")) : (500, Data())
+            }
+            if req.url?.path == "/api/config/global" {
+                return (200, Data(#"{"ok":true,"restart_required":[]}"#.utf8))
+            }
+            return (404, Data())
+        }
+        let store = ConfigStore()
+        await store.load(client: client, project: nil)
+
+        let result = await store.saveGlobalRaw("original\nextra = 1\n", client: client)
+
+        #expect(result == false, "the write landed but the reload didn't — that is not a confirmed save")
+        #expect(ConfigStubURLProtocol.hits("/api/config") == 2, "the reload must still have been attempted")
+        if case .failed = store.view {} else {
+            Issue.record("expected .failed after a failed reload, got \(store.view)")
+        }
+        #expect(store.saving == false)
+    }
+
+    @Test func policySaveWhoseReloadFailsReturnsFalse() async {
+        let getHits = Counter()
+        let client = makeClient { req in
+            if req.url?.path == "/api/config" {
+                return getHits.increment() == 1 ? (200, Self.configJSON()) : (500, Data())
+            }
+            if req.url?.path == "/api/config/policy" {
+                return (200, Data(#"{"ok":true}"#.utf8))
+            }
+            return (404, Data())
+        }
+        let store = ConfigStore()
+        await store.load(client: client, project: nil)
+
+        let result = await store.savePolicy(lock: ["default_model"], client: client)
+
+        #expect(result == false)
+        #expect(store.saving == false)
+    }
+
+    @Test func projectSaveWhoseReloadFailsReturnsFalse() async {
+        let getHits = Counter()
+        let client = makeClient { req in
+            if req.url?.path == "/api/config" {
+                return getHits.increment() == 1
+                    ? (200, Self.configJSON(rawProject: "default_model = \"x\"\n"))
+                    : (500, Data())
+            }
+            if req.url?.path == "/api/config/project/ws-1" {
+                return (200, Data(#"{"ok":true}"#.utf8))
+            }
+            return (404, Data())
+        }
+        let store = ConfigStore()
+        await store.load(client: client, project: "ws-1")
+
+        let result = await store.saveProjectRaw("default_model = \"y\"\n", client: client)
+
+        #expect(result == false)
+        #expect(store.saving == false)
     }
 
     @Test func successfulPolicySaveReloads() async {

@@ -51,11 +51,19 @@ import RupuDesign
 /// same underlying data, and a `.loading` bounce never touches state that
 /// lives one level up from the thing being torn down.
 ///
-/// **Does NOT need `OverviewScreen`'s cold-launch `.onChange(of: backend.
-/// health)` fix**: like `ActivityScreen`/`FleetScreen`, this tab is only
-/// ever reached by an explicit ⌘, after the shell (and therefore the
-/// backend connection attempt) has already been running for a while — never
-/// the very first thing a cold launch renders.
+/// **Needs `OverviewScreen`'s cold-launch `.onChange(of: backend.health)`
+/// fix, same as every other screen** (final-review fix — I2). An earlier
+/// version of this comment claimed the opposite ("only ever reached by an
+/// explicit ⌘, after the backend connection attempt has been running for a
+/// while"), and that claim was false on this very branch: Task 8's menu-bar
+/// `SettingsLink` opens Settings with no main window ever having been
+/// shown, and the app is usable windowless, so a cold Settings open can
+/// absolutely land here BEFORE `backend.client()` exists. `.task` fires
+/// exactly once per mount, so that shape used to strand the tab on
+/// "Backend not connected" with no path back short of closing and
+/// re-opening Settings. `body` therefore carries `.onChange(of: backend.
+/// health)` re-activation (the same `RootView` `hostsFooter` precedent) AND
+/// the not-connected state carries an explicit Retry button.
 public struct ConfigTab: View {
     enum Segment: String, CaseIterable, Identifiable {
         case effective = "Effective"
@@ -77,9 +85,7 @@ public struct ConfigTab: View {
     // section). `rawLayer` is hoisted alongside the two raw texts so a
     // post-save reload can't reset the Raw tab back to Global either.
     @State private var rawLayer: RawLayer = .global
-    @State private var globalDraft = ""
-    @State private var projectDraft = ""
-    @State private var lockDraft: [String] = []
+    @State private var drafts = ConfigDrafts()
 
     /// Non-`nil` while the "discard unsaved edits?" dialog for a SCOPE
     /// switch is up — see `requestScopeSwitch(to:store:)`.
@@ -95,7 +101,7 @@ public struct ConfigTab: View {
             if let store {
                 content(store: store)
             } else {
-                centeredLabel("Backend not connected")
+                notConnectedState
             }
         }
         .frame(maxWidth: .infinity, minHeight: 340, alignment: .top)
@@ -103,6 +109,38 @@ public struct ConfigTab: View {
         .task {
             await activate()
         }
+        // Final-review fix (I2): `.task` fires once per mount, so a Settings
+        // window opened BEFORE the backend became healthy (menu-bar
+        // `SettingsLink`, windowless launch) used to strand this tab forever
+        // on "Backend not connected". `activate()` is idempotent (its
+        // `storeClientID` guard only rebuilds the store on a genuine client
+        // swap), so re-running it on every health transition is safe. Not
+        // gated on `.healthy` specifically: `activate()` no-ops on its own
+        // `guard let client` when there still isn't one, and a `.degraded`
+        // backend can still serve `GET /api/config`.
+        .onChange(of: backend.health) { _, _ in
+            Task { await activate() }
+        }
+    }
+
+    /// Final-review fix (I2): the "no client yet" state carries an explicit
+    /// Retry, so an operator who lands here during a slow/failed backend
+    /// start has a control to press rather than only the implicit
+    /// `.onChange(of: backend.health)` recovery above (which needs the
+    /// health value to actually change — a backend stuck `.down` since
+    /// before this tab mounted never produces that transition).
+    private var notConnectedState: some View {
+        VStack(spacing: 10) {
+            Spacer(minLength: 0)
+            Text("Backend not connected")
+                .font(.noteText)
+                .foregroundStyle(Color.rupuMute)
+            Button("Retry") {
+                Task { await activate() }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func content(store: ConfigStore) -> some View {
@@ -129,14 +167,28 @@ public struct ConfigTab: View {
         // `initial: true` additionally seeds the draft from whatever
         // `store.view` already holds the first time `content(store:)`
         // mounts, not just on a later change.
-        .onChange(of: store.view.value?.rawGlobal, initial: true) { _, newValue in
-            if !isGlobalDirty(store: store) { globalDraft = newValue ?? "" }
+        //
+        // **The comparison is against `oldValue`, never `newValue`**
+        // (final-review fix — C1, a data-loss bug). These three closures
+        // previously called `isGlobalDirty(store:)`/etc., which compare the
+        // draft against `store.view`'s CURRENT (i.e. already-new) value —
+        // so "not dirty" meant "draft already equals the value we were
+        // about to adopt", making every adoption a no-op and leaving the
+        // drafts at their empty initial values on a cold open of Raw/
+        // Policy. Save was then enabled against an EMPTY draft: PUTting
+        // empty raw TOML (wiping `config.toml`) or an empty lock list
+        // (deleting every policy lock). `ConfigDrafts` compares against
+        // `oldValue` — the value this sync last handed the draft — so
+        // "hasn't diverged" is the real question being asked, and a draft
+        // that was never seeded at all (`nil`) adopts unconditionally.
+        .onChange(of: store.view.value?.rawGlobal, initial: true) { oldValue, newValue in
+            drafts.syncGlobal(previous: oldValue, new: newValue)
         }
-        .onChange(of: store.view.value?.rawProject, initial: true) { _, newValue in
-            if !isProjectDirty(store: store) { projectDraft = newValue ?? "" }
+        .onChange(of: store.view.value.flatMap { $0.rawProject }, initial: true) { oldValue, newValue in
+            drafts.syncProject(previous: oldValue, new: newValue)
         }
-        .onChange(of: store.view.value.map { EffectiveConfigGrouping.policyLockKeys(for: $0) }, initial: true) { _, newValue in
-            if !isPolicyDirty(store: store) { lockDraft = newValue ?? [] }
+        .onChange(of: store.view.value.map { EffectiveConfigGrouping.policyLockKeys(for: $0) }, initial: true) { oldValue, newValue in
+            drafts.syncLock(previous: oldValue, new: newValue)
         }
         .confirmationDialog(
             "Discard unsaved edits?",
@@ -213,34 +265,51 @@ public struct ConfigTab: View {
     /// lose, or the operator just explicitly confirmed discarding it in the
     /// dialog — either way, the new scope's server content is exactly what
     /// every draft should show next.
+    ///
+    /// **Also resets `rawLayer` when the new scope is Global-only**
+    /// (final-review fix — I3): `rawLayer` is hoisted `@State` that survives
+    /// a scope change, so returning to "Global only" while the Raw tab was
+    /// showing the Project layer used to leave an editable `TextEditor` up
+    /// whose Save could only ever no-op (`ConfigStore.saveProjectRaw`
+    /// returns `false` immediately with no `selectedProject`). The layer
+    /// button for `.project` is already `disabled` in that state, so there
+    /// was no way back out of it either.
     private func performScopeSwitch(to target: String?, store: ConfigStore) async {
         selectedProjectID = target
+        if target == nil { rawLayer = .global }
         guard let client = backend.client() else { return }
         await store.load(client: client, project: target)
-        globalDraft = store.view.value?.rawGlobal ?? ""
-        projectDraft = store.view.value?.rawProject ?? ""
-        lockDraft = store.view.value.map { EffectiveConfigGrouping.policyLockKeys(for: $0) } ?? []
+        drafts.adoptAll(from: store.view.value)
     }
 
     private var pendingScopeSwitchBinding: Binding<Bool> {
         Binding(get: { pendingScopeSwitch != nil }, set: { if !$0 { pendingScopeSwitch = nil } })
     }
 
-    private func isGlobalDirty(store: ConfigStore) -> Bool {
-        globalDraft != (store.view.value?.rawGlobal ?? "")
-    }
-
-    private func isProjectDirty(store: ConfigStore) -> Bool {
-        projectDraft != (store.view.value?.rawProject ?? "")
-    }
-
-    private func isPolicyDirty(store: ConfigStore) -> Bool {
-        let current = store.view.value.map { EffectiveConfigGrouping.policyLockKeys(for: $0) } ?? []
-        return lockDraft.sorted() != current.sorted()
-    }
-
     private func hasUnsavedEdits(store: ConfigStore) -> Bool {
-        isGlobalDirty(store: store) || isProjectDirty(store: store) || isPolicyDirty(store: store)
+        drafts.hasUnsavedEdits(against: store.view.value)
+    }
+
+    // MARK: Draft bindings
+    //
+    // `ConfigDrafts` stores each draft as an OPTIONAL so "never seeded" is
+    // distinguishable from "seeded, and the operator emptied it" (that
+    // distinction is the whole of the C1 fix — see `ConfigDrafts`'s doc
+    // comment). The sub-views want plain non-optional bindings, so an
+    // unseeded draft reads through as `""`/`[]` here; a WRITE through any
+    // of these seeds the draft, which is correct — the operator typing into
+    // a field is exactly the moment that draft becomes real.
+
+    private var globalBinding: Binding<String> {
+        Binding(get: { drafts.global ?? "" }, set: { drafts.global = $0 })
+    }
+
+    private var projectBinding: Binding<String> {
+        Binding(get: { drafts.project ?? "" }, set: { drafts.project = $0 })
+    }
+
+    private var lockBinding: Binding<[String]> {
+        Binding(get: { drafts.lock ?? [] }, set: { drafts.lock = $0 })
     }
 
     @ViewBuilder
@@ -271,11 +340,11 @@ public struct ConfigTab: View {
                     store: store,
                     backend: backend,
                     layer: $rawLayer,
-                    globalText: $globalDraft,
-                    projectText: $projectDraft
+                    globalText: globalBinding,
+                    projectText: projectBinding
                 )
             case .policy:
-                PolicyLockEditor(store: store, backend: backend, lockedKeys: $lockDraft)
+                PolicyLockEditor(store: store, backend: backend, lockedKeys: lockBinding)
             }
         }
     }
@@ -323,6 +392,110 @@ public struct ConfigTab: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Draft state + adoption rule
+
+/// `ConfigTab`'s three hoisted drafts (Raw Global, Raw Project, Policy
+/// lock list) plus the pure rule deciding when a server refresh may adopt
+/// its new value INTO a draft. Split out of the view as a plain value type
+/// specifically so the rule is testable without a SwiftUI render pass —
+/// the bug it exists to prevent (final-review fix, C1) was silent, and only
+/// visible as an empty editor, so it needs a test that can't be satisfied
+/// by "the view compiles".
+///
+/// **Each draft is `Optional`, and `nil` means "never seeded from server
+/// content".** That is not a stylistic choice: with the pre-fix
+/// non-optional `""` initial value there was no way to tell an unseeded
+/// draft from one the operator deliberately emptied, and the sync had to
+/// guess. `nil` adopts unconditionally (the FIRST content load always
+/// seeds every draft, which is what the pre-fix code failed to do);
+/// `Optional("")` is a real, operator-authored empty draft and is treated
+/// as a divergence like any other.
+///
+/// **The adoption rule compares the draft against the PREVIOUS store value,
+/// not the new one.** The pre-fix closures asked "is the draft different
+/// from what `store.view` holds right now?", but by the time an `onChange`
+/// body runs, `store.view` already holds the NEW value — so the guard only
+/// passed when draft and new value already agreed, i.e. adoption was a
+/// no-op in every case that mattered. Comparing against `oldValue` asks
+/// the question actually intended: "is this draft still exactly what this
+/// sync last handed it?" If yes, the operator hasn't diverged and the fresh
+/// server value is safe to adopt; if no, there's an in-progress edit and it
+/// must survive.
+struct ConfigDrafts: Equatable {
+    /// Raw TOML for the Global layer. `nil` until the first sync/seed.
+    var global: String?
+    /// Raw TOML for the Project layer (`nil` also renders as `""` — a
+    /// scope with no project-layer file yet is an empty editor, not an
+    /// error).
+    var project: String?
+    /// The `[policy].lock` enforced-key list.
+    var lock: [String]?
+
+    /// `true` when a refresh may overwrite `draft` with the server's new
+    /// value: either the draft was never seeded, or it still equals the
+    /// value this sync last gave it (`previous`). A `nil` `previous` — the
+    /// transient `.loading` bounce every reload passes through, where
+    /// `store.view.value` is momentarily absent — is treated as `""`, which
+    /// is exactly what the matching `new ?? ""` adoption wrote into the
+    /// draft on the way in, so the two halves of a bounce chain correctly:
+    /// content("A") → loading(nil) drives a clean draft to `""`, then
+    /// loading(nil) → content("B") sees `"" == previous(nil → "")` and
+    /// adopts `"B"`. A DIRTY draft matches neither leg and survives both.
+    /// (The transient `""` is never rendered: `ConfigTab.body(store:)`
+    /// shows "Loading…" for the whole `.loading` window, so no editor and
+    /// no Save button exists to act on it.)
+    static func shouldAdoptNewValue(draft: String?, previous: String?) -> Bool {
+        guard let draft else { return true }
+        return draft == (previous ?? "")
+    }
+
+    /// The lock-list analogue of `shouldAdoptNewValue`. Order-insensitive
+    /// (`sorted()`) for the same reason `PolicyLockEditor.isDirty` is: the
+    /// editor appends new keys in click order but always PUTs a sorted
+    /// list, so a re-ordering alone is not a divergence.
+    static func shouldAdoptNewLockList(draft: [String]?, previous: [String]?) -> Bool {
+        guard let draft else { return true }
+        return draft.sorted() == (previous ?? []).sorted()
+    }
+
+    mutating func syncGlobal(previous: String?, new: String?) {
+        guard Self.shouldAdoptNewValue(draft: global, previous: previous) else { return }
+        global = new ?? ""
+    }
+
+    mutating func syncProject(previous: String?, new: String?) {
+        guard Self.shouldAdoptNewValue(draft: project, previous: previous) else { return }
+        project = new ?? ""
+    }
+
+    mutating func syncLock(previous: [String]?, new: [String]?) {
+        guard Self.shouldAdoptNewLockList(draft: lock, previous: previous) else { return }
+        lock = new ?? []
+    }
+
+    /// Force-adopts every draft from `view`, bypassing the guard entirely —
+    /// see `ConfigTab.performScopeSwitch(to:store:)`'s doc comment for why
+    /// that bypass is correct there (nothing was dirty, or the operator
+    /// just confirmed discarding it).
+    mutating func adoptAll(from view: APIConfigView?) {
+        global = view?.rawGlobal ?? ""
+        project = view?.rawProject ?? ""
+        lock = view.map { EffectiveConfigGrouping.policyLockKeys(for: $0) } ?? []
+    }
+
+    /// An unseeded draft is never dirty — there is nothing to lose, so a
+    /// scope switch with all three still `nil` must not raise the "discard
+    /// unsaved edits?" dialog.
+    func hasUnsavedEdits(against view: APIConfigView?) -> Bool {
+        if let global, global != (view?.rawGlobal ?? "") { return true }
+        if let project, project != (view?.rawProject ?? "") { return true }
+        if let lock, lock.sorted() != (view.map { EffectiveConfigGrouping.policyLockKeys(for: $0) } ?? []).sorted() {
+            return true
+        }
+        return false
     }
 }
 
@@ -992,10 +1165,19 @@ struct PolicyLockEditor: View {
         newKeyText = ""
     }
 
-    /// Free text, sent verbatim — this editor does no client-side validation
-    /// of the key's shape; the server validates on `PUT /api/config/policy`
-    /// and a bad key surfaces there as a 400, same as any other save
-    /// failure.
+    /// Free text, sent verbatim — this editor does no client-side
+    /// validation of the key's shape.
+    ///
+    /// **And neither does the server** (final-review fix — M2; the previous
+    /// comment here claimed "a bad key surfaces there as a 400", which is
+    /// false). `put_policy` (`crates/rupu-cp/src/api/config.rs`) patches
+    /// `policy.lock` to whatever string array it was handed and only checks
+    /// that the RESULTING document still parses as TOML — it never checks
+    /// that a listed key names anything real. A misspelled or invented key
+    /// therefore saves with a 200 and simply locks nothing; the only
+    /// feedback is its absence from the Effective tab's lock glyphs. A 400
+    /// from this route means the patched document didn't parse, not that a
+    /// key was rejected.
     private func addLock(_ key: String) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !lockedKeys.contains(trimmed) else { return }

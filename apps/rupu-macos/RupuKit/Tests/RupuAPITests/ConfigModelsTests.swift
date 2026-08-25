@@ -22,6 +22,21 @@ import Foundation
     #expect(lockProv.locked)
 
     // Every provenance source variant the fixture carries.
+    //
+    // `log_level`'s `{"source": "default"}` entry is DECODE COVERAGE ONLY
+    // and cannot occur on the real wire (final-review note — M6).
+    // `rupu_config::resolve` (`crates/rupu-config/src/resolve.rs`) inserts a
+    // `provenance` entry only inside `if let Some(v) = val { ... }` — i.e.
+    // only when some layer actually supplied a value — and the sole branch
+    // producing `KeySource::Default` is the one where `val` is `None`. So
+    // `KeySource::Default` is reachable in the Rust enum but never
+    // serialized into a `provenance` map. The fixture keeps the entry
+    // because the plan prescribed round-tripping every `APIKeySource` case,
+    // and this assertion is what proves the Swift decode handles it — NOT
+    // evidence that the server emits it. Production code is written for the
+    // real shape: `EffectiveConfigGrouping.rows(for:)` derives the `default`
+    // chip from the ABSENCE of a provenance entry (`provenance?.source ??
+    // .default`), never from an entry that says `"default"`.
     #expect(view.provenance["default_model"]?.source == .global)
     #expect(view.provenance["log_level"]?.source == .default)
     #expect(view.provenance["cp.max_workspace_bytes"]?.source == .project)
