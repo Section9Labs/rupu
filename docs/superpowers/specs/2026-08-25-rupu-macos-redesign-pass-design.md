@@ -8,7 +8,7 @@
 
 ## 0. Coordination constraint
 
-PR #612 (open, another session) owns the toolbar region (unified Range, icon-only controls, Live item). This pass does NOT touch the top bar: backlog row 27 (scope-select thinness) is **explicitly left to ride with or follow #612**, recorded here so the row isn't lost. If #612 merges mid-pass, rebase; never edit `ShellToolbar.swift` in this arc.
+PR #612 (open, another session) owns the toolbar region (unified Range, icon-only controls, Live item). This pass does NOT touch the top bar: backlog row 27 (scope-select thinness) is **explicitly left to ride with or follow #612**, recorded here so the row isn't lost. If #612 merges mid-pass, rebase; never edit `ShellToolbar.swift` in this arc. **AMENDED mid-pass:** #612 merged (2026-08-25); the branch rebased onto it and the embargo lifted to "extend, never restructure" — T3's Customize reorder adds a menu item + sheet inside the existing `customizeMenu` content without touching #612's ToolbarItem ids/placements/native-Customize semantics (ledger RESEQUENCE ruling).
 
 ## 1. Side-by-side audit (opens the pass)
 
