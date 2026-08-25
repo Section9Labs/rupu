@@ -46,46 +46,6 @@
       "status": "clean"
     }
   ],
-  "catalog": {
-    "concerns": [
-      {
-        "applicable_globs": [
-          "**/auth/**"
-        ],
-        "description": "Secret comparisons must be constant-time.",
-        "id": "timing-attack",
-        "min_strength": "read",
-        "name": "Timing side-channel",
-        "references": [
-          "https://cwe.mitre.org/data/definitions/208.html"
-        ],
-        "severity": "critical",
-        "tags": [
-          "stride:spoofing"
-        ]
-      },
-      {
-        "applicable_globs": [
-          "**"
-        ],
-        "description": "Queries must be parameterized, never string-built.",
-        "id": "sql-injection",
-        "min_strength": "read",
-        "name": "SQL injection",
-        "references": [],
-        "severity": "high",
-        "tags": []
-      }
-    ],
-    "render_modes": {
-      "sql-injection": "index",
-      "timing-attack": "full"
-    },
-    "sources": {
-      "sql-injection": "stride",
-      "timing-attack": "stride"
-    }
-  },
   "files": [
     {
       "edits": 1,
