@@ -49,20 +49,20 @@ struct ProjectQuery {
 }
 
 #[derive(Serialize)]
-struct RuntimeStatus {
-    bind: String,
-    token_set: bool,
-    restart_required_keys: Vec<String>,
+pub struct RuntimeStatus {
+    pub bind: String,
+    pub token_set: bool,
+    pub restart_required_keys: Vec<String>,
 }
 
 #[derive(Serialize)]
-struct ConfigView {
-    effective: serde_json::Value,
-    provenance: BTreeMap<String, rupu_config::KeyProvenance>,
-    raw_global: String,
-    raw_project: Option<String>,
-    cp: serde_json::Value,
-    status: RuntimeStatus,
+pub struct ConfigView {
+    pub effective: serde_json::Value,
+    pub provenance: BTreeMap<String, rupu_config::KeyProvenance>,
+    pub raw_global: String,
+    pub raw_project: Option<String>,
+    pub cp: serde_json::Value,
+    pub status: RuntimeStatus,
 }
 
 /// `GET /api/config` (+ `?project=<ws_id>`) — effective config + provenance +
@@ -765,8 +765,7 @@ input_per_mtok = 5.0
         // This is the "took effect" assertion: it does not touch `s` at all,
         // it just re-reads the file the handler wrote, the same way any
         // other process (a `rupu` CLI invocation, a fresh `cp serve`) would.
-        let resolved = rupu_config::resolve(Some(&global_path), None)
-            .expect("on-disk resolve ok");
+        let resolved = rupu_config::resolve(Some(&global_path), None).expect("on-disk resolve ok");
         assert_eq!(resolved.config.default_model.as_deref(), Some("sonnet"));
 
         // ── 4. Hand-add a comment, then form-patch a DIFFERENT key ──────────
@@ -828,8 +827,7 @@ input_per_mtok = 5.0
 
         // ── 1. Direct resolve(): locked global wins, provenance says so ─────
         let resolved =
-            rupu_config::resolve(Some(&global_path), Some(&project_path))
-                .expect("resolve ok");
+            rupu_config::resolve(Some(&global_path), Some(&project_path)).expect("resolve ok");
         assert_eq!(resolved.config.permission_mode.as_deref(), Some("ask"));
         let prov = resolved
             .provenance

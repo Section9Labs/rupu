@@ -1,0 +1,51 @@
+{
+  "effective": {
+    "cp": {
+      "bind": "127.0.0.1:7420",
+      "max_workspace_bytes": 500000000
+    },
+    "default_model": "claude-sonnet-4-6",
+    "providers": {
+      "GLM-5.2-FP8": {
+        "base_url": "https://oracle.internal/v1",
+        "model": "GLM-5.2-FP8"
+      }
+    }
+  },
+  "provenance": {
+    "cp.max_workspace_bytes": {
+      "source": "project",
+      "locked": false
+    },
+    "default_model": {
+      "source": "global",
+      "locked": false
+    },
+    "log_level": {
+      "source": "default",
+      "locked": false
+    },
+    "policy.lock": {
+      "source": "global",
+      "locked": true
+    },
+    "providers.\"GLM-5.2-FP8\".model": {
+      "source": "project",
+      "locked": false
+    }
+  },
+  "raw_global": "default_model = \"claude-sonnet-4-6\"\nlog_level = \"info\"\n\n[policy]\nlock = [\"policy.lock\"]\n",
+  "raw_project": "default_model = \"claude-opus-4-8\"\n\n[cp]\nmax_workspace_bytes = 500000000\n",
+  "cp": {
+    "bind": "127.0.0.1:7420",
+    "max_workspace_bytes": 500000000
+  },
+  "status": {
+    "bind": "127.0.0.1:7420",
+    "token_set": false,
+    "restart_required_keys": [
+      "bind",
+      "token"
+    ]
+  }
+}
