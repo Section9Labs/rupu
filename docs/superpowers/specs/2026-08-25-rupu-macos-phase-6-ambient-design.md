@@ -36,7 +36,7 @@ A separate fullscreen scene (View ▸ Enter Situation Room; borderless, **dark a
 
 ## 5. Code & source viewers (6B)
 
-- **Project Code tab** (fills Phase 5A's deferred slot in Project detail): lazy file tree (`GET /api/projects/:ws_id/tree`), file viewer (`/source` — mono, line numbers, language label, honest `available:false` states for big/binary files), name-filter over `/files` (truncation flag surfaced).
+- **Project Code tab** (a NEW `.code` case in Project detail's tab enum — Phase 5A shipped no placeholder slot for it): lazy file tree (`GET /api/projects/:ws_id/tree`), file viewer (`/source` — mono, line numbers, language label, honest `available:false` states for big/binary files), name-filter over `/files` (truncation flag surfaced).
 - **Run-scoped previews in the transcript**: tool-result cards for grep/ast_grep gain inline source slices (`GET /api/runs/:id/source` — soft-fail states honest, incl. `REMOTE_NOT_SUPPORTED` for remote runs) and a CST tree for ast_grep matches (`GET /api/runs/:id/ast`, matched-node highlighting, truncation flag). Port the web's mount points (`ToolCard` equivalents in the transcript feed), not its React internals.
 
 ## 6. Autoflow claims (6B)

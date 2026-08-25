@@ -6,8 +6,12 @@ import RupuAPI
 /// can't be meaningfully unit-rendered, so (same idiom `ClaimsTableTests`
 /// establishes for `ClaimTableRow`/`ClaimsTable`) the view-member logic
 /// that decides WHAT to show is pulled out as `static func`s these tests
-/// call directly, with `@testable import RupuProjects` reaching past the
-/// `internal` (not `public`) access `CodeTab`'s type itself uses.
+/// call directly. `CodeTab` the TYPE is `public` (it's rendered from
+/// `RupuProjects`'s own `ProjectDetailScreen`); it's these `static func`
+/// seams specifically that are `internal` (not `private`, but not `public`
+/// either) — `@testable import RupuProjects` is what reaches past that
+/// (review round 1 fix — this previously, incorrectly, claimed the TYPE
+/// itself was internal).
 @Suite
 @MainActor
 struct CodeTabTests {
@@ -109,5 +113,20 @@ struct CodeTabTests {
             reason: nil
         )
         #expect(!CodeTab.unavailableMessage(file).isEmpty, "must never render a blank pane")
+    }
+
+    // MARK: - `lineNumberGutterWidth` — sized to fit the digit count (review round 1)
+
+    @Test func lineNumberGutterWidthKeepsTheOriginalFloorForSmallFiles() {
+        #expect(CodeTab.lineNumberGutterWidth(totalLines: 3) == 40)
+        #expect(CodeTab.lineNumberGutterWidth(totalLines: nil) == 40)
+    }
+
+    @Test func lineNumberGutterWidthGrowsWithDigitCountForLargeFiles() {
+        let fiveDigitWidth = CodeTab.lineNumberGutterWidth(totalLines: 12345)
+        let sixDigitWidth = CodeTab.lineNumberGutterWidth(totalLines: 123456)
+
+        #expect(fiveDigitWidth > 40, "a 5-digit line count must not be clipped by the small-file floor")
+        #expect(sixDigitWidth > fiveDigitWidth, "more digits must widen the gutter further")
     }
 }

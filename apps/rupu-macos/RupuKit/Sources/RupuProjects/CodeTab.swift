@@ -110,7 +110,12 @@ public struct CodeTab: View {
                         parentRow(target: tree.parent ?? "")
                     }
                     let entries = Self.sortedEntries(tree.entries)
-                    if entries.isEmpty && !Self.showsParentRow(parent: tree.parent) {
+                    if entries.isEmpty {
+                        // Review round 1 fix: this note must show whenever
+                        // `entries` is empty, alongside the `..` row when
+                        // one is present — not only at the workspace root.
+                        // An empty SUBdirectory used to render a lone `..`
+                        // with no indication there was nothing else here.
                         Text("Empty directory")
                             .font(.noteText)
                             .foregroundStyle(Color.rupuMute)
@@ -264,13 +269,14 @@ public struct CodeTab: View {
     }
 
     private func availableFileViewer(_ file: APIFileContent) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let gutterWidth = Self.lineNumberGutterWidth(totalLines: file.totalLines)
+        return VStack(alignment: .leading, spacing: 0) {
             viewerHeader(file)
             Divider()
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(file.lines ?? [], id: \.n) { line in
-                        sourceLineRow(line)
+                        sourceLineRow(line, gutterWidth: gutterWidth)
                     }
                 }
             }
@@ -298,12 +304,12 @@ public struct CodeTab: View {
         .padding(.vertical, 8)
     }
 
-    private func sourceLineRow(_ line: APISourceLine) -> some View {
+    private func sourceLineRow(_ line: APISourceLine, gutterWidth: CGFloat) -> some View {
         HStack(spacing: 12) {
             Text("\(line.n)")
                 .font(.dataMono(11))
                 .foregroundStyle(Color.rupuMute)
-                .frame(width: 40, alignment: .trailing)
+                .frame(width: gutterWidth, alignment: .trailing)
             Text(line.text)
                 .font(.dataMono(11))
                 .foregroundStyle(Color.rupuInk)
@@ -395,5 +401,16 @@ public struct CodeTab: View {
     /// a blank pane).
     static func unavailableMessage(_ file: APIFileContent) -> String {
         file.reason ?? "This file is unavailable."
+    }
+
+    /// The line-number gutter's width, sized from `totalLines`'s own digit
+    /// count rather than a fixed constant (review round 1 fix — a fixed
+    /// 40pt clipped a ≥5-digit line number in a large file). `8pt`/digit at
+    /// the viewer's `dataMono(11)` size comfortably fits each glyph plus a
+    /// little breathing room; `max(40, ...)` keeps the original width as a
+    /// floor so small files (1-3 digit line counts) look exactly as before.
+    static func lineNumberGutterWidth(totalLines: Int?) -> CGFloat {
+        let digits = String(totalLines ?? 1).count
+        return max(40, CGFloat(digits) * 8 + 16)
     }
 }

@@ -265,11 +265,19 @@ struct CodeStoreTests {
         #expect(store.tree.value?.path == "fresh")
     }
 
-    /// The shared-`generation` contract cuts BOTH ways (see `CodeStore`'s
-    /// type doc comment): an `open(path:)` that starts while an earlier
-    /// `navigate(path:)` is still in flight must invalidate that
-    /// `navigate`'s eventual result too, not just a same-kind race.
-    @Test func openMidFlightInvalidatesAnEarlierInFlightNavigate() async {
+    /// **Review round 1 fix** (pinned bug): `open(path:)` starting while an
+    /// earlier `navigate(path:)` is still in flight must NOT strand that
+    /// navigate's tree at `.loading` forever. An earlier revision of
+    /// `CodeStore` shared ONE generation counter across both operations, so
+    /// `open`'s bump made the still-in-flight `navigate`'s own guard fail
+    /// once its (perfectly current, not actually stale) tree result
+    /// arrived — this exact test used to assert `tree` STAYS `.loading`,
+    /// pinning the bug rather than catching it. Per-block generations
+    /// (`treeGeneration`/`fileGeneration` — see `CodeStore`'s type doc
+    /// comment) fix this: `open(path:)` only ever bumps `fileGeneration`,
+    /// so `navigate`'s own `treeGeneration` guard is untouched and its tree
+    /// result lands normally once the slow fetch resolves.
+    @Test func openMidFlightNoLongerStrandsAnEarlierInFlightNavigatesTree() async {
         let client = makeClient { req in
             if req.url?.path == "/api/projects/ws1/tree" {
                 Thread.sleep(forTimeInterval: 0.08)
@@ -279,22 +287,52 @@ struct CodeStoreTests {
         }
         let store = CodeStore(wsID: "ws1", client: client)
 
-        let staleNavigate = Task { await store.navigate(path: "slow-dir") }
-        try? await Task.sleep(for: .milliseconds(20))
+        let navigateTask = Task { await store.navigate(path: "slow-dir") }
+        try? await Task.sleep(for: .milliseconds(20)) // let the slow tree request actually fire
         await store.open(path: "main.rs")
 
         #expect(store.selectedPath == "main.rs")
         #expect(store.file?.value?.path == "main.rs")
 
-        await staleNavigate.value
+        await navigateTask.value // let the still-in-flight navigate's slow fetch land
 
-        // The stale navigate's late tree result must not have landed —
-        // `tree` stays whatever it was before (`.loading`, since this store
-        // never had a successful `navigate` before the stale one).
-        guard case .loading = store.tree else {
-            Issue.record("expected tree to stay .loading (the stale navigate's result must be dropped), got \(store.tree)")
-            return
+        // The navigate's tree result must land — `open` must never strand it.
+        #expect(store.currentPath == "slow-dir")
+        #expect(store.tree.value?.path == "slow-dir")
+    }
+
+    /// The other direction of the same cross-kind contract: a
+    /// `navigate(path:)` that starts while an earlier `open(path:)` is
+    /// still in flight must invalidate that `open`'s eventual result — the
+    /// stale file must never resurrect `file` after the operator has moved
+    /// to a different directory. `navigate(path:)` clears `file`/
+    /// `selectedPath` synchronously AND bumps `fileGeneration`, so even a
+    /// late-arriving, otherwise-successful `open` response is dropped.
+    @Test func navigateMidFlightDropsAnEarlierInFlightOpensStaleFileResult() async {
+        let client = makeClient { req in
+            if req.url?.path == "/api/projects/ws1/source" {
+                Thread.sleep(forTimeInterval: 0.08)
+                return (200, Data(Self.fileJSON(path: "slow-file.rs").utf8))
+            }
+            return (200, Data(Self.treeJSON(path: "dir-b", parent: "").utf8))
         }
+        let store = CodeStore(wsID: "ws1", client: client)
+
+        let openTask = Task { await store.open(path: "slow-file.rs") }
+        try? await Task.sleep(for: .milliseconds(20)) // let the slow file request actually fire
+        await store.navigate(path: "dir-b")
+
+        #expect(store.currentPath == "dir-b")
+        #expect(store.tree.value?.path == "dir-b")
+        // `navigate` synchronously clears the selection/file panel.
+        #expect(store.selectedPath == nil)
+        #expect(store.file == nil)
+
+        await openTask.value // let the stale open's slow fetch land too
+
+        // The stale open's late-arriving (otherwise perfectly valid) file
+        // content must never resurrect `file` after `navigate` moved on.
+        #expect(store.file == nil, "the stale open's late-arriving result must be dropped")
     }
 
     // MARK: - Filter (Step 1: "filter loads once and is reused")
