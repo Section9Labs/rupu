@@ -7,9 +7,20 @@ import RupuDesign
 /// additive status chips (`store.statusFilter` narrows synchronously, no
 /// refetch), a live-tail switch, and — when `pendingNewRuns > 0` — a "N new
 /// runs" pill that calls `applyPendingRefresh()`.
+///
+/// **`showRunsChrome` (review fix, round 1)** — `false` while the Activity
+/// screen's autoflows-kind Claims sub-tab is showing: the status chips,
+/// live-tail toggle, and "+N new runs" pill all act on `ActivityStore`'s
+/// `ActivityTable`, which isn't even on screen at that point (`ClaimsTable`
+/// is) — leaving them visible-and-live-but-inert violates the no-dead-
+/// controls rule (toggling live-tail would keep ticking a table nobody can
+/// see; the pill would apply a refresh to rows not shown). The kind picker
+/// stays regardless of this flag — it's the only way back OUT of the
+/// autoflows kind, never inert.
 struct FilterBar: View {
     @Bindable var model: AppModel
     @Bindable var store: ActivityStore
+    let showRunsChrome: Bool
 
     private static let chipStatuses: [ActivityStatus] = [
         .pending, .running, .completed, .failed, .awaiting, .rejected, .cancelled, .paused,
@@ -20,12 +31,16 @@ struct FilterBar: View {
             HStack(spacing: 12) {
                 kindPicker
                 Spacer(minLength: 0)
-                if store.pendingNewRuns > 0 {
-                    newRunsPill
+                if showRunsChrome {
+                    if store.pendingNewRuns > 0 {
+                        newRunsPill
+                    }
+                    liveTailToggle
                 }
-                liveTailToggle
             }
-            statusChips
+            if showRunsChrome {
+                statusChips
+            }
         }
         .padding(12)
         .panelStyle(.panel)

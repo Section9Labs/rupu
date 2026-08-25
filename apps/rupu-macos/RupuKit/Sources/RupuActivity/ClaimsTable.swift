@@ -31,13 +31,18 @@ private enum ClaimsTableLayout {
 /// `requeue(issueRef:)` — see that store's doc comment for why their
 /// pending-state confirmation contrasts with a run mutation's.
 ///
-/// **Local-CP-only footer note**: `CPClient.autoflowClaims()`'s doc comment
-/// notes claims stay local-only, unlike the `/api/runs*` firehose routes —
-/// every row here describes the local `cp serve`'s own claim store, never a
-/// merged multi-host view. Surfaced as a quiet footer line (honest-UI rule),
-/// same idiom `FleetScreen.footerNote` uses for its own CLI-only disclosure,
-/// rather than an unqualified table that implies fleet-wide coverage it
-/// doesn't have.
+/// **Footer discloses TWO limits, not one** (review fix, round 1 — the
+/// original footer only named the host limit): `CPClient.autoflowClaims()`'s
+/// doc comment notes claims stay local-only, unlike the `/api/runs*`
+/// firehose routes — every row here describes the local `cp serve`'s own
+/// claim store, never a merged multi-host view. Separately, this table also
+/// silently ignores the top bar's project-scope selection — NOT a filtering
+/// bug, a genuine impossibility: see `ClaimsStore`'s "No project-scope
+/// filtering" doc comment section for why `repoRef` can't be mapped to a
+/// `ws_id` client-side. Both limits are named plainly in one footer line
+/// (honest-UI rule), same idiom `FleetScreen.footerNote` uses for its own
+/// CLI-only disclosure, rather than an unqualified table that implies either
+/// fleet-wide coverage or project-scoped narrowing it doesn't actually have.
 struct ClaimsTable: View {
     let rows: [APIClaimRow]
     let store: ClaimsStore
@@ -112,7 +117,7 @@ struct ClaimsTable: View {
     }
 
     private var footerNote: some View {
-        Text("Local host only — claims aren't fanned out across hosts")
+        Text("Project scope doesn't apply to claims — always all projects, local host only")
             .font(.noteText)
             .foregroundStyle(Color.rupuMute)
             .padding(.horizontal, 12)
