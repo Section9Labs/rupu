@@ -247,10 +247,15 @@ struct SituationStoreTests {
     /// earlier signal" rule) must MERGE the fresh backfill page into
     /// `eventRows`, not replace it wholesale — the first pass at this
     /// collapsed up to 5,000 accumulated rows down to the last 200 on
-    /// every SSE reconnect. Accumulates past the 200-row page size (one
-    /// backfill row + one live-only row), simulates a reconnect, and
-    /// asserts BOTH the pre-reconnect tail survives AND the reconnect
-    /// page's genuinely-new "gap" row lands.
+    /// every SSE reconnect. This test doesn't reproduce that scale (a
+    /// small, fast backlog — one backfill row plus one live-only row — is
+    /// enough to distinguish "merge" from "replace": a replace would drop
+    /// both on reconnect, a merge keeps both); it simulates a reconnect and
+    /// asserts BOTH that small pre-reconnect backlog survives AND the
+    /// reconnect page's genuinely-new "gap" row lands alongside it. Fixed
+    /// on re-review (round 2, ruling 3): this comment previously claimed
+    /// the test "accumulates past the 200-row page size", which it never
+    /// did.
     @MainActor @Test func reconnectMergesFreshBackfillWithoutTruncatingAccumulatedRows() async {
         let firstPageRow: [String: Any] = ["ts": 1_000, "pos": 0, "type": "run_paused", "run_id": "run-first-page"]
         let firstPageBody = Self.encodeEvents([firstPageRow])
@@ -324,6 +329,46 @@ struct SituationStoreTests {
         await expectEventually("the evicted content is welcomed back as new, not dropped as a duplicate") {
             store.eventRows.first?.event == .stepFailed(runID: "r", stepID: "s0", error: "e0")
         }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// Review fix round 2, ruling 2: a run whose LAST remaining row is
+    /// cap-evicted must be pruned from `newestTSByRun` (the candidate set
+    /// both of `resolveRuns`'s budgeted passes — including the stale-
+    /// recheck pass — select from), not left to linger there forever
+    /// costing a wasted `GET /api/runs/:id` call on every future 60s poll
+    /// tick. Unlike `trimmedRowsAreForgottenSoTheSameContentCanReappearAsNewAfterEviction`
+    /// above (which evicts one row out of several sharing a run), this
+    /// gives the evicted run only ONE row total, so its eviction is also
+    /// its run's total eviction.
+    @MainActor @Test func evictingARunsLastRowPrunesItFromTheStaleRecheckSet() async {
+        let (store, box) = makeStore(maxEventRows: 2) { req in
+            if let hit = Self.defaultAggregateResponse(req) { return hit }
+            return (200, Data("[]".utf8))
+        }
+        await store.activate()
+
+        box.latest.yield(.event(.stepFailed(runID: "r-evicted", stepID: "s0", error: "e0")))
+        await expectEventually("r-evicted's row lands") { store.eventRows.count == 1 }
+        #expect(
+            store.newestTSByRun["r-evicted"] != nil,
+            "the run must be a stale-recheck candidate while its row is present"
+        )
+
+        // Two more DISTINCT events, different runs, push r-evicted's only
+        // row out of the cap (maxEventRows: 2).
+        box.latest.yield(.event(.stepFailed(runID: "other-1", stepID: "s1", error: "e1")))
+        box.latest.yield(.event(.stepFailed(runID: "other-2", stepID: "s2", error: "e2")))
+        await expectEventually("r-evicted's row is fully evicted by the cap") {
+            !store.eventRows.contains { $0.event.runID == "r-evicted" }
+        }
+
+        #expect(
+            store.newestTSByRun["r-evicted"] == nil,
+            "a run with zero remaining rows must be pruned from the stale-recheck candidate set, not linger forever"
+        )
 
         store.deactivate()
         box.latest.finish()

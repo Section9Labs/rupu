@@ -58,28 +58,51 @@ import RupuAPI
 /// web, which has no equivalent re-backfill on reconnect at all) while
 /// keeping every row already accumulated.
 ///
-/// **Dedup, incrementally** (review fix round 1, ruling 2 — HIGH,
-/// perf): `seenEventKeys: Set<CPEvent>` is the "already rendered this exact
-/// content" ledger both `mergeIncoming(_:)` and `applyLive(_:)` consult and
-/// maintain — an O(1) membership check/insert per row instead of the first
-/// pass's O(n) `eventRows.contains(where:)` linear scan (which, at up to
-/// 5,000 rows, made every single live event cost a full backlog scan on the
-/// main actor). `CPEvent`'s `Hashable` conformance (`RupuAPI/CPEvent.swift`)
-/// makes the set member exactly the "everything except the server-injected
-/// `ts`/`pos`" content identity `RupuSituation`'s `contentIdentityKey`/the
-/// web's `identityOf` use — the same shape as the web's `seenRef`, without
-/// this module needing to import `RupuSituation` to get there. A row
-/// trimmed off either end when `maxEventRows` is exceeded has its key
-/// removed from `seenEventKeys` too, so the set's size tracks `eventRows`'s
-/// 1:1, not the whole session's history.
+/// **Dedup, incrementally, with one honest divergence from the web**
+/// (review fix round 1, ruling 2 — HIGH, perf; claim corrected on re-review,
+/// round 2, ruling 4): `seenEventKeys: Set<CPEvent>` is the "already
+/// rendered this exact content" ledger both `mergeIncoming(_:)` and
+/// `applyLive(_:)` consult and maintain — an O(1) membership check/insert
+/// per row instead of the first pass's O(n) `eventRows.contains(where:)`
+/// linear scan (which, at up to 5,000 rows, made every single live event
+/// cost a full backlog scan on the main actor). `CPEvent`'s `Hashable`
+/// conformance (`RupuAPI/CPEvent.swift`) makes the set member exactly the
+/// "everything except the server-injected `ts`/`pos`" content identity
+/// `RupuSituation`'s `contentIdentityKey`/the web's `identityOf` use —
+/// computed the same way, without this module needing to import
+/// `RupuSituation` to get there. Where this genuinely DIVERGES from the
+/// web's own `seenRef`, honestly stated (the round-1 doc comment here
+/// wrongly claimed "the same shape as the web's `seenRef`" on this exact
+/// axis): the web's set never evicts anything — it grows for the entire
+/// life of the page. `seenEventKeys` evicts in lockstep with
+/// `maxEventRows` instead: a row trimmed off either end has its key
+/// removed too, so the set's size tracks `eventRows`'s 1:1, not the whole
+/// session's history. Consequence: in a session busy enough to push more
+/// than `maxEventRows` (5,000) DISTINCT events through, a stale SSE replay
+/// of a long-since-evicted event could be treated as new again and
+/// re-inserted — accepted, not a regression, since this is exactly the
+/// behavior the pre-fix (round 0) implementation already had (its own
+/// `eventRows.contains(where:)` scan was equally blind to anything already
+/// trimmed off the array); this fix trades an unbounded identity set for
+/// bounded memory, the same trade `maxEventRows` itself already makes for
+/// `eventRows`.
 ///
-/// **`newestTSByRun` is maintained incrementally, not rebuilt per call**
-/// (also ruling 2): every insert (`mergeIncoming`/`applyLive`) updates the
-/// per-run high-water mark directly (`max(existing, new)`) rather than
-/// `resolveRuns` re-scanning all of `eventRows` on every call. A stale
-/// entry can linger for a run whose every row has since been trimmed off
-/// the backlog — accepted: the worst case is one wasted `GET /api/runs/:id`
-/// call for a run that's no longer displayed, not a correctness issue.
+/// **`newestTSByRun` is maintained incrementally, not rebuilt per call, AND
+/// pruned on full eviction** (also ruling 2; pruning added on re-review,
+/// round 2, ruling 2): every insert (`mergeIncoming`/`applyLive`) updates
+/// the per-run high-water mark directly (`max(existing, new)`) rather than
+/// `resolveRuns` re-scanning all of `eventRows` on every call — and
+/// `runRowCount` (a per-run count of rows currently in `eventRows`,
+/// maintained alongside `newestTSByRun`) is what lets `trimAndAssign(_:)`
+/// remove a run's `newestTSByRun` entry the moment its LAST remaining row
+/// is trimmed off, in O(1), with no scan of `eventRows` needed to check
+/// "does this run still have any row left". Without this, a non-terminal
+/// run whose every row had been cap-evicted would linger in
+/// `newestTSByRun` forever, making it "stale-recheck eligible" and costing
+/// one `GET /api/runs/:id` call every single 60s poll tick indefinitely —
+/// restores the same "a run with nothing left on screen is nothing left to
+/// track" semantics the pre-fix (round 0) full-`eventRows`-rebuild
+/// implicitly had for free.
 ///
 /// **`resolveRuns` is throttled to the aggregate poll tick, not called per
 /// live event** (also ruling 2): the first pass called it from
@@ -117,9 +140,14 @@ import RupuAPI
 @MainActor
 @Observable
 public final class SituationStore {
-    /// History backfill + live-tail fold, newest-first (ties broken by
-    /// Swift's stable `sort(by:)`, which preserves each equal-`ts` group's
-    /// existing relative order — see `mergeIncoming(_:)`).
+    /// History backfill + live-tail fold, newest-first — ties (rows sharing
+    /// a `ts`, the common case: a backfill page or a burst of live events
+    /// often shares a millisecond) are broken by an EXPLICIT deterministic
+    /// key (`mergeSortKey`, `SituationSelection.swift`), not by relying on
+    /// `Array.sort(by:)`'s incidental behavior — `sort(by:)` is not a
+    /// stability-guaranteed API (round-1's doc comment here wrongly claimed
+    /// it was; corrected on re-review, round 2, ruling 1). See
+    /// `mergeIncoming(_:)`.
     public private(set) var eventRows: [CPEventRow] = []
     public private(set) var findings: [APIFinding] = []
     public private(set) var findingsSummary: APIFindingsSummary?
@@ -168,10 +196,22 @@ public final class SituationStore {
     /// `eventRows`; kept in exact 1:1 sync with it (inserted alongside a
     /// row, removed alongside its trim).
     private var seenEventKeys: Set<CPEvent> = []
-    /// Per-run high-water mark, maintained incrementally on every insert —
-    /// see the type's doc comment ("`newestTSByRun` is maintained
-    /// incrementally").
-    private var newestTSByRun: [String: Int64] = [:]
+    /// Per-run high-water mark, maintained incrementally on every insert and
+    /// pruned on full eviction — see the type's doc comment ("`newestTSByRun`
+    /// is maintained incrementally, not rebuilt per call, AND pruned on
+    /// full eviction"). `internal`, not `private` — reached directly from
+    /// `SituationStoreTests` via `@testable import RupuStore` to assert the
+    /// pruning itself (same seam `ActivityStore.statusOverrides` documents
+    /// for the identical reason), not something production code outside
+    /// this file ever reads.
+    var newestTSByRun: [String: Int64] = [:]
+    /// How many rows currently in `eventRows` belong to each run — the
+    /// bookkeeping `trimAndAssign(_:)` uses to prune `newestTSByRun` in O(1)
+    /// the moment a run's LAST row is evicted, with no scan of `eventRows`
+    /// needed. Incremented alongside `newestTSByRun` on every insert
+    /// (`mergeIncoming`/`applyLive`), decremented (and the run removed from
+    /// both dictionaries once it hits zero) in `trimAndAssign(_:)`.
+    private var runRowCount: [String: Int] = [:]
 
     private var requestedRuns: Set<String> = []
     private var statusCheckedAt: [String: Date] = [:]
@@ -275,27 +315,49 @@ public final class SituationStore {
         for row in rows where !seenEventKeys.contains(row.event) {
             seenEventKeys.insert(row.event)
             merged.append(row)
-            if let runID = row.event.runID {
-                newestTSByRun[runID] = max(newestTSByRun[runID] ?? Int64.min, row.ts)
-            }
+            recordInsertion(row)
             didChange = true
         }
         guard didChange else { return }
 
-        merged.sort { $0.ts > $1.ts } // stable — preserves each tied group's existing relative order
+        // Explicit deterministic tie-break, not incidental `sort(by:)`
+        // stability — see `eventRows`'s doc comment (round 2, ruling 1).
+        merged.sort { a, b in
+            a.ts != b.ts ? a.ts > b.ts : mergeSortKey(a.event) < mergeSortKey(b.event)
+        }
         trimAndAssign(merged)
     }
 
+    /// Updates `newestTSByRun`/`runRowCount` for one freshly-inserted row —
+    /// shared by `mergeIncoming(_:)` and `applyLive(_:)` so the two insert
+    /// paths can't drift out of sync with each other.
+    private func recordInsertion(_ row: CPEventRow) {
+        guard let runID = row.event.runID else { return }
+        newestTSByRun[runID] = max(newestTSByRun[runID] ?? Int64.min, row.ts)
+        runRowCount[runID, default: 0] += 1
+    }
+
     /// Caps `rows` at `maxEventRows`, dropping the OLDEST (tail, since
-    /// callers keep the array newest-first) overflow and removing each
-    /// dropped row's identity from `seenEventKeys` so the set never
-    /// outgrows what's actually displayed.
+    /// callers keep the array newest-first) overflow and, for each dropped
+    /// row: removing its identity from `seenEventKeys` (so the set never
+    /// outgrows what's actually displayed) and decrementing `runRowCount`
+    /// for its run — pruning `newestTSByRun`/`runRowCount` for that run
+    /// entirely once its count reaches zero (round 2, ruling 2 — see the
+    /// type's doc comment).
     private func trimAndAssign(_ rows: [CPEventRow]) {
         var rows = rows
         if rows.count > maxEventRows {
             let overflow = rows.count - maxEventRows
             for dropped in rows.suffix(overflow) {
                 seenEventKeys.remove(dropped.event)
+                guard let runID = dropped.event.runID else { continue }
+                let remaining = (runRowCount[runID] ?? 1) - 1
+                if remaining <= 0 {
+                    runRowCount.removeValue(forKey: runID)
+                    newestTSByRun.removeValue(forKey: runID)
+                } else {
+                    runRowCount[runID] = remaining
+                }
             }
             rows.removeLast(overflow)
         }
@@ -327,15 +389,14 @@ public final class SituationStore {
         seenEventKeys.insert(event)
 
         let tsMS = Int64((Date().timeIntervalSince1970 * 1000).rounded())
-        if let runID = event.runID {
-            newestTSByRun[runID] = max(newestTSByRun[runID] ?? Int64.min, tsMS)
-        }
         // `pos: -1` is a sentinel: `CPEventRow.pos` only matters for the
         // web's "load older" pagination cursor, a feature this fullscreen
         // ambient wall deliberately doesn't implement (see
         // `SituationRoomScreen`'s doc comment) — nothing here ever reads it.
+        let newRow = CPEventRow(event: event, ts: tsMS, pos: -1)
+        recordInsertion(newRow)
         var rows = eventRows
-        rows.insert(CPEventRow(event: event, ts: tsMS, pos: -1), at: 0)
+        rows.insert(newRow, at: 0)
         trimAndAssign(rows)
         eventsSinceTick += 1
 
