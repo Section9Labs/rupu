@@ -10,13 +10,16 @@ import RupuDesign
 /// `storeClientID` recipe every other screen in this module uses, see
 /// `BackendController.clientIdentity()`'s doc comment):
 ///
-/// - **Effective** (`EffectiveConfigList`): the resolved config, grouped by
-///   top-level section, with a provenance chip per key.
+/// - **Effective** (`EffectiveConfigList`): every LEAF of the resolved
+///   `effective` JSON tree, grouped by top-level section, with a provenance
+///   chip per key (falling back to a `default` chip when the key has no
+///   `provenance` entry at all — see `EffectiveConfigGrouping.rows(for:)`).
 /// - **Raw** (`RawConfigEditor`): the raw TOML text for the Global layer (and
 ///   the Project layer, once a project is scoped) with dirty tracking and a
 ///   confirmation gate before an unsaved edit is discarded by a layer switch.
 /// - **Policy** (`PolicyLockEditor`): the GLOBAL `[policy].lock` enforced-key
-///   list.
+///   list, seeded from `effective.policy.lock` — see that type's doc comment
+///   for why `provenance` is the wrong source.
 ///
 /// **Project scope is one control for the whole tab**, not per-segment: the
 /// picker above the segmented control drives `ConfigStore.load(client:
@@ -25,6 +28,28 @@ import RupuDesign
 /// project chooser — `GET /api/config` only ever resolves ONE project layer
 /// at a time, so there is nothing for a second picker to select that this
 /// one doesn't already cover.
+///
+/// **Drafts live here, not in the sub-views (review-round fix).** The Raw
+/// layer selection and its two draft texts, and the Policy lock draft, are
+/// all `ConfigTab`-level `@State`, passed down to `RawConfigEditor`/
+/// `PolicyLockEditor` as `@Binding`s. This is deliberate, not incidental:
+/// `body(store:)` below switches on BOTH `store.view` (loading/failed/
+/// content) AND `segment` (effective/raw/policy) to decide what to render,
+/// and EVERY branch of a `switch` is a distinct position in the view tree —
+/// SwiftUI tears down and rebuilds a child view's OWN `@State` whenever the
+/// branch that constructs it changes, even transiently (a segment switch, OR
+/// a reload that bounces `store.view` through `.loading` and back to
+/// `.content`, e.g. a scope-picker switch or the reload every successful
+/// save triggers). If the drafts lived as `@State` on `RawConfigEditor`/
+/// `PolicyLockEditor` themselves (as an earlier version of this file did),
+/// every one of those transitions would silently reset — or in the
+/// scope-picker's case, silently repoint at the WRONG project's raw text —
+/// an in-progress edit. Hoisting them into `content(store:)`'s own state (a
+/// view that stays mounted across every one of those transitions; only the
+/// `body(store:)` switch inside it changes what renders) fixes all three at
+/// once: a segment switch simply changes which sub-view is REPRESENTING the
+/// same underlying data, and a `.loading` bounce never touches state that
+/// lives one level up from the thing being torn down.
 ///
 /// **Does NOT need `OverviewScreen`'s cold-launch `.onChange(of: backend.
 /// health)` fix**: like `ActivityScreen`/`FleetScreen`, this tab is only
@@ -47,6 +72,18 @@ public struct ConfigTab: View {
     @State private var projects: [APIProjectRow] = []
     @State private var selectedProjectID: String?
     @State private var segment: Segment = .effective
+
+    // MARK: Hoisted drafts (see the type doc comment's "Drafts live here"
+    // section). `rawLayer` is hoisted alongside the two raw texts so a
+    // post-save reload can't reset the Raw tab back to Global either.
+    @State private var rawLayer: RawLayer = .global
+    @State private var globalDraft = ""
+    @State private var projectDraft = ""
+    @State private var lockDraft: [String] = []
+
+    /// Non-`nil` while the "discard unsaved edits?" dialog for a SCOPE
+    /// switch is up — see `requestScopeSwitch(to:store:)`.
+    @State private var pendingScopeSwitch: ScopeSwitchTarget?
 
     public init(model: AppModel, backend: BackendController) {
         self.model = model
@@ -82,6 +119,38 @@ public struct ConfigTab: View {
 
             body(store: store)
         }
+        // Background-refresh sync: adopt whatever `store.view` currently
+        // holds INTO the draft, but only while the draft isn't already
+        // dirty relative to the LAST value this synced from — an
+        // in-progress edit is never silently overwritten by a reload that
+        // wasn't the operator's own save or a confirmed scope switch (both
+        // of which bypass this guard deliberately — see
+        // `performScopeSwitch(to:store:)` and this type's doc comment).
+        // `initial: true` additionally seeds the draft from whatever
+        // `store.view` already holds the first time `content(store:)`
+        // mounts, not just on a later change.
+        .onChange(of: store.view.value?.rawGlobal, initial: true) { _, newValue in
+            if !isGlobalDirty(store: store) { globalDraft = newValue ?? "" }
+        }
+        .onChange(of: store.view.value?.rawProject, initial: true) { _, newValue in
+            if !isProjectDirty(store: store) { projectDraft = newValue ?? "" }
+        }
+        .onChange(of: store.view.value.map { EffectiveConfigGrouping.policyLockKeys(for: $0) }, initial: true) { _, newValue in
+            if !isPolicyDirty(store: store) { lockDraft = newValue ?? [] }
+        }
+        .confirmationDialog(
+            "Discard unsaved edits?",
+            isPresented: pendingScopeSwitchBinding,
+            presenting: pendingScopeSwitch
+        ) { target in
+            Button("Discard and Switch", role: .destructive) {
+                pendingScopeSwitch = nil
+                Task { await performScopeSwitch(to: target.projectID, store: store) }
+            }
+            Button("Cancel", role: .cancel) { pendingScopeSwitch = nil }
+        } message: { _ in
+            Text("Switching project scope discards your unsaved Raw/Policy edits.")
+        }
     }
 
     private func scopeRow(store: ConfigStore) -> some View {
@@ -104,19 +173,74 @@ public struct ConfigTab: View {
         }
     }
 
-    /// Writing this binding both updates the picker's own selection AND
-    /// re-`load`s the shared store against the new scope — the Raw tab's
-    /// "Project" layer and the Policy tab's provenance both need the fresh
-    /// scope's data, not just this row's own display.
+    /// Routes every scope change through `requestScopeSwitch(to:store:)`
+    /// rather than switching + `load`ing directly — see that method's doc
+    /// comment. The picker's displayed selection still reads live off
+    /// `selectedProjectID`, so a switch that ends up needing confirmation
+    /// visually snaps back to the prior selection until the operator either
+    /// confirms or cancels (same "reject and re-render the old state" idiom
+    /// `FleetScreen`'s host-removal confirmation uses).
     private func scopeBinding(store: ConfigStore) -> Binding<String?> {
         Binding(
             get: { selectedProjectID },
-            set: { newValue in
-                selectedProjectID = newValue
-                guard let client = backend.client() else { return }
-                Task { await store.load(client: client, project: newValue) }
-            }
+            set: { newValue in requestScopeSwitch(to: newValue, store: store) }
         )
+    }
+
+    /// A no-op if `target` is already the current scope. Otherwise: with
+    /// nothing unsaved, switches immediately; with an unsaved Raw or Policy
+    /// draft, parks `target` in `pendingScopeSwitch` for the
+    /// `confirmationDialog` in `content(store:)` to resolve — the SAME
+    /// "never silently discard" contract `RawConfigEditor`'s in-editor
+    /// layer button already enforced before this fix, now also covering the
+    /// scope picker (review-round fix — previously this called `store.load`
+    /// directly with no dirty check at all).
+    private func requestScopeSwitch(to target: String?, store: ConfigStore) {
+        guard target != selectedProjectID else { return }
+        if hasUnsavedEdits(store: store) {
+            pendingScopeSwitch = ScopeSwitchTarget(projectID: target)
+        } else {
+            Task { await performScopeSwitch(to: target, store: store) }
+        }
+    }
+
+    /// Actually switches `selectedProjectID` and re-`load`s, then — once the
+    /// new scope's content lands — force-adopts it into every draft,
+    /// UNCONDITIONALLY (not the dirty-guarded sync `content(store:)`'s
+    /// `onChange` triple uses for a background refresh). That bypass is
+    /// safe specifically because getting here at all already means one of
+    /// two things happened: `requestScopeSwitch` found nothing dirty to
+    /// lose, or the operator just explicitly confirmed discarding it in the
+    /// dialog — either way, the new scope's server content is exactly what
+    /// every draft should show next.
+    private func performScopeSwitch(to target: String?, store: ConfigStore) async {
+        selectedProjectID = target
+        guard let client = backend.client() else { return }
+        await store.load(client: client, project: target)
+        globalDraft = store.view.value?.rawGlobal ?? ""
+        projectDraft = store.view.value?.rawProject ?? ""
+        lockDraft = store.view.value.map { EffectiveConfigGrouping.policyLockKeys(for: $0) } ?? []
+    }
+
+    private var pendingScopeSwitchBinding: Binding<Bool> {
+        Binding(get: { pendingScopeSwitch != nil }, set: { if !$0 { pendingScopeSwitch = nil } })
+    }
+
+    private func isGlobalDirty(store: ConfigStore) -> Bool {
+        globalDraft != (store.view.value?.rawGlobal ?? "")
+    }
+
+    private func isProjectDirty(store: ConfigStore) -> Bool {
+        projectDraft != (store.view.value?.rawProject ?? "")
+    }
+
+    private func isPolicyDirty(store: ConfigStore) -> Bool {
+        let current = store.view.value.map { EffectiveConfigGrouping.policyLockKeys(for: $0) } ?? []
+        return lockDraft.sorted() != current.sorted()
+    }
+
+    private func hasUnsavedEdits(store: ConfigStore) -> Bool {
+        isGlobalDirty(store: store) || isProjectDirty(store: store) || isPolicyDirty(store: store)
     }
 
     @ViewBuilder
@@ -125,38 +249,71 @@ public struct ConfigTab: View {
         case .loading:
             centeredLabel("Loading…")
         case .failed(let message):
-            FailedNote(message: message)
+            VStack(alignment: .leading, spacing: 10) {
+                FailedNote(message: message)
+                Button("Retry") {
+                    Task { await retryLoad(store: store) }
+                }
+            }
         case .empty:
-            EmptyView()
+            // Structurally unreachable today — `ConfigStore.load` only ever
+            // produces `.content`/`.failed` — but `BlockState` is a shared
+            // generic type every switch over it must exhaust regardless.
+            // An honest placeholder rather than a silent `EmptyView()`, in
+            // case a future `ConfigStore` change ever does reach this.
+            centeredLabel("No config data")
         case .content:
             switch segment {
             case .effective:
                 EffectiveConfigList(store: store)
             case .raw:
-                RawConfigEditor(store: store, backend: backend)
+                RawConfigEditor(
+                    store: store,
+                    backend: backend,
+                    layer: $rawLayer,
+                    globalText: $globalDraft,
+                    projectText: $projectDraft
+                )
             case .policy:
-                PolicyLockEditor(store: store, backend: backend)
+                PolicyLockEditor(store: store, backend: backend, lockedKeys: $lockDraft)
             }
         }
     }
 
     /// Builds `store` (once) and activates it — same `storeClientID` recipe
     /// `ProjectDetailScreen`/`FleetScreen` use, see their `activate()` doc
-    /// comments and `BackendController.clientIdentity()`. Also loads
-    /// `projects` for the scope picker exactly once per client swap; a
-    /// failed fetch leaves it at `[]` (an honest "Global only" picker,
-    /// matching `ShellToolbar.loadProjects()`'s own fallback), never an
-    /// error surface of its own.
+    /// comments and `BackendController.clientIdentity()`. Matches
+    /// `ProjectDetailScreen.activate()`'s actual shape (review-round fix):
+    /// the rebuild guard covers ONLY "do I need a NEW store" — `store.load`
+    /// itself runs on every call, outside that guard, so a transient load
+    /// failure (network blip, brief 5xx) doesn't strand the tab forever
+    /// with `storeClientID` already set and no further `.task` trigger to
+    /// retry it; the `FailedNote` path's Retry button (`retryLoad`) reaches
+    /// this same unconditional `store.load` call directly. `projects` for
+    /// the scope picker stays gated to "once per client swap" — an
+    /// unrelated, cheap, idempotent fetch that a retry doesn't need to
+    /// repeat — and a failed fetch leaves it at `[]` (an honest "Global
+    /// only" picker, matching `ShellToolbar.loadProjects()`'s own
+    /// fallback), never an error surface of its own.
     private func activate() async {
         guard let client = backend.client() else { return }
         let clientID = backend.clientIdentity()
-        guard storeClientID != clientID else { return }
-        storeClientID = clientID
-        let newStore = ConfigStore()
-        store = newStore
-        async let projectsFetch: [APIProjectRow]? = try? client.projects()
-        await newStore.load(client: client, project: selectedProjectID)
-        projects = (await projectsFetch) ?? []
+        if storeClientID != clientID {
+            storeClientID = clientID
+            store = ConfigStore()
+            Task { projects = (try? await client.projects()) ?? [] }
+        }
+        guard let store else { return }
+        await store.load(client: client, project: selectedProjectID)
+    }
+
+    /// The `FailedNote` path's Retry button — re-runs the SAME `store.load`
+    /// call `activate()` makes, without touching `storeClientID`/rebuilding
+    /// `store`, since the client itself never became invalid (a load
+    /// failure is not a client-identity change).
+    private func retryLoad(store: ConfigStore) async {
+        guard let client = backend.client() else { return }
+        await store.load(client: client, project: selectedProjectID)
     }
 
     private func centeredLabel(_ label: String) -> some View {
@@ -167,6 +324,18 @@ public struct ConfigTab: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+}
+
+/// Identifiable wrapper around a candidate scope-switch target — `String?`
+/// itself can't drive `confirmationDialog(presenting:)` (which needs a
+/// non-optional `Identifiable` to detect "is one currently pending", and a
+/// bare `Optional<String>` can't distinguish "no pending switch" from "a
+/// pending switch TO nil/Global"). `id` is a fresh `UUID` per instance
+/// (rather than `projectID` itself) so requesting the SAME target twice in a
+/// row — cancel, then pick it again — still re-triggers the dialog.
+private struct ScopeSwitchTarget: Identifiable {
+    let id = UUID()
+    let projectID: String?
 }
 
 /// Local copy of the "Failed to load" note every other screen module's own
@@ -197,11 +366,12 @@ private struct FailedNote: View {
 /// deployment's Save reads as read-only from the moment the tab opens, never
 /// flickering to "no changes to save" before the operator has typed anything.
 enum ConfigSaveGate {
-    /// Matches `ConfigStore.handleSaveError`'s fixed 501 message verbatim —
-    /// see that method's doc comment. Shown proactively here (before any
-    /// save is even attempted) so a read-only deployment never has to let an
-    /// operator discover it by clicking Save first.
-    static let readOnlyReason = "editing config requires `rupu cp serve`"
+    /// `ConfigStore.readOnlyMessage` itself — the SAME constant `saveError`
+    /// gets set to on a real 501, not a re-typed copy of its text. Shown
+    /// proactively here (before any save is even attempted) so a read-only
+    /// deployment never has to let an operator discover it by clicking Save
+    /// first.
+    static let readOnlyReason = ConfigStore.readOnlyMessage
 
     static func reason(readOnly: Bool, isDirty: Bool) -> String? {
         if readOnly { return readOnlyReason }
@@ -262,28 +432,68 @@ struct EffectiveConfigGroup: Identifiable, Equatable {
 /// contract directly against a fixture-loaded `APIConfigView`, with no
 /// SwiftUI rendering pass involved.
 enum EffectiveConfigGrouping {
-    /// One row per `view.provenance` entry (provenance's keys are already
-    /// the wire's canonical dotted-key encoding — see `DottedKey`'s doc
-    /// comment — so this is the full set of resolvable fields; `effective`
-    /// itself is never walked top-down to discover keys, only to resolve
-    /// each provenance key's value).
+    /// Section name every single-segment top-level key (`default_model`,
+    /// `log_level`, …) groups under, instead of each getting its own
+    /// one-row section whose header just repeats the row below it
+    /// (review-round fix — Q8).
+    static let topLevelSectionName = "top level"
+
+    /// One row per LEAF of `view.effective`'s JSON tree (review-round fix —
+    /// Q4). Previously this enumerated `view.provenance`'s keys instead,
+    /// which is WRONG: `provenance` only covers keys some layer explicitly
+    /// SET (`rupu_config::resolve` only inserts an entry when a layer
+    /// supplies a value), while `effective` is the FULL typed `Config`,
+    /// defaults included — a key that's only ever at its default (no
+    /// `provenance` entry at all, e.g. the fixture's `cp.bind`) is still a
+    /// real, resolvable value and was previously invisible here. A leaf
+    /// with no `provenance` entry falls back to a `default` chip
+    /// (`provenance?.source ?? .default`), which is exactly correct: no
+    /// entry means no layer overrode it, i.e. it IS at its default.
+    ///
+    /// A leaf is anything in the tree that isn't itself a JSON object —
+    /// `leafPaths` stops descending at a scalar/array/null, matching
+    /// `render`'s "arrays join inline, never expand into further rows"
+    /// treatment.
     static func rows(for view: APIConfigView) -> [EffectiveConfigRow] {
-        view.provenance.keys.sorted().map { key in
-            let segments = DottedKey.split(key)
-            let section = segments.first ?? key
-            let remainderSegments = Array(segments.dropFirst())
+        leafPaths(view.effective, prefix: []).map { segments in
+            let key = DottedKey.join(segments)
+            let isTopLevel = segments.count <= 1
+            let section = isTopLevel ? topLevelSectionName : (segments.first ?? key)
+            let remainderSegments = isTopLevel ? segments : Array(segments.dropFirst())
             let remainderDisplay = DottedKey.join(remainderSegments)
             let resolved = resolveValue(view.effective, segments: segments[...])
             let provenance = view.provenance[key]
             return EffectiveConfigRow(
                 id: key,
                 section: section,
-                remainderDisplay: remainderDisplay.isEmpty ? section : remainderDisplay,
+                remainderDisplay: remainderDisplay.isEmpty ? key : remainderDisplay,
                 valueDisplay: render(resolved),
                 source: provenance?.source ?? .default,
                 locked: provenance?.locked ?? false
             )
+        }.sorted { $0.id < $1.id }
+    }
+
+    /// Recursively collects every LEAF path (segment list from root to a
+    /// non-object value) under `value`. A genuinely empty object (`{}`,
+    /// including a nested one like a hypothetical `providers = {}`) is
+    /// itself treated as a leaf — there's nothing further to descend into,
+    /// but it's still a real, renderable value (`render` shows it as
+    /// `{}`) — EXCEPT at the true root with an empty `prefix`, where an
+    /// empty `effective` object correctly produces zero rows rather than
+    /// one row with no key at all.
+    private static func leafPaths(_ value: JSONValue, prefix: [String]) -> [[String]] {
+        guard case .object(let dict) = value else {
+            return prefix.isEmpty ? [] : [prefix]
         }
+        if dict.isEmpty {
+            return prefix.isEmpty ? [] : [prefix]
+        }
+        var out: [[String]] = []
+        for (key, child) in dict.sorted(by: { $0.key < $1.key }) {
+            out.append(contentsOf: leafPaths(child, prefix: prefix + [key]))
+        }
+        return out
     }
 
     /// Groups already-built rows by `section`, sections alphabetical,
@@ -313,18 +523,44 @@ enum EffectiveConfigGrouping {
     /// segment. Returns `nil` the moment a segment doesn't resolve (missing
     /// key, or the current node isn't an object at all) — the lenient-read
     /// contract: a key that fails to resolve renders `—`, never crashes or
-    /// throws.
-    private static func resolveValue(_ value: JSONValue, segments: ArraySlice<String>) -> JSONValue? {
+    /// throws. Every path `rows(for:)` itself feeds this always resolves
+    /// (it was discovered BY walking the same tree), so this only ever
+    /// returns `nil` for a genuinely bogus caller-supplied path — e.g.
+    /// `PolicyLockEditor.currentLockKeys`'s `["policy", "lock"]` lookup on a
+    /// config that happens not to have a `policy` table at all.
+    ///
+    /// Not `private` — `PolicyLockEditor.currentLockKeys`/`policyLockKeys(
+    /// for:)` reuse this SAME walker to read `effective.policy.lock` (see
+    /// `PolicyLockEditor`'s doc comment for why `provenance` alone is the
+    /// wrong source for the current lock list), rather than a second
+    /// hand-rolled descent.
+    static func resolveValue(_ value: JSONValue, segments: ArraySlice<String>) -> JSONValue? {
         guard let first = segments.first else { return value }
         guard case .object(let dict) = value, let next = dict[first] else { return nil }
         return resolveValue(next, segments: segments.dropFirst())
     }
 
+    /// `effective.policy.lock` as a sorted `[String]`, or `[]` if that path
+    /// doesn't resolve to a string array at all (a config with no `policy`
+    /// table — shouldn't happen given `PolicyConfig` has no
+    /// `skip_serializing_if`, but handled rather than crashing on a
+    /// malformed/future payload). Shared by `PolicyLockEditor.
+    /// currentLockKeys` and `ConfigTab`'s own dirty check, so there is
+    /// exactly one place that knows how to read the enforced-key list off
+    /// the wire.
+    static func policyLockKeys(for view: APIConfigView) -> [String] {
+        guard case .array(let items)? = resolveValue(view.effective, segments: ["policy", "lock"][...]) else {
+            return []
+        }
+        return items.compactMap { item -> String? in
+            guard case .string(let s) = item else { return nil }
+            return s
+        }.sorted()
+    }
+
     /// Scalars render inline; arrays join their (already-rendered) elements
-    /// with `", "`; a bare object (a provenance key that resolves to a
-    /// whole table rather than a leaf — not expected given provenance is
-    /// itself leaf-keyed, but handled rather than left to crash) renders a
-    /// key count. `nil`/`.null` both render `—`.
+    /// with `", "`; a bare object (an empty table — see `leafPaths`'s doc
+    /// comment) renders a key count. `nil`/`.null` both render `—`.
     static func render(_ value: JSONValue?) -> String {
         guard let value else { return "—" }
         switch value {
@@ -363,7 +599,9 @@ enum EffectiveConfigGrouping {
 
 /// Searchable list of every resolved config key, grouped by top-level
 /// section, each row showing its remainder key, rendered value, a lock
-/// glyph when `locked`, and a provenance chip.
+/// glyph when `locked`, and a provenance chip. The list scrolls within a
+/// bounded height (review-round fix — Q5) rather than growing the Settings
+/// window to fit an arbitrarily large real config.
 struct EffectiveConfigList: View {
     let store: ConfigStore
 
@@ -389,6 +627,7 @@ struct EffectiveConfigList: View {
                             }
                         }
                     }
+                    .frame(maxHeight: 380)
                 }
             }
         }
@@ -422,7 +661,10 @@ struct EffectiveConfigList: View {
             Text(row.remainderDisplay)
                 .font(.dataMono(11))
                 .foregroundStyle(Color.rupuDim)
+                .lineLimit(1)
+                .truncationMode(.tail)
                 .frame(minWidth: 140, alignment: .leading)
+                .help(row.id)
             Text(row.valueDisplay)
                 .font(.dataMono(11))
                 .foregroundStyle(Color.rupuInk)
@@ -450,17 +692,21 @@ enum RawLayer: String, CaseIterable, Identifiable {
 }
 
 /// Raw TOML editor for the Global layer (and, once a project is scoped, the
-/// Project layer). Tracks local edits per layer independently so switching
-/// layers never loses either one's in-progress edit; a layer switch while
-/// the CURRENT layer is dirty prompts via `confirmationDialog` rather than
-/// silently discarding.
+/// Project layer). `layer`/`globalText`/`projectText` are `@Binding`s into
+/// `ConfigTab`'s own `@State` (review-round fix — see that type's "Drafts
+/// live here" doc comment) rather than owned locally, so switching Effective/
+/// Raw/Policy segments — which tears down and rebuilds THIS view — never
+/// loses either draft or which layer was selected. A layer switch while the
+/// CURRENT layer is dirty still prompts via `confirmationDialog` rather than
+/// silently discarding — that part is unchanged and stays local (`
+/// pendingLayerSwitch` is transient UI state, not user data).
 struct RawConfigEditor: View {
     let store: ConfigStore
     let backend: BackendController
+    @Binding var layer: RawLayer
+    @Binding var globalText: String
+    @Binding var projectText: String
 
-    @State private var layer: RawLayer = .global
-    @State private var globalText = ""
-    @State private var projectText = ""
     @State private var pendingLayerSwitch: RawLayer?
 
     var body: some View {
@@ -477,19 +723,6 @@ struct RawConfigEditor: View {
             }
             editor
             actions
-        }
-        // `initial: true` seeds local text from whatever `store.view`
-        // already holds the first time this view appears (not just on a
-        // later change) — a plain `.onChange` only fires on a CHANGE from
-        // here on, which would leave the editor blank if the store had
-        // already finished loading before this view mounted. Only synced
-        // when NOT locally dirty, so a reload triggered by something else
-        // (e.g. a project-scope switch) never clobbers an in-progress edit.
-        .onChange(of: store.view.value?.rawGlobal, initial: true) { _, newValue in
-            if !isGlobalDirty { globalText = newValue ?? "" }
-        }
-        .onChange(of: store.view.value?.rawProject, initial: true) { _, newValue in
-            if !isProjectDirty { projectText = newValue ?? "" }
         }
         .confirmationDialog(
             "Discard unsaved edits?",
@@ -615,18 +848,39 @@ struct RawConfigEditor: View {
 
 // MARK: - Policy tab
 
-/// Editor over the GLOBAL `[policy].lock` enforced-key list. There is no
-/// dedicated "current lock list" field on the wire — `policy.lock`'s own
-/// resolved value lives wherever `effective.policy.lock` would be, which
-/// this app never needs to reach into directly: every key the CURRENT lock
-/// list enforces already shows up as `provenance[key].locked == true`
-/// (that's exactly what "locked" means), so the list this editor seeds from
-/// is `provenance`'s locked keys, sorted — no separate lookup needed.
+/// Editor over the GLOBAL `[policy].lock` enforced-key list, seeded from
+/// `effective.policy.lock` — NOT from `provenance`'s locked keys (a prior
+/// version of this type made that mistake; see the correction below, kept
+/// as a warning against repeating it). `lockedKeys` is a `@Binding` into
+/// `ConfigTab`'s own `@State` (review-round fix — see that type's "Drafts
+/// live here" doc comment), not owned locally, so an Effective/Raw/Policy
+/// segment switch never loses an in-progress lock-list edit.
+///
+/// **Why `provenance` is the WRONG source.** `rupu_config::resolve` only
+/// inserts a `provenance` entry for a key when some layer actually SETS a
+/// value for it (`resolve.rs`: `if let Some(v) = val { ... provenance.
+/// insert(...) }`). A lock list can name a key that no layer ever sets —
+/// perfectly valid TOML (`[policy]\nlock = ["permission_mode"]` with no
+/// `permission_mode = ...` anywhere) — and that key then has NO `provenance`
+/// entry at all, locked or otherwise. Seeding this editor from `provenance`'s
+/// `locked == true` keys would silently drop that entry from the visible
+/// list, and since `savePolicy` PUTs the COMPLETE list back, the next save
+/// would silently delete it from the real lock list too — a data-loss bug,
+/// not just a display gap.
+///
+/// `effective.policy.lock` has no such gap: `resolve()` unconditionally pins
+/// `config.policy.lock` to the full GLOBAL-derived lock array regardless of
+/// whether any of its entries resolve to anything (`resolve.rs`'s `config.
+/// policy.lock = lock.clone()`), and `PolicyConfig::lock` has no
+/// `skip_serializing_if`, so it's always present on the wire — this is
+/// exactly what the web reads too (`pages/Settings.tsx`). Walked via
+/// `EffectiveConfigGrouping.policyLockKeys(for:)`, the same
+/// `resolveValue` walker the Effective tab uses.
 struct PolicyLockEditor: View {
     let store: ConfigStore
     let backend: BackendController
+    @Binding var lockedKeys: [String]
 
-    @State private var lockedKeys: [String] = []
     @State private var newKeyText = ""
     @State private var pickerSelection = ""
 
@@ -642,20 +896,19 @@ struct PolicyLockEditor: View {
             }
             actions
         }
-        // Same `initial: true` + not-dirty-guard rationale as
-        // `RawConfigEditor`'s own `onChange` pair.
-        .onChange(of: store.view.value?.provenance, initial: true) { _, _ in
-            if !isDirty { lockedKeys = currentLockKeys }
-        }
     }
 
     /// Not `private` — `ConfigTabTests` reads this directly (via
-    /// `@testable import`) to assert the Policy tab seeds its editable list
-    /// from the fixture's locked provenance entries, without constructing a
-    /// SwiftUI render pass.
+    /// `@testable import`) to assert the Policy tab's Discard button (and
+    /// its dirty check) reads `effective.policy.lock`, WITHOUT constructing
+    /// a SwiftUI render pass — including the case of a lock entry with no
+    /// `provenance` entry at all (see this type's doc comment). Delegates
+    /// to `EffectiveConfigGrouping.policyLockKeys(for:)`, the same helper
+    /// `ConfigTab`'s own dirty check uses, so there is exactly one
+    /// implementation of "how do we read the enforced-key list."
     var currentLockKeys: [String] {
-        guard let provenance = store.view.value?.provenance else { return [] }
-        return provenance.filter(\.value.locked).map(\.key).sorted()
+        guard let view = store.view.value else { return [] }
+        return EffectiveConfigGrouping.policyLockKeys(for: view)
     }
 
     private var isDirty: Bool { lockedKeys.sorted() != currentLockKeys }
@@ -723,6 +976,12 @@ struct PolicyLockEditor: View {
     /// Populated from `provenance`'s keys verbatim (the canonical dotted-key
     /// encoding straight off the wire — no re-derivation), already-locked
     /// keys excluded so the picker only ever offers something new to add.
+    /// (Unlike `currentLockKeys`, this is deliberately still `provenance`-
+    /// sourced — it's a convenience list of keys KNOWN to resolve to
+    /// something, for the "lock one of these" shortcut; the free-text field
+    /// right next to it covers any other key, e.g. one with no `provenance`
+    /// entry, same as the "permission_mode" case `currentLockKeys` itself
+    /// must handle.)
     private var lockablePickerKeys: [String] {
         guard let provenance = store.view.value?.provenance else { return [] }
         return provenance.keys.filter { !lockedKeys.contains($0) }.sorted()

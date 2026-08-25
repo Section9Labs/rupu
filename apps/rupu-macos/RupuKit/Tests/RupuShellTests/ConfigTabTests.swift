@@ -134,38 +134,104 @@ struct ConfigTabTests {
         #expect(providersGroup.rows.contains { $0.id == quotedRow.id })
     }
 
-    /// `policy.lock`'s provenance entry is `locked: true`, but the fixture's
-    /// `effective` tree deliberately carries no `policy` key at all — the
-    /// lenient-read contract must render that row's value as `—` rather
-    /// than crash or silently omit the row.
-    @Test func effectiveGroupingRendersUnresolvableKeyAsEmDash() async throws {
+    /// Review-round fix (Q4): `rows(for:)` walks LEAVES of `effective`, not
+    /// `provenance`'s keys — a key at its default (no `provenance` entry at
+    /// all) must still render as a row, with a `default` chip. The
+    /// fixture's `effective.cp.bind` is exactly this case: it's a real,
+    /// resolvable value, but `provenance` only has an entry for
+    /// `cp.max_workspace_bytes`, never `cp.bind`. Under the OLD
+    /// provenance-keys-only enumeration this row was invisible entirely.
+    @Test func effectiveGroupingSurfacesALeafWithNoProvenanceEntryUnderTheDefaultChip() async throws {
         let store = try await loadedStore()
         let view = try #require(store.view.value)
 
         let rows = EffectiveConfigGrouping.rows(for: view)
-        let lockRow = try #require(rows.first { $0.id == "policy.lock" })
+        let bindRow = try #require(rows.first { $0.id == "cp.bind" })
 
-        #expect(lockRow.section == "policy")
-        #expect(lockRow.valueDisplay == "—")
-        #expect(lockRow.locked)
+        #expect(bindRow.section == "cp")
+        #expect(bindRow.valueDisplay == "127.0.0.1:7420")
+        #expect(bindRow.source == .default)
+        #expect(!bindRow.locked)
+    }
+
+    /// Review-round fix (Q1): `effective.policy.lock` (now present in the
+    /// fixture per the same fix) resolves cleanly through the leaf walk —
+    /// it is no longer the "unresolvable key" example this test used to be
+    /// (that example was itself a symptom of Q1's bug: the fixture didn't
+    /// carry `effective.policy.lock` at all). `resolveValue` itself still
+    /// returns `nil` for a genuinely bogus path, asserted directly below
+    /// without needing a fixture case for it.
+    @Test func resolveValueReturnsNilForAPathNotPresentInTheTree() async throws {
+        let store = try await loadedStore()
+        let view = try #require(store.view.value)
+
+        let resolved = EffectiveConfigGrouping.resolveValue(view.effective, segments: ["not", "a", "real", "path"][...])
+        #expect(resolved == nil)
+        #expect(EffectiveConfigGrouping.render(resolved) == "—")
+    }
+
+    /// Review-round fix (Q8): every single-segment top-level key
+    /// (`default_model`) groups under the shared `topLevelSectionName`
+    /// section rather than getting its own one-row section whose header
+    /// just repeats the row underneath it.
+    @Test func singleSegmentTopLevelKeysGroupUnderTheSharedTopLevelSection() async throws {
+        let store = try await loadedStore()
+        let view = try #require(store.view.value)
+
+        let rows = EffectiveConfigGrouping.rows(for: view)
+        let defaultModelRow = try #require(rows.first { $0.id == "default_model" })
+
+        #expect(defaultModelRow.section == EffectiveConfigGrouping.topLevelSectionName)
+        // The row's own label must still show the real key, not the
+        // shared section name.
+        #expect(defaultModelRow.remainderDisplay == "default_model")
+
+        let groups = EffectiveConfigGrouping.grouped(rows)
+        let topLevelGroup = try #require(groups.first { $0.id == EffectiveConfigGrouping.topLevelSectionName })
+        #expect(topLevelGroup.rows.contains { $0.id == "default_model" })
     }
 
     // MARK: - Step 1: Policy editor renders the fixture's lock entries
 
-    @Test func policyEditorSeedsCurrentLockListFromFixtureLockedProvenance() async throws {
+    /// Review-round fix (Q1 — the data-loss bug): the fixture's
+    /// `effective.policy.lock` is `["policy.lock", "permission_mode"]`, but
+    /// `permission_mode` has NO `provenance` entry at all (no layer ever
+    /// sets it — see `resolve.rs`'s "only insert provenance when a layer
+    /// supplies a value" rule). The editor's seed list must still include
+    /// it — deriving from `provenance`'s locked keys instead (the
+    /// pre-fix behavior) would silently drop it, and the next policy save
+    /// would silently delete it from the real lock list.
+    @Test func policyEditorSeedsCurrentLockListFromEffectivePolicyLockIncludingAKeyWithNoProvenanceEntry() async throws {
         let store = try await loadedStore()
         let backend = makeBackend()
-        let editor = PolicyLockEditor(store: store, backend: backend)
+        let editor = PolicyLockEditor(store: store, backend: backend, lockedKeys: .constant([]))
 
-        // The fixture's only `locked: true` provenance entry is
-        // `policy.lock` itself (mirroring `raw_global`'s `[policy] lock =
-        // ["policy.lock"]`) — the editor's seed list must be exactly that,
-        // not derived from anything else on `APIConfigView`.
-        #expect(editor.currentLockKeys == ["policy.lock"])
+        #expect(editor.currentLockKeys == ["permission_mode", "policy.lock"])
+        // Confirm the silent-delete premise directly: `permission_mode`
+        // really has no `provenance` entry in this fixture.
+        #expect(store.view.value?.provenance["permission_mode"] == nil)
+    }
+
+    /// Same helper `ConfigTab`'s own dirty check uses — pinned here so a
+    /// future change to `PolicyLockEditor.currentLockKeys`'s source can't
+    /// drift from `EffectiveConfigGrouping.policyLockKeys(for:)` without a
+    /// test noticing.
+    @Test func policyLockKeysHelperMatchesTheEditorsCurrentLockKeys() async throws {
+        let store = try await loadedStore()
+        let backend = makeBackend()
+        let editor = PolicyLockEditor(store: store, backend: backend, lockedKeys: .constant([]))
+        let view = try #require(store.view.value)
+
+        #expect(EffectiveConfigGrouping.policyLockKeys(for: view) == editor.currentLockKeys)
     }
 
     // MARK: - Step 1: readOnly disables Save with a reason string
 
+    /// Review-round fix (Q7): asserts `store.saveError` against the SHARED
+    /// `ConfigStore.readOnlyMessage` constant (the actual thing a real 501
+    /// sets), not a gate-vs-gate tautology (`ConfigSaveGate.reason(...) ==
+    /// ConfigSaveGate.readOnlyReason` proves nothing — both sides read the
+    /// same constant by construction).
     @Test func readOnlyDisablesSaveWithAReasonString() async throws {
         let store = try await loadedStore()
 
@@ -182,10 +248,10 @@ struct ConfigTabTests {
         }
         _ = await store.saveGlobalRaw("default_model = \"x\"\n", client: writeClient)
         #expect(store.readOnly)
+        #expect(store.saveError == ConfigStore.readOnlyMessage)
 
         let reason = ConfigSaveGate.reason(readOnly: store.readOnly, isDirty: true)
-        #expect(reason != nil)
-        #expect(reason == ConfigSaveGate.readOnlyReason)
+        #expect(reason == ConfigStore.readOnlyMessage)
         #expect(reason?.contains("rupu cp serve") == true)
     }
 

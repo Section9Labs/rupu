@@ -51,6 +51,18 @@ import RupuAPI
 @MainActor
 @Observable
 public final class ConfigStore {
+    /// The fixed message a 501 write maps `saveError` to — see
+    /// `handleSaveError`'s doc comment. Public so any UI surface that wants
+    /// to explain a disabled Save BEFORE the operator has even attempted one
+    /// (e.g. `RupuShell.ConfigSaveGate`) can quote the exact same string
+    /// `saveError` would show after a real failed attempt, with nothing
+    /// keeping the two wordings in lockstep except this one shared constant.
+    /// `nonisolated` — a plain constant with no actor-isolated state behind
+    /// it, and non-`@MainActor` call sites (e.g. `RupuShell.ConfigSaveGate`,
+    /// itself a plain `enum` with no actor) need to read it from a static
+    /// stored-property initializer, which runs in a nonisolated context.
+    nonisolated public static let readOnlyMessage = "editing config requires `rupu cp serve`"
+
     public private(set) var view: BlockState<APIConfigView> = .loading
     /// `nil` = global-only view (no project scope selected). Set by
     /// `load(client:project:)`; every write route besides `saveProjectRaw`
@@ -199,7 +211,7 @@ public final class ConfigStore {
         if case CPError.http(let status, let body) = error {
             if status == 501 {
                 readOnly = true
-                saveError = "editing config requires `rupu cp serve`"
+                saveError = Self.readOnlyMessage
             } else {
                 saveError = body
             }

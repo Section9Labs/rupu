@@ -1863,6 +1863,22 @@ fn config_view_fixture_is_current() {
     // `rupu_config::resolve::dotted`'s doc comment); `provenance` covers the
     // full source matrix (Global/Project/Default, one locked) plus that same
     // quoted-middle-segment key exactly as `dotted()` would emit it.
+    //
+    // `effective.policy.lock` is included because `resolve()` ALWAYS pins it
+    // (`config.policy.lock = lock.clone()`, unconditional — see
+    // `rupu_config::resolve::resolve`'s doc comment on that line) and
+    // `PolicyConfig::lock` has no `skip_serializing_if`, so it is always on
+    // the real wire — never omit it from this fixture. It deliberately
+    // carries a SECOND entry, `"permission_mode"`, that names a key neither
+    // layer's raw TOML actually sets: `resolve()` only inserts a
+    // `provenance` entry for a key when some layer supplies a value for it
+    // (`if let Some(v) = val { ... provenance.insert(...) }`), so a locked
+    // key that's merely NAMED in `[policy].lock` without ever being set
+    // anywhere never gets a `provenance` entry at all — the fixture's
+    // `provenance` map below deliberately has no `"permission_mode"` key,
+    // reproducing that exact real-world case (a lock list entry invisible
+    // to anything that reads it off `provenance` instead of
+    // `effective.policy.lock`).
     let effective = serde_json::json!({
         "default_model": "claude-sonnet-4-6",
         "providers": {
@@ -1874,6 +1890,9 @@ fn config_view_fixture_is_current() {
         "cp": {
             "bind": "127.0.0.1:7420",
             "max_workspace_bytes": 500_000_000i64,
+        },
+        "policy": {
+            "lock": ["policy.lock", "permission_mode"],
         },
     });
 
@@ -1919,7 +1938,7 @@ fn config_view_fixture_is_current() {
     );
 
     let raw_global = "default_model = \"claude-sonnet-4-6\"\nlog_level = \"info\"\n\n\
-                       [policy]\nlock = [\"policy.lock\"]\n"
+                       [policy]\nlock = [\"policy.lock\", \"permission_mode\"]\n"
         .to_string();
     let raw_project = Some(
         "default_model = \"claude-opus-4-8\"\n\n\
