@@ -91,7 +91,7 @@ struct RupuApp: App {
         .defaultSize(width: 1440, height: 900)
 
         Settings {
-            SettingsView()
+            SettingsView(model: model, backend: backend)
                 .tint(Color.rupuBrand)
         }
     }
