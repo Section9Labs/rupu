@@ -178,6 +178,41 @@ private func makeStore(
     #expect(catalogCounter.value == 2)
 }
 
+/// Regression for the "Catalog tab strands mid-detail-flight" bug
+/// (final-review item 1): `CoverageDetailScreen`'s Catalog tab dispatches
+/// `loadCatalogIfNeeded()` as soon as it's selected, which can land before
+/// `detail` (the header's own eager fetch) has resolved — `hasCatalog` is
+/// unknown yet, so that call is correctly a no-op per this method's own doc
+/// comment. The screen's `.task(id:)` now folds `store.detail.value != nil`
+/// into its identity precisely so it re-fires (and re-calls
+/// `loadCatalogIfNeeded()`) the moment `detail` lands — this test proves
+/// that second call is what actually dispatches the fetch, i.e. the store
+/// side of that fix behaves as the screen depends on.
+@MainActor @Test func loadCatalogIfNeededDispatchesOnceDetailLandsAfterAnEarlyNoOpCall() async {
+    let catalogCounter = Counter()
+    let store = makeStore(
+        fetchDetail: { detailPayload(hasCatalog: true) },
+        fetchCatalog: { catalogCounter.increment(); return catalogPayload() }
+    )
+
+    // Catalog tab selected while `detail` is still `.loading` — a no-op,
+    // same as `loadCatalogIfNeededIsANoOpBeforeDetailHasResolved` above.
+    await store.loadCatalogIfNeeded()
+    #expect(catalogCounter.value == 0)
+    if case .loading = store.catalog {} else { Issue.record("expected catalog to still be .loading") }
+
+    // `detail` lands (the header's `activate()` fetch resolving).
+    await store.activate()
+
+    // The screen's `.task(id:)` re-fires because `store.detail.value != nil`
+    // flipped, re-calling `loadCatalogIfNeeded()` with the tab still
+    // selected — this is the call that must now actually dispatch.
+    await store.loadCatalogIfNeeded()
+
+    #expect(catalogCounter.value == 1)
+    #expect(store.catalog.value != nil)
+}
+
 /// `activate()` resets the catalog lazy-flag so a screen re-appearance (same
 /// store instance) lets the Catalog tab refetch fresh on next selection —
 /// same contract `ProjectDetailStore.activate()`/`SecurityStore.activate()`

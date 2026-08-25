@@ -121,10 +121,18 @@ public struct UsageScreen: View {
     /// for. Recomputed per render rather than cached: cheap (pure arithmetic
     /// over `Date()`), and `windowBounds`'s own doc comment is explicit that
     /// its default-`now` convenience is deliberately NOT memoized — a fresh
-    /// `Date()` on every call. A few-millisecond skew between this and the
-    /// store's own fetch-time `now` only ever WIDENS the chart's `until` by
-    /// that same handful of milliseconds — never a mismatch a viewer could
-    /// notice.
+    /// `Date()` on every call.
+    ///
+    /// **Not the same `now` the store fetched with.** This recomputes
+    /// `until` at render time rather than reusing the `now` `UsageStore`
+    /// captured when it dispatched the fetch, so the two `now`s only match
+    /// exactly right after a fresh `activate()`/`setPivot(_:)` — any render
+    /// after that has drifted by however long the screen has been open. For
+    /// most of a session that's imperceptible, but a screen left open
+    /// across a UTC day boundary can widen `until` into a day the store
+    /// never fetched, so `SpendChart` gap-fills a trailing bucket with no
+    /// data behind it rather than an honest "not fetched yet" — a real,
+    /// if narrow, staleness gap, not just noise.
     private var windowBounds: (since: Date, until: Date) {
         UsageStore.windowBounds(for: model.range)
     }

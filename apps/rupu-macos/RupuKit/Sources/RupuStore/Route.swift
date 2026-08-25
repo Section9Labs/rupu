@@ -49,8 +49,6 @@ public enum Route: Hashable, Sendable {
     /// Projects. `wsID` is `APICoverageSummary.wsID` (never optional on that
     /// row — see its doc comment), carried straight through to
     /// `CPClient.coverageDetail(target:wsID:)`'s disambiguation query param.
-    /// Until Task 4 lands, `RootView` renders this as an honest
-    /// `PlaceholderScreen` — see that switch arm's own comment.
     case coverageDetail(target: String, wsID: String)
     case library
     /// One agent definition's detail view (Phase 5A, Task 7) — pushed from

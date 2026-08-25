@@ -57,11 +57,14 @@ import Testing
         #expect(a.rowID != b.rowID)
     }
 
-    /// `target_id`/`id` alone (the web's own key shape,
-    /// `${f.target_id}/${f.id}`) is NOT enough once `target_id` is known to
+    /// `target_id`/`id` alone is NOT enough once `target_id` is known to
     /// collide across workspaces — two findings sharing both `targetID` AND
     /// `id` under different workspaces would still collide without the
-    /// `wsID` segment `rowID` adds on top.
+    /// `wsID` segment `rowID` adds on top. (The web's own key shape already
+    /// includes that segment — `FindingsTable.tsx`'s `rowKey` is
+    /// `${ws_id}/${target_id}/${id}` for its provenance rows, matching
+    /// `rowID` here — so this isn't a widening past the web, just parity
+    /// with it.)
     @Test func findingRowIDDiffersEvenWhenTargetIDAndFindingIDBothMatchAcrossWorkspaces() {
         let a = finding(wsID: "ws-1", targetID: "auth-core", id: "fnd-1")
         let b = finding(wsID: "ws-2", targetID: "auth-core", id: "fnd-1")

@@ -201,7 +201,19 @@ public struct CoverageDetailScreen: View {
         // doc comment gives — a target/wsID change that leaves `tab`
         // unchanged (still `.overview` after `activate()` resets it) would
         // otherwise miss re-dispatching the lazy Catalog fetch.
-        .task(id: "\(target)|\(wsID)|\(tab.rawValue)") {
+        //
+        // Also folds in whether `store.detail` has resolved
+        // (`store.detail.value != nil`, true only for `.content`) —
+        // `loadCatalogIfNeeded()` is additionally gated on `detail.hasCatalog`
+        // (`CoverageDetailStore`'s own doc comment), which is unknown until
+        // `detail` lands. Without this, selecting Catalog while `detail` is
+        // still `.loading` (the header's `activate()` fetch, still in
+        // flight) dispatches a no-op — `catalogRequested` never latches
+        // true — and once `detail` resolves nothing re-fires this task
+        // (`tab`/`target`/`wsID` are all unchanged), stranding the Catalog
+        // tab at `.loading` forever. Appending detail's resolution to the id
+        // makes that transition its own re-fire.
+        .task(id: "\(target)|\(wsID)|\(tab.rawValue)|\(store.detail.value != nil)") {
             await loadTab(tab, store: store)
         }
     }
