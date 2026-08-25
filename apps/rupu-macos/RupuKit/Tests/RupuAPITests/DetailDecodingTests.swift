@@ -107,6 +107,38 @@ import Foundation
     #expect(anthropicRollup.p50MS == 30)
 }
 
+@Test func decodesProjectDetailFixtureWithCountsBlocksAndRecentRuns() throws {
+    let detail = try JSONDecoder().decode(APIProjectDetail.self, from: Fixtures.data("project_detail.json"))
+
+    // `project` reuses APIProjectRow's partial decode — the fixture's
+    // ProjectRow carries more fields (path, repo_remote, ...) than that type
+    // decodes, and unknown keys are ignored.
+    #expect(detail.project.wsID == "ws-1")
+    #expect(detail.project.name == "rupu")
+    #expect(detail.project.runCount == 14)
+
+    #expect(detail.runs.total == 14)
+    #expect(detail.runs.running == 1)
+    #expect(detail.runs.byStatus["completed"] == 10)
+    #expect(detail.runs.byStatus["failed"] == 2)
+    #expect(detail.runs.byStatus["awaiting_approval"] == 1)
+    #expect(detail.runs.bySurface.workflow == 9)
+    #expect(detail.runs.bySurface.autoflow == 5)
+
+    #expect(detail.sessions.total == 3)
+    #expect(detail.sessions.active == 1)
+
+    #expect(detail.coverage.targets == 4)
+    #expect(detail.coverage.findings == 7)
+
+    #expect(detail.recentRuns.count == 2)
+    #expect(detail.recentRuns[0].id == "run-01")
+    #expect(detail.recentRuns[0].hostID == nil) // project routes never inject host_id
+    #expect(detail.recentRuns[1].status == "running")
+
+    #expect(detail.usage.totalTokens == 6200)
+}
+
 @Test func decodesFindingsFixtureWithSeverityStringsAndRepoScopeNilFilePath() throws {
     let findings = try JSONDecoder().decode(APIFindings.self, from: Fixtures.data("findings_run.json"))
     #expect(findings.findings.count == 2)

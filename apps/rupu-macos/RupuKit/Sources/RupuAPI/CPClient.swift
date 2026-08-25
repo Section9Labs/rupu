@@ -133,6 +133,68 @@ public actor CPClient {
         return response.tools
     }
 
+    /// `GET /api/autoflows` — every workflow definition carrying a top-level
+    /// `autoflow:` block, enabled and disabled alike (global layer merged
+    /// with every distinct registered repo's `.rupu/workflows/`; project
+    /// shadows global by name).
+    public func autoflowDefinitions() async throws -> [AutoflowDefinition] {
+        try await get("api/autoflows")
+    }
+
+    // MARK: - Fleet (read)
+
+    /// `GET /api/workers` — every local execution identity (`rupu` CLI /
+    /// `rupu cp serve` autoflow worker) enriched with run-activity
+    /// attribution. Local-only: unlike `runs(offset:limit:host:)`, there is
+    /// no `?host=` fan-out — a worker record only ever lives on the host
+    /// that registered it.
+    public func workers() async throws -> [APIWorkerRow] {
+        try await get("api/workers")
+    }
+
+    // MARK: - Project detail (read)
+
+    /// `GET /api/projects/:ws_id` — one project's rollup: identity, run/
+    /// session/coverage counts, the 10 most recent runs, and a usage
+    /// summary across every scoped run.
+    public func projectDetail(wsID: String) async throws -> APIProjectDetail {
+        try await get("api/projects/\(wsID)")
+    }
+
+    /// `GET /api/projects/:ws_id/runs` — scoped slim run list, newest-first.
+    /// Local-only, same as every `/api/projects/:ws_id/...` route (a project
+    /// lives on exactly one host's filesystem) — no `host` parameter here.
+    public func projectRuns(wsID: String, offset: Int, limit: Int) async throws -> [APIRunListRow] {
+        try await get("api/projects/\(wsID)/runs", query: offsetLimitQuery(offset: offset, limit: limit))
+    }
+
+    /// `GET /api/projects/:ws_id/sessions` — session rows scoped to the
+    /// project. Same local-only rationale as `projectRuns`.
+    public func projectSessions(wsID: String, offset: Int, limit: Int) async throws -> [APISessionRow] {
+        try await get("api/projects/\(wsID)/sessions", query: offsetLimitQuery(offset: offset, limit: limit))
+    }
+
+    /// `GET /api/projects/:ws_id/agents` — global agents merged with the
+    /// project's own `.rupu/agents/`; project shadows global by name. Same
+    /// `AgentDto` shape `agentDefinitions()` decodes.
+    public func projectAgents(wsID: String) async throws -> [AgentDefinition] {
+        try await get("api/projects/\(wsID)/agents")
+    }
+
+    /// `GET /api/projects/:ws_id/workflows` — global workflows merged with
+    /// the project's own `.rupu/workflows/`; project shadows global by name.
+    /// Same `WorkflowDto` shape `workflowDefinitions()` decodes.
+    public func projectWorkflows(wsID: String) async throws -> [WorkflowDefinition] {
+        try await get("api/projects/\(wsID)/workflows")
+    }
+
+    /// `GET /api/projects/:ws_id/autoflows` — same merge/shadow rule as
+    /// `projectWorkflows`, restricted to workflows carrying an `autoflow:`
+    /// block.
+    public func projectAutoflows(wsID: String) async throws -> [AutoflowDefinition] {
+        try await get("api/projects/\(wsID)/autoflows")
+    }
+
     // MARK: - Run control (write)
 
     /// `mode` in `body` is optional; a `nil` body is valid — the server
@@ -233,6 +295,27 @@ public actor CPClient {
         try await post("api/sessions/\(id)/restore", query: writeHostQuery(host), body: EmptyBody?.none)
     }
 
+    // MARK: - Autoflow definitions (write)
+
+    /// `POST /api/autoflows/:name/enable` or `.../disable`, chosen by
+    /// `enabled` — flips `autoflow.enabled` in the on-disk workflow YAML.
+    /// **Immediate**, not marker-only: the response reflects the file's
+    /// actual new state (see `AutoflowSetEnabledResponse`'s doc comment).
+    /// `scopeKind`/`scopeID` are the same optional `?scope_kind=&scope_id=`
+    /// pinning pair `DELETE /api/agents/:name` / `DELETE /api/workflows/:name`
+    /// accept — omit both to let the server resolve `:name` via its implicit
+    /// project-first lookup; pass both to pin a specific repo when two
+    /// different repos define the same autoflow name.
+    public func setAutoflowEnabled(
+        name: String,
+        scopeKind: String? = nil,
+        scopeID: String? = nil,
+        enabled: Bool
+    ) async throws -> AutoflowSetEnabledResponse {
+        let path = enabled ? "api/autoflows/\(name)/enable" : "api/autoflows/\(name)/disable"
+        return try await post(path, query: scopeQuery(scopeKind: scopeKind, scopeID: scopeID), body: EmptyBody?.none)
+    }
+
     // MARK: - Query helpers
 
     private func offsetLimitQuery(offset: Int, limit: Int, host: String? = nil) -> [URLQueryItem] {
@@ -265,6 +348,19 @@ public actor CPClient {
     private func runControlQuery(host: String?, gate: String) -> [URLQueryItem] {
         var items = writeHostQuery(host)
         items.append(URLQueryItem(name: "gate", value: gate))
+        return items
+    }
+
+    /// `?scope_kind=&scope_id=` pinning pair shared by `setAutoflowEnabled`
+    /// (see its doc comment) — either or both may be omitted.
+    private func scopeQuery(scopeKind: String?, scopeID: String?) -> [URLQueryItem] {
+        var items: [URLQueryItem] = []
+        if let scopeKind {
+            items.append(URLQueryItem(name: "scope_kind", value: scopeKind))
+        }
+        if let scopeID {
+            items.append(URLQueryItem(name: "scope_id", value: scopeID))
+        }
         return items
     }
 

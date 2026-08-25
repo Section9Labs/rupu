@@ -46,6 +46,32 @@ import Foundation
     #expect(rows[0].activeRunID == "run-30")
 }
 
+@Test func decodesProjectRunsFixtureWithNoHostIDInjected() throws {
+    // Project routes are local-only — unlike run_list_row.json, this
+    // fixture carries no `host_id` key at all (not even `"local"`).
+    let rows = try JSONDecoder().decode([APIRunListRow].self, from: Fixtures.data("project_runs.json"))
+    #expect(rows.count == 1)
+    #expect(rows[0].id == "run-01")
+    #expect(rows[0].hostID == nil)
+    #expect(rows[0].usage.totalTokens == 1200)
+    #expect(rows[0].durationMS == 360_000)
+}
+
+@Test func decodesProjectSessionsFixtureWithScopeAndUsageNoHostID() throws {
+    let rows = try JSONDecoder().decode([APISessionRow].self, from: Fixtures.data("project_sessions.json"))
+    #expect(rows.count == 2)
+    #expect(rows[0].scope == "active")
+    #expect(rows[0].sessionID == "ses-01")
+    #expect(rows[0].workspaceID == "ws-1")
+    #expect(rows[0].usage?.priced == true)
+    #expect(rows[0].hostID == nil)
+
+    #expect(rows[1].scope == "archived")
+    #expect(rows[1].activeRunID == nil)
+    #expect(rows[1].usage?.priced == false)
+    #expect(rows[1].usage?.costUSD == nil)
+}
+
 @Test func decodesEventRowsFixtureWithNonOptionalTsAndPos() throws {
     let rows = try JSONDecoder().decode([CPEventRow].self, from: Fixtures.data("event_rows.json"))
     #expect(rows.count == 3)

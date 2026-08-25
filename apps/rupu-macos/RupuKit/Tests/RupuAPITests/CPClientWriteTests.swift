@@ -179,6 +179,40 @@ extension CPClientTests {
         #expect(!query(of: StubURLProtocol.lastRequest).contains(where: { $0.name == "host" }))
     }
 
+    // MARK: - Autoflow definitions
+
+    /// `enabled: true` hits `.../enable`, `enabled: false` hits
+    /// `.../disable`; `scopeKind`/`scopeID` (when both given) become the
+    /// `?scope_kind=&scope_id=` pinning pair, omitted entirely when both are
+    /// `nil`.
+    @Test func setAutoflowEnabledChoosesSubpathAndSendsScopeQuery() async throws {
+        let enableFixture = Data(#"{"name":"nightly-health","enabled":true}"#.utf8)
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], enableFixture) }
+
+        let enableResponse = try await client().setAutoflowEnabled(name: "nightly-health", enabled: true)
+        #expect(enableResponse.enabled)
+        #expect(StubURLProtocol.lastRequest?.httpMethod == "POST")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/autoflows/nightly-health/enable")
+        #expect(query(of: StubURLProtocol.lastRequest).isEmpty)
+
+        let disableFixture = Data(#"{"name":"issue-triage","enabled":false}"#.utf8)
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], disableFixture) }
+
+        let disableResponse = try await client().setAutoflowEnabled(
+            name: "issue-triage",
+            scopeKind: "project",
+            scopeID: "ws-1",
+            enabled: false
+        )
+        #expect(!disableResponse.enabled)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/autoflows/issue-triage/disable")
+        let q = query(of: StubURLProtocol.lastRequest)
+        #expect(q.contains(URLQueryItem(name: "scope_kind", value: "project")))
+        #expect(q.contains(URLQueryItem(name: "scope_id", value: "ws-1")))
+    }
+
     // MARK: - Validate
 
     @Test func validateWorkflowReturnsTrueOn200() async throws {
