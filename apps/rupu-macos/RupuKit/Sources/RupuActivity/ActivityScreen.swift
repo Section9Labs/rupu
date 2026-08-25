@@ -81,28 +81,31 @@ public struct ActivityScreen: View {
     }
 
     public var body: some View {
+        let claimsActive = Self.isClaimsActive(kind: kind, subTab: autoflowsSubTab)
         VStack(alignment: .leading, spacing: 12) {
             if let store {
-                FilterBar(model: model, store: store)
-                if store.freshness == .stale {
-                    Text("Stream stale — reconnecting")
-                        .font(.noteText)
-                        .foregroundStyle(Color.rupuMute)
-                }
-                if store.pendingHosts > 0 {
-                    // Progressive per-host loading (hotfix): local rows are
-                    // already showing by the time this ever renders —
-                    // `store.state` never waits on remote hosts (see
-                    // `ActivityStore`'s doc comment) — this is purely an
-                    // "more may still show up" signal, never a blocking one.
-                    Text("+\(store.pendingHosts) host\(store.pendingHosts == 1 ? "" : "s") loading…")
-                        .font(.noteText)
-                        .foregroundStyle(Color.rupuMute)
+                FilterBar(model: model, store: store, showRunsChrome: !claimsActive)
+                if !claimsActive {
+                    if store.freshness == .stale {
+                        Text("Stream stale — reconnecting")
+                            .font(.noteText)
+                            .foregroundStyle(Color.rupuMute)
+                    }
+                    if store.pendingHosts > 0 {
+                        // Progressive per-host loading (hotfix): local rows are
+                        // already showing by the time this ever renders —
+                        // `store.state` never waits on remote hosts (see
+                        // `ActivityStore`'s doc comment) — this is purely an
+                        // "more may still show up" signal, never a blocking one.
+                        Text("+\(store.pendingHosts) host\(store.pendingHosts == 1 ? "" : "s") loading…")
+                            .font(.noteText)
+                            .foregroundStyle(Color.rupuMute)
+                    }
                 }
                 if kind == .autoflows {
                     autoflowsSubTabPicker
                 }
-                if kind == .autoflows && autoflowsSubTab == .claims {
+                if claimsActive {
                     claimsBody
                 } else {
                     stateBody(store: store)
@@ -144,6 +147,20 @@ public struct ActivityScreen: View {
 
     // MARK: - Autoflows Runs/Claims sub-toggle (Phase 6B, Task 3)
 
+    /// `true` exactly when the Claims sub-tab is the one currently showing
+    /// (review fix, round 1) — every Runs-only control (`FilterBar`'s status
+    /// chips / live-tail toggle / "+N new runs" pill, and this screen's own
+    /// stale/pending-hosts stream banners) sits over an invisible
+    /// `ActivityTable` while this is `true` and must be suppressed (the
+    /// no-dead-controls rule) rather than staying live-and-inert; the kind
+    /// picker itself stays regardless — it's the only way back out to
+    /// `.runs`. Pure and `static` (not a computed instance property) so
+    /// `ActivityScreenClaimsChromeTests` can assert it flips with `subTab`
+    /// without standing up a full view render.
+    static func isClaimsActive(kind: RunKindFilter, subTab: AutoflowsSubTab) -> Bool {
+        kind == .autoflows && subTab == .claims
+    }
+
     private var autoflowsSubTabPicker: some View {
         Picker("View", selection: $autoflowsSubTab) {
             ForEach(AutoflowsSubTab.allCases, id: \.self) { tab in
@@ -155,6 +172,16 @@ public struct ActivityScreen: View {
         .labelsHidden()
     }
 
+    /// The inner `claimsStore == nil` branch (review fix, round 1) renders
+    /// `loadingView`, not `blockView(label: "Backend not connected")` — by
+    /// the time this ever evaluates, the OUTER `if let store` has already
+    /// proven the backend IS connected (this whole `claimsBody` is only ever
+    /// reached from inside that branch); a nil `claimsStore` here can only
+    /// mean the one-frame gap before `activateClaimsIfNeeded()`'s `.task(id:)`
+    /// finishes building and assigning it, i.e. genuinely loading, not
+    /// disconnected. The OUTER `else` (line ~112, `store == nil`) keeps its
+    /// own "Backend not connected" text — that one really is describing a
+    /// disconnected backend.
     @ViewBuilder
     private var claimsBody: some View {
         if let claimsStore {
@@ -169,7 +196,7 @@ public struct ActivityScreen: View {
                 ClaimsTable(rows: rows, store: claimsStore)
             }
         } else {
-            blockView(label: "Backend not connected")
+            loadingView
         }
     }
 

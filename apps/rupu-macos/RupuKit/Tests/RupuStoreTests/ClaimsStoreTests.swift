@@ -215,10 +215,8 @@ struct ClaimsStoreTests {
     /// and still trigger the reload, exactly like `released: true` does.
     @Test func releaseOfUntrackedStillConfirmsAndReloads() async {
         let issueRef = "github:Section9Labs/rupu/issues/999"
-        let getHits = LockedCounter()
         let client = makeClient { req in
             if req.url?.path == "/api/autoflows/claims" {
-                getHits.increment()
                 return (200, Data("[]".utf8))
             }
             if req.url?.path == "/api/autoflows/claims/release" {

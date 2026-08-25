@@ -6,8 +6,8 @@ import RupuAPI
 /// Task 3): the tracked-claim list (`GET /api/autoflows/claims`) plus its two
 /// write routes, release and requeue.
 ///
-/// **`issue_ref` is the ForEach identity, unverified-composite** — verified
-/// by reading `AutoflowClaimStore` (`crates/rupu-workspace/src/
+/// **`issue_ref` is the ForEach identity — verified unique, no composite
+/// needed.** Verified by reading `AutoflowClaimStore` (`crates/rupu-workspace/src/
 /// autoflow_claim_store.rs`): `save(rec)` always persists into `root.join(
 /// sanitize_component(rec.issue_ref))`, i.e. a claim's own directory is
 /// always derived from its own `issue_ref`, so two `save()` calls for the
@@ -47,12 +47,23 @@ import RupuAPI
 /// recorded. So both `release(issueRef:)` and `requeue(issueRef:)` follow a
 /// simpler shape: `begin()` the key, fire the POST, and on success `confirm()`
 /// it directly (same "confirm off the response, no refetch needed to prove
-/// it" idiom `ActionVerb.setEnabled` already uses for exactly this reason) —
-/// then reload the list so the operator sees the claim's new state (or its
-/// absence, for release) without a manual refresh. The reload is for
-/// **display freshness**, not confirmation — unlike `FleetStore.removeHost`'s
-/// "row disappearing IS the confirmation" contract, where the pending key
-/// stays pending until a follow-up fetch proves the effect landed.
+/// it" idiom `ActionVerb.setEnabled` already uses for exactly this reason).
+///
+/// **Confirm BEFORE the reload, not after** (review fix, round 1): the
+/// POST's own synchronous success already IS the confirmation per the
+/// contract above — `confirm(key)` therefore runs immediately off that,
+/// with the reload firing afterward purely for **display freshness** (so
+/// the operator sees the claim's new state, or its absence for release,
+/// without a manual refresh). Ordering it the other way around — reload
+/// first, confirm second — would make a mutation that fully succeeded
+/// server-side report as un-confirmed (or `.pending` forever) whenever the
+/// FOLLOW-UP `load()` merely failed or got cancelled, conflating two
+/// independent outcomes. A reload failure still surfaces — just
+/// independently, via `claims` landing on `.failed(...)`, same as any other
+/// load failure — never by holding the already-earned `.confirmed` hostage.
+/// Unlike `FleetStore.removeHost`'s "row disappearing IS the confirmation"
+/// contract, the reload here proves nothing the response didn't already
+/// prove.
 ///
 /// **`release` is idempotent — confirms on ANY successful response, `released:
 /// true` or `false` alike.** `CPClient.releaseClaim(issueRef:)` returns that
@@ -66,6 +77,17 @@ import RupuAPI
 /// `pendingActions.fail(key, ...)` and returns without reloading, so the
 /// operator's already-visible rows are never blanked or replaced by a
 /// mutation that didn't succeed.
+///
+/// **No project-scope filtering** (review fix, round 1) — unlike
+/// `ActivityStore.scopeFilter`, which narrows rows by matching `ActivityRow.
+/// project` (a workspace id) against the top bar's selection, this store has
+/// no equivalent to offer: `APIClaimRow` carries a `repoRef` (an SCM
+/// identity, `"github:org/repo"`) with no `ws_id` field at all, and there is
+/// no honest client-side way to map one onto the other — a single repo can
+/// back zero, one, or several projects, and that mapping lives server-side
+/// (if anywhere), not in any field this DTO exposes. `ClaimsTable`'s footer
+/// discloses this plainly rather than silently ignoring the top bar's
+/// selection.
 @MainActor
 @Observable
 public final class ClaimsStore {
@@ -101,14 +123,18 @@ public final class ClaimsStore {
     /// pending-state-mutation-confirmed like a run action — see the type doc
     /// comment's "Release/requeue confirm off the RESPONSE" section for why
     /// this confirms immediately on any successful response rather than
-    /// waiting on a later refetch to prove it.
+    /// waiting on a later refetch to prove it. **`confirm(key)` runs BEFORE
+    /// `load()`** (review fix, round 1 — see the type doc comment's "Confirm
+    /// BEFORE the reload" section): the POST's own success is already the
+    /// proof: a reload that subsequently fails or is cancelled must never
+    /// retract it.
     public func release(issueRef: String) async {
         let key = ActionKey(issueRef, .release)
         pendingActions.begin(key)
         do {
             _ = try await client.releaseClaim(issueRef: issueRef)
-            await load()
             pendingActions.confirm(key)
+            await load()
         } catch {
             pendingActions.fail(key, mutationErrorMessage(error))
         }
@@ -116,15 +142,16 @@ public final class ClaimsStore {
 
     /// No confirm-first UI (`ClaimsTable` fires this directly, no
     /// `confirmationDialog`) — requeuing only enqueues a wake, it doesn't
-    /// discard anything. Same confirm-off-the-response shape as `release`
-    /// above; see the type doc comment for the full rationale.
+    /// discard anything. Same confirm-off-the-response shape (and the same
+    /// confirm-BEFORE-reload ordering) as `release` above; see the type doc
+    /// comment for the full rationale.
     public func requeue(issueRef: String) async {
         let key = ActionKey(issueRef, .requeue)
         pendingActions.begin(key)
         do {
             try await client.requeueClaim(issueRef: issueRef)
-            await load()
             pendingActions.confirm(key)
+            await load()
         } catch {
             pendingActions.fail(key, mutationErrorMessage(error))
         }
