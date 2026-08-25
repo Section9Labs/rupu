@@ -168,6 +168,7 @@ struct SituationStoreTests {
     @MainActor
     private func makeStore(
         maxEventRows: Int = 5_000,
+        now: (() -> Date)? = nil,
         respond: @escaping @Sendable (URLRequest) -> (status: Int, body: Data)
     ) -> (store: SituationStore, box: SignalsFactoryBox) {
         SituationStubURLProtocol.reset(handler: respond)
@@ -176,8 +177,25 @@ struct SituationStoreTests {
             session: SituationStubURLProtocol.session()
         )
         let box = SignalsFactoryBox()
-        let store = SituationStore(client: client, signalsFactory: { box.factory() }, maxEventRows: maxEventRows)
+        let store = SituationStore(
+            client: client, signalsFactory: { box.factory() }, maxEventRows: maxEventRows,
+            now: now ?? Date.init
+        )
         return (store, box)
+    }
+
+    /// Review fix round 1, F4: a fixed, hand-advanced clock for
+    /// `SituationStore`'s injected `now` seam — lets a fresh-arrival test
+    /// pin expiry deterministically instead of racing the store's own real
+    /// 250ms prune ticker against however long the test's async waits
+    /// actually take under a loaded parallel-suite run (the #611 doctrine:
+    /// no timing knobs in assertions). `@MainActor` — both the store and
+    /// every caller here already run on it.
+    @MainActor
+    private final class TestClock {
+        var value: Date
+        init(_ value: Date) { self.value = value }
+        func now() -> Date { value }
     }
 
     // MARK: - Step 1 requirements
@@ -428,8 +446,15 @@ struct SituationStoreTests {
     /// sleeps — #611); it only proves the WIRING marks the right events at
     /// all.
     @MainActor @Test func historyBackfillNeverMarksAnythingFreshOnlyALiveArrivalDoes() async {
+        // Fixed clock (review fix round 1, F4): `now()` never advances for
+        // the duration of this test, so the fresh mark this test asserts on
+        // can never cross its own expiry no matter how long the async waits
+        // below actually take under load — the store's real 250ms prune
+        // ticker still runs, but every tick it takes folds against this same
+        // frozen instant, so it never has anything to prune.
+        let clock = TestClock(Date(timeIntervalSince1970: 1_000_000))
         let backfillBody = Self.encodeEvents([["ts": 1_000, "pos": 0, "type": "run_paused", "run_id": "run-1"]])
-        let (store, box) = makeStore { req in
+        let (store, box) = makeStore(now: clock.now) { req in
             if let hit = Self.defaultAggregateResponse(req) { return hit }
             guard req.url?.path == "/api/events" else { return (200, Data("[]".utf8)) }
             return (200, backfillBody)

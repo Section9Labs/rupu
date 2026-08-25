@@ -1,7 +1,10 @@
 // Situation Room (redesign pass, Task 4) — follow/pin scroll contract. Port
-// of `EventStream.tsx` lines 56-65's `follow`/`scrollRef` story, verified
-// full read of the surrounding component (the whole 142-line file — no
-// separate "jump to latest (N new)" affordance exists anywhere in that
+// of `EventStream.tsx`'s `follow`/`scrollRef` story: `useState`/`useRef`
+// declared at lines 42-43, the pin-to-top effect + scroll-driven recompute
+// at lines 56-65 (review fix round 1, F3 — the prior version of this
+// comment cited 56-65 for the declarations too, conflating them with the
+// effect). Verified full read of the surrounding component (the whole
+// 142-line file — no separate "jump to latest (N new)" affordance exists anywhere in that
 // component or its sole page consumer, `Events.tsx`; see
 // `EventStreamColumn.swift`'s file header for that correction against this
 // task's own brief).
@@ -14,7 +17,7 @@
 // `@MainActor` is a `static func` on a View struct; these are plain
 // top-level functions).
 
-/// Follow/pin decision — the web's `EventStream.tsx` line 58 default
+/// Follow/pin decision — the web's `EventStream.tsx` line 43 default
 /// (`useState(true)`) plus line 65's `setFollow(el.scrollTop < 48)`: no
 /// hysteresis, no separate "resume" gesture — scrolling back within 48px of
 /// the top on the web silently resumes following on its own, purely as a
@@ -75,8 +78,13 @@ public func nextStreamRenderState(
 /// What `EventStreamColumn` actually renders this tick — pure, safe to call
 /// on every body evaluation (no state mutation of its own): the full merged
 /// stream while nothing is frozen; only the frozen subset, in `all`'s own
-/// order, while suspended — plus the real count of arrivals being held
-/// back, which backs the "N new" jump-back affordance.
+/// order, while suspended — plus the real count of `StreamCard`s being held
+/// back, which backs the "N new items" jump-back affordance. **Not just
+/// events** (review fix round 1, F2): `all` is the already-merged stream —
+/// event cards AND finding cards alike (findings arrive wholesale via the
+/// 15s aggregate poll, not incrementally the way live events do) — so
+/// `deferredCount` can include held-back findings too; `EventStreamColumn`'s
+/// bar text says "items", not "events", for exactly this reason.
 ///
 /// **Why this diverges from the web's own mechanism, stated honestly**
 /// (this task's interface note: "port the web's actual approach: check
@@ -95,7 +103,7 @@ public func nextStreamRenderState(
 /// of the render window, so the "measure the delta and correct scrollTop"
 /// trick that works against a plain `VStack` does not transfer cleanly).
 /// So this port takes the documented alternative instead: defer rendering.
-/// New arrivals are held out of the list entirely while suspended, rather
+/// New cards are held out of the list entirely while suspended, rather
 /// than inserted above an anchor this platform can't stabilize — the
 /// already-rendered rows literally never move, a STRONGER guarantee than
 /// the web's platform-assisted approximation, not a weaker one — and the

@@ -195,6 +195,18 @@ public final class SituationStore {
 
     private let client: CPClient
     private let signalsFactory: @Sendable () -> AsyncStream<StreamSignal<CPEvent>>
+    /// Injectable clock for the fresh-arrival fold/prune (review fix round 1,
+    /// F4) — same seam/convention `PendingAction.now` already uses. Lets
+    /// `SituationStoreTests` pin expiry against an INJECTED `now` (advanced
+    /// by hand, not by a real 250ms/5s wall-clock race) rather than the
+    /// `historyBackfillNeverMarksAnythingFresh...`-class flake a real
+    /// `Date()` call invited under load (the store's own 250ms prune ticker
+    /// racing the test's aggregate-poll stub). Defaults to `Date.init` in
+    /// production — every other use of "now" in this store (poll/tick
+    /// timestamps, stale-run recheck) is UNCHANGED and still calls `Date()`
+    /// directly; only the two `foldFreshMarks` call sites this ruling names
+    /// route through it.
+    private let now: () -> Date
     private var lifecycle: StreamLifecycle?
     private var pollTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
@@ -259,12 +271,14 @@ public final class SituationStore {
         client: CPClient,
         signalsFactory: @escaping @Sendable () -> AsyncStream<StreamSignal<CPEvent>>,
         pendingActions: PendingActions = PendingActions(),
-        maxEventRows: Int = 5_000 // Events.tsx MAX_EVENTS (line 33)
+        maxEventRows: Int = 5_000, // Events.tsx MAX_EVENTS (line 33)
+        now: @escaping () -> Date = Date.init
     ) {
         self.client = client
         self.signalsFactory = signalsFactory
         self.pendingActions = pendingActions
         self.maxEventRows = maxEventRows
+        self.now = now
     }
 
     // MARK: - Lifecycle
@@ -420,8 +434,11 @@ public final class SituationStore {
 
         // Fresh-arrival highlight — ONLY a genuinely new live event marks
         // one (never the history backfill, never a reconnect's re-fetched
-        // page — see `freshEvents`'s doc comment).
-        freshMarks = foldFreshMarks(freshMarks, arrivals: [event], now: Date())
+        // page — see `freshEvents`'s doc comment). `now()`, not `Date()`
+        // directly (review fix round 1, F4) — the injectable clock lets
+        // tests pin expiry deterministically instead of racing the real
+        // 250ms prune ticker.
+        freshMarks = foldFreshMarks(freshMarks, arrivals: [event], now: now())
         freshEvents = Set(freshMarks.keys)
 
         // `resolveRuns` is NOT called here — throttled to the aggregate
@@ -583,9 +600,20 @@ public final class SituationStore {
         }
     }
 
+    /// Review fix round 1, F6: this runs every 250ms while the store is
+    /// active, but on most ticks NOTHING has actually expired yet (a 2.5s
+    /// window survives ~10 ticks) — reassigning `freshEvents` (an
+    /// `@Observable`-tracked, publicly-read property) unconditionally on
+    /// every tick invalidated the whole Situation Room screen up to 4×/s
+    /// even when it had nothing new to show. `foldFreshMarks(arrivals: [])`
+    /// only ever REMOVES entries (no arrivals to add), so an unchanged
+    /// count is a cheap, exact proxy for "nothing was pruned this tick" —
+    /// no need for a full dictionary/set equality check.
     private func pruneFreshMarks() {
         guard !freshMarks.isEmpty else { return }
-        freshMarks = foldFreshMarks(freshMarks, arrivals: [], now: Date())
+        let pruned = foldFreshMarks(freshMarks, arrivals: [], now: now())
+        guard pruned.count != freshMarks.count else { return }
+        freshMarks = pruned
         freshEvents = Set(freshMarks.keys)
     }
 

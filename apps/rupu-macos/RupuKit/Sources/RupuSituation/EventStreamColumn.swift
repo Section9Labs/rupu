@@ -54,8 +54,9 @@ enum StreamFilter: Equatable {
 /// comment here previously parked both as out of scope; both now land,
 /// closing that gap). `follow`/`scrollOffset`/`renderState` below are owned
 /// at THIS component's level, matching the web's own ownership exactly:
-/// `EventStream.tsx`'s `follow`/`scrollRef` state (lines 56-58) lives inside
-/// that component's own function body, not its page (`Events.tsx`, whose
+/// `EventStream.tsx`'s `follow`/`scrollRef` state (lines 42-43 — review fix
+/// round 1, F3 corrects this citation from an earlier, wrong 56-58) lives
+/// inside that component's own function body, not its page (`Events.tsx`, whose
 /// only Situation-Room-scroll-relevant state is `freshKeys` — passed down as
 /// a prop, `Events.tsx:329`, same as `freshKeys` is passed into this view
 /// below). See `StreamFollow.swift`'s file header for the full read of
@@ -90,6 +91,19 @@ struct EventStreamColumn: View {
 
     private var following: Bool { isFollowing(offsetFromTop: scrollOffset) }
 
+    /// Chip badge counts (review fix round 1, F5 — accepted as-is, doc-
+    /// commented rather than changed): deliberately grouped over the FULL
+    /// `cards` stream, not `renderPlan.shown`/`shown` (the currently-
+    /// rendered, possibly frozen-while-suspended subset). These are
+    /// FILTERS OVER DATA — "how many Findings/Awaiting/Errors exist in the
+    /// stream right now" — not a description of what's currently painted on
+    /// screen; an operator picking the "Errors" chip while suspended reading
+    /// history expects the count and the resulting filtered list to agree
+    /// with the real, current stream, not with whatever's still frozen in
+    /// the viewport. The jump-to-latest bar is the affordance that already
+    /// surfaces "how many of those are held back right now"
+    /// (`renderPlan.deferredCount`) — these counts don't need to duplicate
+    /// that.
     private var counts: [CardGroup: Int] {
         Dictionary(grouping: cards, by: \.group).mapValues(\.count)
     }
@@ -115,27 +129,21 @@ struct EventStreamColumn: View {
             Rectangle().fill(Color.rupuBorder).frame(height: 1)
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        topAnchor
-                        if shown.isEmpty {
-                            emptyState
-                        } else {
-                            ForEach(shown, id: \.key) { card in
-                                EventCardView(
-                                    card: card,
-                                    project: resolveCardProject(card, runToWorkspace: runToWorkspace, projectsByWorkspace: projectsByWorkspace),
-                                    pendingActions: pendingActions,
-                                    fresh: freshKeys.contains(card.key),
-                                    onApprove: onApprove,
-                                    onReject: onReject,
-                                    onOpenRun: onOpenRun
-                                )
-                            }
-                        }
-                    }
-                    .padding(20)
-                    .frame(maxWidth: 820)
-                    .frame(maxWidth: .infinity)
+                    // Review fix round 1, F1 (HIGH): the offset producer
+                    // MUST NOT live inside the `LazyVStack` below — see
+                    // `streamContent`'s doc comment for the unrealization
+                    // trap that caused (a zero-height marker as the
+                    // `LazyVStack`'s first child stopped reporting once
+                    // scrolled far enough that the stack unrealized it,
+                    // silently flipping a deep-reading operator back to
+                    // "following"). `streamContent` below is a plain, NON-
+                    // lazy `VStack` — ScrollView's own direct content is
+                    // always fully laid out regardless of scroll position;
+                    // only a `LazyVStack`'s own ARRANGED CHILDREN are
+                    // virtualized. Anchoring/measuring on that outer,
+                    // always-realized wrapper instead is what keeps the
+                    // signal alive at every scroll depth.
+                    streamContent
                 }
                 .coordinateSpace(name: Self.scrollSpace)
                 .onPreferenceChange(StreamScrollOffsetKey.self) { minY in
@@ -164,22 +172,67 @@ struct EventStreamColumn: View {
         .background(Color.rupuBg)
     }
 
-    /// Invisible marker at the very top of the stream — both the
-    /// `scrollTo` target for pinning/jumping to latest, and (via its
-    /// `GeometryReader` background) the sole source of `scrollOffset`
-    /// above.
-    private var topAnchor: some View {
-        Color.clear
-            .frame(height: 0)
-            .id(Self.topAnchorID)
-            .background(
-                GeometryReader { geo in
-                    Color.clear.preference(
-                        key: StreamScrollOffsetKey.self,
-                        value: Double(geo.frame(in: .named(Self.scrollSpace)).minY)
-                    )
+    /// The stream's actual content — a plain (NON-lazy) `VStack` wrapping
+    /// the `LazyVStack` of cards, carrying both the `scrollTo` target
+    /// (`.id`) and the sole source of `scrollOffset` (the `GeometryReader`
+    /// `.background`).
+    ///
+    /// **The lazy-unrealization trap this fixes (review fix round 1, F1,
+    /// HIGH)**: the first version of this put a zero-height marker view
+    /// carrying that SAME `.id`/`GeometryReader` pair as the `LazyVStack`'s
+    /// own FIRST ARRANGED CHILD. `LazyVStack` deliberately does not keep
+    /// every child laid out — cells far outside the visible region (plus a
+    /// small buffer) get unrealized/dropped entirely, exactly the
+    /// optimization that makes it usable for a 5,000-row stream in the
+    /// first place. Scroll far enough into history and that marker (now far
+    /// outside the render window) stopped being realized too, so its
+    /// `GeometryReader` preference silently fell back to
+    /// `StreamScrollOffsetKey.defaultValue` (`0`) — `scrollOffset` snapped
+    /// to `0`, `isFollowing` flipped back to `true`, the freeze cleared, and
+    /// `pinToTopIfFollowing` yanked a deep-reading operator straight back to
+    /// the newest card. A NON-lazy container is never unrealized this way:
+    /// `ScrollView`'s laziness only ever applies to a `LazyVStack`/
+    /// `LazyHStack`/`LazyVGrid`'s own arranged children, never to
+    /// `ScrollView`'s single direct content view itself (a plain
+    /// `VStack`/`ZStack`/etc. there is always fully laid out, however deep
+    /// the operator has scrolled) — so anchoring here instead keeps the
+    /// signal alive at every scroll depth. This exact class of bug is a
+    /// controller GUI-check item for the running app (a real, long
+    /// multi-thousand-row stream, scrolled deep, then a burst of live
+    /// arrivals) — `swift test`/`xcodebuild` alone can't reproduce
+    /// `LazyVStack`'s actual on-screen unrealization behavior.
+    private var streamContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                if shown.isEmpty {
+                    emptyState
+                } else {
+                    ForEach(shown, id: \.key) { card in
+                        EventCardView(
+                            card: card,
+                            project: resolveCardProject(card, runToWorkspace: runToWorkspace, projectsByWorkspace: projectsByWorkspace),
+                            pendingActions: pendingActions,
+                            fresh: freshKeys.contains(card.key),
+                            onApprove: onApprove,
+                            onReject: onReject,
+                            onOpenRun: onOpenRun
+                        )
+                    }
                 }
-            )
+            }
+            .padding(20)
+            .frame(maxWidth: 820)
+            .frame(maxWidth: .infinity)
+        }
+        .id(Self.topAnchorID)
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: StreamScrollOffsetKey.self,
+                    value: Double(geo.frame(in: .named(Self.scrollSpace)).minY)
+                )
+            }
+        )
     }
 
     /// Pins to the newest card WHILE following — port of `EventStream.tsx`'s
@@ -194,14 +247,20 @@ struct EventStreamColumn: View {
         }
     }
 
-    /// "N new — jump to latest" — see this type's file header for why this
-    /// affordance is a macOS-native addition, not a literal web port, and
-    /// why its count is real rather than fabricated.
+    /// "N new items — jump to latest" — see this type's file header for why
+    /// this affordance is a macOS-native addition, not a literal web port,
+    /// and why its count is real rather than fabricated. "items", not
+    /// "events" (review fix round 1, F2): `renderPlan.deferredCount` counts
+    /// every held-back `StreamCard`, and a `StreamCard` isn't only ever an
+    /// event — the merged stream also carries finding cards (wholesale-
+    /// replaced by the 15s aggregate poll, not incrementally arriving the
+    /// way live events do), so "events" undercounted what the bar can
+    /// actually be reporting.
     private func jumpToLatestBar(count: Int, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Icon(.chevronDown, size: 11)
-                Text("\(count) new event\(count == 1 ? "" : "s") — jump to latest")
+                Text("\(count) new item\(count == 1 ? "" : "s") — jump to latest")
             }
             .font(.metaText.weight(.semibold))
             .padding(.horizontal, 14)
@@ -218,6 +277,10 @@ struct EventStreamColumn: View {
     private var header: some View {
         HStack(spacing: 12) {
             Eyebrow("Live stream")
+            // Same "counts describe the full stream, not the viewport"
+            // rationale as `counts`'s own doc comment above (review fix
+            // round 1, F5) — `cards.count`, not `shown.count`/
+            // `renderPlan.shown.count`.
             Text("\(cards.count) events")
                 .font(.metaText)
                 .foregroundStyle(Color.rupuMute)
