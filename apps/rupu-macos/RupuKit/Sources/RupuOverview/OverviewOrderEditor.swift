@@ -17,6 +17,16 @@ import SwiftUI
 /// supplies from its own `@AppStorage(OverviewWidgets.storageKey)`
 /// declaration (same trick those two already use to stay in sync with no
 /// custom observation code).
+///
+/// **Two-position limitation (disclosed here because THIS is the surface
+/// the operator drags in):** the "Needs you" block renders either before
+/// or after the merged chart group as a whole — dragging it BETWEEN the
+/// merged blocks in this list lands it visually adjacent to the group,
+/// not interleaved inside it. The merged blocks share one fetch/loading
+/// gate (`DashboardStore.merged`) that this task deliberately does not
+/// split; see `OverviewScreen.needsYouPrecedesMergedGroup(_:)` for the
+/// render-side half of this contract. The caption under the list states
+/// the same thing to the operator.
 public struct OverviewOrderEditor: View {
     @Binding var widgetsData: Data
     @Environment(\.dismiss) private var dismiss
@@ -39,8 +49,20 @@ public struct OverviewOrderEditor: View {
                 .onMove(perform: move)
             }
             .navigationTitle("Reorder Widgets")
+            .safeAreaInset(edge: .bottom) {
+                // The operator-facing half of the two-position disclosure
+                // (see the type doc comment).
+                Text("Chart blocks travel as a group — “Needs you” sits before or after them.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+            }
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                ToolbarItem(placement: .automatic) {
+                    // Not `.cancellationAction`: this mutates in place and keeps
+                    // the sheet open — it cancels nothing (review finding 2).
                     Button("Reset Order", action: resetOrder)
                 }
                 ToolbarItem(placement: .confirmationAction) {
