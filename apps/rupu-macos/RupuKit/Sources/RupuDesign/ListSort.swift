@@ -7,7 +7,15 @@ import Foundation
 /// implementation of the same contract for any other sortable list (Phase
 /// 5A's Projects/Fleet/Library screens), not a shared base type the two
 /// funnel through.
-public struct ListSort<Key: Hashable & CaseIterable>: Equatable {
+///
+/// `Sendable` (and the `Key: Sendable` requirement it drags along): under
+/// Swift 6 mode, a store's `@Published`/`@State`-held sort value has to
+/// cross actor boundaries with the store itself (e.g. a screen's
+/// `AppModel`/`@MainActor` store handing its current `ListSort` to a
+/// background task) — a non-`Sendable` value there is a compile error, not
+/// a runtime one, so this is conformance the type needs from day one rather
+/// than bolted on once a call site trips over its absence.
+public struct ListSort<Key: Hashable & CaseIterable & Sendable>: Equatable, Sendable {
     public var key: Key
     public var ascending: Bool
 
@@ -21,8 +29,10 @@ public struct ListSort<Key: Hashable & CaseIterable>: Equatable {
 /// `sortRows` knows which comparator to apply — case-insensitive text,
 /// numeric, or date — independent of the caller's row and key types. A
 /// `nil` payload in any case means "this row has no value for this column"
-/// and always sorts last (see `sortRows` below).
-public enum ListSortValue {
+/// and always sorts last (see `sortRows` below). `Sendable` for the same
+/// reason as `ListSort` above — every payload type (`String?`, `Double?`,
+/// `Date?`) already is, so this is free.
+public enum ListSortValue: Sendable {
     case text(String?)
     case number(Double?)
     case date(Date?)
@@ -48,8 +58,10 @@ public enum ListSortValue {
 /// A `value` closure that returns different `ListSortValue` cases for the
 /// same `key` across rows (e.g. `.text` for one row, `.number` for another)
 /// is a caller bug; such a pair compares as a tie rather than crashing or
-/// producing a confusing partial order.
-public func sortRows<Row, Key: Hashable & CaseIterable>(
+/// producing a confusing partial order — see
+/// `mixedKindPairComparesAsATieAndPreservesOriginalOrder` in
+/// `ListSortTests.swift` for the locked-in regression.
+public func sortRows<Row, Key: Hashable & CaseIterable & Sendable>(
     _ rows: [Row], sort: ListSort<Key>, value: (Row, Key) -> ListSortValue
 ) -> [Row] {
     rows.enumerated()

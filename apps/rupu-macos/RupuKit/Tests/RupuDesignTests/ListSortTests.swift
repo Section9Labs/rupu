@@ -6,7 +6,7 @@ import Foundation
 /// for Phase 5A's sortable Projects/Fleet/Library screens. Mirrors
 /// `RupuStoreTests/ActivitySortTests.swift`'s coverage shape (the semantics
 /// this generalizes) but over a throwaway fixture row/key, not `ActivityRow`.
-private enum TestKey: Hashable, CaseIterable {
+private enum TestKey: Hashable, CaseIterable, Sendable {
     case name, score, when
 }
 
@@ -132,6 +132,35 @@ private let t2 = t0.addingTimeInterval(120)
     // must order 90 < 300 < 2000.
     let sorted = sortRows(rows, sort: ListSort(key: .score, ascending: true), value: value)
     #expect(sorted.map(\.id) == ["ninety", "three-hundred", "two-thousand"])
+}
+
+// MARK: - Mixed-kind pairs (caller bug) — locked-in tie contract
+
+private struct MixedRow {
+    let id: String
+    let useText: Bool
+}
+
+/// A `value` closure that returns a different `ListSortValue` case per row
+/// under the same key — the caller-bug scenario `sortRows`'s doc comment
+/// calls out. `key` is intentionally ignored: every row picks its case from
+/// its own `useText` flag, simulating the bug directly rather than needing
+/// two distinct keys to provoke it.
+private func mixedValue(_ row: MixedRow, _ key: TestKey) -> ListSortValue {
+    row.useText ? .text("x") : .number(1)
+}
+
+@Test func mixedKindPairComparesAsATieAndPreservesOriginalOrder() {
+    let rows = [
+        MixedRow(id: "text-1", useText: true),
+        MixedRow(id: "number-1", useText: false),
+        MixedRow(id: "text-2", useText: true),
+    ]
+    let sorted = sortRows(rows, sort: ListSort(key: .name, ascending: true), value: mixedValue)
+    // Every adjacent pair here is mixed-kind, so every comparison hits the
+    // `default: .tie` branch — locking in that a caller bug degrades to
+    // "preserve input order" rather than crashing or silently reordering.
+    #expect(sorted.map(\.id) == ["text-1", "number-1", "text-2"])
 }
 
 // MARK: - Empty input
