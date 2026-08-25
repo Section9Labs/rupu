@@ -5,6 +5,12 @@
       "max_workspace_bytes": 500000000
     },
     "default_model": "claude-sonnet-4-6",
+    "policy": {
+      "lock": [
+        "policy.lock",
+        "permission_mode"
+      ]
+    },
     "providers": {
       "GLM-5.2-FP8": {
         "base_url": "https://oracle.internal/v1",
@@ -34,7 +40,7 @@
       "locked": false
     }
   },
-  "raw_global": "default_model = \"claude-sonnet-4-6\"\nlog_level = \"info\"\n\n[policy]\nlock = [\"policy.lock\"]\n",
+  "raw_global": "default_model = \"claude-sonnet-4-6\"\nlog_level = \"info\"\n\n[policy]\nlock = [\"policy.lock\", \"permission_mode\"]\n",
   "raw_project": "default_model = \"claude-opus-4-8\"\n\n[cp]\nmax_workspace_bytes = 500000000\n",
   "cp": {
     "bind": "127.0.0.1:7420",
