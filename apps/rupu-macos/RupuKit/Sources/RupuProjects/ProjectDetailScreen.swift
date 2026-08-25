@@ -343,6 +343,62 @@ private struct OverviewTabContent: View {
     }
 }
 
+// MARK: - "Show all" footer contract (Runs + Sessions)
+
+/// The three honest states the Runs/Sessions tab's windowed-list footer can
+/// be in. Pure, no `View` dependency (review fix) — so
+/// `ProjectDetailTabTests` can assert the reconciliation directly, and both
+/// tabs share one implementation instead of duplicating the same "is there
+/// more, and can this store actually fetch it" logic per resource.
+enum ShowAllFooterState: Equatable {
+    case hidden
+    case button(label: String)
+    case note(String)
+}
+
+enum ShowAllFooter {
+    /// `noun` is `"runs"` or `"sessions"` — the only per-resource variable
+    /// in an otherwise identical contract. `showAllLimit` is threaded in
+    /// (rather than read from `ProjectDetailStore.showAllLimit` directly)
+    /// so this stays testable with arbitrary values.
+    ///
+    /// **Review fix**: the previous contract rendered a "Show all N" button
+    /// whenever `!showingAll`, regardless of whether `showAllLimit` could
+    /// actually reach `N` — tapping it silently capped at 1,000 rows while
+    /// the button (and, worse, the resulting `showingAll = true` it used to
+    /// set unconditionally on any fetch success) both claimed completeness
+    /// that was never true for a project with more than `showAllLimit`
+    /// rows. Three states now, each honest about what happens next:
+    ///
+    /// - `.hidden` — either every row is already loaded (`showingAll ==
+    ///   true`, which `ProjectDetailStore` now only ever sets when `loaded
+    ///   >= total`), `total` isn't known yet (`detail` hasn't loaded), or
+    ///   there's nothing left to load at all (`loaded >= total` even before
+    ///   the store's own flag catches up, belt-and-suspenders).
+    /// - `.button` — more to fetch, and the fetch can actually get there:
+    ///   `"Show all N runs"` when `total` fits inside `showAllLimit`,
+    ///   `"Show first 1,000 of N runs"` (both figures formatted, no lie by
+    ///   omission) when it doesn't — the label itself commits to exactly
+    ///   what tapping it will produce.
+    /// - `.note` — already fetched at `showAllLimit` (`loaded ==
+    ///   showAllLimit`) and still short of `total`: there is nothing this
+    ///   store can fetch beyond the cap without real server-side
+    ///   pagination — `GET /api/projects/:ws_id/runs`/`.../sessions` have
+    ///   no cursor this phase (a future need, not built here) — so a
+    ///   "show more" button here would just refetch the identical capped
+    ///   page again. Persistent and quiet instead of a dead control.
+    static func resolve(loaded: Int, total: Int?, showingAll: Bool, showAllLimit: Int, noun: String) -> ShowAllFooterState {
+        guard let total, !showingAll, loaded < total else { return .hidden }
+        if loaded >= showAllLimit {
+            return .note("Showing \(Fmt.count(loaded)) of \(Fmt.count(total)) \(noun)")
+        }
+        if total > showAllLimit {
+            return .button(label: "Show first \(Fmt.count(showAllLimit)) of \(Fmt.count(total)) \(noun)")
+        }
+        return .button(label: "Show all \(Fmt.count(total)) \(noun)")
+    }
+}
+
 // MARK: - Runs tab (windowed)
 
 private struct RunsTabContent: View {
@@ -374,21 +430,29 @@ private struct RunsTabContent: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    /// Honest "show all", per the brief — only rendered while there is
-    /// provably more to show: `store.detail`'s own `runs.total` (a real
-    /// server-reported count, not inferred from the window size) is bigger
-    /// than what's currently loaded, and the window hasn't already been
-    /// widened to "show all". No fake infinite scroll, no guessing.
+    /// See `ShowAllFooter.resolve(...)`'s doc comment for the three-state
+    /// contract this renders.
     @ViewBuilder
     private func showAllFooter(loaded: Int) -> some View {
-        if !store.runsShowingAll, let total = store.detail.value?.runs.total, loaded < total {
-            Button("Show all \(Fmt.count(total)) runs") {
+        switch ShowAllFooter.resolve(
+            loaded: loaded, total: store.detail.value?.runs.total, showingAll: store.runsShowingAll,
+            showAllLimit: ProjectDetailStore.showAllLimit, noun: "runs"
+        ) {
+        case .hidden:
+            EmptyView()
+        case .button(let label):
+            Button(label) {
                 Task { await store.showAllRuns() }
             }
             .buttonStyle(.plain)
             .font(.noteText)
             .foregroundStyle(Color.rupuBrand)
             .padding(12)
+        case .note(let text):
+            Text(text)
+                .font(.noteText)
+                .foregroundStyle(Color.rupuMute)
+                .padding(12)
         }
     }
 }
@@ -424,18 +488,29 @@ private struct SessionsTabContent: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    /// Same honest-total contract as `RunsTabContent.showAllFooter` — see
-    /// that method's doc comment.
+    /// Same `ShowAllFooter.resolve(...)` contract as `RunsTabContent.
+    /// showAllFooter` — see that type's doc comment.
     @ViewBuilder
     private func showAllFooter(loaded: Int) -> some View {
-        if !store.sessionsShowingAll, let total = store.detail.value?.sessions.total, loaded < total {
-            Button("Show all \(Fmt.count(total)) sessions") {
+        switch ShowAllFooter.resolve(
+            loaded: loaded, total: store.detail.value?.sessions.total, showingAll: store.sessionsShowingAll,
+            showAllLimit: ProjectDetailStore.showAllLimit, noun: "sessions"
+        ) {
+        case .hidden:
+            EmptyView()
+        case .button(let label):
+            Button(label) {
                 Task { await store.showAllSessions() }
             }
             .buttonStyle(.plain)
             .font(.noteText)
             .foregroundStyle(Color.rupuBrand)
             .padding(12)
+        case .note(let text):
+            Text(text)
+                .font(.noteText)
+                .foregroundStyle(Color.rupuMute)
+                .padding(12)
         }
     }
 }

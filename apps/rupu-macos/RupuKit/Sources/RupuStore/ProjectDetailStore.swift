@@ -39,12 +39,27 @@ import RupuAPI
 /// first `Self.windowSize` (50) rows on first load, and exposes
 /// `runsShowingAll`/`sessionsShowingAll` plus `showAllRuns()`/
 /// `showAllSessions()` for the screen's "show all" affordance to refetch
-/// with `Self.showAllLimit` (1000 — effectively "all" given this phase has
-/// no true infinite-scroll/cursor UI to keep going past that) instead. This
-/// is a deliberately simpler contract than `PagedSnapshot`'s incremental
-/// `loadMore()`: the brief calls for "windowed — first 50 + show all
-/// (honest, simple; no fake infinite scroll)", not a second paging
-/// mechanism to maintain alongside `PagedSnapshot`.
+/// with `Self.showAllLimit` (1000) instead. This is a deliberately simpler
+/// contract than `PagedSnapshot`'s incremental `loadMore()`: the brief
+/// calls for "windowed — first 50 + show all (honest, simple; no fake
+/// infinite scroll)", not a second paging mechanism to maintain alongside
+/// `PagedSnapshot`.
+///
+/// **`runsShowingAll`/`sessionsShowingAll` are an honesty gate, not a
+/// "did the show-all fetch run" flag** (review fix): they read `true` only
+/// once the loaded row count is *provably* every row the project has —
+/// `loaded >= total`, `total` being `detail`'s own server-reported
+/// `runs.total`/`sessions.total`, never inferred from which fetch (window
+/// vs. `showAllLimit`) ran or from a bare "the request succeeded" signal.
+/// A project with more rows than `showAllLimit` therefore NEVER reaches
+/// `showingAll == true` — `showAllRuns()`/`showAllSessions()` cap out at
+/// exactly `showAllLimit` rows and stay honestly incomplete forever (this
+/// phase has no server-side cursor past that cap to keep going with). The
+/// screen's own `ShowAllFooter.resolve(...)` (`RupuProjects/
+/// ProjectDetailScreen.swift`) reads `loaded == showAllLimit` alongside
+/// `showingAll == false` as the distinct "hit the cap, still short" state
+/// and renders a quiet persistent note instead of a button that would just
+/// refetch the identical capped page again.
 @MainActor
 @Observable
 public final class ProjectDetailStore {
@@ -147,35 +162,35 @@ public final class ProjectDetailStore {
     public func loadRunsIfNeeded() async {
         guard !runsRequested else { return }
         runsRequested = true
-        await loadRuns(limit: Self.windowSize, showingAll: false)
+        await loadRuns(limit: Self.windowSize)
     }
 
     /// Forces a reload regardless of `runsRequested` — the screen's own
     /// retry affordance for a `.failed` Runs tab.
     public func loadRuns() async {
         runsRequested = true
-        await loadRuns(limit: Self.windowSize, showingAll: false)
+        await loadRuns(limit: Self.windowSize)
     }
 
     public func showAllRuns() async {
         runsRequested = true
-        await loadRuns(limit: Self.showAllLimit, showingAll: true)
+        await loadRuns(limit: Self.showAllLimit)
     }
 
     public func loadSessionsIfNeeded() async {
         guard !sessionsRequested else { return }
         sessionsRequested = true
-        await loadSessions(limit: Self.windowSize, showingAll: false)
+        await loadSessions(limit: Self.windowSize)
     }
 
     public func loadSessions() async {
         sessionsRequested = true
-        await loadSessions(limit: Self.windowSize, showingAll: false)
+        await loadSessions(limit: Self.windowSize)
     }
 
     public func showAllSessions() async {
         sessionsRequested = true
-        await loadSessions(limit: Self.showAllLimit, showingAll: true)
+        await loadSessions(limit: Self.showAllLimit)
     }
 
     public func loadAgentsIfNeeded() async {
@@ -256,25 +271,34 @@ public final class ProjectDetailStore {
         }
     }
 
-    private func loadRuns(limit: Int, showingAll: Bool) async {
+    private func loadRuns(limit: Int) async {
         do {
             let rows = try await fetchRuns(0, limit)
             runs = rows.isEmpty ? .empty : .content(rows)
-            runsShowingAll = showingAll
+            runsShowingAll = Self.isComplete(loaded: rows.count, total: detail.value?.runs.total)
         } catch {
             guard !isCancellation(error) else { return }
             runs = .failed(String(describing: error))
         }
     }
 
-    private func loadSessions(limit: Int, showingAll: Bool) async {
+    private func loadSessions(limit: Int) async {
         do {
             let rows = try await fetchSessions(0, limit)
             sessions = rows.isEmpty ? .empty : .content(rows)
-            sessionsShowingAll = showingAll
+            sessionsShowingAll = Self.isComplete(loaded: rows.count, total: detail.value?.sessions.total)
         } catch {
             guard !isCancellation(error) else { return }
             sessions = .failed(String(describing: error))
         }
+    }
+
+    /// `true` only when `loaded` demonstrably contains every row the
+    /// project has. `total == nil` (`detail` hasn't loaded, or failed)
+    /// never counts as complete — an unknown total must never be read as
+    /// "nothing more to show".
+    private static func isComplete(loaded: Int, total: Int?) -> Bool {
+        guard let total else { return false }
+        return loaded >= total
     }
 }
