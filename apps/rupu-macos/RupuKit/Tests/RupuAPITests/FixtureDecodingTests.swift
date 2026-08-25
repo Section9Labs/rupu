@@ -83,16 +83,26 @@ import Foundation
     #expect(critical.project == "rupu")
     #expect(critical.targetID == "auth-core")
     #expect(critical.workflowName == "nightly-security")
-    // Long-form severity strings: exactly the wire values `RunDetailTabs.severity(for:)`
-    // switches on (critical/high/medium/low/info) — Task 3 owns moving that
-    // seam, this only pins the strings it will keep matching.
+    // Long-form severity strings: exactly the wire values `Severity.
+    // init(wireString:)` (`RupuDesign`) switches on (critical/high/medium/
+    // low/info).
     #expect(critical.severity == "critical")
+    // `declared_by` (review fix, Phase 5B Task 3): the real run linkage
+    // `FindingOut`'s flattened `FindingRecord` carries — see `APIFinding`'s
+    // doc comment for why an earlier pass wrongly believed this didn't
+    // exist. `run_9k2f`/`claude-sonnet-4-6`/`workflow` are the fixture's
+    // real values (`crates/rupu-cp/tests/macos_fixtures.rs`), not stand-ins.
+    #expect(critical.declaredBy.runID == "run_9k2f")
+    #expect(critical.declaredBy.model == "claude-sonnet-4-6")
+    #expect(critical.declaredBy.surface == "workflow")
 
     let high = findings.findings[1]
     #expect(high.wsID == "ws-1")
     #expect(high.targetID == "web-api")
     #expect(high.severity == "high")
     #expect(high.filePath == nil)
+    #expect(high.declaredBy.runID == "run_9k2f")
+    #expect(high.declaredBy.surface == "workflow")
 
     // Poisoned/nil field: a workspace-2 finding with no joined workflow_name.
     let medium = findings.findings[2]
@@ -101,10 +111,14 @@ import Foundation
     #expect(medium.targetID == "ml-pipeline")
     #expect(medium.workflowName == nil)
     #expect(medium.severity == "medium")
+    #expect(medium.declaredBy.runID == "run_am4d")
+    #expect(medium.declaredBy.surface == "workflow")
 
     let info = findings.findings[3]
     #expect(info.severity == "info")
     #expect(info.wsID == "ws-2")
+    #expect(info.declaredBy.runID == "run_am4d")
+    #expect(info.declaredBy.surface == "workflow")
 }
 
 @Test func decodesCoverageSummaryFixture() throws {

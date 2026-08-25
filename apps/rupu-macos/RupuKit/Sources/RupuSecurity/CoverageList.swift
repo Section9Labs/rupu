@@ -77,7 +77,14 @@ struct CoverageTabView: View {
         [
             SortableColumn(key: .target, label: "Target", width: nil),
             SortableColumn(key: .assertions, label: "Assertions", width: CoverageLayout.assertions, alignment: .trailing),
-            SortableColumn(key: .catalog, label: "Catalog", width: CoverageLayout.catalog, alignment: .trailing, firstTapAscending: true),
+            // No `firstTapAscending` override (review fix — an earlier draft
+            // had one, unintentionally copied from `FindingsTable.swift`'s
+            // TEXT columns): `.catalog`'s sort value is `.number(hasCatalog
+            // ? 1 : 0)`, not text, so the default trailing-aligned heuristic
+            // (descending-first) is already correct here — same as the
+            // un-overridden `.assertions`/`.findings` columns either side of
+            // it — putting catalog-having targets first on the first tap.
+            SortableColumn(key: .catalog, label: "Catalog", width: CoverageLayout.catalog, alignment: .trailing),
             SortableColumn(key: .findings, label: "Findings", width: CoverageLayout.findings, alignment: .trailing),
         ]
     }

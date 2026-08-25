@@ -53,5 +53,9 @@ let package = Package(
             name: "RupuShellTests",
             dependencies: ["RupuShell", "RupuStore", "RupuBackend", "RupuAPI", "RupuDesign", "RupuActivity"]
         ),
+        .testTarget(
+            name: "RupuSecurityTests",
+            dependencies: ["RupuSecurity", "RupuAPI", "RupuStore", "RupuDesign"]
+        ),
     ]
 )

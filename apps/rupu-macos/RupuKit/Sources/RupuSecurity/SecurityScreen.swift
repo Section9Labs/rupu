@@ -135,7 +135,7 @@ public struct SecurityScreen: View {
     private func tabContent(store: SecurityStore) -> some View {
         switch tab {
         case .findings:
-            FindingsTabView(findings: store.findings, sort: $findingsSort)
+            FindingsTabView(findings: store.findings, sort: $findingsSort, onSelect: { model.navigate(to: $0) })
         case .coverage:
             CoverageTabView(coverage: store.coverage, sort: $coverageSort, onSelect: { model.navigate(to: $0) })
         }

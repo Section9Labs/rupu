@@ -17,26 +17,67 @@ private enum FindingsLayout {
     static let workflow: CGFloat = 128
 }
 
+/// Maps a finding's `declaredBy.surface`/`runID` to the route its row
+/// should navigate to, if any. Pure, and the sole place this decision is
+/// made — see `FindingsTabView`'s doc comment for the full per-surface
+/// rationale (why `workflow`/`autoflow` route and `agent`/`session` don't).
+///
+/// An empty `runID` (the `APIFinding` memberwise init's all-empty
+/// `declaredBy` default, for call sites built before this field existed —
+/// see that type's doc comment) never routes either, regardless of
+/// `surface` — an empty id is not a real run to navigate to.
+func findingNavigationRoute(surface: String, runID: String) -> Route? {
+    guard !runID.isEmpty else { return nil }
+    switch surface {
+    case "workflow", "autoflow":
+        return .runDetail(id: runID, host: nil)
+    default:
+        // "agent"/"session" (and any future/unrecognized surface value) —
+        // never a guessed route for data this client can't actually
+        // resolve. See the tracked follow-up in `FindingsTabView`'s doc
+        // comment.
+        return nil
+    }
+}
+
 /// The Findings tab's content: a severity summary strip (straight off
 /// `APIFindingsSummary`, no client-side recount — same "no fake data"
 /// posture `FindingsTabContent`/`ProjectFindingsTabContent` already take)
 /// above a sortable table, one row per finding across every registered
 /// workspace.
 ///
-/// **Rows are deliberately non-navigating.** `APIFinding` (the `GET /api/
-/// findings` row shape — see that type's doc comment) carries `wsID`/
-/// `project`/`targetID`/`workflowName`, but no `runID`/run linkage at all:
-/// `FindingOut` on the Rust side (`crates/rupu-cp/src/api/findings.rs`) has
-/// no run association to give one — a finding is declared against a
-/// coverage target, not a specific run. Wiring a tap here would either
-/// silently no-op (dead affordance) or navigate somewhere this data doesn't
-/// actually point, so this table renders no row-tap chrome (no hover
-/// cursor, no `onTapGesture`) at all — contrast `CoverageList.swift`'s
-/// `CoverageRow`, which genuinely does have a target/wsID pair to navigate
-/// with.
+/// **Rows navigate where honest, per `declaredBy.surface` — not uniformly.**
+/// `APIFinding.declaredBy` (`FindingOut`'s flattened `FindingRecord.
+/// declared_by: Attribution { run_id, model, surface }` — see `APIFinding`'s
+/// own doc comment; a first pass at this table wrongly believed no run
+/// linkage existed at all and shipped every row non-navigating on that false
+/// premise) IS real run linkage. But not every `surface` value resolves to a
+/// route `RunDetailScreen` can actually serve:
+/// - `workflow`/`autoflow` → `declared_by.run_id` is an orchestrator run id,
+///   exactly what `GET /api/runs/:id` (`RunDetailScreen`'s data source)
+///   expects. `host: nil` — the findings registry (`rupu-coverage`'s ledger)
+///   is local-only, same as every other `/api/coverage`/`/api/findings`
+///   route in this client (no `?host=` fan-out anywhere on `CPClient` for
+///   these), so `nil` here is truthful, not a punt.
+/// - `agent`/`session` → the run id is an agent-run or session-scoped id,
+///   which structurally 404s against `/api/runs/:id` (the Phase 2 "standalone
+///   agent run" lesson `AppModel.Route.agentRunDetail`'s own doc comment
+///   documents) — and `APIFinding` carries neither the `transcriptPath` an
+///   `.agentRunDetail` route needs nor a `sessionID` a `.sessionDetail` route
+///   needs, only `declared_by.run_id`. Wiring these to `.runDetail` would
+///   reintroduce exactly the dead-end-404 bug Phase 2 fixed; they stay
+///   non-navigating instead. **Tracked follow-up, not solved here**: closing
+///   this gap needs a richer server-side row (a resolved surface-specific
+///   route, or the missing transcript/session fields), not a client-side
+///   guess.
+///
+/// `findingNavigationRoute(surface:runID:)` is the pure, tested mapping this
+/// table's rows delegate to — a row only gets tap chrome (hover cursor,
+/// `onTapGesture`) when it returns non-`nil`.
 struct FindingsTabView: View {
     let findings: BlockState<APIFindings>
     @Binding var sort: ListSort<FindingsSortKey>
+    let onSelect: (Route) -> Void
 
     var body: some View {
         Group {
@@ -97,7 +138,11 @@ struct FindingsTabView: View {
             Divider()
             VStack(spacing: 0) {
                 ForEach(Array(sorted.enumerated()), id: \.offset) { _, row in
-                    FindingRow(finding: row)
+                    FindingRow(
+                        finding: row,
+                        route: findingNavigationRoute(surface: row.declaredBy.surface, runID: row.declaredBy.runID),
+                        onSelect: onSelect
+                    )
                     Divider()
                 }
             }
@@ -152,10 +197,23 @@ struct FindingsTabView: View {
 
 private struct FindingRow: View {
     let finding: APIFinding
+    /// `nil` when `findingNavigationRoute(surface:runID:)` couldn't resolve
+    /// one for this row's `declaredBy` — see `FindingsTabView`'s doc
+    /// comment. Only a non-`nil` route gets tap chrome.
+    let route: Route?
+    let onSelect: (Route) -> Void
 
     private var severity: Severity { Severity(wireString: finding.severity) }
 
     var body: some View {
+        if let route {
+            securityRowTapModifiers(rowContent, onSelect: { onSelect(route) })
+        } else {
+            rowContent
+        }
+    }
+
+    private var rowContent: some View {
         HStack(spacing: 0) {
             Rectangle()
                 .fill(Color.severity(severity))

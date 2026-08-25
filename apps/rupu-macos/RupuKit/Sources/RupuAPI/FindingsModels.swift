@@ -44,6 +44,25 @@ public struct APIFindingsSummary: Decodable, Sendable {
 /// the Rust side are plain `String`, never `Option`), so they decode as
 /// non-optional here; the memberwise `init` still defaults them to `""` so
 /// existing call sites built before this field existed keep compiling.
+///
+/// `declaredBy` (Phase 5B, Task 3 review fix): `FindingOut`'s flattened
+/// `FindingRecord` (`crates/rupu-coverage/src/ledger/events.rs`) carries a
+/// `declared_by: Attribution { run_id, model, surface }` field — NOT
+/// flattened further (`Attribution` has no `#[serde(flatten)]` on it inside
+/// `FindingRecord`), so it decodes as one nested object, same shape
+/// `APICoverageAttribution` already models for the coverage routes. Reused
+/// here rather than a duplicate type — see that type's doc comment. This is
+/// the finding's actual run linkage: a first pass at this table wrongly
+/// claimed `APIFinding` carried none at all and shipped non-navigating rows
+/// on that false premise; `declaredBy` is what makes an honest per-surface
+/// navigation decision possible (`RupuSecurity/FindingsTable.swift`'s
+/// `findingNavigationRoute(surface:runID:)`). Always present on the wire
+/// (`Attribution`'s three fields are all plain, non-`Option` on the Rust
+/// side), so it decodes non-optional; the memberwise `init` still defaults
+/// it to an all-empty `APICoverageAttribution` so existing call sites built
+/// before this field existed keep compiling (same `wsID`/`targetID`
+/// precedent above) — that empty default is deliberately unroutable (see
+/// `findingNavigationRoute`'s empty-`runID` guard).
 public struct APIFinding: Decodable, Sendable {
     public let id: String
     public let summary: String
@@ -57,6 +76,7 @@ public struct APIFinding: Decodable, Sendable {
     public let workflowName: String?
     public let permalink: String?
     public let rationale: String
+    public let declaredBy: APICoverageAttribution
     public let declaredAt: String
 
     public init(
@@ -72,6 +92,7 @@ public struct APIFinding: Decodable, Sendable {
         workflowName: String?,
         permalink: String?,
         rationale: String,
+        declaredBy: APICoverageAttribution = APICoverageAttribution(runID: "", model: "", surface: ""),
         declaredAt: String
     ) {
         self.id = id
@@ -86,6 +107,7 @@ public struct APIFinding: Decodable, Sendable {
         self.workflowName = workflowName
         self.permalink = permalink
         self.rationale = rationale
+        self.declaredBy = declaredBy
         self.declaredAt = declaredAt
     }
 
@@ -102,6 +124,7 @@ public struct APIFinding: Decodable, Sendable {
         case workflowName = "workflow_name"
         case permalink
         case evidence
+        case declaredBy = "declared_by"
         case declaredAt = "declared_at"
     }
 
@@ -122,6 +145,7 @@ public struct APIFinding: Decodable, Sendable {
         targetID = try container.decode(String.self, forKey: .targetID)
         workflowName = try container.decodeIfPresent(String.self, forKey: .workflowName)
         permalink = try container.decodeIfPresent(String.self, forKey: .permalink)
+        declaredBy = try container.decode(APICoverageAttribution.self, forKey: .declaredBy)
         declaredAt = try container.decode(String.self, forKey: .declaredAt)
 
         let evidence = try container.nestedContainer(keyedBy: EvidenceKeys.self, forKey: .evidence)
