@@ -1077,6 +1077,23 @@ fn autoflow_defs_fixture_is_current() {
 }
 
 #[test]
+fn autoflow_set_enabled_fixture_is_current() {
+    // Mirrors `SetEnabledResponse` (api/autoflows.rs, `pub(crate)` — no DTO
+    // to import across the crate boundary, same rationale
+    // `workers_fixture_is_current`'s doc comment gives): `{name, enabled}`,
+    // the response `POST /api/autoflows/:name/enable`/`.../disable` return.
+    // `enabled: true` here (a disable response is the identical shape with
+    // `enabled: false` — nothing else varies, so one fixture case covers
+    // both wire values the Swift decode test needs to exercise via a
+    // literal `false` constructed in-test).
+    let value = serde_json::json!({
+        "name": "nightly-health",
+        "enabled": true,
+    });
+    check_fixture("autoflow_set_enabled.json", &value);
+}
+
+#[test]
 fn project_detail_fixture_is_current() {
     // Mirrors `get_project` (api/projects.rs): typed `project` (`ProjectRow`)
     // and `recent_runs` (`Vec<RunListRow>`) alongside ad-hoc `runs` /

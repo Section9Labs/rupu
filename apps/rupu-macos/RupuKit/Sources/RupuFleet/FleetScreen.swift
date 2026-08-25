@@ -38,11 +38,18 @@ private enum FleetLayout {
 /// `.fleet` is only ever reached by a sidebar click, well after the shell's
 /// own connection attempt has already resolved.
 ///
-/// **No add-host forms** — the umbrella spec's disposition for this phase
-/// (`docs/macOS_design/HANDOFF.md` §6, "Fleet"): a quiet footer note points
-/// at the real CLI command instead of building a write form this phase
-/// doesn't need. `POST /api/hosts` (and its `/ssh`/`/bucket`/`/node`
-/// siblings) stay unconsumed by this screen.
+/// **No add-host forms** — the Phase 5 breadth spec's disposition
+/// (`docs/superpowers/specs/2026-08-24-rupu-macos-phase-5-breadth-design.md`
+/// §2, "Fleet": "**Deferred (tracked): add-host/enroll forms** (node/ssh/
+/// bucket — CLI-covered `rupu` flows; Settings-adjacent, revisit Phase 6)"),
+/// carried into the Phase 5A plan's own Task 6 (`docs/superpowers/plans/
+/// 2026-08-24-rupu-macos-phase-5a-projects-fleet-library.md`): a quiet
+/// footer note points at the real CLI command instead of building a write
+/// form this phase doesn't need. `POST /api/hosts` (and its `/ssh`/
+/// `/bucket`/`/node` siblings) stay unconsumed by this screen. (Review fix,
+/// final wave — this previously misattributed the disposition to
+/// `docs/macOS_design/HANDOFF.md` §6, which covers the faulted-card styling
+/// below, not the no-forms decision.)
 public struct FleetScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController

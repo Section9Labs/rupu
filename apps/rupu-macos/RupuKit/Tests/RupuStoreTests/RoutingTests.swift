@@ -99,6 +99,52 @@ import Testing
     #expect(model.route == .library)
 }
 
+/// Final-review fix wave: `.agentDefinition`/`.workflowDefinition` gained
+/// `scopeKind`/`scopeID` so a Library row's tap carries its own scope all
+/// the way to the pushed detail route (`WorkflowDetailScreen.definitionRow`/
+/// `AgentDetailScreen`'s Launch button both key off these, not off `name`
+/// alone — see those types' doc comments). Two routes for the SAME name at
+/// DIFFERENT scopes must compare unequal — this is the exact invariant that
+/// keeps a same-named-but-differently-scoped definition from being silently
+/// conflated, the same scope-collision class `ActionKey.autoflow(...)`
+/// already fixes for the Library toggle.
+@MainActor @Test func definitionRoutesCarryScopeAndDifferByIt() {
+    let globalRoute = Route.agentDefinition(name: "code-reviewer", scopeKind: "global", scopeID: nil)
+    let projectRoute = Route.agentDefinition(name: "code-reviewer", scopeKind: "project", scopeID: "ws-1")
+    #expect(globalRoute != projectRoute)
+
+    guard case .agentDefinition(let name, let scopeKind, let scopeID) = projectRoute else {
+        Issue.record("expected .agentDefinition")
+        return
+    }
+    #expect(name == "code-reviewer")
+    #expect(scopeKind == "project")
+    #expect(scopeID == "ws-1")
+
+    let globalWorkflow = Route.workflowDefinition(name: "nightly-health", scopeKind: "global", scopeID: nil)
+    let projectWorkflow = Route.workflowDefinition(name: "nightly-health", scopeKind: "project", scopeID: "ws-2")
+    #expect(globalWorkflow != projectWorkflow)
+
+    // Omitting scope entirely (legacy call shape) still defaults to nil/nil
+    // and compares equal to an explicit nil/nil route.
+    #expect(Route.agentDefinition(name: "x") == Route.agentDefinition(name: "x", scopeKind: nil, scopeID: nil))
+}
+
+/// A scoped push/pop round-trips exactly like the name-only case above —
+/// the scope fields don't change `navigate(to:)`/`navigateBack()`'s stack
+/// mechanics, only what the pushed route carries.
+@MainActor @Test func navigateBackFromScopedWorkflowDefinitionReturnsToLibrary() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.route = .library
+
+    model.navigate(to: .workflowDefinition(name: "issue-triage", scopeKind: "project", scopeID: "ws-1"))
+    #expect(model.route == .workflowDefinition(name: "issue-triage", scopeKind: "project", scopeID: "ws-1"))
+    #expect(model.routeStack == [.library])
+
+    model.navigateBack()
+    #expect(model.route == .library)
+}
+
 @MainActor @Test func navigateBackRestoresPriorActivityFilterDefaultingToAll() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
 
@@ -225,5 +271,32 @@ import Testing
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
     model.showLauncher = true
     #expect(model.launcherPrefill == nil)
+    #expect(model.consumeLauncherPrefill() == nil)
+}
+
+/// Final-review fix wave, item 5: locks the sequencing contract
+/// `LauncherSheet.activate()` now depends on — see that method's own doc
+/// comment for the full bug this guards against. `LauncherSheet.activate()`
+/// itself is `private` to a `View` and can't be called directly from a test
+/// target, so this simulates its two relevant steps at the `AppModel` level:
+/// (1) a first sheet open that requested a prefill drains it via
+/// `consumeLauncherPrefill()` UNCONDITIONALLY, even when the client-
+/// available guard immediately after would fail and no `LauncherStore`
+/// ever gets built; (2) a second, later sheet open — a plain "+ New run"
+/// that never calls `presentLauncher(...)` — must not inherit whatever the
+/// first attempt drained but never got to apply.
+@MainActor @Test func prefillDoesNotLeakAcrossSheetOpensWhenTheFirstOpenFoundNoClient() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.presentLauncher(kind: .agentRun, name: "code-reviewer", scopeKind: "project", scopeID: "ws-1")
+
+    // First sheet open: activate() drains the prefill before its client
+    // guard (the fix) — even though the simulated client check right after
+    // this would fail (backend down) and no store gets built.
+    let firstAttempt = model.consumeLauncherPrefill()
+    #expect(firstAttempt == LauncherPrefillRequest(kind: .agentRun, name: "code-reviewer", scopeKind: "project", scopeID: "ws-1"))
+    #expect(model.launcherPrefill == nil)
+
+    // Second sheet open — plain, never calls presentLauncher(...) — finds
+    // nothing left to inherit.
     #expect(model.consumeLauncherPrefill() == nil)
 }

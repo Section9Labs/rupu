@@ -118,12 +118,17 @@ public struct LibraryScreen: View {
     }
 
     private var tabPicker: some View {
+        // `.labelsHidden()` (review fix, final wave) — without it the
+        // `Picker`'s "Tab" label string rendered visibly above the
+        // segmented control (GUI-only nit; `make macos-test` stayed green
+        // throughout since nothing asserted the label's visibility).
         Picker("Tab", selection: $tab) {
             ForEach(LibraryTab.allCases, id: \.self) { candidate in
                 Text(candidate.title).tag(candidate)
             }
         }
         .pickerStyle(.segmented)
+        .labelsHidden()
         .frame(maxWidth: 360)
     }
 
@@ -164,7 +169,9 @@ public struct LibraryScreen: View {
             Divider()
             VStack(spacing: 0) {
                 ForEach(Array(sorted.enumerated()), id: \.offset) { _, def in
-                    AgentDefRow(def: def, onSelect: { model.navigate(to: .agentDefinition(name: def.name)) }, onLaunch: {
+                    AgentDefRow(def: def, onSelect: {
+                        model.navigate(to: .agentDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID))
+                    }, onLaunch: {
                         model.presentLauncher(kind: .agentRun, name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID)
                     })
                     Divider()
@@ -177,8 +184,13 @@ public struct LibraryScreen: View {
     private var agentColumns: [SortableColumn<AgentsSortKey>] {
         [
             SortableColumn(key: .name, label: "Name", width: nil),
-            SortableColumn(key: .scope, label: "Scope", width: LibraryLayout.scope, alignment: .trailing),
-            SortableColumn(key: .model, label: "Model", width: LibraryLayout.model, alignment: .trailing),
+            // Text columns, trailing-aligned for metadata visual consistency
+            // (review fix I-3): `firstTapAscending: true` overrides the
+            // alignment heuristic (which would otherwise default a
+            // trailing column to descending-first) since scope/model are
+            // text, not numeric/date.
+            SortableColumn(key: .scope, label: "Scope", width: LibraryLayout.scope, alignment: .trailing, firstTapAscending: true),
+            SortableColumn(key: .model, label: "Model", width: LibraryLayout.model, alignment: .trailing, firstTapAscending: true),
             SortableColumn(key: .runs, label: "Runs", width: LibraryLayout.runs, alignment: .trailing),
             SortableColumn(key: .lastRun, label: "Last run", width: LibraryLayout.lastRun, alignment: .trailing),
             SortableColumn(key: nil, label: "", width: LibraryLayout.launch, alignment: .trailing),
@@ -220,7 +232,9 @@ public struct LibraryScreen: View {
             Divider()
             VStack(spacing: 0) {
                 ForEach(Array(sorted.enumerated()), id: \.offset) { _, def in
-                    WorkflowDefRow(def: def, onSelect: { model.navigate(to: .workflowDefinition(name: def.name)) }, onLaunch: {
+                    WorkflowDefRow(def: def, onSelect: {
+                        model.navigate(to: .workflowDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID))
+                    }, onLaunch: {
                         model.presentLauncher(kind: .workflow, name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID)
                     })
                     Divider()
@@ -282,7 +296,9 @@ public struct LibraryScreen: View {
                     AutoflowDefRow(
                         def: def,
                         pendingActions: store.pendingActions,
-                        onSelect: { model.navigate(to: .workflowDefinition(name: def.name)) },
+                        onSelect: {
+                            model.navigate(to: .workflowDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID))
+                        },
                         onLaunch: {
                             model.presentLauncher(kind: .workflow, name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID)
                         },
@@ -304,8 +320,10 @@ public struct LibraryScreen: View {
     private var autoflowColumns: [SortableColumn<AutoflowsSortKey>] {
         [
             SortableColumn(key: .name, label: "Name", width: nil),
-            SortableColumn(key: .trigger, label: "Trigger", width: LibraryLayout.trigger, alignment: .trailing),
-            SortableColumn(key: .scope, label: "Scope", width: LibraryLayout.scope, alignment: .trailing),
+            // Text columns, trailing-aligned for metadata visual consistency
+            // (review fix I-3) — see `agentColumns`' identical override.
+            SortableColumn(key: .trigger, label: "Trigger", width: LibraryLayout.trigger, alignment: .trailing, firstTapAscending: true),
+            SortableColumn(key: .scope, label: "Scope", width: LibraryLayout.scope, alignment: .trailing, firstTapAscending: true),
             SortableColumn(key: .enabled, label: "Enabled", width: LibraryLayout.enabled, alignment: .trailing),
             SortableColumn(key: nil, label: "", width: LibraryLayout.launch, alignment: .trailing),
         ]

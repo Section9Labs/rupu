@@ -28,13 +28,31 @@ public struct AgentDetailScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
     let name: String
+    /// The tapped row's own scope (final-review fix wave, threaded from
+    /// `Route.agentDefinition`). `GET /api/agents/:name` (unlike the
+    /// Workflow-side `WorkflowDetail`, which decodes NO scope fields at all)
+    /// returns a FULL, self-describing `AgentDetail` including its own
+    /// `scope`/`scopeKind`/`scopeID` — but that response has no scope query
+    /// param to pin it to, so when the same agent name exists at two
+    /// scopes, `detail.scope`/`detail.scopeKind`/`detail.scopeID` reflect
+    /// whichever record the server's own resolution happened to pick, which
+    /// may differ from the row that was actually tapped (a shared,
+    /// server-side web gap — same one `WorkflowDetailScreen`'s doc comment
+    /// documents). The residual honestly: the meta chips + raw markdown
+    /// body below are the server's precedence pick for this name; only
+    /// Launch pins the tapped row (`scopeKind`/`scopeID` here, not
+    /// `detail`'s).
+    let scopeKind: String?
+    let scopeID: String?
 
     @State private var detail: BlockState<AgentDetail> = .loading
 
-    public init(model: AppModel, backend: BackendController, name: String) {
+    public init(model: AppModel, backend: BackendController, name: String, scopeKind: String? = nil, scopeID: String? = nil) {
         self.model = model
         self.backend = backend
         self.name = name
+        self.scopeKind = scopeKind
+        self.scopeID = scopeID
     }
 
     public var body: some View {
@@ -107,7 +125,12 @@ public struct AgentDetailScreen: View {
                 metaChips(detail)
                 Spacer(minLength: 0)
                 Button("Launch") {
-                    model.presentLauncher(kind: .agentRun, name: detail.name, scopeKind: detail.scopeKind, scopeID: detail.scopeID)
+                    // Pinned to the tapped row's scope (`self.scopeKind`/
+                    // `scopeID`), NOT `detail.scopeKind`/`scopeID` — see this
+                    // screen's own doc comment on why the server's GET
+                    // response can't be trusted to be the same-scoped record
+                    // the operator actually tapped.
+                    model.presentLauncher(kind: .agentRun, name: detail.name, scopeKind: scopeKind, scopeID: scopeID)
                 }
                 .buttonStyle(RupuButtonStyle.primary)
             }

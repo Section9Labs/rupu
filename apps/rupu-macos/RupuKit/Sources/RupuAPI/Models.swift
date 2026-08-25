@@ -118,29 +118,43 @@ public struct APIHostRow: Decodable, Equatable, Sendable {
     }
 }
 
-/// One row from `GET /api/projects` (`ProjectRow` on the Rust side). Only
-/// `ws_id`/`name`/`run_count`/`last_run_at`/`usage` are decoded — the
-/// endpoint returns more fields (path, repo_remote, branch, repo_home_url,
-/// created_at, last_active), ignored here (`Decodable`'s default behavior
-/// already skips unknown keys) since the v2 top bar's scope picker only
-/// needs an id, a label, and enough to show recent activity. `usage` was
-/// added for Phase 5A's Projects list screen (`RupuProjects`), whose
-/// sortable "Spend" column needs `usage.cost_usd` — `ProjectRow` on the wire
-/// always carries it (non-optional `UsageSummary`, see `crates/rupu-cp/src/
-/// api/projects.rs`), so this is a required field, not optional.
+/// One row from `GET /api/projects` (`ProjectRow` on the Rust side).
+/// `ws_id`/`name`/`run_count`/`last_run_at`/`usage`/`path`/`repo_home_url`/
+/// `created_at` are decoded — `repo_remote`/`branch`/`last_active` stay
+/// ignored (`Decodable`'s default behavior already skips unknown keys) since
+/// no consumer needs them yet. `usage` was added for Phase 5A's Projects list
+/// screen (`RupuProjects`), whose sortable "Spend" column needs `usage.
+/// cost_usd` — `ProjectRow` on the wire always carries it (non-optional
+/// `UsageSummary`, see `crates/rupu-cp/src/api/projects.rs`), so this is a
+/// required field, not optional. `path`/`repoHomeURL`/`createdAt` (final-
+/// review fix wave) were added for the Project Detail header's second facts
+/// row — all three are optional on this struct even though `ProjectRow`
+/// itself only makes `repo_home_url` genuinely optional server-side
+/// (`path`/`created_at` are always present): decoding them as optionals here
+/// costs nothing and keeps this row tolerant of a future server omission
+/// rather than failing the whole decode.
 public struct APIProjectRow: Decodable, Equatable, Sendable {
     public let wsID: String
     public let name: String
     public let runCount: Int?
     public let lastRunAt: String?
     public let usage: APIUsageSummary
+    public let path: String?
+    public let repoHomeURL: String?
+    public let createdAt: String?
 
-    public init(wsID: String, name: String, runCount: Int?, lastRunAt: String?, usage: APIUsageSummary) {
+    public init(
+        wsID: String, name: String, runCount: Int?, lastRunAt: String?, usage: APIUsageSummary,
+        path: String? = nil, repoHomeURL: String? = nil, createdAt: String? = nil
+    ) {
         self.wsID = wsID
         self.name = name
         self.runCount = runCount
         self.lastRunAt = lastRunAt
         self.usage = usage
+        self.path = path
+        self.repoHomeURL = repoHomeURL
+        self.createdAt = createdAt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -149,6 +163,9 @@ public struct APIProjectRow: Decodable, Equatable, Sendable {
         case runCount = "run_count"
         case lastRunAt = "last_run_at"
         case usage
+        case path
+        case repoHomeURL = "repo_home_url"
+        case createdAt = "created_at"
     }
 }
 

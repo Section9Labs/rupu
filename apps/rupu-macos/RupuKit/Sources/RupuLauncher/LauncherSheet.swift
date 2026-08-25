@@ -69,24 +69,37 @@ public struct LauncherSheet: View {
     /// documents.
     ///
     /// **Prefill (Phase 5A, Task 7)**: after the store's own `activate()`
-    /// populates `agents`/`workflows`, `model.consumeLauncherPrefill()` is
-    /// checked — if the Library screen (or any future caller of `AppModel.
-    /// presentLauncher(...)`) requested one, it's applied via `newStore.
-    /// prefill(...)` and the request is cleared in the same step (see
-    /// `AppModel.launcherPrefill`'s doc comment for why consuming, not just
-    /// reading, matters here). Ordering after `activate()` vs. before
-    /// doesn't matter functionally — `LauncherStore.prefill(...)`'s own doc
-    /// comment explains why (`activate()` only ever populates the raw
-    /// `agents`/`workflows`/`hosts` lists, never `kind`/`selectedDefinition`/
-    /// the scope fields) — sequential here simply because that's the order
-    /// the store's own designated flow already runs in.
+    /// populates `agents`/`workflows`, the drained `prefill` local (see
+    /// below) is applied via `newStore.prefill(...)`. Ordering the APPLY
+    /// after `activate()` vs. before doesn't matter functionally —
+    /// `LauncherStore.prefill(...)`'s own doc comment explains why
+    /// (`activate()` only ever populates the raw `agents`/`workflows`/
+    /// `hosts` lists, never `kind`/`selectedDefinition`/the scope fields) —
+    /// sequential here simply because that's the order the store's own
+    /// designated flow already runs in.
+    ///
+    /// **`model.consumeLauncherPrefill()` is called BEFORE the client guard
+    /// (final-review fix wave, item 5)** — a prior version called it after,
+    /// which meant a sheet open with the backend down (`backend.client()`
+    /// nil) returned at that guard WITHOUT ever draining `model.
+    /// launcherPrefill`. The prefill then sat there until this SAME sheet
+    /// instance's `.task` might never re-run (SwiftUI's `.task` fires once
+    /// per view identity), so it leaked into whatever sheet presentation
+    /// came next — including a later plain "+ New run" that never called
+    /// `presentLauncher(...)` at all, exactly the cross-contamination
+    /// `AppModel.launcherPrefill`'s doc comment says consuming (not just
+    /// reading) is supposed to prevent. Capturing `prefill` into a local
+    /// before the guard keeps the drain unconditional on THIS activate()
+    /// attempt (matching the `store == nil` one-shot contract above) while
+    /// still applying it once a client does turn out to be available.
     private func activate() async {
         guard store == nil else { return }
+        let prefill = model.consumeLauncherPrefill()
         guard let client = backend.client() else { return }
         let newStore = LauncherStore(client: client)
         store = newStore
         await newStore.activate()
-        if let prefill = model.consumeLauncherPrefill() {
+        if let prefill {
             await newStore.prefill(kind: prefill.kind, name: prefill.name, scopeKind: prefill.scopeKind, scopeID: prefill.scopeID)
         }
     }

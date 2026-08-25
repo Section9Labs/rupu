@@ -30,6 +30,9 @@ import Foundation
     #expect(rows[0].name == "rupu")
     #expect(rows[0].runCount == 14)
     #expect(rows[0].lastRunAt == "2026-08-20T12:00:00Z")
+    #expect(rows[0].path == "/Users/matt/Code/rupu")
+    #expect(rows[0].repoHomeURL == "https://github.com/section9labs/rupu")
+    #expect(rows[0].createdAt == "2026-08-01T09:00:00Z")
 }
 
 @Test func decodesDashboardFixture() throws {

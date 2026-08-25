@@ -212,10 +212,10 @@ public struct RootView: View {
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .library:
             LibraryScreen(model: model, backend: backend)
-        case .agentDefinition(let name):
-            AgentDetailScreen(model: model, backend: backend, name: name)
-        case .workflowDefinition(let name):
-            WorkflowDetailScreen(model: model, backend: backend, name: name)
+        case .agentDefinition(let name, let scopeKind, let scopeID):
+            AgentDetailScreen(model: model, backend: backend, name: name, scopeKind: scopeKind, scopeID: scopeID)
+        case .workflowDefinition(let name, let scopeKind, let scopeID):
+            WorkflowDetailScreen(model: model, backend: backend, name: name, scopeKind: scopeKind, scopeID: scopeID)
         case .fleet:
             FleetScreen(model: model, backend: backend)
         case .usage:
