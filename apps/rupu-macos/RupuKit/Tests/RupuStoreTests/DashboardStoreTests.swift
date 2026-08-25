@@ -14,31 +14,89 @@ import RupuAPI
 
 /// Path-routing HTTP stub for `DashboardStore`'s two endpoints
 /// (`GET /api/hosts`, `GET /api/dashboard`). Routes on `request.url?.path`.
+///
+/// **Full-suite flake fix (re-review, 2026-08-24):** `handler`/`pathHits`
+/// are process-wide statics, but `URLProtocol` gives no built-in hook back
+/// to "which test's session dispatched this request" — every test in this
+/// suite (and, under a full `swift test` run, potentially other suites
+/// executing around the same wall-clock window) shares this one subclass.
+/// `Task.cancel()` is cooperative, not preemptive: a mock response handler
+/// already executing synchronously inside `startLoading()` — several tests
+/// below use `Thread.sleep` to simulate a slow host, and under full-suite
+/// system load even an ordinarily-instant handler call can be delayed past
+/// a test's own `deactivate()` by thread-pool contention from unrelated
+/// work — can straggle past the end of the test that started it and land
+/// after the NEXT test's `reset(handler:)` has already swapped `handler`/
+/// `pathHits` out from under it, corrupting the new test's hit counts or
+/// handler-sequencing assumptions (an `attempt == N` check landing at the
+/// wrong attempt, an off-by-one hit count).
+///
+/// Fix: `reset(handler:)` mints a monotonically increasing generation
+/// token and `session()` stamps the CURRENT one into the returned
+/// `URLSession` via `URLSessionConfiguration.httpAdditionalHeaders` —
+/// CFNetwork merges those headers into every request dispatched through
+/// that session before handing it to a custom `URLProtocol`, so
+/// `startLoading()` can read the REQUEST'S ORIGINATING session's token
+/// straight off `request`, with no dependency on request timing. A request
+/// whose token doesn't match the CURRENT generation belongs to a test that
+/// has already ended (or, in a stale-in-flight edge case, a test whose own
+/// `reset` already rotated past it): `startLoading()` fails it immediately
+/// with `.cancelled` — never invoking the new test's `handler`, never
+/// touching `pathHits` — rather than serving it off (or counting it
+/// against) a test it doesn't belong to.
 final class DashboardStubURLProtocol: URLProtocol {
-    nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> (status: Int, body: Data))?
-    nonisolated(unsafe) static var pathHits: [String: Int] = [:]
+    private static let generationHeader = "X-Dashboard-Stub-Generation"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var handler: (@Sendable (URLRequest) -> (status: Int, body: Data))?
+    nonisolated(unsafe) private static var pathHits: [String: Int] = [:]
+    nonisolated(unsafe) private static var currentGeneration = 0
 
+    /// Scopes the returned session to whichever generation is current AT
+    /// THE POINT this is called — every test here calls `reset(handler:)`
+    /// immediately before `session()`, so the session it gets back is
+    /// always stamped with that test's own, freshly-minted generation.
     static func session() -> URLSession {
+        let generation = lock.withLock { currentGeneration }
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [DashboardStubURLProtocol.self]
+        config.httpAdditionalHeaders = [generationHeader: String(generation)]
         return URLSession(configuration: config)
     }
 
     static func reset(handler: @escaping @Sendable (URLRequest) -> (status: Int, body: Data)) {
-        pathHits = [:]
-        self.handler = handler
+        lock.withLock {
+            currentGeneration += 1
+            pathHits = [:]
+            self.handler = handler
+        }
     }
 
-    static func hits(_ path: String) -> Int { pathHits[path, default: 0] }
+    static func hits(_ path: String) -> Int {
+        lock.withLock { pathHits[path, default: 0] }
+    }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        if let path = request.url?.path {
-            DashboardStubURLProtocol.pathHits[path, default: 0] += 1
+        // A missing header (should never happen — every session this stub
+        // hands out stamps one) is treated as belonging to no generation at
+        // all, i.e. always stale — fail safe rather than silently matching
+        // whatever generation happens to be current.
+        let requestGeneration = request.value(forHTTPHeaderField: Self.generationHeader).flatMap(Int.init) ?? -1
+
+        let (isCurrent, activeHandler): (Bool, (@Sendable (URLRequest) -> (status: Int, body: Data))?) = Self.lock.withLock {
+            (requestGeneration == Self.currentGeneration, Self.handler)
         }
-        guard let handler = DashboardStubURLProtocol.handler else {
+        guard isCurrent else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+            return
+        }
+
+        if let path = request.url?.path {
+            Self.lock.withLock { Self.pathHits[path, default: 0] += 1 }
+        }
+        guard let handler = activeHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
         }
@@ -97,6 +155,26 @@ private func pollUntil(
         if ContinuousClock.now >= deadline { return false }
         try? await Task.sleep(for: interval)
     }
+}
+
+/// Best-effort settle after `store.deactivate()`, called at the end of
+/// every `DashboardStoreTests` lifecycle test below: gives any request
+/// already in flight when `deactivate()` was called (Swift `Task`
+/// cancellation is cooperative — it can't interrupt a mock handler's
+/// synchronous `Thread.sleep`, nor guarantee a request already dispatched
+/// to the stub finishes before the calling `Task` notices cancellation)
+/// time to actually land — and, per `DashboardStubURLProtocol`'s
+/// generation-token isolation above, be harmlessly rejected as stale —
+/// before the NEXT test's `reset(handler:)` rotates the generation again.
+/// Belt-and-suspenders on top of that isolation (which is what actually
+/// makes a straggler safe regardless of timing), not a substitute for it:
+/// keeps the suite's behavior under load closer to its behavior in
+/// isolation rather than relying solely on the stub to paper over overlap.
+/// `duration` defaults comfortably past the longest artificial
+/// `Thread.sleep` any "slow host" test in this file uses (150ms).
+@MainActor
+private func drainAfterDeactivate(_ duration: Duration = .milliseconds(200)) async {
+    try? await Task.sleep(for: duration)
 }
 
 @MainActor
@@ -513,6 +591,7 @@ struct DashboardStoreTests {
 
         store.deactivate()
         box.latest.finish()
+        await drainAfterDeactivate()
     }
 
     // (b) A remote host whose HTTP call itself fails (transport/decoding/
@@ -549,6 +628,7 @@ struct DashboardStoreTests {
         #expect(store.pageError == nil, "local alone reported ok — no page-wide error")
 
         store.deactivate()
+        await drainAfterDeactivate()
     }
 
     // (c) A host whose HTTP call SUCCEEDS but whose own per-host
@@ -580,6 +660,7 @@ struct DashboardStoreTests {
         #expect(store.merged?.fleet.workers == 1)
 
         store.deactivate()
+        await drainAfterDeactivate()
     }
 
     // (d) Zero `"ok"` hosts, all resolved: `merged` stays `nil` and
@@ -609,6 +690,7 @@ struct DashboardStoreTests {
         #expect(store.pageError != nil)
 
         store.deactivate()
+        await drainAfterDeactivate()
     }
 
     // (e) `setRange(_:)` refetches every host from scratch; a stale
@@ -655,6 +737,7 @@ struct DashboardStoreTests {
         #expect(store.merged?.fleet.workers == 8, "the stale generation's 999 marker must never land")
 
         store.deactivate()
+        await drainAfterDeactivate()
     }
 
     // (f) `deactivate()` tears the reconcile loop down — asserted via the
@@ -677,6 +760,7 @@ struct DashboardStoreTests {
         #expect(store.reconcileTask == nil)
 
         box.latest.finish()
+        await drainAfterDeactivate()
     }
 
     // (g) A firehose signal schedules a debounced LOCAL-ONLY refetch — a
@@ -718,6 +802,7 @@ struct DashboardStoreTests {
 
         store.deactivate()
         box.latest.finish()
+        await drainAfterDeactivate()
     }
 
     // (h) Review fix (round 1, minor): a host already `.ok` from a prior
@@ -792,6 +877,7 @@ struct DashboardStoreTests {
 
         store.deactivate()
         box.latest.finish()
+        await drainAfterDeactivate()
     }
 
     // (i) Review fix (round 1, minor): calling `activate(range:)` a second
@@ -841,6 +927,15 @@ struct DashboardStoreTests {
 
         store.deactivate()
         box.latest.finish()
+        // Full-suite flake fix: this test's reconcile loop ticks every
+        // 60ms for a 900ms observation window — the exact "reconcile-loop
+        // test right before" the one below that the re-review traced the
+        // flake to. A tick's `GET /api/hosts` dispatch can still be
+        // in-flight (delayed by full-suite system load, not this test's own
+        // handler — it has no artificial `Thread.sleep`) the instant
+        // `deactivate()` returns; drain before the next test rotates the
+        // stub's generation again.
+        await drainAfterDeactivate()
     }
 
     // (j) Final-review fix (Task 1): a THROWN `GET /api/hosts` call on a
@@ -889,6 +984,7 @@ struct DashboardStoreTests {
         #expect(store.pageError == nil)
 
         store.deactivate()
+        await drainAfterDeactivate()
     }
 
     // (k) Final-review fix (Task 4): `pendingFetchCount`'s old raw-counter
@@ -936,5 +1032,6 @@ struct DashboardStoreTests {
 
         store.deactivate()
         box.latest.finish()
+        await drainAfterDeactivate()
     }
 }
