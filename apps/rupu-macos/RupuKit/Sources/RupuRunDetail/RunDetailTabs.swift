@@ -306,7 +306,7 @@ struct FindingsTabContent: View {
     private func findingRow(_ finding: APIFinding) -> some View {
         HStack(spacing: 0) {
             Rectangle()
-                .fill(Color.severity(severity(for: finding.severity)))
+                .fill(Color.severity(Severity(wireString: finding.severity)))
                 .frame(width: 2)
             VStack(alignment: .leading, spacing: 2) {
                 Text(finding.summary)
@@ -326,33 +326,6 @@ struct FindingsTabContent: View {
     private func fileLabel(_ path: String, _ lineRange: [UInt32]?) -> String {
         guard let lineRange, lineRange.count == 2 else { return path }
         return "\(path):\(lineRange[0])-\(lineRange[1])"
-    }
-
-    /// `APIFinding.severity` carries the wire vocabulary rupu-coverage's
-    /// `Severity` enum serializes to (`#[serde(rename_all = "lowercase")]`
-    /// over `Info|Low|Medium|High|Critical` — see
-    /// `crates/rupu-coverage/src/catalog/types.rs`): "critical"/"medium",
-    /// not this app's own `crit`/`med` case names. `Self.severity(for:)` is
-    /// the pure, tested seam for this mapping — moved verbatim from
-    /// `RailViews.swift`'s `FindingsCard`; see `FindingsSeverityTests.swift`.
-    private func severity(for raw: String) -> Severity {
-        Self.severity(for: raw)
-    }
-
-    /// `nil`-free: an unrecognized wire string (future severity, decode
-    /// drift) falls back to `.info` — same "never crash on new data"
-    /// posture the rest of this screen takes — but every value
-    /// `rupu-coverage`'s `Severity` actually serializes today round-trips
-    /// exactly.
-    static func severity(for raw: String) -> Severity {
-        switch raw {
-        case "critical": .crit
-        case "high": .high
-        case "medium": .med
-        case "low": .low
-        case "info": .info
-        default: .info
-        }
     }
 }
 

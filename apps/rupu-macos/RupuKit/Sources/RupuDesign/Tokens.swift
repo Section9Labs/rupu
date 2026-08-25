@@ -43,6 +43,46 @@ public extension Color {
 
 public enum Severity: String, CaseIterable, Sendable { case crit, high, med, low, info }
 
+public extension Severity {
+    /// Maps `rupu-coverage`'s wire vocabulary (the `Severity` enum on the
+    /// Rust side, `#[serde(rename_all = "lowercase")]` over
+    /// `Info|Low|Medium|High|Critical` — see `crates/rupu-coverage/src/
+    /// catalog/types.rs`) onto this app's own case names. The two
+    /// vocabularies only agree on `high`/`low`/`info`; `critical`/`medium`
+    /// don't match `crit`/`med`, so a naive `Severity(rawValue:)` (the
+    /// pre-fix code) silently mapped every critical and medium finding to
+    /// `.info`.
+    ///
+    /// **Shared home (Phase 5B, Task 3 — the "severity lift").** Moved here
+    /// from `RupuRunDetail/RunDetailTabs.swift`'s `FindingsTabContent.
+    /// severity(for:)` — and the byte-for-byte duplicate that had grown in
+    /// `RupuProjects/ProjectDetailScreen.swift`'s `ProjectFindingsTabContent`
+    /// — because `RupuDesign` already owns `Severity` and `Color.
+    /// severity(_:)`; the wire-mapping belongs beside the tokens it feeds,
+    /// not re-derived in every view module that renders a finding. Same
+    /// "lift a view-module mapping into the layer that already owns the
+    /// type" precedent `ActivityStatus.displayLabel` set when it moved from
+    /// `RupuActivity/ActivityTable.swift` into `RupuStore/ActivityRow.swift`.
+    /// Both call sites now delegate to this init; see `FindingsSeverityTests`
+    /// → `SeverityWireMappingTests.swift` (`RupuDesignTests`) for the pinned
+    /// wire-string table this fix protects.
+    ///
+    /// `nil`-free: an unrecognized wire string (future severity, decode
+    /// drift) falls back to `.info` — the same "never crash on new data"
+    /// posture the rest of this app takes — but every value `rupu-coverage`'s
+    /// `Severity` actually serializes today round-trips exactly.
+    init(wireString raw: String) {
+        switch raw {
+        case "critical": self = .crit
+        case "high": self = .high
+        case "medium": self = .med
+        case "low": self = .low
+        case "info": self = .info
+        default: self = .info
+        }
+    }
+}
+
 /// 9-state run/step/gate lifecycle tone. `rejected` is a distinct case from `failed` (different
 /// semantic meaning — a gate decision vs. a run outcome) but renders identically: same RGB pair.
 public enum StatusTone: String, CaseIterable, Sendable {

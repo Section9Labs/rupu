@@ -165,7 +165,7 @@ public final class AppModel {
             case .activity: .activity
             case .runDetail, .sessionDetail, .agentRunDetail: .activity
             case .projects, .projectDetail: .projects
-            case .security: .security
+            case .security, .coverageDetail: .security
             case .library, .agentDefinition, .workflowDefinition: .library
             case .fleet: .fleet
             case .usage: .usage
