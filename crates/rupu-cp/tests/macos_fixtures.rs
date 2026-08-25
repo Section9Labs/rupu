@@ -1483,7 +1483,7 @@ fn coverage_summary_fixture_is_current() {
 fn coverage_detail_fixture_is_current() {
     // `GET /api/coverage/:target` (`get_coverage`, api/coverage.rs) returns a
     // hand-built `json!({ws_id, project, target_id, assertion_lines,
-    // has_catalog, assertions, findings, files})` — exactly those 7 keys,
+    // has_catalog, assertions, findings, files})` — exactly those 8 keys,
     // NEVER a `catalog` key (confirmed against `get_coverage`'s body). This
     // fixture mirrors that exactly, using the REAL `ConcernAssertion` /
     // `rupu_coverage::FindingRecord` / `FileView` types. The target's

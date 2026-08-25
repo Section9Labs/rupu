@@ -88,16 +88,40 @@ struct BreakdownTable: View {
         .panelStyle(.panel)
     }
 
+    /// One sorted `PivotRow` paired with its own `pivotLabel` — computed
+    /// once per render rather than per `ForEach` diff pass. See `table`'s
+    /// `ForEach` for why this pairing exists (a `KeyPath`-based `id:` can't
+    /// close over this table's own `pivot`).
+    private struct LabeledRow {
+        let row: PivotRow
+        let label: String
+    }
+
+    private var labeledSorted: [LabeledRow] {
+        sortRows(pivoted, sort: sort, value: sortValue).map { LabeledRow(row: $0, label: pivotLabel($0, pivot: pivot)) }
+    }
+
     private var table: some View {
-        let sorted = sortRows(pivoted, sort: sort, value: sortValue)
-        return VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             SortableHeaderRow(columns: columns, sort: $sort)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             Divider()
             VStack(spacing: 0) {
-                ForEach(Array(sorted.enumerated()), id: \.offset) { _, row in
-                    BreakdownRow(row: row, pivot: pivot)
+                // Keyed by `pivotLabel`, not a positional offset —
+                // `labeledSorted` reorders on every sort-column tap, and
+                // `PivotRow` (`aggregateRows`' output) already carries a
+                // genuine natural key here: each row is one unique
+                // `pivotKey(of:pivot:)` group (`UsageAggregation.swift`),
+                // and `pivotLabel` renders that same key verbatim (falling
+                // back to "—" only for the single, also-unique empty-key
+                // group) — so it never collides across rows here.
+                // `ForEach`'s `id:` needs a `KeyPath`, and `pivotLabel`
+                // needs this table's own `pivot` to compute — `labeledSorted`
+                // pairs each row with its own label once, up front, rather
+                // than computing it per `ForEach` diff pass.
+                ForEach(labeledSorted, id: \.label) { entry in
+                    BreakdownRow(row: entry.row, pivot: pivot)
                     Divider()
                 }
             }

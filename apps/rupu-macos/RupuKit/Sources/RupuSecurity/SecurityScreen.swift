@@ -198,9 +198,9 @@ func securityFailedBlock(_ message: String, subject: String) -> some View {
 
 /// Row tap target + hover cursor — same small idiom `LibraryScreen`'s
 /// (private, file-scoped) `rowTapModifiers` establishes, re-hoisted here as
-/// package-internal since `FindingsTable.swift`'s (non-navigating) rows
-/// don't need it but `CoverageList.swift`'s do, and both files live in this
-/// module.
+/// package-internal so every navigating row across this module's files can
+/// share it: `FindingsTable.swift`'s `FindingRow`, `CoverageList.swift`'s
+/// `CoverageRow`, and `CoverageDetailScreen.swift`'s `CoverageFindingRow`.
 @MainActor
 func securityRowTapModifiers<V: View>(_ view: V, onSelect: @escaping () -> Void) -> some View {
     view

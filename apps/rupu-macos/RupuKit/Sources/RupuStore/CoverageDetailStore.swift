@@ -101,6 +101,14 @@ public final class CoverageDetailStore {
     ///   genuinely has no catalog; no request is ever sent for it, this
     ///   call, or any later one this activation (nothing about a fixed
     ///   `hasCatalog` value can change without a fresh `activate()`).
+    ///
+    /// This method alone can't strand the Catalog tab — a no-op call while
+    /// `detail` is unresolved is always safe to retry later, per the first
+    /// bullet. The caller is what has to actually retry it:
+    /// `CoverageDetailScreen.tabPanel`'s `.task(id:)` folds `store.detail.
+    /// value != nil` into its id specifically so selecting Catalog before
+    /// `detail` lands gets a second, successful call once it does — see
+    /// that task's own doc comment.
     public func loadCatalogIfNeeded() async {
         guard detail.value?.hasCatalog == true else { return }
         guard !catalogRequested else { return }
