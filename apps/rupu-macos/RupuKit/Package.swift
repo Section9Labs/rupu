@@ -38,7 +38,17 @@ let package = Package(
         // `CPEventRow`, `APIFinding`, `APIProjectRow`) + `RupuDesign`
         // (`Severity`), never on `RupuStore`, so `RupuStore` (Task 7's
         // Situation Room store) can depend on this without a cycle.
-        .target(name: "RupuSituation", dependencies: ["RupuAPI", "RupuDesign"]),
+        // Phase 6B, Task 7: gains `RupuStore` on top of Task 6's `RupuAPI`/
+        // `RupuDesign` pair — the screen layer (`SituationRoomScreen` and
+        // friends) needs `SituationStore`/`BackendController`/`AppModel`/
+        // `Route`/`PendingActions`/`ActionKey`, and `SituationAssembly.swift`
+        // needs `SituationStore`'s raw wire-type snapshot to fold. One
+        // direction only — `RupuStore` does NOT depend on `RupuSituation`
+        // back; see `RupuStore/SituationStore.swift`'s doc comment for why
+        // (a `RupuStore` -> `RupuSituation` edge would cycle the graph) and
+        // how its own `eventsPerMin`/`spark` avoid needing this module's
+        // `EventRateRing` as a result.
+        .target(name: "RupuSituation", dependencies: ["RupuAPI", "RupuDesign", "RupuStore"]),
         .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign", "RupuUsageKit"]),
         .target(name: "RupuActivity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(name: "RupuRunDetail", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),

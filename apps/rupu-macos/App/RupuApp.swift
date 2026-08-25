@@ -4,6 +4,7 @@ import RupuShell
 import RupuStore
 import RupuDesign
 import RupuMenuBar
+import RupuSituation
 import UserNotifications
 import os
 
@@ -243,7 +244,17 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         let isMainSceneWindow: (NSWindow) -> Bool = { window in
             if let id = window.identifier?.rawValue {
                 if id == RupuApp.mainWindowID || id.hasPrefix("\(RupuApp.mainWindowID)-") { return true }
-                if id == RupuApp.settingsWindowID { return false }
+                // Phase 6B, Task 7 fix: the Situation Room window
+                // (`Window(id: "situation")`) is a real, TITLED NSWindow
+                // (fullscreen or not — `.styleMask.contains(.titled)` stays
+                // true even once it's entered fullscreen), so without this
+                // exclusion the fallback below would happily front it for a
+                // notification tap / "Open rupu" / a needs-you deep-link
+                // instead of the actual main content window — the exact
+                // same class of bug the Settings exclusion right below
+                // already fixes for that scene.
+                if id == RupuApp.settingsWindowID || id == RupuApp.situationWindowID
+                    || id.hasPrefix("\(RupuApp.situationWindowID)-") { return false }
             }
             return window.styleMask.contains(.titled)
         }
@@ -254,6 +265,28 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
             openMainWindow?()
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    /// Enters fullscreen for the Situation Room window the moment it
+    /// exists — called from `SituationRoomScreen`'s own `.onAppear` (via
+    /// `RupuApp`'s `Window(id: "situation")` scene) rather than something
+    /// this delegate initiates on its own. Idempotent: a window already in
+    /// `.fullScreen` is left alone (re-toggling would EXIT fullscreen,
+    /// which is the opposite of what a re-appearing/re-triggered call
+    /// should do).
+    ///
+    /// Believed correct but, like `frontMainWindow()`'s windowless
+    /// fallback, this is a GUI-check item for the controller's live
+    /// validation pass — there's no reliable way to assert real
+    /// `NSWindow`/`toggleFullScreen` behavior under `swift test` (no real
+    /// app bundle/run loop).
+    func enterSituationRoomFullScreen() {
+        guard let window = NSApp.windows.first(where: { window in
+            guard let id = window.identifier?.rawValue else { return false }
+            return id == RupuApp.situationWindowID || id.hasPrefix("\(RupuApp.situationWindowID)-")
+        }) else { return }
+        guard !window.styleMask.contains(.fullScreen) else { return }
+        window.toggleFullScreen(nil)
     }
 }
 
@@ -310,6 +343,10 @@ struct RupuApp: App {
     /// scene's window — not something this app assigns itself, but a
     /// well-known constant `frontMainWindow` excludes by.
     static let settingsWindowID = "com_apple_SwiftUI_Settings_window"
+    /// Phase 6B, Task 7: the Situation Room's own `Window(id:)` identifier —
+    /// see `frontMainWindow()`'s doc comment for why this must be excluded
+    /// from its titled-window fallback, same as `settingsWindowID`.
+    static let situationWindowID = "situation"
 
     var body: some Scene {
         WindowGroup(id: RupuApp.mainWindowID) {
@@ -342,11 +379,45 @@ struct RupuApp: App {
                 }
         }
         .defaultSize(width: 1440, height: 900)
+        // Phase 6B, Task 7: "Enter Situation Room" — `CommandGroup(after:
+        // .toolbar)` is the placement SwiftUI folds into the View menu
+        // (the same section View-menu items like "Show Toolbar" land in),
+        // which is where an "enter a special full-window mode" command
+        // belongs. Attached to this scene (not the `Window(id: "situation")`
+        // scene below) so the item exists in the menu bar whether or not
+        // Situation Room is currently open — `openWindow(id:)` creates the
+        // window on demand either way.
+        .commands {
+            CommandGroup(after: .toolbar) {
+                Button("Enter Situation Room") {
+                    openWindow(id: RupuApp.situationWindowID)
+                }
+            }
+        }
 
         Settings {
             SettingsView(model: model, backend: backend, notifier: runNotifier)
                 .tint(Color.rupuBrand)
         }
+
+        // Phase 6B, Task 7: the Situation Room — a fullscreen live wall,
+        // opened via "Enter Situation Room" (above) or the Dock/Mission
+        // Control. Dark always (`.preferredColorScheme(.dark)` — a
+        // deliberate exception to `appearance`; see `SituationRoomScreen`'s
+        // doc comment) and enters fullscreen the moment its window exists
+        // (`AppDelegate.enterSituationRoomFullScreen()`, called from
+        // `.onAppear` since SwiftUI has no declarative "open already
+        // fullscreen" scene modifier).
+        Window("Situation Room", id: RupuApp.situationWindowID) {
+            SituationRoomScreen(model: model, backend: backend, frontMainWindow: { appDelegate.frontMainWindow() })
+                .frame(minWidth: 900, minHeight: 600)
+                .preferredColorScheme(.dark)
+                .tint(Color.rupuBrand)
+                .onAppear {
+                    appDelegate.enterSituationRoomFullScreen()
+                }
+        }
+        .defaultSize(width: 1440, height: 900)
 
         // Task 8: the menu-bar extra. `.window` style (not `.menu`) so
         // `MenuBarView`'s stat tiles / needs-you list / inline gate actions
