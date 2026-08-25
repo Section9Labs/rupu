@@ -22,7 +22,7 @@ let package = Package(
         .target(
             name: "RupuShell",
             dependencies: [
-                "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher",
+                "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
             ]
         ),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
