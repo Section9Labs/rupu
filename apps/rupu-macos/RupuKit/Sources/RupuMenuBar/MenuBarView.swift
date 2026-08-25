@@ -6,14 +6,20 @@ import RupuOverview
 
 /// The `MenuBarExtra` scene's own label content. There is no dedicated
 /// app-icon/asset catalog yet (`apps/rupu-macos/App` has none — icon work is
-/// deferred to Phase 7's signing/notarization pass), so this reuses the
-/// exact wordmark `Sidebar.brandHeader` already renders (`Text("rupu")`,
-/// `leadText`/semibold) rather than inventing a separate glyph asset, with a
-/// small dot overlay — the `.awaiting` status tone, matching the gate rows
-/// it's warning about — when at least one run is awaiting approval
-/// fleet-wide. `hasAttention` is read from `MenuBarStore.counts` by the
-/// caller (`RupuApp`'s `MenuBarExtra` label closure); this view has no
-/// store dependency of its own so it stays a plain, easily-previewed leaf.
+/// deferred to Phase 7's signing/notarization pass), so this renders the
+/// same "rupu" string `Sidebar.brandHeader` uses, just sized for the
+/// status bar — a status-bar label is rendered at menu-bar height by AppKit,
+/// not at `leadText`'s 13pt, so this is its own `Font.system(size:weight:)`
+/// call, not literally `Sidebar.brandHeader` reused (review fix, round 1:
+/// the prior wording overclaimed "reuses the exact wordmark"). A trailing
+/// dot — the `.awaiting` status tone, matching the gate rows it's warning
+/// about — appears inline (not overlaid/offset past the label's own layout
+/// bounds, which risked clipping by the status-bar's own rendering — review
+/// fix, round 1) when at least one run is awaiting approval **on the local
+/// host** (see `MenuBarStore`'s doc comment on why this is local-only, never
+/// fleet-wide). `hasAttention` is read from `MenuBarStore.counts` by the
+/// caller (`RupuApp`'s `MenuBarExtra` label closure); this view has no store
+/// dependency of its own so it stays a plain, easily-previewed leaf.
 public struct MenuBarStatusLabel: View {
     let hasAttention: Bool
 
@@ -22,14 +28,13 @@ public struct MenuBarStatusLabel: View {
     }
 
     public var body: some View {
-        ZStack(alignment: .topTrailing) {
+        HStack(spacing: 4) {
             Text("rupu")
                 .font(.system(size: 12, weight: .semibold))
             if hasAttention {
                 Circle()
                     .fill(Color.status(.awaiting))
                     .frame(width: 6, height: 6)
-                    .offset(x: 5, y: -3)
             }
         }
     }
@@ -37,7 +42,11 @@ public struct MenuBarStatusLabel: View {
 
 /// The `MenuBarExtra`'s popover content (`.menuBarExtraStyle(.window)`):
 /// four live stat tiles, a top-5 needs-you triage list with inline gate
-/// actions, and a footer (Open rupu / New run / Settings…).
+/// actions, and a footer (Open rupu / New run / Settings…). Every count and
+/// row shown here is **local-host only** — the footer caption and stat-tile
+/// tooltips say so explicitly (review fix, round 1: earlier drafts of this
+/// module's doc comments wrongly called the data "fleet-wide"; see
+/// `MenuBarStore`'s own doc comment for the full local-only rationale).
 ///
 /// `store` is expected to already be activated at the app level (see
 /// `MenuBarStore`'s own doc comment on why) — this view only ever reads
@@ -62,6 +71,7 @@ public struct MenuBarView: View {
             Divider()
             needsYouSection
             Divider()
+            localOnlyCaption
             footer
         }
         .frame(width: 320)
@@ -81,7 +91,11 @@ public struct MenuBarView: View {
     }
 
     /// `value == nil` (pre-first-poll, per `MenuBarStore.counts`'s doc
-    /// comment) renders `"—"` rather than a misleading `0`.
+    /// comment) renders `"—"` rather than a misleading `0`. `.help(...)`
+    /// tooltip — same disclosure pattern `NeedsYouCard.header` already uses
+    /// for its own coverage-limitation note — states the local-only scope
+    /// on every tile, not just once in the footer caption, since a tile can
+    /// be glanced at without ever reading down to the footer.
     private func statTile(label: String, value: Int?, tone: StatusTone) -> some View {
         VStack(spacing: 3) {
             Text(value.map(String.init) ?? "—")
@@ -90,6 +104,7 @@ public struct MenuBarView: View {
             Eyebrow(label)
         }
         .frame(maxWidth: .infinity)
+        .help("Local host only — see rupu for fleet-wide counts.")
     }
 
     // MARK: - Needs you
@@ -104,7 +119,7 @@ public struct MenuBarView: View {
                     .padding(.horizontal, 12)
             } else {
                 ForEach(store.needsYou) { item in
-                    MenuBarNeedsYouRow(item: item, backend: backend, onOpen: openRoute)
+                    MenuBarNeedsYouRow(item: item, store: store, backend: backend, onOpen: openRoute)
                     if item.id != store.needsYou.last?.id {
                         Divider()
                     }
@@ -141,6 +156,19 @@ public struct MenuBarView: View {
 
     // MARK: - Footer
 
+    /// Review fix (round 1): explicit in-app disclosure that everything
+    /// above is local-host only, never fleet-wide — matches the
+    /// `NeedsYouCard.header` precedent (`RupuOverview/NeedsYou.swift`) of
+    /// stating a coverage limitation directly in the surface that has it,
+    /// not just in a doc comment nobody using the app ever reads.
+    private var localOnlyCaption: some View {
+        Text("Local host only — open rupu for fleet-wide")
+            .font(.metaText)
+            .foregroundStyle(Color.rupuMute)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+    }
+
     private var footer: some View {
         HStack(spacing: 8) {
             Button("Open rupu") {
@@ -154,9 +182,24 @@ public struct MenuBarView: View {
                 // app in — land on Activity, then present the launcher
                 // sheet via `AppModel.showLauncher`, the one presentation
                 // seam `RootView.sheet(isPresented: $model.showLauncher)`
-                // reads (see that type's doc comment) — front the window
-                // FIRST so the sheet doesn't try to present over a
-                // still-backgrounded window.
+                // reads (see that type's doc comment) — front (or, per
+                // `AppDelegate.frontMainWindow`'s windowless fallback, open)
+                // the window FIRST so the sheet doesn't try to present over
+                // a still-backgrounded or nonexistent window.
+                //
+                // **Known gap** (review fix, round 1 — honesty note, not a
+                // fix): `ShellToolbar.newRunButton` also calls
+                // `palette?.close()` before opening the launcher, because a
+                // launcher sheet opening over an already-open command
+                // palette would strand the palette's own Esc handling
+                // behind the sheet. `RootView`'s `palette` (`PaletteStore`)
+                // is `private` to that module — this module has no handle
+                // on it and no way to close it. In practice this is a
+                // narrow window (the palette must already be open AND the
+                // operator triggers "New run" from the menu bar in the same
+                // moment) rather than a routine occurrence, but it is a real
+                // gap this module cannot close without `RootView` exposing
+                // that seam.
                 model.navigate(to: .activity(.all))
                 openMainWindow()
                 model.showLauncher = true
@@ -180,6 +223,7 @@ public struct MenuBarView: View {
 /// breadcrumb, and — for a gate row — inline Approve/Reject.
 private struct MenuBarNeedsYouRow: View {
     let item: NeedsYouItem
+    let store: MenuBarStore
     let backend: BackendController
     let onOpen: (Route) -> Void
 
@@ -206,7 +250,7 @@ private struct MenuBarNeedsYouRow: View {
             }
             subjectButton
             if item.kind == .gate, case .run(let runID, let host) = item.row.navigation {
-                MenuBarGateActions(runID: runID, host: host, backend: backend)
+                MenuBarGateActions(runID: runID, host: host, store: store, backend: backend)
             }
         }
         .padding(.horizontal, 12)
@@ -261,20 +305,27 @@ private struct MenuBarNeedsYouRow: View {
 /// pending/confirmed consistently if the operator also has Activity or Run
 /// Detail open.
 ///
-/// **Confirmation caveat**: unlike `ActivityStore`'s own approve/reject
-/// (confirmed via that store's live SSE `.statusPatch` reduction),
-/// `MenuBarStore` has no live stream — it only polls REST every 60s. A key
-/// begun here is only ever resolved by `PendingActions.resolve(runID:
-/// observedStatus:)` if SOME other live-patching store (Activity/Run
-/// Detail) happens to be active and observes the same run's status
-/// transition; otherwise it just sits `.pending` until the ledger entry is
-/// cleared some other way. The row disappearing from `needsYou` on the
-/// NEXT poll (once the server no longer reports the run as `.awaiting`) is
-/// the honest signal this view itself relies on — the same "row vanishing
-/// IS the confirmation" contract `ActionVerb.remove` already uses elsewhere.
+/// **Confirmation latency** (review fix, round 1): unlike `ActivityStore`'s
+/// own approve/reject (confirmed via that store's live SSE `.statusPatch`
+/// reduction), `MenuBarStore` has no live stream — it only polls REST. A
+/// successful POST now calls `store.refreshNow()` (mirroring
+/// `ActivityStore`'s own post-mutation `scheduleDebouncedRefresh()`), which
+/// shrinks the wait from up to a full `pollInterval` (60s in production)
+/// down to roughly one request round trip — the row disappearing from
+/// `needsYou` once the server no longer reports the run as `.awaiting` is
+/// still the signal this view relies on (same "row vanishing IS the
+/// confirmation" contract `ActionVerb.remove` already uses elsewhere), it
+/// just now arrives promptly instead of on the next scheduled tick. The
+/// underlying `backend.pendingActions` key itself is still only ever
+/// resolved by `PendingActions.resolve(runID:observedStatus:)` if SOME
+/// live-patching store (Activity/Run Detail) is active and observes the
+/// transition — `refreshNow()` narrows how long the row visibly sits
+/// pending here, it doesn't change how the shared ledger entry itself gets
+/// marked `.confirmed`.
 private struct MenuBarGateActions: View {
     let runID: String
     let host: String?
+    let store: MenuBarStore
     let backend: BackendController
 
     @State private var isBusy = false
@@ -297,35 +348,73 @@ private struct MenuBarGateActions: View {
         isPending(approveKey) || isPending(rejectKey)
     }
 
-    var body: some View {
-        HStack(spacing: 6) {
-            Button {
-                Task { await resolveAndApprove() }
-            } label: {
-                HStack(spacing: 4) {
-                    if isBusy || isPending(approveKey) {
-                        ProgressView().controlSize(.mini)
-                    }
-                    Text("Approve")
-                }
-            }
-            .buttonStyle(RupuButtonStyle.primaryOk)
-            .controlSize(.small)
-            .disabled(isBusy || anyPending)
+    /// Review fix (round 1): ported from `NeedsYouGateActions.isStale`
+    /// (`RupuOverview/NeedsYou.swift:391-393`) — the menu bar is, if
+    /// anything, MORE likely to sit on a stuck pending mutation than that
+    /// card (no SSE confirmation here at all — see this type's doc comment
+    /// on confirmation latency), so it needs the same "this may be stuck"
+    /// affordance at least as much.
+    private var isStale: Bool {
+        [approveKey, rejectKey].compactMap { $0 }.contains { backend.pendingActions.isStale($0) }
+    }
 
-            Button {
-                Task { await resolveAndReject() }
-            } label: {
-                HStack(spacing: 4) {
-                    if isBusy || isPending(rejectKey) {
-                        ProgressView().controlSize(.mini)
-                    }
-                    Text("Reject")
-                }
+    /// Review fix (round 1): the mutating POST's own failure message was
+    /// being written into `backend.pendingActions` via `.fail(_:_:)` and
+    /// never displayed anywhere — a silently-swallowed failed approve/
+    /// reject. Surfaces whichever of the two keys is currently `.failed`
+    /// (both can never be simultaneously in flight — `anyPending`/`isBusy`
+    /// disable the other button while one is running).
+    private var failureMessage: String? {
+        for key in [approveKey, rejectKey].compactMap({ $0 }) {
+            if case .failed(let message) = backend.pendingActions.state(key) {
+                return message
             }
-            .buttonStyle(RupuButtonStyle.dangerOutline)
-            .controlSize(.small)
-            .disabled(isBusy || anyPending)
+        }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Button {
+                    Task { await resolveAndApprove() }
+                } label: {
+                    HStack(spacing: 4) {
+                        if isBusy || isPending(approveKey) {
+                            ProgressView().controlSize(.mini)
+                        }
+                        Text("Approve")
+                    }
+                }
+                .buttonStyle(RupuButtonStyle.primaryOk)
+                .controlSize(.small)
+                .disabled(isBusy || anyPending)
+
+                Button {
+                    Task { await resolveAndReject() }
+                } label: {
+                    HStack(spacing: 4) {
+                        if isBusy || isPending(rejectKey) {
+                            ProgressView().controlSize(.mini)
+                        }
+                        Text("Reject")
+                    }
+                }
+                .buttonStyle(RupuButtonStyle.dangerOutline)
+                .controlSize(.small)
+                .disabled(isBusy || anyPending)
+            }
+            if isStale {
+                Text("Still pending — this may be stuck")
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuMute)
+            }
+            if let failureMessage {
+                Text(failureMessage)
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuErr)
+                    .lineLimit(2)
+            }
         }
     }
 
@@ -340,6 +429,7 @@ private struct MenuBarGateActions: View {
         backend.pendingActions.begin(key)
         do {
             _ = try await client.approveRun(id: runID, host: host, gate: gate)
+            await store.refreshNow()
         } catch {
             backend.pendingActions.fail(key, Self.mutationErrorMessage(error))
         }
@@ -356,6 +446,7 @@ private struct MenuBarGateActions: View {
         backend.pendingActions.begin(key)
         do {
             _ = try await client.rejectRun(id: runID, host: host, gate: gate)
+            await store.refreshNow()
         } catch {
             backend.pendingActions.fail(key, Self.mutationErrorMessage(error))
         }

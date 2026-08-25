@@ -4,12 +4,17 @@ import RupuAPI
 import RupuStore
 import RupuOverview
 
-/// The `MenuBarExtra`'s live-attention data source: fleet-wide active
-/// counts (running/awaiting/paused/pending, from `GET /api/dashboard`'s
-/// `active` field) plus a top-5 needs-you triage list derived from
-/// `GET /api/runs`, both refreshed on the same 60s poll-loop idiom
-/// `HostsFooterStore` established — a `Task`-based loop guarded by `task ==
-/// nil` for idempotence, cancelled and nilled out on `deactivate()`.
+/// The `MenuBarExtra`'s live-attention data source: **local-host-only**
+/// active counts (running/awaiting/paused/pending, from a `host: "local"`
+/// `GET /api/dashboard`'s `active` field) plus a top-5 needs-you triage
+/// list derived from a `host: "local"` `GET /api/runs`, both refreshed on
+/// the same 60s poll-loop idiom `HostsFooterStore` established — a
+/// `Task`-based loop guarded by `task == nil` for idempotence, cancelled
+/// and nilled out on `deactivate()`. Review fix (round 1): this store's own
+/// doc comments previously (wrongly) called this data "fleet-wide" — see
+/// the "Local-only, never fleet-wide" section below and `MenuBarView`'s
+/// in-app disclosure (the footer caption + stat-tile `.help` tooltips) for
+/// where that scope limitation is now surfaced honestly to the operator.
 ///
 /// **App-level lifetime, deliberately** (see `RupuApp.swift`'s activation
 /// wiring, alongside `RunNotifier`'s): this store activates once, from the
@@ -79,9 +84,11 @@ public final class MenuBarStore {
     }
 
     /// Pure seam (Step 1's tested half — no I/O): stores `counts` verbatim,
-    /// derives the fleet-wide needs-you queue via `deriveNeedsYou(rows:
-    /// range:now:)` (capped at 6 there), then trims to this store's own
-    /// top-5 cap for the menu bar's compact list.
+    /// derives the local-host needs-you queue (`rows` is always this
+    /// store's own local-only `GET /api/runs` fetch — never fleet-wide, see
+    /// this type's doc comment) via `deriveNeedsYou(rows:range:now:)`
+    /// (capped at 6 there), then trims to this store's own top-5 cap for
+    /// the menu bar's compact list.
     ///
     /// **Overflow composition**: `deriveNeedsYou`'s own `overflow` already
     /// counts everything beyond its cap of 6; this adds whatever this store
@@ -116,6 +123,21 @@ public final class MenuBarStore {
         task?.cancel()
         task = nil
         client = nil
+    }
+
+    /// Review fix (round 1): triggers one immediate poll outside the normal
+    /// `pollInterval` cadence — `MenuBarGateActions` calls this right after
+    /// a gate approve/reject POST succeeds, mirroring `ActivityStore`'s own
+    /// post-mutation `scheduleDebouncedRefresh()`. Shrinks this store's own
+    /// confirmation latency from up to a full `pollInterval` (60s in
+    /// production) down to roughly one request round trip — the gate row
+    /// disappears from `needsYou` (once the server no longer reports the
+    /// run as `.awaiting`) almost immediately instead of on the next
+    /// scheduled tick. A no-op if the store was never `activate(client:)`d
+    /// — matches `pollOnce`'s own `guard let client` behavior — and, like
+    /// every tick, all-or-nothing and silent on failure.
+    public func refreshNow() async {
+        await pollOnce()
     }
 
     /// One tick: fetches `dashboard(range:host:)` and `runs(offset:limit:
