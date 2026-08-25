@@ -1,7 +1,7 @@
 import Testing
 import Foundation
 import RupuAPI
-@testable import RupuUsage
+@testable import RupuUsageKit
 
 // Test tables ported from `crates/rupu-cp/web/src/lib/usage/buildTimeline.test.ts`
 // (`buildTimeline`/`aggregateRuns`'s observable behavior) plus new tables for

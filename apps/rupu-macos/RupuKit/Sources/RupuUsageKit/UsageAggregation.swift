@@ -20,6 +20,23 @@ import RupuAPI
 // bounds instead — `UsageStore` (which DOES own `TimeRange`) computes those
 // bounds via `UsageStore.windowBounds(for:now:)`, mirroring `presetWindow`
 // exactly, and passes them in.
+//
+// **Renamed `RupuUsage` -> `RupuUsageKit` (Task 6, screen composition).**
+// The Phase 5B plan named this target `RupuUsage`, matching the "one module
+// per screen" convention `CLAUDE.md` documents for every other screen
+// (`RupuSecurity`/`RupuFleet`/`RupuLibrary`/...). Task 6's Usage SCREEN
+// needs that same name for the exact same reason every other screen module
+// has it — but the screen also needs to depend on `RupuStore` (for
+// `UsageStore`) AND this pure module (for `UsagePivot`/`PivotRow`/
+// `SpendBucket`/`aggregateRows`/`buildSpendTimeline`), and `RupuStore`
+// already depends on this pure module — so the screen target cannot ALSO be
+// named `RupuUsage` without either colliding with this target's name or
+// creating `RupuUsage -> RupuStore -> RupuUsage`. Renamed this pure module
+// to `RupuUsageKit` (logic unchanged, identifier only) so the new
+// `RupuUsage` screen target (`Sources/RupuUsage/UsageScreen.swift` etc.,
+// depending on `RupuAPI`/`RupuStore`/`RupuDesign`/`RupuUsageKit`) can take
+// the screen-convention name every other screen module already has, rather
+// than permanently squatting on it with the pure logic module.
 
 /// The six `/usage` pivot dimensions — mirrors the web's `Pivot` union
 /// (`lib/api.ts`) exactly, same rawValues as the `group_by` query param
