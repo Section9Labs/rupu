@@ -81,6 +81,35 @@ final class CodeStubURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+/// De-flakes "wait for an async effect to land" — a private helper per file,
+/// this codebase's established convention (see `ActivityStoreTests.
+/// pollUntil`/`expectEventually` for the identical shape).
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
+@MainActor
+private func expectEventually(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ description: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: () -> Bool
+) async {
+    let succeeded = await pollUntil(timeout: timeout, interval: interval, condition)
+    #expect(succeeded, "timed out waiting for: \(description)", sourceLocation: sourceLocation)
+}
+
 @Suite(.serialized)
 @MainActor
 struct CodeStoreTests {
@@ -235,10 +264,24 @@ struct CodeStoreTests {
     /// superseded by a fast `navigate("fresh")` call before the first
     /// resolves, must never let the slow call's late-arriving tree land —
     /// `tree` must reflect ONLY the fresher call once both have settled.
-    /// Same "start the stale call, give it time to actually fire, start the
-    /// fresh one, then let the stale one's slow fetch finish too" shape
-    /// `PaletteStoreTests.overlappingOpenCallsOnlyApplyTheFresherResults`
+    /// Same "start the stale call, wait until it is genuinely in flight,
+    /// start the fresh one, then let the stale one's slow fetch finish too"
+    /// shape `PaletteStoreTests.overlappingOpenCallsOnlyApplyTheFresherResults`
     /// establishes.
+    ///
+    /// Timed-sleep sweep, classification (b): the stub's own delay is KEPT.
+    /// `navigate` bumps `treeGeneration` synchronously on entry, so once the
+    /// stale call is known to have started, its result is dropped whenever
+    /// it lands — before or after the fresh one — and no assertion here
+    /// reads a mid-flight state. The delay only picks which interleaving is
+    /// exercised. What was NOT order-independent is the start ordering (a
+    /// 20ms sleep that, if lost, made the "stale" call the newest one and
+    /// failed the test on a correct store), so that half is now a signal.
+    /// A gate can't replace the delay here: this stub runs handlers inline
+    /// on `URLSession`'s single shared custom-`URLProtocol` queue, so
+    /// holding this response would block the fresh call's own request from
+    /// ever being sent (see `LauncherStubURLProtocol.startLoading`'s doc
+    /// comment for that verified behaviour).
     @Test func navigateMidFlightDropsStaleResult() async {
         let client = makeClient { req in
             let path = Self.pathQuery(req) ?? ""
@@ -251,7 +294,9 @@ struct CodeStoreTests {
         let store = CodeStore(wsID: "ws1", client: client)
 
         let staleTask = Task { await store.navigate(path: "slow") }
-        try? await Task.sleep(for: .milliseconds(20)) // let the slow request actually fire
+        await expectEventually("the stale navigate's tree request is genuinely in flight") {
+            CodeStubURLProtocol.hits("/api/projects/ws1/tree") >= 1
+        }
         await store.navigate(path: "fresh")
 
         #expect(store.currentPath == "fresh")
@@ -287,8 +332,20 @@ struct CodeStoreTests {
         }
         let store = CodeStore(wsID: "ws1", client: client)
 
+        // Timed-sleep sweep: the navigate MUST be in flight before `open`
+        // is called — if it started after, its synchronous prologue (which
+        // clears `file`/`selectedPath` and bumps `fileGeneration`) would
+        // land during `open`'s await and legitimately drop `open`'s result,
+        // failing the assertions on a correct store. A 20ms sleep only made
+        // that likely; the request reaching the stub proves it. The stub's
+        // own 80ms delay stays (classification (b) — see
+        // `navigateMidFlightDropsStaleResult`'s doc comment: it only widens
+        // the window, and this stub's inline handler can't be gated without
+        // blocking `open`'s own request).
         let navigateTask = Task { await store.navigate(path: "slow-dir") }
-        try? await Task.sleep(for: .milliseconds(20)) // let the slow tree request actually fire
+        await expectEventually("the navigate's tree request is genuinely in flight") {
+            CodeStubURLProtocol.hits("/api/projects/ws1/tree") >= 1
+        }
         await store.open(path: "main.rs")
 
         #expect(store.selectedPath == "main.rs")
@@ -318,8 +375,14 @@ struct CodeStoreTests {
         }
         let store = CodeStore(wsID: "ws1", client: client)
 
+        // Same start-ordering signal as the two tests above (a 20ms sleep
+        // that lost its race made the `open` the NEWER call, so its result
+        // was no longer stale and the "must be dropped" assertion failed on
+        // a correct store). The stub's own delay stays — classification (b).
         let openTask = Task { await store.open(path: "slow-file.rs") }
-        try? await Task.sleep(for: .milliseconds(20)) // let the slow file request actually fire
+        await expectEventually("the open's source request is genuinely in flight") {
+            CodeStubURLProtocol.hits("/api/projects/ws1/source") >= 1
+        }
         await store.navigate(path: "dir-b")
 
         #expect(store.currentPath == "dir-b")
@@ -408,19 +471,35 @@ struct CodeStoreTests {
     /// reject every later keystroke — a permanently "loading" filter field
     /// with no list and no Retry (`CodeTab`'s filter Retry only renders for
     /// `.failed`).
+    ///
+    /// De-flake (timed-stub sweep): the cancel must land while the fetch is
+    /// genuinely unresolved — that is the whole scenario. An 80ms
+    /// `Thread.sleep` made that probable; under parallel-suite load it can
+    /// elapse first, the fetch completes, `filter` is `.content`, and the
+    /// `== nil` assertion fails on a correct store. The response is now
+    /// held on a gate opened immediately AFTER `cancel()` — so the
+    /// cancellation is always in before the response can be delivered —
+    /// and released promptly so the re-dispatch below isn't queued behind
+    /// it (this stub runs handlers inline on `URLSession`'s single shared
+    /// custom-`URLProtocol` queue).
     @Test func aCancelledFilterFetchLeavesTheStoreReDispatchable() async {
         let hits = LockedCounter()
+        let filterGate = DispatchSemaphore(value: 0)
         let client = makeClient { req in
             guard req.url?.path == "/api/projects/ws1/files" else { return (404, Data()) }
-            hits.increment()
-            Thread.sleep(forTimeInterval: 0.08)
+            if hits.increment() == 1 {
+                _ = filterGate.wait(timeout: .now() + 10) // 10s caps a hung test only
+            }
             return (200, try! Fixtures.data("code_files.json"))
         }
         let store = CodeStore(wsID: "ws1", client: client)
 
         let typing = Task { await store.loadFilter() }
-        try? await Task.sleep(for: .milliseconds(20)) // let the slow request actually fire
+        await expectEventually("the filter request is genuinely in flight") {
+            CodeStubURLProtocol.hits("/api/projects/ws1/files") >= 1
+        }
         typing.cancel()
+        filterGate.signal() // the response can only ever arrive post-cancel
         await typing.value
 
         #expect(
@@ -440,6 +519,14 @@ struct CodeStoreTests {
     /// The reset is conditional on `filter` still being `.loading`, so a
     /// cancelled call can never wipe out a CONCURRENT live fetch's result —
     /// either interleaving must end on `.content`.
+    ///
+    /// Timed-sleep sweep, classification (b) — the sleeps are KEPT because
+    /// this test is explicitly order-INDEPENDENT, and that is its whole
+    /// point: whichever of the two calls resolves first, and whether the
+    /// cancel lands before or after the doomed call's own response, the
+    /// surviving call always writes `.content` and the cancelled call's
+    /// `.loading`-guarded reset can never clear it. Nothing here asserts a
+    /// mid-flight state, so there is no bracket for a gate to hold open.
     @Test func aCancelledFilterFetchNeverWipesOutAConcurrentFetchsResult() async {
         let client = makeClient { req in
             guard req.url?.path == "/api/projects/ws1/files" else { return (404, Data()) }

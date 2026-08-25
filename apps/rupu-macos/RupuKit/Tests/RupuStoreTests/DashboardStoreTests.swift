@@ -139,6 +139,7 @@ private final class HitCounter: @unchecked Sendable {
     private var v = 0
     /// Increments and returns the NEW count (1 on the first call).
     func incrementAndGet() -> Int { lock.withLock { v += 1; return v } }
+    var value: Int { lock.withLock { v } }
 }
 
 /// De-flakes "wait for something async to land" — same rationale and shape
@@ -558,6 +559,18 @@ struct DashboardStoreTests {
     // host has answered at all. The remote host's contribution then merges
     // in progressively once its artificially delayed response arrives.
     @MainActor @Test func activateRendersLocalImmediatelyThenMergesSlowRemoteHostProgressively() async {
+        // De-flake (timed-stub sweep, same class as `ActivityStoreTests`'
+        // progressive-merge test): the two assertions right after
+        // `activate(range:)` are MID-FLIGHT — they only mean anything while
+        // "mini" genuinely hasn't answered. An 80ms `Thread.sleep` made that
+        // probable; under parallel-suite load it can elapse while the main
+        // actor is starved and the assertions then fail on a store that
+        // behaved correctly. "mini"'s response is now held until they have
+        // been made. (Safe to hold inline here — `refetchAll` fetches
+        // `/api/hosts` and "local" BEFORE dispatching any remote host's
+        // request, so nothing else is waiting on this stub's shared queue
+        // while the gate is closed.)
+        let miniGate = DispatchSemaphore(value: 0)
         let (store, box) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
             if url.path == "/api/hosts" {
@@ -566,7 +579,7 @@ struct DashboardStoreTests {
             guard url.path == "/api/dashboard" else { return (200, Data("{}".utf8)) }
             let hostID = Self.queryValue("host", in: req) ?? ""
             if hostID == "mini" {
-                Thread.sleep(forTimeInterval: 0.08) // artificially slow remote host
+                _ = miniGate.wait(timeout: .now() + 10) // 10s caps a hung test only
                 return (200, Self.dashboardJSON(hostID: "mini", state: "ok", capturedAt: "2026-08-20T09:00:00Z", workers: 5))
             }
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", capturedAt: "2026-08-20T10:00:00Z", workers: 1))
@@ -574,12 +587,15 @@ struct DashboardStoreTests {
 
         await store.activate(range: .d7)
 
-        // Local truth already showing; the slow remote host hasn't been
+        // Local truth already showing; the gated remote host hasn't been
         // waited on at all.
         #expect(store.merged?.fleet.workers == 1)
         #expect(store.hostStates.first(where: { $0.id == "mini" })?.state == .loading)
 
-        await expectEventually("the slow remote host's contribution merges in") {
+        // Only now let the remote host answer.
+        miniGate.signal()
+
+        await expectEventually("the gated remote host's contribution merges in") {
             store.merged?.fleet.workers == 6
         }
 
@@ -698,6 +714,22 @@ struct DashboardStoreTests {
     // the OLD range) must never land, even once it finally resolves well
     // after the new range's own fetch already completed.
     @MainActor @Test func setRangeRefetchesAllAndDropsStaleInFlightResultsFromThePriorGeneration() async {
+        // De-flake (timed-stub sweep): BOTH ends of this race were clocks.
+        // `#expect(workers == 1)` right after `activate` is a mid-flight
+        // assertion (mini's 7d fetch must not have landed), and the stale
+        // 999 had to arrive only AFTER `setRange` bumped the generation —
+        // a 150ms sleep against a 200ms settle. Both are now signals: the
+        // stale response is held on a gate, and the gate is opened only
+        // once `store.range == .d30` is OBSERVED from the main actor, which
+        // proves `setRange`'s synchronous prologue AND `refetchAll`'s
+        // `generation += 1` already ran (both precede that method's first
+        // suspension point, and the store is `@MainActor`, so nothing else
+        // could have interleaved). Opening it there — rather than after
+        // `setRange` returns — is also what keeps the 30d cycle's own
+        // requests from queueing behind a held response on this stub's
+        // shared inline queue.
+        let stale7dGate = DispatchSemaphore(value: 0)
+        let fresh30dGate = DispatchSemaphore(value: 0)
         let (store, _) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
             if url.path == "/api/hosts" {
@@ -707,33 +739,54 @@ struct DashboardStoreTests {
             let hostID = Self.queryValue("host", in: req) ?? ""
             let range = Self.queryValue("range", in: req) ?? ""
             if hostID == "mini" && range == "7d" {
-                // The stale generation's remote fetch: deliberately slow,
-                // and its marker value (999) must never be observed.
-                Thread.sleep(forTimeInterval: 0.15)
+                // The stale generation's remote fetch: held until the newer
+                // generation exists, and its marker value (999) must never
+                // be observed. 10s caps a hung test only.
+                _ = stale7dGate.wait(timeout: .now() + 10)
                 return (200, Self.dashboardJSON(hostID: "mini", state: "ok", workers: 999))
             }
             if hostID == "mini" && range == "30d" {
+                // Held so that "still local-only immediately after setRange
+                // returns" is a statement about the store's local-first
+                // ordering, not about this fetch happening to be slower
+                // than the main actor.
+                _ = fresh30dGate.wait(timeout: .now() + 10)
                 return (200, Self.dashboardJSON(hostID: "mini", state: "ok", workers: 7))
             }
             // local, any range — instant.
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", workers: 1))
         }
 
-        await store.activate(range: .d7) // fires mini's slow 7d fetch in the background
+        await store.activate(range: .d7) // fires mini's gated 7d fetch in the background
         #expect(store.merged?.fleet.workers == 1) // local only, so far
 
-        await store.setRange(.d30) // bumps generation; local(30d) lands, returns once it does
+        // Fire the new cycle without awaiting it, then release the stale
+        // fetch from a job enqueued on the SAME (main) actor immediately
+        // after it. Main-actor jobs run one at a time in submission order,
+        // and `setRange` → `refetchAll` performs `generation += 1` before
+        // its first suspension point (`client.hosts()`), so the release
+        // cannot possibly run before the new generation exists — an
+        // ordering established by the executor rather than by a sleep long
+        // enough to "probably" cover it. `store.range`/`generation` are
+        // both `private`, so this is the strongest available signal without
+        // touching production code; if it ever failed, the assertion below
+        // fails loudly rather than silently weakening.
+        let rangeSwitch = Task { await store.setRange(.d30) }
+        let releaseStale = Task { stale7dGate.signal() }
+        await releaseStale.value
+        await rangeSwitch.value // local(30d) has landed by the time this returns
         #expect(store.merged?.fleet.workers == 1, "still local-only immediately after setRange returns")
+
+        // Only now let the new generation's remote fetch answer. (Its
+        // request is necessarily behind local's on this stub's shared
+        // queue — `refetchAll` awaits local before dispatching any remote
+        // host — so holding it can never stall the cycle above.)
+        fresh30dGate.signal()
 
         await expectEventually("mini's 30d fetch merges in") {
             store.merged?.fleet.workers == 8
         }
         #expect(store.merged?.fleet.workers == 8, "1 (local) + 7 (mini, 30d) — never 999")
-
-        // Give the stale 7d fetch's artificial 0.15s delay time to actually
-        // resolve, well past its window, and confirm it never corrupted
-        // the now-settled 30d state.
-        try? await Task.sleep(for: .milliseconds(200))
         #expect(store.merged?.fleet.workers == 8, "the stale generation's 999 marker must never land")
 
         store.deactivate()
@@ -813,6 +866,15 @@ struct DashboardStoreTests {
     // the 60s reconcile loop uses, so it stands in for "a reconcile tick
     // fires" without needing to wait out a real interval.
     @MainActor @Test func existingOkSliceStaysOkThroughARefetchCycleUntilItsNewResultLands() async {
+        // De-flake (timed-stub sweep): the mid-cycle assertion below only
+        // means anything while mini's SECOND fetch is unresolved — an 80ms
+        // `Thread.sleep` raced against a 20ms "let the cycle start" sleep,
+        // and under parallel-suite load either could lose (the cycle not
+        // started yet, or mini's refetch already landed and the slice
+        // correctly showing the new capturedAt). Both are now signals: the
+        // cycle's start is observed via mini's second request reaching the
+        // stub, and that response is held until the assertion has been made.
+        let miniSecondCycleGate = DispatchSemaphore(value: 0)
         let miniHits = HitCounter()
         let (store, box) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
@@ -826,10 +888,10 @@ struct DashboardStoreTests {
                 if hit == 1 {
                     return (200, Self.dashboardJSON(hostID: "mini", state: "ok", capturedAt: "2026-08-20T09:00:00Z", workers: 5))
                 }
-                // The second cycle's own fetch for mini: artificially slow,
-                // so the test can observe the slice mid-cycle before it
-                // lands.
-                Thread.sleep(forTimeInterval: 0.08)
+                // The second cycle's own fetch for mini: held so the test
+                // can observe the slice mid-cycle before it lands. 10s caps
+                // a hung test only.
+                _ = miniSecondCycleGate.wait(timeout: .now() + 10)
                 return (200, Self.dashboardJSON(hostID: "mini", state: "ok", capturedAt: "2026-08-20T09:05:00Z", workers: 9))
             }
             return (200, Self.dashboardJSON(hostID: "local", state: "ok", workers: 1))
@@ -848,15 +910,18 @@ struct DashboardStoreTests {
         // mid-flight state before mini's own (slow) refetch resolves.
         let refetchTask = Task { await store.setRange(.d7) }
 
-        // Let the cycle actually start (host discovery + local's instant
-        // refetch) without waiting anywhere near mini's 80ms artificial
-        // delay.
-        try? await Task.sleep(for: .milliseconds(20))
+        // The cycle has genuinely reached mini's own (gated) refetch —
+        // host discovery and local's refetch necessarily precede it — so
+        // this is mid-cycle by construction, not by elapsed time.
+        await expectEventually("the second cycle reaches mini's own refetch") { miniHits.value >= 2 }
         guard case .ok(let midCycleCapturedAt) = store.hostStates.first(where: { $0.id == "mini" })?.state else {
             Issue.record("mini's slice must stay .ok mid-cycle, got \(String(describing: store.hostStates.first(where: { $0.id == "mini" })?.state))")
             return
         }
         #expect(midCycleCapturedAt == "2026-08-20T09:00:00Z", "must still show the FIRST cycle's data — never flash to .loading — until the new fetch actually lands")
+
+        // Only now let mini's second-cycle fetch answer.
+        miniSecondCycleGate.signal()
 
         // `setRange(_:)` itself already returned once LOCAL's (fast) refetch
         // landed — mini's own fetch runs on independently, same
@@ -997,6 +1062,21 @@ struct DashboardStoreTests {
     // ok — an extra local-only refresh (fired via a firehose signal, same
     // burst-coalescing path task (g) exercises) landing while mini is still
     // pending must never manufacture a premature "nothing reported" verdict.
+    //
+    // Timed-sleep sweep, classification (b) — mini's delay is KEPT. Every
+    // assertion here is `pageError == nil`, and mini's eventual answer is
+    // `ok`, so no interleaving of the debounced local-only refresh, mini's
+    // response, and the cycle's own accounting can flip any of them:
+    // manufacturing a premature verdict is the only way to fail, and that
+    // is precisely the regression under test. Nothing is bracketed, so
+    // there is no window for a gate to hold open. (Caveat recorded rather
+    // than papered over: because this stub runs handlers inline on
+    // `URLSession`'s single shared custom-`URLProtocol` queue, mini's sleep
+    // also stalls the local-only refresh's own request, so this exercises
+    // the accounting bug less adversarially than the prose above implies.
+    // Fixing that means dispatching the handler off that queue — the shape
+    // `LauncherStubURLProtocol` already uses — which is a stub-architecture
+    // change, not a de-flake, and is deliberately out of this sweep.)
     @MainActor @Test func debouncedLocalOnlyRefreshDuringAFailingLocalNeverFalselyFlashesPageErrorWhileARemoteHostIsStillPending() async {
         let (store, box) = makeStore(debounceInterval: .milliseconds(20)) { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }

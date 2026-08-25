@@ -166,6 +166,37 @@ private final class Counter: @unchecked Sendable {
     func next() -> Int { lock.withLock { v += 1; return v } }
 }
 
+/// De-flakes "wait for an async effect to land" — a private helper per file,
+/// this codebase's established convention (see `ActivityStoreTests.
+/// pollUntil`/`expectEventually`, `FleetStoreTests`', ... for the identical
+/// shape). Polls `condition` every `interval` until it's `true` or `timeout`
+/// elapses.
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
+@MainActor
+private func expectEventually(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ description: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: () -> Bool
+) async {
+    let succeeded = await pollUntil(timeout: timeout, interval: interval, condition)
+    #expect(succeeded, "timed out waiting for: \(description)", sourceLocation: sourceLocation)
+}
+
 @Suite(.serialized)
 struct PaletteStoreTests {
     private static let usageJSON = #"{"cached_tokens":0,"cost_usd":null,"input_tokens":0,"output_tokens":0,"priced":false,"runs":0,"total_tokens":0}"#
@@ -368,6 +399,20 @@ struct PaletteStoreTests {
         let store = makeStore { req in
             guard req.url?.path == "/api/runs" else { return (200, Data("[]".utf8)) }
             if runsHitCount.next() == 1 {
+                // Timed-sleep sweep, classification (b) — KEPT deliberately.
+                // Once the stale call is known to have started (the poll
+                // below), `openGeneration` has already been bumped for it,
+                // and the fresher `open()` bumps again SYNCHRONOUSLY on
+                // entry — so this response is dropped by the guard whenever
+                // it lands, before or after the fresh one. The delay only
+                // controls how adversarial the interleaving is, never
+                // whether the assertions hold, and no assertion here reads
+                // a mid-flight state. (It cannot become a gate: this stub
+                // runs handlers inline on `URLSession`'s single shared
+                // custom-`URLProtocol` queue, so holding this response would
+                // block the fresher call's own request from ever being
+                // sent — verified behaviour, see `LauncherStubURLProtocol.
+                // startLoading`'s doc comment.)
                 Thread.sleep(forTimeInterval: 0.08) // the older, slower call
                 return (200, Data("[\(Self.runListRowJSON(id: "run-stale", status: "running"))]".utf8))
             }
@@ -375,13 +420,17 @@ struct PaletteStoreTests {
         }
 
         let staleTask = Task { await store.open() }
-        // Give the stale call's request time to actually fire (and enter
-        // its artificial 80ms sleep) before the fresher call starts — same
-        // "give the first async hop a moment to land" pattern
-        // `activateRendersLocalImmediatelyThenMergesSlowOnlineRemoteHostProgressively`
-        // uses in `ActivityStoreTests`.
-        try? await Task.sleep(for: .milliseconds(20))
-        await store.open() // the fresher, later-triggered call — completes fast
+        // De-flake (timed-stub sweep): the stale call MUST have started
+        // before the fresher one — otherwise it captures the newer
+        // generation and legitimately wins, failing the assertions on a
+        // correct store. A 20ms sleep only made that likely; its request
+        // reaching the stub proves it (the hit is recorded before the
+        // handler runs, and `open()` bumps `openGeneration` before ever
+        // dispatching).
+        await expectEventually("the stale open()'s /api/runs request is genuinely in flight") {
+            PaletteStubURLProtocol.requestCount(forPath: "/api/runs") >= 1
+        }
+        await store.open() // the fresher, later-triggered call
 
         #expect(store.items.contains { $0.id == "run:run-fresh" })
         #expect(!store.items.contains { $0.id == "run:run-stale" })

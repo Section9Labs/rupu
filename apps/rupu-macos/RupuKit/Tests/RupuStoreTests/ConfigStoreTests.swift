@@ -234,6 +234,17 @@ struct ConfigStoreTests {
     /// Starts a slow `load(project: "a")`, then fires a fast
     /// `load(project: "b")` before the first resolves — the first's
     /// eventual (STALE) response must never overwrite the second's.
+    ///
+    /// Timed-sleep sweep, classification (b) — the stub's delay is KEPT.
+    /// The start ordering was already a signal (the `hits >= 1` poll below),
+    /// and once 'a' is in flight `load` bumps `generation` synchronously on
+    /// 'b''s entry, so 'a''s response is dropped whenever it lands. No
+    /// assertion here reads a mid-flight state, and this stub runs handlers
+    /// inline on `URLSession`'s single shared custom-`URLProtocol` queue, so
+    /// gating 'a' would block 'b''s own request from being sent at all.
+    /// What DID need fixing was the fixed 600ms "give it room to resolve"
+    /// wait at the end — a duration guess standing in for an event — which
+    /// is now an actual `await` on the stale task.
     @Test func generationGuardDropsStaleResponseWhenProjectSwitchedMidFlight() async {
         let client = makeClient { req in
             guard req.url?.path == "/api/config" else { return (404, Data()) }
@@ -246,7 +257,7 @@ struct ConfigStoreTests {
         }
         let store = ConfigStore()
 
-        Task { await store.load(client: client, project: "a") }
+        let staleLoad = Task { await store.load(client: client, project: "a") }
         await expectEventually("the slow 'a' fetch has dispatched") {
             ConfigStubURLProtocol.hits("/api/config") >= 1
         }
@@ -255,10 +266,10 @@ struct ConfigStoreTests {
         #expect(store.selectedProject == "b")
         #expect(store.view.value?.rawGlobal == "FRESH\n")
 
-        // Give the stale 'a' fetch's artificial 0.3s delay generous room to
-        // actually resolve well past this point, and confirm it never
-        // clobbered the now-settled 'b' state.
-        try? await Task.sleep(for: .milliseconds(600))
+        // The stale 'a' load having actually RESOLVED (its guard run, its
+        // result dropped) is a real signal — awaited, not approximated by a
+        // fixed 600ms settle that a loaded runner could outlast.
+        _ = await staleLoad.value
         #expect(store.view.value?.rawGlobal == "FRESH\n", "the stale generation's response must never land")
         #expect(store.selectedProject == "b")
     }
