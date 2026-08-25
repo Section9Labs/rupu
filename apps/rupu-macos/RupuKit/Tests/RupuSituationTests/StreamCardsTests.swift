@@ -66,41 +66,52 @@ private let ts1000 = Date(timeIntervalSince1970: 1) // 1000ms since epoch
     #expect(c.detail?.contains("high") == true)
 }
 
-// MARK: - unknown / not-in-cards.ts event kinds → nil (see StreamCards.swift
-// file header for why this is a deliberate, cited divergence from cards.ts's
-// own fallback-card behavior for these two categories).
+// MARK: - unknown / not-in-cards.ts event kinds → the web's degraded
+// fallback card (cards.ts lines 99-111), not nil. Fix round 1, finding 1:
+// task review found the earlier "returns nil" behavior contradicted the
+// verified web source; inverted to match cards.ts.
 
-@Test func anUnknownEventTypeMapsToNilRatherThanAFallbackCard() {
+@Test func anUnknownEventTypeGetsTheWebsFallbackCardNotNil() {
     let ev = CPEvent.unknown(type: "future_thing", runID: "r9")
-    #expect(cardForEvent(ev, ts: ts1000) == nil)
+    let c = cardForEvent(ev, ts: ts1000)!
+    #expect(c.form == .activity)
+    #expect(c.group == .activity)
+    #expect(c.accent == .brand)
+    #expect(c.badge == "future thing") // underscores → spaces
+    #expect(c.title == "future_thing") // no step_id on `.unknown` — falls back to the raw type
+    #expect(c.runID == "r9")
 }
 
-@Test func aDispatchEventNotInCardsTsKnownEventTypesAlsoMapsToNil() {
+@Test func dispatchEventsNotInCardsTsKnownEventTypesAlsoGetTheFallbackCard() {
     let started = CPEvent.dispatchStarted(runID: "r1", subRunID: "sr1", agent: "sec", transcriptPath: "t.jsonl")
     let completed = CPEvent.dispatchCompleted(runID: "r1", subRunID: "sr1", success: true, tokensIn: 1, tokensOut: 2)
-    #expect(cardForEvent(started, ts: ts1000) == nil)
-    #expect(cardForEvent(completed, ts: ts1000) == nil)
+
+    let startedCard = cardForEvent(started, ts: ts1000)!
+    #expect(startedCard.form == .activity)
+    #expect(startedCard.accent == .brand)
+    #expect(startedCard.badge == "dispatch started")
+    #expect(startedCard.title == "dispatch_started")
+    #expect(startedCard.runID == "r1")
+
+    let completedCard = cardForEvent(completed, ts: ts1000)!
+    #expect(completedCard.badge == "dispatch completed")
+    #expect(completedCard.title == "dispatch_completed")
+    #expect(completedCard.runID == "r1")
 }
 
 // MARK: - cardForFinding — ported from cards.test.ts lines 69-99.
 
 private func baseFinding(
-    severity: String = "high", // adapted from cards.test.ts's 'HIGH' — see note below
+    severity: String = "HIGH", // cards.test.ts line 74's exact literal — see note below
     filePath: String? = "src/routes/billing.ts",
     lineRange: [UInt32]? = [16, 21]
 ) -> APIFinding {
-    // `Severity(wireString:)` (`RupuDesign/Tokens.swift`) is a case-sensitive
-    // exact match — unlike the web's `normFindingSeverity`
-    // (`raw.toLowerCase()` first), it does not lowercase before matching, so
-    // it never sees an uppercase wire value in practice (rupu-coverage's
-    // `Severity` enum is `#[serde(rename_all = "lowercase")]`, confirmed by
-    // both `findings_global.json`'s fixture values and
-    // `SeverityWireMappingTests`, which only pins lowercase inputs). The web
-    // test's literal `'HIGH'` input exercises normFindingSeverity's
-    // case-insensitivity specifically — a behavior `Severity(wireString:)`
-    // doesn't have and this task doesn't touch (RupuDesign is out of this
-    // task's file scope) — so this port uses the real wire casing ('high')
-    // instead of asserting a false pass. Flagged in the task-6 report.
+    // cards.test.ts's base fixture uses uppercase `'HIGH'` specifically to
+    // exercise `normFindingSeverity`'s `raw.toLowerCase()`. Fix round 1,
+    // finding 2: `cardForFinding` now lowercases the wire string before
+    // calling `Severity(wireString:)` (see that call site's comment), so
+    // this restores the web's exact uppercase input instead of the
+    // lowercase workaround an earlier pass used.
     APIFinding(
         id: "f-1", summary: "Broken org-scoping on GET /invoice/:id", severity: severity, scope: "line",
         filePath: filePath, lineRange: lineRange, wsID: "ws1", project: "billing-api", targetID: "t1",
@@ -157,18 +168,24 @@ private func baseFinding(
     #expect(out.map(\.runID) == ["r2", "r3", "r1"])
 }
 
-@Test func mergeStreamDedupsByContentIdentityExcludingTsKeepingTheNewestOccurrence() {
+@Test func mergeStreamDedupsByContentIdentityExcludingTsKeepingTheFirstArrivedOccurrence() {
     // Same event content (same CPEvent case + associated values), replayed
     // at two different timestamps — mirrors the web's history↔live replay
-    // scenario `identityOf` guards against (`Events.tsx` lines 57-68).
+    // scenario `identityOf` guards against (`Events.tsx` lines 57-68). Fix
+    // round 1, finding 5: the web's `seenRef` gate keeps whichever copy is
+    // *ingested first* — here, `older` (passed first in the input array) —
+    // regardless of which one carries the "newer" `ts`; an earlier pass here
+    // sorted before deduping and so kept `newer` instead. Inverted.
     let older = cardForEvent(.runPaused(runID: "r1"), ts: Date(timeIntervalSince1970: 1))!
     let newer = cardForEvent(.runPaused(runID: "r1"), ts: Date(timeIntervalSince1970: 5))!
     let distinct = cardForEvent(.runResumed(runID: "r2"), ts: Date(timeIntervalSince1970: 3))!
     let out = mergeStream([older, newer, distinct], max: 10)
     #expect(out.count == 2)
-    #expect(out[0].runID == "r1")
-    #expect(out[0].ts == 5000) // the newest occurrence survived, not the oldest
-    #expect(out[1].runID == "r2")
+    // Newest-first sort still applies to the deduped set: distinct (ts=3000)
+    // sorts ahead of the surviving older duplicate (ts=1000).
+    #expect(out[0].runID == "r2")
+    #expect(out[1].runID == "r1")
+    #expect(out[1].ts == 1000) // the first-arrived occurrence survived, not the newest
 }
 
 @Test func mergeStreamCapsAtMax() {
@@ -177,4 +194,16 @@ private func baseFinding(
     }
     #expect(mergeStream(cards, max: 2).count == 2)
     #expect(mergeStream(cards, max: 0).isEmpty)
+}
+
+@Test func mergeStreamBreaksATsTieDeterministicallyByKey() {
+    // Fix round 1, finding 4: two distinct cards sharing a `ts` must order
+    // the same way regardless of input order — proof the sort doesn't ride
+    // Swift's incidental input-order stability alone.
+    let a = cardForEvent(.runPaused(runID: "r1"), ts: ts1000)!
+    let b = cardForEvent(.runPaused(runID: "r2"), ts: ts1000)!
+    let forward = mergeStream([a, b], max: 10)
+    let reversed = mergeStream([b, a], max: 10)
+    #expect(forward.map(\.key) == reversed.map(\.key))
+    #expect(forward.map(\.key) == forward.map(\.key).sorted()) // key-ascending on a ts tie
 }
