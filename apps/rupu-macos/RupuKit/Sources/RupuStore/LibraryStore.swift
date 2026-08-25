@@ -149,24 +149,29 @@ public final class LibraryStore {
         }
     }
 
-    /// Enable/disable one autoflow definition, keyed by definition name
-    /// alone (`ActionKey(name, .setEnabled)`) — see `ActionVerb.setEnabled`'s
-    /// doc comment for why this confirms off the response directly rather
-    /// than waiting on a refetch. `scopeKind`/`scopeID` should be the exact
-    /// values of the row being toggled (an `AutoflowDefinition`'s own
-    /// `scopeKind`/`scopeID`, or a `WorkflowDefinition`'s) — passed straight
-    /// through to the `?scope_kind=&scope_id=` pinning pair so two different
-    /// repos defining the same autoflow name never cross-toggle each other.
+    /// Enable/disable one autoflow definition, keyed by `ActionKey.
+    /// autoflow(name:scopeKind:scopeID:verb:)` — a plain
+    /// `ActionKey(name, .setEnabled)` collides across two repos defining the
+    /// same autoflow name (review fix, round 1: see that helper's doc
+    /// comment for the exact cross-toggle bug this closes). See
+    /// `ActionVerb.setEnabled`'s doc comment for why this confirms off the
+    /// response directly rather than waiting on a refetch. `scopeKind`/
+    /// `scopeID` should be the exact values of the row being toggled (an
+    /// `AutoflowDefinition`'s own `scopeKind`/`scopeID`, or a
+    /// `WorkflowDefinition`'s) — passed straight through to both the
+    /// `?scope_kind=&scope_id=` pinning pair (so the server-side mutation
+    /// itself never cross-toggles) and this key (so the UI ledger tracking
+    /// it doesn't either).
     ///
     /// On success, patches whichever of `autoflows`/`workflows` currently
     /// holds a row matching `name` **and** `scopeKind`/`scopeID` exactly (the
-    /// same three-field match the server itself pins on) — never a bare
-    /// name match, which could silently update the wrong same-named row
-    /// from a different repo. A row that doesn't match (list not loaded yet,
-    /// or genuinely absent) is left untouched; the mutation itself still
-    /// succeeded and is still reported `.confirmed`.
+    /// same three-field match the key above uses, and the server itself pins
+    /// on) — never a bare name match, which could silently update the wrong
+    /// same-named row from a different repo. A row that doesn't match (list
+    /// not loaded yet, or genuinely absent) is left untouched; the mutation
+    /// itself still succeeded and is still reported `.confirmed`.
     public func setAutoflowEnabled(name: String, scopeKind: String?, scopeID: String?, enabled: Bool) async {
-        let key = ActionKey(name, .setEnabled)
+        let key = ActionKey.autoflow(name: name, scopeKind: scopeKind, scopeID: scopeID, verb: .setEnabled)
         pendingActions.begin(key)
         do {
             _ = try await postSetAutoflowEnabled(name, scopeKind, scopeID, enabled)
