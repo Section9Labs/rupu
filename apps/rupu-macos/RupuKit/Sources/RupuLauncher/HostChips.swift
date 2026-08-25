@@ -80,8 +80,8 @@ struct HostChips: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(isSelected ? Color.rupuBrand.opacity(0.12) : Color.rupuSurface)
-            .clipShape(Capsule())
-            .overlay(Capsule().stroke(Color.rupuBorder, lineWidth: 1))
+            .clipShape(ChromeShape.pill)
+            .overlay(ChromeShape.pill.stroke(Color.rupuBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
         .disabled(disabled)
@@ -98,9 +98,9 @@ struct HostChips: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(store.fanOutAllHealthy ? Color.rupuBrand.opacity(0.12) : Color.rupuSurface)
-                .clipShape(Capsule())
+                .clipShape(ChromeShape.pill)
                 .overlay(
-                    Capsule().stroke(store.fanOutAllHealthy ? Color.rupuBrand : Color.rupuBorder, lineWidth: 1)
+                    ChromeShape.pill.stroke(store.fanOutAllHealthy ? Color.rupuBrand : Color.rupuBorder, lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)

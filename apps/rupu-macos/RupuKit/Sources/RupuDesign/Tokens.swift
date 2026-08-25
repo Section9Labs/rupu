@@ -89,6 +89,41 @@ public enum StatusTone: String, CaseIterable, Sendable {
     case running, done, failed, awaiting, paused, pending, skipped, cancelled, rejected
 }
 
+public extension StatusTone {
+    /// The neutral, un-tinted pill treatment — ports web `status.ts`'s exactly
+    /// three flat cases: `pending` (`:58-65`), `cancelled` (`:121-127`),
+    /// `skipped` (`:129-135`), each `bg-surface ... ring-border` with no
+    /// color-tinted background/ring. Every other status (`running`, `done`,
+    /// `failed`, `awaiting`, `paused`, `rejected`) keeps the tinted `/10` bg +
+    /// status ink + `/30` ring treatment. Verified against the full
+    /// `STATUS` record, not assumed.
+    var isFlatPill: Bool {
+        switch self {
+        case .pending, .cancelled, .skipped: true
+        case .running, .done, .failed, .awaiting, .paused, .rejected: false
+        }
+    }
+}
+
+/// Shared pill/badge/chip corner radius — ports Tailwind's default `rounded`
+/// utility (`border-radius: 0.25rem` = 4px), the exact class `StatusPill.tsx:79`'s
+/// `PillShell` applies (`'inline-flex items-center gap-1 rounded ring-1 ...'`),
+/// and the same class `components/ui/Badge.tsx` / `components/ui/Chip.tsx` use
+/// for every non-capsule pill/badge in the web CP. Every kit pill/badge/chip
+/// consumer should clip to `ChromeShape.pill` so a shape change sweeps them
+/// all at once.
+///
+/// NOT for `rounded-full` widgets: Situation Room's status-stream filter chips
+/// (`components/situationRoom/EventStream.tsx:89`, `'rounded-full'`) and the
+/// shared `FilterPills` control (`components/ui/FilterPills.tsx:1`, doc
+/// comment: "Rounded-full, single-select, brand-filled active pill") are a
+/// deliberately different, genuinely-round family — their call sites keep
+/// `Capsule`, not `ChromeShape.pill`.
+public enum ChromeShape {
+    public static let pillRadius: CGFloat = 4
+    public static var pill: RoundedRectangle { RoundedRectangle(cornerRadius: pillRadius) }
+}
+
 public extension Color {
     static func status(_ tone: StatusTone) -> Color {
         switch tone {
@@ -101,6 +136,37 @@ public extension Color {
         case .skipped: dynamicColor((203, 213, 225), (82, 82, 91))
         case .cancelled: dynamicColor((100, 116, 139), (161, 161, 170))
         case .rejected: dynamicColor((239, 68, 68), (248, 113, 113)) // = failed
+        }
+    }
+
+    /// `StatusPill`'s background per web's `pillClass` policy
+    /// (`crates/rupu-cp/web/src/lib/status.ts`): the three flat tones
+    /// (`StatusTone.isFlatPill`) get `bg-surface` → `rupuSurface`; every
+    /// other tone keeps a 12%-opacity fill of its own status color (this
+    /// design's own fill step, ported from web's `/10` Tailwind opacity —
+    /// see `StatusPill.swift`'s doc comment).
+    static func statusPillBackground(_ tone: StatusTone) -> Color {
+        tone.isFlatPill ? .rupuSurface : Color.status(tone).opacity(0.12)
+    }
+
+    /// `StatusPill`'s ring stroke color, same flat/tinted split as
+    /// `statusPillBackground` — flat tones get `ring-border` → `rupuBorder`
+    /// at full opacity; tinted tones keep the status color at 30% (web's
+    /// `ring-status-x/30`).
+    static func statusPillRing(_ tone: StatusTone) -> Color {
+        tone.isFlatPill ? .rupuBorder : Color.status(tone).opacity(0.3)
+    }
+
+    /// `StatusPill`'s icon/label ink color. Web's flat pills use
+    /// `text-ink-dim` for `pending`/`cancelled` (`status.ts:58-65,121-127`)
+    /// but `text-ink-mute` for `skipped` (`status.ts:129-135`) — a
+    /// deliberately dimmer step for the least-consequential terminal state.
+    /// Tinted tones render in their own status color, same as today.
+    static func statusPillInk(_ tone: StatusTone) -> Color {
+        switch tone {
+        case .skipped: .rupuMute
+        case .pending, .cancelled: .rupuDim
+        default: Color.status(tone)
         }
     }
 

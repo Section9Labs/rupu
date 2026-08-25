@@ -352,23 +352,23 @@ public struct RunDetailScreen: View {
     }
 
     /// Fallback pill for a status `StatusDescriptor` has no vocabulary
-    /// for — same chrome as `StatusPill` (icon + mono label, 12%-fill
-    /// capsule with a 30% ring, `.pending` tone since that's what an
-    /// unrecognized status tone-maps to) but with the raw server string as
-    /// the label instead of a synthesized one.
+    /// for — same chrome as `StatusPill` (`ChromeShape.pill`, flat/neutral
+    /// tint since `.pending` is one of the three flat tones — see
+    /// `StatusTone.isFlatPill`) but with the raw server string as the label
+    /// instead of a synthesized one.
     private func unknownStatusPill(_ raw: String) -> some View {
         HStack(spacing: 4) {
             Icon(StatusDescriptor.descriptor(for: .pending).icon, size: 11)
-                .foregroundStyle(Color.status(.pending))
+                .foregroundStyle(Color.statusPillInk(.pending))
             Text(raw)
                 .font(.dataMono(10))
-                .foregroundStyle(Color.status(.pending))
+                .foregroundStyle(Color.statusPillInk(.pending))
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .background(Color.status(.pending).opacity(0.12))
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(Color.status(.pending).opacity(0.3), lineWidth: 1))
+        .background(Color.statusPillBackground(.pending))
+        .clipShape(ChromeShape.pill)
+        .overlay(ChromeShape.pill.stroke(Color.statusPillRing(.pending), lineWidth: 1))
     }
 
     /// IN/OUT/CACHED are not redundant with TOKENS — that item is the

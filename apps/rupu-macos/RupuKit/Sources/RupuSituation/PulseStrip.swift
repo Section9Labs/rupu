@@ -116,7 +116,7 @@ struct PulseStrip: View {
                 .foregroundStyle(Color.severity(severity))
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
-                .background(Color.severityBg(severity), in: Capsule())
+                .background(Color.severityBg(severity), in: ChromeShape.pill)
         }
     }
 

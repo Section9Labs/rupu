@@ -210,7 +210,7 @@ private struct EventCardView: View {
                 .foregroundStyle(accentColor)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
-                .background(accentColor.opacity(0.12), in: Capsule())
+                .background(accentColor.opacity(0.12), in: ChromeShape.pill)
             if let label = project.label {
                 HStack(spacing: 4) {
                     Text(label).font(.metaText).foregroundStyle(Color.rupuDim)
