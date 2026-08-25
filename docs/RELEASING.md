@@ -162,9 +162,11 @@ Set under repo Settings → Secrets and variables → Actions.
 - `APPLE_CERT_P12_BASE64`, `APPLE_CERT_PASSWORD` — Developer ID Application
   cert for signing the macOS binaries.
 - `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `APPLE_API_KEY_BASE64` —
-  App Store Connect API key for `notarytool`. There is no `stapler` step:
-  bare command-line binaries cannot be stapled, so the ticket is served
-  online and Gatekeeper checks it on first run.
+  App Store Connect API key for `notarytool`. The CLI binary has no
+  `stapler` step — bare command-line binaries cannot be stapled, so its
+  ticket is served online and Gatekeeper checks it on first run. rupu.app
+  IS stapled (the `macos-app` job staples both the `.app` bundle and the
+  DMG after notarization; app bundles and disk images accept tickets).
 - `GPG_PRIVATE_KEY`, `GPG_KEY_ID` — signs the apt/yum repository metadata.
 - `AUR_SSH_PRIVATE_KEY`, `AUR_USERNAME`, `AUR_EMAIL` — deploy key and commit
   identity for the `rupuaur` AUR account. `.SRCINFO` is regenerated inside a
@@ -192,7 +194,11 @@ one repository, none expire, and revoking one touches no other account.
 ## Smoking a release
 
 Assets are bare binaries (`rupu-darwin-arm64`, `rupu-linux-x64`,
-`rupu-linux-arm64`) plus `.deb`/`.rpm` packages, each with a `.sha256`:
+`rupu-linux-arm64`), the macOS app (`rupu-app-darwin-arm64.dmg` and `.zip` —
+signed, notarized, stapled), plus `.deb`/`.rpm` packages, each with a
+`.sha256`. Smoke the app asset too: download the DMG, `hdiutil attach` it,
+and `spctl -a -t exec -vv` the mounted `rupu.app` — Gatekeeper must accept
+it with `source=Notarized Developer ID`:
 
 ```bash
 TAG=v0.72.0
