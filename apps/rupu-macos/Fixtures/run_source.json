@@ -1,0 +1,37 @@
+[
+  {
+    "available": true,
+    "path": "src/auth/session.rs",
+    "language": "rust",
+    "startLine": 40,
+    "endLine": 44,
+    "targetLine": 42,
+    "totalLines": 120,
+    "lines": [
+      {
+        "n": 40,
+        "text": "    pub fn verify(&self, token: &str) -> bool {"
+      },
+      {
+        "n": 41,
+        "text": "        let stored_token = self.stored_token();"
+      },
+      {
+        "n": 42,
+        "text": "        if token == stored_token {"
+      },
+      {
+        "n": 43,
+        "text": "            return true;"
+      },
+      {
+        "n": 44,
+        "text": "        }"
+      }
+    ]
+  },
+  {
+    "available": false,
+    "reason": "Source preview is not available for remote-host runs yet."
+  }
+]

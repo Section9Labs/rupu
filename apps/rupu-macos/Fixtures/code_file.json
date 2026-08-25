@@ -1,0 +1,20 @@
+{
+  "available": true,
+  "path": "src/main.rs",
+  "language": "rust",
+  "totalLines": 3,
+  "lines": [
+    {
+      "n": 1,
+      "text": "fn main() {"
+    },
+    {
+      "n": 2,
+      "text": "    println!(\"hi\");"
+    },
+    {
+      "n": 3,
+      "text": "}"
+    }
+  ]
+}

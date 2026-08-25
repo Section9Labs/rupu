@@ -1,0 +1,50 @@
+[
+  {
+    "issue_ref": "github:Section9Labs/rupu/issues/101",
+    "issue_display_ref": "101",
+    "repo_ref": "github:Section9Labs/rupu",
+    "issue_title": "Nightly workflow needs manual review",
+    "issue_url": "https://github.com/Section9Labs/rupu/issues/101",
+    "workflow": "issue-supervisor-dispatch",
+    "status": "await_human",
+    "last_run_id": "run_9k2f",
+    "last_error": "panel review exceeded max_iterations",
+    "last_summary": "blocked pending human review",
+    "pr_url": "https://github.com/Section9Labs/rupu/pull/220",
+    "claim_owner": null,
+    "lease_expires_at": null,
+    "updated_at": "2026-08-25T12:00:00Z"
+  },
+  {
+    "issue_ref": "github:Section9Labs/rupu/issues/102",
+    "issue_display_ref": "102",
+    "repo_ref": "github:Section9Labs/rupu",
+    "issue_title": "Flaky test in rupu-orchestrator",
+    "issue_url": "https://github.com/Section9Labs/rupu/issues/102",
+    "workflow": "issue-supervisor-dispatch",
+    "status": "running",
+    "last_run_id": "run_am4d",
+    "last_error": null,
+    "last_summary": "running the dispatched workflow",
+    "pr_url": null,
+    "claim_owner": "host:kuki:5521",
+    "lease_expires_at": "2026-08-25T13:30:00Z",
+    "updated_at": "2026-08-25T12:15:00Z"
+  },
+  {
+    "issue_ref": "github:Section9Labs/rupu/issues/103",
+    "issue_display_ref": null,
+    "repo_ref": "github:Section9Labs/rupu",
+    "issue_title": null,
+    "issue_url": null,
+    "workflow": "issue-supervisor-dispatch",
+    "status": "eligible",
+    "last_run_id": null,
+    "last_error": null,
+    "last_summary": null,
+    "pr_url": null,
+    "claim_owner": null,
+    "lease_expires_at": null,
+    "updated_at": "2026-08-25T12:00:00Z"
+  }
+]

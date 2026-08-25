@@ -1,0 +1,38 @@
+{
+  "available": true,
+  "language": "rust",
+  "root": {
+    "kind": "source_file",
+    "named": true,
+    "startLine": 1,
+    "startCol": 1,
+    "endLine": 3,
+    "endCol": 2,
+    "matched": false,
+    "children": [
+      {
+        "kind": "function_item",
+        "named": true,
+        "startLine": 1,
+        "startCol": 1,
+        "endLine": 3,
+        "endCol": 2,
+        "matched": false,
+        "children": [
+          {
+            "kind": "identifier",
+            "named": true,
+            "field": "name",
+            "startLine": 2,
+            "startCol": 8,
+            "endLine": 2,
+            "endCol": 12,
+            "matched": true,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  "truncated": false
+}

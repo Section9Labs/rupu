@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{TimeZone, Utc};
+use rupu_ast::AstNode;
 use rupu_config::{KeyProvenance, KeySource};
 use rupu_coverage::{
     AssertionStatus, Attribution as CoverageAttribution, CatalogMode, Concern, ConcernAssertion,
@@ -14,11 +15,14 @@ use rupu_coverage::{
     FindingRecord as CoverageFindingRecord, FindingScope as CoverageFindingScope, FlatCatalog,
     Severity as CoverageSeverity, Surface as CoverageSurface, TouchStrength,
 };
+use rupu_cp::api::autoflow_claims::ClaimRow;
+use rupu_cp::api::code::{FileContent, FileListResult, TreeEntry, TreeResult};
 use rupu_cp::api::config::{ConfigView, RuntimeStatus};
 use rupu_cp::api::findings::{FindingOut, FindingsResponse, FindingsSummary};
 use rupu_cp::api::graph::{ApprovalGateDto, GateDto, StepDag, StepNodeDto, SubStepDto};
 use rupu_cp::api::projects::ProjectRow;
 use rupu_cp::api::runs::RunListRow;
+use rupu_cp::api::source::{AstResponse, SourceLine, SourceSlice};
 use rupu_cp::api::usage_outliers::OutlierRun;
 use rupu_cp::host::dashboard_summary::{
     ActiveCounts, ActiveLongest, CycleCounts, DashboardSummary, FleetCounts, TerminalBucket,
@@ -30,6 +34,7 @@ use rupu_orchestrator::executor::Event;
 use rupu_orchestrator::runs::{AwaitingGate, RunStatus, StepKind};
 use rupu_orchestrator::{FindingRecord, RunRecord, StepResultRecord, UnitCheckpoint};
 use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
+use rupu_workspace::{AutoflowClaimRecord, ClaimStatus};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/rupu-macos/Fixtures")
@@ -1964,4 +1969,273 @@ fn config_view_fixture_is_current() {
         },
     };
     check_fixture("config_view.json", &view);
+}
+
+// ── Situation Room: code viewers + claims (Phase 6B) ────────────────────────
+
+/// Shared skeleton for [`autoflow_claims_fixture_is_current`]'s rows — every
+/// field defaulted to `None`/empty so each case below only sets what it cares
+/// about, mirroring `sample_run_record`'s struct-update pattern above.
+fn sample_claim(issue_ref: &str, status: ClaimStatus) -> AutoflowClaimRecord {
+    AutoflowClaimRecord {
+        issue_ref: issue_ref.into(),
+        repo_ref: "github:Section9Labs/rupu".into(),
+        source_ref: None,
+        issue_display_ref: None,
+        issue_title: None,
+        issue_url: None,
+        issue_state_name: None,
+        issue_tracker: None,
+        workflow: "issue-supervisor-dispatch".into(),
+        status,
+        worktree_path: None,
+        branch: None,
+        last_run_id: None,
+        last_error: None,
+        last_summary: None,
+        pr_url: None,
+        artifacts: None,
+        artifact_manifest_path: None,
+        next_retry_at: None,
+        claim_owner: None,
+        lease_expires_at: None,
+        pending_dispatch: None,
+        contenders: vec![],
+        updated_at: "2026-08-25T12:00:00Z".into(),
+    }
+}
+
+#[test]
+fn autoflow_claims_fixture_is_current() {
+    // `GET /api/autoflows/claims` (`list_claims`, api/autoflow_claims.rs)
+    // returns `Vec<ClaimRow>` — `ClaimRow::from(AutoflowClaimRecord)` real
+    // types, not hand-built, so drift on either shows up here. `status` is
+    // asserted against `ClaimStatus`'s actual snake_case serialization (see
+    // `claim_row_status_is_lowercase_snake` in api/autoflow_claims.rs's own
+    // unit tests) rather than an invented string. Three rows:
+    // 1. `await_human`, `last_error` + `pr_url` set (blocked on a human).
+    // 2. `running`, `claim_owner` + `lease_expires_at` set (an active lease).
+    // 3. `eligible`, every `ClaimRow` `Option` field `None` (honest `—`
+    //    coverage for a freshly-discovered, unclaimed issue).
+    let awaiting = AutoflowClaimRecord {
+        issue_display_ref: Some("101".into()),
+        issue_title: Some("Nightly workflow needs manual review".into()),
+        issue_url: Some("https://github.com/Section9Labs/rupu/issues/101".into()),
+        issue_state_name: Some("open".into()),
+        issue_tracker: Some("github".into()),
+        worktree_path: Some("/tmp/rupu-worktrees/101".into()),
+        branch: Some("autoflow/issue-101".into()),
+        last_run_id: Some("run_9k2f".into()),
+        last_error: Some("panel review exceeded max_iterations".into()),
+        last_summary: Some("blocked pending human review".into()),
+        pr_url: Some("https://github.com/Section9Labs/rupu/pull/220".into()),
+        ..sample_claim(
+            "github:Section9Labs/rupu/issues/101",
+            ClaimStatus::AwaitHuman,
+        )
+    };
+
+    let active = AutoflowClaimRecord {
+        issue_display_ref: Some("102".into()),
+        issue_title: Some("Flaky test in rupu-orchestrator".into()),
+        issue_url: Some("https://github.com/Section9Labs/rupu/issues/102".into()),
+        issue_state_name: Some("open".into()),
+        issue_tracker: Some("github".into()),
+        worktree_path: Some("/tmp/rupu-worktrees/102".into()),
+        branch: Some("autoflow/issue-102".into()),
+        last_run_id: Some("run_am4d".into()),
+        last_summary: Some("running the dispatched workflow".into()),
+        claim_owner: Some("host:kuki:5521".into()),
+        lease_expires_at: Some("2026-08-25T13:30:00Z".into()),
+        updated_at: "2026-08-25T12:15:00Z".into(),
+        ..sample_claim("github:Section9Labs/rupu/issues/102", ClaimStatus::Running)
+    };
+
+    let untouched = sample_claim("github:Section9Labs/rupu/issues/103", ClaimStatus::Eligible);
+
+    let rows: Vec<ClaimRow> = vec![
+        ClaimRow::from(awaiting),
+        ClaimRow::from(active),
+        ClaimRow::from(untouched),
+    ];
+    assert_eq!(rows[0].status, "await_human");
+    assert_eq!(rows[1].status, "running");
+    assert_eq!(rows[2].status, "eligible");
+    check_fixture("autoflow_claims.json", &rows);
+}
+
+#[test]
+fn code_tree_fixture_is_current() {
+    // `GET /api/projects/:ws_id/tree` (`get_tree`, api/code.rs) returns
+    // `TreeResult` directly — `TreeEntry`/`TreeResult` are `pub`, mirrored
+    // for real. A non-root directory (`parent: Some("")`, matching
+    // `list_tree`'s "trim to workspace root" case) with one dir entry sorted
+    // before one file entry (dirs-first-then-files ordering `list_tree`
+    // guarantees — see `lists_root_dirs_first_then_files_and_hides_git`).
+    let tree = TreeResult {
+        path: "src".into(),
+        parent: Some(String::new()),
+        entries: vec![
+            TreeEntry {
+                name: "auth".into(),
+                path: "src/auth".into(),
+                kind: "dir".into(),
+            },
+            TreeEntry {
+                name: "main.rs".into(),
+                path: "src/main.rs".into(),
+                kind: "file".into(),
+            },
+        ],
+    };
+    check_fixture("code_tree.json", &tree);
+}
+
+#[test]
+fn code_file_fixture_is_current() {
+    // `GET /api/projects/:ws_id/source` (`get_source`, api/code.rs) returns
+    // `FileContent` directly. This covers the `available:true` case (with
+    // `lines`/`language`/`total_lines` populated, per `read_whole_file`'s
+    // success path); the `available:false, reason:Some(..)` case is covered
+    // by `run_source.json`'s unavailable element instead, per the brief.
+    let fc = FileContent {
+        available: true,
+        path: Some("src/main.rs".into()),
+        language: Some("rust"),
+        total_lines: Some(3),
+        lines: Some(vec![
+            SourceLine {
+                n: 1,
+                text: "fn main() {".into(),
+            },
+            SourceLine {
+                n: 2,
+                text: "    println!(\"hi\");".into(),
+            },
+            SourceLine {
+                n: 3,
+                text: "}".into(),
+            },
+        ]),
+        reason: None,
+    };
+    check_fixture("code_file.json", &fc);
+}
+
+#[test]
+fn code_files_fixture_is_current() {
+    // `GET /api/projects/:ws_id/files` (`get_files`, api/code.rs) returns
+    // `FileListResult` directly — `truncated: true` case (the `MAX_FILES`
+    // cap tripped mid-walk, per `list_all_files_capped`'s doc comment).
+    let res = FileListResult {
+        files: vec![
+            "README.md".into(),
+            "src/auth/session.rs".into(),
+            "src/main.rs".into(),
+        ],
+        truncated: true,
+    };
+    check_fixture("code_files.json", &res);
+}
+
+#[test]
+fn run_source_fixture_is_current() {
+    // `GET /api/runs/:id/source` (`get_source`, api/source.rs) returns
+    // `SourceSlice` directly. Two-element array covering both cases this
+    // endpoint soft-fails to HTTP 200 for, following the same
+    // multiple-cases-in-one-fixture pattern `workers_fixture_is_current`
+    // (busy vs. idle `WorkerRecord`) uses above:
+    // 1. An available slice with `target_line` + numbered `lines`.
+    // 2. An unavailable slice for a remote-host run — the exact message text
+    //    of the private `REMOTE_NOT_SUPPORTED` const (api/source.rs), copied
+    //    verbatim since the const itself isn't `pub` to import.
+    let available = SourceSlice {
+        available: true,
+        path: Some("src/auth/session.rs".into()),
+        language: Some("rust"),
+        start_line: Some(40),
+        end_line: Some(44),
+        target_line: Some(42),
+        total_lines: Some(120),
+        lines: Some(vec![
+            SourceLine {
+                n: 40,
+                text: "    pub fn verify(&self, token: &str) -> bool {".into(),
+            },
+            SourceLine {
+                n: 41,
+                text: "        let stored_token = self.stored_token();".into(),
+            },
+            SourceLine {
+                n: 42,
+                text: "        if token == stored_token {".into(),
+            },
+            SourceLine {
+                n: 43,
+                text: "            return true;".into(),
+            },
+            SourceLine {
+                n: 44,
+                text: "        }".into(),
+            },
+        ]),
+        reason: None,
+    };
+    let unavailable = SourceSlice {
+        reason: Some("Source preview is not available for remote-host runs yet.".into()),
+        ..SourceSlice::default()
+    };
+    check_fixture("run_source.json", &vec![available, unavailable]);
+}
+
+#[test]
+fn run_ast_fixture_is_current() {
+    // `GET /api/runs/:id/ast` (`get_ast`, api/source.rs) returns
+    // `AstResponse` directly — `root: Some(rupu_ast::AstNode)` is the real
+    // type (fields per `rupu_ast::lib.rs`), hand-built as a small 3-level
+    // tree (`source_file` → `function_item` → `identifier`) rather than a
+    // live tree-sitter parse, so the fixture stays stable across grammar
+    // version bumps. Only the deepest (target) node carries `matched: true`,
+    // mirroring `parse_slice`'s "matched node id" flagging.
+    let identifier = AstNode {
+        kind: "identifier".into(),
+        named: true,
+        field: Some("name".into()),
+        start_line: 2,
+        start_col: 8,
+        end_line: 2,
+        end_col: 12,
+        matched: true,
+        children: vec![],
+    };
+    let function_item = AstNode {
+        kind: "function_item".into(),
+        named: true,
+        field: None,
+        start_line: 1,
+        start_col: 1,
+        end_line: 3,
+        end_col: 2,
+        matched: false,
+        children: vec![identifier],
+    };
+    let source_file = AstNode {
+        kind: "source_file".into(),
+        named: true,
+        field: None,
+        start_line: 1,
+        start_col: 1,
+        end_line: 3,
+        end_col: 2,
+        matched: false,
+        children: vec![function_item],
+    };
+    let response = AstResponse {
+        available: true,
+        language: Some("rust".into()),
+        root: Some(source_file),
+        truncated: Some(false),
+        reason: None,
+    };
+    check_fixture("run_ast.json", &response);
 }

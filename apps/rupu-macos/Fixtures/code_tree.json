@@ -1,0 +1,16 @@
+{
+  "path": "src",
+  "parent": "",
+  "entries": [
+    {
+      "name": "auth",
+      "path": "src/auth",
+      "kind": "dir"
+    },
+    {
+      "name": "main.rs",
+      "path": "src/main.rs",
+      "kind": "file"
+    }
+  ]
+}
