@@ -506,9 +506,16 @@ struct ActivityStoreTests {
     // (headStart + 2*debounceInterval) lands strictly after it — see the
     // arithmetic in the comments below.
     @MainActor @Test func debouncedRefreshCollidingWithInFlightRefreshRetriesOnceAfterItCompletes() async {
+        // Margins deliberately wide (were 10/25/47 — first-fire margin 13ms,
+        // retry margin 3ms): on loaded macos-15 CI runners timer jitter can
+        // shift the retry INSIDE the slow fetch's window, where it collides
+        // again and gives up (one-retry guard) — fetches stuck at 2 forever.
+        // With 10/150/200 the first fire (~160) sits 50ms inside the window
+        // (10..210) and the retry (~310) lands 100ms after it — both margins
+        // comfortably above observed CI jitter, same discriminator.
         let headStartMS = 10
-        let debounceMS = 25
-        let slowFetchMS = 47 // strictly between (headStart+debounce)=35 and (headStart+2*debounce)=60
+        let debounceMS = 150
+        let slowFetchMS = 200 // strictly between (headStart+debounce)=160 and (headStart+2*debounce)=310
 
         let workflowFetches = Counter()
         let (store, box) = makeStore(debounceInterval: .milliseconds(debounceMS)) { req in
