@@ -9,6 +9,7 @@ import RupuOverview
 import RupuProjects
 import RupuFleet
 import RupuLibrary
+import RupuSecurity
 
 /// The app's window content: fixed sidebar + detail pane that switches on
 /// `model.route`. Phase 2+ swaps each `PlaceholderScreen` branch for a real
@@ -209,6 +210,14 @@ public struct RootView: View {
         case .projectDetail(let wsID):
             ProjectDetailScreen(model: model, backend: backend, wsID: wsID)
         case .security:
+            SecurityScreen(model: model, backend: backend)
+        case .coverageDetail:
+            // Phase 5B, Task 3 stubs this route so Coverage-tab row taps
+            // compile and navigate somewhere real; Task 4 replaces this arm
+            // with `CoverageDetailScreen` (`.superpowers/sdd/2026-08-24-
+            // rupu-macos-phase-5b-security-usage/task-4-brief.md`). Same
+            // honest "not built yet" chrome every other placeholder route
+            // uses — no fake header, no fake data.
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .library:
             LibraryScreen(model: model, backend: backend)

@@ -560,9 +560,14 @@ private struct SessionsTabContent: View {
 /// Local, minimal rendering — deliberately not `RupuRunDetail.
 /// FindingsTabContent`, which is private to that module: reaching for it
 /// would mean adding a `RupuProjects → RupuRunDetail` module dependency for
-/// one shared view. `Severity`/`Color.severity(_:)` (the piece that
-/// actually needs sharing — the severity vocabulary itself) already lives
-/// in `RupuDesign`, which this module depends on regardless.
+/// one shared view. `Severity`/`Color.severity(_:)`/`Severity.
+/// init(wireString:)` (the piece that actually needs sharing — the
+/// severity vocabulary and its wire mapping) already live in `RupuDesign`,
+/// which this module depends on regardless — this struct used to carry its
+/// own copy of the wire-string switch too, until Phase 5B Task 3's severity
+/// lift (`RupuDesign/Tokens.swift`'s `Severity.init(wireString:)` doc
+/// comment) moved it out from under both this file and `RunDetailTabs.
+/// swift`.
 private struct ProjectFindingsTabContent: View {
     let findings: BlockState<APIFindings>
 
@@ -616,7 +621,7 @@ private struct ProjectFindingsTabContent: View {
     private func findingRow(_ finding: APIFinding) -> some View {
         HStack(spacing: 0) {
             Rectangle()
-                .fill(Color.severity(severity(for: finding.severity)))
+                .fill(Color.severity(Severity(wireString: finding.severity)))
                 .frame(width: 2)
             VStack(alignment: .leading, spacing: 2) {
                 Text(finding.summary)
@@ -636,20 +641,6 @@ private struct ProjectFindingsTabContent: View {
     private func fileLabel(_ path: String, _ lineRange: [UInt32]?) -> String {
         guard let lineRange, lineRange.count == 2 else { return path }
         return "\(path):\(lineRange[0])-\(lineRange[1])"
-    }
-
-    /// Same wire vocabulary mapping as `RupuRunDetail.FindingsTabContent.
-    /// severity(for:)` — see that method's doc comment for why an
-    /// unrecognized string falls back to `.info` rather than crashing.
-    private func severity(for raw: String) -> Severity {
-        switch raw {
-        case "critical": .crit
-        case "high": .high
-        case "medium": .med
-        case "low": .low
-        case "info": .info
-        default: .info
-        }
     }
 }
 

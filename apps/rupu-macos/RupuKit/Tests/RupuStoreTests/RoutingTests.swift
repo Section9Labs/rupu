@@ -300,3 +300,44 @@ import Testing
     // nothing left to inherit.
     #expect(model.consumeLauncherPrefill() == nil)
 }
+
+// MARK: - .coverageDetail (Phase 5B, Task 3)
+
+/// `.coverageDetail` is pushed from `.security`'s Coverage tab (a row tap —
+/// Task 4 builds the real destination screen, this task only stubs the
+/// route + an honest `PlaceholderScreen`) and keeps the sidebar
+/// highlighting Security, same "pushed, not directly sidebar-selectable"
+/// contract `.projectDetail`/`.agentDefinition` already have for
+/// Projects/Library.
+@MainActor @Test func coverageDetailKeepsSidebarHighlightOnSecurity() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.route = .security
+
+    model.route = .coverageDetail(target: "auth-core", wsID: "ws-1")
+    #expect(model.selectedSidebarItem == SidebarItem.security)
+}
+
+/// `navigate(to:)`/`navigateBack()` from Security push/pop the same as
+/// every other pushed detail route.
+@MainActor @Test func navigateBackFromCoverageDetailReturnsToSecurity() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.route = .security
+
+    model.navigate(to: .coverageDetail(target: "auth-core", wsID: "ws-1"))
+    #expect(model.route == .coverageDetail(target: "auth-core", wsID: "ws-1"))
+    #expect(model.routeStack == [.security])
+
+    model.navigateBack()
+    #expect(model.route == .security)
+}
+
+/// `Route` equality distinguishes `.coverageDetail` instances by both
+/// associated values, same regression-guard shape `RouteTests`'
+/// `agentRunDetailRoutesWithDifferentFieldsAreNotEqual` already establishes
+/// for `.agentRunDetail`.
+@MainActor @Test func coverageDetailRoutesWithDifferentFieldsAreNotEqual() {
+    let base = Route.coverageDetail(target: "auth-core", wsID: "ws-1")
+    #expect(base == Route.coverageDetail(target: "auth-core", wsID: "ws-1"))
+    #expect(base != Route.coverageDetail(target: "web-api", wsID: "ws-1"))
+    #expect(base != Route.coverageDetail(target: "auth-core", wsID: "ws-2"))
+}

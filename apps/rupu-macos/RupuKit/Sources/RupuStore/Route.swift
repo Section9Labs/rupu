@@ -42,6 +42,16 @@ public enum Route: Hashable, Sendable {
     /// `SidebarItem.projects`, same as those two map to `.activity`.
     case projectDetail(wsID: String)
     case security
+    /// One coverage target's detail view (Phase 5B, Task 3 stubs the route;
+    /// Task 4 builds `CoverageDetailScreen`) — pushed from a `.security`
+    /// Coverage-tab row tap via `AppModel.navigate(to:)`, same "pushed, not
+    /// directly sidebar-selectable" contract `.projectDetail` documents for
+    /// Projects. `wsID` is `APICoverageSummary.wsID` (never optional on that
+    /// row — see its doc comment), carried straight through to
+    /// `CPClient.coverageDetail(target:wsID:)`'s disambiguation query param.
+    /// Until Task 4 lands, `RootView` renders this as an honest
+    /// `PlaceholderScreen` — see that switch arm's own comment.
+    case coverageDetail(target: String, wsID: String)
     case library
     /// One agent definition's detail view (Phase 5A, Task 7) — pushed from
     /// a `.library` agents-tab row tap via `AppModel.navigate(to:)`, same
