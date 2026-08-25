@@ -35,6 +35,12 @@ public enum Route: Hashable, Sendable {
     /// "no transcript recorded" state rather than attempting a fetch.
     case agentRunDetail(id: String, transcriptPath: String?, host: String?)
     case projects
+    /// One project's detail (Phase 5A, Task 5) — pushed from a `.projects`
+    /// row tap via `AppModel.navigate(to:)`, same "pushed, not directly
+    /// sidebar-selectable" contract `.runDetail`/`.sessionDetail` already
+    /// follow. `selectedSidebarItem`'s getter maps this to
+    /// `SidebarItem.projects`, same as those two map to `.activity`.
+    case projectDetail(wsID: String)
     case security
     case library
     case fleet

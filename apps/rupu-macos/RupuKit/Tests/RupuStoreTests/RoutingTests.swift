@@ -61,6 +61,14 @@ import Testing
     #expect(model.selectedSidebarItem == SidebarItem.activity)
 }
 
+@MainActor @Test func projectDetailKeepsSidebarHighlightOnProjects() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.route = .projects
+
+    model.route = .projectDetail(wsID: "ws-1")
+    #expect(model.selectedSidebarItem == SidebarItem.projects)
+}
+
 @MainActor @Test func navigateBackRestoresPriorActivityFilterDefaultingToAll() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
 

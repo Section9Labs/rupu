@@ -123,7 +123,7 @@ public final class AppModel {
             case .overview: .overview
             case .activity: .activity
             case .runDetail, .sessionDetail, .agentRunDetail: .activity
-            case .projects: .projects
+            case .projects, .projectDetail: .projects
             case .security: .security
             case .library: .library
             case .fleet: .fleet

@@ -1,0 +1,833 @@
+import SwiftUI
+import RupuAPI
+import RupuStore
+import RupuDesign
+
+/// The Project Detail screen's tab bar (Phase 5A, Task 5) — same
+/// text-button-plus-underline idiom as `RupuRunDetail.RunDetailTabBar`
+/// (deliberately re-derived here rather than shared: that type is private
+/// to `RupuRunDetail`, and this screen's tab set — six, not four — and
+/// findings-badge placement differ enough that a shared generic type isn't
+/// worth the indirection for one more screen).
+public enum ProjectDetailTab: String, CaseIterable, Sendable {
+    case overview, runs, sessions, findings, coverage, definitions
+
+    var title: String {
+        switch self {
+        case .overview: "Overview"
+        case .runs: "Runs"
+        case .sessions: "Sessions"
+        case .findings: "Findings"
+        case .coverage: "Coverage"
+        case .definitions: "Definitions"
+        }
+    }
+}
+
+/// The Project Detail screen (Phase 5A, Task 5), pushed from a Projects list
+/// row tap (`.projectDetail(wsID:)`): header (back chevron, breadcrumb,
+/// facts line) + a six-tab panel — Overview/Runs/Sessions/Findings/Coverage/
+/// Definitions. Owns a `ProjectDetailStore` lifecycle the same way
+/// `RunDetailScreen` owns a `RunDetailStore`: built lazily once
+/// `backend.client()` exists, rebuilt on a `wsID` change OR a backend client
+/// swap, `store.activate()`d on appear (loads `detail` only — every other
+/// tab's block is fetched lazily, see `ProjectDetailStore`'s own doc
+/// comment).
+///
+/// **Lazy tab loading**: `tabPanel`'s `.task(id:)` is keyed on `wsID` AND
+/// `tab` together (not `tab` alone) — a plain `.task(id: tab)` would miss a
+/// `wsID` change that leaves `tab` unchanged (e.g. still `.overview` after
+/// `activate()` resets it back to `.overview` for the new project), since
+/// `.task(id:)` only re-fires when its id's *value* changes. Combining both
+/// into one id makes every `wsID`/`tab` combination its own fetch trigger.
+///
+/// **Does NOT need `OverviewScreen`'s cold-launch fix** — same reasoning
+/// `RunDetailScreen`/`ProjectsScreen` already document: `.projectDetail` is
+/// only ever reached by pushing from `.projects`, never a cold-launch route.
+public struct ProjectDetailScreen: View {
+    @Bindable var model: AppModel
+    let backend: BackendController
+    let wsID: String
+
+    @State private var store: ProjectDetailStore?
+    @State private var storeWsID: String?
+    @State private var storeClientID: ObjectIdentifier?
+    @State private var tab: ProjectDetailTab = .overview
+
+    public init(model: AppModel, backend: BackendController, wsID: String) {
+        self.model = model
+        self.backend = backend
+        self.wsID = wsID
+    }
+
+    public var body: some View {
+        Group {
+            if let store {
+                content(store: store)
+            } else {
+                centeredLabel("Backend not connected")
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color.rupuBg)
+        .task(id: wsID) {
+            await activate()
+        }
+    }
+
+    /// Builds (or rebuilds, on a `wsID` change OR a backend client swap) the
+    /// store, resets `tab` back to `.overview` for the new project, and
+    /// activates it. Same `storeWsID`/`storeClientID` recipe
+    /// `RunDetailScreen` uses for `storeRunID`/`storeClientID` — see that
+    /// type's `activate()` doc comment.
+    private func activate() async {
+        guard let client = backend.client() else { return }
+        let clientID = backend.clientIdentity()
+        if storeWsID != wsID || storeClientID != clientID {
+            store = ProjectDetailStore(wsID: wsID, client: client)
+            storeWsID = wsID
+            storeClientID = clientID
+            tab = .overview
+        }
+        guard let store else { return }
+        await store.activate()
+    }
+
+    // MARK: - Layout
+
+    private func content(store: ProjectDetailStore) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header(store: store)
+            tabPanel(store: store)
+        }
+        .padding(16)
+    }
+
+    // MARK: - Header
+
+    private func header(store: ProjectDetailStore) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Button {
+                    model.navigateBack()
+                } label: {
+                    Icon(.arrowLeft)
+                        .foregroundStyle(Color.rupuDim)
+                }
+                .buttonStyle(.plain)
+
+                if case .content(let detail) = store.detail {
+                    Text("Projects ▸ \(detail.project.name)")
+                        .font(.leadText)
+                        .foregroundStyle(Color.rupuInk)
+                } else {
+                    Text("Projects")
+                        .font(.leadText)
+                        .foregroundStyle(Color.rupuInk)
+                }
+                Spacer(minLength: 0)
+            }
+
+            switch store.detail {
+            case .loading:
+                ProgressView().controlSize(.small)
+            case .failed(let message):
+                FailedNote(message: message)
+            case .empty:
+                EmptyView()
+            case .content(let detail):
+                factsLine(detail)
+            }
+        }
+    }
+
+    private func factsLine(_ detail: APIProjectDetail) -> some View {
+        HStack(spacing: 14) {
+            fact("Runs", Fmt.count(detail.runs.total))
+            fact("Running", Fmt.count(detail.runs.running))
+            fact("Sessions", Fmt.count(detail.sessions.total))
+            fact("Active sessions", Fmt.count(detail.sessions.active))
+            fact("Spend", Fmt.cost(detail.usage.costUSD))
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func fact(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.metaText).foregroundStyle(Color.rupuMute)
+            Text(value).font(.dataMono(11)).foregroundStyle(Color.rupuInk)
+        }
+    }
+
+    // MARK: - Tab panel
+
+    private func tabPanel(store: ProjectDetailStore) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ProjectDetailTabBar(tab: $tab, findingsCount: findingsCount(store: store))
+            Divider()
+            tabContent(store: store)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .panelStyle(.panel)
+        // See the type doc comment's "Lazy tab loading" section for why
+        // both `wsID` and `tab` are folded into one id.
+        .task(id: "\(wsID)|\(tab.rawValue)") {
+            await loadTab(tab, store: store)
+        }
+    }
+
+    private func findingsCount(store: ProjectDetailStore) -> Int {
+        guard case .content(let value) = store.findings else { return 0 }
+        return value.summary.total
+    }
+
+    /// Dispatches the lazy fetch for whichever tab is now selected —
+    /// `.overview`/`.coverage` need nothing beyond `detail` (already loaded
+    /// by `activate()`) and the honest placeholder note respectively.
+    /// `.definitions` fires all three of its own sub-lists concurrently —
+    /// each is independently idempotent (`loadXIfNeeded()`), so a repeat
+    /// visit to this tab is a no-op fan-out, not three redundant fetches.
+    private func loadTab(_ tab: ProjectDetailTab, store: ProjectDetailStore) async {
+        switch tab {
+        case .overview, .coverage:
+            break
+        case .runs:
+            await store.loadRunsIfNeeded()
+        case .sessions:
+            await store.loadSessionsIfNeeded()
+        case .findings:
+            await store.loadFindingsIfNeeded()
+        case .definitions:
+            async let agentsLoad: Void = store.loadAgentsIfNeeded()
+            async let workflowsLoad: Void = store.loadWorkflowsIfNeeded()
+            async let autoflowsLoad: Void = store.loadAutoflowsIfNeeded()
+            _ = await (agentsLoad, workflowsLoad, autoflowsLoad)
+        }
+    }
+
+    @ViewBuilder
+    private func tabContent(store: ProjectDetailStore) -> some View {
+        switch tab {
+        case .overview:
+            OverviewTabContent(store: store, onSelect: { model.navigate(to: $0) })
+        case .runs:
+            RunsTabContent(store: store, onSelect: { model.navigate(to: $0) })
+        case .sessions:
+            SessionsTabContent(store: store, onSelect: { model.navigate(to: $0) })
+        case .findings:
+            ProjectFindingsTabContent(findings: store.findings)
+        case .coverage:
+            CoverageTabContent()
+        case .definitions:
+            DefinitionsTabContent(store: store)
+        }
+    }
+
+    private func centeredLabel(_ label: String) -> some View {
+        VStack {
+            Spacer(minLength: 0)
+            Text(label).font(.noteText).foregroundStyle(Color.rupuMute)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Tab bar
+
+private struct ProjectDetailTabBar: View {
+    @Binding var tab: ProjectDetailTab
+    let findingsCount: Int
+
+    var body: some View {
+        HStack(spacing: 18) {
+            ForEach(ProjectDetailTab.allCases, id: \.self) { candidate in
+                tabButton(candidate)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+    }
+
+    private func tabButton(_ candidate: ProjectDetailTab) -> some View {
+        let active = tab == candidate
+        return Button {
+            tab = candidate
+        } label: {
+            VStack(spacing: 6) {
+                HStack(spacing: 6) {
+                    Text(candidate.title)
+                        .font(.uiText)
+                        .foregroundStyle(active ? Color.rupuInk : Color.rupuDim)
+                    if candidate == .findings, findingsCount > 0 {
+                        Badge("\(findingsCount)", tone: Color.status(.awaiting))
+                    }
+                }
+                Rectangle()
+                    .fill(active ? Color.rupuBrand : Color.clear)
+                    .frame(height: 2)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Overview tab
+
+private struct OverviewTabContent: View {
+    let store: ProjectDetailStore
+    let onSelect: (Route) -> Void
+
+    var body: some View {
+        Group {
+            switch store.detail {
+            case .loading:
+                ProgressView().controlSize(.small).padding(12)
+            case .failed(let message):
+                FailedNote(message: message).padding(12)
+            case .empty:
+                Text("No data").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
+            case .content(let detail):
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        statusBreakdown(detail)
+                        surfaceBreakdown(detail)
+                        recentRuns(detail)
+                    }
+                    .padding(12)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func statusBreakdown(_ detail: APIProjectDetail) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Eyebrow("By status")
+            HStack(spacing: 8) {
+                ForEach(detail.runs.byStatus.sorted(by: { $0.key < $1.key }), id: \.key) { key, count in
+                    Badge("\(key) \(count)")
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private func surfaceBreakdown(_ detail: APIProjectDetail) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Eyebrow("By surface")
+            HStack(spacing: 8) {
+                Badge("workflow \(detail.runs.bySurface.workflow)")
+                Badge("autoflow \(detail.runs.bySurface.autoflow)")
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private func recentRuns(_ detail: APIProjectDetail) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Eyebrow("Recent runs")
+            if detail.recentRuns.isEmpty {
+                Text("No runs yet").font(.noteText).foregroundStyle(Color.rupuMute)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(detail.recentRuns, id: \.id) { row in
+                        RunRow(row: row, onSelect: onSelect)
+                        Divider()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Runs tab (windowed)
+
+private struct RunsTabContent: View {
+    let store: ProjectDetailStore
+    let onSelect: (Route) -> Void
+
+    var body: some View {
+        Group {
+            switch store.runs {
+            case .loading:
+                ProgressView().controlSize(.small).padding(12)
+            case .failed(let message):
+                FailedNote(message: message).padding(12)
+            case .empty:
+                Text("No runs yet").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
+            case .content(let rows):
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(rows, id: \.id) { row in
+                            RunRow(row: row, onSelect: onSelect)
+                            Divider()
+                        }
+                        showAllFooter(loaded: rows.count)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Honest "show all", per the brief — only rendered while there is
+    /// provably more to show: `store.detail`'s own `runs.total` (a real
+    /// server-reported count, not inferred from the window size) is bigger
+    /// than what's currently loaded, and the window hasn't already been
+    /// widened to "show all". No fake infinite scroll, no guessing.
+    @ViewBuilder
+    private func showAllFooter(loaded: Int) -> some View {
+        if !store.runsShowingAll, let total = store.detail.value?.runs.total, loaded < total {
+            Button("Show all \(Fmt.count(total)) runs") {
+                Task { await store.showAllRuns() }
+            }
+            .buttonStyle(.plain)
+            .font(.noteText)
+            .foregroundStyle(Color.rupuBrand)
+            .padding(12)
+        }
+    }
+}
+
+// MARK: - Sessions tab (windowed)
+
+private struct SessionsTabContent: View {
+    let store: ProjectDetailStore
+    let onSelect: (Route) -> Void
+
+    var body: some View {
+        Group {
+            switch store.sessions {
+            case .loading:
+                ProgressView().controlSize(.small).padding(12)
+            case .failed(let message):
+                FailedNote(message: message).padding(12)
+            case .empty:
+                Text("No sessions yet").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
+            case .content(let rows):
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(rows, id: \.sessionID) { row in
+                            SessionRow(row: row, onSelect: onSelect)
+                            Divider()
+                        }
+                        showAllFooter(loaded: rows.count)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Same honest-total contract as `RunsTabContent.showAllFooter` — see
+    /// that method's doc comment.
+    @ViewBuilder
+    private func showAllFooter(loaded: Int) -> some View {
+        if !store.sessionsShowingAll, let total = store.detail.value?.sessions.total, loaded < total {
+            Button("Show all \(Fmt.count(total)) sessions") {
+                Task { await store.showAllSessions() }
+            }
+            .buttonStyle(.plain)
+            .font(.noteText)
+            .foregroundStyle(Color.rupuBrand)
+            .padding(12)
+        }
+    }
+}
+
+// MARK: - Findings tab
+
+/// Local, minimal rendering — deliberately not `RupuRunDetail.
+/// FindingsTabContent`, which is private to that module: reaching for it
+/// would mean adding a `RupuProjects → RupuRunDetail` module dependency for
+/// one shared view. `Severity`/`Color.severity(_:)` (the piece that
+/// actually needs sharing — the severity vocabulary itself) already lives
+/// in `RupuDesign`, which this module depends on regardless.
+private struct ProjectFindingsTabContent: View {
+    let findings: BlockState<APIFindings>
+
+    var body: some View {
+        Group {
+            switch findings {
+            case .loading:
+                ProgressView().controlSize(.small).padding(12)
+            case .failed(let message):
+                FailedNote(message: message).padding(12)
+            case .empty:
+                Text("No findings").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
+            case .content(let value):
+                if value.findings.isEmpty {
+                    Text("No findings").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            summaryBadges(value.summary)
+                            ForEach(value.findings, id: \.id) { finding in
+                                findingRow(finding)
+                            }
+                        }
+                        .padding(12)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func summaryBadges(_ summary: APIFindingsSummary) -> some View {
+        HStack(spacing: 8) {
+            severityCount("C", summary.critical, .crit)
+            severityCount("H", summary.high, .high)
+            severityCount("M", summary.medium, .med)
+            severityCount("L", summary.low, .low)
+            severityCount("I", summary.info, .info)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func severityCount(_ label: String, _ count: Int, _ severity: Severity) -> some View {
+        HStack(spacing: 3) {
+            Text(label).font(.dataMono(10)).foregroundStyle(Color.severity(severity))
+            Text("\(count)").font(.dataMono(10)).foregroundStyle(Color.rupuDim)
+        }
+        .opacity(count == 0 ? 0.35 : 1)
+    }
+
+    private func findingRow(_ finding: APIFinding) -> some View {
+        HStack(spacing: 0) {
+            Rectangle()
+                .fill(Color.severity(severity(for: finding.severity)))
+                .frame(width: 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(finding.summary)
+                    .font(.uiText)
+                    .foregroundStyle(Color.rupuInk)
+                    .lineLimit(2)
+                if let filePath = finding.filePath {
+                    Text(fileLabel(filePath, finding.lineRange))
+                        .font(.dataMono(10))
+                        .foregroundStyle(Color.rupuMute)
+                }
+            }
+            .padding(.leading, 8)
+        }
+    }
+
+    private func fileLabel(_ path: String, _ lineRange: [UInt32]?) -> String {
+        guard let lineRange, lineRange.count == 2 else { return path }
+        return "\(path):\(lineRange[0])-\(lineRange[1])"
+    }
+
+    /// Same wire vocabulary mapping as `RupuRunDetail.FindingsTabContent.
+    /// severity(for:)` — see that method's doc comment for why an
+    /// unrecognized string falls back to `.info` rather than crashing.
+    private func severity(for raw: String) -> Severity {
+        switch raw {
+        case "critical": .crit
+        case "high": .high
+        case "medium": .med
+        case "low": .low
+        case "info": .info
+        default: .info
+        }
+    }
+}
+
+// MARK: - Coverage tab (honest placeholder)
+
+/// Spec-ruled honest placeholder (Phase 5A plan §5's "Coverage-tab
+/// placeholder honesty" note): the cheap `coverage.targets`/`coverage.
+/// findings` counts `APIProjectDetail` already carries are deliberately
+/// NOT rendered here — the metric that would make them meaningful
+/// (`assessed_pct`, a separate `GET /api/projects/:ws_id/coverage/assessed`
+/// call this phase doesn't cover) is absent, and half a coverage picture is
+/// worse than an honest "not yet" note. No fake data, no dead chrome.
+private struct CoverageTabContent: View {
+    var body: some View {
+        VStack(spacing: 8) {
+            Spacer(minLength: 0)
+            Text("Coverage").font(.noteText.weight(.semibold)).foregroundStyle(Color.rupuInk)
+            Text("Arrives with Security (Phase 5B)").font(.noteText).foregroundStyle(Color.rupuMute)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Definitions tab
+
+/// Local, minimal definition rows — Task 7 (`RupuLibrary`, the Library
+/// screen) hadn't landed as of this task, so there is no shared
+/// definition-row component to reuse yet; the brief calls for exactly this
+/// fallback ("if Task 7 hasn't landed yet, keep local minimal rows — say
+/// which"). Three independently-loaded, independently-rendered sections —
+/// Agents/Workflows/Autoflows — each its own `BlockState` from
+/// `ProjectDetailStore`.
+private struct DefinitionsTabContent: View {
+    let store: ProjectDetailStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                agentsSection
+                workflowsSection
+                autoflowsSection
+            }
+            .padding(12)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ViewBuilder
+    private var agentsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Eyebrow("Agents")
+            switch store.agents {
+            case .loading:
+                ProgressView().controlSize(.small)
+            case .failed(let message):
+                FailedNote(message: message)
+            case .empty:
+                Text("None").font(.noteText).foregroundStyle(Color.rupuMute)
+            case .content(let rows):
+                VStack(spacing: 0) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, def in
+                        AgentDefRow(def: def)
+                        Divider()
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var workflowsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Eyebrow("Workflows")
+            switch store.workflows {
+            case .loading:
+                ProgressView().controlSize(.small)
+            case .failed(let message):
+                FailedNote(message: message)
+            case .empty:
+                Text("None").font(.noteText).foregroundStyle(Color.rupuMute)
+            case .content(let rows):
+                VStack(spacing: 0) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, def in
+                        WorkflowDefRow(def: def)
+                        Divider()
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var autoflowsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Eyebrow("Autoflows")
+            switch store.autoflows {
+            case .loading:
+                ProgressView().controlSize(.small)
+            case .failed(let message):
+                FailedNote(message: message)
+            case .empty:
+                Text("None").font(.noteText).foregroundStyle(Color.rupuMute)
+            case .content(let rows):
+                VStack(spacing: 0) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, def in
+                        AutoflowDefRow(def: def)
+                        Divider()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct AgentDefRow: View {
+    let def: AgentDefinition
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(def.name).font(.uiText).foregroundStyle(Color.rupuInk).lineLimit(1)
+            if let provider = def.provider {
+                Badge(provider)
+            }
+            if let model = def.model {
+                Text(model).font(.dataMono(10)).foregroundStyle(Color.rupuDim).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text("\(def.runCount) runs").font(.metaText).foregroundStyle(Color.rupuMute)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct WorkflowDefRow: View {
+    let def: WorkflowDefinition
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(def.name).font(.uiText).foregroundStyle(Color.rupuInk).lineLimit(1)
+            if def.autoflowEnabled == true {
+                Badge("autoflow", tone: Color.status(.running))
+            }
+            Spacer(minLength: 8)
+            Text("\(def.runCount) runs").font(.metaText).foregroundStyle(Color.rupuMute)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct AutoflowDefRow: View {
+    let def: AutoflowDefinition
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(def.name).font(.uiText).foregroundStyle(Color.rupuInk).lineLimit(1)
+            Badge(def.trigger)
+            Spacer(minLength: 8)
+            Badge(def.enabled ? "enabled" : "disabled", tone: def.enabled ? Color.status(.running) : Color.rupuMute)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+// MARK: - Shared row/note views
+
+/// One run row — status dot, workflow name, trigger, duration, cost, and a
+/// relative "started" timestamp. Reused by the Overview tab's recent-runs
+/// preview and the Runs tab's windowed list. Navigation reuses `ActivityRow
+/// (_:APIRunListRow)`'s own `.navigation.route` mapping (`RupuStore`) rather
+/// than re-deriving "which route does a run row push" here — the exact
+/// "smallest equivalent" the brief calls for instead of pulling in
+/// `RupuActivity`'s `ActivityTable` (which needs an `ActivityStore`/
+/// `BackendController` for its own inline gate actions, well beyond what
+/// this read-only row needs).
+private struct RunRow: View {
+    let row: APIRunListRow
+    let onSelect: (Route) -> Void
+
+    private var activityRow: ActivityRow { ActivityRow(row) }
+    private var isClickable: Bool { activityRow.navigation.route != nil }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle().fill(Color.status(activityRow.status.tone)).frame(width: 6, height: 6)
+            Text(row.workflowName)
+                .font(.uiText)
+                .foregroundStyle(Color.rupuInk)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(row.trigger)
+                .font(.metaText)
+                .foregroundStyle(Color.rupuDim)
+            Text(row.durationMS.map { Fmt.duration(ms: $0) } ?? "—")
+                .font(.dataMono(10))
+                .foregroundStyle(Color.rupuDim)
+                .frame(width: 48, alignment: .trailing)
+            Text(Fmt.cost(row.usage.costUSD))
+                .font(.dataMono(10))
+                .foregroundStyle(Color.rupuDim)
+                .frame(width: 56, alignment: .trailing)
+            Text(startedLabel)
+                .font(.dataMono(10))
+                .foregroundStyle(Color.rupuMute)
+                .frame(width: 72, alignment: .trailing)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard isClickable, let route = activityRow.navigation.route else { return }
+            onSelect(route)
+        }
+    }
+
+    private var startedLabel: String {
+        guard let date = ActivityRow.parseISO(row.startedAt) else { return "—" }
+        return Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+}
+
+/// One session row — same navigation-reuse rationale as `RunRow` above,
+/// via `ActivityRow(_:APISessionRow)`.
+private struct SessionRow: View {
+    let row: APISessionRow
+    let onSelect: (Route) -> Void
+
+    private var activityRow: ActivityRow { ActivityRow(row) }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle().fill(Color.status(activityRow.status.tone)).frame(width: 6, height: 6)
+            Text(row.agentName)
+                .font(.uiText)
+                .foregroundStyle(Color.rupuInk)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(row.model)
+                .font(.dataMono(10))
+                .foregroundStyle(Color.rupuDim)
+                .lineLimit(1)
+            Text("\(row.totalTurns) turns")
+                .font(.metaText)
+                .foregroundStyle(Color.rupuMute)
+                .frame(width: 64, alignment: .trailing)
+            Text(Fmt.cost(row.usage?.costUSD))
+                .font(.dataMono(10))
+                .foregroundStyle(Color.rupuDim)
+                .frame(width: 56, alignment: .trailing)
+            Text(startedLabel)
+                .font(.dataMono(10))
+                .foregroundStyle(Color.rupuMute)
+                .frame(width: 72, alignment: .trailing)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard let route = activityRow.navigation.route else { return }
+            onSelect(route)
+        }
+    }
+
+    private var startedLabel: String {
+        guard let date = ActivityRow.parseISO(row.createdAt) else { return "—" }
+        return Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+}
+
+private struct FailedNote: View {
+    let message: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Failed to load")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
+            Text(message)
+                .font(.noteText)
+                .foregroundStyle(Color.rupuDim)
+                .lineLimit(3)
+        }
+    }
+}
