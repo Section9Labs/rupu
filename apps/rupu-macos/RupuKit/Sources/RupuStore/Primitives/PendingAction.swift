@@ -37,6 +37,23 @@ public enum ActionVerb: String, Sendable, Hashable {
     /// `restore`/`send`/`launch` already do for their own response-visible
     /// effects.
     case setEnabled
+    /// Phase 6B, Task 3 addition: `ClaimsStore.release(issueRef:)`. Entity-
+    /// scoped to an issue ref (`ActionKey(issueRef, .release)`, no composite
+    /// needed — see `ClaimsStore`'s doc comment on why `issue_ref` is already
+    /// globally unique). Same "never resolved by status" bucket as every
+    /// other verb below — a claim has no `ActivityStatus` at all.
+    /// `POST /api/autoflows/claims/release` is idempotent (`released: false`
+    /// for an already-untracked issue is still a confirmed 200, not a
+    /// failure), so this confirms on ANY successful response, not just
+    /// `released: true` — see `ClaimsStore.release(issueRef:)`'s doc comment.
+    case release
+    /// Phase 6B, Task 3 addition: `ClaimsStore.requeue(issueRef:)`. Same
+    /// entity-scoping as `.release` above (`ActionKey(issueRef, .requeue)`).
+    /// `POST /api/autoflows/claims/requeue` only enqueues a manual wake — it
+    /// has no "done" signal to wait for at all (the wake itself is consumed
+    /// asynchronously by whichever autoflow worker picks it up next), so this
+    /// confirms as soon as the request itself succeeds, same as `.release`.
+    case requeue
 }
 
 /// Identifies one in-flight mutation: which entity (a run ID today; any
@@ -238,7 +255,7 @@ public final class PendingActions {
             return status == .cancelled
         case .pause:
             return status == .paused
-        case .archive, .restore, .send, .launch, .remove, .setEnabled:
+        case .archive, .restore, .send, .launch, .remove, .setEnabled, .release, .requeue:
             return false
         }
     }
