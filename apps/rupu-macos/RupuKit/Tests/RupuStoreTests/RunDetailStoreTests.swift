@@ -1260,14 +1260,20 @@ private func makeStore(
         runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "step-\(i)", kind: "step", agent: nil, host: nil)))
     }
 
-    let settled = await pollUntil(timeout: .seconds(10)) { store.events.count == 500 }
-    #expect(settled, "expected events to settle at the 500 cap, got \(store.events.count)")
+    // Poll on the TERMINAL condition — the LAST yielded event having folded —
+    // not on `count == 500`: the count hits the cap once event 500 lands and
+    // then stays there while events 501–519 are still folding, so a
+    // count-based poll can return with the tail not yet consumed (flaked on
+    // the slower CI runner at exactly one event short; PR #603).
+    let last = CPEvent.stepStarted(runID: "run-1", stepID: "step-519", kind: "step", agent: nil, host: nil)
+    let settled = await pollUntil(timeout: .seconds(10)) { store.events.last == last }
+    #expect(settled, "expected the final event to fold, got count \(store.events.count), last \(String(describing: store.events.last))")
 
-    // Oldest 20 were dropped: the first surviving event is "step-20", the
-    // last is "step-519" — proving the cap drops from the front, not a
+    // Oldest 20 were dropped: the first surviving event is "step-20" and the
+    // count sits at the cap — proving the cap drops from the front, not a
     // truncation of the newest arrivals.
+    #expect(store.events.count == 500)
     #expect(store.events.first == .stepStarted(runID: "run-1", stepID: "step-20", kind: "step", agent: nil, host: nil))
-    #expect(store.events.last == .stepStarted(runID: "run-1", stepID: "step-519", kind: "step", agent: nil, host: nil))
 
     store.deactivate()
     runBox.latest.finish()
