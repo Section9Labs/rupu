@@ -190,6 +190,7 @@ private struct InstrumentCell<Accessory: View>: View {
                     Text(captionSuffix)
                         .font(.metaText)
                         .foregroundStyle(Color.rupuMute)
+                        .help("Some reporting hosts do not supply a findings count — this is a partial sum, not a fleet total.")
                 }
             }
             Text(value)
