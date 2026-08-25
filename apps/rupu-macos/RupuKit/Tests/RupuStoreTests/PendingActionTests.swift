@@ -120,6 +120,11 @@ private let resolveCases: [ResolveCase] = [
     ResolveCase(verb: .restore, observedStatus: .running, expectedConfirmed: false, label: "restore+running"),
     ResolveCase(verb: .send, observedStatus: .completed, expectedConfirmed: false, label: "send+completed"),
     ResolveCase(verb: .launch, observedStatus: .running, expectedConfirmed: false, label: "launch+running"),
+    // remove (Phase 5A, Task 6): a host has no `ActivityStatus` at all —
+    // never resolved by status, same bucket as archive/restore/send/launch.
+    // Its real confirmation path is `FleetStore.applyHosts(_:)`, covered by
+    // `FleetStoreTests`, not this table.
+    ResolveCase(verb: .remove, observedStatus: .completed, expectedConfirmed: false, label: "remove+completed"),
 ]
 
 @MainActor @Test func pendingActionResolveConfirmationTable() {

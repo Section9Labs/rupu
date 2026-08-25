@@ -164,6 +164,19 @@ public actor CPClient {
         try await get("api/workers")
     }
 
+    // MARK: - Fleet (write)
+
+    /// `DELETE /api/hosts/:id` — remove a registered host (Phase 5A, Task 6).
+    /// 204 No Content on success (no response body — see `delete(_:query:)`'s
+    /// doc comment on why this has no `T: Decodable` return), 400 when `id`
+    /// is `"local"` (`crates/rupu-cp/src/api/hosts.rs::remove_host` rejects
+    /// removing the built-in local host outright — `FleetStore`/
+    /// `FleetScreen` never offer the control for it, but the server is the
+    /// actual enforcement point).
+    public func removeHost(id: String) async throws {
+        try await delete("api/hosts/\(id)")
+    }
+
     // MARK: - Project detail (read)
 
     /// `GET /api/projects/:ws_id` — one project's rollup: identity, run/
@@ -476,6 +489,20 @@ public actor CPClient {
         } catch {
             throw CPError.decoding(String(describing: error))
         }
+    }
+
+    /// No decode step, unlike `get`/`post` — every route this hits today
+    /// (`removeHost`, `DELETE /api/hosts/:id`) responds `204 No Content`
+    /// with an empty body, so there is nothing for a `T: Decodable` to
+    /// decode; a generic `delete<T>` would just make every call site thread
+    /// a phantom response type through for nothing. Same error mapping as
+    /// `get`/`post` (`mapErrorStatus`) — a non-2xx still throws.
+    func delete(_ path: String, query: [URLQueryItem] = []) async throws {
+        let url = try buildURL(path: path, query: query)
+        var request = authorizedRequest(url: url)
+        request.httpMethod = "DELETE"
+        let (data, response) = try await perform(request)
+        try mapErrorStatus(response, data: data, url: url)
     }
 }
 

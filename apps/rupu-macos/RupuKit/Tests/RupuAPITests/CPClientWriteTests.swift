@@ -260,6 +260,34 @@ extension CPClientTests {
         #expect(StubURLProtocol.lastRequest?.url?.path == "/api/tools")
     }
 
+    // MARK: - Fleet (write) — Phase 5A, Task 6
+
+    /// `removeHost` sends `DELETE`, no body, and treats a bare 204 (empty
+    /// data, no `Content-Type`) as success — it never attempts to decode a
+    /// response, unlike every other write route this file covers.
+    @Test func removeHostSendsDeleteToExpectedPathWithNoBody() async throws {
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (204, [:], Data()) }
+
+        try await client().removeHost(id: "mini")
+
+        #expect(StubURLProtocol.lastRequest?.httpMethod == "DELETE")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/hosts/mini")
+        #expect(StubURLProtocol.lastRequest?.httpBodyStreamedOrDirect() == nil || StubURLProtocol.lastRequest?.httpBodyStreamedOrDirect()?.isEmpty == true)
+    }
+
+    /// The server's actual 400 for `id == "local"` (see `CPClient.removeHost`'s
+    /// doc comment) — `delete(_:query:)` maps a non-2xx the same way `get`/
+    /// `post` do.
+    @Test func removeHostThrowsHTTPErrorOnNonTwoXX() async throws {
+        let body = Data(#"{"error":"cannot remove the built-in local host"}"#.utf8)
+        StubURLProtocol.requestHandler = { _ in (400, [:], body) }
+
+        await #expect(throws: CPError.http(status: 400, body: #"{"error":"cannot remove the built-in local host"}"#)) {
+            try await client().removeHost(id: "local")
+        }
+    }
+
     // MARK: - 501 mapping
 
     @Test func fiveOhOneStatusMapsToHTTPErrorPreservingMessage() async throws {

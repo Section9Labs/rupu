@@ -11,6 +11,14 @@ import Observation
 /// response body, or a navigation that already implies success).
 public enum ActionVerb: String, Sendable, Hashable {
     case approve, reject, cancel, pause, resume, archive, restore, send, launch
+    /// Phase 5A, Task 6 addition: `FleetStore.removeHost(id:)`. Entity-scoped
+    /// to a host id, not a run id — `resolve(runID:observedStatus:)` below
+    /// never touches it (there is no `ActivityStatus` for a host), same
+    /// "never resolved by status" bucket as `archive`/`restore`/`send`/
+    /// `launch`. Its own confirmation path is bespoke: `FleetStore.
+    /// applyHosts(_:)` confirms it directly once a fresh `/api/hosts` batch
+    /// no longer contains the removed id — see that method's doc comment.
+    case remove
 }
 
 /// Identifies one in-flight mutation: which entity (a run ID today; any
@@ -189,7 +197,7 @@ public final class PendingActions {
             return status == .cancelled
         case .pause:
             return status == .paused
-        case .archive, .restore, .send, .launch:
+        case .archive, .restore, .send, .launch, .remove:
             return false
         }
     }
