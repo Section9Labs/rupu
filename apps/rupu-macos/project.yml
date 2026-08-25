@@ -21,9 +21,21 @@ targets:
         CFBundleDisplayName: rupu
         LSMinimumSystemVersion: "14.0"
         NSHumanReadableCopyright: "© Section9Labs"
+        # $(MARKETING_VERSION)/$(CURRENT_PROJECT_VERSION) are literal tokens
+        # written into App/Info.plist at xcodegen-generation time; Xcode's
+        # build system substitutes the actual build-setting values (set
+        # below, overridable on the xcodebuild command line) at BUILD time.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.section9labs.rupu
         SWIFT_VERSION: "6.0"
-        ENABLE_HARDENED_RUNTIME: NO   # signing/hardening is Phase 7
+        ENABLE_HARDENED_RUNTIME: YES  # ad-hoc/Developer ID signing needs this on; Debug included — the app neither JITs nor injects, so it doesn't hit a hardened-runtime restriction
         ENABLE_APP_SANDBOX: NO        # spawns the installed rupu binary
+        # Default dev-build stamp; make macos-release overrides both via
+        # xcodebuild command-line settings (RUPU_RELEASE_VERSION env, default
+        # 0.0.0-dev). CFBundleVersion == CFBundleShortVersionString is
+        # acceptable here — we don't yet have a separate build-number scheme.
+        MARKETING_VERSION: "0.0.0-dev"
+        CURRENT_PROJECT_VERSION: "0.0.0-dev"
