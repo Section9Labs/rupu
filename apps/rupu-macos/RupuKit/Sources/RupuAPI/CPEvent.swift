@@ -9,7 +9,14 @@ import Foundation
 /// Unknown `type` tags decode as `.unknown(type:runID:)` rather than
 /// throwing, so the client stays forward-compatible with events added on
 /// the Rust side after this client ships.
-public enum CPEvent: Equatable, Sendable {
+///
+/// `Hashable` (Phase 6B, Task 7 review fix round 1, ruling 2): every case's
+/// associated values are themselves `Hashable` primitives, so this
+/// synthesizes for free. Added so `SituationStore` (`RupuStore`) can
+/// maintain an O(1) `Set<CPEvent>` of "already seen" content identities for
+/// its reconnect-replay dedup, instead of an O(n) linear `contains(where:)`
+/// scan over up to 5,000 rows on every live event.
+public enum CPEvent: Equatable, Hashable, Sendable {
     case runStarted(runID: String, workflowPath: String, startedAt: String)
     case stepStarted(runID: String, stepID: String, kind: String, agent: String?, host: String?)
     case stepWorking(runID: String, stepID: String, note: String?, transcriptPath: String?)

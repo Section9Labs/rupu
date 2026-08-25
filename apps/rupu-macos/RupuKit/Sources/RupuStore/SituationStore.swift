@@ -27,7 +27,10 @@ import RupuAPI
 /// render to build the actual view models. `eventsPerMin`/`spark` are the
 /// one exception worth calling out: they're plain `Int`/`[Int]`, not
 /// `RupuSituation.EventRateRing` — same rationale, expressed as "duplicate
-/// ~10 lines of arithmetic" rather than "import a whole module".
+/// ~10 lines of arithmetic" rather than "import a whole module" (that
+/// arithmetic itself now lives in `SituationSelection.swift`'s
+/// `sparkTick(current:eventsInWindow:windowMS:)`, extracted for testability
+/// — review fix round 1, ruling 5).
 ///
 /// **Live tail**: its own independent firehose connection (`signalsFactory`,
 /// same `backend.makeFirehoseStream(onConnectionChange:)` seam
@@ -40,21 +43,55 @@ import RupuAPI
 /// every `CPClient` call this store makes for a run discovered off that
 /// stream (`runDetail`, `approveRun`, `rejectRun`) passes `host: nil` too.
 ///
-/// **Reconnect-replay dedup**: the CP's SSE stream replays an active run's
-/// `events.jsonl` from offset 0 on every (re)connect (see
-/// `RupuSituation/StreamCards.swift`'s file header for the citation this
-/// store can't literally cross-reference via `import`). Blindly prepending
-/// every event `applyLive(_:)` receives would re-insert an already-seen
-/// event at the front of `eventRows`, stamped with the arrival time rather
-/// than its real historical `ts` — corrupting the stream's ordering on every
-/// reconnect. `applyLive` guards against this with a linear
-/// `eventRows.contains(where: { $0.event == event })` check: `CPEvent`'s
-/// synthesized `Equatable` (every case's associated values are themselves
-/// `Equatable`) makes this an exact content-identity test — the same
-/// "everything except the server-injected `ts`/`pos`" identity
-/// `RupuSituation`'s `contentIdentityKey`/the web's `identityOf` use — with
-/// no separate identity-key function to keep in lockstep with either of
-/// those (and, again, no `RupuSituation` import needed to get there).
+/// **Reconnect-replay dedup, and why a reconnect no longer truncates the
+/// wall** (review fix round 1, ruling 1 — HIGH): the CP's SSE stream
+/// replays an active run's `events.jsonl` from offset 0 on every
+/// (re)connect (see `RupuSituation/StreamCards.swift`'s file header for the
+/// citation this store can't literally cross-reference via `import`). The
+/// first pass at this store's `resnapshot` handler (`loadHistory`) called
+/// `eventRows = rows` — a wholesale REPLACE with the fresh 200-row backfill
+/// page — on every reconnect, which silently collapsed up to `maxEventRows`
+/// (5,000) accumulated rows down to 200 every time the SSE connection
+/// blipped. `loadHistory` now MERGES the fresh backfill page into
+/// `eventRows` instead (`mergeIncoming(_:)`): it recovers the offline gap
+/// (rows this store never saw while disconnected — strictly better than the
+/// web, which has no equivalent re-backfill on reconnect at all) while
+/// keeping every row already accumulated.
+///
+/// **Dedup, incrementally** (review fix round 1, ruling 2 — HIGH,
+/// perf): `seenEventKeys: Set<CPEvent>` is the "already rendered this exact
+/// content" ledger both `mergeIncoming(_:)` and `applyLive(_:)` consult and
+/// maintain — an O(1) membership check/insert per row instead of the first
+/// pass's O(n) `eventRows.contains(where:)` linear scan (which, at up to
+/// 5,000 rows, made every single live event cost a full backlog scan on the
+/// main actor). `CPEvent`'s `Hashable` conformance (`RupuAPI/CPEvent.swift`)
+/// makes the set member exactly the "everything except the server-injected
+/// `ts`/`pos`" content identity `RupuSituation`'s `contentIdentityKey`/the
+/// web's `identityOf` use — the same shape as the web's `seenRef`, without
+/// this module needing to import `RupuSituation` to get there. A row
+/// trimmed off either end when `maxEventRows` is exceeded has its key
+/// removed from `seenEventKeys` too, so the set's size tracks `eventRows`'s
+/// 1:1, not the whole session's history.
+///
+/// **`newestTSByRun` is maintained incrementally, not rebuilt per call**
+/// (also ruling 2): every insert (`mergeIncoming`/`applyLive`) updates the
+/// per-run high-water mark directly (`max(existing, new)`) rather than
+/// `resolveRuns` re-scanning all of `eventRows` on every call. A stale
+/// entry can linger for a run whose every row has since been trimmed off
+/// the backlog — accepted: the worst case is one wasted `GET /api/runs/:id`
+/// call for a run that's no longer displayed, not a correctness issue.
+///
+/// **`resolveRuns` is throttled to the aggregate poll tick, not called per
+/// live event** (also ruling 2): the first pass called it from
+/// `applyLive(_:)` too, meaning every single live event paid for a full
+/// budgeted-selection pass. It now runs only from `pollOnce(generation:)` —
+/// once immediately inside `activate()` (so the very first render already
+/// has whatever resolution a single pass can give it) and again every 60s
+/// poll tick thereafter. A reconnect that merges in rows for a brand-new
+/// run has to wait for the next poll tick (≤60s) before that run's
+/// workspace label resolves — an acceptable latency trade for an already
+/// low-priority, cosmetic (not correctness-affecting) concern on a screen
+/// whose aggregate poll is deliberately slow-cadence to begin with.
 ///
 /// **Poll cadence**: findings/projects/dashboard refresh every 60s (the
 /// task-7 brief's own explicit value) — not the web's 15s `AGG_POLL_MS`
@@ -70,15 +107,19 @@ import RupuAPI
 /// every `activate()` call, and `deactivate()` tears all three down and is
 /// safe to call more than once or before `activate()` ever ran. The scene
 /// (`SituationRoomScreen`) calls `deactivate()` from `.onDisappear` so the
-/// live stream never outlives the Situation Room window.
+/// live stream never outlives the Situation Room window. `activate()`
+/// re-checks `generation == self.generation` after EACH of its two `await`
+/// points (review fix round 1, ruling 9) — without that, a window closed
+/// (and `deactivate()` called) WHILE `activate()`'s `loadHistory`/
+/// `pollOnce` call was still in flight would resume and unconditionally
+/// start a brand-new stream/poll/tick loop on a store the caller had
+/// already torn down, leaking a live connection nothing will ever stop.
 @MainActor
 @Observable
 public final class SituationStore {
-    /// History backfill + live-tail fold, newest-first (the CP's
-    /// `GET /api/events` — see `collect_recent_events`'s own
-    /// `recent_events_returns_newest_first_limited` test — already returns
-    /// newest-first, and every live event is prepended, so the invariant
-    /// holds without this store needing to sort).
+    /// History backfill + live-tail fold, newest-first (ties broken by
+    /// Swift's stable `sort(by:)`, which preserves each equal-`ts` group's
+    /// existing relative order — see `mergeIncoming(_:)`).
     public private(set) var eventRows: [CPEventRow] = []
     public private(set) var findings: [APIFinding] = []
     public private(set) var findingsSummary: APIFindingsSummary?
@@ -100,9 +141,8 @@ public final class SituationStore {
     public private(set) var runTerminalStatus: [String: String] = [:]
 
     /// Events-per-minute, sampled every `tickInterval` (5s, matching the
-    /// web's `SPARK_TICK_MS`) from a per-tick counter reset each tick — see
-    /// the type's doc comment on why this is a plain `Int`/`[Int]` rather
-    /// than `RupuSituation.EventRateRing`.
+    /// web's `SPARK_TICK_MS`) via `sparkTick(current:eventsInWindow:
+    /// windowMS:)` (`SituationSelection.swift`).
     public private(set) var eventsPerMin: Int = 0
     /// Fixed-length (`sparkLength` = 16, matching `SPARK_LEN`), newest-last
     /// ring of per-tick event counts, for the PulseStrip's mini sparkline.
@@ -123,6 +163,16 @@ public final class SituationStore {
     /// `DashboardStore.generation` already use.
     private var generation = 0
 
+    /// Content-identity dedup ledger — see the type's doc comment ("Dedup,
+    /// incrementally"). One entry per row currently represented in
+    /// `eventRows`; kept in exact 1:1 sync with it (inserted alongside a
+    /// row, removed alongside its trim).
+    private var seenEventKeys: Set<CPEvent> = []
+    /// Per-run high-water mark, maintained incrementally on every insert —
+    /// see the type's doc comment ("`newestTSByRun` is maintained
+    /// incrementally").
+    private var newestTSByRun: [String: Int64] = [:]
+
     private var requestedRuns: Set<String> = []
     private var statusCheckedAt: [String: Date] = [:]
 
@@ -136,11 +186,19 @@ public final class SituationStore {
     private static let pollInterval: Duration = .seconds(60) // brief's explicit cadence — see type doc comment
     private static let staleRunInterval: TimeInterval = 120 // Events.tsx STALE_RUN_MS (line 39)
     private static let staleRecheckInterval: TimeInterval = 60 // Events.tsx STALE_RECHECK_MS (line 40)
-    private static let resolveBudget = 12 // Events.tsx's per-pass `budget` (lines 205, 212, 216)
+    private static let resolveBudget = 12 // Events.tsx's per-pass `budget` (lines 205, 212, 215)
     private static let tickInterval: Duration = .seconds(5) // Events.tsx SPARK_TICK_MS (line 35)
     private static let tickIntervalMS: Double = 5_000
     fileprivate static let sparkLength = 16 // Events.tsx SPARK_LEN (line 36)
     private static let terminalStatuses: Set<String> = ["completed", "failed", "cancelled", "rejected"]
+    /// `dashboard(range:host:)`'s range — review fix round 1, ruling 10:
+    /// this store only ever reads `.active.running`/`.active.awaitingApproval`
+    /// off the response (see `pollOnce`), both range-INDEPENDENT counts; the
+    /// first pass requested `.all`, which makes the server compute (and
+    /// serialize) the full terminal/throughput bucket grid on every 60s poll
+    /// for fields this store never looks at. `.d7` is the smallest range
+    /// this app's `TimeRange` vocabulary offers, same cost-minimizing intent.
+    private static let dashboardRange = TimeRange.d7.rawValue
 
     public init(
         client: CPClient,
@@ -157,14 +215,15 @@ public final class SituationStore {
     // MARK: - Lifecycle
 
     /// History backfill (awaited — the screen never renders a blank stream
-    /// while this is in flight), one immediate aggregate poll, then starts
-    /// the live tail, the 60s aggregate poll loop, and the 5s tick sampler.
-    /// Every call — not just the first — rebuilds the three loops from
-    /// scratch; `runToWorkspace`/`runTerminalStatus` are deliberately NOT
-    /// cleared (a re-activation of the same store instance, e.g. the
-    /// Situation Room window closing and reopening with no backend swap in
-    /// between, has no reason to forget an already-resolved run→workspace
-    /// mapping).
+    /// while this is in flight), one immediate aggregate poll (which also
+    /// runs the first `resolveRuns` pass — see the type's doc comment), then
+    /// starts the live tail, the 60s aggregate poll loop, and the 5s tick
+    /// sampler. Every call — not just the first — rebuilds the three loops
+    /// from scratch; `runToWorkspace`/`runTerminalStatus`/`seenEventKeys`/
+    /// `newestTSByRun` are deliberately NOT cleared (a re-activation of the
+    /// same store instance, e.g. the Situation Room window closing and
+    /// reopening with no backend swap in between, has no reason to forget
+    /// already-accumulated state).
     public func activate() async {
         generation += 1
         let generation = generation
@@ -173,8 +232,10 @@ public final class SituationStore {
         eventsPerMin = 0
 
         await loadHistory(generation: generation)
+        guard generation == self.generation else { return } // ruling 9: torn down mid-await
         restartStream()
         await pollOnce(generation: generation)
+        guard generation == self.generation else { return } // ruling 9: torn down mid-await
         startPolling(generation: generation)
         startTicking(generation: generation)
     }
@@ -197,8 +258,48 @@ public final class SituationStore {
     private func loadHistory(generation: Int) async {
         guard let rows = try? await client.recentEvents(limit: Self.historyPageSize) else { return }
         guard generation == self.generation else { return }
+        mergeIncoming(rows)
+    }
+
+    /// Merges a freshly-fetched backfill page into `eventRows` — see the
+    /// type's doc comment ("why a reconnect no longer truncates the wall").
+    /// `rows` is itself newest-first (the server's own order); only rows
+    /// this store hasn't already seen (`seenEventKeys`) are actually new
+    /// information — an unconditional merge-then-resort on every reconnect
+    /// would otherwise re-touch (and potentially reorder, on a tie) rows
+    /// already in place for no reason. A no-op (no resort, no `eventRows`
+    /// reassignment) when every row in `rows` is already known.
+    private func mergeIncoming(_ rows: [CPEventRow]) {
+        var merged = eventRows
+        var didChange = false
+        for row in rows where !seenEventKeys.contains(row.event) {
+            seenEventKeys.insert(row.event)
+            merged.append(row)
+            if let runID = row.event.runID {
+                newestTSByRun[runID] = max(newestTSByRun[runID] ?? Int64.min, row.ts)
+            }
+            didChange = true
+        }
+        guard didChange else { return }
+
+        merged.sort { $0.ts > $1.ts } // stable — preserves each tied group's existing relative order
+        trimAndAssign(merged)
+    }
+
+    /// Caps `rows` at `maxEventRows`, dropping the OLDEST (tail, since
+    /// callers keep the array newest-first) overflow and removing each
+    /// dropped row's identity from `seenEventKeys` so the set never
+    /// outgrows what's actually displayed.
+    private func trimAndAssign(_ rows: [CPEventRow]) {
+        var rows = rows
+        if rows.count > maxEventRows {
+            let overflow = rows.count - maxEventRows
+            for dropped in rows.suffix(overflow) {
+                seenEventKeys.remove(dropped.event)
+            }
+            rows.removeLast(overflow)
+        }
         eventRows = rows
-        resolveRuns(generation: generation)
     }
 
     private func restartStream() {
@@ -220,23 +321,26 @@ public final class SituationStore {
     }
 
     private func applyLive(_ event: CPEvent) {
-        // Reconnect-replay dedup — see the type's doc comment.
-        guard !eventRows.contains(where: { $0.event == event }) else { return }
+        // Reconnect-replay dedup — O(1) via `seenEventKeys`, see the type's
+        // doc comment ("Dedup, incrementally").
+        guard !seenEventKeys.contains(event) else { return }
+        seenEventKeys.insert(event)
 
         let tsMS = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+        if let runID = event.runID {
+            newestTSByRun[runID] = max(newestTSByRun[runID] ?? Int64.min, tsMS)
+        }
         // `pos: -1` is a sentinel: `CPEventRow.pos` only matters for the
         // web's "load older" pagination cursor, a feature this fullscreen
         // ambient wall deliberately doesn't implement (see
         // `SituationRoomScreen`'s doc comment) — nothing here ever reads it.
         var rows = eventRows
         rows.insert(CPEventRow(event: event, ts: tsMS, pos: -1), at: 0)
-        if rows.count > maxEventRows {
-            rows.removeLast(rows.count - maxEventRows)
-        }
-        eventRows = rows
+        trimAndAssign(rows)
         eventsSinceTick += 1
 
-        resolveRuns(generation: generation)
+        // `resolveRuns` is NOT called here — throttled to the aggregate
+        // poll tick (see the type's doc comment).
 
         // Confirms any pending approve/reject/cancel/pause/resume this
         // store itself fired (or that fired from another screen sharing
@@ -276,7 +380,7 @@ public final class SituationStore {
         guard generation == self.generation else { return }
         async let findingsResult = try? client.findings()
         async let projectsResult = try? client.projects()
-        async let dashboardResult = try? client.dashboard(range: TimeRange.all.rawValue, host: nil)
+        async let dashboardResult = try? client.dashboard(range: Self.dashboardRange, host: nil)
         let (f, p, d) = await (findingsResult, projectsResult, dashboardResult)
         guard generation == self.generation else { return }
         if let f {
@@ -289,19 +393,22 @@ public final class SituationStore {
         if let d {
             dashboard = d
         }
-        // Same rationale as Events.tsx's own `dashboard` poll-tick dependency
-        // (line 224's comment): a stale-looking run gets re-checked on every
-        // aggregate poll tick even with no new events arriving to trigger it
-        // another way.
+        // Every poll tick is also `resolveRuns`'s own cadence now (ruling 2)
+        // — a stale-looking run gets re-checked here even with no new
+        // events arriving to trigger it another way, same rationale
+        // Events.tsx's own `dashboard` poll-tick dependency documents
+        // (line 224's comment).
         resolveRuns(generation: generation)
     }
 
     // MARK: - Lazy run → workspace + terminal-status resolution
 
     /// Port of Events.tsx lines 189-224's `getRun` effect: two budgeted
-    /// passes sharing one `budget` (12, matching the web) — first every
-    /// run seen in `eventRows` that has never been resolved or requested,
-    /// then every run whose newest event has gone quiet for
+    /// passes over `newestTSByRun` (maintained incrementally — see the
+    /// type's doc comment), sharing one 12-slot budget, each spent
+    /// newest-first via `selectNewestFirst` (`SituationSelection.swift`,
+    /// ruling 4/5) — first every run that's never been resolved or
+    /// requested, then every run whose newest event has gone quiet for
     /// `staleRunInterval` and hasn't been rechecked within
     /// `staleRecheckInterval` (closing the "the event log ended mid-step but
     /// the run never really told us it was over" gap). Every fetch is
@@ -309,42 +416,34 @@ public final class SituationStore {
     /// (unlike `ActivityStore.remoteHostTasks`) — the `generation` guard
     /// inside each fetch's continuation already makes a stray in-flight
     /// call from a torn-down cycle a harmless no-op, and this store's
-    /// fetches are cheap enough (`GET /api/runs/:id`, budgeted at 12) that
+    /// fetches are cheap enough (`GET /api/runs/:id`, budgeted at 12, and
+    /// only run once per 60s poll tick — see the type's doc comment) that
     /// the extra bookkeeping isn't worth it here.
     private func resolveRuns(generation: Int) {
-        var newestTSByRun: [String: Int64] = [:]
-        for row in eventRows {
-            guard let runID = row.event.runID else { continue }
-            if newestTSByRun[runID] == nil {
-                newestTSByRun[runID] = row.ts // eventRows is newest-first
-            }
-        }
-
         let now = Date()
-        var budget = Self.resolveBudget
-        var toFetch: [String] = []
 
-        for runID in newestTSByRun.keys {
-            guard budget > 0 else { break }
-            guard runToWorkspace[runID] == nil, !requestedRuns.contains(runID) else { continue }
+        let unresolved = selectNewestFirst(candidates: newestTSByRun, budget: Self.resolveBudget) { runID in
+            runToWorkspace[runID] == nil && !requestedRuns.contains(runID)
+        }
+        for runID in unresolved {
             requestedRuns.insert(runID)
             statusCheckedAt[runID] = now
-            toFetch.append(runID)
-            budget -= 1
-        }
-        for (runID, ts) in newestTSByRun {
-            guard budget > 0 else { break }
-            guard runTerminalStatus[runID] == nil else { continue } // already known-terminal
-            let eventAge = now.timeIntervalSince(Date(timeIntervalSince1970: Double(ts) / 1000))
-            guard eventAge >= Self.staleRunInterval else { continue } // still chatty
-            let checked = statusCheckedAt[runID] ?? .distantPast
-            guard now.timeIntervalSince(checked) >= Self.staleRecheckInterval else { continue }
-            statusCheckedAt[runID] = now
-            toFetch.append(runID)
-            budget -= 1
         }
 
-        for runID in toFetch {
+        let remainingBudget = Self.resolveBudget - unresolved.count
+        let stale = selectNewestFirst(candidates: newestTSByRun, budget: remainingBudget) { runID in
+            guard runTerminalStatus[runID] == nil else { return false } // already known-terminal
+            guard let ts = newestTSByRun[runID] else { return false }
+            let eventAge = now.timeIntervalSince(Date(timeIntervalSince1970: Double(ts) / 1000))
+            guard eventAge >= Self.staleRunInterval else { return false } // still chatty
+            let checked = statusCheckedAt[runID] ?? .distantPast
+            return now.timeIntervalSince(checked) >= Self.staleRecheckInterval
+        }
+        for runID in stale {
+            statusCheckedAt[runID] = now
+        }
+
+        for runID in unresolved + stale {
             Task { [weak self] in
                 guard let self else { return }
                 guard let detail = try? await self.client.runDetail(id: runID, host: nil) else { return }
@@ -372,15 +471,12 @@ public final class SituationStore {
         }
     }
 
-    /// Exact port of Events.tsx line 174's
-    /// `Math.round((n * 60_000) / SPARK_TICK_MS)` arithmetic — see the type
-    /// doc comment on why this is inline rather than
-    /// `RupuSituation.eventsPerMinute(_:windowMS:)`.
     private func tick() {
         let n = eventsSinceTick
         eventsSinceTick = 0
-        spark = Array(spark.dropFirst()) + [n]
-        eventsPerMin = Int((Double(n) * 60_000 / Self.tickIntervalMS).rounded())
+        let result = sparkTick(current: spark, eventsInWindow: n, windowMS: Self.tickIntervalMS)
+        spark = result.spark
+        eventsPerMin = result.eventsPerMin
     }
 
     // MARK: - Mutations (await-card Approve/Reject)

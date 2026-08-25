@@ -84,6 +84,17 @@ private final class SignalsFactoryBox: @unchecked Sendable {
     }
 }
 
+/// Thread-safe call counter — same rationale as `DashboardStoreTests`'s own
+/// `HitCounter` (file-scoped `private`, so re-declared here rather than
+/// shared): lets a `@Sendable` stub handler count/branch on request order
+/// without a `var` capture, which strict concurrency checking forbids.
+private final class HitCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0
+    /// Increments and returns the NEW count (1 on the first call).
+    func incrementAndGet() -> Int { lock.withLock { v += 1; return v } }
+}
+
 @MainActor
 private func pollUntil(
     timeout: Duration = .seconds(5),
@@ -226,6 +237,93 @@ struct SituationStoreTests {
             store.eventRows.first?.event == .stepFailed(runID: "r", stepID: "s4", error: "e4"),
             "newest-first: the retained rows are the three most recently pushed"
         )
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// Review fix round 1, ruling 1 (HIGH): a reconnect's resnapshot
+    /// (`StreamLifecycle`'s own "resnapshot on any connect after an
+    /// earlier signal" rule) must MERGE the fresh backfill page into
+    /// `eventRows`, not replace it wholesale — the first pass at this
+    /// collapsed up to 5,000 accumulated rows down to the last 200 on
+    /// every SSE reconnect. Accumulates past the 200-row page size (one
+    /// backfill row + one live-only row), simulates a reconnect, and
+    /// asserts BOTH the pre-reconnect tail survives AND the reconnect
+    /// page's genuinely-new "gap" row lands.
+    @MainActor @Test func reconnectMergesFreshBackfillWithoutTruncatingAccumulatedRows() async {
+        let firstPageRow: [String: Any] = ["ts": 1_000, "pos": 0, "type": "run_paused", "run_id": "run-first-page"]
+        let firstPageBody = Self.encodeEvents([firstPageRow])
+        // The reconnect's fresh backfill page: one row already known (must
+        // be a no-op) alongside one genuinely new "gap" row — content that
+        // arrived while this store was offline, which a reconnect backfill
+        // is exactly meant to recover (strictly better than the web, which
+        // has no re-backfill on reconnect at all).
+        let gapRow: [String: Any] = ["ts": 5_000, "pos": 0, "type": "run_paused", "run_id": "run-gap"]
+        let secondPageBody = Self.encodeEvents([gapRow, firstPageRow])
+
+        let eventsRequestCount = HitCounter()
+        let (store, box) = makeStore { req in
+            if let hit = Self.defaultAggregateResponse(req) { return hit }
+            guard req.url?.path == "/api/events" else { return (200, Data("[]".utf8)) }
+            return (200, eventsRequestCount.incrementAndGet() == 1 ? firstPageBody : secondPageBody)
+        }
+
+        await store.activate()
+        #expect(store.eventRows.count == 1)
+
+        box.latest.yield(.event(.stepFailed(runID: "r", stepID: "live-only", error: "e")))
+        await expectEventually("the live-only event lands") { store.eventRows.count == 2 }
+
+        // Simulate a reconnect: `.connection(false)` then a SECOND
+        // `.connection(true)` is what `StreamLifecycle` treats as a real
+        // reconnect (see that type's doc comment) — the shape that
+        // triggers `resnapshot()`.
+        box.latest.yield(.connection(false))
+        box.latest.yield(.connection(true))
+
+        await expectEventually("the reconnect backfill's gap row merges in") {
+            store.eventRows.contains { $0.event == .runPaused(runID: "run-gap") }
+        }
+
+        #expect(
+            store.eventRows.count == 3,
+            "the live-only row and the original backfill row must both survive the reconnect merge"
+        )
+        #expect(store.eventRows.contains { $0.event == .runPaused(runID: "run-first-page") })
+        #expect(store.eventRows.contains { $0.event == .stepFailed(runID: "r", stepID: "live-only", error: "e") })
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    /// Review fix round 1, ruling 2: the incremental `seenEventKeys` dedup
+    /// ledger must stay in exact sync with `eventRows` — a row trimmed off
+    /// by the cap is forgotten, not permanently blacklisted, so the SAME
+    /// content re-arriving later (a legitimate later occurrence, not a
+    /// stale reconnect replay) is welcomed back as new rather than
+    /// silently dropped forever.
+    @MainActor @Test func trimmedRowsAreForgottenSoTheSameContentCanReappearAsNewAfterEviction() async {
+        let (store, box) = makeStore(maxEventRows: 2) { req in
+            if let hit = Self.defaultAggregateResponse(req) { return hit }
+            return (200, Data("[]".utf8))
+        }
+        await store.activate()
+
+        box.latest.yield(.event(.stepFailed(runID: "r", stepID: "s0", error: "e0")))
+        await expectEventually("s0 lands") { store.eventRows.count == 1 }
+
+        box.latest.yield(.event(.stepFailed(runID: "r", stepID: "s1", error: "e1")))
+        box.latest.yield(.event(.stepFailed(runID: "r", stepID: "s2", error: "e2")))
+        await expectEventually("s0 is evicted by the cap (maxEventRows: 2)") {
+            store.eventRows.count == 2
+                && !store.eventRows.contains { $0.event == .stepFailed(runID: "r", stepID: "s0", error: "e0") }
+        }
+
+        box.latest.yield(.event(.stepFailed(runID: "r", stepID: "s0", error: "e0")))
+        await expectEventually("the evicted content is welcomed back as new, not dropped as a duplicate") {
+            store.eventRows.first?.event == .stepFailed(runID: "r", stepID: "s0", error: "e0")
+        }
 
         store.deactivate()
         box.latest.finish()
