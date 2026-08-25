@@ -565,6 +565,38 @@ struct LauncherStoreTests {
         #expect(store.inputValues["message"] == "hello")
     }
 
+    /// Task 4 review carry-over, closed in Task 7: prefilling a name that
+    /// isn't in the loaded lists (a stale/typo'd name, or a definition
+    /// deleted between the Library row rendering and its Launch button
+    /// firing) must never fabricate a selection. For `.workflow` — the only
+    /// kind `prefill`/`selectDefinition` actually validates against the
+    /// server, via `workflowDetail(name:)` — a 404 fails OPEN honestly
+    /// (`selectDefinition`'s existing catch branch): `selectedDefinition`
+    /// still records what was asked for (so the form doesn't silently
+    /// revert to "nothing selected", which would hide what the user
+    /// clicked), but `workflowInputs`/`inputValues` stay empty and
+    /// `inputsLoadError` carries the real server message — no phantom
+    /// input rows, no fabricated defaults. A subsequent `launch()` attempt
+    /// then surfaces the SAME server truth (the workflow genuinely doesn't
+    /// exist) rather than this store papering over it with an invented
+    /// success path.
+    @MainActor @Test func prefillWithMissingWorkflowNameFailsOpenWithoutFabricatingInputs() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/workflows/ghost" else { return (200, Data("[]".utf8)) }
+            return (404, Data(#"{"error":"workflow ghost not found"}"#.utf8))
+        }
+
+        await store.prefill(kind: .workflow, name: "ghost", scopeKind: "global", scopeID: nil)
+
+        // The honest record of what was asked for — not silently cleared.
+        #expect(store.selectedDefinition == "ghost")
+        // No fabricated declared-input state from a definition that was
+        // never actually loaded.
+        #expect(store.workflowInputs.isEmpty)
+        #expect(store.inputValues.isEmpty)
+        #expect(store.inputsLoadError?.contains("workflow ghost not found") == true)
+    }
+
     // (f) Fan-out over the online hosts only: 2 online + 1 offline yields
     // exactly 2 POSTs (the offline host is skipped outright), with outcomes
     // recorded per host including one failure.

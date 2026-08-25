@@ -8,6 +8,7 @@ import RupuLauncher
 import RupuOverview
 import RupuProjects
 import RupuFleet
+import RupuLibrary
 
 /// The app's window content: fixed sidebar + detail pane that switches on
 /// `model.route`. Phase 2+ swaps each `PlaceholderScreen` branch for a real
@@ -26,7 +27,6 @@ public struct RootView: View {
     @Bindable var backend: BackendController
 
     @State private var liveEventTask: Task<Void, Never>?
-    @State private var showLauncher = false
     @State private var hostsFooter = HostsFooterStore()
 
     /// Flows-composition Task 3: built lazily in `handleHealthChange`, the
@@ -62,7 +62,7 @@ public struct RootView: View {
                 .navigationSplitViewColumnWidth(204)
         } detail: {
             detail
-                .toolbar { ShellToolbar(model: model, showLauncher: $showLauncher, backend: backend, palette: palette) }
+                .toolbar { ShellToolbar(model: model, showLauncher: $model.showLauncher, backend: backend, palette: palette) }
         }
         // Hidden, zero-visual buttons rather than the toolbar controls
         // themselves carrying `.keyboardShortcut` — this keeps ⌘N/⌘K live
@@ -77,7 +77,7 @@ public struct RootView: View {
                 // an open palette, and the palette's own Esc monitor is
                 // app-wide while it's up — leaving it open would swallow
                 // the sheet's Esc on the buried palette instead.
-                Button("New run") { palette?.close(); showLauncher = true }
+                Button("New run") { palette?.close(); model.showLauncher = true }
                     .keyboardShortcut("n", modifiers: .command)
                 Button("Command palette") { Task { await palette?.open() } }
                     .keyboardShortcut("k", modifiers: .command)
@@ -108,7 +108,7 @@ public struct RootView: View {
             OnboardingView(backend: backend, model: model)
                 .interactiveDismissDisabled()
         }
-        .sheet(isPresented: $showLauncher) {
+        .sheet(isPresented: $model.showLauncher) {
             LauncherSheet(model: model, backend: backend)
                 .interactiveDismissDisabled(false)
         }
@@ -211,7 +211,11 @@ public struct RootView: View {
         case .security:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .library:
-            PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
+            LibraryScreen(model: model, backend: backend)
+        case .agentDefinition(let name):
+            AgentDetailScreen(model: model, backend: backend, name: name)
+        case .workflowDefinition(let name):
+            WorkflowDetailScreen(model: model, backend: backend, name: name)
         case .fleet:
             FleetScreen(model: model, backend: backend)
         case .usage:

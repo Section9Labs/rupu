@@ -16,6 +16,8 @@ extension Route {
         case .projectDetail: "Project"
         case .security: "Security"
         case .library: "Library"
+        case .agentDefinition: "Agent"
+        case .workflowDefinition: "Workflow"
         case .fleet: "Fleet"
         case .usage: "Usage"
         }
@@ -27,7 +29,8 @@ extension Route {
         switch self {
         case .overview: 4
         case .activity, .runDetail, .sessionDetail, .agentRunDetail: 2
-        case .projects, .projectDetail, .security, .library, .fleet, .usage: 5
+        case .projects, .projectDetail, .security, .fleet, .usage: 5
+        case .library, .agentDefinition, .workflowDefinition: 5
         }
     }
 }

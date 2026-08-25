@@ -43,6 +43,17 @@ public enum Route: Hashable, Sendable {
     case projectDetail(wsID: String)
     case security
     case library
+    /// One agent definition's detail view (Phase 5A, Task 7) — pushed from
+    /// a `.library` agents-tab row tap via `AppModel.navigate(to:)`, same
+    /// "pushed, not directly sidebar-selectable" contract `.projectDetail`
+    /// documents above. `selectedSidebarItem`'s getter maps this to
+    /// `SidebarItem.library`.
+    case agentDefinition(name: String)
+    /// One workflow definition's detail view — also reached from a
+    /// `.library` autoflows-tab row tap (an autoflow definition IS a
+    /// workflow definition; there is no separate autoflow detail route),
+    /// same push/sidebar-highlight contract as `.agentDefinition` above.
+    case workflowDefinition(name: String)
     case fleet
     case usage
 }

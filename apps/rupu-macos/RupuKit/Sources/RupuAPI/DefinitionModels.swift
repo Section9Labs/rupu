@@ -11,6 +11,14 @@ public struct AgentDefinition: Decodable, Equatable, Sendable {
     public let model: String?
     public let effort: String?
     public let maxTokens: Int?
+    /// The agent's frontmatter `permissionMode:` verbatim (`"ask"` /
+    /// `"bypass"` / `"readonly"`), or `nil` when the frontmatter omits it —
+    /// see `AgentDto.permission_mode`'s Rust doc comment (`crates/rupu-cp/
+    /// src/api/agents.rs`) for why this is never resolved against project/
+    /// global config here. Feeds the Library screen's permission-tone badge
+    /// (`RupuStore.agentPermissionTone(mode:)`) — never parsed from `raw`
+    /// markdown, always this DTO field.
+    public let mode: String?
     public let tools: [String]
     public let scope: String
     public let scopeKind: String
@@ -26,6 +34,7 @@ public struct AgentDefinition: Decodable, Equatable, Sendable {
         model: String?,
         effort: String?,
         maxTokens: Int?,
+        mode: String? = nil,
         tools: [String],
         scope: String,
         scopeKind: String,
@@ -40,6 +49,7 @@ public struct AgentDefinition: Decodable, Equatable, Sendable {
         self.model = model
         self.effort = effort
         self.maxTokens = maxTokens
+        self.mode = mode
         self.tools = tools
         self.scope = scope
         self.scopeKind = scopeKind
@@ -56,12 +66,95 @@ public struct AgentDefinition: Decodable, Equatable, Sendable {
         case model
         case effort
         case maxTokens = "max_tokens"
+        case mode = "permission_mode"
         case tools
         case scope
         case scopeKind = "scope_kind"
         case scopeID = "scope_id"
         case runCount = "run_count"
         case lastRun = "last_run"
+    }
+}
+
+/// `GET /api/agents/:name` — `AgentDetailDto` on the Rust side: every
+/// `AgentDto` field (see `AgentDefinition` above, which this deliberately
+/// duplicates rather than reuses — the wire shape is FLAT/flattened via
+/// serde's `#[serde(flatten)]`, not nested, so one `Decodable` struct with
+/// its own `CodingKeys` is simpler than bolting `system_prompt`/`raw` onto
+/// `AgentDefinition` via a wrapper) plus the two detail-only fields.
+///
+/// **`usage`/`runCount`/`lastRun` are deliberately NOT decoded here** —
+/// unlike the list endpoint (`GET /api/agents`, which `AgentDefinition`
+/// decodes), `load_detail` on the Rust side never enriches them: they are
+/// always `0`/`nil` on this endpoint's response (confirmed by reading
+/// `crates/rupu-cp/src/api/agents.rs::load_detail`, which builds every
+/// branch via `AgentDto::from_spec` alone, with no run-activity pass
+/// afterward). Decoding and then rendering an always-zero "0 runs" chip
+/// would be a lie by omission of context — the Library list's own row
+/// already has the real, enriched counts if the operator wants them.
+public struct AgentDetail: Decodable, Sendable {
+    public let name: String
+    public let slug: String
+    public let description: String?
+    public let provider: String?
+    public let model: String?
+    public let effort: String?
+    public let maxTokens: Int?
+    public let mode: String?
+    public let tools: [String]
+    public let scope: String
+    public let scopeKind: String
+    public let scopeID: String?
+    public let systemPrompt: String
+    public let raw: String
+
+    public init(
+        name: String,
+        slug: String,
+        description: String?,
+        provider: String?,
+        model: String?,
+        effort: String?,
+        maxTokens: Int?,
+        mode: String?,
+        tools: [String],
+        scope: String,
+        scopeKind: String,
+        scopeID: String?,
+        systemPrompt: String,
+        raw: String
+    ) {
+        self.name = name
+        self.slug = slug
+        self.description = description
+        self.provider = provider
+        self.model = model
+        self.effort = effort
+        self.maxTokens = maxTokens
+        self.mode = mode
+        self.tools = tools
+        self.scope = scope
+        self.scopeKind = scopeKind
+        self.scopeID = scopeID
+        self.systemPrompt = systemPrompt
+        self.raw = raw
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case slug
+        case description
+        case provider
+        case model
+        case effort
+        case maxTokens = "max_tokens"
+        case mode = "permission_mode"
+        case tools
+        case scope
+        case scopeKind = "scope_kind"
+        case scopeID = "scope_id"
+        case systemPrompt = "system_prompt"
+        case raw
     }
 }
 

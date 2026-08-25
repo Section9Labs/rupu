@@ -83,6 +83,47 @@ public final class AppModel {
     public var liveConnected: Bool = false
     public var liveEventCount: Int = 0
 
+    /// Whether `RootView`'s Launcher sheet (`.sheet(isPresented:)`) is
+    /// presented. Lifted from a `RootView`-local `@State` (Phases 1–5) into
+    /// `AppModel` in Phase 5A, Task 7 so a screen below the toolbar
+    /// (Library's per-row/page Launch) can open the sheet itself, not just
+    /// the toolbar button / hidden ⌘N button `RootView` already wires —
+    /// every opener now flips this one flag instead of a `RootView`-private
+    /// `@State` only `RootView` itself could reach.
+    public var showLauncher = false
+
+    /// Set by `presentLauncher(...)` alongside `showLauncher = true` —
+    /// `LauncherSheet.activate()` is the sole reader, via
+    /// `consumeLauncherPrefill()` (which clears this the instant it's read,
+    /// see that method's doc comment). The toolbar/⌘N openers never touch
+    /// this field at all, so a plain "+ New run" open is never affected by
+    /// whatever a prior per-row Launch last set here.
+    public private(set) var launcherPrefill: LauncherPrefillRequest?
+
+    /// Opens the Launcher sheet pre-selected to one definition, carrying its
+    /// scope — the Library screen's per-row and detail-page Launch
+    /// affordance (Phase 5A, Task 7). `scopeKind`/`scopeID` should be the
+    /// row's own values (`AgentDefinition`/`WorkflowDefinition`/
+    /// `AutoflowDefinition`'s `scopeKind`/`scopeID`, or `AgentDetail`'s),
+    /// same "carry the row's own scope, never re-derive by name" rule
+    /// `DefinitionPicker`'s row-tap already follows (see
+    /// `LauncherStore.prefill(kind:name:scopeKind:scopeID:)`'s doc comment).
+    public func presentLauncher(kind: LaunchKind, name: String, scopeKind: String? = nil, scopeID: String? = nil) {
+        launcherPrefill = LauncherPrefillRequest(kind: kind, name: name, scopeKind: scopeKind, scopeID: scopeID)
+        showLauncher = true
+    }
+
+    /// Reads and clears `launcherPrefill` in one step — `LauncherSheet.
+    /// activate()`'s only call site, right after it builds a fresh
+    /// `LauncherStore` for this sheet presentation. Consuming (not just
+    /// reading) here is what keeps a later plain "+ New run" open honest:
+    /// without the clear, a per-row Launch's prefill would silently leak
+    /// into the next unrelated sheet presentation.
+    public func consumeLauncherPrefill() -> LauncherPrefillRequest? {
+        defer { launcherPrefill = nil }
+        return launcherPrefill
+    }
+
     /// Whether the user has completed the Embedded/Remote onboarding sheet
     /// (Task 9). Persisted so a relaunch skips straight to the shell.
     public var onboardingComplete: Bool {
@@ -125,7 +166,7 @@ public final class AppModel {
             case .runDetail, .sessionDetail, .agentRunDetail: .activity
             case .projects, .projectDetail: .projects
             case .security: .security
-            case .library: .library
+            case .library, .agentDefinition, .workflowDefinition: .library
             case .fleet: .fleet
             case .usage: .usage
             }

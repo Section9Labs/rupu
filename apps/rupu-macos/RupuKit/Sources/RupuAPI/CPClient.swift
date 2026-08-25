@@ -140,6 +140,19 @@ public actor CPClient {
         try await get("api/workflows/\(name)")
     }
 
+    /// `GET /api/agents/:name` — the Library screen's Agent detail view
+    /// (Phase 5A, Task 7): every `AgentDefinition` field plus `systemPrompt`/
+    /// `raw` (the full `.md` source, for the mono-block source view). No
+    /// scope-pinning query params — the server accepts none on this route
+    /// (unlike `DELETE`/`setAutoflowEnabled`'s `?scope_kind=&scope_id=`;
+    /// confirmed by reading `get_agent` in `crates/rupu-cp/src/api/
+    /// agents.rs`, which takes only the path `:name`), so a name that
+    /// exists in two scopes resolves via the server's own project-first
+    /// `load_detail` fallback rather than a client-side pin.
+    public func agentDetail(name: String) async throws -> AgentDetail {
+        try await get("api/agents/\(name)")
+    }
+
     public func tools() async throws -> [ToolSpec] {
         let response: ToolsListResponse = try await get("api/tools")
         return response.tools
