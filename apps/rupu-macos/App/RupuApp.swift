@@ -61,6 +61,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// tap through the same `AppModel.navigate(to:)` every other deep-link
     /// in this app uses.
     var model: AppModel?
+    /// Review fix (round 1): `frontMainWindow()` below could previously only
+    /// front an ALREADY-EXISTING window — with the main window closed (the
+    /// routine state for a menu-bar-capable app; closing the last window
+    /// does not quit this app), "Open rupu", every needs-you row's
+    /// deep-link, and "New run" all silently did nothing. AppKit has no way
+    /// to create a SwiftUI `WindowGroup`'s window on its own — only
+    /// SwiftUI's `@Environment(\.openWindow)` action can — so `RupuApp`'s
+    /// `.onAppear` hands this closure in (`{ openWindow(id: RupuApp.
+    /// mainWindowID) }`), and `frontMainWindow()` falls back to calling it
+    /// when there is no existing window to front.
+    var openMainWindow: (() -> Void)?
     private var sigtermSource: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -156,13 +167,44 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
     /// Settings window itself is never the one fronted.
     ///
     /// Non-`private` (Task 8): `RupuApp`'s `MenuBarExtra` scene reuses this
-    /// exact mechanism for "Open rupu" and every needs-you row's deep-link,
-    /// via `appDelegate.frontMainWindow()` — same target-window resolution
-    /// a notification tap already relies on, not a second copy of it.
+    /// exact mechanism for "Open rupu", every needs-you row's deep-link, and
+    /// "New run", via `appDelegate.frontMainWindow()` — same target-window
+    /// resolution a notification tap already relies on, not a second copy of
+    /// it.
+    ///
+    /// **Windowless fallback** (review fix, round 1): when NO window
+    /// matches either lookup (the main window was closed and nothing else
+    /// is up but Settings), this now invokes `openMainWindow` — SwiftUI's
+    /// `@Environment(\.openWindow)` action, captured by `RupuApp` and handed
+    /// in here — to actually CREATE the main `WindowGroup`'s window, then
+    /// activates the app so it comes forward. Every caller of
+    /// `frontMainWindow()` (a notification tap, "Open rupu", a needs-you row
+    /// deep-link, "New run") gets this fallback for free just by routing
+    /// through here, which was the point of centralizing this lookup in the
+    /// first place.
+    ///
+    /// `openWindow(id:)` has no completion callback — there is no signal
+    /// this method can wait on for "the window now exists and is ready to
+    /// host a sheet/receive a route". Every caller that needs to act
+    /// afterward (most notably `MenuBarView`'s "New run", which sets
+    /// `model.showLauncher = true` right after calling this) relies on
+    /// SwiftUI reading `RootView`'s `.sheet(isPresented:)` binding's CURRENT
+    /// value at the moment that view mounts — the same mechanism the
+    /// onboarding sheet already depends on for a value set before `RootView`
+    /// existed at all. This is believed correct but is, deliberately, a
+    /// GUI-check item for the controller's live validation pass, not
+    /// something this fix claims to have proven from a unit test — there is
+    /// no reliable way to unit-test actual `NSWindow` creation/SwiftUI scene
+    /// mounting under `swift test` (no real app bundle/run loop).
     func frontMainWindow() {
         let target = NSApp.windows.first(where: { $0.identifier?.rawValue == RupuApp.mainWindowID })
             ?? NSApp.windows.first(where: { $0.identifier?.rawValue != RupuApp.settingsWindowID })
-        target?.makeKeyAndOrderFront(nil)
+        if let target {
+            target.makeKeyAndOrderFront(nil)
+        } else {
+            openMainWindow?()
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 }
 
@@ -186,6 +228,14 @@ struct RupuApp: App {
     /// needs live data even while the popover is closed.
     @State private var menuBarStore = MenuBarStore()
     @AppStorage("appearance") private var appearance: String = "system"
+    /// SwiftUI's window-creation action — the only way to actually create a
+    /// `WindowGroup`'s window from outside SwiftUI's own view hierarchy.
+    /// Handed to `AppDelegate.openMainWindow` in `.onAppear` below so
+    /// `AppDelegate.frontMainWindow()`'s windowless fallback (review fix,
+    /// round 1) can use it. `@Environment` reads on an `App`-conforming type
+    /// work the same way they do on a `View`/`Scene` — this isn't a special
+    /// case.
+    @Environment(\.openWindow) private var openWindow
 
     /// The explicit identifier this app's one `WindowGroup` carries — see
     /// `AppDelegate.frontMainWindow`'s doc comment for why a notification
@@ -206,30 +256,25 @@ struct RupuApp: App {
                 .onAppear {
                     appDelegate.backend = backend
                     appDelegate.model = model
+                    appDelegate.openMainWindow = { openWindow(id: RupuApp.mainWindowID) }
+                    // Review fix (round 1): same reappearance/race fallback
+                    // `RootView`'s own `hostsFooter.activate` `.onAppear`
+                    // guard uses (see that modifier's doc comment) —
+                    // `.onChange(of: backend.health)` below only fires on a
+                    // POST-installation transition. If a client is already
+                    // configured by the time THIS modifier attaches (a fast
+                    // local embedded-server health check racing SwiftUI's
+                    // own environment/scene setup), the change never fires
+                    // and `runNotifier`/`menuBarStore` would sit inert —
+                    // `menuBarStore` stuck showing `—` — until the next
+                    // health flap, which may never come. Both `activate`
+                    // calls are idempotent, so calling them here too is a
+                    // no-op whenever `.onChange` already ran normally.
+                    activateHealthDependents()
                 }
                 .onChange(of: backend.health) { _, newHealth in
                     guard case .healthy = newHealth else { return }
-                    // `MainActor.assumeIsolated` here matches
-                    // `RunDetailStore.makeRunSignalsFactory`/`OverviewScreen.
-                    // makeSignalsFactory`'s own bridging into
-                    // `backend.make*Stream` from inside a factory closure —
-                    // `streamFactory` is invoked from `RunNotifier.activate`'s
-                    // task, which always runs on the main actor (`RunNotifier`
-                    // is `@MainActor`), so the assertion always holds; it's
-                    // what lets `backend`'s own main-actor-isolated method be
-                    // called from a plain, unisolated closure type.
-                    runNotifier.activate(streamFactory: { [backend] in
-                        MainActor.assumeIsolated { backend.makeFirehoseStream() }
-                    })
-                    // `MenuBarStore.activate(client:)` is idempotent (same
-                    // idiom as `HostsFooterStore`) — a `client` swap on a
-                    // later healthy transition (embedded/remote mode
-                    // switch, a manual reconnect) just updates which client
-                    // the next poll tick uses, it never spawns a second
-                    // loop.
-                    if let client = backend.client() {
-                        menuBarStore.activate(client: client)
-                    }
+                    activateHealthDependents()
                 }
         }
         .defaultSize(width: 1440, height: 900)
@@ -263,6 +308,44 @@ struct RupuApp: App {
     private func openMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
         appDelegate.frontMainWindow()
+    }
+
+    /// Shared body for both `runNotifier`/`menuBarStore` activation call
+    /// sites (`.onAppear`'s fallback and `.onChange(of: backend.health)`'s
+    /// normal path — review fix, round 1: factored out so the two stay in
+    /// sync rather than risking drift between two copies of the same
+    /// activation logic).
+    ///
+    /// `runNotifier.activate(streamFactory:)` is called unconditionally,
+    /// not gated on `backend.client()` — see that method's own doc comment:
+    /// it backs off and retries on its own if `streamFactory()` returns
+    /// `nil` (backend not configured yet), so calling it before a client
+    /// exists is safe and is exactly what lets the `.onAppear` fallback
+    /// self-heal without this method needing to duplicate that gating.
+    /// `menuBarStore.activate(client:)` DOES need an actual `CPClient` (its
+    /// signature takes one directly, unlike `RunNotifier`'s lazy factory
+    /// seam), so it's gated the same way `RootView`'s own
+    /// `hostsFooter.activate(client:)` `.onAppear` fallback is.
+    private func activateHealthDependents() {
+        // `MainActor.assumeIsolated` here matches `RunDetailStore.
+        // makeRunSignalsFactory`/`OverviewScreen.makeSignalsFactory`'s own
+        // bridging into `backend.make*Stream` from inside a factory
+        // closure — `streamFactory` is invoked from `RunNotifier.activate`'s
+        // task, which always runs on the main actor (`RunNotifier` is
+        // `@MainActor`), so the assertion always holds; it's what lets
+        // `backend`'s own main-actor-isolated method be called from a
+        // plain, unisolated closure type.
+        runNotifier.activate(streamFactory: { [backend] in
+            MainActor.assumeIsolated { backend.makeFirehoseStream() }
+        })
+        // `MenuBarStore.activate(client:)` is idempotent (same idiom as
+        // `HostsFooterStore`) — a `client` swap on a later healthy
+        // transition (embedded/remote mode switch, a manual reconnect) just
+        // updates which client the next poll tick uses, it never spawns a
+        // second loop.
+        if let client = backend.client() {
+            menuBarStore.activate(client: client)
+        }
     }
 
     private var preferredColorScheme: ColorScheme? {

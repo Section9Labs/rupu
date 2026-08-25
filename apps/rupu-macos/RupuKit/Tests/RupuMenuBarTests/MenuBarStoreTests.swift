@@ -38,6 +38,11 @@ final class MenuBarStubURLProtocol: URLProtocol {
     nonisolated(unsafe) private static var handler: (@Sendable (URLRequest) -> (status: Int, body: Data))?
     nonisolated(unsafe) private static var pathHits: [String: Int] = [:]
     nonisolated(unsafe) private static var currentGeneration = 0
+    /// Every request this generation actually served, in arrival order —
+    /// review fix (round 1): backs `requests(forPath:)`, which
+    /// `bothPollRequestsCarryHostLocal` reads to assert the exact query
+    /// string each request carried (not just that a path was hit).
+    nonisolated(unsafe) private static var served: [URLRequest] = []
 
     static func session() -> URLSession {
         let generation = lock.withLock { currentGeneration }
@@ -51,6 +56,7 @@ final class MenuBarStubURLProtocol: URLProtocol {
         lock.withLock {
             currentGeneration += 1
             pathHits = [:]
+            served = []
             self.handler = handler
         }
     }
@@ -61,6 +67,10 @@ final class MenuBarStubURLProtocol: URLProtocol {
 
     static func hits(_ path: String) -> Int {
         lock.withLock { pathHits[path, default: 0] }
+    }
+
+    static func requests(forPath path: String) -> [URLRequest] {
+        lock.withLock { served.filter { $0.url?.path == path } }
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -78,7 +88,10 @@ final class MenuBarStubURLProtocol: URLProtocol {
         }
 
         if let path = request.url?.path {
-            Self.lock.withLock { Self.pathHits[path, default: 0] += 1 }
+            Self.lock.withLock {
+                Self.pathHits[path, default: 0] += 1
+                Self.served.append(request)
+            }
         }
         guard let handler = activeHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
@@ -152,6 +165,17 @@ private func dashboardJSON(running: Int, awaiting: Int, paused: Int, pending: In
     }
     """
     return Data(json.utf8)
+}
+
+/// Builds a `GET /api/runs` response body for one or more rows, in the exact
+/// wire shape `APIRunListRow` decodes.
+private func runsJSON(_ rows: [(id: String, status: String, startedAt: String)]) -> Data {
+    let items = rows.map { row in
+        #"""
+        {"id":"\#(row.id)","workflow_name":"wf-\#(row.id)","status":"\#(row.status)","started_at":"\#(row.startedAt)","finished_at":null,"trigger":"manual","usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,"total_tokens":0,"cost_usd":null,"priced":false,"runs":1},"turns":1,"duration_ms":null,"host_id":"local"}
+        """#
+    }
+    return Data("[\(items.joined(separator: ","))]".utf8)
 }
 
 /// Builds one `ActivityRow` the way `MenuBarStore.pollOnce` actually does —
@@ -279,6 +303,11 @@ struct MenuBarStorePollTests {
     await drainAfterDeactivate()
 }
 
+/// Review fix (round 1): the original version of this test asserted
+/// `store.needsYou.isEmpty` both before AND after the failure injection —
+/// vacuously true either way, since the seeded `runs` response was always
+/// `[]`. Seeds one awaiting-approval row first so `needsYou` is genuinely
+/// non-empty before the failure, then asserts it SURVIVES unchanged.
 @MainActor @Test func failedPollKeepsLastGoodCounts() async {
     MenuBarStubURLProtocol.reset { req in
         guard let url = req.url else { return (200, Data("{}".utf8)) }
@@ -286,7 +315,7 @@ struct MenuBarStorePollTests {
             return (200, dashboardJSON(running: 2, awaiting: 1, paused: 0, pending: 0))
         }
         if url.path == "/api/runs" {
-            return (200, Data("[]".utf8))
+            return (200, runsJSON([(id: "gate1", status: "awaiting_approval", startedAt: "2026-08-20T09:00:00Z")]))
         }
         return (404, Data())
     }
@@ -300,6 +329,7 @@ struct MenuBarStorePollTests {
     await expectEventually("the first successful poll lands") {
         store.counts?.running == 2
     }
+    #expect(store.needsYou.map(\.row.id) == ["gate1"], "seeded by the first successful poll")
 
     // Every subsequent poll now fails outright.
     MenuBarStubURLProtocol.updateHandler { _ in (500, Data("{}".utf8)) }
@@ -308,7 +338,85 @@ struct MenuBarStorePollTests {
     try? await Task.sleep(for: .milliseconds(200))
 
     #expect(store.counts?.running == 2, "a failed poll must never blank or alter the last good counts")
-    #expect(store.needsYou.isEmpty, "unchanged from the first successful poll's empty runs list")
+    #expect(store.needsYou.map(\.row.id) == ["gate1"], "unchanged by any failed poll after the first successful one")
+
+    store.deactivate()
+    await drainAfterDeactivate()
+}
+
+/// Review fix (round 1): `pollOnce` is deliberately all-or-nothing — a
+/// `dashboard` success paired with a `runs` failure (or vice versa) must
+/// apply NEITHER, not partially update `counts` while leaving `needsYou`
+/// stale (see `pollOnce`'s own doc comment). `dashboard` always succeeds
+/// here; `runs` always 500s — `counts` must never leave `nil`.
+@MainActor @Test func dashboardSuccessPairedWithRunsFailureAppliesNothing() async {
+    MenuBarStubURLProtocol.reset { req in
+        guard let url = req.url else { return (200, Data("{}".utf8)) }
+        if url.path == "/api/dashboard" {
+            return (200, dashboardJSON(running: 9, awaiting: 0, paused: 0, pending: 0))
+        }
+        if url.path == "/api/runs" {
+            return (500, Data("{}".utf8))
+        }
+        return (404, Data())
+    }
+    let client = CPClient(
+        config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+        session: MenuBarStubURLProtocol.session()
+    )
+    let store = MenuBarStore(pollInterval: .milliseconds(30))
+
+    store.activate(client: client)
+    await expectEventually("at least one poll attempt has landed") {
+        MenuBarStubURLProtocol.hits("/api/dashboard") >= 1 && MenuBarStubURLProtocol.hits("/api/runs") >= 1
+    }
+    // A generous settle window past several more ticks — `counts` must stay
+    // `nil` the whole time, never briefly show `9` then revert.
+    try? await Task.sleep(for: .milliseconds(150))
+
+    #expect(store.counts == nil, "dashboard alone succeeding must never partially apply")
+    #expect(store.needsYou.isEmpty)
+
+    store.deactivate()
+    await drainAfterDeactivate()
+}
+
+/// Review fix (round 1): both polled endpoints must always be scoped
+/// `host: "local"` (`MenuBarStore`'s doc comment on why — never an omitted
+/// `host`, which fans a call out across the whole fleet server-side).
+/// Asserts the actual query string each request carried, not just that the
+/// path was hit.
+@MainActor @Test func bothPollRequestsCarryHostLocal() async {
+    MenuBarStubURLProtocol.reset { req in
+        guard let url = req.url else { return (200, Data("{}".utf8)) }
+        if url.path == "/api/dashboard" {
+            return (200, dashboardJSON(running: 0, awaiting: 0, paused: 0, pending: 0))
+        }
+        if url.path == "/api/runs" {
+            return (200, Data("[]".utf8))
+        }
+        return (404, Data())
+    }
+    let client = CPClient(
+        config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+        session: MenuBarStubURLProtocol.session()
+    )
+    let store = MenuBarStore(pollInterval: .seconds(60))
+
+    store.activate(client: client)
+    await expectEventually("the first poll lands") {
+        MenuBarStubURLProtocol.hits("/api/dashboard") >= 1 && MenuBarStubURLProtocol.hits("/api/runs") >= 1
+    }
+
+    for path in ["/api/dashboard", "/api/runs"] {
+        let requests = MenuBarStubURLProtocol.requests(forPath: path)
+        #expect(!requests.isEmpty)
+        for request in requests {
+            let host = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
+                .queryItems?.first(where: { $0.name == "host" })?.value
+            #expect(host == "local", "\(path) must always be scoped host=local")
+        }
+    }
 
     store.deactivate()
     await drainAfterDeactivate()
