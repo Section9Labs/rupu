@@ -44,7 +44,16 @@ struct OutlierPanel: View {
             emptyBlock
         } else {
             VStack(spacing: 0) {
-                ForEach(Array(outliers.enumerated()), id: \.offset) { _, row in
+                // `id: \.runID` (backlog row 20 fix), not `\.offset` — an
+                // offset id ties a row's SwiftUI identity to its array
+                // position, so a window change that re-fetches a
+                // differently-ordered (or partially overlapping) outlier set
+                // would reassign row identity to whatever run lands on the
+                // old offset instead of following the run it actually
+                // belongs to. `runID` is already a stable, locally-unique
+                // key for this endpoint (see this type's own doc comment:
+                // local-only, no host fan-out), so no composite is needed.
+                ForEach(outliers, id: \.runID) { row in
                     OutlierRow(outlier: row, onSelect: { onSelect(outlierNavigationRoute(runID: row.runID)) })
                     Divider()
                 }

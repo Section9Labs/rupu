@@ -168,7 +168,15 @@ public struct LibraryScreen: View {
                 .padding(.vertical, 8)
             Divider()
             VStack(spacing: 0) {
-                ForEach(Array(sorted.enumerated()), id: \.offset) { _, def in
+                // `id: \.rowIdentity` (backlog row 20 fix), not `\.offset` —
+                // an offset id ties a row's SwiftUI identity to its array
+                // position, so a header sort re-ordering `sorted` would
+                // reassign every row's identity to whichever definition
+                // lands on its old offset instead of following it — see
+                // `AgentDefinition.rowIdentity`'s doc comment for why the
+                // identity itself must be composite (name alone collides
+                // across scopes).
+                ForEach(sorted, id: \.rowIdentity) { def in
                     AgentDefRow(def: def, onSelect: {
                         model.navigate(to: .agentDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID))
                     }, onLaunch: {
@@ -197,7 +205,10 @@ public struct LibraryScreen: View {
         ]
     }
 
-    private static func agentSortValue(_ row: AgentDefinition, _ key: AgentsSortKey) -> ListSortValue {
+    // Not `private` (widened for the reorder-under-sort regression test in
+    // `RupuLibraryTests` — `@testable import RupuLibrary` reaches `internal`,
+    // never `private`): still module-internal, never `public` API.
+    static func agentSortValue(_ row: AgentDefinition, _ key: AgentsSortKey) -> ListSortValue {
         switch key {
         case .name: .text(row.name)
         case .scope: .text(row.scope)
@@ -231,7 +242,9 @@ public struct LibraryScreen: View {
                 .padding(.vertical, 8)
             Divider()
             VStack(spacing: 0) {
-                ForEach(Array(sorted.enumerated()), id: \.offset) { _, def in
+                // See `agentsTable`'s identical `id: \.rowIdentity` comment
+                // above — same fix, same rationale.
+                ForEach(sorted, id: \.rowIdentity) { def in
                     WorkflowDefRow(def: def, onSelect: {
                         model.navigate(to: .workflowDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID))
                     }, onLaunch: {
@@ -258,7 +271,8 @@ public struct LibraryScreen: View {
     /// `.autoflow` sorts `Bool?` as `1`/`0`/nil (never-declared last, per
     /// `sortRows`'s null-discipline contract) — there is no third numeric
     /// state, so `true` outranks `false` ascending.
-    private static func workflowSortValue(_ row: WorkflowDefinition, _ key: WorkflowsSortKey) -> ListSortValue {
+    // Not `private` — see `agentSortValue`'s identical comment above.
+    static func workflowSortValue(_ row: WorkflowDefinition, _ key: WorkflowsSortKey) -> ListSortValue {
         switch key {
         case .name: .text(row.name)
         case .scope: .text(row.scope)
@@ -292,7 +306,9 @@ public struct LibraryScreen: View {
                 .padding(.vertical, 8)
             Divider()
             VStack(spacing: 0) {
-                ForEach(Array(sorted.enumerated()), id: \.offset) { _, def in
+                // See `agentsTable`'s identical `id: \.rowIdentity` comment
+                // above — same fix, same rationale.
+                ForEach(sorted, id: \.rowIdentity) { def in
                     AutoflowDefRow(
                         def: def,
                         pendingActions: store.pendingActions,
@@ -329,7 +345,8 @@ public struct LibraryScreen: View {
         ]
     }
 
-    private static func autoflowSortValue(_ row: AutoflowDefinition, _ key: AutoflowsSortKey) -> ListSortValue {
+    // Not `private` — see `agentSortValue`'s identical comment above.
+    static func autoflowSortValue(_ row: AutoflowDefinition, _ key: AutoflowsSortKey) -> ListSortValue {
         switch key {
         case .name: .text(row.name)
         case .trigger: .text(row.trigger)
