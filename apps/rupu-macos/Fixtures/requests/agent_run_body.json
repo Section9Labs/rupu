@@ -3,5 +3,7 @@
   "mode": "bypass",
   "target": "main",
   "working_dir": "/tmp/project",
-  "host": "mini"
+  "host": "mini",
+  "scope_kind": "project",
+  "scope_id": "ws_a"
 }
