@@ -1483,12 +1483,14 @@ fn coverage_summary_fixture_is_current() {
 fn coverage_detail_fixture_is_current() {
     // `GET /api/coverage/:target` (`get_coverage`, api/coverage.rs) returns a
     // hand-built `json!({ws_id, project, target_id, assertion_lines,
-    // has_catalog, assertions, findings, files})` — mirrored here with the
-    // REAL `ConcernAssertion` / `rupu_coverage::FindingRecord` / `FileView`
-    // types. A `catalog` key (the target's `FlatCatalog`, normally served by
-    // the sibling `GET /api/coverage/:target/catalog` route) is bundled into
-    // this SAME fixture file per the Task 1 brief, so the Swift decode test
-    // exercises assertions + findings + catalog from one file.
+    // has_catalog, assertions, findings, files})` — exactly those 7 keys,
+    // NEVER a `catalog` key (confirmed against `get_coverage`'s body). This
+    // fixture mirrors that exactly, using the REAL `ConcernAssertion` /
+    // `rupu_coverage::FindingRecord` / `FileView` types. The target's
+    // `FlatCatalog` is served by the SEPARATE `GET /api/coverage/:target/catalog`
+    // route (`get_catalog`) and has its own fixture — see
+    // `coverage_catalog_fixture_is_current` below; Task 2 should decode it as
+    // an independent Swift type, not a field on `APICoverageDetail`.
     let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
 
     let assertions = vec![
@@ -1547,6 +1549,27 @@ fn coverage_detail_fixture_is_current() {
         touched_by: vec![coverage_attribution("run_9k2f")],
     }];
 
+    let value = serde_json::json!({
+        "ws_id": "ws-1",
+        "project": "rupu",
+        "target_id": "auth-core",
+        "assertion_lines": 128,
+        "has_catalog": true,
+        "assertions": assertions,
+        "findings": findings,
+        "files": files,
+    });
+    check_fixture("coverage_detail.json", &value);
+}
+
+#[test]
+fn coverage_catalog_fixture_is_current() {
+    // `GET /api/coverage/:target/catalog` (`get_catalog`, api/coverage.rs)
+    // returns a BARE `FlatCatalog` at the top level — no wrapper object, no
+    // `ws_id`/`target_id` (the target is only in the URL path). `FlatCatalog`
+    // is `pub` (`rupu_coverage`) and derives `Serialize`, so this is real,
+    // not hand-built. Same 2-concern catalog `coverage_detail_fixture_is_current`
+    // used to embed before it was split out to match the real route shape.
     let catalog = FlatCatalog {
         concerns: vec![
             Concern {
@@ -1579,19 +1602,7 @@ fn coverage_detail_fixture_is_current() {
             ("sql-injection".to_string(), CatalogMode::Index),
         ]),
     };
-
-    let value = serde_json::json!({
-        "ws_id": "ws-1",
-        "project": "rupu",
-        "target_id": "auth-core",
-        "assertion_lines": 128,
-        "has_catalog": true,
-        "assertions": assertions,
-        "findings": findings,
-        "files": files,
-        "catalog": catalog,
-    });
-    check_fixture("coverage_detail.json", &value);
+    check_fixture("coverage_catalog.json", &catalog);
 }
 
 #[test]
