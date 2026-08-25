@@ -38,6 +38,12 @@ public struct RunDetailScreen: View {
 
     @State private var store: RunDetailStore?
     @State private var storeRunID: String?
+
+    /// Tracked alongside `storeRunID` so `activate()` rebuilds on a backend
+    /// client swap (embedded/remote switch, reconnect, restart) too, not
+    /// just a `runID` change — see `activate()`'s doc comment and
+    /// `BackendController.clientIdentity()`.
+    @State private var storeClientID: ObjectIdentifier?
     @State private var selectedTab: RunDetailTab = .transcript
 
     public init(model: AppModel, backend: BackendController, runID: String, host: String?) {
@@ -65,18 +71,27 @@ public struct RunDetailScreen: View {
         }
     }
 
-    /// Builds (or rebuilds, on a `runID` change) the store and activates it.
-    /// `storeRunID` — not the store's own identity — is what decides
-    /// "rebuild vs. reuse": `RunDetailStore` doesn't expose its `runID`
-    /// publicly (it's plumbing, not UI-relevant state), so this screen keeps
-    /// its own record of which run the current `store` was built for.
+    /// Builds (or rebuilds, on a `runID` change OR a backend client swap)
+    /// the store and activates it. `storeRunID` — not the store's own
+    /// identity — is what decides "rebuild vs. reuse" for a `runID` change:
+    /// `RunDetailStore` doesn't expose its `runID` publicly (it's plumbing,
+    /// not UI-relevant state), so this screen keeps its own record of which
+    /// run the current `store` was built for. `storeClientID` is the same
+    /// idea for the backend connection: an embedded/remote mode switch,
+    /// reconnect, or restart swaps `backend.client()` to a brand-new
+    /// `CPClient` (see `BackendController.clientIdentity()`'s doc comment)
+    /// without ever going through `nil` in between, so a plain "do I
+    /// already have a store" check would never notice and would keep
+    /// running `store` against the abandoned connection.
     private func activate() async {
         guard let client = backend.client() else { return }
-        if storeRunID != runID {
+        let clientID = backend.clientIdentity()
+        if storeRunID != runID || storeClientID != clientID {
             store?.deactivate()
             let newStore = RunDetailStore(runID: runID, host: host, client: client, backend: backend)
             store = newStore
             storeRunID = runID
+            storeClientID = clientID
         }
         guard let store else { return }
         await store.activate()

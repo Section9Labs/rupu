@@ -30,6 +30,12 @@ public struct ActivityScreen: View {
 
     @State private var store: ActivityStore?
 
+    /// Tracked so `activate(kind:)` rebuilds on a backend client swap
+    /// (embedded/remote switch, reconnect, restart), not just the first
+    /// build — see that method's doc comment and
+    /// `BackendController.clientIdentity()`.
+    @State private var storeClientID: ObjectIdentifier?
+
     public init(model: AppModel, backend: BackendController) {
         self.model = model
         self.backend = backend
@@ -147,12 +153,26 @@ public struct ActivityScreen: View {
     /// `kind` — the only correct way to (re)start `ActivityStore`'s live
     /// stream, per Task 5's report, whether this is the very first
     /// activation or a kind switch mid-session.
+    ///
+    /// Also rebuilds — deactivating the old store first — whenever
+    /// `backend.client()`'s identity has changed since the store currently
+    /// held was built: an embedded/remote mode switch, a manual reconnect,
+    /// or a restart all swap `backend.client()` to a brand-new `CPClient`
+    /// directly (never through `nil` in between — see
+    /// `BackendController.clientIdentity()`'s doc comment), so a plain "do I
+    /// already have a store" check would never notice and would keep
+    /// running `store` against the abandoned connection until this screen
+    /// happened to be torn down and rebuilt some other way (e.g. navigating
+    /// away and back).
     private func activate(kind: RunKindFilter) async {
+        guard let client = backend.client() else { return }
+        let clientID = backend.clientIdentity()
+
         let activeStore: ActivityStore
-        if let existing = store {
+        if let existing = store, storeClientID == clientID {
             activeStore = existing
         } else {
-            guard let client = backend.client() else { return }
+            store?.deactivate()
             let newStore = ActivityStore(
                 client: client,
                 signalsFactory: Self.makeSignalsFactory(backend: backend),
@@ -166,6 +186,7 @@ public struct ActivityScreen: View {
             // sync too.
             newStore.scopeFilter = model.scopeWsID
             store = newStore
+            storeClientID = clientID
             activeStore = newStore
         }
         await activeStore.activate(kind: kind)
