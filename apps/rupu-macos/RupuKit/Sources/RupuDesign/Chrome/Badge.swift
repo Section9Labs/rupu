@@ -21,6 +21,6 @@ public struct Badge: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(tone.opacity(0.12))
-            .clipShape(RoundedRectangle(cornerRadius: 4))
+            .clipShape(ChromeShape.pill)
     }
 }

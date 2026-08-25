@@ -260,7 +260,7 @@ struct ClaimTableRow: View {
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(Color.rupuBrand.opacity(0.12))
-                        .clipShape(Capsule())
+                        .clipShape(ChromeShape.pill)
                 }
                 .buttonStyle(.plain)
                 .help(prURLString)

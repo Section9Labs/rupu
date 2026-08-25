@@ -25,11 +25,16 @@ public struct StatusDescriptor {
     }
 }
 
-/// Web-parity status pill: tone-colored icon + mono label, tone color at a
-/// 12% fill with a 30% ring — matches `StatusPill.tsx`'s `PillShell` (which
-/// uses `bg-status-x/10 ring-status-x/30`; 12% is this design's own fill step,
-/// see `docs/macOS_design/V2-CONTRACT.md`). `compact` mirrors the web pill's `xs` size (9pt icon,
-/// tighter label) vs. the default `sm` size (11pt icon).
+/// Web-parity status pill: icon + mono label on a `ChromeShape.pill` (4pt
+/// rounded rect, matching `StatusPill.tsx:79`'s `rounded` class — see
+/// `ChromeShape`'s own doc comment). Tint follows `StatusTone.isFlatPill`:
+/// `pending`/`cancelled`/`skipped` render flat/neutral (`Color.
+/// statusPillBackground`/`Ring`/`Ink`, ported from `status.ts`'s `bg-surface
+/// ... ring-border` rows); every other tone keeps the tone color at a 12%
+/// fill with a 30% ring (matches `StatusPill.tsx`'s `bg-status-x/10
+/// ring-status-x/30`; 12% is this design's own fill step, see
+/// `docs/macOS_design/V2-CONTRACT.md`). `compact` mirrors the web pill's `xs`
+/// size (9pt icon, tighter label) vs. the default `sm` size (11pt icon).
 public struct StatusPill: View {
     private let tone: StatusTone
     private let compact: Bool
@@ -41,18 +46,18 @@ public struct StatusPill: View {
 
     public var body: some View {
         let descriptor = StatusDescriptor.descriptor(for: tone)
-        let color = Color.status(tone)
+        let ink = Color.statusPillInk(tone)
         HStack(spacing: 4) {
             Icon(descriptor.icon, size: compact ? 9 : 11)
-                .foregroundStyle(color)
+                .foregroundStyle(ink)
             Text(descriptor.label)
                 .font(.dataMono(compact ? 9 : 10))
-                .foregroundStyle(color)
+                .foregroundStyle(ink)
         }
         .padding(.horizontal, compact ? 6 : 8)
         .padding(.vertical, compact ? 2 : 3)
-        .background(color.opacity(0.12))
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(color.opacity(0.3), lineWidth: 1))
+        .background(Color.statusPillBackground(tone))
+        .clipShape(ChromeShape.pill)
+        .overlay(ChromeShape.pill.stroke(Color.statusPillRing(tone), lineWidth: 1))
     }
 }

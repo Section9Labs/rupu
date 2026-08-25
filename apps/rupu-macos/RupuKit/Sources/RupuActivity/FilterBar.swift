@@ -102,21 +102,34 @@ struct FilterBar: View {
         }
     }
 
+    /// Task 2 (chrome-kit fidelity, A5): neutral-outline-until-selected, per
+    /// web's `FilterPills` (`components/ui/FilterPills.tsx:41-45`) — the real
+    /// web analog for this control (`WorkflowRuns.tsx`/`AgentRuns.tsx` use it
+    /// for their lifecycle/status filter row). Inactive = `border-border
+    /// bg-panel text-ink-dim`; active = `border-brand-600 bg-brand-600
+    /// text-white`, never per-status color-tinted — this chip no longer
+    /// reads `status.tone` at all. Shape stays `Capsule`, NOT `ChromeShape.
+    /// pill`: `FilterPills` is `rounded-full` (its own doc comment: "Rounded-
+    /// full, single-select, brand-filled active pill"), a deliberately
+    /// different, genuinely-round family from `StatusPill`'s 4pt `rounded`
+    /// (see `ChromeShape`'s doc comment) — the audit's assumption that this
+    /// chip "rides the same 4pt kit constant" didn't hold up against the
+    /// actual source and is corrected here. Multi-select toggle semantics
+    /// (vs. web's single-select tabs) are unchanged — out of this task's
+    /// shape/tint-fidelity scope.
     private func statusChip(_ status: ActivityStatus) -> some View {
         let isOn = store.statusFilter.contains(status)
-        let tone = Color.status(status.tone)
         return Button {
             toggle(status)
         } label: {
             Text(status.displayLabel)
                 .font(.metaText)
-                .foregroundStyle(isOn ? Color.rupuInk : Color.rupuDim)
+                .foregroundStyle(isOn ? Color.white : Color.rupuDim)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(tone.opacity(0.12))
+                .background(isOn ? Color.rupuBrand600 : Color.rupuPanel)
                 .clipShape(Capsule())
-                .overlay(Capsule().stroke(tone.opacity(0.3), lineWidth: 1))
-                .opacity(isOn ? 1.0 : 0.6)
+                .overlay(Capsule().stroke(isOn ? Color.rupuBrand600 : Color.rupuBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
