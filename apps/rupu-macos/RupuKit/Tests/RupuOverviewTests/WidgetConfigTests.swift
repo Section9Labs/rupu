@@ -155,3 +155,13 @@ import Testing
         #expect(decoded.order == ["needsYou", "fleet", "instruments", "charts", "cycles"])
     }
 }
+
+// Review finding 3 (Task 3): `label(for:)` falls back to the raw id when
+// `defaultOrder` and its switch drift — this guards that every canonical
+// block id resolves to a real human label, so a newly added block can't
+// silently ship its raw id as UI text.
+@Test func everyDefaultOrderIDResolvesToARealLabelNotTheRawID() {
+    for id in OverviewWidgets.defaultOrder {
+        #expect(OverviewWidgets.label(for: id) != id, "block id \(id) has no label — add it to label(for:)")
+    }
+}
