@@ -381,6 +381,118 @@ private func makeStore(
     #expect(counter.value == 1)
 }
 
+// MARK: - Cancellation mid-flight clears the lazy latch (recoverable-cancel
+// contract — see `CodeStore`'s "Cancellation always leaves the store
+// re-dispatchable" section; a cancelled `.task` must not leave the tab
+// latched at `.loading` with no way to re-dispatch).
+
+@MainActor @Test func runsCancellationMidFlightClearsTheLatchSoReSelectingTheTabRefetches() async {
+    let counter = Counter()
+    let store = makeStore(runsResult: { _, _ in
+        if counter.increment() == 1 { throw CancellationError() }
+        return [runRow(id: "run-1")]
+    })
+
+    await store.loadRunsIfNeeded()
+    guard case .loading = store.runs else { Issue.record("expected runs still .loading after cancel"); return }
+
+    await store.loadRunsIfNeeded()
+    #expect(counter.value == 2, "a cancelled fetch must clear the latch so re-selection re-dispatches")
+    #expect(store.runs.value?.count == 1)
+}
+
+@MainActor @Test func sessionsCancellationMidFlightClearsTheLatchSoReSelectingTheTabRefetches() async {
+    let counter = Counter()
+    let store = makeStore(sessionsResult: { _, _ in
+        if counter.increment() == 1 { throw CancellationError() }
+        return [sessionRow(id: "sess-1")]
+    })
+
+    await store.loadSessionsIfNeeded()
+    guard case .loading = store.sessions else { Issue.record("expected sessions still .loading after cancel"); return }
+
+    await store.loadSessionsIfNeeded()
+    #expect(counter.value == 2, "a cancelled fetch must clear the latch so re-selection re-dispatches")
+    #expect(store.sessions.value?.count == 1)
+}
+
+@MainActor @Test func agentsCancellationMidFlightClearsTheLatchSoReSelectingTheTabRefetches() async {
+    let counter = Counter()
+    let store = makeStore(agentsResult: {
+        if counter.increment() == 1 { throw CancellationError() }
+        return [agentDef(name: "rupuso")]
+    })
+
+    await store.loadAgentsIfNeeded()
+    guard case .loading = store.agents else { Issue.record("expected agents still .loading after cancel"); return }
+
+    await store.loadAgentsIfNeeded()
+    #expect(counter.value == 2, "a cancelled fetch must clear the latch so re-selection re-dispatches")
+    #expect(store.agents.value?.map(\.name) == ["rupuso"])
+}
+
+@MainActor @Test func workflowsCancellationMidFlightClearsTheLatchSoReSelectingTheTabRefetches() async {
+    let counter = Counter()
+    let store = makeStore(workflowsResult: {
+        if counter.increment() == 1 { throw CancellationError() }
+        return [workflowDef(name: "nightly-health")]
+    })
+
+    await store.loadWorkflowsIfNeeded()
+    guard case .loading = store.workflows else { Issue.record("expected workflows still .loading after cancel"); return }
+
+    await store.loadWorkflowsIfNeeded()
+    #expect(counter.value == 2, "a cancelled fetch must clear the latch so re-selection re-dispatches")
+    #expect(store.workflows.value?.map(\.name) == ["nightly-health"])
+}
+
+@MainActor @Test func autoflowsCancellationMidFlightClearsTheLatchSoReSelectingTheTabRefetches() async {
+    let counter = Counter()
+    let store = makeStore(autoflowsResult: {
+        if counter.increment() == 1 { throw CancellationError() }
+        return [autoflowDef(name: "issue-triage")]
+    })
+
+    await store.loadAutoflowsIfNeeded()
+    guard case .loading = store.autoflows else { Issue.record("expected autoflows still .loading after cancel"); return }
+
+    await store.loadAutoflowsIfNeeded()
+    #expect(counter.value == 2, "a cancelled fetch must clear the latch so re-selection re-dispatches")
+    #expect(store.autoflows.value?.map(\.name) == ["issue-triage"])
+}
+
+@MainActor @Test func findingsCancellationMidFlightClearsTheLatchSoReSelectingTheTabRefetches() async {
+    let counter = Counter()
+    let store = makeStore(findingsResult: {
+        if counter.increment() == 1 { throw CancellationError() }
+        return findings(count: 3)
+    })
+
+    await store.loadFindingsIfNeeded()
+    guard case .loading = store.findings else { Issue.record("expected findings still .loading after cancel"); return }
+
+    await store.loadFindingsIfNeeded()
+    #expect(counter.value == 2, "a cancelled fetch must clear the latch so re-selection re-dispatches")
+    #expect(store.findings.value?.summary.total == 3)
+}
+
+/// A cancelled `showAllRuns()` goes through the same `loadRuns(limit:)`
+/// catch — the latch it clears is the same `runsRequested`, so the tab's
+/// next `loadRunsIfNeeded()` re-dispatches (the window fetch, honestly).
+@MainActor @Test func showAllRunsCancellationAlsoClearsTheLatch() async {
+    let counter = Counter()
+    let store = makeStore(runsResult: { _, limit in
+        if counter.increment() == 2 { throw CancellationError() }
+        return (0..<min(limit, 5)).map { runRow(id: "run-\($0)") }
+    })
+
+    await store.loadRunsIfNeeded()
+    await store.showAllRuns()
+
+    await store.loadRunsIfNeeded()
+    #expect(counter.value == 3, "a cancelled show-all must leave the tab re-dispatchable too")
+}
+
 // MARK: - activate() resets lazy flags for repeatability
 
 @MainActor @Test func activateAgainResetsLazyFlagsSoATabRefetchesOnNextSelection() async {

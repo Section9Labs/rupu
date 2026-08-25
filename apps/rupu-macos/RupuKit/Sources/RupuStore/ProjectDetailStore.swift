@@ -31,7 +31,14 @@ import RupuAPI
 /// leaves the flag set — a `.failed` tab is not retried automatically; the
 /// screen's own retry affordance (same "every mutating/loading control's
 /// tap is its own retry" convention `RunDetailScreen` documents) calls the
-/// unconditional `loadX()` counterpart instead.
+/// unconditional `loadX()` counterpart instead. A call that is CANCELLED
+/// mid-flight (SwiftUI tearing down the tab's `.task` because the user
+/// switched away before the fetch landed) clears the flag instead — the
+/// block is still `.loading` and no retry affordance will ever render for
+/// it, so leaving the latch set would freeze the tab as a permanent
+/// spinner; clearing it lets the tab's next `.task` re-dispatch fresh
+/// (same "cancellation always leaves the store re-dispatchable" contract
+/// `CodeStore` documents).
 ///
 /// **Windowing (Runs/Sessions only)**: `GET /api/projects/:ws_id/runs` and
 /// `.../sessions` have no pagination envelope, same as every other list
@@ -205,7 +212,10 @@ public final class ProjectDetailStore {
             let rows = try await fetchAgents()
             agents = rows.isEmpty ? .empty : .content(rows)
         } catch {
-            guard !isCancellation(error) else { return }
+            guard !isCancellation(error) else {
+                agentsRequested = false
+                return
+            }
             agents = .failed(String(describing: error))
         }
     }
@@ -222,7 +232,10 @@ public final class ProjectDetailStore {
             let rows = try await fetchWorkflows()
             workflows = rows.isEmpty ? .empty : .content(rows)
         } catch {
-            guard !isCancellation(error) else { return }
+            guard !isCancellation(error) else {
+                workflowsRequested = false
+                return
+            }
             workflows = .failed(String(describing: error))
         }
     }
@@ -239,7 +252,10 @@ public final class ProjectDetailStore {
             let rows = try await fetchAutoflows()
             autoflows = rows.isEmpty ? .empty : .content(rows)
         } catch {
-            guard !isCancellation(error) else { return }
+            guard !isCancellation(error) else {
+                autoflowsRequested = false
+                return
+            }
             autoflows = .failed(String(describing: error))
         }
     }
@@ -255,7 +271,10 @@ public final class ProjectDetailStore {
         do {
             findings = .content(try await fetchFindings())
         } catch {
-            guard !isCancellation(error) else { return }
+            guard !isCancellation(error) else {
+                findingsRequested = false
+                return
+            }
             findings = .failed(String(describing: error))
         }
     }
@@ -277,7 +296,10 @@ public final class ProjectDetailStore {
             runs = rows.isEmpty ? .empty : .content(rows)
             runsShowingAll = Self.isComplete(loaded: rows.count, total: detail.value?.runs.total)
         } catch {
-            guard !isCancellation(error) else { return }
+            guard !isCancellation(error) else {
+                runsRequested = false
+                return
+            }
             runs = .failed(String(describing: error))
         }
     }
@@ -288,7 +310,10 @@ public final class ProjectDetailStore {
             sessions = rows.isEmpty ? .empty : .content(rows)
             sessionsShowingAll = Self.isComplete(loaded: rows.count, total: detail.value?.sessions.total)
         } catch {
-            guard !isCancellation(error) else { return }
+            guard !isCancellation(error) else {
+                sessionsRequested = false
+                return
+            }
             sessions = .failed(String(describing: error))
         }
     }
