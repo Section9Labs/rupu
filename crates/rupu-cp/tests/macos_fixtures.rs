@@ -7,12 +7,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{TimeZone, Utc};
+use rupu_config::{KeyProvenance, KeySource};
 use rupu_coverage::{
     AssertionStatus, Attribution as CoverageAttribution, CatalogMode, Concern, ConcernAssertion,
     Evidence as CoverageEvidence, FileView, FindingEvidence as CoverageFindingEvidence,
     FindingRecord as CoverageFindingRecord, FindingScope as CoverageFindingScope, FlatCatalog,
     Severity as CoverageSeverity, Surface as CoverageSurface, TouchStrength,
 };
+use rupu_cp::api::config::{ConfigView, RuntimeStatus};
 use rupu_cp::api::findings::{FindingOut, FindingsResponse, FindingsSummary};
 use rupu_cp::api::graph::{ApprovalGateDto, GateDto, StepDag, StepNodeDto, SubStepDto};
 use rupu_cp::api::projects::ProjectRow;
@@ -1838,4 +1840,109 @@ fn usage_outliers_fixture_is_current() {
         },
     ];
     check_fixture("usage_outliers.json", &outliers);
+}
+
+// ── Settings / config (Phase 6A) ────────────────────────────────────────────
+
+#[test]
+fn config_view_fixture_is_current() {
+    // `GET /api/config` (`get_config`, api/config.rs): `ConfigView`/
+    // `RuntimeStatus` were hoisted from private to `pub` (fields included) so
+    // this integration test can construct the real types directly, rather
+    // than hand-building a `json!` mirror as the private-DTO fixtures above
+    // do. `pub(crate)` (as the visibility this arm's brief originally
+    // specified) does NOT work here: `tests/macos_fixtures.rs` compiles as a
+    // separate crate linking against `rupu-cp` as an external dependency, so
+    // `pub(crate)` items stay invisible to it (confirmed by a compile
+    // failure — `struct ConfigView is private`) — the same reason every
+    // OTHER type imported directly in this file (`FindingOut`, `ProjectRow`,
+    // `RunListRow`, `OutlierRun`, …) is `pub`, never `pub(crate)`.
+    //
+    // `effective` carries a dotted-name provider table key (`GLM-5.2-FP8`) to
+    // exercise the canonical quoted-encoding stress case (see
+    // `rupu_config::resolve::dotted`'s doc comment); `provenance` covers the
+    // full source matrix (Global/Project/Default, one locked) plus that same
+    // quoted-middle-segment key exactly as `dotted()` would emit it.
+    let effective = serde_json::json!({
+        "default_model": "claude-sonnet-4-6",
+        "providers": {
+            "GLM-5.2-FP8": {
+                "model": "GLM-5.2-FP8",
+                "base_url": "https://oracle.internal/v1",
+            },
+        },
+        "cp": {
+            "bind": "127.0.0.1:7420",
+            "max_workspace_bytes": 500_000_000i64,
+        },
+    });
+
+    let mut provenance = BTreeMap::new();
+    provenance.insert(
+        "default_model".to_string(),
+        KeyProvenance {
+            source: KeySource::Global,
+            locked: false,
+        },
+    );
+    provenance.insert(
+        "cp.max_workspace_bytes".to_string(),
+        KeyProvenance {
+            source: KeySource::Project,
+            locked: false,
+        },
+    );
+    provenance.insert(
+        "log_level".to_string(),
+        KeyProvenance {
+            source: KeySource::Default,
+            locked: false,
+        },
+    );
+    provenance.insert(
+        "policy.lock".to_string(),
+        KeyProvenance {
+            source: KeySource::Global,
+            locked: true,
+        },
+    );
+    // The quoted-middle-segment stress case: `providers."GLM-5.2-FP8".model`,
+    // exactly as `rupu_config::resolve::dotted()` emits a segment containing
+    // a `.` (see its doc comment — matches `config_write::split_dotted_key`
+    // and the frontend's `quoteSegment`/`splitDottedKey`).
+    provenance.insert(
+        "providers.\"GLM-5.2-FP8\".model".to_string(),
+        KeyProvenance {
+            source: KeySource::Project,
+            locked: false,
+        },
+    );
+
+    let raw_global = "default_model = \"claude-sonnet-4-6\"\nlog_level = \"info\"\n\n\
+                       [policy]\nlock = [\"policy.lock\"]\n"
+        .to_string();
+    let raw_project = Some(
+        "default_model = \"claude-opus-4-8\"\n\n\
+         [cp]\nmax_workspace_bytes = 500000000\n"
+            .to_string(),
+    );
+
+    let cp = serde_json::json!({
+        "bind": "127.0.0.1:7420",
+        "max_workspace_bytes": 500_000_000i64,
+    });
+
+    let view = ConfigView {
+        effective,
+        provenance,
+        raw_global,
+        raw_project,
+        cp,
+        status: RuntimeStatus {
+            bind: "127.0.0.1:7420".into(),
+            token_set: false,
+            restart_required_keys: vec!["bind".into(), "token".into()],
+        },
+    };
+    check_fixture("config_view.json", &view);
 }
