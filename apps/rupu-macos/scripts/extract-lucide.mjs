@@ -63,6 +63,7 @@ const ICONS = [
   { enumCase: "repeatIcon", asset: "repeat", source: "repeat" },
   { enumCase: "messageSquare", asset: "message-square", source: "message-square" },
   { enumCase: "folderGit2", asset: "folder-git-2", source: "folder-git-2" },
+  { enumCase: "folder", asset: "folder", source: "folder" },
   { enumCase: "shieldCheck", asset: "shield-check", source: "shield-check" },
   { enumCase: "shieldAlert", asset: "shield-alert", source: "shield-alert" },
   { enumCase: "network", asset: "network", source: "network" },

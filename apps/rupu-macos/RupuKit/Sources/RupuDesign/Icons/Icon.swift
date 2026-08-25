@@ -16,6 +16,7 @@ public enum LucideIcon: String, CaseIterable, Sendable {
     case repeatIcon = "repeat"
     case messageSquare
     case folderGit2
+    case folder
     case shieldCheck
     case shieldAlert
     case network

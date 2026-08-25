@@ -11,7 +11,7 @@ import RupuDesign
 /// findings-badge placement differ enough that a shared generic type isn't
 /// worth the indirection for one more screen).
 public enum ProjectDetailTab: String, CaseIterable, Sendable {
-    case overview, runs, sessions, findings, coverage, definitions
+    case overview, runs, sessions, findings, coverage, definitions, code
 
     var title: String {
         switch self {
@@ -21,6 +21,7 @@ public enum ProjectDetailTab: String, CaseIterable, Sendable {
         case .findings: "Findings"
         case .coverage: "Coverage"
         case .definitions: "Definitions"
+        case .code: "Code"
         }
     }
 }
@@ -42,6 +43,17 @@ public enum ProjectDetailTab: String, CaseIterable, Sendable {
 /// `.task(id:)` only re-fires when its id's *value* changes. Combining both
 /// into one id makes every `wsID`/`tab` combination its own fetch trigger.
 ///
+/// **Phase 6B addition**: the id ALSO folds in `store.detail.value != nil`
+/// (the parent detail block's own resolution state) — the PR #501
+/// stranding class this codebase guards against everywhere a lazy fetch
+/// depends on a SIBLING block: an operator who taps `.code` before
+/// `store.detail` has resolved must still see the Code tab's fetch
+/// eventually fire once `detail` DOES resolve, even though `tab` itself
+/// never changed value across that transition. `loadTab`'s own `.code`
+/// dispatch is idempotent (`codeRequested`), so the extra re-fire this
+/// causes for every OTHER tab whenever `detail` finishes loading is a
+/// harmless no-op, not a double-fetch.
+///
 /// **Does NOT need `OverviewScreen`'s cold-launch fix** — same reasoning
 /// `RunDetailScreen`/`ProjectsScreen` already document: `.projectDetail` is
 /// only ever reached by pushing from `.projects`, never a cold-launch route.
@@ -54,6 +66,21 @@ public struct ProjectDetailScreen: View {
     @State private var storeWsID: String?
     @State private var storeClientID: ObjectIdentifier?
     @State private var tab: ProjectDetailTab = .overview
+
+    /// The Code tab's own store (Phase 6B, Task 4) — deliberately NOT
+    /// folded into `ProjectDetailStore` (unlike Runs/Sessions/Findings/
+    /// Definitions): `CodeStore` owns navigable directory/file/filter state
+    /// (`currentPath`/`selectedPath`) that has nothing in common with
+    /// `ProjectDetailStore`'s read-once-per-tab `BlockState` blocks. Built
+    /// and rebuilt in the SAME `activate()` branch as `store` — same
+    /// `wsID`/client-identity lifecycle — so it's already non-nil by the
+    /// time `content(store:)` (and therefore `tabContent`'s `.code` case)
+    /// can possibly render it; `codeRequested` is this screen's own
+    /// "fetch the root listing once per activation" latch, mirroring
+    /// `ProjectDetailStore`'s internal `xRequested` flags for its own lazy
+    /// tabs.
+    @State private var codeStore: CodeStore?
+    @State private var codeRequested = false
 
     public init(model: AppModel, backend: BackendController, wsID: String) {
         self.model = model
@@ -86,6 +113,8 @@ public struct ProjectDetailScreen: View {
         let clientID = backend.clientIdentity()
         if storeWsID != wsID || storeClientID != clientID {
             store = ProjectDetailStore(wsID: wsID, client: client)
+            codeStore = CodeStore(wsID: wsID, client: client)
+            codeRequested = false
             storeWsID = wsID
             storeClientID = clientID
             tab = .overview
@@ -205,8 +234,9 @@ public struct ProjectDetailScreen: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .panelStyle(.panel)
         // See the type doc comment's "Lazy tab loading" section for why
-        // both `wsID` and `tab` are folded into one id.
-        .task(id: "\(wsID)|\(tab.rawValue)") {
+        // `wsID`, `tab`, AND `store.detail`'s resolution state are all
+        // folded into one id.
+        .task(id: "\(wsID)|\(tab.rawValue)|\(store.detail.value != nil)") {
             await loadTab(tab, store: store)
         }
     }
@@ -222,6 +252,11 @@ public struct ProjectDetailScreen: View {
     /// `.definitions` fires all three of its own sub-lists concurrently —
     /// each is independently idempotent (`loadXIfNeeded()`), so a repeat
     /// visit to this tab is a no-op fan-out, not three redundant fetches.
+    /// `.code` loads `codeStore`'s workspace-root listing exactly once per
+    /// screen activation (`codeRequested` — see that property's doc
+    /// comment); every re-fire this method's own `.task(id:)` now produces
+    /// for `store.detail` resolving is therefore a no-op here too, same as
+    /// every other case's own idempotent guard.
     private func loadTab(_ tab: ProjectDetailTab, store: ProjectDetailStore) async {
         switch tab {
         case .overview, .coverage:
@@ -237,6 +272,10 @@ public struct ProjectDetailScreen: View {
             async let workflowsLoad: Void = store.loadWorkflowsIfNeeded()
             async let autoflowsLoad: Void = store.loadAutoflowsIfNeeded()
             _ = await (agentsLoad, workflowsLoad, autoflowsLoad)
+        case .code:
+            guard let codeStore, !codeRequested else { return }
+            codeRequested = true
+            await codeStore.activate()
         }
     }
 
@@ -253,6 +292,12 @@ public struct ProjectDetailScreen: View {
             ProjectFindingsTabContent(findings: store.findings)
         case .coverage:
             CoverageTabContent()
+        case .code:
+            if let codeStore {
+                CodeTab(store: codeStore)
+            } else {
+                centeredLabel("Backend not connected")
+            }
         case .definitions:
             DefinitionsTabContent(
                 store: store,
