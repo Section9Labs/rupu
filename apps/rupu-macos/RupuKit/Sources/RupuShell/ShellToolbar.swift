@@ -2,6 +2,7 @@ import SwiftUI
 import RupuAPI
 import RupuStore
 import RupuDesign
+import RupuOverview
 
 /// Detail-pane toolbar: screen title, project-scope picker, time-range
 /// picker, search affordance, "+ New run" launcher, live-stream pill,
@@ -26,6 +27,7 @@ struct ShellToolbar: ToolbarContent {
     let backend: BackendController
     let palette: PaletteStore?
     @AppStorage("appearance") private var appearance: String = "system"
+    @AppStorage(OverviewWidgets.storageKey) private var overviewWidgetsData: Data = Data()
     @State private var projects: [APIProjectRow] = []
 
     var body: some ToolbarContent {
@@ -50,11 +52,55 @@ struct ShellToolbar: ToolbarContent {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            if case .overview = model.route {
+                customizeMenu
+            }
             searchButton
             newRunButton
             livePill
             appearancePicker
         }
+    }
+
+    /// Overview-only Customize menu (Task 6): five checkmark toggles over
+    /// `OverviewWidgets`' visibility fields — keyed off `model.route` being
+    /// `.overview` itself (a real route-case check, not a string compare
+    /// against `screenTitle`, which is just display text and could
+    /// coincidentally collide with another screen's title). `Toggle` inside
+    /// a `Menu` renders as a checkmark item on macOS, same chrome as any
+    /// system menu's option toggles.
+    ///
+    /// Reads/writes `overviewWidgetsData` directly (this view's own
+    /// `@AppStorage(OverviewWidgets.storageKey)` declaration) — the same
+    /// `"appearance"` trick `SettingsView`/`ShellToolbar` already use to
+    /// keep two unrelated views in sync on one `UserDefaults` key with no
+    /// custom observation code: `OverviewScreen` declares the identical
+    /// `@AppStorage` key independently, so a toggle here is reflected there
+    /// automatically the next time SwiftUI re-evaluates its body.
+    private var customizeMenu: some View {
+        Menu {
+            Toggle("Needs you", isOn: overviewWidgetToggle(\.needsYou))
+            Toggle("Instruments", isOn: overviewWidgetToggle(\.instruments))
+            Toggle("Charts", isOn: overviewWidgetToggle(\.charts))
+            Toggle("Cycle summary", isOn: overviewWidgetToggle(\.cycles))
+            Toggle("Fleet strip", isOn: overviewWidgetToggle(\.fleet))
+        } label: {
+            Icon(.settings, size: 12)
+                .foregroundStyle(Color.rupuDim)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 20)
+    }
+
+    private func overviewWidgetToggle(_ keyPath: WritableKeyPath<OverviewWidgets, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { OverviewWidgets.decode(overviewWidgetsData)[keyPath: keyPath] },
+            set: { newValue in
+                var widgets = OverviewWidgets.decode(overviewWidgetsData)
+                widgets[keyPath: keyPath] = newValue
+                overviewWidgetsData = widgets.encoded
+            }
+        )
     }
 
     private var scopePicker: some View {
