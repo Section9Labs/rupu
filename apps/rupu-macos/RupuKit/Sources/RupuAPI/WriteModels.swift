@@ -61,6 +61,27 @@ public struct RunControlResponse: Decodable, Sendable {
     }
 }
 
+/// Response of `POST /api/autoflows/:name/enable` or `.../disable`
+/// (`SetEnabledResponse` on the Rust side) — `{name, enabled}`. Same
+/// **immediate** contract as reject/cancel (see `RunControlResponse`'s doc
+/// comment on marker-only vs. immediate): this rewrites the on-disk YAML
+/// directly, no background worker involved, so `enabled` in the response is
+/// the definition's actual new state.
+public struct AutoflowSetEnabledResponse: Decodable, Equatable, Sendable {
+    public let name: String
+    public let enabled: Bool
+
+    public init(name: String, enabled: Bool) {
+        self.name = name
+        self.enabled = enabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case enabled
+    }
+}
+
 // MARK: - Request bodies
 
 /// `POST /api/runs/:id/approve` body. Bodyless requests are valid (server

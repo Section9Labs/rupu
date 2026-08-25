@@ -84,6 +84,57 @@ import Foundation
     #expect(response.tools[1].kind == "write")
 }
 
+@Test func decodesAutoflowDefsFixture() throws {
+    let defs = try JSONDecoder().decode([AutoflowDefinition].self, from: Fixtures.data("autoflow_defs.json"))
+    #expect(defs.count == 2)
+
+    let global = defs[0]
+    #expect(global.name == "nightly-health")
+    #expect(global.slug == "nightly-health")
+    #expect(global.trigger == "cron")
+    #expect(global.scope == "global")
+    #expect(global.scopeKind == "global")
+    #expect(global.scopeID == nil)
+    #expect(global.enabled)
+
+    // A DISABLED def is still listed (not filtered out), and its slug can
+    // differ from its parsed name.
+    let project = defs[1]
+    #expect(project.name == "issue-triage")
+    #expect(project.slug == "issue-triage-v2")
+    #expect(project.trigger == "event")
+    #expect(project.scope == "rupu")
+    #expect(project.scopeKind == "project")
+    #expect(project.scopeID == "ws-1")
+    #expect(!project.enabled)
+}
+
+@Test func decodesWorkersFixtureWithFullAndEmptyCapabilities() throws {
+    let rows = try JSONDecoder().decode([APIWorkerRow].self, from: Fixtures.data("workers.json"))
+    #expect(rows.count == 2)
+
+    let busy = rows[0]
+    #expect(busy.workerID == "worker_local_team-mini_cli")
+    #expect(busy.kind == "cli")
+    #expect(busy.capabilities.backends == ["local_worktree"])
+    #expect(busy.capabilities.scmHosts == ["github"])
+    #expect(busy.capabilities.permissionModes == ["bypass", "readonly"])
+    #expect(busy.activeRunCount == 2)
+    #expect(busy.totalRunCount == 9)
+    #expect(busy.lastRunAt == "2026-08-20T12:20:00Z")
+
+    // `capabilities: {}` on the wire (every list empty via
+    // `skip_serializing_if`) must still decode, defaulting each list to [].
+    let idle = rows[1]
+    #expect(idle.kind == "autoflow_serve")
+    #expect(idle.capabilities.backends == [])
+    #expect(idle.capabilities.scmHosts == [])
+    #expect(idle.capabilities.permissionModes == [])
+    #expect(idle.activeRunCount == 0)
+    #expect(idle.totalRunCount == 0)
+    #expect(idle.lastRunAt == nil)
+}
+
 @Test func decodesHostsFixtureWithVersionAndActiveRunCount() throws {
     let hosts = try JSONDecoder().decode([APIHostRow].self, from: Fixtures.data("hosts.json"))
     #expect(hosts.count == 3)

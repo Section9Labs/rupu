@@ -106,6 +106,50 @@ public struct WorkflowDefinition: Decodable, Equatable, Sendable {
     }
 }
 
+/// Row from `GET /api/autoflows` (and `GET /api/projects/:ws_id/autoflows`)
+/// — `AutoflowDefRow` on the Rust side. A workflow definition carrying a
+/// top-level `autoflow:` block, enabled or disabled alike (a disabled def is
+/// still listed — see `scan_autoflow_defs`'s doc comment on the Rust side).
+/// `slug` is the file stem (the workflow detail route's key), which can
+/// differ from `name` (the parsed frontmatter/YAML `name:`).
+public struct AutoflowDefinition: Decodable, Equatable, Sendable {
+    public let name: String
+    public let slug: String
+    public let trigger: String
+    public let scope: String
+    public let scopeKind: String
+    public let scopeID: String?
+    public let enabled: Bool
+
+    public init(
+        name: String,
+        slug: String,
+        trigger: String,
+        scope: String,
+        scopeKind: String,
+        scopeID: String?,
+        enabled: Bool
+    ) {
+        self.name = name
+        self.slug = slug
+        self.trigger = trigger
+        self.scope = scope
+        self.scopeKind = scopeKind
+        self.scopeID = scopeID
+        self.enabled = enabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case slug
+        case trigger
+        case scope
+        case scopeKind = "scope_kind"
+        case scopeID = "scope_id"
+        case enabled
+    }
+}
+
 /// One declared input on a workflow's `workflow.inputs` map (`GET
 /// /api/workflows/:name`'s `workflow.inputs.<name>` shape) — the Launcher's
 /// declared-input rows source.

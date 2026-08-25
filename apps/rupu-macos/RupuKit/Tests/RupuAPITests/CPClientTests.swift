@@ -241,6 +241,112 @@ struct CPClientTests {
         #expect(StubURLProtocol.lastRequest?.url?.path == "/api/sessions/sess-1/runs")
     }
 
+    // MARK: - Fleet & project detail (Phase 5A)
+
+    @Test func workersHitsExpectedPathAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("workers.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let rows = try await client.workers()
+
+        #expect(rows.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/workers")
+    }
+
+    @Test func autoflowDefinitionsHitsExpectedPathAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("autoflow_defs.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let defs = try await client.autoflowDefinitions()
+
+        #expect(defs.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/autoflows")
+    }
+
+    @Test func projectDetailHitsWsIDPathAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("project_detail.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let detail = try await client.projectDetail(wsID: "ws-1")
+
+        #expect(detail.project.wsID == "ws-1")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/projects/ws-1")
+    }
+
+    /// `projectRuns`/`projectSessions` are local-only (no `?host=`) — this
+    /// proves the offset/limit query and that no `host` param is ever sent,
+    /// unlike the fleet-wide `runs`/`sessions` methods.
+    @Test func projectRunsAndProjectSessionsSendOffsetLimitAndNoHostQuery() async throws {
+        let runsFixture = try Fixtures.data("project_runs.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], runsFixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let runs = try await client.projectRuns(wsID: "ws-1", offset: 0, limit: 25)
+        #expect(runs.count == 1)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/projects/ws-1/runs")
+        var query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "offset", value: "0")) == true)
+        #expect(query?.contains(URLQueryItem(name: "limit", value: "25")) == true)
+        #expect(query?.contains(where: { $0.name == "host" }) == false)
+
+        let sessionsFixture = try Fixtures.data("project_sessions.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], sessionsFixture) }
+        let sessions = try await client.projectSessions(wsID: "ws-1", offset: 0, limit: 25)
+        #expect(sessions.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/projects/ws-1/sessions")
+        query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(where: { $0.name == "host" }) == false)
+    }
+
+    /// `projectAgents`/`projectWorkflows`/`projectAutoflows` reuse the same
+    /// `AgentDefinition`/`WorkflowDefinition`/`AutoflowDefinition` shapes the
+    /// global `GET /api/agents` / `/api/workflows` / `/api/autoflows` routes
+    /// decode — this proves both the subpath and the shared decode.
+    @Test func projectAgentsWorkflowsAndAutoflowsHitExpectedSubpaths() async throws {
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], try! Fixtures.data("agent_defs.json")) }
+        StubURLProtocol.lastRequest = nil
+        let agents = try await client.projectAgents(wsID: "ws-1")
+        #expect(agents.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/projects/ws-1/agents")
+
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], try! Fixtures.data("workflow_defs.json")) }
+        StubURLProtocol.lastRequest = nil
+        let workflows = try await client.projectWorkflows(wsID: "ws-1")
+        #expect(workflows.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/projects/ws-1/workflows")
+
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], try! Fixtures.data("autoflow_defs.json")) }
+        StubURLProtocol.lastRequest = nil
+        let autoflows = try await client.projectAutoflows(wsID: "ws-1")
+        #expect(autoflows.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/projects/ws-1/autoflows")
+    }
+
     // MARK: - Per-host progressive loading (hotfix)
 
     /// The four federated list endpoints all accept an optional `host`,

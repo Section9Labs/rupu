@@ -144,3 +144,199 @@ public struct APIProjectRow: Decodable, Equatable, Sendable {
         case lastRunAt = "last_run_at"
     }
 }
+
+/// `WorkerCapabilities` on the Rust side, nested inside `GET /api/workers`'s
+/// rows. Every list is individually omitted from the wire when empty
+/// (`skip_serializing_if = "Vec::is_empty"`) — including all three at once,
+/// which serializes `capabilities` as `{}` — so this decodes each with a
+/// custom `init` rather than a synthesized one, defaulting a missing key to
+/// `[]` instead of failing to decode.
+public struct APIWorkerCapabilities: Decodable, Equatable, Sendable {
+    public let backends: [String]
+    public let scmHosts: [String]
+    public let permissionModes: [String]
+
+    public init(backends: [String], scmHosts: [String], permissionModes: [String]) {
+        self.backends = backends
+        self.scmHosts = scmHosts
+        self.permissionModes = permissionModes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case backends
+        case scmHosts = "scm_hosts"
+        case permissionModes = "permission_modes"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        backends = try container.decodeIfPresent([String].self, forKey: .backends) ?? []
+        scmHosts = try container.decodeIfPresent([String].self, forKey: .scmHosts) ?? []
+        permissionModes = try container.decodeIfPresent([String].self, forKey: .permissionModes) ?? []
+    }
+}
+
+/// Row from `GET /api/workers` (`WorkerView` on the Rust side): a
+/// `WorkerRecord` (`#[serde(flatten)]`ed on the wire) plus run-activity
+/// attribution. A worker is a local execution identity, not a per-run
+/// object — `activeRunCount`/`totalRunCount`/`lastRunAt` summarize the runs
+/// whose `worker_id` matches this worker (`lastRunAt` is `nil` when it has
+/// none).
+public struct APIWorkerRow: Decodable, Equatable, Sendable {
+    public let version: Int
+    public let workerID: String
+    public let kind: String
+    public let name: String
+    public let host: String
+    public let capabilities: APIWorkerCapabilities
+    public let registeredAt: String
+    public let lastSeenAt: String
+    public let activeRunCount: UInt64
+    public let totalRunCount: UInt64
+    public let lastRunAt: String?
+
+    public init(
+        version: Int,
+        workerID: String,
+        kind: String,
+        name: String,
+        host: String,
+        capabilities: APIWorkerCapabilities,
+        registeredAt: String,
+        lastSeenAt: String,
+        activeRunCount: UInt64,
+        totalRunCount: UInt64,
+        lastRunAt: String?
+    ) {
+        self.version = version
+        self.workerID = workerID
+        self.kind = kind
+        self.name = name
+        self.host = host
+        self.capabilities = capabilities
+        self.registeredAt = registeredAt
+        self.lastSeenAt = lastSeenAt
+        self.activeRunCount = activeRunCount
+        self.totalRunCount = totalRunCount
+        self.lastRunAt = lastRunAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case workerID = "worker_id"
+        case kind
+        case name
+        case host
+        case capabilities
+        case registeredAt = "registered_at"
+        case lastSeenAt = "last_seen_at"
+        case activeRunCount = "active_run_count"
+        case totalRunCount = "total_run_count"
+        case lastRunAt = "last_run_at"
+    }
+}
+
+/// The `runs` block of `GET /api/projects/:ws_id` (ad-hoc `json!` on the Rust
+/// side, not a named type — see `get_project` in `api/projects.rs`).
+/// `byStatus` keys are whatever `RunStatus::as_str()` produces
+/// (`"completed"`, `"running"`, …), so a dictionary rather than a fixed set
+/// of fields.
+public struct APIProjectRunsSummary: Decodable, Equatable, Sendable {
+    public let total: Int
+    public let running: Int
+    public let byStatus: [String: Int]
+    public let bySurface: APIProjectRunsBySurface
+
+    public init(total: Int, running: Int, byStatus: [String: Int], bySurface: APIProjectRunsBySurface) {
+        self.total = total
+        self.running = running
+        self.byStatus = byStatus
+        self.bySurface = bySurface
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case total
+        case running
+        case byStatus = "by_status"
+        case bySurface = "by_surface"
+    }
+}
+
+/// `runs.by_surface` — a fixed two-key breakdown (`"manual"` triggers count
+/// as `workflow`, `"cron"`/`"event"` as `autoflow` — see `get_project`).
+public struct APIProjectRunsBySurface: Decodable, Equatable, Sendable {
+    public let workflow: Int
+    public let autoflow: Int
+
+    public init(workflow: Int, autoflow: Int) {
+        self.workflow = workflow
+        self.autoflow = autoflow
+    }
+}
+
+/// The `sessions` block of `GET /api/projects/:ws_id`.
+public struct APIProjectSessionsSummary: Decodable, Equatable, Sendable {
+    public let total: Int
+    public let active: Int
+
+    public init(total: Int, active: Int) {
+        self.total = total
+        self.active = active
+    }
+}
+
+/// The `coverage` block of `GET /api/projects/:ws_id` — cheap signals only
+/// (target count + findings count); the expensive `assessed_pct` is a
+/// separate `GET /api/projects/:ws_id/coverage/assessed` call this phase
+/// doesn't cover.
+public struct APIProjectCoverageSummary: Decodable, Equatable, Sendable {
+    public let targets: Int
+    public let findings: Int
+
+    public init(targets: Int, findings: Int) {
+        self.targets = targets
+        self.findings = findings
+    }
+}
+
+/// `GET /api/projects/:ws_id` response (`ProjectDetail` on the Rust side).
+/// `project` reuses `APIProjectRow` — its partial decode (only `wsID`/
+/// `name`/`runCount`/`lastRunAt`) still succeeds here since `ProjectDetail`'s
+/// `project` field is the FULL `ProjectRow` (a superset of what
+/// `GET /api/projects` returns), and `Decodable` ignores unknown keys.
+/// `recentRuns` reuses `APIRunListRow` (`Vec<RunListRow>` on the Rust side,
+/// same type `GET /api/runs` decodes — no `host_id` here since this endpoint
+/// never proxies to a remote host).
+public struct APIProjectDetail: Decodable, Equatable, Sendable {
+    public let project: APIProjectRow
+    public let runs: APIProjectRunsSummary
+    public let sessions: APIProjectSessionsSummary
+    public let coverage: APIProjectCoverageSummary
+    public let recentRuns: [APIRunListRow]
+    public let usage: APIUsageSummary
+
+    public init(
+        project: APIProjectRow,
+        runs: APIProjectRunsSummary,
+        sessions: APIProjectSessionsSummary,
+        coverage: APIProjectCoverageSummary,
+        recentRuns: [APIRunListRow],
+        usage: APIUsageSummary
+    ) {
+        self.project = project
+        self.runs = runs
+        self.sessions = sessions
+        self.coverage = coverage
+        self.recentRuns = recentRuns
+        self.usage = usage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case project
+        case runs
+        case sessions
+        case coverage
+        case recentRuns = "recent_runs"
+        case usage
+    }
+}
