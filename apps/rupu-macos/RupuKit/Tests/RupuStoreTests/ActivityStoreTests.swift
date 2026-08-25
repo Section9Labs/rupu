@@ -768,6 +768,17 @@ struct ActivityStoreTests {
     // response actually arrives — proving the merge is progressive, not a
     // single all-or-nothing wait.
     @MainActor @Test func activateRendersLocalImmediatelyThenMergesSlowOnlineRemoteHostProgressively() async {
+        // De-flake (the long-hunted ~1/20 full-suite failure, finally
+        // attributed on main's CI): the old shape raced two TIMERS — a 60ms
+        // poll window for observing `pendingHosts == 1` against an 80ms
+        // `Thread.sleep` "slow remote". Under parallel-suite load either
+        // could lose (discovery landing late, or the sleep elapsing while
+        // the main actor was starved, draining 1→0 unobserved). The remote
+        // response now blocks on a semaphore the TEST releases only after
+        // it has asserted the mid-flight state — the pending window is held
+        // open deterministically, so the poll below can use the generous
+        // default timeout without ever waiting out a real failure.
+        let remoteGate = DispatchSemaphore(value: 0)
         let (store, box) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
             if url.path == "/api/hosts" {
@@ -775,7 +786,9 @@ struct ActivityStoreTests {
             }
             guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
             if Self.queryHost(req) == "mini" {
-                Thread.sleep(forTimeInterval: 0.08) // artificially slow remote host
+                // Held by the test until the pending state is asserted; the
+                // 10s cap only bounds a hung test, it is not a timing knob.
+                _ = remoteGate.wait(timeout: .now() + 10)
                 let row = Self.runListRowJSON(id: "run-remote-1", startedAt: "2026-08-20T09:00:00Z", status: "running")
                 return (200, Data("[\(row)]".utf8))
             }
@@ -785,30 +798,29 @@ struct ActivityStoreTests {
 
         await store.activate(kind: .workflows)
 
-        // Local truth is already showing — the slow remote host hasn't
+        // Local truth is already showing — the gated remote host hasn't
         // been waited on at all.
         guard case .content = store.state else {
+            remoteGate.signal()
             Issue.record("expected .content from the local load alone, got \(store.state)")
             return
         }
         #expect(store.rows.map(\.id) == ["run-wf-1"])
 
-        // Give the (fast, non-delayed) `GET /api/hosts` discovery call a
-        // moment to land and register the one online remote host as
-        // pending — polled, but bounded well under the remote row fetch's
-        // artificial 80ms delay, so a slow discovery response is a real
-        // failure rather than something this poll silently waits out.
+        // Discovery registers the one online remote host as pending. The
+        // remote row fetch is gated on the semaphore, so this state cannot
+        // drain early — the default (generous) poll timeout is safe.
         await expectEventually(
-            timeout: .milliseconds(60),
             "GET /api/hosts discovery lands and registers the one online remote host as pending"
         ) { store.pendingHosts == 1 }
         #expect(store.pendingHosts == 1)
         #expect(store.rows.map(\.id) == ["run-wf-1"]) // still local-only
 
-        // Poll past the remote host's artificial delay — bounded generously
-        // (default 5s) rather than a fixed sleep sized only for a fast dev
-        // machine.
-        await expectEventually("the slow remote host's row merges in and pendingHosts drains to 0") {
+        // Only now let the remote host answer.
+        remoteGate.signal()
+
+        // Poll to the terminal state — bounded generously (default 5s).
+        await expectEventually("the gated remote host's row merges in and pendingHosts drains to 0") {
             store.pendingHosts == 0 && store.rows.count == 2
         }
 
@@ -918,6 +930,15 @@ struct ActivityStoreTests {
     private func pruningOutcome(matchingRowIsLocal: Bool) async -> (statuses: Set<ActivityStatus>, overridePruned: Bool) {
         let localStatus = matchingRowIsLocal ? "completed" : "running"
         let remoteStatus = matchingRowIsLocal ? "running" : "completed"
+        // De-flake (same class as the progressive-merge test above, and
+        // attributed on the same CI runs): the old 80ms `Thread.sleep` only
+        // *probably* held the remote fetch back past the live-patch below —
+        // under parallel-suite load the sleep could elapse before the
+        // override was recorded, recompute() ran with nothing standing to
+        // prune, and `overridePruned` read false. The remote response now
+        // blocks on a semaphore released only after the override is
+        // OBSERVED standing — deterministic, no timing knob.
+        let remoteGate = DispatchSemaphore(value: 0)
         let (store, box) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
             if url.path == "/api/hosts" {
@@ -925,13 +946,8 @@ struct ActivityStoreTests {
             }
             guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
             if Self.queryHost(req) == "mini" {
-                // Artificially slow — same rationale as
-                // `activateRendersLocalImmediatelyThenMergesSlowOnlineRemoteHostProgressively`:
-                // without this, `loadRemoteHosts`' background fetch (kicked
-                // off by `activate()`, no delay by default) can race ahead
-                // of the live-patch event below and prune the override
-                // before this test ever observes it standing.
-                Thread.sleep(forTimeInterval: 0.08)
+                // Held until the override stands; 10s caps a hung test only.
+                _ = remoteGate.wait(timeout: .now() + 10)
                 let row = Self.runListRowJSON(id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: remoteStatus)
                 return (200, Data("[\(row)]".utf8))
             }
@@ -948,6 +964,9 @@ struct ActivityStoreTests {
         await expectEventually("run-wf-1 has a standing .completed override") {
             store.statusOverrides["run-wf-1"] != nil
         }
+
+        // Only now let the remote host answer.
+        remoteGate.signal()
 
         // The remote host answers with its (deliberately delayed) row —
         // `loadRemoteHost`'s recompute() is the non-full-clear vehicle this
