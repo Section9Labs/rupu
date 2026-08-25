@@ -49,14 +49,11 @@ public struct RunDetailScreen: View {
 
     @State private var store: RunDetailStore?
     @State private var storeRunID: String?
-    /// Phase 6B, Task 5: the transcript tab's source/AST preview cache —
-    /// rebuilt in lockstep with `store` (same `storeRunID`/`storeClientID`
-    /// condition in `activate()`) so it always holds a fresh `CPClient` and
-    /// starts empty for the run it's targeting. `SourcePreviewStore` itself
-    /// also supports being reconfigured in place via `setRun(runID:host:)`
-    /// (see that type's doc comment) for a longer-lived owner; this screen
-    /// just doesn't need that — a fresh instance already gives the same
-    /// "empty cache for this run" guarantee with less state to track.
+    /// Phase 6B, Task 5: the transcript tab's source/AST preview cache. A
+    /// client-identity change rebuilds it fresh (a new `CPClient`); a
+    /// run-only change instead reconfigures the SAME instance in place via
+    /// `setRun(runID:host:)`, which flushes its cache — see `activate()`'s
+    /// doc comment for why the split exists.
     @State private var sourcePreviewStore: SourcePreviewStore?
 
     /// Tracked alongside `storeRunID` so `activate()` rebuilds on a backend
@@ -103,16 +100,38 @@ public struct RunDetailScreen: View {
     /// without ever going through `nil` in between, so a plain "do I
     /// already have a store" check would never notice and would keep
     /// running `store` against the abandoned connection.
+    ///
+    /// **`sourcePreviewStore` splits the two triggers** (review fix,
+    /// finding 3): a client-identity change still rebuilds it fresh (a new
+    /// `CPClient` means the old instance's captured client is dead weight —
+    /// same reasoning `RunDetailStore` gets rebuilt fresh for too). A
+    /// run-ONLY change instead calls `setRun(runID:host:)` on the EXISTING
+    /// instance — this is what makes `SourcePreviewStore`'s own generation
+    /// guard (see that type's doc comment) load-bearing rather than
+    /// theoretical: without this, every run switch would already start from
+    /// an empty cache via a fresh instance, and `setRun`'s flush would never
+    /// actually run in production. `RunDetailStore` itself is still rebuilt
+    /// fresh on every run change (it owns a live stream/tail lifecycle that
+    /// genuinely needs a clean restart, unlike this store's plain fetch
+    /// cache).
     private func activate() async {
         guard let client = backend.client() else { return }
         let clientID = backend.clientIdentity()
-        if storeRunID != runID || storeClientID != clientID {
+        if storeClientID != clientID {
             store?.deactivate()
-            let newStore = RunDetailStore(runID: runID, host: host, client: client, backend: backend)
-            store = newStore
+            store = RunDetailStore(runID: runID, host: host, client: client, backend: backend)
             sourcePreviewStore = SourcePreviewStore(runID: runID, host: host, client: client)
             storeRunID = runID
             storeClientID = clientID
+        } else if storeRunID != runID {
+            store?.deactivate()
+            store = RunDetailStore(runID: runID, host: host, client: client, backend: backend)
+            if let sourcePreviewStore {
+                sourcePreviewStore.setRun(runID: runID, host: host)
+            } else {
+                sourcePreviewStore = SourcePreviewStore(runID: runID, host: host, client: client)
+            }
+            storeRunID = runID
         }
         guard let store else { return }
         await store.activate()
