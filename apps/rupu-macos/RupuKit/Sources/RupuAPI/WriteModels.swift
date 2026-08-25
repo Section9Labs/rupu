@@ -136,19 +136,32 @@ public struct AgentLaunchBody: Encodable, Equatable, Sendable {
     public let target: String?
     public let workingDir: String?
     public let host: String?
+    /// Scope-aware launch (Phase 5A): pins the launch to the definition the
+    /// picker showed. Server contract: LOCAL launches only (the server
+    /// ignores scope on remote-targeted launches — never send it with a
+    /// non-local `host`), and mutually exclusive with `workingDir` (400).
+    /// Threading from the picker's selection is LauncherStore's job
+    /// (Phase 5A Task 4); the fields exist here so the request fixture
+    /// round-trips.
+    public let scopeKind: String?
+    public let scopeID: String?
 
     public init(
         prompt: String? = nil,
         mode: String? = nil,
         target: String? = nil,
         workingDir: String? = nil,
-        host: String? = nil
+        host: String? = nil,
+        scopeKind: String? = nil,
+        scopeID: String? = nil
     ) {
         self.prompt = prompt
         self.mode = mode
         self.target = target
         self.workingDir = workingDir
         self.host = host
+        self.scopeKind = scopeKind
+        self.scopeID = scopeID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -157,6 +170,8 @@ public struct AgentLaunchBody: Encodable, Equatable, Sendable {
         case target
         case workingDir = "working_dir"
         case host
+        case scopeKind = "scope_kind"
+        case scopeID = "scope_id"
     }
 }
 
