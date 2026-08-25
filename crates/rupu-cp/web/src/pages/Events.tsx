@@ -145,6 +145,11 @@ export default function Events() {
       },
       undefined,
       () => setConnection('reconnecting'),
+      // `open` — not the first frame — is the honest "live" signal: a
+      // healthy stream with no runs emitting stays idle indefinitely, and
+      // before this the pill sat on "Connecting" against a perfectly good
+      // connection until an event happened to arrive.
+      () => setConnection('live'),
     );
   }, []);
 

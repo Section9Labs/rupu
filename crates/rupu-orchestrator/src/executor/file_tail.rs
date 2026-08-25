@@ -40,6 +40,13 @@ impl FileTailRunSource {
         let offset_for_drain = offset.clone();
         tokio::spawn(async move {
             while !path_for_drain.exists() {
+                // A file that never appears must not pin this task forever:
+                // once the consumer drops the stream (receiver closed) there
+                // is nobody left to drain for, so exit instead of spinning
+                // on the existence check for the rest of the process.
+                if tx_for_drain.is_closed() {
+                    return;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             if let Ok(bytes) = std::fs::read(&path_for_drain) {
