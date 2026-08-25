@@ -20,9 +20,12 @@ public enum ActionVerb: String, Sendable, Hashable {
     /// no longer contains the removed id — see that method's doc comment.
     case remove
     /// Phase 5A, Task 7 addition: `LibraryStore.setAutoflowEnabled(...)`.
-    /// Entity-scoped to a definition name (per the brief, "keyed sensibly
-    /// (definition name)"), not a run id — same "never resolved by status"
-    /// bucket as `archive`/`restore`/`send`/`launch`/`remove`.
+    /// Entity-scoped to a definition, not a run id — same "never resolved by
+    /// status" bucket as `archive`/`restore`/`send`/`launch`/`remove`.
+    /// **Always built via `ActionKey.autoflow(name:scopeKind:scopeID:verb:)`**
+    /// (review fix, round 1) — never a plain `ActionKey(name, .setEnabled)` —
+    /// see that method's doc comment for why a bare name collides across two
+    /// repos defining the same autoflow name.
     ///
     /// **Confirmed immediately, not on a later refetch** (unlike `.remove`'s
     /// "row disappearing IS the confirmation" contract): `POST /api/
@@ -77,6 +80,29 @@ public struct ActionKey: Hashable, Sendable {
     /// or another, whichever gate a given key names).
     public static func gate(runID: String, stepID: String, verb: ActionVerb) -> ActionKey {
         ActionKey("\(runID):\(stepID)", verb)
+    }
+
+    /// **Composite-entity convention for `.setEnabled`** (Phase 5A, Task 7
+    /// review fix, round 1) — same class of bug `gate(runID:stepID:verb:)`
+    /// above already fixed once for approve/reject: a plain
+    /// `ActionKey(name, .setEnabled)` collides whenever two different repos
+    /// define an autoflow with the same `name` (a legitimate, unremarkable
+    /// case — `LibraryStore.applyAutoflowEnabled`'s own data patch already
+    /// matches `name` + `scopeKind` + `scopeID` together for exactly this
+    /// reason, per that method's doc comment). Without this, toggling repo
+    /// A's row also showed repo B's same-named row as pending/disabled, and
+    /// a failure on A's POST painted its error message onto B's row too —
+    /// two independent mutations sharing one tracked state.
+    ///
+    /// Built only via this helper so every call site
+    /// (`LibraryStore.setAutoflowEnabled`, `LibraryScreen`'s row toggle,
+    /// `WorkflowDetailScreen`'s detail-page toggle) agrees on the exact same
+    /// composite string. `scopeKind`/`scopeID` are folded in as-is (`nil`
+    /// rendered as the literal `"nil"` token, distinct from any real scope
+    /// id) — two rows can only produce the same key if they genuinely agree
+    /// on `name`, `scopeKind`, AND `scopeID`, i.e. are the same row.
+    public static func autoflow(name: String, scopeKind: String?, scopeID: String?, verb: ActionVerb) -> ActionKey {
+        ActionKey("\(name):\(scopeKind ?? "nil"):\(scopeID ?? "nil")", verb)
     }
 }
 

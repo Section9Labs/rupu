@@ -187,7 +187,7 @@ private func makeStore(
     )
     await store.activate()
 
-    let key = ActionKey("nightly-health", .setEnabled)
+    let key = ActionKey.autoflow(name: "nightly-health", scopeKind: "global", scopeID: nil, verb: .setEnabled)
     let task = Task { await store.setAutoflowEnabled(name: "nightly-health", scopeKind: "global", scopeID: nil, enabled: false) }
     await expectEventually("setAutoflowEnabled begins the key before the POST resolves") {
         if case .pending = pendingActions.state(key) { return true }
@@ -210,7 +210,7 @@ private func makeStore(
 
     await store.setAutoflowEnabled(name: "nightly-health", scopeKind: "global", scopeID: nil, enabled: false)
 
-    let key = ActionKey("nightly-health", .setEnabled)
+    let key = ActionKey.autoflow(name: "nightly-health", scopeKind: "global", scopeID: nil, verb: .setEnabled)
     #expect(pendingActions.state(key) == .confirmed)
     #expect(store.autoflows.value?.first?.enabled == false)
 }
@@ -249,6 +249,66 @@ private func makeStore(
     #expect(rows.first(where: { $0.scopeID == "ws-b" })?.enabled == true)
 }
 
+/// **Review fix, round 1**: the UI pending/failure ledger must isolate two
+/// same-named, differently-scoped rows exactly like the data patch already
+/// does (`setAutoflowEnabledNeverPatchesADifferentlyScopedSameNamedRow`
+/// above covers the row content; this covers `PendingActions` itself) —
+/// toggling repo A's row must never show repo B's same-named row as
+/// pending, nor paint A's failure message onto B's row. Verifies both
+/// directions: A's begin-pending state, and A's failure, both leave B at
+/// `.idle` throughout.
+@MainActor @Test func setAutoflowEnabledNeverCrossPollutesADifferentlyScopedSameNamedRowsPendingState() async {
+    let pendingActions = PendingActions()
+    let store = makeStore(
+        fetchAutoflows: {
+            [
+                autoflowDef(name: "nightly-health", scope: "repo-a", scopeKind: "project", scopeID: "ws-a", enabled: true),
+                autoflowDef(name: "nightly-health", scope: "repo-b", scopeKind: "project", scopeID: "ws-b", enabled: true),
+            ]
+        },
+        postSetAutoflowEnabled: { _, _, _, _ in
+            try await Task.sleep(for: .seconds(60)) // never returns in this test's window
+            return AutoflowSetEnabledResponse(name: "unused", enabled: false)
+        },
+        pendingActions: pendingActions
+    )
+    await store.activate()
+
+    let keyA = ActionKey.autoflow(name: "nightly-health", scopeKind: "project", scopeID: "ws-a", verb: .setEnabled)
+    let keyB = ActionKey.autoflow(name: "nightly-health", scopeKind: "project", scopeID: "ws-b", verb: .setEnabled)
+    #expect(keyA != keyB)
+
+    let task = Task { await store.setAutoflowEnabled(name: "nightly-health", scopeKind: "project", scopeID: "ws-a", enabled: false) }
+    await expectEventually("A's key begins pending before its POST resolves") {
+        if case .pending = pendingActions.state(keyA) { return true }
+        return false
+    }
+    #expect(pendingActions.state(keyB) == .idle)
+    task.cancel()
+
+    // Same isolation on the failure path: a synchronous failing POST for A
+    // must never touch B's (still-untouched) ledger entry either.
+    let failingStore = makeStore(
+        fetchAutoflows: {
+            [
+                autoflowDef(name: "nightly-health", scope: "repo-a", scopeKind: "project", scopeID: "ws-a", enabled: true),
+                autoflowDef(name: "nightly-health", scope: "repo-b", scopeKind: "project", scopeID: "ws-b", enabled: true),
+            ]
+        },
+        postSetAutoflowEnabled: { _, _, _, _ in throw StubError(description: "repo A only") },
+        pendingActions: pendingActions
+    )
+    await failingStore.activate()
+    await failingStore.setAutoflowEnabled(name: "nightly-health", scopeKind: "project", scopeID: "ws-a", enabled: false)
+
+    guard case .failed(let message) = pendingActions.state(keyA) else {
+        Issue.record("expected A's key .failed, got \(pendingActions.state(keyA))")
+        return
+    }
+    #expect(message.contains("repo A only"))
+    #expect(pendingActions.state(keyB) == .idle)
+}
+
 /// A POST failure fails the key with the error message and leaves the row
 /// untouched — nothing was actually toggled server-side.
 @MainActor @Test func setAutoflowEnabledFailureFailsTheKeyAndLeavesTheRowUntouched() async {
@@ -262,7 +322,7 @@ private func makeStore(
 
     await store.setAutoflowEnabled(name: "nightly-health", scopeKind: "global", scopeID: nil, enabled: false)
 
-    let key = ActionKey("nightly-health", .setEnabled)
+    let key = ActionKey.autoflow(name: "nightly-health", scopeKind: "global", scopeID: nil, verb: .setEnabled)
     guard case .failed(let message) = pendingActions.state(key) else {
         Issue.record("expected .failed, got \(pendingActions.state(key))")
         return

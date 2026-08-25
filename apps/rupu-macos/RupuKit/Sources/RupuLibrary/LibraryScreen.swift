@@ -42,9 +42,12 @@ private enum LibraryLayout {
 
 /// The Library screen (Phase 5A, Task 7), replacing the `.library`
 /// placeholder: three definition tabs (agents/workflows/autoflows), never
-/// run lists (spec §"Library" — `docs/macOS_design/HANDOFF.md`). Owns a
-/// `LibraryStore` lifecycle the same lazy-build/`storeClientID`-rebuild
-/// convention `ProjectsScreen`/`FleetScreen` already established.
+/// run lists (`docs/superpowers/specs/2026-08-24-rupu-macos-phase-5-breadth-
+/// design.md`'s "Library" section — `docs/macOS_design/HANDOFF.md`'s older
+/// "Library" line says the same, but that doc is superseded, see its own
+/// header note). Owns a `LibraryStore` lifecycle the same lazy-build/
+/// `storeClientID`-rebuild convention `ProjectsScreen`/`FleetScreen` already
+/// established.
 ///
 /// **Does NOT need `OverviewScreen`'s cold-launch `.onChange(of: backend.
 /// health)` fix** — same reasoning `ProjectsScreen`/`FleetScreen` document:
@@ -534,7 +537,11 @@ private struct AutoflowDefRow: View {
     let onLaunch: () -> Void
     let onToggle: (Bool) -> Void
 
-    private var key: ActionKey { ActionKey(def.name, .setEnabled) }
+    /// Composite key (review fix, round 1) — a bare `ActionKey(def.name,
+    /// .setEnabled)` would show a differently-scoped, same-named autoflow's
+    /// pending/failure state on this row too. See `ActionKey.autoflow(...)`'s
+    /// doc comment.
+    private var key: ActionKey { ActionKey.autoflow(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID, verb: .setEnabled) }
 
     private var isPending: Bool {
         if case .pending = pendingActions.state(key) { return true }

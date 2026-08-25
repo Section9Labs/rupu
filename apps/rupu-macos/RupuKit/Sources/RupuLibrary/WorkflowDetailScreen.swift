@@ -254,7 +254,12 @@ private struct AutoflowToggleRow: View {
     let pendingActions: PendingActions
     let onToggle: (Bool) -> Void
 
-    private var key: ActionKey { ActionKey(def.name, .setEnabled) }
+    /// Composite key (review fix, round 1) — same rationale
+    /// `LibraryScreen.AutoflowDefRow.key` documents: a bare
+    /// `ActionKey(def.name, .setEnabled)` would collide with a
+    /// differently-scoped, same-named autoflow's pending/failure state. See
+    /// `ActionKey.autoflow(...)`'s doc comment.
+    private var key: ActionKey { ActionKey.autoflow(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID, verb: .setEnabled) }
 
     private var isPending: Bool {
         if case .pending = pendingActions.state(key) { return true }
