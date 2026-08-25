@@ -64,13 +64,23 @@ public enum ActivityStatus: Hashable, Sendable {
     /// directly — `ActivityStatus.normalize` already puts an explicit `"—"`
     /// there for a genuinely absent status, so there's nothing further to
     /// null-guard here.
+    ///
+    /// **`.awaiting` is the full canonical "Awaiting approval"**
+    /// (redesign-pass fix — audit A4): this is the app-wide status string
+    /// (`StatusPill`'s `.awaiting` descriptor, the web's `status.ts:95`),
+    /// and the audit found room for the full string in the Activity table's
+    /// status column, which reads this property directly
+    /// (`ActivityTable.swift:315`). `FilterBar`'s status chip is narrower
+    /// and deliberately overrides back to the short "Awaiting" for THAT one
+    /// case rather than reading this property verbatim — see
+    /// `FilterBar.statusChip`'s own doc comment for why.
     public var displayLabel: String {
         switch self {
         case .pending: "Pending"
         case .running: "Running"
         case .completed: "Completed"
         case .failed: "Failed"
-        case .awaiting: "Awaiting"
+        case .awaiting: "Awaiting approval"
         case .rejected: "Rejected"
         case .cancelled: "Cancelled"
         case .paused: "Paused"

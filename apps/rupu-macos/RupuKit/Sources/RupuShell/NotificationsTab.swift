@@ -21,33 +21,48 @@ public struct NotificationsTab: View {
     }
 
     public var body: some View {
-        Form {
+        VStack(alignment: .leading, spacing: 12) {
             if notifier.authorizationDenied {
                 authorizationDeniedBanner
-                    .padding(.bottom, 4)
             }
 
-            Section("Notify me when") {
-                toggleRow(
-                    title: "A run needs approval",
-                    detail: "A gate step is waiting on you before it can continue.",
-                    isOn: $notifier.notifyGates
-                )
-                toggleRow(
-                    title: "A step or run fails",
-                    detail: "Any step error, or a run that ends in a failed state.",
-                    isOn: $notifier.notifyFailures
-                )
-                toggleRow(
-                    title: "A run finishes",
-                    detail: "Completed, cancelled, or rejected. Failed runs are covered by Failures.",
-                    isOn: $notifier.notifyCompletions
-                )
+            // Redesign-pass fix (spec §4, "Settings scene tone"): this tab
+            // used to be a native `Form`/`Section`, painting the same
+            // chrome-gray material the audit (A8) flagged across every
+            // Settings tab. A token-styled panel — `Eyebrow` header over a
+            // `Color.rupuPanel` card, the exact idiom `SettingsView`'s own
+            // `settingsCard`/`ConfigTab`'s `sectionCard` already use — keeps
+            // the native `Toggle` controls but retones the surface around
+            // them.
+            VStack(alignment: .leading, spacing: 10) {
+                Eyebrow("Notify me when")
+                VStack(alignment: .leading, spacing: 12) {
+                    toggleRow(
+                        title: "A run needs approval",
+                        detail: "A gate step is waiting on you before it can continue.",
+                        isOn: $notifier.notifyGates
+                    )
+                    toggleRow(
+                        title: "A step or run fails",
+                        detail: "Any step error, or a run that ends in a failed state.",
+                        isOn: $notifier.notifyFailures
+                    )
+                    toggleRow(
+                        title: "A run finishes",
+                        detail: "Completed, cancelled, or rejected. Failed runs are covered by Failures.",
+                        isOn: $notifier.notifyCompletions
+                    )
+                }
             }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .panelStyle(.panel)
+
+            Spacer(minLength: 0)
         }
         .padding(.top, 12)
-        // The banner (when shown) is a single row above a three-row
-        // Section; without a floor this can visually collapse thinner than
+        // The banner (when shown) is a single row above the three-toggle
+        // panel; without a floor this can visually collapse thinner than
         // the other three tabs when it's absent, same rationale as
         // `SettingsView.generalTab`'s own `minHeight`.
         .frame(minHeight: 200, alignment: .top)
@@ -65,6 +80,8 @@ public struct NotificationsTab: View {
         Toggle(isOn: isOn) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
+                    .font(.uiText)
+                    .foregroundStyle(Color.rupuInk)
                 Text(detail)
                     .font(.noteText)
                     .foregroundStyle(Color.rupuMute)

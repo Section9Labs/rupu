@@ -69,52 +69,128 @@ public struct SettingsView: View {
         }
         .frame(width: 560)
         .padding(20)
+        // Redesign-pass fix (spec §4, "Settings scene tone"): the native
+        // `Settings` window paints its own chrome-gray material behind
+        // whatever this `TabView` renders, which is what the 6A validation
+        // note and the redesign audit (A8) both flagged as reading
+        // out-of-family with the app's v2 token palette. An explicit
+        // `Color.rupuBg` fill behind the tab content — the same background
+        // token every other screen sits on — brings the tone into line
+        // while the `Settings { }` scene itself (window chrome, traffic
+        // lights, tab strip) stays exactly the native macOS frame the spec
+        // calls for keeping.
+        .background(Color.rupuBg)
     }
 
     var generalTab: some View {
-        Form {
-            Picker("Appearance", selection: $appearance) {
-                Text("System").tag("system")
-                Text("Light").tag("light")
-                Text("Dark").tag("dark")
+        VStack(alignment: .leading, spacing: 12) {
+            settingsCard(title: "Appearance") {
+                labeledRow(label: "Appearance") {
+                    Picker("", selection: $appearance) {
+                        Text("System").tag("system")
+                        Text("Light").tag("light")
+                        Text("Dark").tag("dark")
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
+                }
             }
+            Spacer(minLength: 0)
         }
         .padding(.top, 12)
         // General is a single picker; keep it from collapsing to a sliver
         // now the shared tab width grew to 560 to fit the Config editors.
-        .frame(minHeight: 200, alignment: .top)
+        // `maxHeight: .infinity` + the background below is what actually
+        // repaints the native tab well (see `body`'s doc comment) rather
+        // than leaving a chrome-gray margin around an intrinsically-sized
+        // card.
+        .frame(maxWidth: .infinity, minHeight: 200, maxHeight: .infinity, alignment: .top)
+        .background(Color.rupuBg)
     }
 
     var connectionTab: some View {
-        Form {
-            Section("Embedded server") {
-                TextField(
-                    "Port",
-                    value: $embeddedPort,
-                    format: .number.grouping(.never)
-                )
-                TextField(
-                    "rupu binary override",
-                    text: $binaryPathOverride,
-                    prompt: Text("Auto-detected")
-                )
-                Toggle("Keep server running when app quits", isOn: $keepServerRunning)
+        VStack(alignment: .leading, spacing: 12) {
+            settingsCard(title: "Embedded server") {
+                VStack(alignment: .leading, spacing: 10) {
+                    labeledRow(label: "Port") {
+                        TextField(
+                            "",
+                            value: $embeddedPort,
+                            format: .number.grouping(.never)
+                        )
+                        .textFieldStyle(.plain)
+                        .padding(6)
+                        .panelStyle(.innerCard)
+                        .frame(width: 100)
+                    }
+                    labeledRow(label: "rupu binary override") {
+                        TextField(
+                            "",
+                            text: $binaryPathOverride,
+                            prompt: Text("Auto-detected").foregroundStyle(Color.rupuMute)
+                        )
+                        .textFieldStyle(.plain)
+                        .padding(6)
+                        .panelStyle(.innerCard)
+                    }
+                    Toggle("Keep server running when app quits", isOn: $keepServerRunning)
+                        .font(.uiText)
+                        .foregroundStyle(Color.rupuInk)
+                }
             }
 
-            Section("Current connection") {
+            settingsCard(title: "Current connection") {
                 Text(connectionSummary)
-                    .foregroundStyle(.secondary)
+                    .font(.uiText)
+                    .foregroundStyle(Color.rupuDim)
             }
+
+            Spacer(minLength: 0)
         }
         .padding(.top, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color.rupuBg)
+    }
+
+    /// Shared card chrome for General/Connection: an `Eyebrow` header over a
+    /// `Color.rupuPanel` card — the same panel/eyebrow idiom `ConfigTab`'s
+    /// `sectionCard`/`EffectiveConfigList` already use, so all four Settings
+    /// tabs read as one token-styled family rather than General/Connection
+    /// (formerly native `Form`/`Section`) looking like a different app from
+    /// Config/Notifications.
+    private func settingsCard(title: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Eyebrow(title)
+            content()
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panelStyle(.panel)
+    }
+
+    /// A left label / right control row — replaces the label column a
+    /// native `Form` drew for free, styled on tokens instead of the system
+    /// control-label color.
+    private func labeledRow(label: String, @ViewBuilder control: () -> some View) -> some View {
+        HStack {
+            Text(label)
+                .font(.uiText)
+                .foregroundStyle(Color.rupuInk)
+            Spacer(minLength: 12)
+            control()
+        }
     }
 
     var configTab: some View {
         ConfigTab(model: model, backend: backend)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(Color.rupuBg)
     }
 
     var notificationsTab: some View {
         NotificationsTab(notifier: notifier)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(Color.rupuBg)
     }
 
     /// Read-only summary of `backend.mode`/`.origin` — the port/URL actually

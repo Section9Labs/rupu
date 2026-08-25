@@ -106,7 +106,6 @@ private func makeStore(
     findingsResult: @escaping @Sendable () async throws -> APIFindings = { findings(count: 0) }
 ) -> ProjectDetailStore {
     ProjectDetailStore(
-        wsID: "ws-1",
         fetchDetail: detailResult,
         fetchRuns: runsResult,
         fetchSessions: sessionsResult,
