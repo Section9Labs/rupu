@@ -230,10 +230,26 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
     /// no reliable way to unit-test actual `NSWindow` creation/SwiftUI scene
     /// mounting under `swift test` (no real app bundle/run loop).
     func frontMainWindow() {
-        let target = NSApp.windows.first(where: { $0.identifier?.rawValue == RupuApp.mainWindowID })
-            ?? NSApp.windows.first(where: { $0.identifier?.rawValue != RupuApp.settingsWindowID })
-        if let target {
+        // Live-validation fix: the old second lookup ("any window that isn't
+        // Settings") matched the MenuBarExtra POPOVER — itself a borderless
+        // NSWindow in `NSApp.windows` — so in the windowless state this
+        // fronted the popover and the `openMainWindow` fallback never ran.
+        // Match the main scene deliberately instead: SwiftUI stamps
+        // `WindowGroup(id: "main")` windows with the scene id verbatim or a
+        // derived "main-AppWindow-N" form (observed both across macOS
+        // versions), and as a last resort any regular TITLED window that
+        // isn't the Settings scene — the popover is borderless and can never
+        // satisfy `.titled`.
+        let isMainSceneWindow: (NSWindow) -> Bool = { window in
+            if let id = window.identifier?.rawValue {
+                if id == RupuApp.mainWindowID || id.hasPrefix("\(RupuApp.mainWindowID)-") { return true }
+                if id == RupuApp.settingsWindowID { return false }
+            }
+            return window.styleMask.contains(.titled)
+        }
+        if let target = NSApp.windows.first(where: isMainSceneWindow) {
             target.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
         } else {
             openMainWindow?()
             NSApp.activate(ignoringOtherApps: true)

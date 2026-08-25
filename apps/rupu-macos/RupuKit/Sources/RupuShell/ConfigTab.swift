@@ -971,7 +971,16 @@ struct RawConfigEditor: View {
         TextEditor(text: layer == .global ? $globalText : $projectText)
             .font(.dataMono(11))
             .scrollContentBackground(.hidden)
-            .frame(minHeight: 220)
+            // Bounded BOTH ways (live-validation fix): with only a
+            // `minHeight`, `TextEditor` asks for its content's full ideal
+            // height, and a real-world config.toml pushed the Save/Discard
+            // row past the Settings scene's fixed window height — the
+            // editor filled the window and the actions were unreachable.
+            // The cap is sized to what the fixed Settings window leaves
+            // below the scope/segment/layer rows with room for the actions
+            // row (measured live against a ~40-line real config).
+            // `TextEditor` scrolls internally, so capping it is honest.
+            .frame(minHeight: 150, maxHeight: 190)
             .padding(8)
             .panelStyle(.innerCard)
             .disabled(store.readOnly)
