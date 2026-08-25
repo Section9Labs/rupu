@@ -76,6 +76,24 @@ public struct AgentDefinition: Decodable, Equatable, Sendable {
     }
 }
 
+extension AgentDefinition {
+    /// Stable per-row identity for a sortable table of `AgentDefinition`
+    /// rows (`RupuLibrary/LibraryScreen.swift`'s agents tab) — `name` alone
+    /// is NOT unique: `list_agents`'s own doc comment (`crates/rupu-cp/src/
+    /// api/agents.rs`) says "a project def shadows a same-named GLOBAL row;
+    /// two different repos defining the same name both appear (distinguished
+    /// by `scope`)". Composited exactly like `RupuStore.ActionKey.
+    /// autoflow(name:scopeKind:scopeID:verb:)` (`RupuStore/Primitives/
+    /// PendingAction.swift`) already does for the identical ambiguity on the
+    /// autoflow-toggle pending-action key — same `"nil"` token for a `nil`
+    /// `scopeID` — so this is the same row-identity contract the app already
+    /// treats as canonical, not a fresh one. Used as a `ForEach` `id:` so a
+    /// column-header sort re-ordering the array doesn't churn row identity
+    /// (a row keeps following its own definition, never whatever offset it
+    /// happens to land on).
+    public var rowIdentity: String { "\(name):\(scopeKind):\(scopeID ?? "nil")" }
+}
+
 /// `GET /api/agents/:name` — `AgentDetailDto` on the Rust side: every
 /// `AgentDto` field (see `AgentDefinition` above, which this deliberately
 /// duplicates rather than reuses — the wire shape is FLAT/flattened via
@@ -199,6 +217,13 @@ public struct WorkflowDefinition: Decodable, Equatable, Sendable {
     }
 }
 
+extension WorkflowDefinition {
+    /// See `AgentDefinition.rowIdentity`'s doc comment — identical rationale
+    /// (`list_workflows` shadows/duplicates the same way `list_agents` does),
+    /// identical composite shape.
+    public var rowIdentity: String { "\(name):\(scopeKind):\(scopeID ?? "nil")" }
+}
+
 /// Row from `GET /api/autoflows` (and `GET /api/projects/:ws_id/autoflows`)
 /// — `AutoflowDefRow` on the Rust side. A workflow definition carrying a
 /// top-level `autoflow:` block, enabled or disabled alike (a disabled def is
@@ -241,6 +266,18 @@ public struct AutoflowDefinition: Decodable, Equatable, Sendable {
         case scopeID = "scope_id"
         case enabled
     }
+}
+
+extension AutoflowDefinition {
+    /// See `AgentDefinition.rowIdentity`'s doc comment — identical rationale
+    /// and shape. Deliberately `name`-based, matching `ActionKey.
+    /// autoflow(name:scopeKind:scopeID:verb:)`'s own composite exactly (not
+    /// `slug`-based) — the app already treats `(name, scopeKind, scopeID)`
+    /// as "the same row" for this exact entity via that key (see its doc
+    /// comment), so the sortable table's row identity agrees with the
+    /// pending-action identity already governing this row's toggle instead
+    /// of introducing a second, subtly different notion of "same row".
+    public var rowIdentity: String { "\(name):\(scopeKind):\(scopeID ?? "nil")" }
 }
 
 /// One declared input on a workflow's `workflow.inputs` map (`GET

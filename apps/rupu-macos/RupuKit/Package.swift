@@ -123,5 +123,15 @@ let package = Package(
             name: "RupuActivityTests",
             dependencies: ["RupuActivity", "RupuAPI", "RupuStore", "RupuDesign"]
         ),
+        // Redesign-pass Task 5: the first test file for `RupuLibrary`'s own
+        // View-member pure logic (`LibraryScreen`'s `agentSortValue`/
+        // `workflowSortValue`/`autoflowSortValue` seams), hence the first
+        // `RupuLibraryTests` target — same "one test target per screen
+        // module, `@testable import` reaching the module-internal seams"
+        // convention every sibling screen target above already follows.
+        .testTarget(
+            name: "RupuLibraryTests",
+            dependencies: ["RupuLibrary", "RupuAPI", "RupuStore", "RupuDesign"]
+        ),
     ]
 )
