@@ -488,7 +488,14 @@ jobs:
     # client that talks to a `rupu cp serve` over HTTP; it embeds no web
     # assets of its own, so there is no `web-dist` artifact to download.
     needs: [meta]
-    runs-on: macos-latest
+    # Pinned, NOT macos-latest, deliberately diverging from the `macos` job
+    # above: the PR gate (`macos-app` in ci.yml) pins macos-15, and a
+    # released .app must be built by the same Xcode/SDK that gate actually
+    # exercised — a floating image would ship a bundle no PR ever compiled,
+    # with a Swift or SDK version bump landing first in a release rather than
+    # in a pull request. The CLI job is immaterial to this: cargo pins its own
+    # toolchain, so the image underneath it does not change the product.
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       # One definition of the product path, read by every step below.
@@ -516,6 +523,18 @@ jobs:
 
       # Import the Developer ID cert into a throwaway keychain rather than
       # the runner's login keychain. Discarded with the runner.
+      #
+      # Two deliberate divergences from the `macos` job's otherwise identical
+      # step, both because this job signs TWICE with a notarization wait in
+      # between (the CLI job signs once, up front):
+      #   * the idle-lock timeout is 7200s, not 3600s — Apple's notary queue
+      #     is usually minutes but has had hour-plus days, and a keychain that
+      #     re-locked mid-job fails the DMG signing at the very end of an
+      #     hour of work;
+      #   * the keychain name and password are exported so the DMG step can
+      #     unlock explicitly rather than betting on that timer. The password
+      #     is a per-run uuid for a keychain that exists only on this runner,
+      #     and it is masked so it cannot surface in the log.
       - name: Import signing certificate
         env:
           CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
@@ -524,10 +543,11 @@ jobs:
           set -euo pipefail
           KEYCHAIN=build.keychain
           KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security default-keychain -s "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -t 3600 -u "$KEYCHAIN"
+          security set-keychain-settings -t 7200 -u "$KEYCHAIN"
           echo "$CERT_B64" | base64 --decode > /tmp/cert.p12
           security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
             -T /usr/bin/codesign
@@ -536,6 +556,10 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security find-identity -v -p codesigning
+          {
+            echo "KEYCHAIN=$KEYCHAIN"
+            echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+          } >> "$GITHUB_ENV"
 
       # `make macos-release` ad-hoc-signs the product (CODE_SIGN_IDENTITY=-)
       # so the same target works on a developer machine with no Developer ID;
@@ -563,15 +587,19 @@ jobs:
             echo "::error::bundle says version '$got', tag says '$VERSION'"
             exit 1
           fi
-          # The assets are named darwin-arm64. A runner-image change that
-          # moved this job onto x86_64 would otherwise publish an Intel build
-          # under an arm64 name.
+          # The assets are named darwin-arm64, so the bundle must CONTAIN an
+          # arm64 slice — it need not be arm64-only. A universal build is a
+          # perfectly shippable superset and must not fail here; what must
+          # fail is a runner-image change that moved this job onto x86_64 and
+          # would publish an Intel-only build under an arm64 name.
           archs=$(lipo -archs "$APP/Contents/MacOS/rupu")
-          if [ "$archs" != "arm64" ]; then
-            echo "::error::bundle executable is '$archs', expected arm64"
-            exit 1
-          fi
-          echo "rupu.app $got (arm64)"
+          case "$archs" in
+            *arm64*) ;;
+            *)
+              echo "::error::bundle executable is '$archs', which carries no arm64 slice"
+              exit 1 ;;
+          esac
+          echo "rupu.app $got ($archs)"
 
       # The CLI job signs via scripts/sign-dev.sh; that script signs one bare
       # binary and has a deliberate fallback to "the first codesigning
@@ -584,10 +612,15 @@ jobs:
       - name: Sign the bundle with the Developer ID identity
         run: |
           set -euo pipefail
-          identity=$(security find-identity -v -p codesigning \
-            | awk '/Developer ID Application/ { print $2; exit }')
+          # `|| true` because a nonzero `security` under `set -o pipefail`
+          # would abort the step here and the friendly diagnosis below would
+          # never print — an empty identity is the condition to report, and
+          # how it came to be empty is what the dump in that branch shows.
+          identity=$(security find-identity -v -p codesigning 2>/dev/null \
+            | awk '/Developer ID Application/ { print $2; exit }' || true)
           if [ -z "$identity" ]; then
-            security find-identity -v -p codesigning
+            echo "--- security find-identity -v -p codesigning ---"
+            security find-identity -v -p codesigning || true
             echo "::error::no Developer ID Application identity in the build keychain — refusing to ship an ad-hoc-signed rupu.app"
             exit 1
           fi
@@ -618,11 +651,42 @@ jobs:
           # a submission vehicle only — the shipped zip is produced later,
           # from the STAPLED bundle, by scripts/package-app-dmg.sh.
           ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/rupu-app-submit.zip"
+
+          # A rejection prints a status and a submission id, and NOTHING about
+          # why — the reason lives in the per-submission log, which needs the
+          # API key to fetch. Diagnosing one afterwards would mean a manual
+          # re-run by whoever holds the secrets, so fetch it here, while the
+          # key is still on disk, and put it in the release run's own log.
+          #
+          # `tee` keeps the progress output live (this step waits for minutes)
+          # while capturing it; PIPESTATUS is why the pipeline is not simply
+          # `set -e`-checked. The status line is checked as well as the exit
+          # code: `submit --wait` has historically exited 0 on a submission
+          # that came back Invalid, and an unnoticed Invalid here means an
+          # un-notarized app gets stapled (which fails) or shipped.
+          log="$RUNNER_TEMP/notarize-app.log"
+          set +e
           xcrun notarytool submit "$RUNNER_TEMP/rupu-app-submit.zip" \
             --key "$key" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait
+            --wait 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          id=$(awk '/^ *id: / { print $2; exit }' "$log" || true)
+          status=$(awk '/^ *status: / { s=$2 } END { print s }' "$log" || true)
+          if [ "$rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+            if [ -n "$id" ]; then
+              echo "--- notarytool log $id ---"
+              xcrun notarytool log "$id" \
+                --key "$key" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID" || true
+            fi
+            rm -rf "$RUNNER_TEMP/private_keys"
+            echo "::error::notarizing rupu.app was not accepted (exit $rc, status '${status:-unknown}')"
+            exit 1
+          fi
           rm -rf "$RUNNER_TEMP/private_keys"
 
       # Unlike the bare CLI binary above — which cannot be stapled (stapler
@@ -637,9 +701,20 @@ jobs:
           set -euo pipefail
           xcrun stapler staple "$APP"
           xcrun stapler validate "$APP"
+          # Ask Gatekeeper the question the user's machine will ask on first
+          # launch, rather than inferring the answer from the fact that each
+          # preceding command exited 0. Nothing in this whole path has ever
+          # run against real secrets, so the first failure must be a red CI
+          # run and not a quarantine report from someone who downloaded it.
+          # `-t exec` is the assessment type for an application. There is no
+          # precedent for this in the CLI `macos` job because a bare binary is
+          # not spctl-assessable this way — it has no bundle to assess.
+          spctl -a -t exec -vv "$APP"
 
       - name: Package the DMG and the zip
-        run: scripts/package-app-dmg.sh "$APP" dist "${{ needs.meta.outputs.version }}"
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: scripts/package-app-dmg.sh "$APP" dist "$VERSION"
 
       # The DMG is a container the user downloads and mounts, so Gatekeeper
       # checks IT, not only the app inside it: an unsigned DMG is quarantined
@@ -654,36 +729,82 @@ jobs:
         run: |
           set -euo pipefail
           dmg=dist/rupu-app-darwin-arm64.dmg
-          identity=$(security find-identity -v -p codesigning \
-            | awk '/Developer ID Application/ { print $2; exit }')
+
+          # Everything since the import step — a build, a signature and a
+          # full notarization wait — has run on the clock of the keychain's
+          # idle-lock timer. That timer is set to 7200s for exactly this
+          # reason, but Apple's queue is not bounded by anything we control,
+          # so do not bet the last step of an hour-long job on it. Unlocking
+          # an already-unlocked keychain is a no-op.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Same lookup, same `|| true` reasoning as the app signing step.
+          identity=$(security find-identity -v -p codesigning 2>/dev/null \
+            | awk '/Developer ID Application/ { print $2; exit }' || true)
           if [ -z "$identity" ]; then
+            echo "--- security find-identity -v -p codesigning ---"
+            security find-identity -v -p codesigning || true
             echo "::error::no Developer ID Application identity in the build keychain — refusing to ship an unsigned DMG"
             exit 1
           fi
+          # No --deep: a DMG is a single file, not a tree of nested code.
           codesign --force --timestamp -s "$identity" "$dmg"
           codesign --verify --strict --verbose=2 "$dmg"
 
           mkdir -p "$RUNNER_TEMP/private_keys"
           key="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
           echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$key"
+
+          # Same capture-and-fetch-the-log shape as the app notarization
+          # above, and for the same reason: a rejection has to be diagnosable
+          # from this run's log, without a manual re-run holding the secrets.
+          log="$RUNNER_TEMP/notarize-dmg.log"
+          set +e
           xcrun notarytool submit "$dmg" \
             --key "$key" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait
+            --wait 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          id=$(awk '/^ *id: / { print $2; exit }' "$log" || true)
+          status=$(awk '/^ *status: / { s=$2 } END { print s }' "$log" || true)
+          if [ "$rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+            if [ -n "$id" ]; then
+              echo "--- notarytool log $id ---"
+              xcrun notarytool log "$id" \
+                --key "$key" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID" || true
+            fi
+            rm -rf "$RUNNER_TEMP/private_keys"
+            echo "::error::notarizing the DMG was not accepted (exit $rc, status '${status:-unknown}')"
+            exit 1
+          fi
           rm -rf "$RUNNER_TEMP/private_keys"
 
           xcrun stapler staple "$dmg"
           xcrun stapler validate "$dmg"
+          # The Gatekeeper question a downloaded DMG actually faces. `-t open`
+          # with the primary-signature context is the assessment macOS runs
+          # when a user opens a disk image — `-t exec` (used on the .app
+          # above) assesses executables and is the wrong question for a
+          # container. Same rationale for asserting at all: this path has
+          # never run against real secrets, so its first failure must be here.
+          spctl -a -t open --context context:primary-signature -vv "$dmg"
 
       # scripts/package-app-dmg.sh wrote a sidecar for each asset the moment
       # it created them, but the DMG has been rewritten since — its signature
       # and its stapled ticket both live inside the file — so that sidecar is
-      # now stale. Recompute BOTH (the zip is untouched; recomputing it costs
-      # nothing and makes "every sidecar in dist/ was computed over the bytes
-      # that ship" true by construction rather than by argument). `publish`
-      # runs `sha256sum -c` across dist/, which would catch a stale sidecar
-      # there — after it had already been uploaded to the rolling tag.
+      # now stale. Without this step EVERY release would fail, not silently
+      # ship a wrong hash: `publish` runs `sha256sum -c` across dist/ in its
+      # sanity check, which is the step BEFORE the upload, so a stale sidecar
+      # reliably reddens the release rather than reaching a user. This is
+      # therefore about not shipping a lane that cannot succeed, not about
+      # closing a corruption hole. Recompute BOTH (the zip is untouched;
+      # recomputing it costs nothing and makes "every sidecar in dist/ was
+      # computed over the bytes that ship" true by construction rather than
+      # by argument), and verify locally so the failure names this job.
       - name: Recompute the checksums over the bytes that ship
         run: |
           set -euo pipefail
