@@ -9,7 +9,7 @@ let package = Package(
             name: "RupuKit",
             targets: [
                 "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
-                "RupuProjects", "RupuShell",
+                "RupuProjects", "RupuFleet", "RupuShell",
             ]
         )
     ],
@@ -23,11 +23,12 @@ let package = Package(
         .target(name: "RupuLauncher", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(name: "RupuOverview", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(name: "RupuProjects", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(name: "RupuFleet", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(
             name: "RupuShell",
             dependencies: [
                 "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
-                "RupuProjects",
+                "RupuProjects", "RupuFleet",
             ]
         ),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),

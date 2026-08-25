@@ -7,6 +7,7 @@ import RupuRunDetail
 import RupuLauncher
 import RupuOverview
 import RupuProjects
+import RupuFleet
 
 /// The app's window content: fixed sidebar + detail pane that switches on
 /// `model.route`. Phase 2+ swaps each `PlaceholderScreen` branch for a real
@@ -212,7 +213,7 @@ public struct RootView: View {
         case .library:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .fleet:
-            PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
+            FleetScreen(model: model, backend: backend)
         case .usage:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         }
