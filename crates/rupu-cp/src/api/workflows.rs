@@ -626,12 +626,18 @@ struct LaunchBody {
 /// Resolve an optional `scope_kind`/`scope_id` selector on [`LaunchBody`] to
 /// a working-dir override. The workflow-launch twin of
 /// `api::agents::resolve_launch_scope` — see that function's doc comment for
-/// the full contract (back-compat when both are absent, 400 on an
+/// the full contract: back-compat when both are absent, 400 on an
 /// unrecognized `scope_kind`, 404 naming the scope on any resolution
-/// mismatch, `Project` returns the workspace ROOT so `rupu workflow run`'s
+/// mismatch, LOCAL-ONLY (only ever called from [`launch_run`]'s local
+/// branch), `Project` returns the workspace ROOT so `rupu workflow run`'s
 /// cwd-based discovery finds the SAME `.rupu/workflows/<name>.yaml` the
-/// picker resolved, `Global` has no project path to hand back). Applies here
-/// to [`resolve_workflow_scoped_explicit`] instead of the agent resolver.
+/// picker resolved, `Global` applies the identical trick one level higher
+/// (pointing cwd at `AppState::global_dir`'s PARENT so `project_root_for`'s
+/// walk hits the global dir itself first) — GUARDED: only when `global_dir`
+/// is literally named `.rupu`; otherwise 400 (loud beats wrong) rather than
+/// silently proceeding without an override under a non-default `$RUPU_HOME`.
+/// Applies here to [`resolve_workflow_scoped_explicit`] instead of the agent
+/// resolver.
 fn resolve_launch_scope(
     s: &AppState,
     name: &str,
@@ -650,19 +656,41 @@ fn resolve_launch_scope(
         resolve_workflow_scoped_explicit(s, name, kind, scope_id).ok_or_else(|| {
             ApiError::not_found(format!("workflow {name} not found in the requested scope"))
         })?;
-    Ok(match resolved_kind {
-        // dir == <workspace root>/.rupu/workflows; strip both segments.
-        ScopeKind::Project => dir
+    match resolved_kind {
+        // dir == <workspace root>/.rupu/workflows; strip both segments to
+        // reach the workspace root the picker's Project row targets.
+        ScopeKind::Project => Ok(dir
             .parent()
             .and_then(|p| p.parent())
-            .map(std::path::PathBuf::from),
-        ScopeKind::Global => None,
-    })
+            .map(std::path::PathBuf::from)),
+        // dir == <global_dir>/workflows; dir.parent() == global_dir itself.
+        ScopeKind::Global => {
+            let global_dir = dir
+                .parent()
+                .ok_or_else(|| ApiError::internal("resolved global workflows dir has no parent"))?;
+            if global_dir.file_name() != Some(std::ffi::OsStr::new(".rupu")) {
+                return Err(ApiError::bad_request(
+                    "global-scope launch pinning isn't available: RUPU_HOME is set to a \
+                     directory not named \".rupu\", so the cwd-based trick that forces \
+                     global-only resolution can't be applied here",
+                ));
+            }
+            let global_parent = global_dir
+                .parent()
+                .ok_or_else(|| ApiError::internal("global dir has no parent"))?;
+            Ok(Some(global_parent.to_path_buf()))
+        }
+    }
 }
 
 /// Start a fresh run of `:name` via the configured [`RunLauncher`] (local) or
 /// by proxying to a remote host. Returns the new run id plus the owning
 /// `host_id`. 501 when no launcher is installed and the target is local.
+///
+/// Scope (`scope_kind`/`scope_id`) is a LOCAL-ONLY affordance (ruled): a
+/// remote-targeted launch skips scope validation and the working_dir
+/// override entirely and behaves exactly as before — see
+/// `api::agents::run_agent`'s identical doc comment for the full rationale.
 ///
 /// [`RunLauncher`]: crate::launcher::RunLauncher
 async fn launch_run(
@@ -671,17 +699,11 @@ async fn launch_run(
     body: Option<Json<LaunchBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let mut b = body.map(|j| j.0).unwrap_or_default();
-    // Scope validation always runs; the working_dir override it computes is
-    // applied only on the local branch below — see `resolve_launch_scope`'s
-    // doc comment (mirroring `resolve_workflow_scoped`'s host-unaware
-    // contract: this endpoint's scope machinery only ever inspects THIS
-    // process's own local workspace registry).
-    let scope_working_dir =
-        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
     let host = b.host.as_deref().unwrap_or("local").to_string();
 
     if host != "local" {
-        // Remote path: resolve the connector and proxy the launch.
+        // Remote: scope fields, if present, are silently ignored — see this
+        // function's doc comment.
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = crate::launcher::LaunchRequest {
             workflow: name,
@@ -700,9 +722,19 @@ async fn launch_run(
         ));
     }
 
-    // Local path: unchanged (including the 501 when no launcher is installed)
-    // except for the scope-driven working_dir override computed above, which
-    // only ever fills in a working_dir the body left unset.
+    // Local path from here. `scope_kind` and a body-supplied `working_dir`
+    // are mutually exclusive — see `api::agents::run_agent`'s identical
+    // comment for the rationale (no existing caller sends both).
+    if b.scope_kind.is_some() && b.working_dir.is_some() {
+        return Err(ApiError::bad_request(
+            "scope_kind and working_dir are mutually exclusive — the scope selector determines the working directory",
+        ));
+    }
+    let scope_working_dir =
+        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
+    // Unchanged local behavior (including the 501 when no launcher is
+    // installed) except for the scope-driven working_dir override computed
+    // above, which only ever fills in a working_dir the body left unset.
     if b.working_dir.is_none() {
         b.working_dir = scope_working_dir.map(|p| p.display().to_string());
     }
@@ -1028,6 +1060,159 @@ mod tests {
             .expect_err("unresolvable scope must 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
         assert!(mock.last.lock().unwrap().is_none());
+    }
+
+    /// `scope_kind: global` launches the GLOBAL definition even when the
+    /// spawned subprocess's cwd (absent an override) would otherwise sit
+    /// inside a SHADOWING project of the same name — same mechanism as
+    /// `api::agents::run_agent`'s identical test, applied to workflows.
+    #[tokio::test]
+    async fn launch_run_scope_kind_global_resolves_global_definition_over_project_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // global_dir MUST be literally named `.rupu` for the cwd trick to
+        // apply — build AppState directly on a `.rupu`-named child.
+        let global_dir = tmp.path().join(".rupu");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "run_global".into(),
+        });
+        let s = AppState::new(global_dir.clone(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(global_dir.clone())
+            .with_launcher(Some(mock.clone()));
+
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(workflows_dir(&s).join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: Some("global".into()),
+            scope_id: None,
+        };
+        let _ = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect("global-scoped launch should resolve");
+
+        let got = mock.last.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            got.working_dir.as_deref(),
+            Some(global_dir.parent().unwrap().display().to_string().as_str()),
+            "working_dir must be global_dir's PARENT, not global_dir itself"
+        );
+    }
+
+    /// `scope_kind: global` under a `$RUPU_HOME`-style global dir NOT named
+    /// `.rupu` can't be pinned by the cwd trick — 400, never a silent no-op.
+    #[tokio::test]
+    async fn launch_run_scope_kind_global_under_non_dot_rupu_home_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global_dir = tmp.path().join("custom-home");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "unused".into(),
+        });
+        let s = AppState::new(global_dir.clone(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(global_dir.clone())
+            .with_launcher(Some(mock.clone()));
+
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(workflows_dir(&s).join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: Some("global".into()),
+            scope_id: None,
+        };
+        let err = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect_err("global pinning under a non-\".rupu\" RUPU_HOME must 400");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(mock.last.lock().unwrap().is_none());
+    }
+
+    /// `scope_kind` and a body-supplied `working_dir` are mutually
+    /// exclusive — same rationale as `api::agents::run_agent`'s identical
+    /// test. Nothing launches.
+    #[tokio::test]
+    async fn launch_run_scope_kind_with_explicit_working_dir_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "unused".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: Some("/explicit/caller/dir".into()),
+            host: None,
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_a".into()),
+        };
+        let err = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect_err("scope_kind + working_dir together must 400");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(mock.last.lock().unwrap().is_none());
+    }
+
+    /// A REMOTE-targeted launch ignores scope fields entirely — scope is a
+    /// LOCAL-ONLY affordance (ruled). A project unknown to THIS process's
+    /// local workspace registry must not 404 a remote launch.
+    #[tokio::test]
+    async fn launch_run_remote_host_ignores_scope_fields_and_proxies_unmodified() {
+        let remote = httpmock::MockServer::start_async().await;
+        let m = remote.mock(|when, then| {
+            when.method("POST").path("/api/workflows/nightly/run");
+            then.status(200)
+                .json_body(serde_json::json!({ "run_id": "remote_1", "host_id": "local" }));
+        });
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let host = s
+            .hosts
+            .add_host("test-remote", &remote.base_url(), None)
+            .expect("add_host should succeed");
+
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: Some(host.id.clone()),
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_unknown_locally".into()),
+        };
+        let resp = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect("remote launch must succeed exactly like a scope-less remote launch");
+        assert_eq!(resp.0["run_id"], "remote_1");
+        assert_eq!(resp.0["host_id"], host.id);
+        m.assert();
     }
 
     #[tokio::test]
