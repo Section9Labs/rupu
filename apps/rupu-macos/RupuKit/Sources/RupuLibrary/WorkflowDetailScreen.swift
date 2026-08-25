@@ -38,15 +38,22 @@ public struct WorkflowDetailScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
     let name: String
+    /// The tapped row's own scope (final-review fix wave, threaded from
+    /// `Route.workflowDefinition`) — see `definitionRow`'s doc comment for
+    /// why matching on these too (not `name` alone) matters.
+    let scopeKind: String?
+    let scopeID: String?
 
     @State private var detail: BlockState<WorkflowDetail> = .loading
     @State private var store: LibraryStore?
     @State private var storeClientID: ObjectIdentifier?
 
-    public init(model: AppModel, backend: BackendController, name: String) {
+    public init(model: AppModel, backend: BackendController, name: String, scopeKind: String? = nil, scopeID: String? = nil) {
         self.model = model
         self.backend = backend
         self.name = name
+        self.scopeKind = scopeKind
+        self.scopeID = scopeID
     }
 
     public var body: some View {
@@ -106,9 +113,22 @@ public struct WorkflowDetailScreen: View {
     /// the list (a race with a concurrent delete, or a name typo reaching
     /// this route directly). Every caller below already tolerates `nil`
     /// (scope-dependent chrome simply doesn't render), never crashes on it.
+    ///
+    /// **Matches on `name` + `scopeKind` + `scopeID`, not `name` alone**
+    /// (final-review fix wave) — a bare name match would silently pick
+    /// whichever same-named row happens to come first when the same
+    /// workflow name exists at two different scopes (e.g. a global
+    /// `nightly-health` and a project-scoped one), rendering the WRONG
+    /// row's scope badge/autoflow toggle/Launch scope even though the tap
+    /// that pushed this route was unambiguous. `scopeKind == nil` (this
+    /// route reached without a scope — no known caller does this today, but
+    /// nothing enforces it) falls back to the old name-only match rather
+    /// than matching nothing, so a legitimately unscoped navigation still
+    /// resolves a row when there's exactly one candidate.
     private var definitionRow: WorkflowDefinition? {
         guard case .content(let rows) = store?.workflows else { return nil }
-        return rows.first(where: { $0.name == name })
+        guard let scopeKind else { return rows.first(where: { $0.name == name }) }
+        return rows.first(where: { $0.name == name && $0.scopeKind == scopeKind && $0.scopeID == scopeID })
     }
 
     // MARK: - Header

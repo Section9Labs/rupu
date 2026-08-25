@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import RupuAPI
 import RupuStore
 import RupuDesign
@@ -137,6 +138,7 @@ public struct ProjectDetailScreen: View {
                 EmptyView()
             case .content(let detail):
                 factsLine(detail)
+                metaLine(detail)
             }
         }
     }
@@ -149,6 +151,38 @@ public struct ProjectDetailScreen: View {
             fact("Active sessions", Fmt.count(detail.sessions.active))
             fact("Spend", Fmt.cost(detail.usage.costUSD))
             Spacer(minLength: 0)
+        }
+    }
+
+    /// Second facts row (final-review fix wave): the identity/provenance
+    /// line `factsLine` above never carried — mono `path` (middle-truncated,
+    /// same idiom `RunDetailScreen.identityMetaLine` uses for a long id),
+    /// a tappable repo link when the project has one, and created/last-run
+    /// relative times. Null discipline throughout: any of `path`/
+    /// `repoHomeURL`/`createdAt` can be absent on the wire (see
+    /// `APIProjectRow`'s doc comment) and each renders nothing rather than a
+    /// blank or a fabricated placeholder — `detail.project.lastRunAt` already
+    /// has an established fallback via `Fmt`-style em dash handling in
+    /// `relativeLabel(_:)`.
+    private func metaLine(_ detail: APIProjectDetail) -> some View {
+        HStack(spacing: 14) {
+            if let path = detail.project.path {
+                Text(path)
+                    .font(.dataMono(10))
+                    .foregroundStyle(Color.rupuDim)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if let repoHomeURL = detail.project.repoHomeURL, let url = URL(string: repoHomeURL) {
+                Link(repoHomeURL, destination: url)
+                    .font(.dataMono(10))
+                    .foregroundStyle(Color.rupuBrand)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+            fact("Created", relativeLabel(detail.project.createdAt))
+            fact("Last run", relativeLabel(detail.project.lastRunAt))
         }
     }
 
@@ -220,7 +254,13 @@ public struct ProjectDetailScreen: View {
         case .coverage:
             CoverageTabContent()
         case .definitions:
-            DefinitionsTabContent(store: store)
+            DefinitionsTabContent(
+                store: store,
+                onSelect: { model.navigate(to: $0) },
+                onLaunch: { kind, name, scopeKind, scopeID in
+                    model.presentLauncher(kind: kind, name: name, scopeKind: scopeKind, scopeID: scopeID)
+                }
+            )
         }
     }
 
@@ -615,13 +655,22 @@ private struct ProjectFindingsTabContent: View {
 
 // MARK: - Coverage tab (honest placeholder)
 
-/// Spec-ruled honest placeholder (Phase 5A plan §5's "Coverage-tab
-/// placeholder honesty" note): the cheap `coverage.targets`/`coverage.
-/// findings` counts `APIProjectDetail` already carries are deliberately
-/// NOT rendered here — the metric that would make them meaningful
-/// (`assessed_pct`, a separate `GET /api/projects/:ws_id/coverage/assessed`
-/// call this phase doesn't cover) is absent, and half a coverage picture is
-/// worse than an honest "not yet" note. No fake data, no dead chrome.
+/// Spec-ruled honest placeholder — the Phase 5 breadth spec's Coverage line
+/// (`docs/superpowers/specs/2026-08-24-rupu-macos-phase-5-breadth-design.md`
+/// §2, "Projects": "this one tab ships with Plan B, which owns the coverage
+/// models; the tab bar carries it from day one with an honest 'arrives with
+/// Security' placeholder"), carried into the Phase 5A plan's Task 5
+/// ("Coverage tab renders the spec's 'arrives with Security' placeholder
+/// note (NO fake data)"): the cheap `coverage.targets`/`coverage.findings`
+/// counts `APIProjectDetail` already carries are deliberately NOT rendered
+/// here — the metric that would make them meaningful (`assessed_pct`, a
+/// separate `GET /api/projects/:ws_id/coverage/assessed` call this phase
+/// doesn't cover) is absent, and half a coverage picture is worse than an
+/// honest "not yet" note. No fake data, no dead chrome. (Review fix, final
+/// wave — this previously cited a non-existent "plan §5"; the plan has no
+/// numbered §5, only an unnumbered Task 5 and a separate "Self-review
+/// notes" section whose own "§5" shorthand refers to the DESIGN SPEC's §5,
+/// not the plan's own structure.)
 private struct CoverageTabContent: View {
     var body: some View {
         VStack(spacing: 8) {
@@ -636,15 +685,29 @@ private struct CoverageTabContent: View {
 
 // MARK: - Definitions tab
 
-/// Local, minimal definition rows — Task 7 (`RupuLibrary`, the Library
-/// screen) hadn't landed as of this task, so there is no shared
-/// definition-row component to reuse yet; the brief calls for exactly this
-/// fallback ("if Task 7 hasn't landed yet, keep local minimal rows — say
-/// which"). Three independently-loaded, independently-rendered sections —
+/// Local definition rows, now visually/behaviorally unified with Library's
+/// rendering (final-review fix wave, item 7) — Task 7 (`RupuLibrary`)
+/// hadn't landed when this tab was first built, so it shipped with bare
+/// name/badge rows and no navigation (the brief's own documented fallback
+/// at the time). Deliberately still NOT the same Swift types as
+/// `RupuLibrary.LibraryScreen`'s private `AgentDefRow`/`WorkflowDefRow`/
+/// `AutoflowDefRow` — literally sharing them would mean adding a
+/// `RupuProjects → RupuLibrary` module dependency and widening those types'
+/// access level to `public` for one set of rows, the same "not worth the
+/// indirection for one more screen" call `ProjectFindingsTabContent`'s own
+/// doc comment already makes for `RupuRunDetail.FindingsTabContent` above.
+/// Instead these rows re-derive the same chrome from the vocabulary that
+/// already IS shared (`RupuStore.agentPermissionTone(mode:)`, `RupuDesign.
+/// Badge`) and now tap through to the same scoped detail routes Library's
+/// rows push (`.agentDefinition`/`.workflowDefinition`, carrying the row's
+/// own `scopeKind`/`scopeID` — see `Route`'s doc comment on why that
+/// matters). Three independently-loaded, independently-rendered sections —
 /// Agents/Workflows/Autoflows — each its own `BlockState` from
 /// `ProjectDetailStore`.
 private struct DefinitionsTabContent: View {
     let store: ProjectDetailStore
+    let onSelect: (Route) -> Void
+    let onLaunch: (LaunchKind, String, String?, String?) -> Void
 
     var body: some View {
         ScrollView {
@@ -672,7 +735,11 @@ private struct DefinitionsTabContent: View {
             case .content(let rows):
                 VStack(spacing: 0) {
                     ForEach(Array(rows.enumerated()), id: \.offset) { _, def in
-                        AgentDefRow(def: def)
+                        AgentDefRow(
+                            def: def,
+                            onSelect: { onSelect(.agentDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID)) },
+                            onLaunch: { onLaunch(.agentRun, def.name, def.scopeKind, def.scopeID) }
+                        )
                         Divider()
                     }
                 }
@@ -694,7 +761,11 @@ private struct DefinitionsTabContent: View {
             case .content(let rows):
                 VStack(spacing: 0) {
                     ForEach(Array(rows.enumerated()), id: \.offset) { _, def in
-                        WorkflowDefRow(def: def)
+                        WorkflowDefRow(
+                            def: def,
+                            onSelect: { onSelect(.workflowDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID)) },
+                            onLaunch: { onLaunch(.workflow, def.name, def.scopeKind, def.scopeID) }
+                        )
                         Divider()
                     }
                 }
@@ -702,6 +773,16 @@ private struct DefinitionsTabContent: View {
         }
     }
 
+    /// **No enable/disable toggle** (unlike `RupuLibrary.AutoflowDefRow`) —
+    /// `ProjectDetailStore` has no `setAutoflowEnabled`/`PendingActions`
+    /// capability this phase (it's a read-only store, see its own type doc
+    /// comment); wiring a toggle here would mean either faking one against
+    /// nothing (a silent no-op — the exact anti-pattern this codebase
+    /// rejects elsewhere: "no dead controls, per the brief") or duplicating
+    /// `LibraryStore`'s mutation + pending-state plumbing onto a second
+    /// store for one tab. Deferred rather than faked; the enabled/disabled
+    /// badge stays read-only chrome, same as before this fix wave — only
+    /// navigation is new here.
     @ViewBuilder
     private var autoflowsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -716,7 +797,10 @@ private struct DefinitionsTabContent: View {
             case .content(let rows):
                 VStack(spacing: 0) {
                     ForEach(Array(rows.enumerated()), id: \.offset) { _, def in
-                        AutoflowDefRow(def: def)
+                        AutoflowDefRow(
+                            def: def,
+                            onSelect: { onSelect(.workflowDefinition(name: def.name, scopeKind: def.scopeKind, scopeID: def.scopeID)) }
+                        )
                         Divider()
                     }
                 }
@@ -727,10 +811,15 @@ private struct DefinitionsTabContent: View {
 
 private struct AgentDefRow: View {
     let def: AgentDefinition
+    let onSelect: () -> Void
+    let onLaunch: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
             Text(def.name).font(.uiText).foregroundStyle(Color.rupuInk).lineLimit(1)
+            if let mode = def.mode, let tone = agentPermissionTone(mode: mode) {
+                Badge(mode, tone: Color.status(tone))
+            }
             if let provider = def.provider {
                 Badge(provider)
             }
@@ -739,13 +828,19 @@ private struct AgentDefRow: View {
             }
             Spacer(minLength: 8)
             Text("\(def.runCount) runs").font(.metaText).foregroundStyle(Color.rupuMute)
+            DefRowLaunchButton(action: onLaunch)
         }
         .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .onHover(perform: DefRowHover.apply)
     }
 }
 
 private struct WorkflowDefRow: View {
     let def: WorkflowDefinition
+    let onSelect: () -> Void
+    let onLaunch: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -755,13 +850,18 @@ private struct WorkflowDefRow: View {
             }
             Spacer(minLength: 8)
             Text("\(def.runCount) runs").font(.metaText).foregroundStyle(Color.rupuMute)
+            DefRowLaunchButton(action: onLaunch)
         }
         .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .onHover(perform: DefRowHover.apply)
     }
 }
 
 private struct AutoflowDefRow: View {
     let def: AutoflowDefinition
+    let onSelect: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -771,6 +871,39 @@ private struct AutoflowDefRow: View {
             Badge(def.enabled ? "enabled" : "disabled", tone: def.enabled ? Color.status(.running) : Color.rupuMute)
         }
         .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .onHover(perform: DefRowHover.apply)
+    }
+}
+
+/// Trailing "Launch" text button — same shape/idiom `RupuLibrary.
+/// LaunchButton` establishes, re-derived locally rather than imported (see
+/// `DefinitionsTabContent`'s doc comment on why this file doesn't take a
+/// `RupuLibrary` dependency for its row chrome).
+private struct DefRowLaunchButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button("Launch", action: action)
+            .buttonStyle(.plain)
+            .font(.metaText.weight(.semibold))
+            .foregroundStyle(Color.rupuBrand)
+    }
+}
+
+/// Shared pointer-cursor hover handler for the three definition rows above
+/// — same idiom `RunRow`/`SessionRow`'s own `onHover` closures use (see
+/// those types' doc comments), factored to a single static function since
+/// none of these three rows has a conditional "is this clickable" gate the
+/// way `RunRow` does (every definition row is always navigable).
+private enum DefRowHover {
+    static func apply(_ hovering: Bool) {
+        if hovering {
+            NSCursor.pointingHand.push()
+        } else {
+            NSCursor.pop()
+        }
     }
 }
 
@@ -823,6 +956,18 @@ private struct RunRow: View {
             guard isClickable, let route = activityRow.navigation.route else { return }
             onSelect(route)
         }
+        // Pointer-cursor hover (review fix, final wave) — matches
+        // `ProjectsScreen.ProjectListRow`'s idiom; gated on `isClickable` so
+        // a row with no navigable route (e.g. a synthetic session with no
+        // `sessionID`) doesn't advertise a click that does nothing.
+        .onHover { hovering in
+            guard isClickable else { return }
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 
     private var startedLabel: String {
@@ -844,6 +989,7 @@ private struct SessionRow: View {
     let onSelect: (Route) -> Void
 
     private var activityRow: ActivityRow { ActivityRow(row) }
+    private var isClickable: Bool { activityRow.navigation.route != nil }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -877,6 +1023,16 @@ private struct SessionRow: View {
             guard let route = activityRow.navigation.route else { return }
             onSelect(route)
         }
+        // Pointer-cursor hover (review fix, final wave) — same idiom
+        // `RunRow`'s `onHover` above adds; see that one's doc comment.
+        .onHover { hovering in
+            guard isClickable else { return }
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 
     private var startedLabel: String {
@@ -889,6 +1045,27 @@ private struct SessionRow: View {
         formatter.unitsStyle = .abbreviated
         return formatter
     }()
+}
+
+// MARK: - Shared formatting (header meta line)
+
+/// `@MainActor` global — same rationale `LibraryScreen.swift`'s own
+/// `relativeFormatter`/`relativeLabel` pair documents: `RelativeDateTimeFormatter`
+/// isn't `Sendable`, and every call site here is already MainActor (called
+/// from `View` bodies). Kept as its own copy rather than sharing `RunRow`/
+/// `SessionRow`'s private instance-scoped formatters above — those are
+/// `private` to their own types.
+@MainActor
+private let headerRelativeFormatter: RelativeDateTimeFormatter = {
+    let formatter = RelativeDateTimeFormatter()
+    formatter.unitsStyle = .abbreviated
+    return formatter
+}()
+
+@MainActor
+private func relativeLabel(_ iso: String?) -> String {
+    guard let iso, let date = ActivityRow.parseISO(iso) else { return "—" }
+    return headerRelativeFormatter.localizedString(for: date, relativeTo: Date())
 }
 
 private struct FailedNote: View {

@@ -111,11 +111,16 @@ import Foundation
     let detail = try JSONDecoder().decode(APIProjectDetail.self, from: Fixtures.data("project_detail.json"))
 
     // `project` reuses APIProjectRow's partial decode — the fixture's
-    // ProjectRow carries more fields (path, repo_remote, ...) than that type
-    // decodes, and unknown keys are ignored.
+    // ProjectRow carries more fields (repo_remote, branch, last_active) than
+    // that type decodes, and unknown keys are ignored; path/repo_home_url/
+    // created_at ARE decoded (final-review fix wave — the Project Detail
+    // header's second facts row needs them).
     #expect(detail.project.wsID == "ws-1")
     #expect(detail.project.name == "rupu")
     #expect(detail.project.runCount == 14)
+    #expect(detail.project.path == "/Users/matt/Code/rupu")
+    #expect(detail.project.repoHomeURL == "https://github.com/section9labs/rupu")
+    #expect(detail.project.createdAt == "2026-08-01T09:00:00Z")
 
     #expect(detail.runs.total == 14)
     #expect(detail.runs.running == 1)

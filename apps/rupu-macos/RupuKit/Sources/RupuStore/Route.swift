@@ -48,12 +48,24 @@ public enum Route: Hashable, Sendable {
     /// "pushed, not directly sidebar-selectable" contract `.projectDetail`
     /// documents above. `selectedSidebarItem`'s getter maps this to
     /// `SidebarItem.library`.
-    case agentDefinition(name: String)
+    ///
+    /// **`scopeKind`/`scopeID` (final-review fix wave)**: the tapped row's
+    /// own scope, carried alongside `name` so a same-named definition at a
+    /// DIFFERENT scope never gets pinned to the wrong row — the same
+    /// scope-collision class `ActionKey.autoflow(...)` (`RupuStore`) already
+    /// fixes for the Library toggle. `AgentDetailScreen`/`WorkflowDetailScreen`
+    /// use these to pin their own row-derived chrome/toggle/launch to the
+    /// tapped row; the underlying `GET /api/agents/:name` / `GET /api/
+    /// workflows/:name` calls themselves take no scope query params (a
+    /// shared, tracked web gap — see those screens' own doc comments for the
+    /// exact residual each one documents).
+    case agentDefinition(name: String, scopeKind: String? = nil, scopeID: String? = nil)
     /// One workflow definition's detail view — also reached from a
     /// `.library` autoflows-tab row tap (an autoflow definition IS a
     /// workflow definition; there is no separate autoflow detail route),
     /// same push/sidebar-highlight contract as `.agentDefinition` above.
-    case workflowDefinition(name: String)
+    /// `scopeKind`/`scopeID`: see `.agentDefinition`'s doc comment.
+    case workflowDefinition(name: String, scopeKind: String? = nil, scopeID: String? = nil)
     case fleet
     case usage
 }
