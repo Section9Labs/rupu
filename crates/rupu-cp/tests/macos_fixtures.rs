@@ -18,6 +18,7 @@ use rupu_netflow::{Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome};
 use rupu_orchestrator::executor::Event;
 use rupu_orchestrator::runs::{AwaitingGate, RunStatus, StepKind};
 use rupu_orchestrator::{FindingRecord, RunRecord, StepResultRecord, UnitCheckpoint};
+use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/rupu-macos/Fixtures")
@@ -972,4 +973,295 @@ fn dashboard_fixture_is_current() {
     obj.insert("fleet_partial".into(), serde_json::json!(false));
 
     check_fixture("dashboard.json", &value);
+}
+
+// ── Fleet & project detail (Phase 5A) ───────────────────────────────────────
+//
+// `WorkerView` (api/workers.rs), `AutoflowDefRow` (api/autoflows.rs), and
+// `ProjectDetail`/`SessionDto` (api/projects.rs, api/sessions.rs) are private
+// (or `pub(crate)`) to their modules — no DTO to import across the crate
+// boundary from an integration test. Each fixture below hand-builds the
+// exact wire shape instead, mirroring the pattern `run_detail_fixture_is_current`
+// and `dashboard_fixture_is_current` already use for the same reason. Where a
+// `pub` type exists (`WorkerRecord` from `rupu_runtime`, `ProjectRow`/
+// `RunListRow`/`UsageSummary` from `rupu_cp`), it's serialized for real
+// rather than hand-typed, so drift on THOSE types still shows up here.
+
+#[test]
+fn workers_fixture_is_current() {
+    // Mirrors `list_workers` (api/workers.rs): `WorkerView` is
+    // `#[serde(flatten)] WorkerRecord` plus `active_run_count` /
+    // `total_run_count` / `last_run_at`. Two rows: one with full
+    // capabilities and run activity, one with every `WorkerCapabilities`
+    // list empty (exercising the `skip_serializing_if = "Vec::is_empty"`
+    // omission) and no run activity at all (`last_run_at: null`, both
+    // counts `0`).
+    let busy = WorkerRecord {
+        version: WorkerRecord::VERSION,
+        worker_id: "worker_local_team-mini_cli".into(),
+        kind: WorkerKind::Cli,
+        name: "team-mini".into(),
+        host: "team-mini.local".into(),
+        capabilities: WorkerCapabilities {
+            backends: vec!["local_worktree".into()],
+            scm_hosts: vec!["github".into()],
+            permission_modes: vec!["bypass".into(), "readonly".into()],
+        },
+        registered_at: "2026-08-19T16:00:00Z".into(),
+        last_seen_at: "2026-08-20T12:22:00Z".into(),
+    };
+    let mut busy_value = serde_json::to_value(&busy).expect("serialize WorkerRecord");
+    {
+        let obj = busy_value
+            .as_object_mut()
+            .expect("WorkerRecord is an object");
+        obj.insert("active_run_count".into(), serde_json::json!(2));
+        obj.insert("total_run_count".into(), serde_json::json!(9));
+        obj.insert(
+            "last_run_at".into(),
+            serde_json::json!("2026-08-20T12:20:00Z"),
+        );
+    }
+
+    let idle = WorkerRecord {
+        version: WorkerRecord::VERSION,
+        worker_id: "worker_local_kuki_autoflow_serve".into(),
+        kind: WorkerKind::AutoflowServe,
+        name: "kuki".into(),
+        host: "kuki.local".into(),
+        capabilities: WorkerCapabilities::default(),
+        registered_at: "2026-08-20T09:00:00Z".into(),
+        last_seen_at: "2026-08-20T09:05:00Z".into(),
+    };
+    let mut idle_value = serde_json::to_value(&idle).expect("serialize WorkerRecord");
+    {
+        let obj = idle_value
+            .as_object_mut()
+            .expect("WorkerRecord is an object");
+        obj.insert("active_run_count".into(), serde_json::json!(0));
+        obj.insert("total_run_count".into(), serde_json::json!(0));
+        obj.insert("last_run_at".into(), serde_json::Value::Null);
+    }
+
+    check_fixture("workers.json", &vec![busy_value, idle_value]);
+}
+
+#[test]
+fn autoflow_defs_fixture_is_current() {
+    // Mirrors `AutoflowDefRow` (api/autoflows.rs): `{name, slug, trigger,
+    // scope, scope_kind, scope_id, enabled}`. One global row (`scope_id:
+    // null`), one project row (`scope_id` set) — also covers a `false`
+    // `enabled` (a disabled def is listed, not filtered out — see
+    // `scan_autoflow_defs`'s doc comment).
+    let value = serde_json::json!([
+        {
+            "name": "nightly-health",
+            "slug": "nightly-health",
+            "trigger": "cron",
+            "scope": "global",
+            "scope_kind": "global",
+            "scope_id": null,
+            "enabled": true,
+        },
+        {
+            "name": "issue-triage",
+            "slug": "issue-triage-v2",
+            "trigger": "event",
+            "scope": "rupu",
+            "scope_kind": "project",
+            "scope_id": "ws-1",
+            "enabled": false,
+        },
+    ]);
+    check_fixture("autoflow_defs.json", &value);
+}
+
+#[test]
+fn project_detail_fixture_is_current() {
+    // Mirrors `get_project` (api/projects.rs): typed `project` (`ProjectRow`)
+    // and `recent_runs` (`Vec<RunListRow>`) alongside ad-hoc `runs` /
+    // `sessions` / `coverage` objects and a project-level `usage` rollup.
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+
+    let project = ProjectRow {
+        ws_id: "ws-1".into(),
+        name: "rupu".into(),
+        path: "/Users/matt/Code/rupu".into(),
+        repo_remote: Some("git@github.com:section9labs/rupu.git".into()),
+        branch: Some("main".into()),
+        repo_home_url: Some("https://github.com/section9labs/rupu".into()),
+        created_at: "2026-08-01T09:00:00Z".into(),
+        last_run_at: Some("2026-08-20T12:00:00Z".into()),
+        usage: UsageSummary {
+            input_tokens: 5000,
+            output_tokens: 1200,
+            cached_tokens: 300,
+            total_tokens: 6200,
+            cost_usd: Some(0.85),
+            priced: true,
+            runs: 2,
+        },
+        run_count: 14,
+        last_active: Some("2026-08-20T12:00:00Z".into()),
+    };
+
+    let recent_runs = vec![
+        RunListRow {
+            id: "run-01".into(),
+            workflow_name: "nightly-health".into(),
+            status: RunStatus::Completed,
+            started_at: t,
+            finished_at: Some(t + chrono::Duration::minutes(6)),
+            trigger: "cron",
+            usage: UsageSummary {
+                input_tokens: 1000,
+                output_tokens: 200,
+                cached_tokens: 0,
+                total_tokens: 1200,
+                cost_usd: Some(0.12),
+                priced: true,
+                runs: 1,
+            },
+            turns: 4,
+            duration_ms: Some(360_000),
+        },
+        RunListRow {
+            id: "run-02".into(),
+            workflow_name: "issue-triage".into(),
+            status: RunStatus::Running,
+            started_at: t + chrono::Duration::hours(1),
+            finished_at: None,
+            trigger: "event",
+            usage: UsageSummary::default(),
+            turns: 0,
+            duration_ms: None,
+        },
+    ];
+
+    let usage = UsageSummary {
+        input_tokens: 5000,
+        output_tokens: 1200,
+        cached_tokens: 300,
+        total_tokens: 6200,
+        cost_usd: Some(0.85),
+        priced: true,
+        runs: 2,
+    };
+
+    let value = serde_json::json!({
+        "project": project,
+        "runs": {
+            "total": 14,
+            "running": 1,
+            "by_status": {
+                "awaiting_approval": 1,
+                "cancelled": 0,
+                "completed": 10,
+                "failed": 2,
+                "running": 1,
+            },
+            "by_surface": { "workflow": 9, "autoflow": 5 },
+        },
+        "sessions": { "total": 3, "active": 1 },
+        "coverage": { "targets": 4, "findings": 7 },
+        "recent_runs": recent_runs,
+        "usage": usage,
+    });
+    check_fixture("project_detail.json", &value);
+}
+
+#[test]
+fn project_runs_fixture_is_current() {
+    // Mirrors `project_runs` (api/projects.rs) — `Vec<RunListRow>` returned
+    // AS-IS with no `host_id` injected (unlike the fleet-wide `run_list_row`
+    // fixture, this endpoint never proxies to a remote host — see
+    // `resolve_workflow_scoped`'s doc comment on why project routes stay
+    // local-only).
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+    let rows = vec![RunListRow {
+        id: "run-01".into(),
+        workflow_name: "nightly-health".into(),
+        status: RunStatus::Completed,
+        started_at: t,
+        finished_at: Some(t + chrono::Duration::minutes(6)),
+        trigger: "cron",
+        usage: UsageSummary {
+            input_tokens: 1000,
+            output_tokens: 200,
+            cached_tokens: 0,
+            total_tokens: 1200,
+            cost_usd: Some(0.12),
+            priced: true,
+            runs: 1,
+        },
+        turns: 4,
+        duration_ms: Some(360_000),
+    }];
+    check_fixture("project_runs.json", &rows);
+}
+
+#[test]
+fn project_sessions_fixture_is_current() {
+    // Mirrors `project_sessions` (api/projects.rs), which filters
+    // `collect_sessions`'s output (`SessionDto` + injected `scope`/`usage`)
+    // to one workspace — no `host_id` injected (same local-only rationale as
+    // `project_runs`). `SessionDto` is private to `api::sessions`, so this
+    // hand-builds the shape rather than importing it.
+    let value = serde_json::json!([
+        {
+            "session_id": "ses-01",
+            "agent_name": "rupuso",
+            "model": "claude-sonnet-4-6",
+            "provider_name": "anthropic",
+            "status": "running",
+            "total_turns": 6,
+            "total_tokens_in": 5000,
+            "total_tokens_out": 1200,
+            "total_tokens_cached": 300,
+            "created_at": "2026-08-20T11:00:00Z",
+            "updated_at": "2026-08-20T12:00:00Z",
+            "active_run_id": "run-02",
+            "last_error": null,
+            "target": "crates/rupu-cp",
+            "workspace_id": "ws-1",
+            "scope": "active",
+            "usage": {
+                "input_tokens": 5000,
+                "output_tokens": 1200,
+                "cached_tokens": 300,
+                "total_tokens": 6200,
+                "cost_usd": 0.85,
+                "priced": true,
+                "runs": 1,
+            },
+        },
+        {
+            "session_id": "ses-00",
+            "agent_name": "rupuso",
+            "model": "claude-sonnet-4-6",
+            "provider_name": "anthropic",
+            "status": "stopped",
+            "total_turns": 12,
+            "total_tokens_in": 9000,
+            "total_tokens_out": 2100,
+            "total_tokens_cached": 0,
+            "created_at": "2026-08-15T09:00:00Z",
+            "updated_at": "2026-08-15T10:30:00Z",
+            "active_run_id": null,
+            "last_error": null,
+            "target": null,
+            "workspace_id": "ws-1",
+            "scope": "archived",
+            "usage": {
+                "input_tokens": 9000,
+                "output_tokens": 2100,
+                "cached_tokens": 0,
+                "total_tokens": 11100,
+                "cost_usd": null,
+                "priced": false,
+                "runs": 1,
+            },
+        },
+    ]);
+    check_fixture("project_sessions.json", &value);
 }

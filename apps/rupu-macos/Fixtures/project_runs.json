@@ -1,0 +1,21 @@
+[
+  {
+    "id": "run-01",
+    "workflow_name": "nightly-health",
+    "status": "completed",
+    "started_at": "2026-08-20T12:00:00Z",
+    "finished_at": "2026-08-20T12:06:00Z",
+    "trigger": "cron",
+    "usage": {
+      "input_tokens": 1000,
+      "output_tokens": 200,
+      "cached_tokens": 0,
+      "total_tokens": 1200,
+      "cost_usd": 0.12,
+      "priced": true,
+      "runs": 1
+    },
+    "turns": 4,
+    "duration_ms": 360000
+  }
+]
