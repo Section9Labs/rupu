@@ -200,6 +200,29 @@ struct CPClientTests {
         #expect(query?.contains(URLQueryItem(name: "run_id", value: "run-40")) == true)
     }
 
+    /// Phase 5A's Projects Findings tab: `findings(wsID:)` sends `ws_id`,
+    /// never `run_id` — a distinct query key from `runFindings(id:)` above,
+    /// not an overload of the same one. Reuses `findings_run.json` — the
+    /// response envelope shape (`{findings, summary}`) is identical
+    /// regardless of which query key scoped it server-side.
+    @Test func findingsWsIDSendsWsIDAsQueryParameter() async throws {
+        let fixture = try Fixtures.data("findings_run.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let findings = try await client.findings(wsID: "ws-1")
+
+        #expect(findings.findings.count == 2)
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/findings")
+        let query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "ws_id", value: "ws-1")) == true)
+        #expect(query?.contains(where: { $0.name == "run_id" }) == false)
+    }
+
     @Test func runNetflowHitsNetflowSubpathAndDecodesFixture() async throws {
         let fixture = try Fixtures.data("netflow_run.json")
         StubURLProtocol.lastRequest = nil

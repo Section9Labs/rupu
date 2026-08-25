@@ -106,6 +106,18 @@ public actor CPClient {
         try await get("api/findings", query: [URLQueryItem(name: "run_id", value: id)])
     }
 
+    /// `GET /api/findings?ws_id=<id>` — every finding scoped to one project,
+    /// across every run that ever declared one (not just `recentRuns`).
+    /// Phase 5A's Projects Findings tab: the smallest honest addition over
+    /// `runFindings(id:)` above — the server's `FindingsQuery` (`crates/
+    /// rupu-cp/src/api/findings.rs`) already accepts `ws_id` as an
+    /// independent filter from `run_id`, so this is a second thin method
+    /// rather than overloading `runFindings`'s `id` parameter to mean two
+    /// different query keys depending on caller.
+    public func findings(wsID: String) async throws -> APIFindings {
+        try await get("api/findings", query: [URLQueryItem(name: "ws_id", value: wsID)])
+    }
+
     public func sessionDetail(id: String) async throws -> APISessionRow {
         try await get("api/sessions/\(id)")
     }

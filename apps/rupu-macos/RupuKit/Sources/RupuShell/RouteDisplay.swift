@@ -13,6 +13,7 @@ extension Route {
         case .sessionDetail: "Session"
         case .agentRunDetail: "Agent run"
         case .projects: "Projects"
+        case .projectDetail: "Project"
         case .security: "Security"
         case .library: "Library"
         case .fleet: "Fleet"
@@ -26,7 +27,7 @@ extension Route {
         switch self {
         case .overview: 4
         case .activity, .runDetail, .sessionDetail, .agentRunDetail: 2
-        case .projects, .security, .library, .fleet, .usage: 5
+        case .projects, .projectDetail, .security, .library, .fleet, .usage: 5
         }
     }
 }

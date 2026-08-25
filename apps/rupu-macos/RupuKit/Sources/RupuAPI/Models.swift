@@ -119,22 +119,28 @@ public struct APIHostRow: Decodable, Equatable, Sendable {
 }
 
 /// One row from `GET /api/projects` (`ProjectRow` on the Rust side). Only
-/// `ws_id`/`name`/`run_count`/`last_run_at` are decoded — the endpoint
-/// returns more fields (path, repo_remote, branch, repo_home_url,
-/// created_at, usage, last_active), ignored here (`Decodable`'s default
-/// behavior already skips unknown keys) since the v2 top bar's scope
-/// picker only needs an id, a label, and enough to show recent activity.
+/// `ws_id`/`name`/`run_count`/`last_run_at`/`usage` are decoded — the
+/// endpoint returns more fields (path, repo_remote, branch, repo_home_url,
+/// created_at, last_active), ignored here (`Decodable`'s default behavior
+/// already skips unknown keys) since the v2 top bar's scope picker only
+/// needs an id, a label, and enough to show recent activity. `usage` was
+/// added for Phase 5A's Projects list screen (`RupuProjects`), whose
+/// sortable "Spend" column needs `usage.cost_usd` — `ProjectRow` on the wire
+/// always carries it (non-optional `UsageSummary`, see `crates/rupu-cp/src/
+/// api/projects.rs`), so this is a required field, not optional.
 public struct APIProjectRow: Decodable, Equatable, Sendable {
     public let wsID: String
     public let name: String
     public let runCount: Int?
     public let lastRunAt: String?
+    public let usage: APIUsageSummary
 
-    public init(wsID: String, name: String, runCount: Int?, lastRunAt: String?) {
+    public init(wsID: String, name: String, runCount: Int?, lastRunAt: String?, usage: APIUsageSummary) {
         self.wsID = wsID
         self.name = name
         self.runCount = runCount
         self.lastRunAt = lastRunAt
+        self.usage = usage
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -142,6 +148,7 @@ public struct APIProjectRow: Decodable, Equatable, Sendable {
         case name
         case runCount = "run_count"
         case lastRunAt = "last_run_at"
+        case usage
     }
 }
 

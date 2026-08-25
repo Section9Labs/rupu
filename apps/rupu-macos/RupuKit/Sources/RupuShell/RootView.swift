@@ -6,6 +6,7 @@ import RupuActivity
 import RupuRunDetail
 import RupuLauncher
 import RupuOverview
+import RupuProjects
 
 /// The app's window content: fixed sidebar + detail pane that switches on
 /// `model.route`. Phase 2+ swaps each `PlaceholderScreen` branch for a real
@@ -203,7 +204,9 @@ public struct RootView: View {
         case .agentRunDetail(let id, let transcriptPath, let host):
             AgentRunDetailScreen(model: model, backend: backend, runID: id, transcriptPath: transcriptPath, host: host)
         case .projects:
-            PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
+            ProjectsScreen(model: model, backend: backend)
+        case .projectDetail(let wsID):
+            ProjectDetailScreen(model: model, backend: backend, wsID: wsID)
         case .security:
             PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
         case .library:
