@@ -1,0 +1,39 @@
+[
+  {
+    "active_run_count": 2,
+    "capabilities": {
+      "backends": [
+        "local_worktree"
+      ],
+      "permission_modes": [
+        "bypass",
+        "readonly"
+      ],
+      "scm_hosts": [
+        "github"
+      ]
+    },
+    "host": "team-mini.local",
+    "kind": "cli",
+    "last_run_at": "2026-08-20T12:20:00Z",
+    "last_seen_at": "2026-08-20T12:22:00Z",
+    "name": "team-mini",
+    "registered_at": "2026-08-19T16:00:00Z",
+    "total_run_count": 9,
+    "version": 1,
+    "worker_id": "worker_local_team-mini_cli"
+  },
+  {
+    "active_run_count": 0,
+    "capabilities": {},
+    "host": "kuki.local",
+    "kind": "autoflow_serve",
+    "last_run_at": null,
+    "last_seen_at": "2026-08-20T09:05:00Z",
+    "name": "kuki",
+    "registered_at": "2026-08-20T09:00:00Z",
+    "total_run_count": 0,
+    "version": 1,
+    "worker_id": "worker_local_kuki_autoflow_serve"
+  }
+]

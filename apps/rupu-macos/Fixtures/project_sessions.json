@@ -1,0 +1,56 @@
+[
+  {
+    "active_run_id": "run-02",
+    "agent_name": "rupuso",
+    "created_at": "2026-08-20T11:00:00Z",
+    "last_error": null,
+    "model": "claude-sonnet-4-6",
+    "provider_name": "anthropic",
+    "scope": "active",
+    "session_id": "ses-01",
+    "status": "running",
+    "target": "crates/rupu-cp",
+    "total_tokens_cached": 300,
+    "total_tokens_in": 5000,
+    "total_tokens_out": 1200,
+    "total_turns": 6,
+    "updated_at": "2026-08-20T12:00:00Z",
+    "usage": {
+      "cached_tokens": 300,
+      "cost_usd": 0.85,
+      "input_tokens": 5000,
+      "output_tokens": 1200,
+      "priced": true,
+      "runs": 1,
+      "total_tokens": 6200
+    },
+    "workspace_id": "ws-1"
+  },
+  {
+    "active_run_id": null,
+    "agent_name": "rupuso",
+    "created_at": "2026-08-15T09:00:00Z",
+    "last_error": null,
+    "model": "claude-sonnet-4-6",
+    "provider_name": "anthropic",
+    "scope": "archived",
+    "session_id": "ses-00",
+    "status": "stopped",
+    "target": null,
+    "total_tokens_cached": 0,
+    "total_tokens_in": 9000,
+    "total_tokens_out": 2100,
+    "total_turns": 12,
+    "updated_at": "2026-08-15T10:30:00Z",
+    "usage": {
+      "cached_tokens": 0,
+      "cost_usd": null,
+      "input_tokens": 9000,
+      "output_tokens": 2100,
+      "priced": false,
+      "runs": 1,
+      "total_tokens": 11100
+    },
+    "workspace_id": "ws-1"
+  }
+]

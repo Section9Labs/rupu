@@ -1,0 +1,20 @@
+[
+  {
+    "enabled": true,
+    "name": "nightly-health",
+    "scope": "global",
+    "scope_id": null,
+    "scope_kind": "global",
+    "slug": "nightly-health",
+    "trigger": "cron"
+  },
+  {
+    "enabled": false,
+    "name": "issue-triage",
+    "scope": "rupu",
+    "scope_id": "ws-1",
+    "scope_kind": "project",
+    "slug": "issue-triage-v2",
+    "trigger": "event"
+  }
+]
