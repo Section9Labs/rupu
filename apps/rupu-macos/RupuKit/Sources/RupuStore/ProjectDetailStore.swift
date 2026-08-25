@@ -91,7 +91,6 @@ public final class ProjectDetailStore {
     /// type doc comment's "Windowing" section.
     public static let showAllLimit = 1000
 
-    private let wsID: String
     private let fetchDetail: @Sendable () async throws -> APIProjectDetail
     private let fetchRuns: @Sendable (_ offset: Int, _ limit: Int) async throws -> [APIRunListRow]
     private let fetchSessions: @Sendable (_ offset: Int, _ limit: Int) async throws -> [APISessionRow]
@@ -113,7 +112,6 @@ public final class ProjectDetailStore {
     /// Production entry point — `ProjectDetailScreen` calls this.
     public convenience init(wsID: String, client: CPClient) {
         self.init(
-            wsID: wsID,
             fetchDetail: { try await client.projectDetail(wsID: wsID) },
             fetchRuns: { offset, limit in try await client.projectRuns(wsID: wsID, offset: offset, limit: limit) },
             fetchSessions: { offset, limit in try await client.projectSessions(wsID: wsID, offset: offset, limit: limit) },
@@ -128,8 +126,13 @@ public final class ProjectDetailStore {
     /// seam every other store in this module already established.
     /// `internal`, not `public` — reached from tests via `@testable import
     /// RupuStore`.
+    ///
+    /// No `wsID` parameter here (redesign-pass rider, spec §4 dead-code
+    /// list): the convenience init above still takes one, since every fetch
+    /// closure it builds captures it directly — but the designated init
+    /// itself only ever stored `wsID` into a `private let` nothing else in
+    /// this file ever read. Removed rather than kept "for completeness."
     init(
-        wsID: String,
         fetchDetail: @escaping @Sendable () async throws -> APIProjectDetail,
         fetchRuns: @escaping @Sendable (_ offset: Int, _ limit: Int) async throws -> [APIRunListRow],
         fetchSessions: @escaping @Sendable (_ offset: Int, _ limit: Int) async throws -> [APISessionRow],
@@ -138,7 +141,6 @@ public final class ProjectDetailStore {
         fetchAutoflows: @escaping @Sendable () async throws -> [AutoflowDefinition],
         fetchFindings: @escaping @Sendable () async throws -> APIFindings
     ) {
-        self.wsID = wsID
         self.fetchDetail = fetchDetail
         self.fetchRuns = fetchRuns
         self.fetchSessions = fetchSessions

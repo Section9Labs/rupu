@@ -34,19 +34,58 @@ struct Sidebar: View {
         .overlay(alignment: .trailing) { Color.rupuBorder.frame(width: 1) }
     }
 
-    /// App-name header row, matching `Shell.tsx:95`'s rail header — height
-    /// 48, bottom border.
+    /// App-name header row — height 48, bottom border, same row rhythm as
+    /// `Shell.tsx:95`'s rail header. Redesign-pass fix (audit A3): the bare
+    /// bold "rupu" wordmark this row used to render was missing the badge +
+    /// subtitle the audit found on the LIVE web CP (`127.0.0.1:7420`,
+    /// unflagged — `getShell()` in `crates/rupu-cp/web/src/lib/shell.ts`
+    /// defaults to `'v1'` absent a `[ui.cp] shell = "v2"` config override or
+    /// a dev-only `localStorage` opt-in, so a stock `rupu cp serve` serves
+    /// the v1 `Layout` shell, not `ShellV2`'s bare-wordmark rail). That v1
+    /// shell renders `<Brand />` at its default variant
+    /// (`crates/rupu-cp/web/src/components/Brand.tsx:29-43`, mounted via
+    /// `crates/rupu-cp/web/src/components/Layout.tsx:32`) — a 28px
+    /// (`h-7 w-7`) `rounded-md` (6px radius) tile, SOLID `bg-brand-600`
+    /// (not `ShellV2`'s gradient rail tile), holding a white 15px
+    /// font-light `&#8734;` glyph, next to a two-line wordmark: "rupu"
+    /// (14px/`text-sm` semibold, `text-ink`) over "Control Plane"
+    /// (11px/`text-[11px]`, `text-ink-mute`). Ported verbatim below, kept
+    /// inside the row's existing 48pt height (the v1 header's own `py-5`
+    /// padding doesn't fit this app's denser v2 rail rhythm, but the badge
+    /// + two text lines fit the 48pt row with room to spare).
     private var brandHeader: some View {
         HStack(spacing: 8) {
-            Text("rupu")
-                .font(.leadText)
-                .fontWeight(.semibold)
-                .foregroundStyle(Color.rupuInk)
+            brandBadge
+            VStack(alignment: .leading, spacing: 0) {
+                Text("rupu")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.rupuInk)
+                Text("Control Plane")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.rupuMute)
+            }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)
         .frame(height: 48)
         .overlay(alignment: .bottom) { Color.rupuBorder.frame(height: 1) }
+    }
+
+    /// The badge itself — `Brand.tsx`'s default-variant tile
+    /// (`h-7 w-7 rounded-md bg-brand-600` + a centered 15px font-light
+    /// `&#8734;` glyph in white). `rupuBrand600` is the exact RGB pair
+    /// `--c-brand-600` resolves to (`Tokens.swift`'s doc comment — ported
+    /// verbatim from `styles.css`), so this is a byte-match to the web's
+    /// `bg-brand-600`, not an approximation.
+    private var brandBadge: some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(Color.rupuBrand600)
+            .frame(width: 28, height: 28)
+            .overlay {
+                Text("\u{221E}")
+                    .font(.system(size: 15, weight: .light))
+                    .foregroundStyle(.white)
+            }
     }
 
     private var nav: some View {

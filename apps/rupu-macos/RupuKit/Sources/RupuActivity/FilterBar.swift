@@ -122,7 +122,7 @@ struct FilterBar: View {
         return Button {
             toggle(status)
         } label: {
-            Text(status.displayLabel)
+            Text(chipLabel(status))
                 .font(.metaText)
                 .foregroundStyle(isOn ? Color.white : Color.rupuDim)
                 .padding(.horizontal, 8)
@@ -132,6 +132,18 @@ struct FilterBar: View {
                 .overlay(Capsule().stroke(isOn ? Color.rupuBrand600 : Color.rupuBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
+    }
+
+    /// `status.displayLabel` verbatim for every case except `.awaiting`
+    /// (redesign-pass fix — audit A4). `displayLabel` itself now carries
+    /// the full canonical "Awaiting approval" (matched to the Activity
+    /// table's status column, which reads that property directly), but this
+    /// chip is one of a row of narrow capsules sharing the filter bar's
+    /// width — the audit explicitly left the short "Awaiting" form here as
+    /// an accepted call rather than a divergence to fix, so this override
+    /// is deliberate, not a leftover from before the table's label grew.
+    private func chipLabel(_ status: ActivityStatus) -> String {
+        status == .awaiting ? "Awaiting" : status.displayLabel
     }
 
     private func toggle(_ status: ActivityStatus) {

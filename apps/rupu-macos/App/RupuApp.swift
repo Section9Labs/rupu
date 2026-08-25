@@ -410,7 +410,15 @@ struct RupuApp: App {
         }
 
         Settings {
+            // Redesign-pass fix (audit A8): this scene used to omit
+            // `.preferredColorScheme` entirely, so it tracked the REAL
+            // system appearance while the main `WindowGroup` above forces
+            // `appearance`'s preference — observed live as a Light-appearance
+            // app with a stubbornly dark Settings window whenever the OS
+            // itself was in Dark mode. Same computed property, same mapping,
+            // so both scenes always agree.
             SettingsView(model: model, backend: backend, notifier: runNotifier)
+                .preferredColorScheme(preferredColorScheme)
                 .tint(Color.rupuBrand)
         }
 

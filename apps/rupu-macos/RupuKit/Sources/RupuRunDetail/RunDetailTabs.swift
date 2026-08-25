@@ -229,7 +229,16 @@ struct EventsTabContent: View {
         case .runStarted: "Run Started"
         case .stepStarted: "Step Started"
         case .stepWorking: "Step Working"
-        case .stepAwaitingApproval: "Awaiting Approval"
+        // Deliberately NOT Title Case, unlike every sibling case in this
+        // switch (redesign-pass fix — audit A4): "Awaiting approval" is
+        // this app's one canonical string for the gate-pending status
+        // (`StatusPill`'s `.awaiting` descriptor, `EventStreamColumn.swift`'s
+        // Situation Room card, `status.ts:95` on the web side), so this
+        // Events-tab type label matches that string exactly rather than
+        // following the Title Case convention every other event-type label
+        // here uses for its own, unrelated reason (labeling an event TYPE,
+        // not a status).
+        case .stepAwaitingApproval: "Awaiting approval"
         case .stepCompleted: "Step Completed"
         case .stepFailed: "Step Failed"
         case .stepSkipped: "Step Skipped"
