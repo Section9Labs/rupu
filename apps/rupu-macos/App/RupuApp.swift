@@ -280,11 +280,25 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
     /// validation pass — there's no reliable way to assert real
     /// `NSWindow`/`toggleFullScreen` behavior under `swift test` (no real
     /// app bundle/run loop).
-    func enterSituationRoomFullScreen() {
+    func enterSituationRoomFullScreen(attempt: Int = 0) {
+        // Live-validation fix: at `.onAppear` time SwiftUI has not yet
+        // stamped the scene's identifier onto its `NSWindow`, so the lookup
+        // found nothing and the old single-shot guard silently no-oped —
+        // the SR opened as a plain window (observed live). Retry on the
+        // main queue, bounded: the identifier lands within the first few
+        // run-loop turns; ten 100ms attempts is far past that, and giving
+        // up leaves an entirely usable plain window rather than looping.
         guard let window = NSApp.windows.first(where: { window in
             guard let id = window.identifier?.rawValue else { return false }
             return id == RupuApp.situationWindowID || id.hasPrefix("\(RupuApp.situationWindowID)-")
-        }) else { return }
+        }) else {
+            if attempt < 10 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    self?.enterSituationRoomFullScreen(attempt: attempt + 1)
+                }
+            }
+            return
+        }
         guard !window.styleMask.contains(.fullScreen) else { return }
         window.toggleFullScreen(nil)
     }
