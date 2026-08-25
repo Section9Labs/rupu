@@ -15,8 +15,11 @@ on:
         required: true
       # The rupu.app lane (`macos-app` below) can only be proven with real
       # Apple secrets, which a fork or a local run does not have. This input
-      # exists so that path can be exercised against an already-published tag
-      # without publishing anything: every build job runs exactly as it would
+      # re-exercises that path against an already-published tag without
+      # publishing anything. NOTE: it only works on tags that already CONTAIN
+      # the lane (`make macos-release` + the packaging script) — tags cut
+      # before this landed fail at the build step, so the lane's FIRST proof
+      # is necessarily a real release cut; dry runs de-risk changes after it: every build job runs exactly as it would
       # for a real release, and only `publish` is skipped. `repo`,
       # `community`, `publish-aur` and `publish-homebrew` all need `publish`,
       # so they skip with it — that single `if:` is the whole mechanism.
