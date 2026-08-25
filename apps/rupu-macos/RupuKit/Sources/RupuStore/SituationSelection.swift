@@ -1,4 +1,5 @@
 import Foundation
+import RupuAPI
 
 // Situation Room (Phase 6B, Task 7 review fix round 1, ruling 5) — pure,
 // testable logic `SituationStore` wires its budgeted run-resolution and
@@ -49,4 +50,73 @@ func sparkTick(current: [Int], eventsInWindow: Int, windowMS: Double) -> (spark:
     let nextSpark = Array(current.dropFirst()) + [eventsInWindow]
     let rate = Int((Double(eventsInWindow) * 60_000 / windowMS).rounded())
     return (nextSpark, rate)
+}
+
+/// Deterministic secondary sort key for `SituationStore.mergeIncoming(_:)`'s
+/// merge sort — review fix round 2, ruling 1: `Array.sort(by:)` is NOT a
+/// stability-guaranteed API (an earlier doc comment on this file's sole
+/// caller wrongly claimed it was), and two rows sharing a `ts` (the common
+/// case — a burst of events from one poll/backfill page frequently shares
+/// a millisecond, and multiple live events can share the "arrival time"
+/// stamp `SituationStore.applyLive(_:)` gives them) is exactly the shape
+/// where an unstable sort's tie order is allowed to differ between calls.
+/// This composes every field a case carries (minus the server-injected
+/// `ts`/`pos`, which is what `CPEventRow` already keeps separate from
+/// `CPEvent`) into one string, so `merged.sort { a, b in a.ts != b.ts ?
+/// a.ts > b.ts : mergeSortKey(a.event) < mergeSortKey(b.event) }` is a full,
+/// deterministic total order — same "value descending, key ascending"
+/// shape `selectNewestFirst` above already uses, with a row's own content
+/// standing in for that function's `runID` key.
+///
+/// Deliberately a SEPARATE, scoped-down composition from `RupuSituation`'s
+/// own `contentIdentityKey` (`StreamCards.swift`) — same "cannot import
+/// `RupuSituation`" module-boundary reason as everywhere else in this
+/// module (see `SituationStore`'s own doc comment) — not a shared
+/// implementation reused across the boundary. This one only needs to be a
+/// deterministic function of an event's content for ONE purpose (breaking
+/// a sort tie inside a single process's memory); it never needs to match a
+/// key computed by different code, so nothing here needs to stay in
+/// lockstep with that other function's exact composition.
+func mergeSortKey(_ event: CPEvent) -> String {
+    let runID = event.runID ?? ""
+    switch event {
+    case let .runStarted(_, workflowPath, startedAt):
+        return "runStarted|\(runID)|\(workflowPath)|\(startedAt)"
+    case let .stepStarted(_, stepID, kind, agent, host):
+        return "stepStarted|\(runID)|\(stepID)|\(kind)|\(agent ?? "")|\(host ?? "")"
+    case let .stepWorking(_, stepID, note, transcriptPath):
+        return "stepWorking|\(runID)|\(stepID)|\(note ?? "")|\(transcriptPath ?? "")"
+    case let .stepAwaitingApproval(_, stepID, reason):
+        return "stepAwaitingApproval|\(runID)|\(stepID)|\(reason)"
+    case let .stepCompleted(_, stepID, success, durationMS, host):
+        return "stepCompleted|\(runID)|\(stepID)|\(success)|\(durationMS)|\(host ?? "")"
+    case let .stepFailed(_, stepID, error):
+        return "stepFailed|\(runID)|\(stepID)|\(error)"
+    case let .stepSkipped(_, stepID, reason):
+        return "stepSkipped|\(runID)|\(stepID)|\(reason)"
+    case let .unitStarted(_, stepID, index, unitKey, agent, transcriptPath, host):
+        return "unitStarted|\(runID)|\(stepID)|\(index)|\(unitKey)|\(agent ?? "")|\(transcriptPath)|\(host ?? "")"
+    case let .unitCompleted(_, stepID, index, unitKey, success, tokensIn, tokensOut, host):
+        return "unitCompleted|\(runID)|\(stepID)|\(index)|\(unitKey)|\(success)|\(tokensIn)|\(tokensOut)|\(host ?? "")"
+    case let .panelRound(_, stepID, round, maxIterations, maxSeverityRemaining):
+        return "panelRound|\(runID)|\(stepID)|\(round)|\(maxIterations)|\(maxSeverityRemaining ?? "")"
+    case let .runCompleted(_, status, finishedAt):
+        return "runCompleted|\(runID)|\(status)|\(finishedAt)"
+    case let .runFailed(_, error, finishedAt):
+        return "runFailed|\(runID)|\(error)|\(finishedAt)"
+    case .runPaused:
+        return "runPaused|\(runID)"
+    case .runResumed:
+        return "runResumed|\(runID)"
+    case let .stepPaused(_, stepID):
+        return "stepPaused|\(runID)|\(stepID)"
+    case let .stepResumed(_, stepID):
+        return "stepResumed|\(runID)|\(stepID)"
+    case let .dispatchStarted(_, subRunID, agent, transcriptPath):
+        return "dispatchStarted|\(runID)|\(subRunID)|\(agent ?? "")|\(transcriptPath)"
+    case let .dispatchCompleted(_, subRunID, success, tokensIn, tokensOut):
+        return "dispatchCompleted|\(runID)|\(subRunID)|\(success)|\(tokensIn)|\(tokensOut)"
+    case let .unknown(type, _):
+        return "unknown|\(runID)|\(type)"
+    }
 }

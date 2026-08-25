@@ -1,10 +1,12 @@
 import Testing
+import RupuAPI
 @testable import RupuStore
 
-// Table tests for `SituationSelection.swift`'s two pure functions — review
-// fix round 1, ruling 5. Plain `@Test func`s: both functions are fully
-// pure (no networking, no timers, no `@MainActor` state), so nothing here
-// needs `@MainActor`.
+// Table tests for `SituationSelection.swift`'s pure functions — review fix
+// round 1, ruling 5 (`selectNewestFirst`/`sparkTick`) and round 2, ruling 1
+// (`mergeSortKey`). Plain `@Test func`s: every function here is fully pure
+// (no networking, no timers, no `@MainActor` state), so nothing needs
+// `@MainActor`.
 
 @Suite
 struct SelectNewestFirstTests {
@@ -82,5 +84,50 @@ struct SparkTickTests {
         // rounds rather than truncates.
         let result = sparkTick(current: [0], eventsInWindow: 1, windowMS: 4_800)
         #expect(result.eventsPerMin == 13, "round(60_000 / 4_800) == round(12.5) == 13")
+    }
+}
+
+@Suite
+struct MergeSortKeyTests {
+    @Test func isDeterministicAcrossRepeatedCallsOnEqualValues() {
+        let a = CPEvent.stepFailed(runID: "r1", stepID: "s1", error: "boom")
+        let b = CPEvent.stepFailed(runID: "r1", stepID: "s1", error: "boom")
+        #expect(mergeSortKey(a) == mergeSortKey(b))
+    }
+
+    @Test func distinguishesEventsThatDifferOnlyByOneField() {
+        let a = CPEvent.stepFailed(runID: "r1", stepID: "s1", error: "boom")
+        let b = CPEvent.stepFailed(runID: "r1", stepID: "s1", error: "bang")
+        #expect(mergeSortKey(a) != mergeSortKey(b))
+    }
+
+    @Test func distinguishesDifferentCasesThatShareARunID() {
+        let a = CPEvent.runPaused(runID: "r1")
+        let b = CPEvent.runResumed(runID: "r1")
+        #expect(mergeSortKey(a) != mergeSortKey(b))
+    }
+
+    @Test func producesAStableTotalOrderForATsTieInTheMergeSort() {
+        // Mirrors how `SituationStore.mergeIncoming` actually sorts:
+        // `a.ts != b.ts ? a.ts > b.ts : mergeSortKey(a.event) < mergeSortKey(b.event)`.
+        // Two distinct events sharing a `ts` must sort the same way every
+        // time — the whole point of round 2's ruling 1 fix.
+        let rows = [
+            CPEventRow(event: .runPaused(runID: "z"), ts: 1_000, pos: 0),
+            CPEventRow(event: .runPaused(runID: "a"), ts: 1_000, pos: 1),
+            CPEventRow(event: .runPaused(runID: "m"), ts: 1_000, pos: 2),
+        ]
+        let sortedOnce = rows.sorted { a, b in
+            a.ts != b.ts ? a.ts > b.ts : mergeSortKey(a.event) < mergeSortKey(b.event)
+        }
+        let sortedAgain = rows.reversed().sorted { a, b in
+            a.ts != b.ts ? a.ts > b.ts : mergeSortKey(a.event) < mergeSortKey(b.event)
+        }
+        let runIDs = sortedOnce.map { $0.event.runID }
+        #expect(runIDs == ["a", "m", "z"], "runPaused|a < runPaused|m < runPaused|z lexicographically")
+        #expect(
+            sortedAgain.map { $0.event.runID } == runIDs,
+            "the same input set, given to the sort in a different starting order, must land in the identical order"
+        )
     }
 }
