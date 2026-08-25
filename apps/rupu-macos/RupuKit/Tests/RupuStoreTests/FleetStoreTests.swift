@@ -50,6 +50,33 @@ private final class Counter: @unchecked Sendable {
     private var v = 0
     @discardableResult
     func increment() -> Int { lock.withLock { v += 1; return v } }
+    var value: Int { lock.withLock { v } }
+}
+
+/// Async-safe one-shot gate — the `async` sibling of the `DispatchSemaphore`
+/// gate the URLProtocol-stub tests in this module use (see
+/// `ActivityStoreTests`' progressive-merge test for the class rationale:
+/// a "slow" stub held back by `Thread.sleep`/`Task.sleep` only
+/// *probabilistically* brackets the state the test asserts, and under
+/// parallel-suite load either side can win). `FleetStore`'s seam is a plain
+/// `async` fetch closure rather than a `URLProtocol`, so the wait must not
+/// park a cooperative thread — it bridges the semaphore through a
+/// continuation resumed off a global (non-cooperative) queue instead.
+///
+/// The 10s cap only bounds a hung test; it is never a timing knob.
+private final class AsyncGate: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                _ = self.semaphore.wait(timeout: .now() + 10)
+                continuation.resume()
+            }
+        }
+    }
+
+    func open() { semaphore.signal() }
 }
 
 /// De-flakes "wait for an async outcome to settle" assertions — a private
@@ -397,9 +424,28 @@ private func makeStore(
 /// `hosts` with no pending indicator at all, directly contradicting the
 /// "row disappearing IS the confirmation" contract. With the guard, the
 /// stale cycle's result is dropped once it finally resolves.
+/// De-flake (this test failed on this branch's own CI run — the same
+/// timed-stub class the `ActivityStoreTests` semaphore gates fixed): the old
+/// shape raced two clocks. A 10ms `Task.sleep` was meant to give the stale
+/// cycle a head start (so it captures the OLDER generation) while an 80ms
+/// `Task.sleep` inside its fetch was meant to hold its result back until
+/// after `removeHost`'s newer cycle landed. Under parallel-suite load either
+/// could lose: if the stale `Task` hadn't reached `activate()` within 10ms,
+/// `removeHost`'s reconcile went FIRST and the "stale" cycle became the
+/// NEWEST one — its `["local", "mini"]` result then legitimately resurrected
+/// "mini" (`.confirmed`/`["local"]` both fail), which is the failure CI
+/// actually recorded.
+///
+/// Both clocks are now deterministic signals: the head start is a poll on
+/// the fetch having genuinely ENTERED (`hostsCallCount == 2`, incremented
+/// before the gate — which can only happen after `reconcile` bumped
+/// `generation`, so generation ordering is established, not hoped for), and
+/// the stale result is held on a gate the test opens only AFTER the newer
+/// cycle's outcome is asserted.
 @MainActor @Test func staleReconcileIsDroppedWhenANewerReconcileAlreadyCompleted() async {
     let pendingActions = PendingActions()
     let hostsCallCount = Counter()
+    let staleGate = AsyncGate()
     let store = makeStore(
         fetchHosts: {
             switch hostsCallCount.increment() {
@@ -408,11 +454,11 @@ private func makeStore(
                 return [hostRow(id: "local"), hostRow(id: "mini", name: "mini")]
             case 2:
                 // A second, overlapping full reconcile (stands in for the
-                // periodic tick) — deliberately slow, and must resolve
-                // AFTER call 3 below for this test to actually exercise the
-                // guard. Still reports "mini" present (nothing removed it
-                // as far as this stale cycle knows).
-                try? await Task.sleep(for: .milliseconds(80))
+                // periodic tick) — held by the test until the newer cycle
+                // has landed and been asserted, so this stale result can
+                // only ever arrive afterwards. Still reports "mini" present
+                // (nothing removed it as far as this stale cycle knows).
+                await staleGate.wait()
                 return [hostRow(id: "local"), hostRow(id: "mini", name: "mini")]
             default:
                 // `removeHost`'s own hosts-only confirming reconcile: fast,
@@ -425,12 +471,13 @@ private func makeStore(
 
     await store.activate() // call 1
 
-    // Fire the slow, overlapping cycle (call 2) and give it a generous
-    // head start to actually begin (bump `generation`, dispatch its fetch)
-    // before the faster `removeHost` cycle below — mirrors
-    // `DashboardStoreTests`' own generation-race test's margin philosophy.
+    // Fire the overlapping cycle (call 2) and wait for its fetch to have
+    // actually entered — proof that `reconcile` already bumped `generation`
+    // for it, so the `removeHost` cycle below is genuinely the NEWER one.
     let staleReconcile = Task { await store.activate() }
-    try? await Task.sleep(for: .milliseconds(10))
+    await expectEventually("the stale cycle's own /api/hosts fetch has entered (generation bumped)") {
+        hostsCallCount.value >= 2
+    }
 
     // The faster, newer cycle (call 3) — confirms the removal.
     await store.removeHost(id: "mini")
@@ -439,8 +486,9 @@ private func makeStore(
     #expect(pendingActions.state(key) == .confirmed)
     #expect(store.hosts.value?.map(\.id) == ["local"])
 
-    // Let the stale call 2 actually resolve (`.value` awaits it past its
-    // 80ms artificial delay) and confirm it never resurrected "mini".
+    // Only now let the stale call 2 answer, and confirm its late arrival
+    // never resurrected "mini".
+    staleGate.open()
     _ = await staleReconcile.value
     #expect(store.hosts.value?.map(\.id) == ["local"], "the stale generation's result must never be applied")
     #expect(pendingActions.state(key) == .confirmed, "the stale cycle must not disturb the already-confirmed key either")

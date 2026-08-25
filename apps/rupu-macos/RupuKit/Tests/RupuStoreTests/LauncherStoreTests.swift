@@ -172,6 +172,14 @@ struct LauncherStoreTests {
     // the background and must never delay that return, even when it's
     // artificially slow.
     @MainActor @Test func activateLoadsDefinitionsInParallelAndHostsProgressivelyWithoutBlocking() async {
+        // De-flake (timed-stub sweep): `#expect(store.hosts.isEmpty)` below
+        // is a MID-FLIGHT assertion — it only means anything while
+        // discovery genuinely hasn't answered. An 80ms `Thread.sleep` made
+        // that "probably true"; under parallel-suite load the sleep can
+        // elapse while the main actor is starved, hosts fill in, and the
+        // assertion fails on a store that behaved correctly. The response
+        // is now held on a gate the test opens only after asserting.
+        let hostsGate = DispatchSemaphore(value: 0)
         let store = makeStore { req in
             guard let path = req.url?.path else { return (200, Data("[]".utf8)) }
             switch path {
@@ -180,7 +188,11 @@ struct LauncherStoreTests {
             case "/api/workflows":
                 return (200, Data("[\(Self.workflowJSON(name: "nightly"))]".utf8))
             case "/api/hosts":
-                Thread.sleep(forTimeInterval: 0.08) // artificially slow
+                // Held until the test has asserted that `activate()` came
+                // back WITHOUT waiting on discovery (see the gate's
+                // rationale at the call site). The 10s cap only bounds a
+                // hung test; it is never a timing knob.
+                _ = hostsGate.wait(timeout: .now() + 10)
                 return (200, Data("[\(Self.hostJSON(id: "local", status: "online"))]".utf8))
             default:
                 return (200, Data("[]".utf8))
@@ -195,7 +207,10 @@ struct LauncherStoreTests {
         #expect(store.workflows.value?.map(\.name) == ["nightly"])
         #expect(store.hosts.isEmpty)
 
-        await expectEventually("the slow /api/hosts discovery call lands and fills in hosts") {
+        // Only now let discovery answer.
+        hostsGate.signal()
+
+        await expectEventually("the gated /api/hosts discovery call lands and fills in hosts") {
             !store.hosts.isEmpty
         }
         #expect(store.hosts.map(\.id) == ["local"])
@@ -229,10 +244,22 @@ struct LauncherStoreTests {
     // even without the fix (it's set synchronously); the fix is that
     // `workflowInputs` agrees with it.
     @MainActor @Test func rapidSelectDefinitionRaceOlderSlowerCallNeverClobbersNewerFasterOne() async {
+        // De-flake (timed-stub sweep): this race was scripted with two
+        // clocks — a 10ms head start for A and an 80ms "slow" A response —
+        // and BOTH are load-bearing. `selectDefinition` bumps its
+        // generation synchronously, so if A's `async let` hadn't actually
+        // started within the head start, A became the NEWER call and
+        // legitimately won (`selectedDefinition == "B"` then fails on a
+        // correct store). Both are now signals: A's start is observed via
+        // its request reaching the stub, and A's response is held on a gate
+        // opened only once B has fully landed.
+        let slowAGate = DispatchSemaphore(value: 0)
         let store = makeStore { req in
             guard let path = req.url?.path else { return (200, Data("[]".utf8)) }
             if path == "/api/workflows/A" {
-                Thread.sleep(forTimeInterval: 0.08) // artificially slow, the OLDER call
+                // The OLDER call — held until B has applied. 10s caps a
+                // hung test only.
+                _ = slowAGate.wait(timeout: .now() + 10)
                 return (200, Data(Self.racyWorkflowDetailJSON(name: "A").utf8))
             }
             if path == "/api/workflows/B" {
@@ -243,12 +270,16 @@ struct LauncherStoreTests {
         store.kind = .workflow
 
         async let first: Void = store.selectDefinition("A")
-        try? await Task.sleep(for: .milliseconds(10)) // let A's slow fetch actually begin
-        async let second: Void = store.selectDefinition("B")
-        _ = await (first, second)
+        // A's request reaching the stub proves `selectDefinition("A")` ran
+        // (and captured the older generation) before B is ever called.
+        await expectEventually("A's fetch is genuinely in flight before B is called") {
+            LauncherStubURLProtocol.hitCount("/api/workflows/A") == 1
+        }
+        await store.selectDefinition("B") // the NEWER call — lands fully first
 
-        // Outlive A's slow fetch, in case it's still resolving.
-        try? await Task.sleep(for: .milliseconds(120))
+        // Only now let the older, superseded call answer, and await it.
+        slowAGate.signal()
+        await first
 
         #expect(store.selectedDefinition == "B")
         #expect(store.workflowInputs.keys.contains("B_input"))
@@ -260,10 +291,13 @@ struct LauncherStoreTests {
     // older call ("B") is the slow one. Rules out any accidental bias
     // toward a specific name or call slot in the fix.
     @MainActor @Test func rapidSelectDefinitionRaceReversedOrderStillLastCallWins() async {
+        // Same two-clock de-flake as (b2) above, names/roles reversed.
+        let slowBGate = DispatchSemaphore(value: 0)
         let store = makeStore { req in
             guard let path = req.url?.path else { return (200, Data("[]".utf8)) }
             if path == "/api/workflows/B" {
-                Thread.sleep(forTimeInterval: 0.08) // artificially slow, the OLDER call this time
+                // The OLDER call this time — held until A has applied.
+                _ = slowBGate.wait(timeout: .now() + 10)
                 return (200, Data(Self.racyWorkflowDetailJSON(name: "B").utf8))
             }
             if path == "/api/workflows/A" {
@@ -274,11 +308,13 @@ struct LauncherStoreTests {
         store.kind = .workflow
 
         async let first: Void = store.selectDefinition("B")
-        try? await Task.sleep(for: .milliseconds(10)) // let B's slow fetch actually begin
-        async let second: Void = store.selectDefinition("A")
-        _ = await (first, second)
+        await expectEventually("B's fetch is genuinely in flight before A is called") {
+            LauncherStubURLProtocol.hitCount("/api/workflows/B") == 1
+        }
+        await store.selectDefinition("A") // the NEWER call this time
 
-        try? await Task.sleep(for: .milliseconds(120))
+        slowBGate.signal()
+        await first
 
         #expect(store.selectedDefinition == "A")
         #expect(store.workflowInputs.keys.contains("A_input"))
@@ -653,35 +689,40 @@ struct LauncherStoreTests {
     // (f2) Review fix (Important 2): a fast target's `LaunchOutcome` lands
     // in `launchResults` while a slower target is still in flight — the
     // fan-out publishes progressively, not all-at-once after the last one
-    // finishes. Uses a bounded `Thread.sleep` for "aslow" (same recipe, and
-    // same rationale, as `ActivityStoreTests`'s slow-remote-host test) —
-    // an earlier version of this test used an indefinite
-    // `DispatchSemaphore.wait()` gate instead, which turned out to be
-    // genuinely flaky when run as part of the full suite: it can starve
-    // Swift Concurrency's cooperative thread pool (a thread parked forever
-    // in a blocking wait, rather than for a bounded interval, is a
-    // documented footgun), which stalled the *other* target's continuation
-    // resumption too, not just the deliberately-stuck one — a test
-    // artifact, not evidence the store itself was serializing.
+    // finishes.
+    //
+    // Timed-stub sweep (2026-08-25): "aslow" is held on a BOUNDED gate the
+    // test opens once the mid-flight assertion has been made, not on a
+    // `Thread.sleep` the test then races. The historical objection to a
+    // gate here no longer applies: the earlier, genuinely-flaky version
+    // parked its wait INLINE in `startLoading()`, on the single shared
+    // queue `URLSession` funnels every custom-`URLProtocol` request
+    // through, so the *other* target's request could not even be submitted
+    // while it was held (verified: a blocked handler stalls the whole
+    // session). `startLoading()` now dispatches the handler off that queue
+    // (see its doc comment, fold-in minor 4), so a held response blocks
+    // only its own target — which is exactly what this test needs — and
+    // the wait is capped at 10s purely to bound a hung test.
     //
     // Final-review fix (fold-in, minor 4): the slow host is named "aslow",
     // not "slow" — `resolvedTargets()` returns `selectedHosts.sorted()`, so
     // "aslow" sorts *before* "local" (`"a" < "l"`). If a future regression
     // ever turned the fan-out back into a serial `for` loop over that sorted
-    // order, "aslow" would be the *first* target dispatched and its 0.08s
-    // sleep would block "local"'s request from ever being sent in time —
-    // this test would then fail outright instead of silently passing
-    // because the already-fast host happened to be visited first. Margins
-    // also widened to the 300ms sleep / 2s poll-ceiling pairing (f3)
-    // already uses, for the same de-flake rationale documented there — the
-    // tighter 80ms/60ms pairing lost races under full-suite parallel load.
+    // order, "aslow" would be the *first* target dispatched and its held
+    // response would block "local"'s request from ever being sent — this
+    // test would then fail outright (on the gate's 10s cap) instead of
+    // silently passing because the already-fast host happened to be visited
+    // first.
     @MainActor @Test func fastTargetOutcomeAppearsInLaunchResultsWhileSlowTargetStillInFlight() async {
+        let slowHostGate = DispatchSemaphore(value: 0)
         let store = makeStore { req in
             guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
             let json = LauncherStubURLProtocol.bodyJSON(req)
             let host = (json?["host"] as? String) ?? "local"
             if host == "aslow" {
-                Thread.sleep(forTimeInterval: 0.3) // artificially slow, generous margin under load
+                // Held until the test has asserted that "local"'s outcome
+                // published on its own. 10s caps a hung test only.
+                _ = slowHostGate.wait(timeout: .now() + 10)
                 return (200, Data(#"{"run_id":"run-slow","host_id":"aslow"}"#.utf8))
             }
             return (200, Data(#"{"run_id":"run-fast","host_id":"local"}"#.utf8))
@@ -693,18 +734,17 @@ struct LauncherStoreTests {
 
         let launchTask = Task { await store.launch() }
 
-        // Polled with a generous ceiling well short of "aslow"'s own 300ms
-        // artificial delay, so this only passes if "local" genuinely lands
-        // before "aslow" could possibly have finished sleeping.
-        await expectEventually(
-            timeout: .seconds(2),
-            "the fast target's outcome lands while the slow one is still stuck"
-        ) {
+        // "aslow" cannot possibly have answered — it is gated — so this can
+        // only pass by "local" genuinely publishing on its own, and the
+        // generous default ceiling never waits out a real failure.
+        await expectEventually("the fast target's outcome lands while the slow one is still stuck") {
             store.launchResults.contains { $0.host == "local" }
         }
         #expect(store.launchResults.count == 1) // "aslow" hasn't landed yet
         #expect(store.launchResults.first?.host == "local")
 
+        // Only now let the slow target answer.
+        slowHostGate.signal()
         _ = await launchTask.value
 
         #expect(store.launchResults.count == 2)
@@ -714,31 +754,26 @@ struct LauncherStoreTests {
     // (f3) Review fix (Important 2): a slow target must never delay another
     // target's own POST from being *sent* — proven here by both requests'
     // path hit count reaching 2 (both dispatched) while the slow target is
-    // still mid-sleep, not merely by favorable overall timing. See (f2)'s
-    // doc comment on why this uses a bounded `Thread.sleep` rather than an
-    // indefinite gate, and on why the slow host is named "aslow" rather than
-    // "slow" (sorts first — a serial-loop regression must fail this test,
-    // not accidentally pass it).
+    // still unanswered, not merely by favorable overall timing. See (f2)'s
+    // doc comment for why the slow host is held on a bounded gate (and why
+    // the historical objection to gating here no longer applies), and on why
+    // it is named "aslow" rather than "slow" (sorts first — a serial-loop
+    // regression must fail this test, not accidentally pass it).
     //
-    // Margins are deliberately generous (300ms sleep / up to 2s to observe
-    // dispatch) rather than the tight 80ms/60ms pairing used elsewhere in
-    // this file: under full-suite parallel load (many Swift Testing suites'
-    // threads contending for the cooperative pool at once), a 60ms poll
-    // window can lose the race against scheduling jitter even though
-    // dispatch itself was never serialized — a test artifact, not evidence
-    // of a real ordering violation (same class of flake (f2)'s doc comment
-    // describes for `DispatchSemaphore.wait()`). The ordering claim itself
-    // is unchanged: the assertion fires the instant the poll condition
-    // first observes hitCount == 2, which — because sending is what's under
-    // test, not completion — lands almost immediately and leaves ample
-    // headroom before "aslow"'s 300ms sleep can have elapsed.
+    // Gating strictly strengthens this one: "aslow" is now guaranteed
+    // unanswered while the dispatch count is observed, where the old 300ms
+    // sleep merely made it likely. `!launchResults.contains { aslow }` is
+    // therefore an assertion about the store, not about the clock.
     @MainActor @Test func slowTargetNeverDelaysAnotherTargetsPOSTFromBeingSent() async {
+        let slowHostGate = DispatchSemaphore(value: 0)
         let store = makeStore { req in
             guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
             let json = LauncherStubURLProtocol.bodyJSON(req)
             let host = (json?["host"] as? String) ?? "local"
             if host == "aslow" {
-                Thread.sleep(forTimeInterval: 0.3) // artificially slow, generous margin under load
+                // Held until both dispatches have been observed. 10s caps a
+                // hung test only.
+                _ = slowHostGate.wait(timeout: .now() + 10)
                 return (200, Data(#"{"run_id":"run-slow","host_id":"aslow"}"#.utf8))
             }
             return (200, Data(#"{"run_id":"run-fast","host_id":"local"}"#.utf8))
@@ -750,21 +785,22 @@ struct LauncherStoreTests {
 
         let launchTask = Task { await store.launch() }
 
-        // Both requests dispatched (hit count 2) well before "aslow"'s 300ms
-        // sleep could have elapsed — proves sending isn't serialized behind
-        // another target's completion. The 2s ceiling is just how long
-        // we're willing to wait to *observe* dispatch on a loaded runner;
-        // it doesn't weaken the ordering check below, which fires as soon
-        // as the condition is first true.
-        await expectEventually(
-            timeout: .seconds(2),
-            "both requests are sent even though \"aslow\" hasn't answered yet"
-        ) {
+        // Both requests dispatched (hit count 2) while "aslow" is provably
+        // still unanswered — proves sending isn't serialized behind another
+        // target's completion.
+        await expectEventually("both requests are sent even though \"aslow\" hasn't answered yet") {
             LauncherStubURLProtocol.hitCount("/api/agents/rupuso/run") == 2
         }
-        #expect(store.launchResults.contains { $0.host == "local" })
-        #expect(!store.launchResults.contains { $0.host == "aslow" }) // still in flight
+        // "local"'s own completion is a separate event from its dispatch —
+        // polled, not assumed to have already landed at the instant the
+        // dispatch count was observed (that assumption was its own small
+        // race in the pre-gate version of this test).
+        await expectEventually("the fast target's outcome publishes") {
+            store.launchResults.contains { $0.host == "local" }
+        }
+        #expect(!store.launchResults.contains { $0.host == "aslow" }) // gated — provably still in flight
 
+        slowHostGate.signal()
         _ = await launchTask.value
 
         #expect(store.launchResults.count == 2)
@@ -852,9 +888,16 @@ struct LauncherStoreTests {
     // Esc/click-outside gating itself is view-only (SwiftUI modifier), but
     // this proves the state it reads flips at the right moments.
     @MainActor @Test func isLaunchInFlightTrueWhileLaunchPendingFalseOnceResolved() async {
+        // De-flake (timed-stub sweep): `isLaunchInFlight == true` is only
+        // observable WHILE the POST is unresolved. A 300ms `Thread.sleep`
+        // made that window probable; under parallel-suite load it can
+        // elapse before the poll below ever runs, after which the flag is
+        // (correctly) false and the poll times out on a healthy store. The
+        // response is now held until the flag has actually been observed.
+        let launchGate = DispatchSemaphore(value: 0)
         let store = makeStore { req in
             guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
-            Thread.sleep(forTimeInterval: 0.3) // artificially slow, generous margin under load
+            _ = launchGate.wait(timeout: .now() + 10) // 10s caps a hung test only
             return (200, Data(#"{"run_id":"run-1","host_id":"local"}"#.utf8))
         }
         store.kind = .agentRun
@@ -868,6 +911,8 @@ struct LauncherStoreTests {
             store.isLaunchInFlight
         }
 
+        // Only now let the POST resolve.
+        launchGate.signal()
         _ = await launchTask.value
         #expect(store.isLaunchInFlight == false) // confirmed — no longer pending
     }

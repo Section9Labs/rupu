@@ -393,13 +393,21 @@ struct ActivityStoreTests {
 
     // (f) reconnect (scripted disconnect+connect) triggers a refresh before
     // further deltas apply. The workflow endpoint's second response (the
-    // resnapshot) is deliberately slow and returns a materially different
+    // resnapshot) is deliberately gated and returns a materially different
     // row than the first, so the final merged state can only be explained
     // by resnapshot completing (new row content visible) before the
     // trailing event's patch is layered on top of it.
     @MainActor @Test func reconnectResnapshotsBeforeApplyingFurtherDeltas() async {
         let log = EventLog()
         let workflowCallCount = CountBox()
+        // De-flake (same class as the two gates below — a timed stub only
+        // *probably* brackets the state it is sized for): the resnapshot's
+        // response is held until the test has yielded the trailing event,
+        // so the adversarial window (an event queued behind an
+        // still-unresolved resnapshot) is established deterministically
+        // rather than by a 30ms `Thread.sleep` that parallel-suite load can
+        // let elapse first.
+        let resnapshotGate = DispatchSemaphore(value: 0)
         let (store, box) = makeStore { req in
             guard req.url?.path == "/api/runs/workflows" else {
                 return (200, Self.fourSourceBody(for: req.url?.path ?? ""))
@@ -411,10 +419,12 @@ struct ActivityStoreTests {
                 return (200, Data("[\(row)]".utf8))
             } else {
                 log.record("resnapshot-fetch")
-                // Simulate the resnapshot's REST round trip being slow, to
-                // widen the window a bug (event applied before resnapshot
-                // completes) would need to fall into.
-                Thread.sleep(forTimeInterval: 0.03)
+                // Held open until the test has yielded the trailing event
+                // (below) — that is exactly the window a bug (event applied
+                // before the resnapshot completes) would have to fall into,
+                // and it is now guaranteed rather than sized. The 10s cap
+                // only bounds a hung test; it is not a timing knob.
+                _ = resnapshotGate.wait(timeout: .now() + 10)
                 let row = Self.runListRowJSON(
                     id: "run-wf-1", startedAt: "2026-08-20T10:00:00Z", status: "running",
                     durationMS: "9999", turns: 2
@@ -433,11 +443,16 @@ struct ActivityStoreTests {
         box.latest.yield(.connection(false))
         box.latest.yield(.connection(true))
         box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        // The trailing event is now queued behind the still-unresolved
+        // resnapshot — release it. (Signalling before the resnapshot's
+        // handler is even reached is harmless: the semaphore's count is
+        // held, so the wait returns immediately when it does run, and the
+        // event was still yielded first either way.)
+        resnapshotGate.signal()
         // CI regression (macos-15 runner, slower than a dev machine): a
         // fixed post-event sleep here wasn't always long enough for the
-        // resnapshot's deliberately-slow (30ms `Thread.sleep`) fetch plus
-        // the trailing patch to land — poll for the fully-settled end
-        // state instead of asserting at one fixed instant.
+        // resnapshot's fetch plus the trailing patch to land — poll for the
+        // fully-settled end state instead of asserting at one fixed instant.
         await expectEventually("run-wf-1 reflects both the resnapshot's fresh row and the trailing patch") {
             let row = store.rows.first(where: { $0.id == "run-wf-1" })
             return row?.durationMS == 9999 && row?.status == .completed
@@ -506,6 +521,16 @@ struct ActivityStoreTests {
     // (headStart + 2*debounceInterval) lands strictly after it — see the
     // arithmetic in the comments below.
     @MainActor @Test func debouncedRefreshCollidingWithInFlightRefreshRetriesOnceAfterItCompletes() async {
+        // Timed-sleep sweep: this is one of the few stubs in the suite whose
+        // sleep is NOT convertible to a semaphore gate — what's under test
+        // IS the debounce window's own arithmetic (a fire landing inside an
+        // in-flight fetch, its retry landing after that fetch), so the
+        // fetch's duration is the discriminator, not scaffolding around one.
+        // A gate would have to be released at a wall-clock instant chosen by
+        // the test — the same clock, just moved. The de-flaking that IS
+        // available here is already applied: wide margins (below) plus a
+        // condition-based, not duration-based, final wait.
+        //
         // Margins deliberately wide (were 10/25/47 — first-fire margin 13ms,
         // retry margin 3ms): on loaded macos-15 CI runners timer jitter can
         // shift the retry INSIDE the slow fetch's window, where it collides

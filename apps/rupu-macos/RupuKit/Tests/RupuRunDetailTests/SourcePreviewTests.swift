@@ -75,6 +75,35 @@ final class SourcePreviewStubURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+/// De-flakes "wait for an async effect to land" — a private helper per file,
+/// this codebase's established convention (see `ActivityStoreTests.
+/// pollUntil`/`expectEventually` for the identical shape).
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
+@MainActor
+private func expectEventually(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ description: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: () -> Bool
+) async {
+    let succeeded = await pollUntil(timeout: timeout, interval: interval, condition)
+    #expect(succeeded, "timed out waiting for: \(description)", sourceLocation: sourceLocation)
+}
+
 @Suite(.serialized)
 @MainActor
 struct SourcePreviewStoreTests {
@@ -256,6 +285,15 @@ struct SourcePreviewStoreTests {
     /// must never populate the NEW run's cache once it eventually lands —
     /// same "captured generation must still match" shape `CodeStoreTests.
     /// navigateMidFlightDropsStaleResult` pins for `CodeStore`.
+    ///
+    /// Timed-sleep sweep, classification (b): the stub's delay is KEPT (the
+    /// guard drops the run-a result whenever it lands, and no assertion
+    /// here reads a mid-flight state), but the START ordering was NOT
+    /// order-independent — if the fetch hadn't begun before `setRun`, it
+    /// would run under run-b's own identity and legitimately populate the
+    /// cache, failing the test on a correct store. That half is now a
+    /// signal. See `CodeStoreTests.navigateMidFlightDropsStaleResult` for
+    /// why the delay itself can't become a gate in an inline stub.
     @Test func aFetchInFlightWhenTheRunChangesIsDroppedOnArrival() async {
         let client = makeClient { req in
             guard req.url?.path == "/api/runs/run-a/source" else { return (404, Data()) }
@@ -265,7 +303,9 @@ struct SourcePreviewStoreTests {
         let store = SourcePreviewStore(runID: "run-a", host: nil, client: client)
 
         let staleTask = Task { await store.loadSourceIfNeeded(path: "src/a.rs", line: 10) }
-        try? await Task.sleep(for: .milliseconds(20)) // let the slow request actually fire
+        await expectEventually("the run-a source request is genuinely in flight") {
+            SourcePreviewStubURLProtocol.hits("/api/runs/run-a/source") >= 1
+        }
         store.setRun(runID: "run-b", host: nil)
 
         #expect(store.sourceState(path: "src/a.rs", line: 10) == nil)
@@ -313,21 +353,37 @@ struct SourcePreviewStoreTests {
     /// `loadSourceIfNeeded`'s `!= nil` presence guard swallowed the
     /// re-expand and the row sat on "Loading source…" forever with no
     /// Retry affordance (Retry only renders for `.failed`).
+    ///
+    /// De-flake (timed-stub sweep): the cancel must land while the fetch is
+    /// genuinely unresolved — that IS the scenario. An 80ms `Thread.sleep`
+    /// made it probable; under parallel-suite load it can elapse first, the
+    /// fetch lands, the key is `.content`, and the `== nil` assertion fails
+    /// on a correct store. The response is now held on a gate opened
+    /// immediately AFTER `cancel()`, so cancellation always precedes
+    /// delivery (verified: a response delivered right after a cancel still
+    /// surfaces as `NSURLErrorCancelled`), and released at once so the
+    /// re-dispatch below isn't queued behind it on this stub's shared
+    /// inline queue.
     @Test func aCancelledSourceFetchLeavesTheKeyReDispatchable() async {
         let hits = LockedCounter()
+        let sourceGate = DispatchSemaphore(value: 0)
         let client = makeClient { req in
             guard req.url?.path == "/api/runs/run-1/source" else { return (404, Data()) }
-            hits.increment()
-            Thread.sleep(forTimeInterval: 0.08)
+            if hits.increment() == 1 {
+                _ = sourceGate.wait(timeout: .now() + 10) // 10s caps a hung test only
+            }
             return (200, Data(Self.sourceJSON(available: true).utf8))
         }
         let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
 
         // Expand → fetch in flight.
         let expand = Task { await store.loadSourceIfNeeded(path: "src/a.rs", line: 10) }
-        try? await Task.sleep(for: .milliseconds(20)) // let the slow request actually fire
+        await expectEventually("the source request is genuinely in flight") {
+            SourcePreviewStubURLProtocol.hits("/api/runs/run-1/source") >= 1
+        }
         // Collapse → SwiftUI cancels the mounted `.task`.
         expand.cancel()
+        sourceGate.signal() // the response can only ever arrive post-cancel
         await expand.value
 
         #expect(
@@ -349,18 +405,24 @@ struct SourcePreviewStoreTests {
     /// Same contract on the AST path — `AstTreeView` mounts its fetch from
     /// the same kind of `.task(id:)` and gets cancelled the same way.
     @Test func aCancelledAstFetchLeavesTheKeyReDispatchable() async {
+        // Same gate-instead-of-sleep de-flake as the source-path test above.
         let hits = LockedCounter()
+        let astGate = DispatchSemaphore(value: 0)
         let client = makeClient { req in
             guard req.url?.path == "/api/runs/run-1/ast" else { return (404, Data()) }
-            hits.increment()
-            Thread.sleep(forTimeInterval: 0.08)
+            if hits.increment() == 1 {
+                _ = astGate.wait(timeout: .now() + 10) // 10s caps a hung test only
+            }
             return (200, Data(Self.astJSON(available: true).utf8))
         }
         let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
 
         let expand = Task { await store.loadAstIfNeeded(path: "src/a.rs", line: 2, col: 8) }
-        try? await Task.sleep(for: .milliseconds(20))
+        await expectEventually("the ast request is genuinely in flight") {
+            SourcePreviewStubURLProtocol.hits("/api/runs/run-1/ast") >= 1
+        }
         expand.cancel()
+        astGate.signal() // the response can only ever arrive post-cancel
         await expand.value
 
         #expect(store.astState(path: "src/a.rs", line: 2, col: 8) == nil)
@@ -382,6 +444,11 @@ struct SourcePreviewStoreTests {
     /// call then writes its content) or the live call's success first
     /// (entry is `.content`, so the `catch` leaves it alone) — the key must
     /// end on `.content`, never blanked back to "Loading…".
+    ///
+    /// Timed-sleep sweep, classification (b) — the sleeps are KEPT: the
+    /// paragraph above IS the order-independence proof, and that
+    /// independence is itself the contract under test. Nothing here asserts
+    /// a mid-flight state, so there is no bracket for a gate to hold open.
     @Test func aCancelledFetchNeverWipesOutAConcurrentFetchsResultForTheSameKey() async {
         let client = makeClient { req in
             guard req.url?.path == "/api/runs/run-1/source" else { return (404, Data()) }

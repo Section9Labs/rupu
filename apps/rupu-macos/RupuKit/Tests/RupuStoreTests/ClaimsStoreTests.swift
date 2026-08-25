@@ -328,14 +328,22 @@ struct ClaimsStoreTests {
 
     // MARK: - Pending state, mid-flight
 
+    /// De-flake (timed-stub sweep): `.pending` is observable ONLY while the
+    /// release POST is unresolved — the assertion is mid-flight by
+    /// definition. A 150ms `Thread.sleep` made that window probable; under
+    /// parallel-suite load it can elapse before the poll below ever runs,
+    /// after which the key is (correctly) `.confirmed` and the poll times
+    /// out on a healthy store. The response is now held on a gate the test
+    /// opens only after `.pending` has actually been observed.
     @Test func releaseMarksTheKeyPendingBeforeTheRequestResolves() async {
         let issueRef = "github:Section9Labs/rupu/issues/101"
+        let releaseGate = DispatchSemaphore(value: 0)
         let client = makeClient { req in
             if req.url?.path == "/api/autoflows/claims" {
                 return (200, Data("[\(Self.claimJSON(issueRef: issueRef))]".utf8))
             }
             if req.url?.path == "/api/autoflows/claims/release" {
-                Thread.sleep(forTimeInterval: 0.15)
+                _ = releaseGate.wait(timeout: .now() + 10) // 10s caps a hung test only
                 return (200, Data(#"{"released": true}"#.utf8))
             }
             return (404, Data())
@@ -351,6 +359,8 @@ struct ClaimsStoreTests {
             if case .pending = pendingActions.state(key) { return true }
             return false
         }
+        // Only now let the POST resolve.
+        releaseGate.signal()
         _ = await task.value
         #expect(pendingActions.state(key) == .confirmed)
     }
