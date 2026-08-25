@@ -11,20 +11,23 @@ import Testing
 // half, extracted so it can be pinned without a SwiftUI host (same
 // "view-member pure logic gets its own testable static func" idiom
 // `SourcePreview.taskID` / `CodeTab.lineNumberGutterWidth` establish).
+// `@MainActor` on every test: a static on a View TYPE is MainActor-isolated
+// under CI's stricter isolation inference even when the body is pure — the
+// standing rule from PR #599 applies to statics too (broke #604's first CI run).
 
-@Test func aSpawnedActivateRunsWhileTheScreenHasNotTornDown() {
+@Test @MainActor func aSpawnedActivateRunsWhileTheScreenHasNotTornDown() {
     #expect(SituationRoomScreen.shouldActivate(spawnEpoch: 0, currentEpoch: 0))
     #expect(SituationRoomScreen.shouldActivate(spawnEpoch: 7, currentEpoch: 7))
 }
 
-@Test func aSpawnedActivateIsSkippedOnceOnDisappearHasBumpedTheEpoch() {
+@Test @MainActor func aSpawnedActivateIsSkippedOnceOnDisappearHasBumpedTheEpoch() {
     // `.onDisappear` bumps the epoch BEFORE calling `deactivate()`/clearing
     // `store`, so any already-spawned task that has not yet re-checked sees
     // the bump and returns without starting a stream.
     #expect(!SituationRoomScreen.shouldActivate(spawnEpoch: 0, currentEpoch: 1))
 }
 
-@Test func repeatedTeardownsKeepSkippingEveryTaskSpawnedBeforeThem() {
+@Test @MainActor func repeatedTeardownsKeepSkippingEveryTaskSpawnedBeforeThem() {
     // A window reopened and torn down again keeps bumping — a task spawned
     // under ANY earlier epoch stays skipped, never accidentally re-matching.
     for spawnEpoch in 0..<3 {
