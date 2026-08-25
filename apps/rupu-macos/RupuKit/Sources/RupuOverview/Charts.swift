@@ -2,24 +2,8 @@ import Charts
 import Foundation
 import RupuAPI
 import RupuDesign
+import RupuStore
 import SwiftUI
-
-// MARK: - Timestamp parsing
-
-/// Parses a server-emitted RFC 3339 `ts`, tolerating both shapes chrono
-/// emits (fractional seconds only when nanos are non-zero) — mirrors
-/// `RupuStore/DashboardStore.swift`'s `parseTimestamp`. `nil` on a genuinely
-/// unparseable string; callers drop that bucket rather than fabricating a
-/// date, since the server contract guarantees well-formed, zero-filled,
-/// midnight-UTC-aligned `ts` values.
-func parseBucketTimestamp(_ s: String) -> Date? {
-    let withFractional = ISO8601DateFormatter()
-    withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = withFractional.date(from: s) { return date }
-    let plain = ISO8601DateFormatter()
-    plain.formatOptions = [.withInternetDateTime]
-    return plain.date(from: s)
-}
 
 // MARK: - Pure adapters (the testable seam)
 
@@ -33,7 +17,7 @@ func parseBucketTimestamp(_ s: String) -> Date? {
 /// dropped rather than guessed at.
 public func chartRows(from buckets: [APITerminalBucket]) -> [(ts: Date, series: String, value: Int)] {
     buckets.flatMap { bucket -> [(ts: Date, series: String, value: Int)] in
-        guard let ts = parseBucketTimestamp(bucket.ts) else { return [] }
+        guard let ts = ActivityRow.parseISO(bucket.ts) else { return [] }
         return [
             (ts: ts, series: "completed", value: bucket.completed),
             (ts: ts, series: "failed", value: bucket.failed),
@@ -48,7 +32,7 @@ public func chartRows(from buckets: [APITerminalBucket]) -> [(ts: Date, series: 
 /// (`crates/rupu-cp/web/src/components/dashboard/ThroughputChart.tsx`).
 public func throughputRows(from buckets: [APIThroughputBucket]) -> [(ts: Date, series: String, value: Int)] {
     buckets.flatMap { bucket -> [(ts: Date, series: String, value: Int)] in
-        guard let ts = parseBucketTimestamp(bucket.ts) else { return [] }
+        guard let ts = ActivityRow.parseISO(bucket.ts) else { return [] }
         return [
             (ts: ts, series: "manual", value: bucket.manual),
             (ts: ts, series: "cron", value: bucket.cron),

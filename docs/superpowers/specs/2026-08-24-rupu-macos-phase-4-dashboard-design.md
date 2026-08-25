@@ -19,19 +19,25 @@ language: needs-you queue + instrument strip + trend charts + fleet band, backed
    selector** (v2 arc locked decision #4: a parked gate must never be hidden by a
    filter). Row types this phase: approval gates (awaiting tone, oldest first) and
    failed runs (failed tone, newest first, within the active range). Cap 6 rows +
-   "+N more" footer that navigates to Activity pre-filtered (awaiting). Inline
-   actions: gates get Approve / Reject (the same gate-scoped
-   `PendingActions` machinery as Activity/RunDetail — pending state visible in
-   place, confirm-from-observed-status, never optimistic-remove); failed runs get
-   Open (run detail). Empty state: a single quiet row "nothing needs you"
-   (`ink-mute`) — never an empty card. Critical-finding rows are **Phase 5**
-   (global findings endpoint) — the row model is built to accept a third type
-   then.
-3. **Instrument strip** — one bordered panel, six equal cells: Awaiting you ·
-   Active now · Paused · Failed (range) with inline sparkline · Success rate ·
-   Open findings. Values from the merged dashboard summary; null discipline: a
-   poisoned/partial field renders `—` (plus `+` marker when `*_partial`), never a
-   fabricated 0.
+   "+N more" footer that navigates to Activity **unfiltered** (`.activity(.all)`)
+   — `Route.activity` carries only a `RunKindFilter` (all/agents/workflows/
+   autoflows/sessions), never a status preset, so there is no "awaiting" route to
+   send it to instead (verified against `RupuStore/Route.swift` at implementation
+   time; disposition recorded, final-review Task 5). Inline actions: gates get
+   Approve / Reject (the same gate-scoped `PendingActions` machinery as
+   Activity/RunDetail — pending state visible in place, confirm-from-observed-
+   status, never optimistic-remove); failed runs get Open (run detail). Empty
+   state: a single quiet row "nothing needs you" (`ink-mute`) — never an empty
+   card. Critical-finding rows are **Phase 5** (global findings endpoint) — the
+   row model is built to accept a third type then. The queue's fleet-coverage
+   caveat (§3 below) is surfaced in-app as a `.help(...)` tooltip on the "Needs
+   you" header, not as a permanent caption line.
+3. **Instrument strip** — six individually-bordered tiles (web `TileShell`
+   parity — each cell its own `rupuPanel`/`rupuSurface` background + stroke, not
+   one enclosing panel): Awaiting you · Active now · Paused · Failed (range) with
+   inline sparkline · Success rate · Open findings. Values from the merged
+   dashboard summary; null discipline: a poisoned/partial field renders `—`
+   (plus `+` marker when `*_partial`), never a fabricated 0.
 4. **Charts row** — two side-by-side stacked-area charts via SwiftUI Charts
    (first-party, allowed): **Outcomes** over `terminal_buckets`
    (completed/failed/rejected/cancelled, status-tone colors) and **Throughput by
@@ -39,8 +45,14 @@ language: needs-you queue + instrument strip + trend charts + fleet band, backed
    from the web's TriggerChip — three new tokens). No animation (web rule:
    liveness is per-transport, charts don't pretend). Buckets arrive zero-filled
    from the server — no client-side gap fill.
-5. **Cycle summary line** — "N cycles · M clean · K with failures" (mono data,
-   `+` when `cycles_partial`).
+5. **Cycle summary line** — "N cycles · M clean · K with failures" (mono data).
+   `cycles_partial` marks the line two ways at once (controller ruling,
+   final-review Task 6): the clean/with-failures FIGURES themselves each carry
+   `Fmt.partial`'s trailing `+` (total never does — it's always a complete sum,
+   see §2's poisoning rule), AND the line keeps its existing "(partial)" caption
+   + tooltip. Either alone was judged insufficient — the caption names which
+   figures are incomplete, the `+` marks each one at the point a reader's eye
+   actually lands on it.
 6. **Fleet strip** — dim inventory band (repos · providers (+unhealthy loud) ·
    autoflows on/off · workers · claims · issues, `issues_capped` renders `N+`);
    weight only on fault.

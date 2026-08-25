@@ -2,13 +2,64 @@ import RupuAPI
 import RupuDesign
 import SwiftUI
 
+// MARK: - Pure seam (the tested formatting)
+
+/// The three formatted figures `CycleSummaryLine` renders — a plain,
+/// non-View struct so `compute(cycles:partial:)`'s formatting is testable
+/// without `@MainActor` (CI rule: only tests that touch a `View`-type member
+/// need it; same pattern as `InstrumentValues`/`InstrumentStrip`).
+public struct CycleSummaryFigures: Equatable, Sendable {
+    public let total: String
+    public let clean: String
+    public let withFailures: String
+
+    public init(total: String, clean: String, withFailures: String) {
+        self.total = total
+        self.clean = clean
+        self.withFailures = withFailures
+    }
+
+    /// `total` is always a plain `Fmt.count` — it's a complete sum
+    /// regardless of `partial` (see `DashboardStore.merge`'s doc comment).
+    /// `clean`/`withFailures` are each a plain em dash when `nil` (nothing
+    /// reported, nothing to mark as partial), otherwise `Fmt.partial`'s
+    /// trailing `+` when `partial` is set — the final-review (Task 6)
+    /// controller ruling: the null-discipline `+` marker governs the
+    /// figures themselves, alongside (not instead of) the line's existing
+    /// "(partial)" caption + tooltip.
+    public static func compute(cycles: APICycleCounts, partial: Bool) -> CycleSummaryFigures {
+        func figure(_ n: Int?) -> String {
+            guard let n else { return Fmt.count(nil) }
+            return partial ? Fmt.partial(n, isPartial: true) : Fmt.count(n)
+        }
+        return CycleSummaryFigures(
+            total: Fmt.count(cycles.total),
+            clean: figure(cycles.clean),
+            withFailures: figure(cycles.withFailures)
+        )
+    }
+}
+
+// MARK: - View
+
 /// The one line of aggregate cycle numbers beneath the throughput chart
 /// (spec §5.5, ported from the web's `CycleSummaryLine`). Three scalars,
 /// nothing more — the per-cycle detail and per-run drill-in belong to
 /// `/runs`, not the dashboard. `cycles.clean`/`cycles.withFailures` are
-/// `nil` when a reporting host can't supply the breakdown (SSH) — `Fmt.
-/// count` renders that as an em dash, never a fabricated `0`; `partial`
-/// marks the pair as a split over only the hosts that DID report it.
+/// `nil` when a reporting host can't supply the breakdown (SSH) — rendered
+/// as an em dash regardless of `partial` (nothing to mark up on an absent
+/// figure). `cycles.total` is always a complete sum (see `DashboardStore.
+/// merge`'s doc comment — poisoning never touches it) and so never carries
+/// the `+` marker either way.
+///
+/// Final-review fix (Task 6, controller ruling): when `partial` is set, the
+/// clean/with-failures FIGURES themselves carry `Fmt.partial`'s trailing
+/// `+` — the same null-discipline marker every other partial-sum figure in
+/// this screen uses (`InstrumentStrip`'s open-findings tile, `FleetStrip`
+/// below) — in addition to, not instead of, the existing "(partial)"
+/// caption + tooltip. The two together, not either alone: the caption names
+/// *which* figures are incomplete, the `+` marks each one at the point a
+/// reader's eye actually lands on it.
 public struct CycleSummaryLine: View {
     private let cycles: APICycleCounts
     private let partial: Bool
@@ -19,12 +70,13 @@ public struct CycleSummaryLine: View {
     }
 
     public var body: some View {
+        let figures = CycleSummaryFigures.compute(cycles: cycles, partial: partial)
         HStack(spacing: 4) {
-            figure(Fmt.count(cycles.total))
+            figure(figures.total)
             label("cycles ·")
-            figure(Fmt.count(cycles.clean))
+            figure(figures.clean)
             label("clean ·")
-            figure(Fmt.count(cycles.withFailures))
+            figure(figures.withFailures)
             label("with failures")
             if partial {
                 Text("(partial)")

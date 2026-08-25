@@ -174,13 +174,20 @@ public final class DashboardStore {
     /// progressively.
     private var okResponses: [String: APIDashboardResponse] = [:]
 
-    /// Counts down from `hostStates.count` as each seeded host's fetch
-    /// resolves (`.ok`, `.offline`, or `.unavailable` all count) — reaching
-    /// zero with `okResponses` still empty is what triggers `pageError`.
-    /// Never goes negative (`performFetch` clamps at zero) so a stray
-    /// local-only refresh outside the initial cycle (the firehose-coalesced
-    /// path) can't drive it below the floor.
-    private var pendingFetchCount = 0
+    /// Every seeded host id from the current cycle that has not yet resolved
+    /// at least once (`.ok`, `.offline`, or `.unavailable` all count as
+    /// resolved) — emptying it is what triggers `pageError` when
+    /// `okResponses` is still empty. Deliberately a `Set`, not a counter
+    /// (final-review fix, Task 4): `performFetch` is also reachable from
+    /// `refreshLocalOnly()`'s debounced local-only refresh, which runs
+    /// OUTSIDE the cycle this set was sized for. A raw counter decremented
+    /// unconditionally on every `performFetch` call double-counts that extra
+    /// refresh and can under-run the real cycle's total, flashing a false
+    /// "no host reported dashboard data" `pageError` the moment the actual
+    /// cycle's last host resolves. Removing a host id by id is idempotent —
+    /// a stray extra refresh for a host already resolved this cycle is a
+    /// harmless no-op instead of phantom progress.
+    private var pendingHostIDs: Set<String> = []
 
     /// Every in-flight non-local host `Task` from the current cycle, so a
     /// new `refetchAll()` (and `deactivate()`) can cancel them outright
@@ -344,17 +351,16 @@ public final class DashboardStore {
         // inversion that would make "oldest" silently wrong for a fleet
         // mixing precisions. Parse both sides to `Date` and compare those
         // instead.
+        //
+        // Final-review fix (Task 3): this used to be a locally-duplicated
+        // fractional-then-plain `ISO8601DateFormatter` pair — identical,
+        // third-time-duplicated logic to `ActivityRow.parseISO` (`RupuStore/
+        // ActivityRow.swift`) and (until this same fix) `RupuOverview`'s own
+        // `parseBucketTimestamp`. Delegates to the one canonical
+        // implementation instead; `ActivityRow.parseISO` takes `String?`, so
+        // a non-optional `String` argument here promotes implicitly.
         func parseTimestamp(_ s: String) -> Date? {
-            let withFractional = ISO8601DateFormatter()
-            withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = withFractional.date(from: s) { return date }
-            // `.withFractionalSeconds` rejects a fractional-less string
-            // outright rather than tolerating a missing suffix, so a
-            // whole-second timestamp needs the plain formatter as a second
-            // attempt.
-            let plain = ISO8601DateFormatter()
-            plain.formatOptions = [.withInternetDateTime]
-            return plain.date(from: s)
+            ActivityRow.parseISO(s)
         }
 
         // An unparseable candidate is treated as unknown and never WINS the
@@ -527,7 +533,23 @@ public final class DashboardStore {
         let currentGeneration = generation
         cancelHostTasks()
 
-        let hosts = (try? await client.hosts()) ?? []
+        let hosts: [APIHostRow]
+        do {
+            hosts = try await client.hosts()
+        } catch {
+            // Final-review fix (Task 1): a THROWN `GET /api/hosts` call is a
+            // transient failure, not evidence the fleet is empty. The prior
+            // `(try? await client.hosts()) ?? []` idiom conflated the two —
+            // a blip on this 60s reconcile tick reseeded `hostStates` empty,
+            // pruned every `okResponses` entry, nil'd `merged`, and stamped
+            // a lying "no hosts registered" `pageError` (this type keeps
+            // last-known-good on every OTHER failure path; this was the one
+            // exception). Leave every existing slice, `okResponses`, and
+            // `merged` exactly as they were — the cycle simply doesn't
+            // advance this tick. The next reconcile tick (or an explicit
+            // `activate`/`setRange`) retries from scratch.
+            return
+        }
         guard currentGeneration == generation else { return }
 
         let previousStates = Dictionary(uniqueKeysWithValues: hostStates.map { ($0.id, $0.state) })
@@ -542,8 +564,11 @@ public final class DashboardStore {
         okResponses = okResponses.filter { currentIDs.contains($0.key) }
         recomputeMerged()
 
-        pendingFetchCount = hostStates.count
+        pendingHostIDs = currentIDs
 
+        // A genuinely EMPTY `GET /api/hosts` response (200, zero entries) —
+        // as opposed to the thrown case handled above — really does mean
+        // "no hosts registered", so this message stays honest here.
         guard !hostStates.isEmpty else {
             pageError = "no hosts registered"
             return
@@ -565,15 +590,16 @@ public final class DashboardStore {
     /// One host's fetch: resolves to an outcome, applies it (if this cycle
     /// is still current), and — once every seeded host in the cycle has
     /// resolved with zero `"ok"` — sets `pageError`. Shared by the full
-    /// cycle above and `refreshLocalOnly()` below; `pendingFetchCount` is
-    /// clamped at zero so a call from the latter (outside the cycle it was
-    /// sized for) can never drive it negative.
+    /// cycle above and `refreshLocalOnly()` below; `pendingHostIDs.remove`
+    /// is idempotent so a call from the latter (outside the cycle it was
+    /// sized for) can never manufacture phantom progress toward "every host
+    /// resolved" — see that property's doc comment.
     private func performFetch(hostID: String, generation: Int) async {
         let outcome = await fetchOutcome(hostID: hostID)
         guard generation == self.generation else { return }
         apply(outcome, hostID: hostID)
-        pendingFetchCount = max(0, pendingFetchCount - 1)
-        if pendingFetchCount == 0 && okResponses.isEmpty {
+        pendingHostIDs.remove(hostID)
+        if pendingHostIDs.isEmpty && okResponses.isEmpty {
             pageError = "no host reported dashboard data"
         }
     }

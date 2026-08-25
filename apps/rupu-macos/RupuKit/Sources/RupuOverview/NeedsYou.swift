@@ -193,10 +193,17 @@ public struct NeedsYouCard: View {
         }
     }
 
+    /// Final-review fix (Task 2): spec §3's "Needs-you data (disposition)"
+    /// promises this coverage limitation is "stated in-app" — no UI carried
+    /// it until now. A `.help(...)` tooltip rather than always-visible copy:
+    /// the header itself already reads as "the operator's attention queue",
+    /// and a permanent disclaimer line would fight that at a glance for
+    /// something only worth knowing on demand.
     private var header: some View {
         Eyebrow("Needs you")
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .help("Covers runs the fleet-wide list APIs return — the same coverage as Activity — not a server-defined attention set.")
     }
 
     /// Single 36pt row, `.rupuMute` — nothing needs the operator right now.
