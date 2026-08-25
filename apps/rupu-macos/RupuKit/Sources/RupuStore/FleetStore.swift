@@ -34,6 +34,24 @@ import RupuAPI
 /// or the server's 400 for `id == "local"`) fails the key immediately
 /// instead — that failure is known the moment the request returns, no
 /// refetch needed to learn it.
+///
+/// **Generation guard (review fix)**: `reconcile(includeWorkers:)` can run
+/// concurrently more than once — the periodic 60s tick, `removeHost(id:)`'s
+/// own post-success refresh, and a second `activate()` (screen
+/// reappearance) can all be in flight at once, same "more than one cycle
+/// alive at a time" scenario `DashboardStore.refetchAll()`/`performFetch`
+/// already guard against. Without a guard, a STALE cycle's slow `GET
+/// /api/hosts` (this screen's own core scenario: a probe hanging on a
+/// faulted host) can resolve AFTER a newer, faster cycle already applied —
+/// e.g. `removeHost`'s own confirming reconcile — and silently resurrect a
+/// just-removed host with no pending indicator at all, directly
+/// contradicting the "row disappearing IS the confirmation" contract above.
+/// `generation` is bumped once per `reconcile(includeWorkers:)` call
+/// (mirroring `DashboardStore.refetchAll()`'s `generation += 1`); each
+/// fetch's result is applied only if `self.generation` still matches the
+/// generation captured when that fetch started — a stale cycle's result is
+/// silently dropped rather than applied, same drop-not-clobber behavior
+/// `DashboardStore.performFetch` already establishes.
 @MainActor
 @Observable
 public final class FleetStore {
@@ -53,6 +71,12 @@ public final class FleetStore {
     private let postRemoveHost: @Sendable (String) async throws -> Void
 
     private var task: Task<Void, Never>?
+
+    /// Bumped once per `reconcile(includeWorkers:)` call — see the type doc
+    /// comment's "Generation guard" section. Never read/written outside
+    /// `reconcile(includeWorkers:)`/`loadHosts(generation:)`/
+    /// `loadWorkers(generation:)`.
+    private var generation = 0
 
     /// Production entry point — `FleetScreen` calls this.
     public convenience init(client: CPClient, pendingActions: PendingActions) {
@@ -107,31 +131,53 @@ public final class FleetStore {
         }
     }
 
-    /// Fans the two fetches out concurrently — `hosts`/`workers` are
-    /// independent blocks (see the type doc comment), so there is no reason
-    /// for one to wait on the other.
-    private func reconcile() async {
-        async let hostsLoad: Void = loadHosts()
-        async let workersLoad: Void = loadWorkers()
-        _ = await (hostsLoad, workersLoad)
+    /// Bumps `generation` (see the type doc comment's "Generation guard"
+    /// section) and fans the fetch(es) out concurrently — `hosts`/`workers`
+    /// are independent blocks, so there is no reason for one to wait on the
+    /// other when both are requested. `includeWorkers: false` — used by
+    /// `removeHost(id:)`'s post-success refresh (review fix: narrows what
+    /// that call actually needs, shrinking the race surface rather than
+    /// refetching a block a host removal has no bearing on) — fetches only
+    /// `hosts`.
+    private func reconcile(includeWorkers: Bool = true) async {
+        generation += 1
+        let currentGeneration = generation
+        if includeWorkers {
+            async let hostsLoad: Void = loadHosts(generation: currentGeneration)
+            async let workersLoad: Void = loadWorkers(generation: currentGeneration)
+            _ = await (hostsLoad, workersLoad)
+        } else {
+            await loadHosts(generation: currentGeneration)
+        }
     }
 
-    private func loadHosts() async {
+    /// `generation` is the value captured by the `reconcile(includeWorkers:)`
+    /// call that started this fetch — applied only if `self.generation`
+    /// still matches once the fetch resolves; a newer, since-started cycle
+    /// (`self.generation` having moved on) means this result is stale and
+    /// must be dropped, never applied over whatever the newer cycle already
+    /// established. See the type doc comment's "Generation guard" section.
+    private func loadHosts(generation: Int) async {
         do {
             let rows = try await fetchHosts()
+            guard generation == self.generation else { return }
             applyHosts(rows)
         } catch {
             guard !isCancellation(error) else { return }
+            guard generation == self.generation else { return }
             hosts = .failed(String(describing: error))
         }
     }
 
-    private func loadWorkers() async {
+    /// Same generation-guard contract as `loadHosts(generation:)` above.
+    private func loadWorkers(generation: Int) async {
         do {
             let rows = try await fetchWorkers()
+            guard generation == self.generation else { return }
             workers = rows.isEmpty ? .empty : .content(rows)
         } catch {
             guard !isCancellation(error) else { return }
+            guard generation == self.generation else { return }
             workers = .failed(String(describing: error))
         }
     }
@@ -164,21 +210,27 @@ public final class FleetStore {
 
     /// Confirm-first host removal — see the type doc comment's "removeHost"
     /// section for the full contract. `begin()`s the key, fires the
-    /// `DELETE`; on success, triggers one immediate `reconcile()` so the
-    /// confirmation (via `applyHosts(_:)`) lands as soon as realistically
-    /// possible rather than waiting for the next 60s tick — but the key
-    /// stays `.pending` until that reconcile actually stops listing `id`,
-    /// same as every other pending-state mutation in this codebase that
-    /// can't confirm off the write response alone. A `DELETE` failure fails
-    /// the key with the server's message (`mutationErrorMessage`, same
-    /// helper every other mutation in this module uses) and leaves `hosts`
-    /// untouched — nothing was actually removed.
+    /// `DELETE`; on success, triggers one immediate hosts-only reconcile
+    /// (`includeWorkers: false` — a host removal has no bearing on
+    /// `workers`, so refetching it here would just be an unnecessary extra
+    /// request widening the race surface for no reason) so the confirmation
+    /// (via `applyHosts(_:)`) lands as soon as realistically possible rather
+    /// than waiting for the next 60s tick — but the key stays `.pending`
+    /// until that reconcile actually stops listing `id`, same as every
+    /// other pending-state mutation in this codebase that can't confirm off
+    /// the write response alone. This reconcile also bumps `generation`
+    /// (see the type doc comment's "Generation guard" section), so it wins
+    /// against — and correctly invalidates — any older, still-in-flight
+    /// cycle's stale result. A `DELETE` failure fails the key with the
+    /// server's message (`mutationErrorMessage`, same helper every other
+    /// mutation in this module uses) and leaves `hosts` untouched — nothing
+    /// was actually removed.
     public func removeHost(id: String) async {
         let key = ActionKey(id, .remove)
         pendingActions.begin(key)
         do {
             try await postRemoveHost(id)
-            await reconcile()
+            await reconcile(includeWorkers: false)
         } catch {
             pendingActions.fail(key, mutationErrorMessage(error))
         }

@@ -453,6 +453,13 @@ private struct HostCard: View {
 /// One worker row: name + short id, freshness (fresh/stale, derived —
 /// see `workerIsStale(_:)`), active/total run counts, last-run relative
 /// timestamp.
+///
+/// **`row.capabilities` (backends/scmHosts/permissionModes) is deliberately
+/// unrendered** — the brief's column set is name/status/active/total/
+/// last-run only, and there is no sixth column here for it (unlike the
+/// web's `Workers.tsx`, which has room for a dedicated Capabilities column
+/// alongside Kind/Host/Version). Surfacing it is a legitimate follow-up for
+/// a future pass, not an oversight.
 private struct WorkerListRow: View {
     let row: APIWorkerRow
 
