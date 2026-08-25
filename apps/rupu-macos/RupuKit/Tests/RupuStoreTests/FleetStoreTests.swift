@@ -52,6 +52,39 @@ private final class Counter: @unchecked Sendable {
     func increment() -> Int { lock.withLock { v += 1; return v } }
 }
 
+/// De-flakes "wait for an async outcome to settle" assertions — a private
+/// helper per file, this codebase's established convention (see
+/// `ActivityStoreTests.pollUntil`/`RunDetailStoreTests.pollUntil` for the
+/// identical shape). Polls `condition` every `interval` until it's `true`
+/// or `timeout` elapses.
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
+/// `pollUntil` plus a descriptive failure on timeout — same pairing
+/// `ActivityStoreTests.expectEventually` establishes.
+@MainActor
+private func expectEventually(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ description: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: () -> Bool
+) async {
+    let succeeded = await pollUntil(timeout: timeout, interval: interval, condition)
+    #expect(succeeded, "timed out waiting for: \(description)", sourceLocation: sourceLocation)
+}
+
 @MainActor
 private func makeStore(
     fetchHosts: @escaping @Sendable () async throws -> [APIHostRow] = { [hostRow()] },
@@ -276,14 +309,14 @@ private func makeStore(
 
     let key = ActionKey("mini", .remove)
     let task = Task { await store.removeHost(id: "mini") }
-    // Give the mutation a moment to fire `begin()` before we check —
-    // `postRemoveHost` above never completes, so `removeHost` is still
-    // suspended inside it right after `begin()`.
-    try? await Task.sleep(for: .milliseconds(20))
-    guard case .pending = pendingActions.state(key) else {
-        Issue.record("expected .pending, got \(pendingActions.state(key))")
-        task.cancel()
-        return
+    // Polled, not a fixed sleep (this codebase has been bitten by fixed
+    // sleeps before — see 67085ede) — `postRemoveHost` above never
+    // completes, so `removeHost` stays suspended inside it right after
+    // `begin()`, and this only needs to observe that transition happen at
+    // all, not race a guessed duration for it.
+    await expectEventually("removeHost begins the key before the DELETE resolves") {
+        if case .pending = pendingActions.state(key) { return true }
+        return false
     }
     task.cancel()
 }
@@ -351,4 +384,64 @@ private func makeStore(
     await store.activate()
     store.deactivate()
     store.deactivate() // idempotent
+}
+
+// MARK: - Generation guard (review fix): out-of-order reconcile completion
+
+/// The scenario the review flagged: two `reconcile` cycles overlap — an
+/// older, ambient one (standing in for a periodic-tick `GET /api/hosts`
+/// hung "probing a faulted host", the review's own framing) that is slow,
+/// and a newer one (`removeHost`'s own hosts-only confirming reconcile)
+/// that is fast and lands first. Without the generation guard, the STALE
+/// cycle's late arrival would silently resurrect `"mini"` — re-adding it to
+/// `hosts` with no pending indicator at all, directly contradicting the
+/// "row disappearing IS the confirmation" contract. With the guard, the
+/// stale cycle's result is dropped once it finally resolves.
+@MainActor @Test func staleReconcileIsDroppedWhenANewerReconcileAlreadyCompleted() async {
+    let pendingActions = PendingActions()
+    let hostsCallCount = Counter()
+    let store = makeStore(
+        fetchHosts: {
+            switch hostsCallCount.increment() {
+            case 1:
+                // The initial `activate()` load: fast, "mini" present.
+                return [hostRow(id: "local"), hostRow(id: "mini", name: "mini")]
+            case 2:
+                // A second, overlapping full reconcile (stands in for the
+                // periodic tick) — deliberately slow, and must resolve
+                // AFTER call 3 below for this test to actually exercise the
+                // guard. Still reports "mini" present (nothing removed it
+                // as far as this stale cycle knows).
+                try? await Task.sleep(for: .milliseconds(80))
+                return [hostRow(id: "local"), hostRow(id: "mini", name: "mini")]
+            default:
+                // `removeHost`'s own hosts-only confirming reconcile: fast,
+                // "mini" already gone.
+                return [hostRow(id: "local")]
+            }
+        },
+        pendingActions: pendingActions
+    )
+
+    await store.activate() // call 1
+
+    // Fire the slow, overlapping cycle (call 2) and give it a generous
+    // head start to actually begin (bump `generation`, dispatch its fetch)
+    // before the faster `removeHost` cycle below — mirrors
+    // `DashboardStoreTests`' own generation-race test's margin philosophy.
+    let staleReconcile = Task { await store.activate() }
+    try? await Task.sleep(for: .milliseconds(10))
+
+    // The faster, newer cycle (call 3) — confirms the removal.
+    await store.removeHost(id: "mini")
+
+    let key = ActionKey("mini", .remove)
+    #expect(pendingActions.state(key) == .confirmed)
+    #expect(store.hosts.value?.map(\.id) == ["local"])
+
+    // Let the stale call 2 actually resolve (`.value` awaits it past its
+    // 80ms artificial delay) and confirm it never resurrected "mini".
+    _ = await staleReconcile.value
+    #expect(store.hosts.value?.map(\.id) == ["local"], "the stale generation's result must never be applied")
+    #expect(pendingActions.state(key) == .confirmed, "the stale cycle must not disturb the already-confirmed key either")
 }
