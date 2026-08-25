@@ -49,6 +49,15 @@ public struct RunDetailScreen: View {
 
     @State private var store: RunDetailStore?
     @State private var storeRunID: String?
+    /// Phase 6B, Task 5: the transcript tab's source/AST preview cache —
+    /// rebuilt in lockstep with `store` (same `storeRunID`/`storeClientID`
+    /// condition in `activate()`) so it always holds a fresh `CPClient` and
+    /// starts empty for the run it's targeting. `SourcePreviewStore` itself
+    /// also supports being reconfigured in place via `setRun(runID:host:)`
+    /// (see that type's doc comment) for a longer-lived owner; this screen
+    /// just doesn't need that — a fresh instance already gives the same
+    /// "empty cache for this run" guarantee with less state to track.
+    @State private var sourcePreviewStore: SourcePreviewStore?
 
     /// Tracked alongside `storeRunID` so `activate()` rebuilds on a backend
     /// client swap (embedded/remote switch, reconnect, restart) too, not
@@ -101,6 +110,7 @@ public struct RunDetailScreen: View {
             store?.deactivate()
             let newStore = RunDetailStore(runID: runID, host: host, client: client, backend: backend)
             store = newStore
+            sourcePreviewStore = SourcePreviewStore(runID: runID, host: host, client: client)
             storeRunID = runID
             storeClientID = clientID
         }
@@ -118,7 +128,7 @@ public struct RunDetailScreen: View {
             }
             stepGraphSection(store: store)
                 .frame(height: 140)
-            RunDetailTabPanel(store: store, tab: $selectedTab)
+            RunDetailTabPanel(store: store, tab: $selectedTab, sourcePreviewStore: sourcePreviewStore)
         }
         .padding(16)
     }

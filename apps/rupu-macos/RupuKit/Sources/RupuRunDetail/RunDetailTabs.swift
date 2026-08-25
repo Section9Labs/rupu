@@ -27,6 +27,10 @@ public enum RunDetailTab: String, CaseIterable, Sendable {
 struct RunDetailTabPanel: View {
     let store: RunDetailStore
     @Binding var tab: RunDetailTab
+    /// Phase 6B, Task 5: forwarded to `TranscriptTabContent` alone (every
+    /// other tab ignores it) — see `TranscriptFeed`'s own doc comment for
+    /// why this is the one screen that wires a `SourcePreviewStore` in.
+    let sourcePreviewStore: SourcePreviewStore?
 
     var body: some View {
         GeometryReader { geo in
@@ -50,7 +54,7 @@ struct RunDetailTabPanel: View {
     private var content: some View {
         switch tab {
         case .transcript:
-            TranscriptTabContent(store: store)
+            TranscriptTabContent(store: store, sourcePreviewStore: sourcePreviewStore)
         case .events:
             EventsTabContent(store: store)
         case .findings:
@@ -119,11 +123,12 @@ struct RunDetailTabBar: View {
 /// `RunDetailScreen` rendered above the old transcript column.
 struct TranscriptTabContent: View {
     let store: RunDetailStore
+    let sourcePreviewStore: SourcePreviewStore?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             liveIndicator
-            TranscriptFeed(events: store.transcript)
+            TranscriptFeed(events: store.transcript, sourcePreviewStore: sourcePreviewStore)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(12)
