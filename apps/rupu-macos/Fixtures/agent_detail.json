@@ -1,0 +1,31 @@
+{
+  "name": "code-reviewer",
+  "slug": "code-reviewer",
+  "description": "Reviews code for correctness and style",
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "effort": "Medium",
+  "max_tokens": 8192,
+  "permission_mode": "ask",
+  "tools": [
+    "Read",
+    "Grep",
+    "Edit"
+  ],
+  "scope": "global",
+  "scope_kind": "global",
+  "scope_id": null,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cached_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": null,
+    "priced": false,
+    "runs": 0
+  },
+  "run_count": 0,
+  "last_run": null,
+  "system_prompt": "You are a meticulous code reviewer. Review the diff for correctness, security, and style issues before approving.\n",
+  "raw": "---\nname: code-reviewer\ndescription: Reviews code for correctness and style\nprovider: anthropic\nmodel: claude-sonnet-4-6\neffort: medium\nmaxTokens: 8192\ntools: [Read, Grep, Edit]\npermissionMode: ask\n---\nYou are a meticulous code reviewer. Review the diff for correctness, security, and style issues before approving.\n"
+}
