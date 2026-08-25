@@ -238,6 +238,20 @@ sudo dnf install --enablerepo=rupu-beta rupu
 sudo dnf upgrade --enablerepo=rupu-beta rupu
 ```
 
+**macOS app (rupu.app):**
+
+Download `rupu-app-darwin-arm64.dmg` (or the `.zip`) from the
+[Releases](https://github.com/Section9Labs/rupu/releases) page, open the DMG, and drag
+`rupu.app` to `/Applications`. Both the DMG and the app inside it are signed, notarized,
+and stapled, so Gatekeeper opens it cleanly — no "unidentified developer" workaround
+needed.
+
+`rupu.app` is a thin native client for `rupu cp serve`; it needs a `rupu` binary
+**version 0.74.0 or newer** on your `$PATH` (install it via any of the methods above
+first). On launch it probes for an already-running control plane on port 7420 and
+attaches to it, or spawns `rupu cp serve` itself if none answers. Both the discovered
+`rupu` binary and the port are overridable in the app's Settings.
+
 ---
 
 ## Quick start
