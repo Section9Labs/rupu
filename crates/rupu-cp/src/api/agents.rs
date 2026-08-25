@@ -818,9 +818,13 @@ async fn run_agent_with(
 /// definition purely as a SIDE EFFECT of the spawned subprocess's cwd (see
 /// `cp_agent_launcher::SubprocessAgentLauncher::launch`, which just does
 /// `cmd.current_dir(working_dir)` and lets `rupu run <agent>` discover
-/// `.rupu/agents/<name>.md` by walking up from there) — completely
-/// independent of whatever scope a picker resolved when it showed the
-/// operator this row.
+/// `.rupu/agents/<name>.md` by walking up from there, via
+/// `paths::project_root_for` in `rupu-cli`) — completely independent of
+/// whatever scope a picker resolved when it showed the operator this row.
+///
+/// LOCAL-ONLY (ruled): only called from each handler's local branch. A
+/// remote-targeted launch (`host != "local"`) skips this entirely — see
+/// `run_agent`/`start_session`'s doc comments.
 ///
 /// - Both fields absent → `Ok(None)`: no behavior change whatsoever. This is
 ///   the back-compat contract every existing caller relies on.
@@ -834,18 +838,32 @@ async fn run_agent_with(
 ///   `.rupu/agents` subdirectory two segments down), but its grandparent —
 ///   the directory `rupu run`/`rupu session` walks UP FROM to (re)discover
 ///   `.rupu/agents/<name>.md`. The caller applies this as the launch
-///   `working_dir` ONLY when the request body didn't already supply one, so
-///   the spawned subprocess's cwd reproduces exactly the resolution this
-///   function (and the picker that sent `scope_kind`/`scope_id`) just
-///   computed — closing the "the definition the picker showed is the
-///   definition that runs" invariant for the project-scoped case.
-/// - A resolved `Global` match returns `Ok(None)`: there's no project path to
-///   hand back, and unlike `Project` there's no cwd trick available to force
-///   a GLOBAL resolution over a same-named project that would otherwise
-///   shadow it — `scope_kind=global` therefore still validates the row
-///   exists globally (so a stale/bad selector 404s), but callers combining
-///   it with an explicit `working_dir` that resolves inside a colliding
-///   project are responsible for not doing that.
+///   `working_dir` (the caller enforces it never coexists with a
+///   body-supplied `working_dir` — see the mutual-exclusion 400 in
+///   `run_agent`/`start_session`), so the spawned subprocess's cwd
+///   reproduces exactly the resolution this function (and the picker that
+///   sent `scope_kind`/`scope_id`) just computed — closing the "the
+///   definition the picker showed is the definition that runs" invariant
+///   for the project-scoped case.
+/// - A resolved `Global` match applies the SAME trick one level higher:
+///   [`resolve_agent_scoped_explicit`]'s `dir` for `Global` is
+///   `<global_dir>/agents`, so `dir.parent()` is `AppState::global_dir`
+///   itself (`rupu-cli::paths::global_dir()`'s result — `~/.rupu` by
+///   default, or `$RUPU_HOME` verbatim when set) and `dir.parent().parent()`
+///   is ITS parent. `project_root_for` discovers a project by walking UP
+///   from cwd looking for the FIRST directory literally named `.rupu`; when
+///   `global_dir` IS named `.rupu` (true by default, and true for any
+///   `$RUPU_HOME` an operator happens to point at a directory named
+///   `.rupu`), pointing cwd at `global_dir`'s PARENT makes that walk's very
+///   FIRST check succeed against the GLOBAL dir itself — before it can ever
+///   reach a real project's `.rupu` further up the tree — forcing global
+///   resolution exactly the way the `Project` arm forces project resolution
+///   one level down. When `global_dir` is NOT named `.rupu` (a `$RUPU_HOME`
+///   override pointed at some other directory name), this trick cannot pin
+///   global resolution — loud beats wrong, so this returns a 400 explaining
+///   that global-scope pinning isn't available under that `$RUPU_HOME`
+///   rather than silently proceeding without an override (which could still
+///   let a colliding project shadow it).
 fn resolve_launch_scope(
     s: &AppState,
     name: &str,
@@ -864,16 +882,43 @@ fn resolve_launch_scope(
         resolve_agent_scoped_explicit(s, name, kind, scope_id).ok_or_else(|| {
             ApiError::not_found(format!("agent {name} not found in the requested scope"))
         })?;
-    Ok(match resolved_kind {
-        // dir == <workspace root>/.rupu/agents; strip both segments.
-        ScopeKind::Project => dir.parent().and_then(|p| p.parent()).map(PathBuf::from),
-        ScopeKind::Global => None,
-    })
+    match resolved_kind {
+        // dir == <workspace root>/.rupu/agents; strip both segments to reach
+        // the workspace root the picker's Project row targets.
+        ScopeKind::Project => Ok(dir.parent().and_then(|p| p.parent()).map(PathBuf::from)),
+        // dir == <global_dir>/agents; dir.parent() == global_dir itself.
+        ScopeKind::Global => {
+            let global_dir = dir
+                .parent()
+                .ok_or_else(|| ApiError::internal("resolved global agents dir has no parent"))?;
+            if global_dir.file_name() != Some(std::ffi::OsStr::new(".rupu")) {
+                return Err(ApiError::bad_request(
+                    "global-scope launch pinning isn't available: RUPU_HOME is set to a \
+                     directory not named \".rupu\", so the cwd-based trick that forces \
+                     global-only resolution can't be applied here",
+                ));
+            }
+            let global_parent = global_dir
+                .parent()
+                .ok_or_else(|| ApiError::internal("global dir has no parent"))?;
+            Ok(Some(global_parent.to_path_buf()))
+        }
+    }
 }
 
 /// Start a fresh run of agent `:name` via the configured [`AgentLauncher`]
 /// (local) or by proxying to a remote host. Returns the new run id plus the
 /// owning `host_id`. 501 when no launcher is installed and the target is local.
+///
+/// Scope (`scope_kind`/`scope_id`) is a LOCAL-ONLY affordance (ruled): a
+/// remote-targeted launch (`host` set to a non-`"local"` id) skips scope
+/// validation and the working_dir override ENTIRELY and behaves exactly as
+/// it did before this field pair existed — [`resolve_launch_scope`] only
+/// ever inspects THIS process's own local workspace registry/filesystem, so
+/// running it against a remote-targeted request could 404 a perfectly good
+/// remote launch whose project simply isn't registered locally. Remote scope
+/// semantics (validating/resolving against the REMOTE host's own registry)
+/// are future host-connector work, not implemented here.
 ///
 /// [`AgentLauncher`]: crate::agent_launcher::AgentLauncher
 async fn run_agent(
@@ -882,16 +927,12 @@ async fn run_agent(
     body: Option<Json<AgentRunBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let mut b = body.map(|b| b.0).unwrap_or_default();
-    // Scope resolution/validation always runs (so a bad selector 404s/400s
-    // regardless of destination host); the resulting working_dir OVERRIDE is
-    // applied only on the local branch below — see [`resolve_launch_scope`]'s
-    // doc comment on why the project-root cwd trick is local-only (mirroring
-    // `resolve_agent_scoped`'s own "host-unaware" contract).
-    let scope_working_dir =
-        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
     let host = b.host.as_deref().unwrap_or("local").to_string();
 
     if host != "local" {
+        // Remote: scope fields, if present, are silently ignored — see this
+        // function's doc comment. The request proceeds exactly as it would
+        // with no scope fields at all.
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
             agent: name.clone(),
@@ -910,9 +951,24 @@ async fn run_agent(
         ));
     }
 
-    // Local path: unchanged (including the 501 when no launcher is installed)
-    // except for the scope-driven working_dir override computed above, which
-    // only ever fills in a working_dir the body left unset.
+    // Local path from here. `scope_kind` and a body-supplied `working_dir`
+    // are mutually exclusive: accepting both would create a silent
+    // precedence question (which one actually wins?) — the scope selector,
+    // when present, IS what determines the working directory, so reject
+    // rather than guess. No existing caller sends both (every prior test
+    // sends one or the other), so this is safe.
+    if b.scope_kind.is_some() && b.working_dir.is_some() {
+        return Err(ApiError::bad_request(
+            "scope_kind and working_dir are mutually exclusive — the scope selector determines the working directory",
+        ));
+    }
+    let scope_working_dir =
+        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
+    // Unchanged local behavior (including the 501 when no launcher is
+    // installed) except for the scope-driven working_dir override computed
+    // above, which only ever fills in a working_dir the body left unset —
+    // guaranteed `None` here whenever `scope_kind` was `Some` by the
+    // mutual-exclusion check just above.
     if b.working_dir.is_none() {
         b.working_dir = scope_working_dir.map(|p| p.display().to_string());
     }
@@ -974,6 +1030,9 @@ async fn start_session_with(
 /// (local) or by proxying to a remote host. Returns the new session id plus the
 /// owning `host_id`. 501 when no starter is installed and the target is local.
 ///
+/// Scope is LOCAL-ONLY — see `run_agent`'s identical doc comment. A
+/// remote-targeted session start skips scope validation/override entirely.
+///
 /// [`SessionStarter`]: crate::session_starter::SessionStarter
 async fn start_session(
     State(s): State<AppState>,
@@ -981,13 +1040,11 @@ async fn start_session(
     body: Option<Json<SessionStartBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let mut b = body.map(|b| b.0).unwrap_or_default();
-    // See `run_agent`'s identical comment: validation always runs, the
-    // working_dir override only applies on the local branch below.
-    let scope_working_dir =
-        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
     let host = b.host.as_deref().unwrap_or("local").to_string();
 
     if host != "local" {
+        // Remote: scope fields, if present, are silently ignored — see
+        // `run_agent`'s doc comment.
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = SessionStartRequest {
             agent: name.clone(),
@@ -1006,8 +1063,18 @@ async fn start_session(
         ));
     }
 
-    // Local path: unchanged (including the 501 when no starter is installed)
-    // except for the scope-driven working_dir override computed above.
+    // Local path from here. See `run_agent`'s identical comment: `scope_kind`
+    // and a body-supplied `working_dir` are mutually exclusive.
+    if b.scope_kind.is_some() && b.working_dir.is_some() {
+        return Err(ApiError::bad_request(
+            "scope_kind and working_dir are mutually exclusive — the scope selector determines the working directory",
+        ));
+    }
+    let scope_working_dir =
+        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
+    // Unchanged local behavior (including the 501 when no starter is
+    // installed) except for the scope-driven working_dir override computed
+    // above.
     if b.working_dir.is_none() {
         b.working_dir = scope_working_dir.map(|p| p.display().to_string());
     }
@@ -1224,10 +1291,12 @@ mod tests {
         );
     }
 
-    /// A body-supplied `working_dir` always wins over the scope-derived one
-    /// — the override only ever fills in a field the caller left unset.
+    /// `scope_kind` and a body-supplied `working_dir` are mutually
+    /// exclusive: accepting both would create a silent precedence question
+    /// (which one actually wins?), so the handler rejects rather than
+    /// guesses. Nothing launches.
     #[tokio::test]
-    async fn run_agent_scope_resolved_does_not_override_explicit_working_dir() {
+    async fn run_agent_scope_kind_with_explicit_working_dir_is_bad_request() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mock = Arc::new(MockAgent {
             last: Mutex::new(None),
@@ -1249,12 +1318,147 @@ mod tests {
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
         };
+        let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
+            .await
+            .expect_err("scope_kind + working_dir together must 400");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            mock.last.lock().unwrap().is_none(),
+            "must not launch when scope_kind and working_dir conflict"
+        );
+    }
+
+    /// A REMOTE-targeted launch ignores scope fields entirely — scope is a
+    /// LOCAL-ONLY affordance (ruled). A project unknown to THIS process's
+    /// local workspace registry must not 404 a remote launch; the request
+    /// proxies through exactly as it would with no scope fields at all.
+    #[tokio::test]
+    async fn run_agent_remote_host_ignores_scope_fields_and_proxies_unmodified() {
+        let remote = httpmock::MockServer::start_async().await;
+        let m = remote.mock(|when, then| {
+            when.method("POST").path("/api/agents/triage/run");
+            then.status(200)
+                .json_body(serde_json::json!({ "run_id": "remote_1", "host_id": "local" }));
+        });
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let host = s
+            .hosts
+            .add_host("test-remote", &remote.base_url(), None)
+            .expect("add_host should succeed");
+
+        // No local workspace named "ws_unknown_locally" is registered at
+        // all — a local scope resolution would 404. The remote path must
+        // never even attempt it.
+        let body = AgentRunBody {
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: Some(host.id.clone()),
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_unknown_locally".into()),
+        };
+        let resp = run_agent(State(s), Path("triage".into()), Some(Json(body)))
+            .await
+            .expect("remote launch must succeed exactly like a scope-less remote launch");
+        assert_eq!(resp.0["run_id"], "remote_1");
+        assert_eq!(resp.0["host_id"], host.id);
+        m.assert();
+    }
+
+    /// The default global dir (named `.rupu`) can be pinned exactly like a
+    /// project: `scope_kind: global` launches the GLOBAL definition even
+    /// when the spawned subprocess's cwd (absent an override) would
+    /// otherwise sit inside a SHADOWING project of the same name — proven
+    /// by asserting the launcher receives `global_dir`'s PARENT as
+    /// `working_dir` (the cwd `project_root_for` would resolve to the
+    /// global dir itself from, per `resolve_launch_scope`'s doc comment).
+    #[tokio::test]
+    async fn run_agent_scope_kind_global_resolves_global_definition_over_project_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // global_dir MUST be literally named `.rupu` for the cwd trick to
+        // apply — test_state's tmp.path() is an arbitrary tempdir name, so
+        // build AppState directly on a `.rupu`-named child instead.
+        let global_dir = tmp.path().join(".rupu");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let s = AppState::new(global_dir.clone(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(global_dir.clone())
+            .with_agent_launcher(Some(mock.clone()));
+
+        std::fs::create_dir_all(agents_dir(&s)).unwrap();
+        std::fs::write(agents_dir(&s).join("triage.md"), VALID_TRIAGE_MD).unwrap();
+
+        // A same-named PROJECT definition exists too — the exact collision
+        // a naive cwd-only resolution could shadow the global one with.
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("triage.md"), VALID_TRIAGE_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let body = AgentRunBody {
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: Some("global".into()),
+            scope_id: None,
+        };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
-            .expect("resolvable scope with an explicit working_dir should still launch");
+            .expect("global-scoped launch should resolve");
 
-        let got = mock.last.lock().unwrap().clone().unwrap();
-        assert_eq!(got.working_dir.as_deref(), Some("/explicit/caller/dir"));
+        let got = mock.last.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            got.working_dir.as_deref(),
+            Some(global_dir.parent().unwrap().display().to_string().as_str()),
+            "working_dir must be global_dir's PARENT, not global_dir itself"
+        );
+    }
+
+    /// `scope_kind: global` under a `$RUPU_HOME`-style global dir NOT named
+    /// `.rupu` can't be pinned by the cwd trick — loud beats wrong: 400,
+    /// never a silent no-op that could still let a colliding project shadow
+    /// the intended global definition.
+    #[tokio::test]
+    async fn run_agent_scope_kind_global_under_non_dot_rupu_home_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // global_dir named "custom-home", not ".rupu".
+        let global_dir = tmp.path().join("custom-home");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let s = AppState::new(global_dir.clone(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(global_dir.clone())
+            .with_agent_launcher(Some(mock.clone()));
+
+        std::fs::create_dir_all(agents_dir(&s)).unwrap();
+        std::fs::write(agents_dir(&s).join("triage.md"), VALID_TRIAGE_MD).unwrap();
+
+        let body = AgentRunBody {
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: Some("global".into()),
+            scope_id: None,
+        };
+        let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
+            .await
+            .expect_err("global pinning under a non-\".rupu\" RUPU_HOME must 400");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            mock.last.lock().unwrap().is_none(),
+            "must not launch when global-scope pinning isn't available"
+        );
     }
 
     /// An unrecognized `scope_kind` string is a 400 the handler controls
@@ -1351,6 +1555,115 @@ mod tests {
             got.working_dir.as_deref(),
             Some(proj.path().display().to_string().as_str())
         );
+    }
+
+    /// `scope_kind: global` resolves the global definition for
+    /// `start_session` too — same mechanism as `run_agent`'s identical test.
+    #[tokio::test]
+    async fn start_session_scope_kind_global_resolves_global_definition_over_project_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global_dir = tmp.path().join(".rupu");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let mock = Arc::new(MockStarter {
+            last: Mutex::new(None),
+        });
+        let s = AppState::new(global_dir.clone(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(global_dir.clone())
+            .with_session_starter(Some(mock.clone()));
+
+        std::fs::create_dir_all(agents_dir(&s)).unwrap();
+        std::fs::write(agents_dir(&s).join("triage.md"), VALID_TRIAGE_MD).unwrap();
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("triage.md"), VALID_TRIAGE_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let body = SessionStartBody {
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: None,
+            scope_kind: Some("global".into()),
+            scope_id: None,
+        };
+        let _ = start_session(State(s), Path("triage".into()), Some(Json(body)))
+            .await
+            .expect("global-scoped session start should resolve");
+
+        let got = mock.last.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            got.working_dir.as_deref(),
+            Some(global_dir.parent().unwrap().display().to_string().as_str())
+        );
+    }
+
+    /// `scope_kind` + a body-supplied `working_dir` is a 400 for
+    /// `start_session` too.
+    #[tokio::test]
+    async fn start_session_scope_kind_with_explicit_working_dir_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockStarter {
+            last: Mutex::new(None),
+        });
+        let s = test_state(&tmp).with_session_starter(Some(mock.clone()));
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("triage.md"), VALID_TRIAGE_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let body = SessionStartBody {
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: Some("/explicit/caller/dir".into()),
+            host: None,
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_a".into()),
+        };
+        let err = start_session(State(s), Path("triage".into()), Some(Json(body)))
+            .await
+            .expect_err("scope_kind + working_dir together must 400");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(mock.last.lock().unwrap().is_none());
+    }
+
+    /// A remote-targeted session start ignores scope fields entirely.
+    #[tokio::test]
+    async fn start_session_remote_host_ignores_scope_fields_and_proxies_unmodified() {
+        let remote = httpmock::MockServer::start_async().await;
+        let m = remote.mock(|when, then| {
+            when.method("POST").path("/api/agents/triage/session");
+            then.status(200)
+                .json_body(serde_json::json!({ "session_id": "remote_ses_1", "host_id": "local" }));
+        });
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let host = s
+            .hosts
+            .add_host("test-remote", &remote.base_url(), None)
+            .expect("add_host should succeed");
+
+        let body = SessionStartBody {
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            host: Some(host.id.clone()),
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_unknown_locally".into()),
+        };
+        let resp = start_session(State(s), Path("triage".into()), Some(Json(body)))
+            .await
+            .expect("remote session start must succeed exactly like a scope-less remote request");
+        assert_eq!(resp.0["session_id"], "remote_ses_1");
+        assert_eq!(resp.0["host_id"], host.id);
+        m.assert();
     }
 
     #[test]
