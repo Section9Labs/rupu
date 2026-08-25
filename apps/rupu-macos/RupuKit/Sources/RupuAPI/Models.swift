@@ -44,6 +44,16 @@ public struct CPEventRow: Decodable, Equatable, Sendable {
         case pos
     }
 
+    /// Programmatic construction — the type only had a `Decodable` init
+    /// before Phase 6B Task 6's `RupuSituation` port needed to build
+    /// `CPEventRow` values directly in tests (`deriveActivity`'s ported
+    /// `roster.test.ts` table). Never used by the decode path itself.
+    public init(event: CPEvent, ts: Int64, pos: Int) {
+        self.event = event
+        self.ts = ts
+        self.pos = pos
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.ts = try container.decode(Int64.self, forKey: .ts)
@@ -120,10 +130,10 @@ public struct APIHostRow: Decodable, Equatable, Sendable {
 
 /// One row from `GET /api/projects` (`ProjectRow` on the Rust side).
 /// `ws_id`/`name`/`run_count`/`last_run_at`/`usage`/`path`/`repo_home_url`/
-/// `created_at` are decoded — `repo_remote`/`branch`/`last_active` stay
-/// ignored (`Decodable`'s default behavior already skips unknown keys) since
-/// no consumer needs them yet. `usage` was added for Phase 5A's Projects list
-/// screen (`RupuProjects`), whose sortable "Spend" column needs `usage.
+/// `created_at` are decoded — `repo_remote` stays ignored (`Decodable`'s
+/// default behavior already skips unknown keys) since no consumer needs it
+/// yet. `usage` was added for Phase 5A's Projects list screen
+/// (`RupuProjects`), whose sortable "Spend" column needs `usage.
 /// cost_usd` — `ProjectRow` on the wire always carries it (non-optional
 /// `UsageSummary`, see `crates/rupu-cp/src/api/projects.rs`), so this is a
 /// required field, not optional. `path`/`repoHomeURL`/`createdAt` (final-
@@ -133,6 +143,15 @@ public struct APIHostRow: Decodable, Equatable, Sendable {
 /// (`path`/`created_at` are always present): decoding them as optionals here
 /// costs nothing and keeps this row tolerant of a future server omission
 /// rather than failing the whole decode.
+///
+/// `branch`/`lastActive` (Phase 6B, Task 6 — `RupuSituation`'s roster port)
+/// were added because `crates/rupu-cp/web/src/lib/situationRoom/roster.ts`'s
+/// `buildRoster` reads `p.branch` (roster card subtitle) and `p.last_active`
+/// (idle-project recency fallback when no run touched it) straight off
+/// `ProjectRow` — both keys are already on the wire (confirmed in the
+/// `projects.json` macOS fixture) and were simply never decoded before this
+/// task needed them. Both optional, matching `ProjectRow.branch`/
+/// `.last_active`'s own `Option<String>` on the Rust side.
 public struct APIProjectRow: Decodable, Equatable, Sendable {
     public let wsID: String
     public let name: String
@@ -142,10 +161,13 @@ public struct APIProjectRow: Decodable, Equatable, Sendable {
     public let path: String?
     public let repoHomeURL: String?
     public let createdAt: String?
+    public let branch: String?
+    public let lastActive: String?
 
     public init(
         wsID: String, name: String, runCount: Int?, lastRunAt: String?, usage: APIUsageSummary,
-        path: String? = nil, repoHomeURL: String? = nil, createdAt: String? = nil
+        path: String? = nil, repoHomeURL: String? = nil, createdAt: String? = nil,
+        branch: String? = nil, lastActive: String? = nil
     ) {
         self.wsID = wsID
         self.name = name
@@ -155,6 +177,8 @@ public struct APIProjectRow: Decodable, Equatable, Sendable {
         self.path = path
         self.repoHomeURL = repoHomeURL
         self.createdAt = createdAt
+        self.branch = branch
+        self.lastActive = lastActive
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -166,6 +190,8 @@ public struct APIProjectRow: Decodable, Equatable, Sendable {
         case path
         case repoHomeURL = "repo_home_url"
         case createdAt = "created_at"
+        case branch
+        case lastActive = "last_active"
     }
 }
 

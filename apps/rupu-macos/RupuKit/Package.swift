@@ -10,6 +10,7 @@ let package = Package(
             targets: [
                 "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
                 "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsageKit", "RupuUsage", "RupuShell", "RupuMenuBar",
+                "RupuSituation",
             ]
         )
     ],
@@ -30,6 +31,14 @@ let package = Package(
         // `UsageAggregation.swift`'s file-header doc comment for the full
         // rationale.
         .target(name: "RupuUsageKit", dependencies: ["RupuAPI"]),
+        // Phase 6B, Task 6: Situation Room's pure derivations (line-by-line
+        // Swift port of `crates/rupu-cp/web/src/lib/situationRoom/{cards,
+        // roster}.ts`) — a pure aggregation module in the same spirit as
+        // `RupuUsageKit` above: depends only on `RupuAPI` (`CPEvent`,
+        // `CPEventRow`, `APIFinding`, `APIProjectRow`) + `RupuDesign`
+        // (`Severity`), never on `RupuStore`, so `RupuStore` (Task 7's
+        // Situation Room store) can depend on this without a cycle.
+        .target(name: "RupuSituation", dependencies: ["RupuAPI", "RupuDesign"]),
         .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign", "RupuUsageKit"]),
         .target(name: "RupuActivity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(name: "RupuRunDetail", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
@@ -67,6 +76,7 @@ let package = Package(
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
         .testTarget(name: "RupuUsageKitTests", dependencies: ["RupuUsageKit", "RupuAPI"]),
+        .testTarget(name: "RupuSituationTests", dependencies: ["RupuSituation", "RupuAPI", "RupuDesign"]),
         .testTarget(name: "RupuStoreTests", dependencies: ["RupuStore", "RupuBackend", "RupuAPI", "RupuDesign", "RupuUsageKit"]),
         .testTarget(
             name: "RupuUsageTests",

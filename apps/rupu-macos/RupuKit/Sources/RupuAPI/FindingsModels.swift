@@ -12,7 +12,7 @@ public struct APIFindings: Decodable, Sendable {
 }
 
 /// Severity-bucketed counts alongside `findings.summary`.
-public struct APIFindingsSummary: Decodable, Sendable {
+public struct APIFindingsSummary: Decodable, Equatable, Sendable {
     public let total: Int
     public let critical: Int
     public let high: Int
@@ -76,6 +76,16 @@ public struct APIFinding: Decodable, Sendable {
     public let workflowName: String?
     public let permalink: String?
     public let rationale: String
+    /// Evidence's real code excerpt (`evidence.code_excerpt`), when the
+    /// finding carries one — added for Phase 6B Task 6's `RupuSituation`
+    /// port of `crates/rupu-cp/web/src/lib/situationRoom/cards.ts`'s
+    /// `cardFromFinding`, which surfaces this verbatim as `StreamCard.code`
+    /// (never fabricated). The wire key was already present (confirmed in
+    /// the `findings_global.json` macOS fixture's `evidence.code_excerpt`)
+    /// but never decoded before this task needed it — `FindingEvidence.
+    /// code_excerpt` is `Option<String>` on the Rust side, so this decodes
+    /// optionally too.
+    public let codeExcerpt: String?
     public let declaredBy: APICoverageAttribution
     public let declaredAt: String
 
@@ -92,6 +102,7 @@ public struct APIFinding: Decodable, Sendable {
         workflowName: String?,
         permalink: String?,
         rationale: String,
+        codeExcerpt: String? = nil,
         declaredBy: APICoverageAttribution = APICoverageAttribution(runID: "", model: "", surface: ""),
         declaredAt: String
     ) {
@@ -107,6 +118,7 @@ public struct APIFinding: Decodable, Sendable {
         self.workflowName = workflowName
         self.permalink = permalink
         self.rationale = rationale
+        self.codeExcerpt = codeExcerpt
         self.declaredBy = declaredBy
         self.declaredAt = declaredAt
     }
@@ -130,6 +142,7 @@ public struct APIFinding: Decodable, Sendable {
 
     private enum EvidenceKeys: String, CodingKey {
         case rationale
+        case codeExcerpt = "code_excerpt"
     }
 
     public init(from decoder: Decoder) throws {
@@ -150,6 +163,7 @@ public struct APIFinding: Decodable, Sendable {
 
         let evidence = try container.nestedContainer(keyedBy: EvidenceKeys.self, forKey: .evidence)
         rationale = try evidence.decode(String.self, forKey: .rationale)
+        codeExcerpt = try evidence.decodeIfPresent(String.self, forKey: .codeExcerpt)
     }
 }
 
