@@ -63,6 +63,7 @@ struct ShellToolbar: CustomizableToolbarContent {
     let palette: PaletteStore?
     @AppStorage(OverviewWidgets.storageKey) private var overviewWidgetsData: Data = Data()
     @State private var projects: [APIProjectRow] = []
+    @State private var showOrderEditor = false
 
     var body: some CustomizableToolbarContent {
         ToolbarItem(id: "scope", placement: .navigation) {
@@ -108,13 +109,14 @@ struct ShellToolbar: CustomizableToolbarContent {
         .help("Time range for lists and charts")
     }
 
-    /// Overview Customize menu (Task 6): five checkmark toggles over
-    /// `OverviewWidgets`' visibility fields — `.disabled` off-Overview via
-    /// a real route-case check (not a string compare against
-    /// `screenTitle`, which is just display text and could coincidentally
-    /// collide with another screen's title). `Toggle` inside a `Menu`
-    /// renders as a checkmark item on macOS, same chrome as any system
-    /// menu's option toggles.
+    /// Overview Customize menu (Task 6, plus reorder added by the redesign
+    /// pass's Task 3): five checkmark toggles over `OverviewWidgets`'
+    /// visibility fields, a divider, then "Reorder…" — `.disabled`
+    /// off-Overview via a real route-case check (not a string compare
+    /// against `screenTitle`, which is just display text and could
+    /// coincidentally collide with another screen's title). `Toggle` inside
+    /// a `Menu` renders as a checkmark item on macOS, same chrome as any
+    /// system menu's option toggles.
     ///
     /// Reads/writes `overviewWidgetsData` directly (this view's own
     /// `@AppStorage(OverviewWidgets.storageKey)` declaration) — the same
@@ -130,10 +132,19 @@ struct ShellToolbar: CustomizableToolbarContent {
             Toggle("Charts", isOn: overviewWidgetToggle(\.charts))
             Toggle("Cycle summary", isOn: overviewWidgetToggle(\.cycles))
             Toggle("Fleet strip", isOn: overviewWidgetToggle(\.fleet))
+            Divider()
+            Button("Reorder…") { showOrderEditor = true }
         } label: {
             Label("Customize", systemImage: "slider.horizontal.3")
         }
         .help("Choose which Overview widgets are shown")
+        // The reorder affordance itself (drag handles + Reset Order) lives
+        // in `OverviewOrderEditor`, presented as a sheet rather than inline
+        // in this `Menu` — see that type's doc comment on why a `List`
+        // can't live inside an `NSMenu`.
+        .sheet(isPresented: $showOrderEditor) {
+            OverviewOrderEditor(widgetsData: $overviewWidgetsData)
+        }
     }
 
     private func overviewWidgetToggle(_ keyPath: WritableKeyPath<OverviewWidgets, Bool>) -> Binding<Bool> {

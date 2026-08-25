@@ -6,12 +6,13 @@ import SwiftUI
 
 // MARK: - Widget visibility persistence
 
-/// The Overview screen's block-visibility toggles (spec §4, "Customize &
-/// persistence" — visibility persistence now, layout editing later; see
-/// `docs/superpowers/specs/2026-08-24-rupu-macos-phase-4-dashboard-design.md`).
-/// A plain `Codable`/`Equatable` struct, not a `View` member or an
-/// `@Observable` store — CI rule: only a test touching a `View`-type member
-/// needs `@MainActor`, and this stays testable without it.
+/// The Overview screen's block-visibility toggles AND block order (spec §4,
+/// "Customize & persistence"; order added by the redesign pass's Task 3 —
+/// see `docs/superpowers/specs/2026-08-24-rupu-macos-phase-4-dashboard-design.md`
+/// for the original visibility-only cut). A plain `Codable`/`Equatable`
+/// struct, not a `View` member or an `@Observable` store — CI rule: only a
+/// test touching a `View`-type member needs `@MainActor`, and this stays
+/// testable without it.
 ///
 /// **Absent → all visible**: every field defaults `true`, so a fresh install
 /// (nothing ever saved under `storageKey`) shows the full dashboard, never a
@@ -37,20 +38,80 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
     public var cycles: Bool
     public var fleet: Bool
 
+    /// Block-id order for the Customize menu's reorder affordance (Task 3).
+    /// Always exactly `defaultOrder`'s set of ids, in whatever order the
+    /// operator dragged them to — see `normalized(_:)` for the forward-compat
+    /// contract that guarantees that invariant on every decode.
+    public var order: [String]
+
     public static let storageKey = "overview.widgets"
+
+    /// Canonical id set and their ship-default order. `OverviewOrderEditor`'s
+    /// "Reset Order" restores exactly this array; `normalized(_:)` treats it
+    /// as both the allowlist (unrecognized persisted ids are dropped) and the
+    /// fallback ordering (ids missing from a persisted array — a block that
+    /// didn't exist yet when it was saved — are appended in this relative
+    /// order, never spliced into the middle of what the operator arranged).
+    public static let defaultOrder = ["needsYou", "instruments", "charts", "cycles", "fleet"]
 
     public init(
         needsYou: Bool = true,
         instruments: Bool = true,
         charts: Bool = true,
         cycles: Bool = true,
-        fleet: Bool = true
+        fleet: Bool = true,
+        order: [String] = OverviewWidgets.defaultOrder
     ) {
         self.needsYou = needsYou
         self.instruments = instruments
         self.charts = charts
         self.cycles = cycles
         self.fleet = fleet
+        self.order = Self.normalized(order)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case needsYou, instruments, charts, cycles, fleet, order
+    }
+
+    /// Custom decode so a `Data` blob saved before this field existed (every
+    /// install's persisted state prior to Task 3) decodes cleanly instead of
+    /// failing the whole struct: a missing `order` key falls back to
+    /// `defaultOrder`, then `normalized(_:)` still runs over it (a no-op for
+    /// the default array, but keeps this one code path as the sole source of
+    /// the "always exactly the canonical id set" invariant).
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        needsYou = try container.decodeIfPresent(Bool.self, forKey: .needsYou) ?? true
+        instruments = try container.decodeIfPresent(Bool.self, forKey: .instruments) ?? true
+        charts = try container.decodeIfPresent(Bool.self, forKey: .charts) ?? true
+        cycles = try container.decodeIfPresent(Bool.self, forKey: .cycles) ?? true
+        fleet = try container.decodeIfPresent(Bool.self, forKey: .fleet) ?? true
+        let persisted = try container.decodeIfPresent([String].self, forKey: .order) ?? Self.defaultOrder
+        order = Self.normalized(persisted)
+    }
+
+    /// Forward-compat normalization (Task 3's binding rule): drop any id
+    /// `defaultOrder` doesn't recognize (a downgrade, or a retired block —
+    /// keeps a stray id from silently reserving a rendering slot forever),
+    /// preserving the persisted relative order of everything that survives;
+    /// then append any canonical id absent from `persisted` — a block added
+    /// in a release after this operator's array was saved — at the end, in
+    /// `defaultOrder`'s relative order. "Append, don't vanish": a new block
+    /// always still renders for existing users, just at the tail rather than
+    /// wherever `defaultOrder` would have put it from scratch.
+    static func normalized(_ persisted: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for id in persisted where defaultOrder.contains(id) && !seen.contains(id) {
+            result.append(id)
+            seen.insert(id)
+        }
+        for id in defaultOrder where !seen.contains(id) {
+            result.append(id)
+            seen.insert(id)
+        }
+        return result
     }
 
     /// Decodes the raw `Data` shape `@AppStorage(storageKey)` stores.
@@ -63,6 +124,21 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
 
     public var encoded: Data {
         (try? JSONEncoder().encode(self)) ?? Data()
+    }
+
+    /// Display label for a block id, shared by the Customize menu's reorder
+    /// sheet and anywhere else an id needs a human-readable name. Falls back
+    /// to the raw id rather than a bogus label if `defaultOrder` and this
+    /// switch ever drift.
+    public static func label(for id: String) -> String {
+        switch id {
+        case "needsYou": return "Needs you"
+        case "instruments": return "Instruments"
+        case "charts": return "Charts"
+        case "cycles": return "Cycle summary"
+        case "fleet": return "Fleet strip"
+        default: return id
+        }
     }
 
     /// Reads straight from `defaults` — no key at all (nothing ever saved)
@@ -81,9 +157,12 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
 // MARK: - Screen
 
 /// The Overview screen (spec §1's top-to-bottom composition, replacing the
-/// Phase 1 `PlaceholderScreen` for `.overview`): host freshness strip →
-/// needs-you queue → instrument strip → charts row → cycle summary line →
-/// fleet strip, in one vertical `ScrollView` stack.
+/// Phase 1 `PlaceholderScreen` for `.overview`): host freshness strip (fixed
+/// — chrome, not a widget) followed by needs-you queue / instrument strip /
+/// charts row / cycle summary line / fleet strip in `widgets.order`'s
+/// persisted sequence (defaults to that same needs-you → instruments →
+/// charts → cycles → fleet order — see `OverviewWidgets.defaultOrder`), in
+/// one vertical `ScrollView` stack.
 ///
 /// Owns two independent store lifecycles, mirroring `RunDetailScreen`'s
 /// pattern (build lazily once `backend.client()` exists, activate on
@@ -249,12 +328,43 @@ public struct OverviewScreen: View {
 
     // MARK: - Layout
 
+    /// The merged-gate block ids — everything in `OverviewWidgets.order`
+    /// except `needsYou`, which has its own independent load path (see the
+    /// type doc comment) and isn't part of `dashboardStore.merged`'s gate.
+    static let mergedBlockIDs: Set<String> = ["instruments", "charts", "cycles", "fleet"]
+
+    /// Order-driven rendering, pure half (Task 3): the four merged blocks'
+    /// relative order, filtered out of the full persisted `order`. Visibility
+    /// is applied separately in `mergedSection` — this only decides sequence.
+    static func mergedBlockOrder(_ order: [String]) -> [String] {
+        order.filter { mergedBlockIDs.contains($0) }
+    }
+
+    /// Order-driven rendering, pure half (Task 3): whether `needsYou` renders
+    /// above the merged block group or below it. The merged group always
+    /// renders as one contiguous unit (it shares one loading/error gate —
+    /// see `mergedSection`'s doc comment), so full interleaving of `needsYou`
+    /// between individual merged blocks isn't supported; this is the coarser
+    /// two-position ordering that's actually representable without splitting
+    /// `dashboardStore.merged` into four independent `BlockState`s, which is
+    /// out of scope here. Compares `needsYou`'s index against the first
+    /// merged id's index in `order`; either id missing from `order` (should
+    /// never happen — `OverviewWidgets.normalized(_:)` guarantees the full
+    /// canonical set) defaults to "needsYou first", matching `defaultOrder`.
+    static func needsYouPrecedesMergedGroup(_ order: [String]) -> Bool {
+        guard let needsYouIndex = order.firstIndex(of: "needsYou") else { return true }
+        guard let firstMergedIndex = order.firstIndex(where: { mergedBlockIDs.contains($0) }) else { return true }
+        return needsYouIndex < firstMergedIndex
+    }
+
     private func content(dashboardStore: DashboardStore, activityStore: ActivityStore) -> some View {
-        ScrollView {
+        let needsYouFirst = Self.needsYouPrecedesMergedGroup(widgets.order)
+
+        return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 FreshnessStrip(slices: dashboardStore.hostStates)
 
-                if widgets.needsYou {
+                if needsYouFirst, widgets.needsYou {
                     NeedsYouCard(
                         store: activityStore,
                         backend: backend,
@@ -264,6 +374,15 @@ public struct OverviewScreen: View {
                 }
 
                 mergedSection(dashboardStore: dashboardStore)
+
+                if !needsYouFirst, widgets.needsYou {
+                    NeedsYouCard(
+                        store: activityStore,
+                        backend: backend,
+                        range: model.range,
+                        onNavigate: { model.navigate(to: $0) }
+                    )
+                }
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .top)
@@ -273,24 +392,17 @@ public struct OverviewScreen: View {
     /// The four blocks that share `dashboardStore.merged` as their common
     /// gate — see the type's doc comment on why this is one shared
     /// three-state gate (loading / failed / content) rather than four
-    /// independent ones.
+    /// independent ones. Internal sequence of the four (when all are
+    /// visible and loaded) follows `mergedBlockOrder(_:)` — the Customize
+    /// menu's reorder sheet.
     @ViewBuilder
     private func mergedSection(dashboardStore: DashboardStore) -> some View {
         let showAnyMergedWidget = widgets.instruments || widgets.charts || widgets.cycles || widgets.fleet
         if showAnyMergedWidget {
             if let merged = dashboardStore.merged {
                 VStack(alignment: .leading, spacing: 16) {
-                    if widgets.instruments {
-                        InstrumentStrip(merged: merged)
-                    }
-                    if widgets.charts {
-                        chartsRow(merged: merged)
-                    }
-                    if widgets.cycles {
-                        CycleSummaryLine(cycles: merged.cycles, partial: merged.cyclesPartial)
-                    }
-                    if widgets.fleet {
-                        FleetStrip(fleet: merged.fleet, partial: merged.fleetPartial)
+                    ForEach(Self.mergedBlockOrder(widgets.order), id: \.self) { id in
+                        mergedBlock(id: id, merged: merged)
                     }
                 }
             } else if let pageError = dashboardStore.pageError {
@@ -298,6 +410,37 @@ public struct OverviewScreen: View {
             } else {
                 loadingBlock
             }
+        }
+    }
+
+    /// Renders one merged-gate block by id, still gated by its own
+    /// visibility toggle (`widgets.<field>`) — `mergedBlockOrder(_:)` only
+    /// decides sequence, not whether a hidden block's id (still present in
+    /// `order` — order and visibility are independent, same as before this
+    /// task) renders at all. An id `mergedBlockIDs` doesn't recognize can't
+    /// reach here (`mergedBlockOrder(_:)` already filtered to that set), so
+    /// there's no "unknown id" fallback branch to omit silently.
+    @ViewBuilder
+    private func mergedBlock(id: String, merged: MergedDashboard) -> some View {
+        switch id {
+        case "instruments":
+            if widgets.instruments {
+                InstrumentStrip(merged: merged)
+            }
+        case "charts":
+            if widgets.charts {
+                chartsRow(merged: merged)
+            }
+        case "cycles":
+            if widgets.cycles {
+                CycleSummaryLine(cycles: merged.cycles, partial: merged.cyclesPartial)
+            }
+        case "fleet":
+            if widgets.fleet {
+                FleetStrip(fleet: merged.fleet, partial: merged.fleetPartial)
+            }
+        default:
+            EmptyView()
         }
     }
 
