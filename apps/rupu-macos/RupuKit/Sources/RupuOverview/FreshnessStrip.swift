@@ -7,6 +7,20 @@ import SwiftUI
 /// time — mirrors the web's `HostFreshnessStrip.tsx` `LIVE_THRESHOLD_MS`.
 private let freshnessLiveThreshold: TimeInterval = 5
 
+/// Past this age, an `.ok` slice stops rendering a green ("done"-tone) dot
+/// and falls back to the same `.pending` tone a `.loading` slice gets — a
+/// stale host must not lie green forever. The web's 5s `LIVE_THRESHOLD_MS`
+/// (`freshnessLiveThreshold` above) does NOT transfer to this app's tone
+/// decision: that threshold assumes an SSE-pushed client where "not live"
+/// already means several seconds stale, but `DashboardStore`'s per-host
+/// slices only refresh on its 60s reconcile loop (`RupuStore/
+/// DashboardStore.swift`'s `reconcileInterval`), so a 5s cutoff would flip
+/// every freshly-`.ok` host to "stale" almost immediately after painting.
+/// 120s — 2x that reconcile cadence — gives one missed/slow tick of slack
+/// before a host that hasn't actually reported in a while reads as
+/// questionable rather than confidently "ok".
+private let freshnessStaleThreshold: TimeInterval = 120
+
 /// Formats the elapsed time since `capturedAt` the same way the web's
 /// `age()` does: `"live"` under the threshold, then `Ns` / `Nm` / `Nh` —
 /// deliberately NOT `RelativeDateTimeFormatter`'s "3 minutes ago" wording,
@@ -45,24 +59,42 @@ public struct FreshnessStrip: View {
     }
 }
 
-/// One host's dot + name + age. Tone mapping is fixed per the state's
-/// meaning, not a general `StatusDescriptor` lookup (these states are host
-/// reporting states, not run/step lifecycle states): `.ok` → `.done`,
-/// `.offline` → `.failed`, `.unavailable` → `.awaiting`, `.loading` →
-/// `.pending` (this host has never actually reported yet — distinct from
-/// "known-stale", so it must not read the same as a resolved-but-not-live
-/// host).
+/// The pure tone decision behind `FreshnessPill`'s dot — a plain struct
+/// static (not a `View` member) so it's testable without `@MainActor`.
+/// Tone mapping is fixed per the state's meaning, not a general
+/// `StatusDescriptor` lookup (these are host reporting states, not
+/// run/step lifecycle states): `.loading` → `.pending` (this host has
+/// never actually reported yet — distinct from "known-stale", so it must
+/// not read the same as a resolved-but-not-live host), `.offline` →
+/// `.failed`, `.unavailable` → `.awaiting`. `.ok` is the one state that
+/// isn't a flat mapping: it reads `.done` only while `capturedAt` parses
+/// to within `freshnessStaleThreshold` of `now`; a `nil`/unparseable
+/// `capturedAt`, or one older than the threshold, falls back to `.pending`
+/// — unknown or stale is never "fresh" (Task 1's rule), and a stale host
+/// must not keep showing a green dot indefinitely.
+enum FreshnessTone {
+    static func tone(for slice: HostSlice, now: Date) -> StatusTone {
+        switch slice.state {
+        case .loading:
+            return .pending
+        case .offline:
+            return .failed
+        case .unavailable:
+            return .awaiting
+        case .ok(let capturedAt):
+            guard let capturedAt, let date = parseBucketTimestamp(capturedAt) else { return .pending }
+            return now.timeIntervalSince(date) > freshnessStaleThreshold ? .pending : .done
+        }
+    }
+}
+
+/// One host's dot + name + age.
 private struct FreshnessPill: View {
     let slice: HostSlice
     let now: Date
 
     private var tone: StatusTone {
-        switch slice.state {
-        case .loading: .pending
-        case .ok: .done
-        case .offline: .failed
-        case .unavailable: .awaiting
-        }
+        FreshnessTone.tone(for: slice, now: now)
     }
 
     /// `capturedAt == nil` on an `.ok` slice reads as "unknown", never
