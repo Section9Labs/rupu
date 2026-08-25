@@ -50,6 +50,19 @@ private func item(_ ts: Int64, _ event: CPEvent) -> CPEventRow {
     #expect(m["ws2"]?.total == 1)
 }
 
+@Test func findingsByWorkspaceLowercasesTheWireSeverityBeforeMatching() {
+    // Fix round 1, finding 2: roster.ts line 120 goes through
+    // `normFindingSeverity`, which lowercases the raw string first — an
+    // uppercase wire value (e.g. from `findings_global.json`-style fixtures
+    // that happen to carry mixed case) must still bucket correctly rather
+    // than silently falling back to `info`.
+    let m = findingsByWorkspace([finding(ws: "ws1", sev: "HIGH"), finding(ws: "ws1", sev: "Critical")])
+    #expect(m["ws1"]?.high == 1)
+    #expect(m["ws1"]?.critical == 1)
+    #expect(m["ws1"]?.info == 0)
+    #expect(m["ws1"]?.total == 2)
+}
+
 // MARK: - buildRoster (foldRoster) — roster.test.ts lines 46-73
 
 private let rosterProjects = [
@@ -79,6 +92,40 @@ private let rosterRunToWs = ["rA": "ws1", "rB": "ws2"]
     let activity: [String: RunActivity] = ["orphan": act("orphan", .running, 100)]
     let roster = foldRoster(projects: rosterProjects, runToWs: [:], activity: activity, findings: [])
     #expect(roster.allSatisfy { $0.status == .idle })
+}
+
+@Test func foldRosterPicksTheActionDeterministicallyWhenTwoLiveRunsShareATs() {
+    // Fix round 1, finding 3: `activity`'s `Dictionary` iteration order
+    // isn't stable across process launches, so without an explicit
+    // tiebreak on `newestLive`, the picked `action` on a `ts` tie could
+    // vary launch-to-launch for the identical input. Constructing the same
+    // `activity` dictionary two different ways (insertion order shouldn't
+    // matter for a `Dictionary` anyway, but this pins the contract) must
+    // yield the same `action` both times — the lower `runID` wins.
+    let runToWs = ["rX": "ws1", "rY": "ws1"]
+    let activityA: [String: RunActivity] = [
+        "rX": act("rX", .running, 500, "agent-x · step"),
+        "rY": act("rY", .running, 500, "agent-y · step"),
+    ]
+    let activityB: [String: RunActivity] = [
+        "rY": act("rY", .running, 500, "agent-y · step"),
+        "rX": act("rX", .running, 500, "agent-x · step"),
+    ]
+    let rosterA = foldRoster(projects: [project(ws: "ws1", name: "billing-api")], runToWs: runToWs, activity: activityA, findings: [])
+    let rosterB = foldRoster(projects: [project(ws: "ws1", name: "billing-api")], runToWs: runToWs, activity: activityB, findings: [])
+    #expect(rosterA[0].action == "agent-x · step") // "rX" < "rY"
+    #expect(rosterA[0].action == rosterB[0].action)
+}
+
+@Test func foldRosterBreaksAStatusAndLastActiveTieByProjectInputOrder() {
+    // Fix round 1, finding 4: two idle projects with no activity and no
+    // `last_active` both land on status=idle/lastActiveTS=nil — a genuine
+    // tie. The explicit index tiebreak must preserve the projects' input
+    // order (here: "zzz-app" before "aaa-app", the reverse of alphabetical)
+    // rather than an incidental re-ordering.
+    let projects = [project(ws: "ws-z", name: "zzz-app"), project(ws: "ws-a", name: "aaa-app")]
+    let roster = foldRoster(projects: projects, runToWs: [:], activity: [:], findings: [])
+    #expect(roster.map(\.name) == ["zzz-app", "aaa-app"])
 }
 
 // MARK: - deriveActivity — roster.test.ts lines 75-114

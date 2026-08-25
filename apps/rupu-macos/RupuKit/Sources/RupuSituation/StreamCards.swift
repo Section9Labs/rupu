@@ -8,32 +8,30 @@ import RupuDesign
 // 211 lines) — every switch arm below cites the web line(s) it mirrors so a
 // future diff against the web file is a straight line-number lookup.
 //
-// Two deliberate, cited divergences from the web source (both forced by
-// what `CPEvent`/`APIFinding` — this task's fixed inputs — actually carry;
-// neither is a "fix" to the web's behavior, both are documented here and in
-// the task-6 report):
+// Fix round 1 correction: an earlier pass here had `cardForEvent` return
+// `nil` for `.unknown`/`.dispatchStarted`/`.dispatchCompleted` believing the
+// task-6 brief's "returns nil" paraphrase over the verified `cards.ts`
+// source. Task review confirmed the web source (not the paraphrase) is
+// authoritative: `cards.ts` lines 99-111 special-case
+// `!isKnownRunEvent(ev)` (which — per `web/src/lib/api.ts`'s
+// `KNOWN_EVENT_TYPES`, lines 311-328 — covers `.unknown` AND
+// `dispatch_started`/`dispatch_completed`, none of which that set lists) by
+// STILL rendering a degraded activity card rather than dropping the event:
+// `form`/`group` = `activity`, `accent` = `brand`, `badge` = the raw type
+// with underscores replaced by spaces, `title` = the raw `step_id` when the
+// raw object carries a string one, else the raw type verbatim, `runId`
+// carried through. That fallback is now ported below for all three cases.
 //
-// 1. Unknown/forward-compat events. `cards.ts` lines 99-111 special-case
-//    `!isKnownRunEvent(ev)` by still rendering a fallback activity card
-//    (badge = the raw type with underscores replaced, title falling back to
-//    the raw `step_id` when present). `CPEvent.unknown(type:runID:)`
-//    (`RupuAPI/CPEvent.swift` lines 12,31,53) carries only `type`/`runID` —
-//    no `step_id` — because the Swift decoder never retains the rest of the
-//    raw JSON object the JS `identityOf`/fallback path reads from. Per this
-//    task's brief (`task-6-brief.md` line 23: "Where `CPEvent.unknown`
-//    arrives, the card mapping returns nil"), `cardForEvent` returns `nil`
-//    for `.unknown` rather than fabricating a lower-fidelity fallback card
-//    from partial data.
-// 2. `CPEvent.swift`'s `knownTypeTags` (lines 226-232) additionally decodes
-//    `dispatch_started`/`dispatch_completed` into typed cases — event kinds
-//    `cards.ts`'s own `KNOWN_EVENT_TYPES` (`web/src/lib/api.ts` lines
-//    311-328) does NOT include, so on the web these are themselves
-//    `isKnownRunEvent`-false and take the unknown-event fallback path. To
-//    stay consistent with divergence (1) above, `cardForEvent`'s switch below
-//    covers exactly the 16 event kinds `cards.ts`'s `KNOWN_EVENT_TYPES` set
-//    lists (matching `cardFromEvent`'s 16 explicit `case` arms, `cards.ts`
-//    lines 116-175) and falls through to `nil` for `.dispatchStarted`,
-//    `.dispatchCompleted`, and `.unknown` alike.
+// One remaining, honest divergence: the web's title fallback is
+// conditional on the raw JS object actually having a string `step_id` key.
+// `CPEvent.unknown(type:runID:)` and the two `dispatch*` cases
+// (`RupuAPI/CPEvent.swift`) never carry a `step_id` field at all — the
+// Swift decoder doesn't retain the rest of the payload the way the raw JS
+// object does — so for these three cases the title always takes the
+// `ev.type` branch of that ternary; the `step_id`-present branch is simply
+// unreachable here. Not a behavior gap in practice (no known instance of
+// these event kinds carries a `step_id` on the wire today), documented for
+// honesty.
 
 /// Which filter chip a card answers to. Port of `cards.ts` line 24's
 /// `CardGroup` union. `await_` (trailing underscore) sidesteps the `await`
@@ -172,11 +170,69 @@ private func formatTenthsSeconds(_ durationMS: UInt64) -> String {
     return String(tenths)
 }
 
-/// Map one event to a `StreamCard`, or `nil` when the event carries nothing
-/// worth a row (a note-less `step_working` heartbeat, an unknown/
-/// forward-compat event type, or a `dispatch_started`/`dispatch_completed`
-/// event `cards.ts`'s own `KNOWN_EVENT_TYPES` doesn't include — see the file
-/// header for both cited divergences).
+/// Explicit, auditable content-identity key — one string per `CPEvent`
+/// case, composed from every field the case carries (i.e. everything
+/// `CPEventRow` keeps on `CPEvent` once the server-injected `ts`/`pos` are
+/// stripped out — see `RupuAPI/Models.swift` lines 37-52). This mirrors what
+/// the web's `identityOf` (`web/src/pages/Events.tsx` lines 48-68) covers —
+/// every remaining key of the raw event object after `ts`/`pos` — but as an
+/// explicit, stable composition rather than `String(describing:)`
+/// reflection, whose output format Swift does not document as stable across
+/// compiler versions (fix round 1, finding 6).
+private func contentIdentityKey(_ e: CPEvent) -> String {
+    func key(_ parts: String?...) -> String {
+        parts.map { $0 ?? "\u{0}" }.joined(separator: "|")
+    }
+    switch e {
+    case let .runStarted(runID, workflowPath, startedAt):
+        return key("run_started", runID, workflowPath, startedAt)
+    case let .stepStarted(runID, stepID, kind, agent, host):
+        return key("step_started", runID, stepID, kind, agent, host)
+    case let .stepWorking(runID, stepID, note, transcriptPath):
+        return key("step_working", runID, stepID, note, transcriptPath)
+    case let .stepAwaitingApproval(runID, stepID, reason):
+        return key("step_awaiting_approval", runID, stepID, reason)
+    case let .stepCompleted(runID, stepID, success, durationMS, host):
+        return key("step_completed", runID, stepID, String(success), String(durationMS), host)
+    case let .stepFailed(runID, stepID, error):
+        return key("step_failed", runID, stepID, error)
+    case let .stepSkipped(runID, stepID, reason):
+        return key("step_skipped", runID, stepID, reason)
+    case let .unitStarted(runID, stepID, index, unitKey, agent, transcriptPath, host):
+        return key("unit_started", runID, stepID, String(index), unitKey, agent, transcriptPath, host)
+    case let .unitCompleted(runID, stepID, index, unitKey, success, tokensIn, tokensOut, host):
+        return key(
+            "unit_completed", runID, stepID, String(index), unitKey, String(success),
+            String(tokensIn), String(tokensOut), host
+        )
+    case let .panelRound(runID, stepID, round, maxIterations, maxSeverityRemaining):
+        return key("panel_round", runID, stepID, String(round), String(maxIterations), maxSeverityRemaining)
+    case let .runCompleted(runID, status, finishedAt):
+        return key("run_completed", runID, status, finishedAt)
+    case let .runFailed(runID, error, finishedAt):
+        return key("run_failed", runID, error, finishedAt)
+    case let .runPaused(runID):
+        return key("run_paused", runID)
+    case let .runResumed(runID):
+        return key("run_resumed", runID)
+    case let .stepPaused(runID, stepID):
+        return key("step_paused", runID, stepID)
+    case let .stepResumed(runID, stepID):
+        return key("step_resumed", runID, stepID)
+    case let .dispatchStarted(runID, subRunID, agent, transcriptPath):
+        return key("dispatch_started", runID, subRunID, agent, transcriptPath)
+    case let .dispatchCompleted(runID, subRunID, success, tokensIn, tokensOut):
+        return key("dispatch_completed", runID, subRunID, String(success), String(tokensIn), String(tokensOut))
+    case let .unknown(type, runID):
+        return key("unknown", type, runID)
+    }
+}
+
+/// Map one event to a `StreamCard`. `nil` only for a note-less
+/// `step_working` heartbeat (`cards.ts` lines 131-136) — every other event
+/// kind, known or not, renders a card (the unknown/dispatch fallback below
+/// included), matching `cardFromEvent`'s only `null`-returning path on the
+/// web.
 ///
 /// `ts` is caller-supplied (mirrors `cards.ts` line 99's `ts: number`
 /// parameter, adapted to `Date?` per the task-6 brief so this pure layer
@@ -187,16 +243,15 @@ private func formatTenthsSeconds(_ durationMS: UInt64) -> String {
 /// unparseable/missing timestamp.
 ///
 /// `key` is derived internally (unlike `cards.ts`'s caller-supplied `key`
-/// parameter) from `CPEvent`'s own case + associated values — since
-/// `CPEventRow` already separates `ts`/`pos` from the decoded `CPEvent`
-/// (`RupuAPI/Models.swift` lines 37-52), two decoded events are content-
-/// identical (`Equatable`) exactly when they'd produce the same web
-/// `identityOf` (`web/src/pages/Events.tsx` lines 48-68) content-hash key —
-/// `String(describing:)` on the enum gives a stable, deterministic string
-/// for that same identity without re-deriving a stable-stringify routine.
+/// parameter) via `contentIdentityKey` below — an explicit, per-case
+/// composition of every field `CPEventRow` keeps on `CPEvent` (i.e.
+/// everything except the server-injected `ts`/`pos`, which `CPEventRow`
+/// already keeps separate — `RupuAPI/Models.swift` lines 37-52), mirroring
+/// what the web's `identityOf` (`web/src/pages/Events.tsx` lines 48-68)
+/// covers for the same fields.
 public func cardForEvent(_ e: CPEvent, ts: Date?) -> StreamCard? {
     let tsMS = ts.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0
-    let key = String(describing: e)
+    let key = contentIdentityKey(e)
 
     switch e {
     case let .runStarted(runID, workflowPath, _):
@@ -319,11 +374,33 @@ public func cardForEvent(_ e: CPEvent, ts: Date?) -> StreamCard? {
             key: key, ts: tsMS, form: .lifecycle, group: .activity, accent: .brand,
             badge: "Resumed", title: "\(stepLabel(stepID)) resumed", runID: runID, stepID: stepID
         )
-    case .dispatchStarted, .dispatchCompleted, .unknown:
-        // Not in cards.ts's KNOWN_EVENT_TYPES (dispatch_*) or the web's
-        // isKnownRunEvent gate (.unknown) — see file header divergence (1)/(2).
-        return nil
+    case let .unknown(type, runID):
+        // cards.ts lines 100-111 — isKnownRunEvent-false fallback. No
+        // step_id field on this case (see file header), so title always
+        // takes the `ev.type` branch of the web's ternary.
+        return fallbackCard(key: key, ts: tsMS, rawType: type, runID: runID)
+    case let .dispatchStarted(runID, _, _, _):
+        // Not in cards.ts's KNOWN_EVENT_TYPES (web/src/lib/api.ts lines
+        // 311-328 omits dispatch_started/dispatch_completed) — same
+        // isKnownRunEvent-false fallback path as `.unknown` above. The wire
+        // type tag is hardcoded here since CPEvent's typed dispatch cases
+        // (unlike `.unknown`) don't carry their own type string back.
+        return fallbackCard(key: key, ts: tsMS, rawType: "dispatch_started", runID: runID)
+    case let .dispatchCompleted(runID, _, _, _, _):
+        return fallbackCard(key: key, ts: tsMS, rawType: "dispatch_completed", runID: runID)
     }
+}
+
+/// Port of `cards.ts` lines 100-111's `isKnownRunEvent`-false fallback card.
+/// Never carries a `stepId` (the web's returned object literal doesn't set
+/// one either) even though `title` may equal the raw type string.
+private func fallbackCard(key: String, ts: Int64, rawType: String, runID: String?) -> StreamCard {
+    StreamCard(
+        key: key, ts: ts, form: .activity, group: .activity, accent: .brand,
+        badge: rawType.replacingOccurrences(of: "_", with: " "),
+        title: rawType,
+        runID: runID
+    )
 }
 
 // MARK: - cardForFinding
@@ -361,7 +438,12 @@ func rfc3339ToMS(_ s: String) -> Int64 {
 /// `Date.parse(f.declared_at)`), so parsing it happens inside this pure
 /// function rather than at a caller boundary.
 public func cardForFinding(_ f: APIFinding) -> StreamCard {
-    let sev = Severity(wireString: f.severity)
+    // cards.ts line 185: `normFindingSeverity(f.severity)` lowercases the
+    // raw wire string before matching (`raw.toLowerCase()`) — `Severity
+    // (wireString:)` (RupuDesign) does an exact-match switch with no
+    // lowercasing of its own, so this port lowercases at the call site to
+    // stay parity with the web (fix round 1, finding 2).
+    let sev = Severity(wireString: f.severity.lowercased())
     let ts = rfc3339ToMS(f.declaredAt)
     let fileRef: String?
     if let path = f.filePath {
@@ -400,34 +482,47 @@ public func cardForFinding(_ f: APIFinding) -> StreamCard {
 /// `max`.
 ///
 /// There is no single `mergeStream` function on the web side to port
-/// line-by-line — the web assembles its stream in two places instead:
-/// `Events.tsx` lines 271-274 does the newest-first `sort`, uncapped
-/// (`[...eventCards, ...findingCards].sort((a, b) => b.ts - a.ts)`); the
-/// content-identity dedup EXCLUDING `ts`/`pos` that this task's brief calls
-/// out lives one layer upstream, on the raw `RunEvent` before it ever
-/// becomes a card — `Events.tsx`'s `identityOf` (lines 48-68, a sorted-key
-/// stable-stringify of the event object minus `ts`/`pos`) feeds the
-/// `seenRef` `Set` that `cardFromEvent`'s own caller-supplied `key`
-/// parameter is built from (line 253's `cardFromEvent(event, ts, key)`).
-/// `cardForEvent` above already reproduces that same content identity as
-/// `StreamCard.key` (see its doc comment) — a card built from a duplicate
-/// replay of the same event (same content, different `ts`) carries the same
-/// `key`. So the port here is: newest-first sort, then dedup by `key`
-/// keeping the first (i.e. newest) occurrence — the same net effect as the
-/// web's upstream `seenRef` gate applied post-sort instead of pre-map — then
-/// cap at `max` (`Events.tsx`'s `MAX_EVENTS`/`STREAM_FINDINGS_CAP`-style
-/// caps, generalized to one caller-supplied bound).
+/// line-by-line — the web assembles its stream across two places instead,
+/// and each contributes one half of what this does:
+///
+/// 1. **Dedup, in ingestion order, keeping the first-arrived duplicate.**
+///    `Events.tsx`'s `identityOf` (lines 48-68, a sorted-key
+///    stable-stringify of the event object minus `ts`/`pos`) feeds the
+///    `seenRef` `Set` that gates BOTH the history loader and the live SSE
+///    handler (lines 116-119 / 133-137) — whichever copy of an event
+///    (history row or live replay) is *ingested first* wins; a
+///    later-arriving duplicate is dropped outright, regardless of which one
+///    carries the "newer" `ts`. `cardForEvent`'s `key` (via
+///    `contentIdentityKey`) reproduces that same content identity, so
+///    deduping `cards` in the order the caller passes them in, keeping the
+///    first occurrence of each `key`, is the direct port of that gate.
+///    (Fix round 1, finding 5 — an earlier pass here sorted before deduping
+///    and so kept the newest-`ts` duplicate instead; inverted.)
+/// 2. **Newest-first sort.** `Events.tsx` lines 271-274:
+///    `[...eventCards, ...findingCards].sort((a, b) => b.ts - a.ts)`,
+///    applied (on the web) to the already-deduped `items`/`findings`
+///    state. JS's `Array.prototype.sort` has been a stable sort since
+///    ES2019, so a `ts` tie there resolves to array order, which is itself
+///    ingestion order — an implicit tiebreak this port makes explicit
+///    instead of relying on `sorted`'s incidental stability surviving a
+///    future refactor: ties break on `key` (fix round 1, finding 4).
+///
+/// Then capped at `max` (`Events.tsx`'s `MAX_EVENTS`/`STREAM_FINDINGS_CAP`-
+/// style caps, generalized to one caller-supplied bound).
 public func mergeStream(_ cards: [StreamCard], max: Int) -> [StreamCard] {
     guard max > 0 else { return [] }
-    let sorted = cards.sorted { $0.ts > $1.ts }
+
     var seen = Set<String>()
-    var out: [StreamCard] = []
-    out.reserveCapacity(Swift.min(sorted.count, max))
-    for card in sorted {
-        if seen.contains(card.key) { continue }
+    var deduped: [StreamCard] = []
+    deduped.reserveCapacity(cards.count)
+    for card in cards {
+        if seen.contains(card.key) { continue } // first-arrived wins
         seen.insert(card.key)
-        out.append(card)
-        if out.count >= max { break }
+        deduped.append(card)
     }
-    return out
+
+    let sorted = deduped.sorted { a, b in
+        a.ts != b.ts ? a.ts > b.ts : a.key < b.key
+    }
+    return Array(sorted.prefix(max))
 }

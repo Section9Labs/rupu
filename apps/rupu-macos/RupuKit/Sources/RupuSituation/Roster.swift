@@ -156,7 +156,11 @@ public func findingsByWorkspace(_ findings: [APIFinding]) -> [String: SevCounts]
     var out: [String: SevCounts] = [:]
     for f in findings {
         var counts = out[f.wsID] ?? SevCounts()
-        counts.increment(Severity(wireString: f.severity))
+        // roster.ts line 120 goes through `normFindingSeverity`, which
+        // lowercases the raw wire string before matching — lowercase here
+        // too, for the same reason as `cardForFinding` (fix round 1,
+        // finding 2; see StreamCards.swift's matching comment).
+        counts.increment(Severity(wireString: f.severity.lowercased()))
         out[f.wsID] = counts
     }
     return out
@@ -223,19 +227,33 @@ public func foldRoster(
         byWs[ws, default: []].append(act)
     }
 
-    var rows: [RosterEntry] = projects.map { p in
+    // `projects.enumerated()` carries each project's input-array position
+    // alongside its built `RosterEntry` — an explicit tiebreak (fix round 1,
+    // finding 4) so a `lastActiveTS` tie in the sort below resolves to
+    // project input order deterministically, rather than riding `sorted`'s
+    // incidental (if Swift-guaranteed) stability surviving a future
+    // refactor. Mirrors the web's own implicit reliance on
+    // `Array.prototype.sort`'s ES2019 stability guarantee for the same tie.
+    let indexed: [(index: Int, entry: RosterEntry)] = projects.enumerated().map { index, p in
         let acts = byWs[p.wsID] ?? []
         let live = acts.filter { $0.state == .running || $0.state == .awaiting }
         let awaiting = live.contains { $0.state == .awaiting }
         let status: RosterEntry.Status = awaiting ? .await_ : (live.count > 0 ? .running : .idle)
 
-        // Current action = the most recent live run's action.
-        let newestLive = live.sorted { $0.ts > $1.ts }.first
+        // Current action = the most recent live run's action, tiebroken on
+        // `runID` when two live runs share a `ts` (fix round 1, finding 3):
+        // `acts`' element order depends on `activity`'s `Dictionary`
+        // iteration order, which is not stable across process launches, so
+        // without an explicit tiebreak the picked `action` could vary
+        // launch-to-launch for the same input.
+        let newestLive = live.sorted { a, b in
+            a.ts != b.ts ? a.ts > b.ts : a.runID < b.runID
+        }.first
 
         let projLastActive: Int64 = p.lastActive.map(rfc3339ToMS) ?? 0
         let lastActiveTS = acts.reduce(projLastActive) { max($0, $1.ts) }
 
-        return RosterEntry(
+        let entry = RosterEntry(
             wsID: p.wsID,
             name: p.name,
             branch: p.branch,
@@ -245,14 +263,17 @@ public func foldRoster(
             findings: findMap[p.wsID] ?? SevCounts(),
             lastActiveTS: lastActiveTS > 0 ? lastActiveTS : nil
         )
+        return (index, entry)
     }
 
-    rows.sort { a, b in
-        let ra = statusRank(a.status), rb = statusRank(b.status)
+    let sorted = indexed.sorted { a, b in
+        let ra = statusRank(a.entry.status), rb = statusRank(b.entry.status)
         if ra != rb { return ra < rb }
-        return (b.lastActiveTS ?? 0) < (a.lastActiveTS ?? 0)
+        let la = a.entry.lastActiveTS ?? 0, lb = b.entry.lastActiveTS ?? 0
+        if la != lb { return la > lb }
+        return a.index < b.index // stable fallback: original project input order
     }
-    return rows
+    return sorted.map(\.entry)
 }
 
 /// Count of projects with at least one active (running/awaiting) run. Port
