@@ -214,6 +214,20 @@ struct FindingsTabView: View {
     /// "Contained, lazy, windowed" section); windowing is applied AFTER
     /// `sortRows`, so the visible top-N always respects whichever column/
     /// direction is currently active.
+    ///
+    /// Rows keyed by `APIFinding.rowID` (`wsID/targetID/id`), not a
+    /// positional offset (review fix 3 — the same audit that found and
+    /// fixed `CoverageList.swift`'s identical-shaped bug: see
+    /// `APIFinding.rowID`'s own doc comment). This table's `ForEach` was
+    /// never actually exposed to that bug's collision mechanism — it's a
+    /// single, flat, non-nested `ForEach`, so a per-array positional
+    /// offset was locally unique across the whole array regardless — but
+    /// content-derived identity is strictly the more correct choice
+    /// regardless (positional identity means re-sorting reassigns each
+    /// view's identity to a DIFFERENT finding, which can leak transient
+    /// per-row state — e.g. hover — across rows on every re-sort), and
+    /// costs nothing here since `APIFinding` already carries everything
+    /// `rowID` needs.
     private func table(_ rows: [APIFinding]) -> some View {
         let sorted = sortRows(rows, sort: sort, value: Self.sortValue)
         let windowed = FindingsWindow.window(sorted, showingAll: showAll)
@@ -224,7 +238,7 @@ struct FindingsTabView: View {
             Divider()
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(windowed.enumerated()), id: \.offset) { _, row in
+                    ForEach(windowed, id: \.rowID) { row in
                         FindingRow(
                             finding: row,
                             route: findingNavigationRoute(surface: row.declaredBy.surface, runID: row.declaredBy.runID),
