@@ -50,6 +50,22 @@ public struct ActivityScreen: View {
     /// `BackendController.clientIdentity()`.
     @State private var storeClientID: ObjectIdentifier?
 
+    /// Phase 6B, Task 3: the autoflows-kind Runs/Claims sub-toggle — a
+    /// screen-local `@State`, never persisted, never read by anything
+    /// outside this screen (unlike `kind`, which the sidebar/command palette
+    /// also care about via `model.route`). Defaults to `.runs` — the
+    /// existing federated-feed view every other kind already shows, so
+    /// switching TO the autoflows kind never surprises a returning user with
+    /// an unfamiliar screen.
+    @State private var autoflowsSubTab: AutoflowsSubTab = .runs
+    @State private var claimsStore: ClaimsStore?
+    /// Same rebuild-on-client-swap rationale as `storeClientID` above,
+    /// tracked independently — `claimsStore` has its own lazy-build
+    /// lifecycle (only ever built once the Claims sub-tab is first
+    /// selected), so it needs its own client-identity watermark rather than
+    /// reusing `storeClientID`.
+    @State private var claimsStoreClientID: ObjectIdentifier?
+
     public init(model: AppModel, backend: BackendController) {
         self.model = model
         self.backend = backend
@@ -83,7 +99,14 @@ public struct ActivityScreen: View {
                         .font(.noteText)
                         .foregroundStyle(Color.rupuMute)
                 }
-                stateBody(store: store)
+                if kind == .autoflows {
+                    autoflowsSubTabPicker
+                }
+                if kind == .autoflows && autoflowsSubTab == .claims {
+                    claimsBody
+                } else {
+                    stateBody(store: store)
+                }
             } else {
                 blockView(label: "Backend not connected")
             }
@@ -93,6 +116,9 @@ public struct ActivityScreen: View {
         .background(Color.rupuBg)
         .task(id: kind) {
             await activate(kind: kind)
+        }
+        .task(id: ClaimsTaskID(kind: kind, subTab: autoflowsSubTab, clientID: backend.clientIdentity())) {
+            await activateClaimsIfNeeded()
         }
         .onChange(of: model.scopeWsID) { _, newScope in
             store?.scopeFilter = newScope
@@ -114,6 +140,87 @@ public struct ActivityScreen: View {
         case .content:
             ActivityTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
         }
+    }
+
+    // MARK: - Autoflows Runs/Claims sub-toggle (Phase 6B, Task 3)
+
+    private var autoflowsSubTabPicker: some View {
+        Picker("View", selection: $autoflowsSubTab) {
+            ForEach(AutoflowsSubTab.allCases, id: \.self) { tab in
+                Text(tab.label).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 160)
+        .labelsHidden()
+    }
+
+    @ViewBuilder
+    private var claimsBody: some View {
+        if let claimsStore {
+            switch claimsStore.claims {
+            case .loading:
+                loadingView
+            case .failed(let message):
+                claimsFailedView(message: message, store: claimsStore)
+            case .empty:
+                blockView(label: "No tracked claims")
+            case .content(let rows):
+                ClaimsTable(rows: rows, store: claimsStore)
+            }
+        } else {
+            blockView(label: "Backend not connected")
+        }
+    }
+
+    private func claimsFailedView(message: String, store: ClaimsStore) -> some View {
+        VStack(spacing: 10) {
+            Spacer(minLength: 0)
+            Text("Failed to load claims")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
+            Text(message)
+                .font(.uiText)
+                .foregroundStyle(Color.rupuDim)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            Button("Retry") {
+                Task { await store.load() }
+            }
+            .buttonStyle(RupuButtonStyle.outline)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .panelStyle(.panel)
+    }
+
+    /// Lazy-builds (and, on a backend client swap, rebuilds — same
+    /// `storeClientID` recipe `activate(kind:)` above already establishes)
+    /// `claimsStore` and loads it, but ONLY once the Claims sub-tab is
+    /// actually selected — `.task(id:)`'s `ClaimsTaskID` folds in `kind` AND
+    /// `autoflowsSubTab` AND the backend's client identity, so this fires
+    /// exactly on first selection, on a later re-selection after a kind
+    /// round-trip, and on a client swap while Claims happens to already be
+    /// selected — never eagerly for every other kind/sub-tab combination.
+    /// Folding `clientID` into the task id (not just checking it inside the
+    /// body, PR #501's exact bug class) is what makes a client swap actually
+    /// restart this task rather than leaving a stale closure captured over
+    /// an abandoned `CPClient` running to completion against a connection
+    /// nothing else is using any more.
+    private func activateClaimsIfNeeded() async {
+        guard kind == .autoflows, autoflowsSubTab == .claims else { return }
+        guard let client = backend.client() else { return }
+        let clientID = backend.clientIdentity()
+        let activeStore: ClaimsStore
+        if let existing = claimsStore, claimsStoreClientID == clientID {
+            activeStore = existing
+        } else {
+            let newStore = ClaimsStore(client: client, pendingActions: backend.pendingActions)
+            claimsStore = newStore
+            claimsStoreClientID = clientID
+            activeStore = newStore
+        }
+        await activeStore.load()
     }
 
     private var loadingView: some View {
@@ -285,4 +392,35 @@ public struct ActivityScreen: View {
             return signals
         }
     }
+}
+
+/// The autoflows-kind sub-toggle (Phase 6B, Task 3) — screen-local, not a
+/// `RunKindFilter` case: every other kind (`.all`/`.agents`/`.workflows`/
+/// `.sessions`) has no equivalent second view, so this narrower toggle lives
+/// entirely inside `ActivityScreen`, only ever rendered when `kind ==
+/// .autoflows`.
+enum AutoflowsSubTab: String, CaseIterable, Sendable {
+    case runs, claims
+
+    var label: String {
+        switch self {
+        case .runs: "Runs"
+        case .claims: "Claims"
+        }
+    }
+}
+
+/// `.task(id:)` identity for the Claims sub-tab's lazy load
+/// (`ActivityScreen.activateClaimsIfNeeded()`). Folds in every value that
+/// load depends on — `kind`/`autoflowsSubTab` (so it fires exactly once per
+/// distinct "landed on Claims" transition, not on every unrelated body
+/// re-render) AND `clientID` (so a backend client swap — embedded/remote
+/// toggle, reconnect, restart — actually restarts this task against the new
+/// client rather than a stale closure quietly finishing out its await
+/// against an abandoned connection, the exact class of bug PR #501 fixed for
+/// run-state closures).
+private struct ClaimsTaskID: Equatable {
+    let kind: RunKindFilter
+    let subTab: AutoflowsSubTab
+    let clientID: ObjectIdentifier?
 }

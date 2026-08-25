@@ -96,5 +96,12 @@ let package = Package(
             name: "RupuMenuBarTests",
             dependencies: ["RupuMenuBar", "RupuAPI", "RupuStore", "RupuBackend", "RupuDesign", "RupuOverview"]
         ),
+        // Phase 6B, Task 3: `ClaimsTableTests` — the first test file for
+        // `RupuActivity`'s own View-member pure logic (`ClaimsTable`'s
+        // static seams), hence the first `RupuActivityTests` target.
+        .testTarget(
+            name: "RupuActivityTests",
+            dependencies: ["RupuActivity", "RupuAPI", "RupuStore", "RupuDesign"]
+        ),
     ]
 )
