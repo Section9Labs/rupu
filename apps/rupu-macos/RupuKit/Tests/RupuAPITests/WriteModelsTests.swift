@@ -97,10 +97,24 @@ private func assertJSONEqualsFixture<T: Encodable>(_ value: T, fixture: String) 
 }
 
 @Test func workflowLaunchBodyEncodesToFixtureOmittingUnsetOptionalFields() throws {
+    // `scopeKind`/`scopeID` left `nil` (default) — the fixture predates
+    // Phase 5A's scope fields and has neither key, so this also proves the
+    // synthesized `Encodable` conformance omits them via `encodeIfPresent`
+    // rather than encoding an explicit `null`.
     try assertJSONEqualsFixture(
         WorkflowLaunchBody(inputs: ["branch": "main"], mode: "ask", host: "mini"),
         fixture: "workflow_launch_body.json"
     )
+}
+
+@Test func workflowLaunchBodyEncodesScopeFieldsWhenSet() throws {
+    let data = try JSONEncoder().encode(
+        WorkflowLaunchBody(inputs: ["branch": "main"], mode: "ask", scopeKind: "project", scopeID: "ws_a")
+    )
+    let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    #expect(object?["scope_kind"] as? String == "project")
+    #expect(object?["scope_id"] as? String == "ws_a")
+    #expect(object?["host"] == nil)
 }
 
 @Test func validateBodyEncodesToFixture() throws {

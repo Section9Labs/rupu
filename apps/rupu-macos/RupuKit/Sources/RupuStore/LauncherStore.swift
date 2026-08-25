@@ -96,6 +96,22 @@ public final class LauncherStore {
 
     public var selectedDefinition: String?
 
+    /// The picked row's scope, threaded through from `DefinitionPicker`'s
+    /// `selectDefinition(_:scopeKind:scopeID:)` call (Phase 5A Task 4) —
+    /// captured from the tapped row itself, never re-derived by a later
+    /// name lookup against `agents`/`workflows` (those lists can carry the
+    /// same definition name in two scopes at once, per `DefinitionPicker`'s
+    /// doc comment; re-deriving by name would be ambiguous exactly where
+    /// scope-pinning matters most). `private(set)` — direct assignment to
+    /// `selectedDefinition` (as several existing tests and any future
+    /// programmatic selection do) intentionally leaves these `nil`, the
+    /// same "no scope pin" behavior launches had before this phase.
+    ///
+    /// `performLaunch` is the only reader: see its doc comment for the
+    /// LOCAL-ONLY threading rule (never sent to a non-local target).
+    public private(set) var selectedScopeKind: String?
+    public private(set) var selectedScopeID: String?
+
     public private(set) var workflowInputs: [String: WorkflowInputDef] = [:]
     public var inputValues: [String: String] = [:]
 
@@ -161,6 +177,35 @@ public final class LauncherStore {
         loadHostsInBackground()
     }
 
+    /// Prefill seam (Phase 5A Task 7): opens the sheet with `name` already
+    /// selected under `kind`, carrying the given row's scope — the smallest
+    /// honest public API a caller outside this module (e.g. a Library
+    /// screen's per-row "Launch" action) needs to preselect a definition
+    /// before presenting the sheet, rather than reaching into
+    /// `selectedDefinition`/`kind` directly and hand-rolling the same
+    /// input-fetch/generation dance `selectDefinition` already owns.
+    ///
+    /// Just `kind = kind; await selectDefinition(...)` — for a workflow this
+    /// also fetches its declared inputs exactly as a picker tap would, so
+    /// the prefilled sheet's input form is populated, not empty.
+    ///
+    /// **Ordering with `activate()`**: call this before, after, or
+    /// concurrently with `activate()` — order between the two never
+    /// matters. `activate()` only ever populates `agents`/`workflows`/
+    /// `hosts`; it never reads or writes `kind`/`selectedDefinition`/
+    /// `selectedScopeKind`/`selectedScopeID`/`workflowInputs`/
+    /// `inputValues`, so a prefilled selection survives an `activate()`
+    /// call landing before, during, or after it. The only ordering that
+    /// *does* matter is between overlapping `prefill`/`selectDefinition`
+    /// calls themselves — `selectDefinitionGeneration` already guarantees
+    /// last-*called*-wins for that (see `selectDefinition`'s doc comment);
+    /// a `prefill` immediately followed by an operator tapping a different
+    /// row resolves the same way a rapid double-tap already does.
+    public func prefill(kind: LaunchKind, name: String, scopeKind: String? = nil, scopeID: String? = nil) async {
+        self.kind = kind
+        await selectDefinition(name, scopeKind: scopeKind, scopeID: scopeID)
+    }
+
     /// Selects `name` as the definition to launch. For a workflow, also
     /// fetches its declared inputs (`GET /api/workflows/:name`) and seeds
     /// `workflowInputs` plus a defaulted `inputValues` (each declared
@@ -185,11 +230,20 @@ public final class LauncherStore {
     /// resolves — same "only the most recent call wins, by construction"
     /// recipe `RunDetailStore.focusStep`'s `focusGeneration` already
     /// documents.
-    public func selectDefinition(_ name: String) async {
+    /// `scopeKind`/`scopeID` default to `nil` for callers that only have a
+    /// name in hand (existing tests, and any direct `selectedDefinition =`
+    /// assignment elsewhere) — pass the tapped row's own `scopeKind`/
+    /// `scopeID` (see `AgentDefinition`/`WorkflowDefinition`) to pin the
+    /// launch to that row's scope; see `selectedScopeKind`'s doc comment
+    /// for why this is captured from the row at selection time rather than
+    /// re-derived later by name.
+    public func selectDefinition(_ name: String, scopeKind: String? = nil, scopeID: String? = nil) async {
         selectDefinitionGeneration += 1
         let generation = selectDefinitionGeneration
 
         selectedDefinition = name
+        selectedScopeKind = scopeKind
+        selectedScopeID = scopeID
         validationError = nil
         inputsLoadError = nil
 
@@ -379,10 +433,35 @@ public final class LauncherStore {
         launchResults.append(outcome)
     }
 
+    /// Threads `selectedScopeKind`/`selectedScopeID` into a launch body's
+    /// scope fields — LOCAL TARGETS ONLY (SERVER RULE, Phase 5A): scope is a
+    /// local-only affordance (`resolve_launch_scope` on the server side only
+    /// ever inspects this process's own local workspace registry), and the
+    /// server silently ignores scope fields sent to a remote-proxied launch
+    /// — sending them there would imply a guarantee ("this run targets the
+    /// scope you picked") the server cannot honor for a remote host, so this
+    /// omits them outright rather than sending a value the receiving end
+    /// discards. `hostField` already carries this distinction for free:
+    /// `nil` means "local" (see `launch()`'s `hostField` computation), any
+    /// other value is a remote host id.
+    ///
+    /// SERVER RULE (scope + `workingDir` mutual exclusion, 400 if both are
+    /// present): every `performLaunch` body below constructs `workingDir` as
+    /// implicitly `nil` — this phase's Launcher sheet has no working-directory
+    /// field of its own, so a body from this store can never carry both. A
+    /// future phase that adds one must gate this function on it (only thread
+    /// scope when no working directory is set) rather than assume the
+    /// invariant still holds.
+    private func scopeFields(forHostField hostField: String?) -> (kind: String?, id: String?) {
+        guard hostField == nil else { return (nil, nil) }
+        return (selectedScopeKind, selectedScopeID)
+    }
+
     private func performLaunch(hostField: String?) async throws -> Route {
         guard let name = selectedDefinition else {
             throw CPError.transport("no definition selected")
         }
+        let scope = scopeFields(forHostField: hostField)
         switch kind {
         case .agentRun:
             // Final-review fix (Important 3): a standalone agent run is not
@@ -397,21 +476,21 @@ public final class LauncherStore {
             // `AgentRunDetailStore` now makes one best-effort attempt to
             // resolve it (see that type's doc comment) before falling back
             // to an honest empty state.
-            let body = AgentLaunchBody(prompt: prompt, mode: mode, host: hostField)
+            let body = AgentLaunchBody(prompt: prompt, mode: mode, host: hostField, scopeKind: scope.kind, scopeID: scope.id)
             let response = try await client.launchAgentRun(name: name, body: body)
             guard let runID = response.runID else {
                 throw CPError.decoding("launchAgentRun response missing run_id")
             }
             return .agentRunDetail(id: runID, transcriptPath: nil, host: response.hostID == "local" ? nil : response.hostID)
         case .session:
-            let body = AgentLaunchBody(prompt: prompt, mode: mode, host: hostField)
+            let body = AgentLaunchBody(prompt: prompt, mode: mode, host: hostField, scopeKind: scope.kind, scopeID: scope.id)
             let response = try await client.startAgentSession(name: name, body: body)
             guard let sessionID = response.sessionID else {
                 throw CPError.decoding("startAgentSession response missing session_id")
             }
             return .sessionDetail(id: sessionID)
         case .workflow:
-            let body = WorkflowLaunchBody(inputs: inputValues, mode: mode, host: hostField)
+            let body = WorkflowLaunchBody(inputs: inputValues, mode: mode, host: hostField, scopeKind: scope.kind, scopeID: scope.id)
             let response = try await client.runWorkflow(name: name, body: body)
             guard let runID = response.runID else {
                 throw CPError.decoding("runWorkflow response missing run_id")

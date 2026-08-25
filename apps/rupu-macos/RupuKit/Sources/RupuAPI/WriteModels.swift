@@ -184,19 +184,32 @@ public struct WorkflowLaunchBody: Encodable, Equatable, Sendable {
     public let target: String?
     public let workingDir: String?
     public let host: String?
+    /// Scope-aware launch (Phase 5A): same contract as
+    /// `AgentLaunchBody.scopeKind`/`scopeID` — pins the launch to the
+    /// definition the picker showed. LOCAL launches only (never send with a
+    /// non-local `host`), mutually exclusive with `workingDir` (400).
+    /// Threading from the picker's selection is `LauncherStore`'s job
+    /// (Phase 5A Task 4); the fields exist here so the request fixture
+    /// round-trips.
+    public let scopeKind: String?
+    public let scopeID: String?
 
     public init(
         inputs: [String: String] = [:],
         mode: String? = nil,
         target: String? = nil,
         workingDir: String? = nil,
-        host: String? = nil
+        host: String? = nil,
+        scopeKind: String? = nil,
+        scopeID: String? = nil
     ) {
         self.inputs = inputs
         self.mode = mode
         self.target = target
         self.workingDir = workingDir
         self.host = host
+        self.scopeKind = scopeKind
+        self.scopeID = scopeID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -205,6 +218,8 @@ public struct WorkflowLaunchBody: Encodable, Equatable, Sendable {
         case target
         case workingDir = "working_dir"
         case host
+        case scopeKind = "scope_kind"
+        case scopeID = "scope_id"
     }
 }
 

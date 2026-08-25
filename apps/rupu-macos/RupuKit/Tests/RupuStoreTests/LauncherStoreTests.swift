@@ -398,6 +398,173 @@ struct LauncherStoreTests {
         _ = await store.launch()
     }
 
+    // (e2) Phase 5A Task 4: a picked row's scope rides along in the launch
+    // body when the target is local — `selectDefinition(_:scopeKind:scopeID:)`
+    // (as `DefinitionPicker`'s row tap now calls it) captures the tapped
+    // row's own scope, and `performLaunch` threads it through for a local
+    // target (`hostField == nil`).
+    @MainActor @Test func localTargetCarriesPickedRowScopeInLaunchBody() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            let json = LauncherStubURLProtocol.bodyJSON(req)
+            #expect(json?["scope_kind"] as? String == "project")
+            #expect(json?["scope_id"] as? String == "ws_a")
+            return (200, Data(#"{"run_id":"run-1","host_id":"local"}"#.utf8))
+        }
+        store.kind = .agentRun
+        await store.selectDefinition("rupuso", scopeKind: "project", scopeID: "ws_a")
+        store.prompt = "hi"
+        store.selectedHosts = ["local"]
+
+        _ = await store.launch()
+    }
+
+    // (e3) A global-scope row has no `scopeID` (`AgentDefinition.scopeID` is
+    // `nil` for a global-scoped definition) — the launch body must still
+    // carry `scope_kind: "global"` while `scope_id` is nil-safe (omitted,
+    // not an explicit `null`, and never crashes threading a `nil` through).
+    @MainActor @Test func globalScopeRowSendsScopeKindWithNilScopeID() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            let json = LauncherStubURLProtocol.bodyJSON(req)
+            #expect(json?["scope_kind"] as? String == "global")
+            #expect(json?["scope_id"] == nil)
+            return (200, Data(#"{"run_id":"run-1","host_id":"local"}"#.utf8))
+        }
+        store.kind = .agentRun
+        await store.selectDefinition("rupuso", scopeKind: "global", scopeID: nil)
+        store.prompt = "hi"
+        store.selectedHosts = ["local"]
+
+        _ = await store.launch()
+    }
+
+    // (e4) SERVER RULE (Phase 5A): scope is a LOCAL-ONLY affordance — a
+    // remote-targeted launch must omit `scope_kind`/`scope_id` entirely
+    // even though a scope was picked, since the server silently ignores
+    // them there and sending them would misleadingly imply the remote host
+    // honors the pin.
+    @MainActor @Test func remoteTargetOmitsScopeEvenWhenPicked() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            let json = LauncherStubURLProtocol.bodyJSON(req)
+            #expect(json?["scope_kind"] == nil)
+            #expect(json?["scope_id"] == nil)
+            #expect(json?["host"] as? String == "mini")
+            return (200, Data(#"{"run_id":"run-1","host_id":"mini"}"#.utf8))
+        }
+        store.kind = .agentRun
+        await store.selectDefinition("rupuso", scopeKind: "project", scopeID: "ws_a")
+        store.prompt = "hi"
+        store.selectedHosts = ["mini"]
+
+        _ = await store.launch()
+    }
+
+    // (e5) A fan-out launch targeting both "local" and a remote host sends
+    // scope on the local target's POST only — proves rule 1's "local
+    // target gets scope, remote targets don't" per-target, not per-batch.
+    @MainActor @Test func fanOutSendsScopeOnlyToLocalTarget() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            let json = LauncherStubURLProtocol.bodyJSON(req)
+            let host = json?["host"] as? String
+            if host == "mini" {
+                #expect(json?["scope_kind"] == nil)
+                return (200, Data(#"{"run_id":"run-mini","host_id":"mini"}"#.utf8))
+            }
+            // nil host == "local"
+            #expect(json?["scope_kind"] as? String == "project")
+            #expect(json?["scope_id"] as? String == "ws_a")
+            return (200, Data(#"{"run_id":"run-local","host_id":"local"}"#.utf8))
+        }
+        store.kind = .agentRun
+        await store.selectDefinition("rupuso", scopeKind: "project", scopeID: "ws_a")
+        store.prompt = "hi"
+        store.selectedHosts = ["local", "mini"]
+
+        let route = await store.launch()
+
+        #expect(route == nil) // multi-target
+        #expect(store.launchResults.count == 2)
+    }
+
+    // (e6) A plain `selectedDefinition =` assignment (bypassing
+    // `selectDefinition`, as several tests above and any future
+    // programmatic caller might do) leaves scope unset — no scope fields
+    // ride along, same as launches had before this phase.
+    @MainActor @Test func directSelectedDefinitionAssignmentCarriesNoScope() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            let json = LauncherStubURLProtocol.bodyJSON(req)
+            #expect(json?["scope_kind"] == nil)
+            #expect(json?["scope_id"] == nil)
+            return (200, Data(#"{"run_id":"run-1","host_id":"local"}"#.utf8))
+        }
+        store.kind = .agentRun
+        store.selectedDefinition = "rupuso"
+        store.prompt = "hi"
+        store.selectedHosts = ["local"]
+
+        _ = await store.launch()
+
+        #expect(store.selectedScopeKind == nil)
+        #expect(store.selectedScopeID == nil)
+    }
+
+    // (e7) Prefill seam (Phase 5A Task 7): `prefill(kind:name:scopeKind:
+    // scopeID:)` selects the definition (and its scope) synchronously
+    // enough that a subsequent `activate()` call never clobbers it — proven
+    // here by calling `activate()` *after* `prefill`, matching the
+    // presenter's real call order (prefill before the sheet's own
+    // `.task { await store.activate() }` fires on appear).
+    @MainActor @Test func prefillSelectsDefinitionAndScopeSurvivingSubsequentActivate() async {
+        let store = makeStore { req in
+            switch req.url?.path {
+            case "/api/agents":
+                return (200, Data("[\(Self.agentJSON(name: "rupuso"))]".utf8))
+            case "/api/workflows":
+                return (200, Data("[]".utf8))
+            default:
+                return (200, Data("[]".utf8))
+            }
+        }
+
+        await store.prefill(kind: .agentRun, name: "rupuso", scopeKind: "project", scopeID: "ws_a")
+
+        #expect(store.kind == .agentRun)
+        #expect(store.selectedDefinition == "rupuso")
+        #expect(store.selectedScopeKind == "project")
+        #expect(store.selectedScopeID == "ws_a")
+
+        await store.activate()
+
+        // `activate()` only populates `agents`/`workflows`/`hosts` — the
+        // prefilled selection is untouched.
+        #expect(store.selectedDefinition == "rupuso")
+        #expect(store.selectedScopeKind == "project")
+        #expect(store.selectedScopeID == "ws_a")
+        #expect(store.agents.value?.map(\.name) == ["rupuso"])
+    }
+
+    // (e8) Prefill of a workflow fetches its declared inputs exactly as a
+    // picker tap would — the prefilled sheet's input form isn't empty.
+    @MainActor @Test func prefillOfWorkflowSeedsDeclaredInputs() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/workflows/deploy" else { return (200, Data("[]".utf8)) }
+            return (200, Data(Self.workflowDetailJSON(name: "deploy").utf8))
+        }
+
+        await store.prefill(kind: .workflow, name: "deploy", scopeKind: "global", scopeID: nil)
+
+        #expect(store.kind == .workflow)
+        #expect(store.selectedDefinition == "deploy")
+        #expect(store.selectedScopeKind == "global")
+        #expect(store.selectedScopeID == nil)
+        #expect(store.workflowInputs["target"]?.required == true)
+        #expect(store.inputValues["message"] == "hello")
+    }
+
     // (f) Fan-out over the online hosts only: 2 online + 1 offline yields
     // exactly 2 POSTs (the offline host is skipped outright), with outcomes
     // recorded per host including one failure.
