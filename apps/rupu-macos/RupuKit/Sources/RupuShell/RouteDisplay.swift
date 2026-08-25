@@ -30,10 +30,11 @@ extension Route {
         switch self {
         case .overview: 4
         case .activity, .runDetail, .sessionDetail, .agentRunDetail: 2
-        // `.security` itself is real as of Phase 5B Task 3 (this value is
-        // now unused for that case — `RootView` no longer routes it through
-        // `PlaceholderScreen`) but stays listed for exhaustiveness.
-        // `.coverageDetail` is still genuinely a placeholder until Task 4.
+        // `.security`/`.coverageDetail` are both real as of Phase 5B (Task 3
+        // and Task 4 respectively) — this value is now unused for either
+        // case, `RootView` no longer routes them through `PlaceholderScreen`
+        // — but they stay listed for exhaustiveness, same as every other
+        // now-real route above.
         case .projects, .projectDetail, .security, .coverageDetail, .fleet, .usage: 5
         case .library, .agentDefinition, .workflowDefinition: 5
         }

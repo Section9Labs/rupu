@@ -211,14 +211,8 @@ public struct RootView: View {
             ProjectDetailScreen(model: model, backend: backend, wsID: wsID)
         case .security:
             SecurityScreen(model: model, backend: backend)
-        case .coverageDetail:
-            // Phase 5B, Task 3 stubs this route so Coverage-tab row taps
-            // compile and navigate somewhere real; Task 4 replaces this arm
-            // with `CoverageDetailScreen` (`.superpowers/sdd/2026-08-24-
-            // rupu-macos-phase-5b-security-usage/task-4-brief.md`). Same
-            // honest "not built yet" chrome every other placeholder route
-            // uses — no fake header, no fake data.
-            PlaceholderScreen(title: model.route.screenTitle, phase: model.route.placeholderPhase)
+        case .coverageDetail(let target, let wsID):
+            CoverageDetailScreen(model: model, backend: backend, target: target, wsID: wsID)
         case .library:
             LibraryScreen(model: model, backend: backend)
         case .agentDefinition(let name, let scopeKind, let scopeID):
