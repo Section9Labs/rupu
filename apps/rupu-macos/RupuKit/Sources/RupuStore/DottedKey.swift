@@ -7,8 +7,8 @@ import Foundation
 /// `ConfigEditor.tsx`'s `quoteSegment`/`splitDottedKey`
 /// (`crates/rupu-cp/web/src/components/ConfigEditor.tsx:46-116`). All must
 /// stay in lockstep — the same dotted-key string flows from the resolved
-/// provenance map, through this app's config-field plumbing, to the
-/// `PUT /api/config` write path, unchanged.
+/// provenance map, through this app's config-field plumbing (and, for policy
+/// lock entries, back out through `PUT /api/config/policy`), unchanged.
 ///
 /// A config key SEGMENT can itself contain a `.` — the pricing model table
 /// for a model id like `/raid/models/zai-org/GLM-5.2-FP8` produces a dotted
@@ -16,10 +16,12 @@ import Foundation
 /// plain `key.split(separator: ".")` would tear that segment in two.
 ///
 /// This module ships only the lenient READ-side decoder (`split`) plus the
-/// canonical encoder (`quoteSegment`/`join`) — this app renders resolved
-/// config fields, it never authors a `PUT /api/config` write, so there is no
-/// Swift counterpart to the Rust/TS WRITE-side `split_dotted_key` that
-/// rejects malformed input outright.
+/// canonical encoder (`quoteSegment`/`join`). The app DOES write config
+/// (`CPClient.putConfigGlobal`/`putConfigProject`/`putConfigPolicy`), but its
+/// write bodies are whole-file raw TOML or an already-encoded `lock` string
+/// array — nothing here ever needs to DECODE an arbitrary dotted key into
+/// validated segments, so there is no Swift counterpart to the Rust/TS
+/// WRITE-side `split_dotted_key` that rejects malformed input outright.
 public enum DottedKey {
     /// Quote a single key segment: a segment containing a `.` or a `"` is
     /// wrapped in double quotes with embedded `"` escaped as `\"`
