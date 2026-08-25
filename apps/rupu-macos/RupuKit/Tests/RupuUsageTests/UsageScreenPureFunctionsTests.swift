@@ -103,20 +103,43 @@ private func row(
 // MARK: - assignSeriesColors
 
 @Test func assignSeriesColorsIsStableAndDeterministicAcrossInputOrder() {
-    let mapA = assignSeriesColors(["gpt", "claude", "gemini"])
-    let mapB = assignSeriesColors(["claude", "gemini", "gpt"])
+    let mapA = assignSeriesColors(["gpt", "claude", "gemini"], pivot: .model)
+    let mapB = assignSeriesColors(["claude", "gemini", "gpt"], pivot: .model)
     #expect(mapA == mapB)
     #expect(mapA.keys.count == 3)
 }
 
 @Test func assignSeriesColorsCyclesPastTenDistinctKeys() {
     let labels = (0..<13).map { "series-\($0)" }
-    let map = assignSeriesColors(labels)
+    let map = assignSeriesColors(labels, pivot: .model)
     #expect(map.count == 13)
     // The 11th (index 10, sorted) key wraps back to the palette's first
     // color, same as the 1st (index 0) sorted key.
     let sorted = labels.sorted()
     #expect(map[sorted[0]] == map[sorted[10]])
+}
+
+@Test func assignSeriesColorsUsesTheModelIdentityPaletteOnlyForTheModelPivot() {
+    let labels = ["claude", "gpt"]
+    let modelMap = assignSeriesColors(labels, pivot: .model)
+    let providerMap = assignSeriesColors(labels, pivot: .provider)
+    // Same label set, different pivot -> different palette source, so at
+    // least one entry must disagree (both palettes are 10-long with
+    // different colors at every index by construction).
+    #expect(modelMap != providerMap)
+}
+
+@Test func assignSeriesColorsUsesTheSameThemedRampForEveryNonModelPivot() {
+    let labels = ["a", "b", "c"]
+    let provider = assignSeriesColors(labels, pivot: .provider)
+    let workflow = assignSeriesColors(labels, pivot: .workflow)
+    let host = assignSeriesColors(labels, pivot: .host)
+    let project = assignSeriesColors(labels, pivot: .project)
+    let agent = assignSeriesColors(labels, pivot: .agent)
+    #expect(provider == workflow)
+    #expect(provider == host)
+    #expect(provider == project)
+    #expect(provider == agent)
 }
 
 // MARK: - pivotTitle
