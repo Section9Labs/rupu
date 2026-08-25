@@ -43,6 +43,30 @@ private enum CoverageLayout {
 /// not per-row (each group's own `ForEach` is realized whole once that
 /// group scrolls into range) — acceptable at today's per-project target
 /// counts, which run far below the row count that broke Findings.
+///
+/// **Rows keyed by `APICoverageSummary.rowID`, not a positional offset
+/// (review fix 3 — a second live-GUI bug, distinct from the containment
+/// fix above)**: the inner row `ForEach` originally used `id: \.offset`
+/// (from `Array(group.rows.enumerated())`), reset to `0` at the start of
+/// EVERY project group's own closure invocation. Nested inside the outer
+/// `ForEach(groups, id: \.project)`, itself inside a `LazyVStack`, that
+/// per-group-local numbering is not a safe view identity: SwiftUI's
+/// diffing for a `LazyVStack`'s flattened child list does not reliably
+/// re-scope a nested `ForEach`'s ids per outer-closure invocation the way
+/// a naive read of "nested `ForEach` = nested identity scope" would
+/// suggest — two rows in DIFFERENT groups that happen to land on the same
+/// local offset (e.g. both the first row of their own group, offset `0`)
+/// can collide, and SwiftUI silently keeps only the first one, leaving
+/// reserved-but-blank space where every colliding duplicate should have
+/// rendered. On a real fleet this manifested as 8-9 project headers with
+/// almost every row beneath them blank except a couple of survivors.
+/// `APICoverageSummary.rowID` (`wsID/targetID`, see that property's own
+/// doc comment — it was ALSO the right fix for the reverse-but-related
+/// hazard this type's own top doc comment already warned about:
+/// `targetID` genuinely does collide across workspaces on a real fleet)
+/// is what the `ForEach` keys off now instead — content-derived and
+/// globally unique across the ENTIRE table, not scoped to (and therefore
+/// not vulnerable to colliding across) any one group's local numbering.
 struct CoverageTabView: View {
     let coverage: BlockState<[APICoverageSummary]>
     @Binding var sort: ListSort<CoverageSortKey>
@@ -81,7 +105,7 @@ struct CoverageTabView: View {
                             .padding(.horizontal, 12)
                             .padding(.top, 10)
                             .padding(.bottom, 4)
-                        ForEach(Array(group.rows.enumerated()), id: \.offset) { _, row in
+                        ForEach(group.rows, id: \.rowID) { row in
                             CoverageRow(row: row, onSelect: {
                                 onSelect(.coverageDetail(target: row.targetID, wsID: row.wsID))
                             })
@@ -116,7 +140,15 @@ struct CoverageTabView: View {
     /// group's rows independently by the active `sort` — a target in one
     /// project never gets interleaved with another's regardless of which
     /// column is active.
-    private static func groupedByProject(
+    ///
+    /// `internal`, not `private` (review fix) — reached directly from
+    /// `RupuSecurityTests` via `@testable import RupuSecurity` for the
+    /// "uniqueness seam" test: the actual `ForEach`/`LazyVStack` rendering
+    /// isn't unit-testable, but this pure transform — the thing that
+    /// actually feeds the `ForEach` — is, and is exactly where a
+    /// same-`targetID`-different-`wsID` pair needs to be proven to survive
+    /// intact rather than merge or drop.
+    static func groupedByProject(
         _ rows: [APICoverageSummary], sort: ListSort<CoverageSortKey>
     ) -> [(project: String, rows: [APICoverageSummary])] {
         let grouped = Dictionary(grouping: rows, by: \.project)

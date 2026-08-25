@@ -152,3 +152,25 @@ public struct APIFinding: Decodable, Sendable {
         rationale = try evidence.decode(String.self, forKey: .rationale)
     }
 }
+
+public extension APIFinding {
+    /// Globally unique identity for this finding across every registered
+    /// workspace on the global (unfiltered) `GET /api/findings` view —
+    /// review fix (Security screen, Coverage-table collision incident):
+    /// `id` alone can collide (nothing guarantees finding ids are
+    /// namespaced globally), and `targetID` alone definitely can — a real
+    /// fleet reuses `target_id` values across DIFFERENT workspaces, which
+    /// is exactly what silently collapsed most of the Coverage table's
+    /// rows onto one another when this table's `ForEach` used a
+    /// non-composite id (see `RupuSecurity/CoverageList.swift`'s
+    /// `APICoverageSummary.rowID` doc comment for the full incident). The
+    /// web keys findings by `${f.target_id}/${f.id}` alone — this widens
+    /// that by one more segment (`wsID`) precisely because `target_id`
+    /// alone is now confirmed unsafe as even half of a composite key.
+    /// `RupuSecurity/FindingsTable.swift`'s table keys its `ForEach` rows
+    /// by this rather than a positional index, closing the same
+    /// vulnerability class before it manifests there too (it hadn't yet,
+    /// only because that table's `ForEach` isn't nested the way
+    /// Coverage's is — see that file's own doc comment).
+    var rowID: String { "\(wsID)/\(targetID)/\(id)" }
+}

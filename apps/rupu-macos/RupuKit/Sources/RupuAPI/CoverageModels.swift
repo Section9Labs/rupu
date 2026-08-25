@@ -38,6 +38,22 @@ public struct APICoverageSummary: Decodable, Equatable, Sendable {
     }
 }
 
+public extension APICoverageSummary {
+    /// Globally unique identity for this row on the Security screen's
+    /// Coverage table — review fix. The type doc comment above already
+    /// warned that `targetID` collides across workspaces; that warning
+    /// went unheeded once (the Coverage table's `ForEach` originally keyed
+    /// its rows by a per-project-group positional offset, which a nested
+    /// `ForEach` inside a `LazyVStack` does not scope safely across
+    /// sibling group closures — most rows across a real multi-workspace
+    /// fleet silently collapsed onto whichever row claimed each offset
+    /// value first, leaving reserved-but-empty space for every other row
+    /// that lost the collision). `wsID` is the qualifier that makes this
+    /// composite safe; `RupuSecurity/CoverageList.swift`'s table keys its
+    /// `ForEach` rows by this instead.
+    var rowID: String { "\(wsID)/\(targetID)" }
+}
+
 /// Provenance shared by assertions, findings, and file touches under a
 /// coverage target (`Attribution` on the Rust side, `crates/rupu-coverage/
 /// src/ledger/events.rs`). `surface` is one of `"workflow"` | `"agent"` |
