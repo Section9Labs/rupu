@@ -115,7 +115,10 @@ public final class LibraryStore {
         _ = await (agentsLoad, workflowsLoad, autoflowsLoad)
     }
 
-    private func loadAgents() async {
+    /// Public for the same reason as `loadWorkflows` — the Agents tab's
+    /// failed-block Retry button reloads just this block rather than
+    /// re-fanning all three through `activate()`.
+    public func loadAgents() async {
         do {
             let rows = try await fetchAgents()
             agents = rows.isEmpty ? .empty : .content(rows)
@@ -125,10 +128,10 @@ public final class LibraryStore {
         }
     }
 
-    /// Public (unlike the sibling `loadAgents`/`loadAutoflows`) — this is
-    /// the narrower single-block reload `WorkflowDetailScreen` calls instead
+    /// The narrower single-block reload `WorkflowDetailScreen` calls instead
     /// of a full `activate()` (that screen only ever needs `workflows`, not
-    /// `agents`/`autoflows` too).
+    /// `agents`/`autoflows` too); also the Workflows tab's failed-block
+    /// Retry target.
     public func loadWorkflows() async {
         do {
             let rows = try await fetchWorkflows()
@@ -139,7 +142,9 @@ public final class LibraryStore {
         }
     }
 
-    private func loadAutoflows() async {
+    /// Public for the same reason as `loadWorkflows` — the Autoflows tab's
+    /// failed-block Retry button reloads just this block.
+    public func loadAutoflows() async {
         do {
             let rows = try await fetchAutoflows()
             autoflows = rows.isEmpty ? .empty : .content(rows)

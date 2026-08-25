@@ -122,7 +122,10 @@ public struct SessionDetailScreen: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                failedContent(message)
+                // `loadSession()`, NOT `activate()` — the full re-activate
+                // would also refetch runs and refocus the newest run,
+                // discarding whichever run the user had focused.
+                FailedBlock(subject: "session", message: message, retry: { await store.loadSession() })
             case .empty:
                 EmptyView()
             case .content(let session):
@@ -233,7 +236,10 @@ public struct SessionDetailScreen: View {
             case .loading:
                 blockShell { ProgressView().controlSize(.small) }
             case .failed(let message):
-                blockShell { failedContent(message) }
+                blockShell {
+                    FailedBlock(subject: "runs", message: message, retry: { await store.activate() })
+                        .padding(12)
+                }
             case .empty:
                 blockShell { Text("No runs yet").font(.noteText).foregroundStyle(Color.rupuMute) }
             case .content(let rows):
@@ -438,18 +444,6 @@ public struct SessionDetailScreen: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .panelStyle(.panel)
-    }
-
-    private func failedContent(_ message: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .lineLimit(2)
-        }
     }
 
     private func centeredLabel(_ label: String) -> some View {

@@ -71,6 +71,10 @@ struct CoverageTabView: View {
     let coverage: BlockState<[APICoverageSummary]>
     @Binding var sort: ListSort<CoverageSortKey>
     let onSelect: (Route) -> Void
+    /// `SecurityStore.loadCoverage()` — the failed block's Retry target,
+    /// threaded in because this view holds only the `BlockState`, never the
+    /// store.
+    let onRetry: () async -> Void
 
     var body: some View {
         Group {
@@ -78,7 +82,7 @@ struct CoverageTabView: View {
             case .loading:
                 securityLoadingBlock()
             case .failed(let message):
-                securityFailedBlock(message, subject: "coverage")
+                FailedBlock(subject: "coverage", message: message, retry: onRetry)
             case .empty:
                 securityEmptyBlock("No coverage targets")
             case .content(let rows):

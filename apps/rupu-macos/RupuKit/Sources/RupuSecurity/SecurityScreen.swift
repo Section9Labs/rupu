@@ -135,9 +135,15 @@ public struct SecurityScreen: View {
     private func tabContent(store: SecurityStore) -> some View {
         switch tab {
         case .findings:
-            FindingsTabView(findings: store.findings, sort: $findingsSort, onSelect: { model.navigate(to: $0) })
+            FindingsTabView(
+                findings: store.findings, sort: $findingsSort, onSelect: { model.navigate(to: $0) },
+                onRetry: { await store.loadFindings() }
+            )
         case .coverage:
-            CoverageTabView(coverage: store.coverage, sort: $coverageSort, onSelect: { model.navigate(to: $0) })
+            CoverageTabView(
+                coverage: store.coverage, sort: $coverageSort, onSelect: { model.navigate(to: $0) },
+                onRetry: { await store.loadCoverage() }
+            )
         }
     }
 
@@ -154,11 +160,13 @@ public struct SecurityScreen: View {
 // MARK: - Shared block chrome (used by `FindingsTable.swift`/`CoverageList.swift`)
 
 /// Package-internal (not `private`) — `FindingsTabView`/`CoverageTabView`
-/// live in separate files within this same module and share these three
-/// tiny blocks rather than each carrying its own copy, same content every
-/// other screen's `loadingBlock`/`emptyBlock`/`failedBlock` trio renders
-/// (`FleetScreen`/`LibraryScreen`), just hoisted out since this screen's
-/// version is split across files instead of living in one.
+/// live in separate files within this same module and share these two tiny
+/// blocks rather than each carrying its own copy, same content every other
+/// screen's `loadingBlock`/`emptyBlock` pair renders (`FleetScreen`/
+/// `LibraryScreen`), just hoisted out since this screen's version is split
+/// across files instead of living in one. The failed counterpart is
+/// `RupuDesign.FailedBlock` — shared app-wide, with the retry affordance
+/// these purely-local blocks never carried.
 @MainActor
 func securityLoadingBlock() -> some View {
     HStack {
@@ -179,21 +187,6 @@ func securityEmptyBlock(_ label: String) -> some View {
     }
     .frame(maxWidth: .infinity, minHeight: 120)
     .panelStyle(.panel)
-}
-
-@MainActor
-func securityFailedBlock(_ message: String, subject: String) -> some View {
-    TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load \(subject)")
-                .font(.noteText.weight(.semibold))
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
 }
 
 /// Row tap target + hover cursor — same small idiom `LibraryScreen`'s

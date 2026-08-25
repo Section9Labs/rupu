@@ -315,7 +315,11 @@ public final class SessionDetailStore {
         return body.contains("is stopped")
     }
 
-    private func loadSession() async {
+    /// Public (unlike `loadRuns`, which stays private behind `activate()`):
+    /// the session header's failed-block Retry button reloads just this
+    /// block — a full `activate()` would also refetch `runs` and refocus
+    /// the newest run, discarding whichever run the user had focused.
+    public func loadSession() async {
         do {
             session = .content(try await fetchSession())
         } catch {

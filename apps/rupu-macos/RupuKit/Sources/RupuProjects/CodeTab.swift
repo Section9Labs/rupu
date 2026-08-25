@@ -343,6 +343,7 @@ public struct CodeTab: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 12)
             Button("Retry", action: retry)
+                .buttonStyle(RupuButtonStyle.outline)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

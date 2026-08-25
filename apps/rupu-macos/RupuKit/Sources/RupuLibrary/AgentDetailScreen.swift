@@ -63,7 +63,7 @@ public struct AgentDetailScreen: View {
                 case .loading:
                     ProgressView().controlSize(.small)
                 case .failed(let message):
-                    FailedNote(message: message)
+                    FailedBlock(subject: "agent definition", message: message, retry: { await load() })
                 case .empty:
                     Text("Not found").font(.noteText).foregroundStyle(Color.rupuMute)
                 case .content(let value):
@@ -179,22 +179,6 @@ public struct AgentDetailScreen: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.rupuSurface)
                 .clipShape(RoundedRectangle(cornerRadius: 4))
-        }
-    }
-}
-
-private struct FailedNote: View {
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .lineLimit(3)
         }
     }
 }

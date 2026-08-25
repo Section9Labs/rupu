@@ -152,7 +152,7 @@ public struct LibraryScreen: View {
         case .loading:
             loadingBlock
         case .failed(let message):
-            failedBlock(message, subject: "agents")
+            FailedBlock(subject: "agents", message: message, retry: { await store.loadAgents() })
         case .empty:
             emptyBlock("No agent definitions")
         case .content(let rows):
@@ -215,7 +215,7 @@ public struct LibraryScreen: View {
         case .loading:
             loadingBlock
         case .failed(let message):
-            failedBlock(message, subject: "workflows")
+            FailedBlock(subject: "workflows", message: message, retry: { await store.loadWorkflows() })
         case .empty:
             emptyBlock("No workflow definitions")
         case .content(let rows):
@@ -276,7 +276,7 @@ public struct LibraryScreen: View {
         case .loading:
             loadingBlock
         case .failed(let message):
-            failedBlock(message, subject: "autoflows")
+            FailedBlock(subject: "autoflows", message: message, retry: { await store.loadAutoflows() })
         case .empty:
             emptyBlock("No autoflow definitions")
         case .content(let rows):
@@ -358,20 +358,6 @@ public struct LibraryScreen: View {
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .panelStyle(.panel)
-    }
-
-    private func failedBlock(_ message: String, subject: String) -> some View {
-        TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Failed to load \(subject)")
-                    .font(.noteText.weight(.semibold))
-                    .foregroundStyle(Color.status(.failed))
-                Text(message)
-                    .font(.noteText)
-                    .foregroundStyle(Color.status(.failed))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
     }
 
     private func centeredLabel(_ label: String) -> some View {

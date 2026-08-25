@@ -42,7 +42,7 @@ struct DefinitionPicker: View {
         case .loading:
             loadingRow
         case .failed(let message):
-            failedRow(message)
+            failedRow(message, subject: "agents")
         case .empty:
             emptyRow("No agents defined")
         case .content(let agents):
@@ -74,7 +74,7 @@ struct DefinitionPicker: View {
         case .loading:
             loadingRow
         case .failed(let message):
-            failedRow(message)
+            failedRow(message, subject: "workflows")
         case .empty:
             emptyRow("No workflows defined")
         case .content(let workflows):
@@ -139,16 +139,13 @@ struct DefinitionPicker: View {
         }
     }
 
-    private func failedRow(_ message: String) -> some View {
+    private func failedRow(_ message: String, subject: String) -> some View {
         listShell {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
+            // `activate()` — repeatable by contract (reloads both
+            // definition lists); the narrowest public reload the store
+            // exposes, and the sheet needs both lists anyway.
+            FailedBlock(subject: subject, message: message, retry: { await store.activate() })
                 .padding(10)
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .padding(.horizontal, 10)
         }
     }
 

@@ -58,9 +58,9 @@ struct RunDetailTabPanel: View {
         case .events:
             EventsTabContent(store: store)
         case .findings:
-            FindingsTabContent(findings: store.findings)
+            FindingsTabContent(findings: store.findings, onRetry: { await store.loadFindings() })
         case .netflow:
-            NetflowTabContent(netflow: store.netflow)
+            NetflowTabContent(netflow: store.netflow, onRetry: { await store.loadNetflow() })
         }
     }
 }
@@ -256,6 +256,10 @@ struct EventsTabContent: View {
 /// width, list layout (the rail's fixed 280pt column is gone).
 struct FindingsTabContent: View {
     let findings: BlockState<APIFindings>
+    /// `RunDetailStore.loadFindings()` — the failed block's Retry target,
+    /// threaded in because this view holds only the `BlockState`, never the
+    /// store.
+    let onRetry: () async -> Void
 
     var body: some View {
         Group {
@@ -263,7 +267,8 @@ struct FindingsTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                FailedTabNote(message: message)
+                FailedBlock(subject: "findings", message: message, retry: onRetry)
+                    .padding(12)
             case .empty:
                 Text("No findings").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let value):
@@ -343,6 +348,10 @@ struct FindingsTabContent: View {
 /// work.
 struct NetflowTabContent: View {
     let netflow: BlockState<APINetflow>
+    /// `RunDetailStore.loadNetflow()` — the failed block's Retry target,
+    /// threaded in because this view holds only the `BlockState`, never the
+    /// store.
+    let onRetry: () async -> Void
 
     var body: some View {
         Group {
@@ -350,7 +359,8 @@ struct NetflowTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                FailedTabNote(message: message)
+                FailedBlock(subject: "netflow", message: message, retry: onRetry)
+                    .padding(12)
             case .empty:
                 Text("No network calls").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let value):
@@ -405,23 +415,5 @@ struct NetflowTabContent: View {
             }
         }
         .padding(.vertical, 2)
-    }
-}
-
-// MARK: - Shared
-
-private struct FailedTabNote: View {
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .lineLimit(3)
-        }
     }
 }

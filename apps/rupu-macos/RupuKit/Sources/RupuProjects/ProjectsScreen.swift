@@ -85,7 +85,7 @@ public struct ProjectsScreen: View {
             case .loading:
                 loadingBlock
             case .failed(let message):
-                failedBlock(message)
+                FailedBlock(subject: "projects", message: message, retry: { await store.activate() })
             case .empty:
                 emptyBlock
             case .content(let rows):
@@ -155,20 +155,6 @@ public struct ProjectsScreen: View {
         }
         .frame(maxWidth: .infinity, minHeight: 120)
         .panelStyle(.panel)
-    }
-
-    private func failedBlock(_ message: String) -> some View {
-        TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Failed to load projects")
-                    .font(.noteText.weight(.semibold))
-                    .foregroundStyle(Color.status(.failed))
-                Text(message)
-                    .font(.noteText)
-                    .foregroundStyle(Color.status(.failed))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
     }
 
     private func centeredLabel(_ label: String) -> some View {

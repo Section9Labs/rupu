@@ -174,6 +174,68 @@ private func makeStore(
     #expect(agentsCounter.value == 0) // fetchAgents was never invoked by loadWorkflows()
 }
 
+/// `loadAgents()` — the single-block reload the Agents tab's failed-block
+/// Retry button calls (public like `loadWorkflows`, promoted for exactly
+/// that affordance) — retries a `.failed` block to `.content` without ever
+/// fetching the sibling blocks.
+@MainActor @Test func loadAgentsAloneRetriesAFailedAgentsBlock() async {
+    let agentsCounter = Counter()
+    let workflowsCounter = Counter()
+    let store = makeStore(
+        fetchAgents: {
+            if agentsCounter.increment() == 1 { throw StubError(description: "agents down") }
+            return [agentDef(name: "recovered")]
+        },
+        fetchWorkflows: {
+            workflowsCounter.increment()
+            return [workflowDef()]
+        }
+    )
+
+    await store.loadAgents()
+    guard case .failed(let message) = store.agents else {
+        Issue.record("expected agents to be .failed, got \(store.agents)")
+        return
+    }
+    #expect(message.contains("agents down"))
+
+    await store.loadAgents()
+
+    #expect(store.agents.value?.map(\.name) == ["recovered"])
+    if case .loading = store.workflows {} else { Issue.record("expected workflows to still be .loading") }
+    if case .loading = store.autoflows {} else { Issue.record("expected autoflows to still be .loading") }
+    #expect(workflowsCounter.value == 0)
+}
+
+/// Same contract as `loadAgentsAloneRetriesAFailedAgentsBlock`, for the
+/// Autoflows tab's failed block.
+@MainActor @Test func loadAutoflowsAloneRetriesAFailedAutoflowsBlock() async {
+    let autoflowsCounter = Counter()
+    let agentsCounter = Counter()
+    let store = makeStore(
+        fetchAgents: {
+            agentsCounter.increment()
+            return [agentDef()]
+        },
+        fetchAutoflows: {
+            if autoflowsCounter.increment() == 1 { throw StubError(description: "autoflows down") }
+            return [autoflowDef(name: "recovered")]
+        }
+    )
+
+    await store.loadAutoflows()
+    guard case .failed = store.autoflows else {
+        Issue.record("expected autoflows to be .failed, got \(store.autoflows)")
+        return
+    }
+
+    await store.loadAutoflows()
+
+    #expect(store.autoflows.value?.map(\.name) == ["recovered"])
+    if case .loading = store.agents {} else { Issue.record("expected agents to still be .loading") }
+    #expect(agentsCounter.value == 0)
+}
+
 // MARK: - setAutoflowEnabled — pending state
 
 @MainActor @Test func setAutoflowEnabledBeginsPendingImmediately() async {

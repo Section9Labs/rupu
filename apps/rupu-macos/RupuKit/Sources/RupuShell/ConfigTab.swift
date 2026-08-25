@@ -318,12 +318,7 @@ public struct ConfigTab: View {
         case .loading:
             centeredLabel("Loading…")
         case .failed(let message):
-            VStack(alignment: .leading, spacing: 10) {
-                FailedNote(message: message)
-                Button("Retry") {
-                    Task { await retryLoad(store: store) }
-                }
-            }
+            FailedBlock(subject: "config", message: message, retry: { await retryLoad(store: store) })
         case .empty:
             // Structurally unreachable today — `ConfigStore.load` only ever
             // produces `.content`/`.failed` — but `BlockState` is a shared
@@ -376,7 +371,7 @@ public struct ConfigTab: View {
         await store.load(client: client, project: selectedProjectID)
     }
 
-    /// The `FailedNote` path's Retry button — re-runs the SAME `store.load`
+    /// The failed block's Retry target — re-runs the SAME `store.load`
     /// call `activate()` makes, without touching `storeClientID`/rebuilding
     /// `store`, since the client itself never became invalid (a load
     /// failure is not a client-identity change).
@@ -515,26 +510,6 @@ struct ConfigDrafts: Equatable {
 private struct ScopeSwitchTarget: Identifiable {
     let id = UUID()
     let projectID: String?
-}
-
-/// Local copy of the "Failed to load" note every other screen module's own
-/// file already carries its own copy of (`ProjectDetailScreen`/
-/// `CoverageDetailScreen`/`AgentDetailScreen`/`WorkflowDetailScreen`) —
-/// `private` to this file, same as those.
-private struct FailedNote: View {
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .lineLimit(3)
-        }
-    }
 }
 
 // MARK: - Shared save-gate reason

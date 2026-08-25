@@ -64,7 +64,7 @@ public struct WorkflowDetailScreen: View {
                 case .loading:
                     ProgressView().controlSize(.small)
                 case .failed(let message):
-                    FailedNote(message: message)
+                    FailedBlock(subject: "workflow definition", message: message, retry: { await loadDetail() })
                 case .empty:
                     Text("Not found").font(.noteText).foregroundStyle(Color.rupuMute)
                 case .content(let value):
@@ -305,22 +305,6 @@ private struct AutoflowToggleRow: View {
                     .font(.metaText)
                     .foregroundStyle(Color.rupuErr)
             }
-        }
-    }
-}
-
-private struct FailedNote: View {
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .lineLimit(3)
         }
     }
 }

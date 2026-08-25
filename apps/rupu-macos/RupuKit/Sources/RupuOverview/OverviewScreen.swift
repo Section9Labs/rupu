@@ -294,17 +294,7 @@ public struct OverviewScreen: View {
                     }
                 }
             } else if let pageError = dashboardStore.pageError {
-                TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Failed to load dashboard")
-                            .font(.noteText.weight(.semibold))
-                            .foregroundStyle(Color.status(.failed))
-                        Text(pageError)
-                            .font(.noteText)
-                            .foregroundStyle(Color.status(.failed))
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                FailedBlock(subject: "dashboard", message: pageError, retry: { await activate() })
             } else {
                 loadingBlock
             }

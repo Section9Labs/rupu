@@ -631,7 +631,12 @@ public final class RunDetailStore {
         }
     }
 
-    private func loadGraph() async {
+    /// Public (unlike `loadDetail`, which stays private behind `activate()`
+    /// and the stream's resnapshot): the step-graph failed block's Retry
+    /// button reloads just this block — a full `activate()` would also tear
+    /// down and restart the live event stream and reset transcript focus,
+    /// far too heavy for retrying one failed GET.
+    public func loadGraph() async {
         do {
             graph = .content(try await fetchGraph())
         } catch {
@@ -640,7 +645,9 @@ public final class RunDetailStore {
         }
     }
 
-    private func loadNetflow() async {
+    /// Public for the same reason as `loadGraph` — the Netflow tab's
+    /// failed-block Retry target.
+    public func loadNetflow() async {
         do {
             netflow = .content(try await fetchNetflow())
         } catch {
@@ -649,7 +656,9 @@ public final class RunDetailStore {
         }
     }
 
-    private func loadFindings() async {
+    /// Public for the same reason as `loadGraph` — the Findings tab's
+    /// failed-block Retry target.
+    public func loadFindings() async {
         do {
             findings = .content(try await fetchFindings())
         } catch {
