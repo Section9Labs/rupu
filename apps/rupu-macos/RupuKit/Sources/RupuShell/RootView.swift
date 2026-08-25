@@ -68,7 +68,11 @@ public struct RootView: View {
                 // window title, in sync — `ShellToolbar` carries no title
                 // item of its own (see its doc comment).
                 .navigationTitle(model.route.screenTitle)
-                .toolbar { ShellToolbar(model: model, showLauncher: $model.showLauncher, backend: backend, palette: palette) }
+                // `.toolbar(id:)`, not plain `.toolbar {}`: the id'd form
+                // is what makes the toolbar user-customizable (right-click
+                // → "Customize Toolbar…"). Never add a second plain
+                // `.toolbar {}` here — see `ShellToolbar`'s doc comment.
+                .toolbar(id: "rupu.shell") { ShellToolbar(model: model, showLauncher: $model.showLauncher, backend: backend, palette: palette) }
         }
         // Hidden, zero-visual buttons rather than the toolbar controls
         // themselves carrying `.keyboardShortcut` — this keeps ⌘N/⌘K live

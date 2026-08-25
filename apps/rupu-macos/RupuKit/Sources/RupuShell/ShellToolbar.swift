@@ -5,17 +5,37 @@ import RupuDesign
 import RupuOverview
 
 /// Detail-pane toolbar: project-scope menu, time-range picker, the
-/// Overview-only Customize menu, search, "+ New Run" launcher, and the
+/// Overview Customize menu, search, "+ New Run" launcher, and the
 /// live-stream status. The screen title is not an item here — `RootView`
 /// sets `.navigationTitle` on the detail pane, which puts the title in
 /// the toolbar's leading slot (and keeps the window title in sync) the
 /// way native macOS apps do.
 ///
-/// Toolbar controls use SF Symbols with visible text labels
-/// (`.titleAndIcon`), per the Finder/Mail toolbar idiom. Lucide glyphs
-/// remain the icon contract for the sidebar and pane content (web
-/// parity); window chrome is deliberately native. Appearance selection
-/// lives in Settings (⌘,), not here.
+/// This is `CustomizableToolbarContent`, attached with `.toolbar(id:)` in
+/// `RootView`, so users get the native right-click → "Customize Toolbar…"
+/// / display-mode menu. Two contracts fall out of that:
+///
+/// - Every item's `id` is what macOS keys the saved arrangement on —
+///   treat the strings as persisted contract; renaming one silently drops
+///   it from users' saved layouts.
+/// - The item set must be static (customizable builders reject `if`), so
+///   the Overview-only Customize menu is always present and `.disabled`
+///   off-Overview — the standard macOS idiom for contextual toolbar items
+///   (Mail's Reply with no selection), not a route-conditional item. Do
+///   NOT reintroduce a second plain `.toolbar {}` for conditional items:
+///   mixing plain and `id:` toolbar content on the same view makes
+///   AppKit drop "Customize Toolbar…" entirely (verified empirically on
+///   macOS 26).
+///
+/// Toolbar controls carry a `Label` (SF Symbol + title) but do NOT force
+/// a label style: the toolbar's display mode ("Icon Only" / "Icon and
+/// Text" in its context menu) decides whether the title renders beneath
+/// the icon. Forcing `.titleAndIcon` inside the control — the pre-fix
+/// idiom — printed the title twice in Icon-and-Text mode, once inside
+/// the button and again below it. Lucide glyphs remain the icon contract
+/// for the sidebar and pane content (web parity); window chrome is
+/// deliberately native. Appearance selection lives in Settings (⌘,), not
+/// here.
 ///
 /// The ⌘N/⌘K shortcuts live on separate hidden buttons in `RootView` (so
 /// they fire regardless of toolbar focus), not on the visible buttons —
@@ -32,7 +52,7 @@ import RupuOverview
 /// `handleHealthChange`). `palette` is `nil` for the brief window before
 /// the first healthy connection; the button silently no-ops then, same
 /// "no client yet" degrade `scopeMenu`'s `loadProjects()` already uses.
-struct ShellToolbar: ToolbarContent {
+struct ShellToolbar: CustomizableToolbarContent {
     @Bindable var model: AppModel
     @Binding var showLauncher: Bool
     let backend: BackendController
@@ -40,38 +60,61 @@ struct ShellToolbar: ToolbarContent {
     @AppStorage(OverviewWidgets.storageKey) private var overviewWidgetsData: Data = Data()
     @State private var projects: [APIProjectRow] = []
 
-    var body: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
+    var body: some CustomizableToolbarContent {
+        ToolbarItem(id: "scope", placement: .navigation) {
             scopeMenu
         }
 
-        ToolbarItem(placement: .principal) {
-            Picker("Range", selection: $model.range) {
-                ForEach(TimeRange.allCases, id: \.self) { range in
-                    Text(range.rawValue).tag(range)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 160)
+        ToolbarItem(id: "range", placement: .principal) {
+            rangeControl
         }
 
-        ToolbarItemGroup(placement: .primaryAction) {
-            if case .overview = model.route {
-                customizeMenu
-            }
+        ToolbarItem(id: "customizeOverview", placement: .primaryAction) {
+            customizeMenu
+                .disabled(!isOverview)
+        }
+
+        ToolbarItem(id: "search", placement: .primaryAction) {
             searchButton
+        }
+
+        ToolbarItem(id: "newRun", placement: .primaryAction) {
             newRunButton
+        }
+
+        ToolbarItem(id: "live", placement: .primaryAction) {
             liveStatus
         }
     }
 
-    /// Overview-only Customize menu (Task 6): five checkmark toggles over
-    /// `OverviewWidgets`' visibility fields — keyed off `model.route` being
-    /// `.overview` itself (a real route-case check, not a string compare
-    /// against `screenTitle`, which is just display text and could
-    /// coincidentally collide with another screen's title). `Toggle` inside
-    /// a `Menu` renders as a checkmark item on macOS, same chrome as any
-    /// system menu's option toggles.
+    private var isOverview: Bool {
+        if case .overview = model.route { return true }
+        return false
+    }
+
+    /// A bare segmented picker — no fixed width, no wrapper chrome. The
+    /// toolbar renders this as one unified segmented control (the Finder
+    /// view-switcher idiom), which is the "single area" look; the previous
+    /// `.frame(width: 160)` + in-control text treatment read as buttons
+    /// stacked inside a capsule. (A `ControlGroup` wrapper was tried first
+    /// and collapses to zero width inside a customizable toolbar item.)
+    private var rangeControl: some View {
+        Picker("Range", selection: $model.range) {
+            ForEach(TimeRange.allCases, id: \.self) { range in
+                Text(range.rawValue).tag(range)
+            }
+        }
+        .pickerStyle(.segmented)
+        .help("Time range for lists and charts")
+    }
+
+    /// Overview Customize menu (Task 6): five checkmark toggles over
+    /// `OverviewWidgets`' visibility fields — `.disabled` off-Overview via
+    /// a real route-case check (not a string compare against
+    /// `screenTitle`, which is just display text and could coincidentally
+    /// collide with another screen's title). `Toggle` inside a `Menu`
+    /// renders as a checkmark item on macOS, same chrome as any system
+    /// menu's option toggles.
     ///
     /// Reads/writes `overviewWidgetsData` directly (this view's own
     /// `@AppStorage(OverviewWidgets.storageKey)` declaration) — the same
@@ -89,7 +132,6 @@ struct ShellToolbar: ToolbarContent {
             Toggle("Fleet strip", isOn: overviewWidgetToggle(\.fleet))
         } label: {
             Label("Customize", systemImage: "slider.horizontal.3")
-                .labelStyle(.titleAndIcon)
         }
         .help("Choose which Overview widgets are shown")
     }
@@ -125,7 +167,6 @@ struct ShellToolbar: ToolbarContent {
             .labelsHidden()
         } label: {
             Label(scopeTitle, systemImage: "folder")
-                .labelStyle(.titleAndIcon)
         }
         .help("Filter to a project")
         .task {
@@ -148,7 +189,6 @@ struct ShellToolbar: ToolbarContent {
             Task { await palette?.open() }
         } label: {
             Label("Search", systemImage: "magnifyingglass")
-                .labelStyle(.titleAndIcon)
         }
         .help("Search (⌘K)")
     }
@@ -162,7 +202,6 @@ struct ShellToolbar: ToolbarContent {
             showLauncher = true
         } label: {
             Label("New Run", systemImage: "plus")
-                .labelStyle(.titleAndIcon)
         }
         .buttonStyle(.borderedProminent)
         .help("New run (⌘N)")
@@ -171,8 +210,6 @@ struct ShellToolbar: ToolbarContent {
     private var liveStatus: some View {
         Label(model.liveConnected ? "Live" : "Offline",
               systemImage: "dot.radiowaves.left.and.right")
-            .labelStyle(.titleAndIcon)
-            .font(.metaText)
             .foregroundStyle(model.liveConnected ? Color.rupuBrand700 : Color.rupuMute)
             .help(model.liveConnected ? "Event stream connected" : "Event stream disconnected")
     }
