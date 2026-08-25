@@ -421,6 +421,47 @@ public actor CPClient {
         return try await post(path, query: scopeQuery(scopeKind: scopeKind, scopeID: scopeID), body: EmptyBody?.none)
     }
 
+    // MARK: - Config (read/write)
+
+    /// `GET /api/config[?project=<ws_id>]` — effective resolved config, per-
+    /// key provenance, raw global/project TOML text, and CP runtime status.
+    /// `project` (default `nil`) omits the `?project=` param entirely,
+    /// mirroring the server's own `ProjectQuery { project: Option<String> }`
+    /// (`crates/rupu-cp/src/api/config.rs`).
+    public func fetchConfig(project: String? = nil) async throws -> APIConfigView {
+        var query: [URLQueryItem] = []
+        if let project {
+            query.append(URLQueryItem(name: "project", value: project))
+        }
+        return try await get("api/config", query: query)
+    }
+
+    /// `PUT /api/config/global` — persist a raw TOML edit to the global
+    /// layer. 501 (see `put(_:body:)`'s doc comment) when this `cp serve`
+    /// has no launcher installed (`require_writable` in `crates/rupu-cp/src/
+    /// api/config.rs`) — Task 4 maps that status to the app's read-only
+    /// mode. The success body is a bare `{"ok": true, "restart_required":
+    /// []}` acknowledgement no caller needs, so this returns `Void`.
+    public func putConfigGlobal(raw: String) async throws {
+        try await put("api/config/global", body: ConfigRawWriteBody(raw: raw))
+    }
+
+    /// `PUT /api/config/project/:id` — persist a raw TOML edit to one
+    /// project's `.rupu/config.toml`. Same 501-without-launcher gate and
+    /// `Void` return as `putConfigGlobal`; additionally 400s when the edit
+    /// would set a key enforced by the GLOBAL `[policy].lock` list
+    /// (`reject_locked_project_keys`).
+    public func putConfigProject(id: String, raw: String) async throws {
+        try await put("api/config/project/\(id)", body: ConfigRawWriteBody(raw: raw))
+    }
+
+    /// `PUT /api/config/policy` — set the GLOBAL `[policy].lock` enforced-key
+    /// list. Same 501-without-launcher gate and `Void` return as
+    /// `putConfigGlobal`.
+    public func putConfigPolicy(lock: [String]) async throws {
+        try await put("api/config/policy", body: ConfigPolicyWriteBody(lock: lock))
+    }
+
     // MARK: - Query helpers
 
     private func offsetLimitQuery(offset: Int, limit: Int, host: String? = nil) -> [URLQueryItem] {
@@ -601,6 +642,27 @@ public actor CPClient {
         let url = try buildURL(path: path, query: query)
         var request = authorizedRequest(url: url)
         request.httpMethod = "DELETE"
+        let (data, response) = try await perform(request)
+        try mapErrorStatus(response, data: data, url: url)
+    }
+
+    /// `PUT` with a required JSON body and no decode step — used by the
+    /// config write routes (`putConfigGlobal`/`putConfigProject`/
+    /// `putConfigPolicy`), whose success body is a bare acknowledgement
+    /// object no caller needs (same rationale as `delete`'s doc comment for
+    /// skipping a `T: Decodable` return). Same error mapping as `get`/
+    /// `post`/`delete` (`mapErrorStatus`) — a non-2xx still throws
+    /// `CPError.http`, so a 501 (this deployment has no `RunLauncher`
+    /// installed — see `require_writable` in `crates/rupu-cp/src/api/
+    /// config.rs`) surfaces as `CPError.http(status: 501, ...)` exactly the
+    /// way every other write route's 501 already does, distinguishable by
+    /// callers matching on `.status` (Task 4 maps it to read-only mode).
+    func put<B: Encodable>(_ path: String, body: B) async throws {
+        let url = try buildURL(path: path, query: [])
+        var request = authorizedRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
         let (data, response) = try await perform(request)
         try mapErrorStatus(response, data: data, url: url)
     }
