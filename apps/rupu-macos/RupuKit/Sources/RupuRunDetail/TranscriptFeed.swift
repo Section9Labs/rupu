@@ -1,14 +1,30 @@
 import SwiftUI
 import Foundation
 import RupuAPI
+import RupuStore
 import RupuDesign
 
 /// Renders a flat `[TranscriptEvent]` array as a scrolling feed. Deliberately
-/// has **no run-specific coupling** — it doesn't know about `RunDetailStore`,
-/// a run ID, or a transcript path; it just renders whatever events it's
-/// handed, in order. `RunDetailScreen` (Task 8) feeds it `store.transcript`;
-/// Task 9 (Session detail) is expected to reuse this exact view unchanged
-/// for a session's own transcript.
+/// has **no run-specific coupling of its own** — it doesn't know about
+/// `RunDetailStore`, a run ID, or a transcript path; it just renders
+/// whatever events it's handed, in order. `RunDetailScreen` (Task 8) feeds
+/// it `store.transcript`; Task 9 (Session detail) reuses this exact view
+/// unchanged for a session's own transcript.
+///
+/// **`sourcePreviewStore` is the one deliberate exception** (Phase 6B, Task
+/// 5): an optional, defaulted-`nil` `SourcePreviewStore` that — when
+/// present — lets an `ast_grep` tool-call row's matches expand into an
+/// inline source slice / CST tree (`SourcePreview`/`AstTreeView`). This view
+/// still doesn't know a run ID or host itself; those live inside the store
+/// it's handed. Callers that don't pass one (`SessionDetailScreen`,
+/// `AgentRunDetailScreen`) render exactly as before — plain `ast_grep`
+/// match text, no expand affordance. Only `RunDetailScreen`'s transcript tab
+/// passes one currently: `SourcePreviewStore`'s `id` targets `GET /api/runs/
+/// :id/source|ast`, which 404s for a standalone agent run the same way `GET
+/// /api/runs/:id` already does (see `AgentRunDetailScreen`'s own doc
+/// comment) — wiring it into that screen, or into a session's per-turn
+/// agent-run transcript, would point the fetch at an endpoint that can't
+/// answer for that ID.
 ///
 /// Per the brief's render list: `assistant_message` becomes a prose block;
 /// `tool_call` pairs with its matching `tool_result` (by `call_id`) into one
@@ -32,9 +48,11 @@ import RupuDesign
 /// silently) — is skipped: nothing in this phase's design renders them yet.
 public struct TranscriptFeed: View {
     private let events: [TranscriptEvent]
+    private let sourcePreviewStore: SourcePreviewStore?
 
-    public init(events: [TranscriptEvent]) {
+    public init(events: [TranscriptEvent], sourcePreviewStore: SourcePreviewStore? = nil) {
         self.events = events
+        self.sourcePreviewStore = sourcePreviewStore
     }
 
     public var body: some View {
@@ -42,7 +60,7 @@ public struct TranscriptFeed: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                        TranscriptRowView(row: row)
+                        TranscriptRowView(row: row, sourcePreviewStore: sourcePreviewStore)
                             .id(index)
                     }
                     if rows.isEmpty {
@@ -116,13 +134,14 @@ private enum TranscriptRow {
 
 private struct TranscriptRowView: View {
     let row: TranscriptRow
+    let sourcePreviewStore: SourcePreviewStore?
 
     var body: some View {
         switch row {
         case .single(let event):
             singleRow(event)
         case .toolPair(let call, let result):
-            ToolCallRow(call: call, result: result)
+            ToolCallRow(call: call, result: result, sourcePreviewStore: sourcePreviewStore)
         }
     }
 
@@ -180,6 +199,7 @@ private struct ProseRow: View {
 private struct ToolCallRow: View {
     let call: TranscriptEvent
     let result: TranscriptEvent?
+    let sourcePreviewStore: SourcePreviewStore?
 
     @State private var expanded = false
 
@@ -212,6 +232,25 @@ private struct ToolCallRow: View {
         return nil
     }
 
+    /// `ast_grep` tool calls carry the raw builtin tool name on the wire
+    /// (verified against `crates/rupu-cp/web/src/components/transcript/
+    /// transcriptView.ts`'s `classify(tool:)`, which switches on this exact
+    /// literal) — no separate `kind` field exists on `TranscriptEvent`
+    /// itself, so this checks `tool` directly.
+    private var isAstGrep: Bool { tool == "ast_grep" }
+
+    /// Parsed `ast_grep` matches — structured (`resultStructured`) first,
+    /// falling back to a text-parse of `resultOutput` when structured data
+    /// is absent (an older run, or a text-only transcript) — same fallback
+    /// order the web `ToolCard`'s `AstGrepBody` uses. Empty (not just for a
+    /// non-`ast_grep` tool) whenever neither source yields anything to show.
+    private var astGrepMatches: [AstGrepTranscriptParsing.Match] {
+        guard isAstGrep else { return [] }
+        let structured = AstGrepTranscriptParsing.fromStructured(resultStructured)
+        guard structured.isEmpty else { return structured }
+        return AstGrepTranscriptParsing.fromText(resultOutput ?? "")
+    }
+
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
             VStack(alignment: .leading, spacing: 8) {
@@ -231,6 +270,15 @@ private struct ToolCallRow: View {
                 }
                 if let resultStructured {
                     jsonBlock(label: "Structured", json: resultStructured)
+                }
+                // Phase 6B, Task 5: an `ast_grep` result's matches each get
+                // their own file:line[:col] row, with an inline "source" /
+                // "tree" disclosure per match once `sourcePreviewStore` is
+                // available — additive alongside the raw Output/Structured
+                // blocks above, never replacing them (nothing this view
+                // already showed becomes harder to see).
+                if isAstGrep, resultError == nil, !astGrepMatches.isEmpty {
+                    astGrepMatchesSection
                 }
                 if result == nil {
                     Text("Awaiting result")
@@ -260,6 +308,15 @@ private struct ToolCallRow: View {
         }
         .padding(10)
         .panelStyle(.innerCard)
+    }
+
+    private var astGrepMatchesSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Eyebrow("\(astGrepMatches.count) match\(astGrepMatches.count == 1 ? "" : "es")")
+            ForEach(Array(astGrepMatches.enumerated()), id: \.offset) { _, match in
+                AstGrepMatchRow(match: match, sourcePreviewStore: sourcePreviewStore)
+            }
+        }
     }
 
     @ViewBuilder
@@ -400,6 +457,129 @@ private struct RunCompleteRow: View {
         .padding(10)
         .panelStyle(.innerCard)
     }
+}
+
+// MARK: - ast_grep match rows (Phase 6B, Task 5)
+
+/// One parsed `ast_grep` match's `file:line:col` header, its matched text
+/// (when known), and — once `sourcePreviewStore` is non-`nil` — independent
+/// "source"/"tree" toggle buttons mounting `SourcePreview`/`AstTreeView`
+/// beneath it. Mirrors the web `AstGrepMatchRow`/`AstGrepTextMatchRow`'s own
+/// "either, both, or neither can be open at once" shape via two separate
+/// `@State` flags, ported as one row type since this phase doesn't
+/// distinguish the structured-vs-text-parsed match shapes the web keeps as
+/// two components (`AstGrepTranscriptParsing.Match` already unifies them).
+private struct AstGrepMatchRow: View {
+    let match: AstGrepTranscriptParsing.Match
+    let sourcePreviewStore: SourcePreviewStore?
+
+    @State private var sourceOpen = false
+    @State private var treeOpen = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Text("\(match.file):\(match.startLine):\(match.startCol)")
+                    .font(.dataMono(10.5))
+                    .foregroundStyle(Color.rupuMute)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if sourcePreviewStore != nil {
+                    Button("source") { sourceOpen.toggle() }
+                        .buttonStyle(.plain)
+                        .font(.metaText)
+                        .foregroundStyle(Color.rupuBrand)
+                    Button("tree") { treeOpen.toggle() }
+                        .buttonStyle(.plain)
+                        .font(.metaText)
+                        .foregroundStyle(Color.rupuBrand)
+                }
+                Spacer(minLength: 0)
+            }
+            if let text = match.text, !text.isEmpty {
+                Text(text)
+                    .font(.dataMono(10.5))
+                    .foregroundStyle(Color.rupuInk)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+            }
+            if sourceOpen, let sourcePreviewStore {
+                SourcePreview(store: sourcePreviewStore, path: match.file, line: match.startLine)
+            }
+            if treeOpen, let sourcePreviewStore {
+                AstTreeView(store: sourcePreviewStore, path: match.file, line: match.startLine, col: match.startCol)
+            }
+        }
+        .padding(8)
+        .panelStyle(.innerCard)
+    }
+}
+
+/// Pure `ast_grep` match parsing — no view/state dependency, so it's
+/// directly `@Test`-able via `@testable import RupuRunDetail` without any
+/// SwiftUI rendering. Two sources, same fallback order the web `ToolCard`'s
+/// `AstGrepBody` uses: `fromStructured` reads `tool_result.structured`
+/// (camelCase `matches[].{file,range:{startLine,startCol,...}, text}`, per
+/// `crates/rupu-cp/src/api/...`'s `AstGrepStructured` shape); `fromText`
+/// falls back to a line-by-line `path:line:col: text` parse of the plain
+/// output for a run recorded before structured `ast_grep` output existed.
+/// Deliberately narrower than the web's own `AstGrepMatch` (no metavar
+/// bindings/highlight table) — this phase only needs enough per match to
+/// target `SourcePreview`/`AstTreeView`'s `(path, line, col)`, not to
+/// reproduce the web's full match-card rendering.
+enum AstGrepTranscriptParsing {
+    struct Match: Equatable {
+        let file: String
+        let startLine: Int
+        let startCol: Int
+        let text: String?
+    }
+
+    /// Parses `tool_result.structured`'s `matches: [{ file, range?:
+    /// {startLine,startCol,endLine,endCol}, text? }]` shape. A match missing
+    /// `file` or a well-formed `range` is skipped rather than surfaced with
+    /// fabricated coordinates — same "skip the malformed entry, don't
+    /// corrupt the render" discipline the web parser follows. Returns `[]`
+    /// (not just for absent/malformed input) whenever nothing usable is
+    /// found, which is exactly the fallback-to-text-parse trigger
+    /// `astGrepMatches` above checks.
+    static func fromStructured(_ value: JSONValue?) -> [Match] {
+        guard case .object(let root)? = value, case .array(let rawMatches)? = root["matches"] else { return [] }
+        return rawMatches.compactMap { raw -> Match? in
+            guard case .object(let m) = raw, case .string(let file)? = m["file"] else { return nil }
+            guard case .object(let range)? = m["range"],
+                  case .number(let startLine)? = range["startLine"],
+                  case .number(let startCol)? = range["startCol"]
+            else { return nil }
+            let text: String? = {
+                if case .string(let t)? = m["text"] { return t }
+                return nil
+            }()
+            return Match(file: file, startLine: Int(startLine), startCol: Int(startCol), text: text)
+        }
+    }
+
+    /// Parses the compact `path:line:col: text` line format `ast_grep`'s
+    /// plain-text output uses — direct port of the web `parseAstGrepText`'s
+    /// regex, minus the per-file grouping this phase's flat row list doesn't
+    /// need.
+    static func fromText(_ output: String) -> [Match] {
+        output.split(separator: "\n", omittingEmptySubsequences: true).compactMap { substring -> Match? in
+            let line = String(substring)
+            guard let match = Self.lineRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+                  match.numberOfRanges == 5,
+                  let fileRange = Range(match.range(at: 1), in: line),
+                  let lineRange = Range(match.range(at: 2), in: line),
+                  let colRange = Range(match.range(at: 3), in: line),
+                  let textRange = Range(match.range(at: 4), in: line),
+                  let lineNumber = Int(line[lineRange]),
+                  let colNumber = Int(line[colRange])
+            else { return nil }
+            return Match(file: String(line[fileRange]), startLine: lineNumber, startCol: colNumber, text: String(line[textRange]))
+        }
+    }
+
+    private static let lineRegex = try! NSRegularExpression(pattern: #"^(.*?):(\d+):(\d+): (.*)$"#)
 }
 
 // MARK: - JSON pretty printing

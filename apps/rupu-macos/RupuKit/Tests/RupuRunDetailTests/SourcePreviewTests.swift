@@ -1,0 +1,417 @@
+import Testing
+import Foundation
+import RupuAPI
+@testable import RupuStore
+@testable import RupuRunDetail
+
+// MARK: - Test infra (generation-token-isolated stub — see
+// `CodeStoreTests.CodeStubURLProtocol`'s doc comment for the full
+// rationale; duplicated here because it's `internal`/file-scoped to that
+// sibling test file in a different target, same as every other store-test
+// file's own copy of this rig).
+
+/// Path-routing HTTP stub for `SourcePreviewStore`'s two endpoints (`GET
+/// .../source`, `GET .../ast`). A monotonically increasing generation token
+/// (stamped into each session via `httpAdditionalHeaders`, read back off the
+/// request itself) makes a straggling response from a PRIOR test's session
+/// harmlessly fail as `.cancelled` instead of corrupting the CURRENT test's
+/// `handler`/`hits` state under full-suite parallel load.
+final class SourcePreviewStubURLProtocol: URLProtocol {
+    private static let generationHeader = "X-SourcePreview-Stub-Generation"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var handler: (@Sendable (URLRequest) -> (status: Int, body: Data))?
+    nonisolated(unsafe) private static var pathHits: [String: Int] = [:]
+    nonisolated(unsafe) private static var currentGeneration = 0
+
+    static func session() -> URLSession {
+        let generation = lock.withLock { currentGeneration }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SourcePreviewStubURLProtocol.self]
+        config.httpAdditionalHeaders = [generationHeader: String(generation)]
+        return URLSession(configuration: config)
+    }
+
+    static func reset(handler: @escaping @Sendable (URLRequest) -> (status: Int, body: Data)) {
+        lock.withLock {
+            currentGeneration += 1
+            pathHits = [:]
+            self.handler = handler
+        }
+    }
+
+    static func hits(_ path: String) -> Int {
+        lock.withLock { pathHits[path, default: 0] }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let requestGeneration = request.value(forHTTPHeaderField: Self.generationHeader).flatMap(Int.init) ?? -1
+        let (isCurrent, activeHandler): (Bool, (@Sendable (URLRequest) -> (status: Int, body: Data))?) = Self.lock.withLock {
+            (requestGeneration == Self.currentGeneration, Self.handler)
+        }
+        guard isCurrent else {
+            client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+            return
+        }
+        if let path = request.url?.path {
+            Self.lock.withLock { Self.pathHits[path, default: 0] += 1 }
+        }
+        guard let handler = activeHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let (status, body) = handler(request)
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+@Suite(.serialized)
+@MainActor
+struct SourcePreviewStoreTests {
+    private func makeClient(respond: @escaping @Sendable (URLRequest) -> (status: Int, body: Data)) -> CPClient {
+        SourcePreviewStubURLProtocol.reset(handler: respond)
+        return CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: SourcePreviewStubURLProtocol.session()
+        )
+    }
+
+    nonisolated private static func sourceJSON(available: Bool, line: Int = 10, reason: String? = nil) -> String {
+        guard available else {
+            let reasonJSON = reason.map { "\"\($0)\"" } ?? "null"
+            return """
+            {"available": false, "path": null, "language": null, "startLine": null,
+             "endLine": null, "targetLine": null, "totalLines": null, "lines": null,
+             "reason": \(reasonJSON)}
+            """
+        }
+        return """
+        {"available": true, "path": "src/a.rs", "language": "rust", "startLine": \(line - 1),
+         "endLine": \(line + 1), "targetLine": \(line), "totalLines": 100,
+         "lines": [{"n": \(line), "text": "let x = 1;"}], "reason": null}
+        """
+    }
+
+    nonisolated private static func astJSON(available: Bool, reason: String? = nil) -> String {
+        guard available else {
+            let reasonJSON = reason.map { "\"\($0)\"" } ?? "null"
+            return #"{"available": false, "language": null, "root": null, "truncated": null, "reason": \#(reasonJSON)}"#
+        }
+        return """
+        {"available": true, "language": "rust",
+         "root": {"kind": "source_file", "named": true, "field": null, "startLine": 1,
+                   "startCol": 1, "endLine": 1, "endCol": 1, "matched": true, "children": []},
+         "truncated": false}
+        """
+    }
+
+    // MARK: - "second expand = no second hit"
+
+    @Test func loadSourceIfNeededCachesPerKeySoASecondExpandDoesNotRefetch() async {
+        let hits = LockedCounter()
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/source" else { return (404, Data()) }
+            hits.increment()
+            return (200, Data(Self.sourceJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+
+        #expect(hits.value == 1, "a second/third expand of the same (path,line) must not re-fetch")
+        guard case .content(let slice) = store.sourceState(path: "src/a.rs", line: 10) else {
+            Issue.record("expected .content, got \(String(describing: store.sourceState(path: "src/a.rs", line: 10)))")
+            return
+        }
+        #expect(slice.available)
+        #expect(slice.targetLine == 10)
+    }
+
+    @Test func loadAstIfNeededCachesPerKeySoASecondExpandDoesNotRefetch() async {
+        let hits = LockedCounter()
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/ast" else { return (404, Data()) }
+            hits.increment()
+            return (200, Data(Self.astJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        await store.loadAstIfNeeded(path: "src/a.rs", line: 2, col: 8)
+        await store.loadAstIfNeeded(path: "src/a.rs", line: 2, col: 8)
+
+        #expect(hits.value == 1, "a second expand of the same (path,line,col) must not re-fetch")
+        guard case .content(let response) = store.astState(path: "src/a.rs", line: 2, col: 8) else {
+            Issue.record("expected .content, got \(String(describing: store.astState(path: "src/a.rs", line: 2, col: 8)))")
+            return
+        }
+        #expect(response.available)
+    }
+
+    /// Two different (path,line) keys are independent — a second cache slot
+    /// must actually fetch (this is the flip side of the "no second hit"
+    /// test above: proving the guard is keyed correctly, not just present).
+    @Test func differentKeysEachFetchIndependently() async {
+        let hits = LockedCounter()
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/source" else { return (404, Data()) }
+            hits.increment()
+            return (200, Data(Self.sourceJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+        await store.loadSourceIfNeeded(path: "src/b.rs", line: 10)
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 20)
+
+        #expect(hits.value == 3)
+    }
+
+    // MARK: - Unavailable reason surfaces verbatim
+
+    @Test func unavailableSourceReasonSurfacesVerbatim() async {
+        let reason = "Source preview is not available for remote-host runs yet."
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/source" else { return (404, Data()) }
+            return (200, Data(Self.sourceJSON(available: false, reason: reason).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: "mini", client: client)
+
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+
+        guard case .content(let slice) = store.sourceState(path: "src/a.rs", line: 10) else {
+            Issue.record("expected .content (available:false is still a 200), got \(String(describing: store.sourceState(path: "src/a.rs", line: 10)))")
+            return
+        }
+        #expect(!slice.available)
+        #expect(slice.reason == reason, "the server's reason must render verbatim, never a synthesized enum")
+    }
+
+    @Test func unavailableAstReasonSurfacesVerbatim() async {
+        let reason = "No grammar registered for this file type."
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/ast" else { return (404, Data()) }
+            return (200, Data(Self.astJSON(available: false, reason: reason).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        await store.loadAstIfNeeded(path: "src/a.rs", line: 1, col: 1)
+
+        guard case .content(let response) = store.astState(path: "src/a.rs", line: 1, col: 1) else {
+            Issue.record("expected .content, got \(String(describing: store.astState(path: "src/a.rs", line: 1, col: 1)))")
+            return
+        }
+        #expect(!response.available)
+        #expect(response.reason == reason)
+    }
+
+    // MARK: - Run-identity change flushes cache
+
+    @Test func setRunWithADifferentRunIDFlushesBothCaches() async {
+        let client = makeClient { req in
+            if req.url?.path == "/api/runs/run-a/source" {
+                return (200, Data(Self.sourceJSON(available: true).utf8))
+            }
+            return (404, Data())
+        }
+        let store = SourcePreviewStore(runID: "run-a", host: nil, client: client)
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+        #expect(store.sourceState(path: "src/a.rs", line: 10) != nil)
+
+        store.setRun(runID: "run-b", host: nil)
+
+        #expect(store.runID == "run-b")
+        #expect(store.sourceState(path: "src/a.rs", line: 10) == nil, "a run-identity change must flush the cache, even for a key the new run hasn't fetched yet")
+    }
+
+    /// Same-`runID` call is a no-op — an idempotent re-`activate()` (or a
+    /// redundant `setRun` from a screen that doesn't itself track whether
+    /// the run actually changed) must never discard a cache the operator is
+    /// still looking at.
+    @Test func setRunWithTheSameRunIDLeavesTheCacheIntact() async {
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-a/source" else { return (404, Data()) }
+            return (200, Data(Self.sourceJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-a", host: nil, client: client)
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+
+        store.setRun(runID: "run-a", host: nil)
+
+        #expect(store.sourceState(path: "src/a.rs", line: 10) != nil, "a same-runID setRun must not flush the cache")
+    }
+
+    /// A fetch still in flight when `setRun` switches to a different run
+    /// must never populate the NEW run's cache once it eventually lands —
+    /// same "captured generation must still match" shape `CodeStoreTests.
+    /// navigateMidFlightDropsStaleResult` pins for `CodeStore`.
+    @Test func aFetchInFlightWhenTheRunChangesIsDroppedOnArrival() async {
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-a/source" else { return (404, Data()) }
+            Thread.sleep(forTimeInterval: 0.08)
+            return (200, Data(Self.sourceJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-a", host: nil, client: client)
+
+        let staleTask = Task { await store.loadSourceIfNeeded(path: "src/a.rs", line: 10) }
+        try? await Task.sleep(for: .milliseconds(20)) // let the slow request actually fire
+        store.setRun(runID: "run-b", host: nil)
+
+        #expect(store.sourceState(path: "src/a.rs", line: 10) == nil)
+
+        await staleTask.value // let the stale call's slow fetch land too
+
+        #expect(store.sourceState(path: "src/a.rs", line: 10) == nil, "the stale run-a fetch's late-arriving result must never populate run-b's cache")
+        #expect(store.runID == "run-b")
+    }
+
+    // MARK: - Retry (the "compact Retry" affordance's underlying contract)
+
+    @Test func loadSourceIfNeededDoesNotRetryAFailureButReloadSourceDoes() async {
+        let hits = LockedCounter()
+        let client = makeClient { req in
+            let n = hits.increment()
+            let status = n == 1 ? 500 : 200
+            return (status, n == 1 ? Data() : Data(Self.sourceJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+        guard case .failed = store.sourceState(path: "src/a.rs", line: 10) else {
+            Issue.record("expected .failed, got \(String(describing: store.sourceState(path: "src/a.rs", line: 10)))")
+            return
+        }
+
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10) // no-op: already cached as .failed
+        #expect(hits.value == 1, "loadSourceIfNeeded must never retry a .failed slice")
+
+        await store.reloadSource(path: "src/a.rs", line: 10) // the Retry path
+        #expect(hits.value == 2)
+        guard case .content = store.sourceState(path: "src/a.rs", line: 10) else {
+            Issue.record("expected .content after reloadSource(), got \(String(describing: store.sourceState(path: "src/a.rs", line: 10)))")
+            return
+        }
+    }
+}
+
+// MARK: - View-member pure seams (no SwiftUI rendering — same idiom
+// `RunDetailScreenStatusTests` establishes for `RunDetailScreen.
+// unrecognizedStatusRaw`)
+
+@Test @MainActor func gutterWidthGrowsWithDigitCountAndFloorsAtASmallMinimum() {
+    // `nil`/small totals both fall back to the 1-digit case (`"1".count` /
+    // `"5".count`), which is below the `max(28, ...)` floor — both must
+    // land on the SAME floored value, not two different tiny widths.
+    #expect(SourcePreview.gutterWidth(totalLines: nil) == SourcePreview.gutterWidth(totalLines: 5))
+    #expect(SourcePreview.gutterWidth(totalLines: 5) == 28)
+    // A 5-digit total (≥10,000 lines) must widen past the floor, not clip.
+    #expect(SourcePreview.gutterWidth(totalLines: 12345) == CGFloat(5) * 7 + 12)
+}
+
+@Test @MainActor func matchedAncestorPathsFindsTheChainDownToTheMatchedNode() {
+    // Mirrors `run_ast.json`'s 3-level shape: source_file -> function_item ->
+    // identifier (matched).
+    let matchedLeaf = APIAstNode(
+        kind: "identifier", named: true, field: "name",
+        startLine: 2, startCol: 8, endLine: 2, endCol: 12,
+        matched: true, children: []
+    )
+    let functionItem = APIAstNode(
+        kind: "function_item", named: true, field: nil,
+        startLine: 1, startCol: 1, endLine: 3, endCol: 2,
+        matched: false, children: [matchedLeaf]
+    )
+    let root = APIAstNode(
+        kind: "source_file", named: true, field: nil,
+        startLine: 1, startCol: 1, endLine: 3, endCol: 2,
+        matched: false, children: [functionItem]
+    )
+
+    let ancestors = AstTreeView.matchedAncestorPaths(root: root, path: "0")
+
+    #expect(ancestors == ["0", "0.0"], "must return every ancestor's path down to (but not including) the matched node itself")
+}
+
+@Test @MainActor func matchedAncestorPathsReturnsNilWhenNothingIsMatched() {
+    let leaf = APIAstNode(kind: "identifier", named: true, field: nil, startLine: 1, startCol: 1, endLine: 1, endCol: 1, matched: false, children: [])
+    let root = APIAstNode(kind: "source_file", named: true, field: nil, startLine: 1, startCol: 1, endLine: 1, endCol: 1, matched: false, children: [leaf])
+
+    #expect(AstTreeView.matchedAncestorPaths(root: root, path: "0") == nil)
+}
+
+@Test @MainActor func matchedAncestorPathsHandlesTheRootItselfBeingMatched() {
+    let root = APIAstNode(kind: "source_file", named: true, field: nil, startLine: 1, startCol: 1, endLine: 1, endCol: 1, matched: true, children: [])
+    #expect(AstTreeView.matchedAncestorPaths(root: root, path: "0") == [])
+}
+
+@Test @MainActor func fromStructuredParsesWellFormedMatchesAndSkipsMalformedOnes() {
+    let structured = JSONValue.object([
+        "matches": .array([
+            .object([
+                "file": .string("src/a.rs"),
+                "range": .object([
+                    "startLine": .number(12), "startCol": .number(3),
+                    "endLine": .number(12), "endCol": .number(9),
+                ]),
+                "text": .string("fn foo()"),
+            ]),
+            // Missing `range` — must be skipped, not crash or fabricate a location.
+            .object(["file": .string("src/b.rs")]),
+            // Missing `file` — must be skipped.
+            .object(["range": .object(["startLine": .number(1), "startCol": .number(1)])]),
+        ]),
+    ])
+
+    let matches = AstGrepTranscriptParsing.fromStructured(structured)
+
+    #expect(matches == [
+        AstGrepTranscriptParsing.Match(file: "src/a.rs", startLine: 12, startCol: 3, text: "fn foo()"),
+    ])
+}
+
+@Test @MainActor func fromStructuredReturnsEmptyForAbsentOrShapelessInput() {
+    #expect(AstGrepTranscriptParsing.fromStructured(nil).isEmpty)
+    #expect(AstGrepTranscriptParsing.fromStructured(.object([:])).isEmpty)
+    #expect(AstGrepTranscriptParsing.fromStructured(.string("not an object")).isEmpty)
+}
+
+@Test @MainActor func fromTextParsesTheCompactPathLineColFormatAndSkipsUnparseableLines() {
+    let output = """
+    src/a.rs:12:3: fn foo() {
+    this line has no match at all
+    src/b.rs:1:1: use bar;
+    """
+
+    let matches = AstGrepTranscriptParsing.fromText(output)
+
+    #expect(matches == [
+        AstGrepTranscriptParsing.Match(file: "src/a.rs", startLine: 12, startCol: 3, text: "fn foo() {"),
+        AstGrepTranscriptParsing.Match(file: "src/b.rs", startLine: 1, startCol: 1, text: "use bar;"),
+    ])
+}
+
+@Test @MainActor func fromTextReturnsEmptyForBlankOutput() {
+    #expect(AstGrepTranscriptParsing.fromText("").isEmpty)
+}
+
+/// Thread-safe call counter — same rationale as every other store test's own
+/// copy of this pattern (`CodeStoreTests.LockedCounter`). Named distinctly
+/// to avoid ambiguity within this file/target.
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0
+    @discardableResult
+    func increment() -> Int { lock.withLock { v += 1; return v } }
+    var value: Int { lock.withLock { v } }
+}
