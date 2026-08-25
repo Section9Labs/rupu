@@ -5,8 +5,12 @@ import RupuDesign
 import RupuOverview
 
 /// Detail-pane toolbar: project-scope menu, time-range picker, the
-/// Overview Customize menu, search, "+ New Run" launcher, and the
-/// live-stream status. The screen title is not an item here — `RootView`
+/// Overview Customize menu, search, and the "+ New Run" launcher —
+/// interactive controls only, deliberately. The live-stream status lives
+/// in `Sidebar`'s footer with the other passive status lines: a
+/// non-interactive item in a row of buttons has no honest chrome (it
+/// reads as a broken or disabled button whatever it's styled as).
+/// The screen title is not an item here — `RootView`
 /// sets `.navigationTitle` on the detail pane, which puts the title in
 /// the toolbar's leading slot (and keeps the window title in sync) the
 /// way native macOS apps do.
@@ -80,10 +84,6 @@ struct ShellToolbar: CustomizableToolbarContent {
 
         ToolbarItem(id: "newRun", placement: .primaryAction) {
             newRunButton
-        }
-
-        ToolbarItem(id: "live", placement: .primaryAction) {
-            liveStatus
         }
     }
 
@@ -207,10 +207,4 @@ struct ShellToolbar: CustomizableToolbarContent {
         .help("New run (⌘N)")
     }
 
-    private var liveStatus: some View {
-        Label(model.liveConnected ? "Live" : "Offline",
-              systemImage: "dot.radiowaves.left.and.right")
-            .foregroundStyle(model.liveConnected ? Color.rupuBrand700 : Color.rupuMute)
-            .help(model.liveConnected ? "Event stream connected" : "Event stream disconnected")
-    }
 }

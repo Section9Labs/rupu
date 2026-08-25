@@ -115,11 +115,15 @@ struct Sidebar: View {
         }
     }
 
-    /// Backend-health line (unchanged from the pre-v2 sidebar footer) plus
-    /// a new host-fleet line driven by `HostsFooterStore`.
+    /// Backend-health line (unchanged from the pre-v2 sidebar footer), the
+    /// live event-stream line (moved here from the toolbar — a passive
+    /// status had no honest chrome in a row of buttons; the footer is the
+    /// app's status block), and the host-fleet line driven by
+    /// `HostsFooterStore`.
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
             healthLine
+            liveLine
             hostsLine
         }
         .padding(.horizontal, 12)
@@ -156,6 +160,25 @@ struct Sidebar: View {
         case .down: "Offline"
         case .incompatible: "Incompatible"
         }
+    }
+
+    /// Live event-stream status, driven by `model.liveConnected` (set by
+    /// `BackendController.onLiveConnectionChange` — connection-level, not
+    /// frame-level; see `RootView.init`). The dot is brand purple, not the
+    /// footer's green/red status tones: purple is the app's "live"
+    /// identity (the Activity screen's Live-tail toggle), and it keeps
+    /// this line visually distinct from the backend-health line above.
+    private var liveLine: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(model.liveConnected ? Color.rupuBrand700 : Color.rupuMute)
+                .frame(width: 6, height: 6)
+            Text(model.liveConnected ? "Live events" : "Events offline")
+                .font(.metaText)
+                .foregroundStyle(Color.rupuDim)
+            Spacer(minLength: 0)
+        }
+        .help(model.liveConnected ? "Event stream connected" : "Event stream disconnected")
     }
 
     /// `"N hosts"`, `" · M down"` appended when any host isn't `"online"` —
