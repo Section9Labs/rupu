@@ -42,17 +42,17 @@ public enum ProjectDetailTab: String, CaseIterable, Sendable {
 /// `activate()` resets it back to `.overview` for the new project), since
 /// `.task(id:)` only re-fires when its id's *value* changes. Combining both
 /// into one id makes every `wsID`/`tab` combination its own fetch trigger.
-///
-/// **Phase 6B addition**: the id ALSO folds in `store.detail.value != nil`
-/// (the parent detail block's own resolution state) — the PR #501
-/// stranding class this codebase guards against everywhere a lazy fetch
-/// depends on a SIBLING block: an operator who taps `.code` before
-/// `store.detail` has resolved must still see the Code tab's fetch
-/// eventually fire once `detail` DOES resolve, even though `tab` itself
-/// never changed value across that transition. `loadTab`'s own `.code`
-/// dispatch is idempotent (`codeRequested`), so the extra re-fire this
-/// causes for every OTHER tab whenever `detail` finishes loading is a
-/// harmless no-op, not a double-fetch.
+/// (Review round 1: an earlier revision also folded `store.detail.value !=
+/// nil` into this id, on the premise that `.code`'s dispatch needed to wait
+/// on the parent detail block. That premise was wrong — `loadTab`'s `.code`
+/// case never reads `store.detail`, and `codeStore` is already non-nil by
+/// the time this id can even be evaluated (see `codeStore`'s own doc
+/// comment) — and the extra id component actively regressed every tab: it
+/// flips once when `detail` resolves, which cancels whatever tab load is
+/// in flight AT THAT MOMENT via `.task(id:)`'s replace-on-change semantics,
+/// which (before the `codeRequested` fix below) could latch a lazy-load
+/// flag `true` with no completed fetch behind it. Reverted to plain
+/// `wsID`/`tab`.)
 ///
 /// **Does NOT need `OverviewScreen`'s cold-launch fix** — same reasoning
 /// `RunDetailScreen`/`ProjectsScreen` already document: `.projectDetail` is
@@ -75,10 +75,28 @@ public struct ProjectDetailScreen: View {
     /// and rebuilt in the SAME `activate()` branch as `store` — same
     /// `wsID`/client-identity lifecycle — so it's already non-nil by the
     /// time `content(store:)` (and therefore `tabContent`'s `.code` case)
-    /// can possibly render it; `codeRequested` is this screen's own
-    /// "fetch the root listing once per activation" latch, mirroring
-    /// `ProjectDetailStore`'s internal `xRequested` flags for its own lazy
-    /// tabs.
+    /// can possibly render it: `content(store:)` only ever runs once
+    /// `store` itself is non-nil, and both fields are assigned in the exact
+    /// same synchronous branch of `activate()`, so there is no window where
+    /// `store` exists but `codeStore` doesn't — `tabContent`'s `.code` case
+    /// relies on this invariant directly (no optional-handling fallback).
+    ///
+    /// `codeRequested` is this screen's own "fetch the root listing once
+    /// per activation" latch, mirroring `ProjectDetailStore`'s internal
+    /// `xRequested` flags for its own lazy tabs — including THEIR reset
+    /// discipline: `activate()` resets `codeRequested = false`
+    /// UNCONDITIONALLY on every call (same as `ProjectDetailStore.
+    /// activate()` resets its own six flags unconditionally), not only
+    /// inside the store-rebuild branch, so a screen re-appearance with the
+    /// SAME `wsID`/client still lets a re-visited Code tab refetch fresh.
+    ///
+    /// **Review round 1 fix**: `loadTab`'s `.code` case also clears this
+    /// flag back to `false` if its own `codeStore.activate()` call gets
+    /// cancelled mid-flight (a tab switch away before the fetch finishes) —
+    /// without that, a cancelled dispatch would leave `codeRequested`
+    /// latched `true` with no completed fetch behind it, permanently
+    /// blocking every future visit to the tab from ever trying again. See
+    /// `loadTab`'s own doc comment.
     @State private var codeStore: CodeStore?
     @State private var codeRequested = false
 
@@ -114,11 +132,15 @@ public struct ProjectDetailScreen: View {
         if storeWsID != wsID || storeClientID != clientID {
             store = ProjectDetailStore(wsID: wsID, client: client)
             codeStore = CodeStore(wsID: wsID, client: client)
-            codeRequested = false
             storeWsID = wsID
             storeClientID = clientID
             tab = .overview
         }
+        // Unconditional, every call — see `codeRequested`'s doc comment:
+        // mirrors `ProjectDetailStore.activate()` resetting its own six
+        // `xRequested` flags on every call, not only inside the
+        // store-rebuild branch above.
+        codeRequested = false
         guard let store else { return }
         await store.activate()
     }
@@ -234,9 +256,8 @@ public struct ProjectDetailScreen: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .panelStyle(.panel)
         // See the type doc comment's "Lazy tab loading" section for why
-        // `wsID`, `tab`, AND `store.detail`'s resolution state are all
-        // folded into one id.
-        .task(id: "\(wsID)|\(tab.rawValue)|\(store.detail.value != nil)") {
+        // both `wsID` and `tab` are folded into one id.
+        .task(id: "\(wsID)|\(tab.rawValue)") {
             await loadTab(tab, store: store)
         }
     }
@@ -252,11 +273,20 @@ public struct ProjectDetailScreen: View {
     /// `.definitions` fires all three of its own sub-lists concurrently —
     /// each is independently idempotent (`loadXIfNeeded()`), so a repeat
     /// visit to this tab is a no-op fan-out, not three redundant fetches.
+    ///
     /// `.code` loads `codeStore`'s workspace-root listing exactly once per
-    /// screen activation (`codeRequested` — see that property's doc
-    /// comment); every re-fire this method's own `.task(id:)` now produces
-    /// for `store.detail` resolving is therefore a no-op here too, same as
-    /// every other case's own idempotent guard.
+    /// screen activation (`codeRequested`). **Review round 1 fix**: because
+    /// this whole method runs inside `tabPanel`'s `.task(id:)`, switching
+    /// away from `.code` before `codeStore.activate()` finishes cancels
+    /// this call mid-flight — `CodeStore.navigate(path:)` swallows that
+    /// cancellation internally (see its own doc comment) and returns
+    /// normally rather than throwing, so `codeRequested` — already flipped
+    /// `true` synchronously above the `await` — would otherwise stay
+    /// latched `true` forever with no completed fetch behind it, and no
+    /// future visit to the tab would ever try again. Checking `Task.
+    /// isCancelled` right after the call returns and un-latching the flag
+    /// when it fired makes a re-entry (tab-switch back to `.code`)
+    /// re-dispatch instead.
     private func loadTab(_ tab: ProjectDetailTab, store: ProjectDetailStore) async {
         switch tab {
         case .overview, .coverage:
@@ -276,6 +306,9 @@ public struct ProjectDetailScreen: View {
             guard let codeStore, !codeRequested else { return }
             codeRequested = true
             await codeStore.activate()
+            if Task.isCancelled {
+                codeRequested = false
+            }
         }
     }
 
@@ -293,11 +326,14 @@ public struct ProjectDetailScreen: View {
         case .coverage:
             CoverageTabContent()
         case .code:
-            if let codeStore {
-                CodeTab(store: codeStore)
-            } else {
-                centeredLabel("Backend not connected")
-            }
+            // `codeStore!` — provably non-nil here, not merely "usually":
+            // `tabContent(store:)` only ever runs once `content(store:)`
+            // has already confirmed `store` itself is non-nil, and
+            // `activate()` assigns `store`/`codeStore` together in the same
+            // synchronous branch (see `codeStore`'s own doc comment). A
+            // `nil`-handling else-branch here would be permanently dead
+            // code, not a real fallback (review round 1 fix).
+            CodeTab(store: codeStore!)
         case .definitions:
             DefinitionsTabContent(
                 store: store,
