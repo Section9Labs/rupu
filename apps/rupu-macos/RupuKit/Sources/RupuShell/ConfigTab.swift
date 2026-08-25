@@ -443,7 +443,13 @@ struct ConfigDrafts: Equatable {
     /// draft on the way in, so the two halves of a bounce chain correctly:
     /// content("A") → loading(nil) drives a clean draft to `""`, then
     /// loading(nil) → content("B") sees `"" == previous(nil → "")` and
-    /// adopts `"B"`. A DIRTY draft matches neither leg and survives both.
+    /// adopts `"B"`. A dirty NON-EMPTY draft matches neither leg and
+    /// survives both. One deliberate edge: a draft the operator emptied to
+    /// exactly `""` is indistinguishable from the bounce's own transient
+    /// `""`, so leg 2 re-adopts the server value — safe (post-adoption the
+    /// draft equals the server, Save is disabled, nothing wrong can be PUT)
+    /// but the emptied text is not preserved across a mid-edit reload.
+    /// Pinned by the adoption-table test's `("", nil) → adopt` case.
     /// (The transient `""` is never rendered: `ConfigTab.body(store:)`
     /// shows "Loading…" for the whole `.loading` window, so no editor and
     /// no Save button exists to act on it.)
