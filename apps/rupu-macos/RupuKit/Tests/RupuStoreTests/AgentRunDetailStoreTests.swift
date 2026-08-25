@@ -61,6 +61,20 @@ private final class FlagBox: @unchecked Sendable {
     }
 }
 
+/// Thread-safe call counter — same Sendable rationale as `FlagBox`, for
+/// closures whose behavior differs between the first and second call
+/// (tests (k)/(l)'s "retry while the backend is still erroring" shape).
+private final class CounterBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0
+    func next() -> Int {
+        lock.withLock {
+            v += 1
+            return v
+        }
+    }
+}
+
 @MainActor
 private func makeStore(
     transcriptPath: String?,
@@ -266,6 +280,74 @@ private func makeResolvingStore(
 
     #expect(resolverCalled.value == false)
     #expect(store.resolvedPath == "t/known.jsonl")
+}
+
+// (k) A retry while the backend is still erroring never rewrites a real
+// failure as "no transcript recorded": first activate resolved a path but
+// the transcript fetch failed (`.failed` banner shown); on re-activate the
+// resolver itself now throws too. The prior resolved path must survive —
+// a thrown resolution is "couldn't check", not "resolved to nothing" — so
+// the screen keeps its `.failed` state (and Retry affordance) instead of
+// flipping to the false `.empty`/`resolvedPath == nil` combination.
+@MainActor @Test func failedReactivateWithErroringResolverNeverConvertsFailedToEmpty() async {
+    let resolverCalls = CounterBox()
+    let store = makeResolvingStore(
+        transcriptPath: nil,
+        resolveTranscriptPath: {
+            if resolverCalls.next() == 1 { return "t/flaky.jsonl" }
+            throw StubError(description: "agent-runs list unreachable")
+        },
+        fetchTranscript: { _ in
+            throw StubError(description: "transcript endpoint down")
+        }
+    )
+
+    await store.activate()
+
+    #expect(store.resolvedPath == "t/flaky.jsonl")
+    guard case .failed = store.transcript else {
+        Issue.record("expected .failed after the first activate, got \(store.transcript)")
+        return
+    }
+
+    await store.activate()
+
+    #expect(store.resolvedPath == "t/flaky.jsonl")
+    guard case .failed(let message) = store.transcript else {
+        Issue.record("expected the retry to stay .failed, got \(store.transcript)")
+        return
+    }
+    #expect(message.contains("transcript endpoint down"))
+}
+
+// (l) The retained path is genuinely reused, not just displayed: with the
+// resolver still erroring on the retry, a now-healthy transcript endpoint
+// recovers the screen to `.content` through the previously resolved path.
+@MainActor @Test func reactivateWithErroringResolverReusesPriorPathAndRecovers() async {
+    let resolverCalls = CounterBox()
+    let fetchCalls = CounterBox()
+    let store = makeResolvingStore(
+        transcriptPath: nil,
+        resolveTranscriptPath: {
+            if resolverCalls.next() == 1 { return "t/flaky.jsonl" }
+            throw StubError(description: "agent-runs list unreachable")
+        },
+        fetchTranscript: { path in
+            #expect(path == "t/flaky.jsonl")
+            if fetchCalls.next() == 1 { throw StubError(description: "transcript endpoint down") }
+            return APITranscriptPage(events: [.assistantMessage(content: "recovered", thinking: nil)], summary: nil)
+        }
+    )
+
+    await store.activate()
+    await store.activate()
+
+    #expect(store.resolvedPath == "t/flaky.jsonl")
+    guard case .content(let events) = store.transcript else {
+        Issue.record("expected the retry to recover to .content, got \(store.transcript)")
+        return
+    }
+    #expect(events == [.assistantMessage(content: "recovered", thinking: nil)])
 }
 
 // (j) End-to-end wiring: the production `init(runID:transcriptPath:host:
