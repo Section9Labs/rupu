@@ -43,22 +43,27 @@ fn wake_store(s: &AppState) -> WakeStore {
 /// Slim wire DTO for an autoflow claim. `status` is the lowercase
 /// `snake_case` form of [`ClaimStatus`] (e.g. `"await_human"`) so the
 /// frontend gets a stable string.
+///
+/// `pub`, not `pub(crate)`: `tests/macos_fixtures.rs` compiles as a separate
+/// crate linking against `rupu-cp` as an external dependency, so
+/// `pub(crate)` items stay invisible to it (same reason `ConfigView` was
+/// hoisted in Phase 6A — see that fixture's doc comment).
 #[derive(Serialize)]
-pub(crate) struct ClaimRow {
-    pub(crate) issue_ref: String,
-    pub(crate) issue_display_ref: Option<String>,
-    pub(crate) repo_ref: String,
-    pub(crate) issue_title: Option<String>,
-    pub(crate) issue_url: Option<String>,
-    pub(crate) workflow: String,
-    pub(crate) status: String,
-    pub(crate) last_run_id: Option<String>,
-    pub(crate) last_error: Option<String>,
-    pub(crate) last_summary: Option<String>,
-    pub(crate) pr_url: Option<String>,
-    pub(crate) claim_owner: Option<String>,
-    pub(crate) lease_expires_at: Option<String>,
-    pub(crate) updated_at: String,
+pub struct ClaimRow {
+    pub issue_ref: String,
+    pub issue_display_ref: Option<String>,
+    pub repo_ref: String,
+    pub issue_title: Option<String>,
+    pub issue_url: Option<String>,
+    pub workflow: String,
+    pub status: String,
+    pub last_run_id: Option<String>,
+    pub last_error: Option<String>,
+    pub last_summary: Option<String>,
+    pub pr_url: Option<String>,
+    pub claim_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub updated_at: String,
 }
 
 impl From<AutoflowClaimRecord> for ClaimRow {
