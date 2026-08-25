@@ -279,33 +279,32 @@ private struct ActivityTableRow: View {
 
     /// `GET /api/runs/workflows` (the source this row came from) carries no
     /// `awaiting[]` detail — only `GET /api/runs/:id` does — so a compact
-    /// row's tap resolves the gate id itself before calling
-    /// `store.approve`, same "gate targeting always explicit" contract
-    /// every write route in this phase follows (never omitted, never
-    /// guessed). A run with no resolvable single gate (already resolved
-    /// server-side by the time this lands, or the API otherwise disagrees
-    /// with the row's own `.awaiting` status) is a silent no-op — the row's
-    /// next live-patch or refresh will correct its status either way.
-    /// `isBusy` brackets the whole resolve-then-post round trip so a
-    /// double-tap can't fire two overlapping gate lookups.
+    /// row's tap resolves the gate id itself (via `ActivityStore.
+    /// resolveSoleAwaitingGate(client:runID:host:)` — Phase 4, Task 5 fix
+    /// round 1 lifted this out of a local private method here, since
+    /// `NeedsYouCard` needed the identical resolution and this is the one
+    /// shared home for it now) before calling `store.approve`, same "gate
+    /// targeting always explicit" contract every write route in this phase
+    /// follows (never omitted, never guessed). A run with no resolvable
+    /// single gate (already resolved server-side by the time this lands, or
+    /// the API otherwise disagrees with the row's own `.awaiting` status) is
+    /// a silent no-op — the row's next live-patch or refresh will correct
+    /// its status either way. `isBusy` brackets the whole resolve-then-post
+    /// round trip so a double-tap can't fire two overlapping gate lookups.
     private func resolveGateAndApprove(runID: String, host: String?) async {
         isBusy = true
         defer { isBusy = false }
-        guard let gate = await resolveSoleAwaitingGate(runID: runID, host: host) else { return }
+        guard let client = backend.client() else { return }
+        guard let gate = await ActivityStore.resolveSoleAwaitingGate(client: client, runID: runID, host: host) else { return }
         await store.approve(runID: runID, gate: gate, host: host)
     }
 
     private func resolveGateAndReject(runID: String, host: String?) async {
         isBusy = true
         defer { isBusy = false }
-        guard let gate = await resolveSoleAwaitingGate(runID: runID, host: host) else { return }
+        guard let client = backend.client() else { return }
+        guard let gate = await ActivityStore.resolveSoleAwaitingGate(client: client, runID: runID, host: host) else { return }
         await store.reject(runID: runID, gate: gate, host: host)
-    }
-
-    private func resolveSoleAwaitingGate(runID: String, host: String?) async -> String? {
-        guard let client = backend.client() else { return nil }
-        guard let detail = try? await client.runDetail(id: runID, host: host) else { return nil }
-        return detail.run.awaiting.first?.stepID
     }
 
     private var statusCell: some View {

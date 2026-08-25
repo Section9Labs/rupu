@@ -153,16 +153,24 @@ public struct NeedsYouCard: View {
         self.onNavigate = onNavigate
     }
 
+    /// Controller ruling (Phase 4, Task 5 fix round 1 — the brief's row
+    /// anatomy left this underspecified): when there is nothing to show,
+    /// the whole panel collapses to the single 36pt empty row — no
+    /// "Needs you" header, no divider under it. Per the v2 redesign's §1a
+    /// intent, "never render an empty card": a header + divider framing
+    /// nothing would still read as a card with content, just an
+    /// unusually terse one.
     public var body: some View {
         let result = deriveNeedsYou(rows: store.rows, range: range, now: Date())
-        let oldestGateID = result.items.first(where: { $0.kind == .gate })?.id
 
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider()
-            if result.items.isEmpty {
-                emptyRow
-            } else {
+        if result.items.isEmpty {
+            emptyRow
+                .panelStyle(.panel)
+        } else {
+            let oldestGateID = result.items.first(where: { $0.kind == .gate })?.id
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                Divider()
                 VStack(spacing: 0) {
                     ForEach(result.items) { item in
                         NeedsYouRow(
@@ -181,8 +189,8 @@ public struct NeedsYouCard: View {
                     footer(overflow: result.overflow)
                 }
             }
+            .panelStyle(.panel)
         }
-        .panelStyle(.panel)
     }
 
     private var header: some View {
@@ -192,6 +200,8 @@ public struct NeedsYouCard: View {
     }
 
     /// Single 36pt row, `.rupuMute` — nothing needs the operator right now.
+    /// The *entire* card when empty (see the controller ruling on `body`
+    /// above) — not a row nested inside a header+divider shell.
     private var emptyRow: some View {
         Text("Nothing needs you")
             .font(.uiText)
@@ -318,19 +328,22 @@ private struct NeedsYouRow: View {
 
 /// Compact Approve/Reject for one gate row — reuses `ActivityTable`'s
 /// inline-action shape (`RupuActivity/ActivityTable.swift`'s
-/// `awaitingActions`/`resolveSoleAwaitingGate`): this feed
-/// (`ActivityStore.rows`, same federated source `ActivityTable` renders)
-/// carries no per-row `awaiting[]` detail, only `GET /api/runs/:id` does —
-/// so a tap resolves the sole parked gate via `runDetail` before posting,
-/// same "gate targeting always explicit" contract every write route in this
-/// phase follows.
+/// `awaitingActions`): this feed (`ActivityStore.rows`, same federated
+/// source `ActivityTable` renders) carries no per-row `awaiting[]` detail,
+/// only `GET /api/runs/:id` does — so a tap resolves the sole parked gate
+/// before posting, same "gate targeting always explicit" contract every
+/// write route in this phase follows. The resolution call itself
+/// (`ActivityStore.resolveSoleAwaitingGate(client:runID:host:)`) is shared,
+/// not duplicated — Phase 4, Task 5 fix round 1 lifted it out of both this
+/// type and `ActivityTable` into `RupuStore`.
 ///
-/// Not lifted into a shared `RupuStore`/`RupuDesign` component: the two call
-/// sites render different chrome (`ActivityTable`'s icon-only pair inside a
+/// The button *chrome* stays duplicated, deliberately: the two call sites
+/// render different UI (`ActivityTable`'s icon-only pair inside a
 /// fixed-width table column vs. this card's full `RupuButtonStyle.primaryOk`/
-/// `.dangerOutline` labeled buttons), so sharing would mean parameterizing
-/// the chrome itself for two call sites — not a clean seam yet. Noted here
-/// (per the brief) rather than duplicated silently.
+/// `.dangerOutline` labeled buttons with a busy/stale-state readout below),
+/// so lifting it would mean parameterizing the chrome itself for two call
+/// sites that don't actually want to look alike — reviewed and agreed as
+/// legitimately view-local, not a missed seam.
 private struct NeedsYouGateActions: View {
     let runID: String
     let host: String?
@@ -427,14 +440,15 @@ private struct NeedsYouGateActions: View {
         await store.reject(runID: runID, gate: gate, host: host)
     }
 
-    /// A run with no resolvable single gate (already resolved server-side
-    /// by the time this lands, or the API otherwise disagrees with the
-    /// row's own `.awaiting` status) is a silent no-op — the row's next
-    /// live-patch or refresh corrects its status either way, same as
-    /// `ActivityTable`'s identical fallback.
+    /// Delegates to `ActivityStore.resolveSoleAwaitingGate(client:runID:
+    /// host:)` — Phase 4, Task 5 fix round 1 lifted the actual resolution
+    /// (this method used to duplicate `ActivityTable`'s byte-for-byte) into
+    /// `RupuStore` as the one shared home; see that method's doc comment
+    /// for the full "why here, why static" rationale. A run with no
+    /// resolvable single gate is a silent no-op here too — the row's next
+    /// live-patch or refresh corrects its status either way.
     private func resolveSoleAwaitingGate() async -> String? {
         guard let client = backend.client() else { return nil }
-        guard let detail = try? await client.runDetail(id: runID, host: host) else { return nil }
-        return detail.run.awaiting.first?.stepID
+        return await ActivityStore.resolveSoleAwaitingGate(client: client, runID: runID, host: host)
     }
 }

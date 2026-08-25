@@ -378,6 +378,37 @@ public final class ActivityStore {
         }
     }
 
+    /// Resolves the sole gate `runID` is currently parked on — the shared
+    /// half of "gate targeting always explicit" (see `approve(runID:gate:
+    /// host:)`'s doc comment): neither this store's own federated rows nor
+    /// `NeedsYouCard`'s (`RupuOverview`, same `ActivityRow` feed) carry
+    /// per-row `awaiting[]` detail, only `GET /api/runs/:id` does, so both
+    /// resolve it the same way before posting.
+    ///
+    /// **Lift, not a fresh design** (Phase 4, Task 5 fix round 1): this was
+    /// byte-for-byte duplicated between `RupuActivity/ActivityTable.swift`'s
+    /// compact row and `RupuOverview/NeedsYou.swift`'s card row — same
+    /// precedent as `ActivityStatus.displayLabel`'s move into this module
+    /// (see that property's doc comment): both call sites depend on
+    /// `RupuStore` already, so this is the one shared home rather than a
+    /// third copy or a cross-module helper type. Lives on `ActivityStore`
+    /// (not a free function alongside `ActivityRow`) because it's gate
+    /// *mutation* machinery — the read half of the same "resolve, then
+    /// approve/reject" flow `approve`/`reject` above are the write half of —
+    /// not part of the row data model `ActivityRow.swift` otherwise holds.
+    /// `static`: it needs no store state, just the caller's own `CPClient`,
+    /// so a future caller holding a client but no `ActivityStore` instance
+    /// (there isn't one today) could still call it. A run with no
+    /// resolvable single gate (already resolved server-side by the time
+    /// this lands, or the API otherwise disagrees with the caller's
+    /// `.awaiting` belief) returns `nil` — every caller treats that as a
+    /// silent no-op, trusting the row's next live-patch or refresh to
+    /// correct its status either way.
+    public static func resolveSoleAwaitingGate(client: CPClient, runID: String, host: String?) async -> String? {
+        guard let detail = try? await client.runDetail(id: runID, host: host) else { return nil }
+        return detail.run.awaiting.first?.stepID
+    }
+
     // MARK: - Sources
 
     private func activeSources() -> [Source] {
