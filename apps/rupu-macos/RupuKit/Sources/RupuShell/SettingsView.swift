@@ -9,8 +9,8 @@ import RupuStore
 /// **Config** (`ConfigTab`, defined in `ConfigTab.swift` — a `ConfigStore`-
 /// backed editor for `[cp]` and provider sections; Providers folds into this
 /// tab rather than getting its own), and **Notifications** (`NotificationsTab`,
-/// a `RunNotifier`-backed preferences editor). `NotificationsTab` is still a
-/// placeholder shell in this task, wired for real in Task 7 of the same PR.
+/// defined in `NotificationsTab.swift` — a `RunNotifier`-backed preferences
+/// editor; Task 7 replaced the earlier placeholder shell).
 /// There is no separate Dashboard tab: that disposition is covered by
 /// Overview's own Customize visibility menu, not Settings.
 public struct SettingsView: View {
@@ -21,10 +21,12 @@ public struct SettingsView: View {
 
     private let model: AppModel
     private let backend: BackendController
+    private let notifier: RunNotifier
 
-    public init(model: AppModel, backend: BackendController) {
+    public init(model: AppModel, backend: BackendController, notifier: RunNotifier) {
         self.model = model
         self.backend = backend
+        self.notifier = notifier
     }
 
     public var body: some View {
@@ -112,7 +114,7 @@ public struct SettingsView: View {
     }
 
     var notificationsTab: some View {
-        NotificationsTab()
+        NotificationsTab(notifier: notifier)
     }
 
     /// Read-only summary of `backend.mode`/`.origin` — the port/URL actually
@@ -133,18 +135,5 @@ public struct SettingsView: View {
         case nil:
             return "Not connected"
         }
-    }
-}
-
-/// Placeholder Notifications tab. Task 7 replaces this with a
-/// `RunNotifier`-backed preferences editor.
-// Replaced in Task 7
-struct NotificationsTab: View {
-    var body: some View {
-        Form {
-            Text("Notifications")
-                .foregroundStyle(.secondary)
-        }
-        .padding(.top, 12)
     }
 }

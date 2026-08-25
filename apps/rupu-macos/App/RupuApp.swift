@@ -3,6 +3,7 @@ import SwiftUI
 import RupuShell
 import RupuStore
 import RupuDesign
+import UserNotifications
 import os
 
 /// Routes app termination through `BackendController.shutdown` on both
@@ -38,13 +39,35 @@ import os
 ///
 /// `BackendController.shutdown`/`EmbeddedServer.stop` are idempotent, so
 /// both paths racing is harmless.
+///
+/// `@MainActor`: AppKit already calls every `NSApplicationDelegate` method
+/// on the main thread, but the `UNUserNotificationCenterDelegate` async
+/// methods below (`willPresent`/`didReceive`) have no actor annotation of
+/// their own — without this, `didReceive` touching `model` (a `@MainActor`
+/// type) requires bridging via `MainActor.run`, and under strict
+/// concurrency checking that flags "sending self risks data races" (`self`
+/// isn't `Sendable`). Isolating the whole class instead is the standard fix
+/// for exactly this shape: an `async` delegate requirement with no
+/// annotation of its own can be satisfied by a `@MainActor` method without
+/// any extra hop.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let logger = Logger(subsystem: "com.section9labs.rupu", category: "lifecycle")
 
     var backend: BackendController?
+    /// Set from `RupuApp`'s `.onAppear` alongside `backend` — needed so
+    /// `userNotificationCenter(_:didReceive:)` below can route a notification
+    /// tap through the same `AppModel.navigate(to:)` every other deep-link
+    /// in this app uses.
+    var model: AppModel?
     private var sigtermSource: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Claims the tap-routing/foreground-presentation delegate slot. This
+        // is app-level, real-bundle code — never touched by unit tests
+        // (`RunNotifier`'s own `NotificationPosting` seam is what tests
+        // exercise instead; see that type's doc comment).
+        UNUserNotificationCenter.current().delegate = self
         signal(SIGTERM, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         source.setEventHandler { [weak self] in
@@ -73,11 +96,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Tap routing for `RunNotifier`'s local notifications.
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    /// `nonisolated`, not `@MainActor` (even though the class itself is):
+    /// `UNUserNotificationCenterDelegate`'s methods carry no actor
+    /// annotation of their own, and their parameter types (`UNNotification`/
+    /// `UNNotificationResponse`/`UNUserNotificationCenter`) aren't
+    /// `Sendable` — a `@MainActor` override would require the FRAMEWORK's
+    /// caller to send a non-`Sendable` value across the actor boundary,
+    /// which strict concurrency checking rejects. `nonisolated` matches the
+    /// requirement's own isolation exactly, so nothing needs to cross;
+    /// extracting the one `Sendable` piece we actually need (`runID`, a
+    /// `String?`) here and handing THAT to a `@MainActor` helper is what
+    /// lets the rest of the work reach `model` safely.
+    ///
+    /// Without `.banner`/`.sound` here, macOS silently swallows a
+    /// notification whenever this app is already frontmost — matching the
+    /// "toggles describe what they do" honesty bar: an enabled pref that
+    /// silently produced nothing whenever the app happened to be focused
+    /// would be a lie by omission.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let runID = response.notification.request.content.userInfo["runID"] as? String
+        await routeNotificationTap(runID: runID)
+    }
+
+    /// Notifications this app posts only ever describe local-CP runs —
+    /// `RunNotifier.activate` is fed by `backend.makeFirehoseStream`, the
+    /// LOCAL firehose (never a remote host's), so `host: nil` here is
+    /// always correct, not a shortcut.
+    private func routeNotificationTap(runID: String?) {
+        if let runID {
+            model?.navigate(to: .runDetail(id: runID, host: nil))
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first?.makeKeyAndOrderFront(nil)
+    }
+}
+
 @main
 struct RupuApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
     @State private var backend = BackendController()
+    /// Owned here, not by any screen — a firehose subscriber that must
+    /// outlive whatever screen happens to be on-screen. `SettingsView`'s
+    /// Notifications tab reads/writes the same instance's prefs; the
+    /// `.onChange(of: backend.health)` below is this arc's own activation
+    /// seam, independent of `RootView`'s (kept minimal on purpose — see
+    /// `RunNotifier.activate`'s doc comment for why re-activating on every
+    /// healthy transition is safe).
+    @State private var runNotifier = RunNotifier(poster: UNCenterNotificationPoster())
     @AppStorage("appearance") private var appearance: String = "system"
 
     var body: some Scene {
@@ -86,12 +164,30 @@ struct RupuApp: App {
                 .frame(minWidth: 1150, minHeight: 760)
                 .preferredColorScheme(preferredColorScheme)
                 .tint(Color.rupuBrand)
-                .onAppear { appDelegate.backend = backend }
+                .onAppear {
+                    appDelegate.backend = backend
+                    appDelegate.model = model
+                }
+                .onChange(of: backend.health) { _, newHealth in
+                    guard case .healthy = newHealth else { return }
+                    // `MainActor.assumeIsolated` here matches
+                    // `RunDetailStore.makeRunSignalsFactory`/`OverviewScreen.
+                    // makeSignalsFactory`'s own bridging into
+                    // `backend.make*Stream` from inside a factory closure —
+                    // `streamFactory` is invoked from `RunNotifier.activate`'s
+                    // task, which always runs on the main actor (`RunNotifier`
+                    // is `@MainActor`), so the assertion always holds; it's
+                    // what lets `backend`'s own main-actor-isolated method be
+                    // called from a plain, unisolated closure type.
+                    runNotifier.activate(streamFactory: { [backend] in
+                        MainActor.assumeIsolated { backend.makeFirehoseStream() }
+                    })
+                }
         }
         .defaultSize(width: 1440, height: 900)
 
         Settings {
-            SettingsView(model: model, backend: backend)
+            SettingsView(model: model, backend: backend, notifier: runNotifier)
                 .tint(Color.rupuBrand)
         }
     }
