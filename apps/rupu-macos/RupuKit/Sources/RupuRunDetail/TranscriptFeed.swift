@@ -239,16 +239,32 @@ private struct ToolCallRow: View {
     /// itself, so this checks `tool` directly.
     private var isAstGrep: Bool { tool == "ast_grep" }
 
+    /// `fromStructured`'s parsed result — `nil` for a non-`ast_grep` tool or
+    /// when `resultStructured` doesn't carry a `matches` array at all (see
+    /// `AstGrepTranscriptParsing`'s doc comment for the exact trigger and
+    /// its documented divergence from the web parser).
+    private var astGrepStructured: AstGrepTranscriptParsing.StructuredResult? {
+        guard isAstGrep else { return nil }
+        return AstGrepTranscriptParsing.fromStructured(resultStructured)
+    }
+
     /// Parsed `ast_grep` matches — structured (`resultStructured`) first,
-    /// falling back to a text-parse of `resultOutput` when structured data
-    /// is absent (an older run, or a text-only transcript) — same fallback
-    /// order the web `ToolCard`'s `AstGrepBody` uses. Empty (not just for a
-    /// non-`ast_grep` tool) whenever neither source yields anything to show.
+    /// falling back to a text-parse of `resultOutput` when structured
+    /// parsing yields nothing (an older run, a text-only transcript, or —
+    /// per `AstGrepTranscriptParsing`'s doc comment — every individual
+    /// match in a present `matches` array failing to parse). Empty (not
+    /// just for a non-`ast_grep` tool) whenever neither source yields
+    /// anything to show.
     private var astGrepMatches: [AstGrepTranscriptParsing.Match] {
         guard isAstGrep else { return [] }
-        let structured = AstGrepTranscriptParsing.fromStructured(resultStructured)
-        guard structured.isEmpty else { return structured }
+        if let structured = astGrepStructured, !structured.matches.isEmpty { return structured.matches }
         return AstGrepTranscriptParsing.fromText(resultOutput ?? "")
+    }
+
+    /// The matches section's count label — see `AstGrepTranscriptParsing.
+    /// matchCountLabel`'s doc comment for the truncation-honesty contract.
+    private var astGrepMatchCountLabel: String {
+        AstGrepTranscriptParsing.matchCountLabel(structured: astGrepStructured, matches: astGrepMatches)
     }
 
     var body: some View {
@@ -312,7 +328,7 @@ private struct ToolCallRow: View {
 
     private var astGrepMatchesSection: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Eyebrow("\(astGrepMatches.count) match\(astGrepMatches.count == 1 ? "" : "es")")
+            Eyebrow(astGrepMatchCountLabel)
             ForEach(Array(astGrepMatches.enumerated()), id: \.offset) { _, match in
                 AstGrepMatchRow(match: match, sourcePreviewStore: sourcePreviewStore)
             }
@@ -485,14 +501,8 @@ private struct AstGrepMatchRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if sourcePreviewStore != nil {
-                    Button("source") { sourceOpen.toggle() }
-                        .buttonStyle(.plain)
-                        .font(.metaText)
-                        .foregroundStyle(Color.rupuBrand)
-                    Button("tree") { treeOpen.toggle() }
-                        .buttonStyle(.plain)
-                        .font(.metaText)
-                        .foregroundStyle(Color.rupuBrand)
+                    disclosureToggle(title: "source", isOpen: $sourceOpen, accessibilityVerb: "source preview")
+                    disclosureToggle(title: "tree", isOpen: $treeOpen, accessibilityVerb: "AST tree")
                 }
                 Spacer(minLength: 0)
             }
@@ -513,16 +523,59 @@ private struct AstGrepMatchRow: View {
         .padding(8)
         .panelStyle(.innerCard)
     }
+
+    /// One "source"/"tree" toggle button — review fix (finding 7): a bare
+    /// text button gave no visible sign of which of the two independent
+    /// disclosures was currently open. A rotating chevron (same `chevronDown`
+    /// + `rotationEffect` idiom `AstNodeRow`'s own expand chevron uses) plus
+    /// an ink-vs-brand color swap when open, and an explicit accessibility
+    /// label describing the CURRENT action ("Show"/"Hide" — not just the
+    /// static title), close both gaps.
+    private func disclosureToggle(title: String, isOpen: Binding<Bool>, accessibilityVerb: String) -> some View {
+        Button {
+            isOpen.wrappedValue.toggle()
+        } label: {
+            HStack(spacing: 2) {
+                Icon(.chevronDown, size: 9)
+                    .rotationEffect(.degrees(isOpen.wrappedValue ? 0 : -90))
+                Text(title)
+            }
+        }
+        .buttonStyle(.plain)
+        .font(.metaText)
+        .foregroundStyle(isOpen.wrappedValue ? Color.rupuInk : Color.rupuBrand)
+        .accessibilityLabel(isOpen.wrappedValue ? "Hide \(accessibilityVerb)" : "Show \(accessibilityVerb)")
+    }
 }
 
 /// Pure `ast_grep` match parsing — no view/state dependency, so it's
 /// directly `@Test`-able via `@testable import RupuRunDetail` without any
-/// SwiftUI rendering. Two sources, same fallback order the web `ToolCard`'s
-/// `AstGrepBody` uses: `fromStructured` reads `tool_result.structured`
-/// (camelCase `matches[].{file,range:{startLine,startCol,...}, text}`, per
-/// `crates/rupu-cp/src/api/...`'s `AstGrepStructured` shape); `fromText`
-/// falls back to a line-by-line `path:line:col: text` parse of the plain
-/// output for a run recorded before structured `ast_grep` output existed.
+/// SwiftUI rendering. Two sources: `fromStructured` reads `tool_result.
+/// structured` (camelCase `{matchCount, fileCount, truncated, matches: [{
+/// file, range?: {startLine,startCol,endLine,endCol}, text? }]}` — built as
+/// a raw `serde_json::json!` object by the actual wire producer,
+/// `crates/rupu-tools/src/ast_grep.rs:299-332` (there is no Rust
+/// `AstGrepStructured` struct; the TS interface of the same name the web
+/// side decodes into is `crates/rupu-cp/web/src/components/transcript/
+/// ToolCard.tsx:177`). `fromText` falls back to a line-by-line
+/// `path:line:col: text` parse of the plain output for a run recorded
+/// before structured `ast_grep` output existed.
+///
+/// **Fallback trigger diverges from the web, by omission, not by design.**
+/// The web's `asAstGrepStructured` (`ToolCard.tsx`) falls back to
+/// `parseAstGrepText` ONLY when `structured` is absent or its `matches`
+/// field isn't an array — a present-but-malformed individual match (e.g.
+/// missing `range`) still renders as a range-less row, never triggers a
+/// wholesale re-parse of `output`. `astGrepMatches` (below) falls back
+/// whenever `fromStructured(...).matches.isEmpty` instead — which also
+/// fires if EVERY match in an otherwise-present `matches` array individually
+/// failed to parse (dropped by the `compactMap` below, since a match missing
+/// `file` or a well-formed `range` is skipped rather than surfaced with
+/// fabricated coordinates). This divergence is unreachable against today's
+/// emitter (`crates/rupu-tools/src/ast_grep.rs` always populates a real
+/// `range` on every match it emits), so it's left as-is and documented
+/// rather than restructured to match the web's narrower trigger.
+///
 /// Deliberately narrower than the web's own `AstGrepMatch` (no metavar
 /// bindings/highlight table) — this phase only needs enough per match to
 /// target `SourcePreview`/`AstTreeView`'s `(path, line, col)`, not to
@@ -535,17 +588,37 @@ enum AstGrepTranscriptParsing {
         let text: String?
     }
 
-    /// Parses `tool_result.structured`'s `matches: [{ file, range?:
-    /// {startLine,startCol,endLine,endCol}, text? }]` shape. A match missing
-    /// `file` or a well-formed `range` is skipped rather than surfaced with
-    /// fabricated coordinates — same "skip the malformed entry, don't
-    /// corrupt the render" discipline the web parser follows. Returns `[]`
-    /// (not just for absent/malformed input) whenever nothing usable is
-    /// found, which is exactly the fallback-to-text-parse trigger
-    /// `astGrepMatches` above checks.
-    static func fromStructured(_ value: JSONValue?) -> [Match] {
-        guard case .object(let root)? = value, case .array(let rawMatches)? = root["matches"] else { return [] }
-        return rawMatches.compactMap { raw -> Match? in
+    /// `fromStructured`'s full result: the parsed (possibly match-dropping,
+    /// see the type doc comment) match list alongside the wire's own
+    /// `matchCount`/`truncated` — the server-reported TOTAL match count and
+    /// whether the `matches` array is a truncated prefix of it (capped at
+    /// `MAX_STRUCTURED_MATCHES = 200`, `crates/rupu-tools/src/
+    /// ast_grep.rs:34`), needed to render the web's honest "showing first N
+    /// of M" label (`ToolCard.tsx:697-701`) instead of a plain count that
+    /// would silently imply `matches.count` IS the total.
+    struct StructuredResult: Equatable {
+        let matches: [Match]
+        /// The wire's own `matchCount` when present; falls back to
+        /// `matches.count` for a malformed/absent field rather than reading
+        /// as `0` — an honest reading of "we don't know the true total, so
+        /// assume it's exactly what we parsed," never a fabricated number.
+        let matchCount: Int
+        let truncated: Bool
+    }
+
+    /// Parses `tool_result.structured`'s `{matchCount, truncated, matches:
+    /// [{ file, range?: {startLine,startCol,endLine,endCol}, text? }]}`
+    /// shape — see the type doc comment for the exact wire producer and the
+    /// documented fallback-trigger divergence from the web parser. `nil`
+    /// when `structured` is absent or its `matches` field isn't present as
+    /// an array at all (the web's own fallback trigger); a present-but-
+    /// empty-after-parsing `matches` list still returns a non-`nil`
+    /// `StructuredResult` with an empty `matches` array — `astGrepMatches`
+    /// (below) is what decides whether THAT case additionally falls back to
+    /// `fromText`.
+    static func fromStructured(_ value: JSONValue?) -> StructuredResult? {
+        guard case .object(let root)? = value, case .array(let rawMatches)? = root["matches"] else { return nil }
+        let matches = rawMatches.compactMap { raw -> Match? in
             guard case .object(let m) = raw, case .string(let file)? = m["file"] else { return nil }
             guard case .object(let range)? = m["range"],
                   case .number(let startLine)? = range["startLine"],
@@ -557,6 +630,36 @@ enum AstGrepTranscriptParsing {
             }()
             return Match(file: file, startLine: Int(startLine), startCol: Int(startCol), text: text)
         }
+        let matchCount: Int = {
+            if case .number(let n)? = root["matchCount"] { return Int(n) }
+            return matches.count
+        }()
+        let truncated: Bool = {
+            if case .bool(let t)? = root["truncated"] { return t }
+            return false
+        }()
+        return StructuredResult(matches: matches, matchCount: matchCount, truncated: truncated)
+    }
+
+    /// The matches section's count label — the web's own truthful-under-
+    /// truncation shape (`ToolCard.tsx:697-701`, `"showing first N of M
+    /// matches"`) whenever `structured` is present AND its own `truncated`
+    /// flag is set (its `matches` array is a capped prefix of the server's
+    /// real total, `MAX_STRUCTURED_MATCHES = 200` — `crates/rupu-tools/src/
+    /// ast_grep.rs:34`); a plain `"N matches"` otherwise — including for the
+    /// text-parsed fallback (`structured == nil`), which carries no
+    /// truncation signal at all, and for an untruncated structured result
+    /// (where `matches.count` already equals `matchCount`, so a plain count
+    /// isn't misleading). `matches` is the list actually being RENDERED
+    /// (post text-fallback if that's what fired) — always `structured?.
+    /// matches` when `structured` is truncated, since truncation only ever
+    /// applies to the structured path.
+    static func matchCountLabel(structured: StructuredResult?, matches: [Match]) -> String {
+        if let structured, structured.truncated {
+            return "showing first \(structured.matches.count) of \(structured.matchCount) matches"
+        }
+        let count = matches.count
+        return "\(count) match\(count == 1 ? "" : "es")"
     }
 
     /// Parses the compact `path:line:col: text` line format `ast_grep`'s

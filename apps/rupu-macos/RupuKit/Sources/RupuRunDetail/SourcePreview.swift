@@ -35,7 +35,7 @@ struct SourcePreview: View {
 
     var body: some View {
         content
-            .task(id: "\(path):\(line)") {
+            .task(id: Self.taskID(runID: store.runID, path: path, line: line)) {
                 await store.loadSourceIfNeeded(path: path, line: line)
             }
     }
@@ -140,5 +140,23 @@ struct SourcePreview: View {
     static func gutterWidth(totalLines: Int?) -> CGFloat {
         let digits = String(totalLines ?? 1).count
         return max(28, CGFloat(digits) * 7 + 12)
+    }
+
+    /// Review fix (finding 2): the `.task(id:)` key MUST include the
+    /// store's own `runID`, not just `(path, line)` — a `SourcePreview`
+    /// instance can survive a run switch on a screen that reuses its
+    /// `@State` across a `runID` prop change (`RunDetailScreen`'s own doc
+    /// comment describes exactly this "same screen slot, different run"
+    /// case). `SourcePreviewStore.setRun` flushes its cache on that switch,
+    /// but a `(path, line)`-only task id never re-fires for a row whose
+    /// path/line happen to coincide across the two runs — this view would
+    /// strand on "Loading source…" forever, querying a cache key that will
+    /// never be populated again (the OLD in-flight fetch, if any, is
+    /// generation-guarded away by the store itself; nothing else would ever
+    /// retrigger it). Folding `runID` in makes a run switch produce a fresh
+    /// task id, which re-fires `.task` and re-issues the fetch against the
+    /// NEW run correctly.
+    static func taskID(runID: String, path: String, line: Int) -> String {
+        "\(runID):\(path):\(line)"
     }
 }

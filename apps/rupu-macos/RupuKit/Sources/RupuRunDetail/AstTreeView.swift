@@ -6,9 +6,10 @@ import RupuDesign
 /// Run-scoped tree-sitter CST viewer for the transcript's "view AST"
 /// disclosure (Phase 6B, Task 5) — sibling of `SourcePreview`'s "view
 /// source" disclosure; both fetch through the same `SourcePreviewStore`.
-/// Recursive `AstNodeRow`, matched-node highlight, and an ancestor-chain
-/// auto-expand on load mirror the web `AstTree` component (`crates/rupu-cp/
-/// web/src/components/transcript/AstTree.tsx`).
+/// Recursive `AstNodeRow`, matched-node highlight, an ancestor-chain
+/// auto-expand on load, and a named-only default with an anonymous-nodes
+/// disclosure mirror the web `AstTree` component (`crates/rupu-cp/web/src/
+/// components/transcript/AstTree.tsx`).
 ///
 /// **Lazy on mount** — same convention as `SourcePreview`: this view's own
 /// `.task(id:)` triggers the fetch, so the caller controls "fetch on expand
@@ -27,6 +28,11 @@ struct AstTreeView: View {
     let col: Int
 
     @State private var expanded: Set<String> = []
+    /// Review fix (finding 7): web parity — `AstTree.tsx`'s own "show
+    /// anonymous" checkbox defaults OFF, so an unnamed/anonymous
+    /// tree-sitter node (punctuation, keywords, ...) stays hidden until the
+    /// operator asks for it. `false` here matches that default exactly.
+    @State private var showAnonymous = false
 
     init(store: SourcePreviewStore, path: String, line: Int, col: Int) {
         self.store = store
@@ -37,7 +43,7 @@ struct AstTreeView: View {
 
     var body: some View {
         content
-            .task(id: "\(path):\(line):\(col)") {
+            .task(id: Self.taskID(runID: store.runID, path: path, line: line, col: col)) {
                 await store.loadAstIfNeeded(path: path, line: line, col: col)
                 seedExpansionIfPossible()
             }
@@ -83,10 +89,22 @@ struct AstTreeView: View {
         case .content(let response):
             if response.available, let root = response.root {
                 VStack(alignment: .leading, spacing: 4) {
-                    if response.truncated == true {
-                        Text("tree truncated (large file)")
-                            .font(.metaText)
-                            .foregroundStyle(Color.rupuMute)
+                    HStack(spacing: 8) {
+                        Button {
+                            showAnonymous.toggle()
+                        } label: {
+                            Text(showAnonymous ? "hide anonymous" : "show anonymous")
+                        }
+                        .buttonStyle(.plain)
+                        .font(.metaText)
+                        .foregroundStyle(Color.rupuBrand)
+                        .accessibilityLabel(showAnonymous ? "Hide anonymous nodes" : "Show anonymous nodes")
+                        Spacer(minLength: 0)
+                        if response.truncated == true {
+                            Text("tree truncated (large file)")
+                                .font(.metaText)
+                                .foregroundStyle(Color.rupuMute)
+                        }
                     }
                     // Contained scrolling — a CST tree can run deep/wide; it
                     // sits inside its own bounded `ScrollView`, never an
@@ -94,7 +112,7 @@ struct AstTreeView: View {
                     // 5B "eager container" lesson).
                     ScrollView([.vertical, .horizontal]) {
                         VStack(alignment: .leading, spacing: 1) {
-                            AstNodeRow(node: root, path: "0", depth: 0, expanded: $expanded)
+                            AstNodeRow(node: root, path: "0", depth: 0, expanded: $expanded, showAnonymous: showAnonymous)
                         }
                     }
                     .frame(maxHeight: 220)
@@ -126,25 +144,41 @@ struct AstTreeView: View {
         }
         return nil
     }
+
+    /// Review fix (finding 2): same "fold run identity into the task id"
+    /// contract as `SourcePreview.taskID` — see that function's doc comment
+    /// for the full rationale (a same-slot run switch, with this view's
+    /// `@State` surviving it, must re-fire `.task` against the newly-flushed
+    /// store rather than stranding on "Loading AST…" forever).
+    static func taskID(runID: String, path: String, line: Int, col: Int) -> String {
+        "\(runID):\(path):\(line):\(col)"
+    }
 }
 
-/// One recursive CST row: a chevron toggle (when the node has children), the
-/// node's field name (if any) + kind + `startLine:startCol-endLine:endCol`
-/// range, `Color.rupuWarnBg` highlight when `node.matched`, indented by
-/// `depth`. Named-vs-anonymous distinction reads as dimmed text rather than
-/// a separate toggle (unlike the web viewer's "show anonymous" checkbox —
-/// this phase keeps it simple: anonymous nodes are always shown, just
-/// visually de-emphasized).
+/// One recursive CST row: a chevron toggle (when the node has any VISIBLE
+/// children under the current `showAnonymous` filter), the node's field name
+/// (if any) + kind + `startLine:startCol-endLine:endCol` range,
+/// `Color.rupuWarnBg` highlight when `node.matched`, indented by `depth`.
+/// Named-vs-anonymous filtering (web parity — `AstTreeView`'s own "show
+/// anonymous" toggle) happens here, at each level, the same way the web
+/// `TreeNode` does it: children are walked with their ORIGINAL index
+/// (`node.children.enumerated()`), and an index is simply skipped from
+/// rendering (not filtered out of the array first) when it's anonymous and
+/// `showAnonymous` is off — so a path string like `"0.2"` always means "the
+/// 3rd child in the RAW `children` array," matching what
+/// `AstTreeView.matchedAncestorPaths`'s `expanded` set already stores,
+/// regardless of how many siblings are currently hidden.
 private struct AstNodeRow: View {
     let node: APIAstNode
     let path: String
     let depth: Int
     @Binding var expanded: Set<String>
+    let showAnonymous: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 4) {
-                if node.children.isEmpty {
+                if visibleChildIndices.isEmpty {
                     Color.clear.frame(width: 12, height: 12)
                 } else {
                     Button {
@@ -155,6 +189,7 @@ private struct AstNodeRow: View {
                             .rotationEffect(.degrees(isExpanded ? 0 : -90))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(isExpanded ? "Collapse \(node.kind)" : "Expand \(node.kind)")
                 }
                 if let field = node.field {
                     Text("\(field):")
@@ -173,14 +208,27 @@ private struct AstNodeRow: View {
             .background(node.matched ? Color.rupuWarnBg : Color.clear)
 
             if isExpanded {
-                ForEach(Array(node.children.enumerated()), id: \.offset) { index, child in
-                    AstNodeRow(node: child, path: "\(path).\(index)", depth: depth + 1, expanded: $expanded)
+                ForEach(visibleChildIndices, id: \.self) { index in
+                    AstNodeRow(
+                        node: node.children[index], path: "\(path).\(index)", depth: depth + 1,
+                        expanded: $expanded, showAnonymous: showAnonymous
+                    )
                 }
             }
         }
     }
 
     private var isExpanded: Bool { expanded.contains(path) }
+
+    /// The original `node.children` indices that should actually render
+    /// under the current `showAnonymous` filter — every index when
+    /// `showAnonymous` is on, else only the named ones. A node whose
+    /// children are ALL anonymous (and `showAnonymous` is off) correctly
+    /// reads as a leaf (no chevron) rather than showing a disclosure that
+    /// expands to nothing.
+    private var visibleChildIndices: [Int] {
+        node.children.indices.filter { showAnonymous || node.children[$0].named }
+    }
 
     private func toggle() {
         if expanded.contains(path) {
