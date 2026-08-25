@@ -194,6 +194,29 @@ private func iso(_ s: String) -> Date {
     #expect(buckets[0].day == "2026-07-05")
 }
 
+/// Review fix (round 1, Important): a BOUNDED window (7d/30d, `since` well
+/// after the epoch) must fill its FULL span with leading zero-buckets even
+/// when the first activity inside the window isn't on day one — the
+/// original implementation clamped `fillStart` up to the window-scoped
+/// earliest row, which silently dropped days 1-2 here. Mirrors what the
+/// Rust source's `timeline_fill_start` actually resolves to for an
+/// established project (its store-wide earliest run predates the window,
+/// so `window_start.max(earliest_run)` == `window_start`).
+@Test func buildSpendTimelineBoundedWindowFillsFromSinceWithLeadingZeroDaysEvenWhenFirstActivityIsLater() {
+    let since = iso("2026-07-01T00:00:00Z")
+    let until = iso("2026-07-07T23:59:59Z")
+    let rows = [row(runID: "run_a", startedAt: "2026-07-03T12:00:00Z")]
+
+    let buckets = buildSpendTimeline(rows: rows, since: since, until: until)
+
+    #expect(buckets.map(\.day) == [
+        "2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05", "2026-07-06", "2026-07-07",
+    ])
+    #expect(buckets[0].rows.isEmpty, "day 1 (before any activity) must still render as a zero bucket")
+    #expect(buckets[1].rows.isEmpty, "day 2 (before any activity) must still render as a zero bucket")
+    #expect(buckets[2].rows.count == 1, "day 3 carries the only row")
+}
+
 @Test func buildSpendTimelineEmptyRowsProducesEmptyOutput() {
     #expect(buildSpendTimeline(rows: [], since: iso("2026-07-01T00:00:00Z"), until: iso("2026-07-05T00:00:00Z")).isEmpty)
 }
