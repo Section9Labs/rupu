@@ -67,12 +67,28 @@ public struct LauncherSheet: View {
     /// scene reactivation while the sheet is still up) — `store == nil` is
     /// the same one-shot-construction contract `ActivityScreen.activate`
     /// documents.
+    ///
+    /// **Prefill (Phase 5A, Task 7)**: after the store's own `activate()`
+    /// populates `agents`/`workflows`, `model.consumeLauncherPrefill()` is
+    /// checked — if the Library screen (or any future caller of `AppModel.
+    /// presentLauncher(...)`) requested one, it's applied via `newStore.
+    /// prefill(...)` and the request is cleared in the same step (see
+    /// `AppModel.launcherPrefill`'s doc comment for why consuming, not just
+    /// reading, matters here). Ordering after `activate()` vs. before
+    /// doesn't matter functionally — `LauncherStore.prefill(...)`'s own doc
+    /// comment explains why (`activate()` only ever populates the raw
+    /// `agents`/`workflows`/`hosts` lists, never `kind`/`selectedDefinition`/
+    /// the scope fields) — sequential here simply because that's the order
+    /// the store's own designated flow already runs in.
     private func activate() async {
         guard store == nil else { return }
         guard let client = backend.client() else { return }
         let newStore = LauncherStore(client: client)
         store = newStore
         await newStore.activate()
+        if let prefill = model.consumeLauncherPrefill() {
+            await newStore.prefill(kind: prefill.kind, name: prefill.name, scopeKind: prefill.scopeKind, scopeID: prefill.scopeID)
+        }
     }
 }
 

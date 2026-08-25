@@ -12,6 +12,25 @@ public enum LaunchKind: String, CaseIterable, Sendable {
     case agentRun, session, workflow
 }
 
+/// One request to open the Launcher sheet pre-selected to a specific
+/// definition, carrying its scope — `AppModel.presentLauncher(...)`'s
+/// payload (Phase 5A, Task 7: the Library screen's per-row/page Launch).
+/// See `AppModel.launcherPrefill`'s doc comment for the produce/consume
+/// contract.
+public struct LauncherPrefillRequest: Equatable, Sendable {
+    public let kind: LaunchKind
+    public let name: String
+    public let scopeKind: String?
+    public let scopeID: String?
+
+    public init(kind: LaunchKind, name: String, scopeKind: String? = nil, scopeID: String? = nil) {
+        self.kind = kind
+        self.name = name
+        self.scopeKind = scopeKind
+        self.scopeID = scopeID
+    }
+}
+
 /// `LaunchOutcome.result`'s failure payload — a bare message, not a typed
 /// taxonomy of failure modes (every mutation surface in this module already
 /// collapses failures down to one string via `mutationErrorMessage(_:)`).

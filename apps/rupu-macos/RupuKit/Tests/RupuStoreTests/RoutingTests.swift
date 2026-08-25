@@ -69,6 +69,36 @@ import Testing
     #expect(model.selectedSidebarItem == SidebarItem.projects)
 }
 
+/// Phase 5A, Task 7: `.agentDefinition`/`.workflowDefinition` are pushed from
+/// `.library` (either agents/workflows tab, or an autoflows-tab row — an
+/// autoflow definition IS a workflow definition, no separate detail route)
+/// and keep the sidebar highlighting Library, same "pushed, not directly
+/// sidebar-selectable" contract `.projectDetail` already has for Projects.
+@MainActor @Test func agentAndWorkflowDefinitionKeepSidebarHighlightOnLibrary() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.route = .library
+
+    model.route = .agentDefinition(name: "code-reviewer")
+    #expect(model.selectedSidebarItem == SidebarItem.library)
+
+    model.route = .workflowDefinition(name: "nightly-health")
+    #expect(model.selectedSidebarItem == SidebarItem.library)
+}
+
+/// `navigate(to:)`/`navigateBack()` from Library push/pop the same as every
+/// other pushed detail route.
+@MainActor @Test func navigateBackFromAgentDefinitionReturnsToLibrary() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.route = .library
+
+    model.navigate(to: .agentDefinition(name: "code-reviewer"))
+    #expect(model.route == .agentDefinition(name: "code-reviewer"))
+    #expect(model.routeStack == [.library])
+
+    model.navigateBack()
+    #expect(model.route == .library)
+}
+
 @MainActor @Test func navigateBackRestoresPriorActivityFilterDefaultingToAll() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
 
@@ -152,4 +182,48 @@ import Testing
     model.navigateBack()
     #expect(model.route == .activity(.workflows))
     #expect(model.routeStack == [])
+}
+
+// MARK: - Launcher prefill seam (Phase 5A, Task 7)
+//
+// `AppModel.presentLauncher(...)`/`consumeLauncherPrefill()` — the Library
+// screen's per-row/page Launch seam. See `AppModel.launcherPrefill`'s doc
+// comment for the produce/consume contract `LauncherSheet.activate()`
+// depends on.
+
+@MainActor @Test func presentLauncherSetsShowLauncherAndTheRequestedPrefill() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    #expect(!model.showLauncher)
+    #expect(model.launcherPrefill == nil)
+
+    model.presentLauncher(kind: .agentRun, name: "code-reviewer", scopeKind: "project", scopeID: "ws-1")
+
+    #expect(model.showLauncher)
+    #expect(model.launcherPrefill == LauncherPrefillRequest(kind: .agentRun, name: "code-reviewer", scopeKind: "project", scopeID: "ws-1"))
+}
+
+/// `consumeLauncherPrefill()` reads and clears in one step — a second call
+/// with nothing new set returns `nil`, never re-delivering the same
+/// request. This is what keeps a later plain "+ New run" open (toolbar/⌘N,
+/// neither of which calls `presentLauncher`) from silently inheriting a
+/// stale prior per-row Launch request.
+@MainActor @Test func consumeLauncherPrefillReadsAndClearsInOneStep() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.presentLauncher(kind: .workflow, name: "nightly-health")
+
+    let first = model.consumeLauncherPrefill()
+    #expect(first == LauncherPrefillRequest(kind: .workflow, name: "nightly-health"))
+    #expect(model.launcherPrefill == nil)
+
+    let second = model.consumeLauncherPrefill()
+    #expect(second == nil)
+}
+
+/// `showLauncher` toggled directly (the toolbar/⌘N path) never sets a
+/// prefill — `presentLauncher(...)` is the only producer.
+@MainActor @Test func settingShowLauncherDirectlyNeverSetsAPrefill() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    model.showLauncher = true
+    #expect(model.launcherPrefill == nil)
+    #expect(model.consumeLauncherPrefill() == nil)
 }

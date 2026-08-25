@@ -19,6 +19,21 @@ public enum ActionVerb: String, Sendable, Hashable {
     /// applyHosts(_:)` confirms it directly once a fresh `/api/hosts` batch
     /// no longer contains the removed id — see that method's doc comment.
     case remove
+    /// Phase 5A, Task 7 addition: `LibraryStore.setAutoflowEnabled(...)`.
+    /// Entity-scoped to a definition name (per the brief, "keyed sensibly
+    /// (definition name)"), not a run id — same "never resolved by status"
+    /// bucket as `archive`/`restore`/`send`/`launch`/`remove`.
+    ///
+    /// **Confirmed immediately, not on a later refetch** (unlike `.remove`'s
+    /// "row disappearing IS the confirmation" contract): `POST /api/
+    /// autoflows/:name/enable|disable`'s response body IS the on-disk file's
+    /// actual new state (`AutoflowSetEnabledResponse.enabled`), not a
+    /// recorded-but-not-yet-applied marker — see `CPClient.
+    /// setAutoflowEnabled`'s doc comment. `LibraryStore.setAutoflowEnabled`
+    /// calls `confirm(_:)` directly off that response, same as `archive`/
+    /// `restore`/`send`/`launch` already do for their own response-visible
+    /// effects.
+    case setEnabled
 }
 
 /// Identifies one in-flight mutation: which entity (a run ID today; any
@@ -197,7 +212,7 @@ public final class PendingActions {
             return status == .cancelled
         case .pause:
             return status == .paused
-        case .archive, .restore, .send, .launch, .remove:
+        case .archive, .restore, .send, .launch, .remove, .setEnabled:
             return false
         }
     }

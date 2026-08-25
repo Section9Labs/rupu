@@ -296,6 +296,24 @@ struct CPClientTests {
         #expect(StubURLProtocol.lastRequest?.url?.path == "/api/autoflows")
     }
 
+    /// Phase 5A, Task 7: `GET /api/agents/:name` — no scope query params, per
+    /// `agentDetail(name:)`'s doc comment.
+    @Test func agentDetailHitsNamePathAndDecodesFixture() async throws {
+        let fixture = try Fixtures.data("agent_detail.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+        let detail = try await client.agentDetail(name: "code-reviewer")
+
+        #expect(detail.name == "code-reviewer")
+        #expect(StubURLProtocol.lastRequest?.url?.path == "/api/agents/code-reviewer")
+        #expect(StubURLProtocol.lastRequest?.url?.query == nil)
+    }
+
     @Test func projectDetailHitsWsIDPathAndDecodesFixture() async throws {
         let fixture = try Fixtures.data("project_detail.json")
         StubURLProtocol.lastRequest = nil
