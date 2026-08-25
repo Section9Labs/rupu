@@ -25,11 +25,23 @@ public struct SituationSnapshot: Equatable, Sendable {
     public let cards: [StreamCard]
     public let roster: [RosterEntry]
     public let vitals: Vitals
+    /// `StreamCard.key`s currently inside the fresh-arrival highlight
+    /// window — the `EventStreamColumn`-facing translation of
+    /// `SituationStore.freshEvents: Set<CPEvent>` (see that property's doc
+    /// comment for why the store tracks the `CPEvent` identity rather than
+    /// this string one). Computed alongside `cards` below so it always
+    /// reflects exactly the keys actually present in THIS snapshot's
+    /// `cards` — never a stale key for a card that got capped out of the
+    /// stream. Findings can never appear here — `Events.tsx`'s own
+    /// `freshKeys` is populated only from the live event stream
+    /// (`subscribeEvents`'s callback), never from a finding.
+    public let freshKeys: Set<String>
 
-    public init(cards: [StreamCard], roster: [RosterEntry], vitals: Vitals) {
+    public init(cards: [StreamCard], roster: [RosterEntry], vitals: Vitals, freshKeys: Set<String> = []) {
         self.cards = cards
         self.roster = roster
         self.vitals = vitals
+        self.freshKeys = freshKeys
     }
 }
 
@@ -45,6 +57,12 @@ public struct SituationSnapshot: Equatable, Sendable {
 ///   `[...eventCards, ...findingCards].sort((a,b) => b.ts - a.ts)` was doing
 ///   on the web, capped at `cardCap` (`MAX_EVENTS` = 5000, matching
 ///   `SituationStore.eventRows`'s own cap — see that type's doc comment).
+/// - `freshKeys` (redesign pass, Task 4 — no `Events.tsx` line range of its
+///   own, since the web computes `freshKeys` directly as `StreamCard`-shaped
+///   string keys already; this port's `SituationStore` tracks the same
+///   concept keyed on `CPEvent` instead, so this function is where that
+///   translates to the `StreamCard.key` strings `EventStreamColumn` actually
+///   renders against — see `SituationSnapshot.freshKeys`'s own doc comment).
 /// - `activity`/`roster` (lines 276-283): `deriveActivity` needs its input
 ///   newest-first, which `eventRows` already is (see `SituationStore`'s doc
 ///   comment on that invariant).
@@ -61,17 +79,27 @@ public func assembleSituation(
     runTerminalStatus: [String: String],
     dashboard: APIDashboardResponse?,
     eventsPerMin: Int,
+    freshEvents: Set<CPEvent> = [],
     cardCap: Int = 5_000,
     findingsStreamCap: Int = 60
 ) -> SituationSnapshot {
+    var freshKeys: Set<String> = []
     let eventCards: [StreamCard] = eventRows.compactMap { row in
-        cardForEvent(row.event, ts: Date(timeIntervalSince1970: Double(row.ts) / 1000))
+        guard let card = cardForEvent(row.event, ts: Date(timeIntervalSince1970: Double(row.ts) / 1000)) else {
+            return nil
+        }
+        if freshEvents.contains(row.event) { freshKeys.insert(card.key) }
+        return card
     }
     let findingCards: [StreamCard] = findings
         .sorted { rfc3339ToMS($0.declaredAt) > rfc3339ToMS($1.declaredAt) }
         .prefix(findingsStreamCap)
         .map(cardForFinding)
     let cards = mergeStream(eventCards + findingCards, max: cardCap)
+    // `mergeStream` can cap/dedup cards out of the final list — never claim
+    // a key is fresh if its card didn't survive into `cards`.
+    let survivingKeys = Set(cards.map(\.key))
+    freshKeys.formIntersection(survivingKeys)
 
     let activity = reconcileActivity(deriveActivity(eventRows), persistedStatus: runTerminalStatus)
     let roster = foldRoster(projects: projects, runToWs: runToWorkspace, activity: activity, findings: findings)
@@ -87,7 +115,7 @@ public func assembleSituation(
         eventsPerMin: eventsPerMin
     )
 
-    return SituationSnapshot(cards: cards, roster: roster, vitals: vitals)
+    return SituationSnapshot(cards: cards, roster: roster, vitals: vitals, freshKeys: freshKeys)
 }
 
 /// Port of `Events.tsx`'s `resolveProject` (lines 291-302): a card's own

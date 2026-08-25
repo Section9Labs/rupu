@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 import RupuAPI
 @testable import RupuStore
 
@@ -84,6 +85,63 @@ struct SparkTickTests {
         // rounds rather than truncates.
         let result = sparkTick(current: [0], eventsInWindow: 1, windowMS: 4_800)
         #expect(result.eventsPerMin == 13, "round(60_000 / 4_800) == round(12.5) == 13")
+    }
+}
+
+@Suite
+struct FoldFreshMarksTests {
+    private let epoch = Date(timeIntervalSince1970: 1_000_000)
+
+    @Test func arrivalsAreMarkedFreshUntilNowPlusDuration() {
+        let next = foldFreshMarks([:], arrivals: ["a"], now: epoch, duration: 2.5)
+        #expect(next["a"] == epoch.addingTimeInterval(2.5))
+    }
+
+    @Test func multipleArrivalsInOneFoldAllGetTheSameExpiry() {
+        let next = foldFreshMarks([:], arrivals: ["a", "b", "c"], now: epoch, duration: 2.5)
+        #expect(next.keys.sorted() == ["a", "b", "c"])
+        #expect(Set(next.values) == [epoch.addingTimeInterval(2.5)])
+    }
+
+    @Test func anEntryStillWithinItsWindowSurvivesAFoldWithNoNewArrivals() {
+        let marked = foldFreshMarks([:], arrivals: ["a"], now: epoch, duration: 2.5)
+        // 1s later — well before the 2.5s window closes.
+        let pruned = foldFreshMarks(marked, arrivals: [], now: epoch.addingTimeInterval(1), duration: 2.5)
+        #expect(pruned["a"] != nil, "a) must still be fresh 1s into a 2.5s window")
+    }
+
+    @Test func anEntryPastItsExpiryIsPrunedEvenWithNoNewArrivals() {
+        let marked = foldFreshMarks([:], arrivals: ["a"], now: epoch, duration: 2.5)
+        // 2.5s later — exactly AT expiry: `> now` (not `>=`) is what
+        // survives a fold, so the boundary itself is already gone.
+        let pruned = foldFreshMarks(marked, arrivals: [], now: epoch.addingTimeInterval(2.5), duration: 2.5)
+        #expect(pruned["a"] == nil, "expiry is exclusive — the exact expiry instant is no longer fresh")
+    }
+
+    @Test func aKeyPastExpiryIsPrunedEvenAsOtherKeysRemainFresh() {
+        let firstMark = foldFreshMarks([:], arrivals: ["old"], now: epoch, duration: 2.5)
+        // 2s later: "old" (marked at epoch) has 0.5s left; "new" is marked
+        // fresh right now for its own full 2.5s window.
+        let mixed = foldFreshMarks(firstMark, arrivals: ["new"], now: epoch.addingTimeInterval(2), duration: 2.5)
+        #expect(mixed["old"] != nil, "old still has 0.5s left")
+        #expect(mixed["new"] != nil)
+
+        // 1s further (3s total since epoch): "old"'s window (epoch + 2.5s)
+        // has closed; "new"'s (epoch+2s + 2.5s = epoch+4.5s) has not.
+        let after = foldFreshMarks(mixed, arrivals: [], now: epoch.addingTimeInterval(3), duration: 2.5)
+        #expect(after["old"] == nil, "old must be pruned once its own window closes")
+        #expect(after["new"] != nil, "new's independent, later-started window must not be affected")
+    }
+
+    @Test func aKeyThatArrivesAgainBeforeExpiryRefreshesItsWindowFromNow() {
+        let firstMark = foldFreshMarks([:], arrivals: ["a"], now: epoch, duration: 2.5)
+        let refreshed = foldFreshMarks(firstMark, arrivals: ["a"], now: epoch.addingTimeInterval(2), duration: 2.5)
+        #expect(refreshed["a"] == epoch.addingTimeInterval(2).addingTimeInterval(2.5), "re-arriving resets the expiry to duration from THIS now, not the original")
+    }
+
+    @Test func productionDurationMatchesEventsTsFreshMsAsSeconds() {
+        // `Events.tsx` line 37: `FRESH_MS = 2500` (milliseconds) = 2.5s.
+        #expect(freshHighlightSeconds == 2.5)
     }
 }
 

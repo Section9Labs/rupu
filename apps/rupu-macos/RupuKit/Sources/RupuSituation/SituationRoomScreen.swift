@@ -157,7 +157,8 @@ public struct SituationRoomScreen: View {
             runToWorkspace: store.runToWorkspace,
             runTerminalStatus: store.runTerminalStatus,
             dashboard: store.dashboard,
-            eventsPerMin: store.eventsPerMin
+            eventsPerMin: store.eventsPerMin,
+            freshEvents: store.freshEvents
         )
         let projectsByWorkspace = Dictionary(uniqueKeysWithValues: store.projects.map { ($0.wsID, $0) })
 
@@ -166,6 +167,7 @@ public struct SituationRoomScreen: View {
             HStack(spacing: 0) {
                 EventStreamColumn(
                     cards: snapshot.cards,
+                    freshKeys: snapshot.freshKeys,
                     filter: $filter,
                     projectsByWorkspace: projectsByWorkspace,
                     runToWorkspace: store.runToWorkspace,

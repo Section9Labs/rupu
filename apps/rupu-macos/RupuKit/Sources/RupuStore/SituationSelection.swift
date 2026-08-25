@@ -52,6 +52,63 @@ func sparkTick(current: [Int], eventsInWindow: Int, windowMS: Double) -> (spark:
     return (nextSpark, rate)
 }
 
+/// `Events.tsx` line 37's `FRESH_MS = 2500` (milliseconds), as seconds —
+/// the fresh-arrival highlight window `foldFreshMarks` below marks a key
+/// for.
+let freshHighlightSeconds: TimeInterval = 2.5
+
+/// Fresh-arrival tracking — port of `Events.tsx`'s `freshKeys: Set<string>`
+/// plus its per-key `setTimeout(() => ..., FRESH_MS)` removal (lines 87,
+/// 139-144), verified against the actual `subscribeEvents` callback (not
+/// the initial `getEvents` history-load effect, lines 109-125, which never
+/// touches `freshKeys` at all — only a genuinely NEW live event marks one).
+///
+/// **Lives here (`RupuStore`), not in `RupuSituation` alongside
+/// `isFollowing`/`planStreamRender`** (this task's brief sketch put both
+/// pure pieces in `RupuSituation`) — a deliberate, reasoned divergence, not
+/// an oversight. The web's "only a genuinely new LIVE event, never the
+/// history backfill or a reconnect's re-fetched page" trigger is not
+/// something the RENDER layer can reconstruct after the fact: by the time
+/// `RupuSituation`'s `assembleSituation` sees `eventRows`, a freshly-merged
+/// history row and a freshly-applied live row are indistinguishable arrays
+/// of the same `CPEventRow` shape. `SituationStore.applyLive(_:)` is the
+/// ONE place in this port that already knows the difference (it's the
+/// event-arrival function itself — `mergeIncoming(_:)`, used by both the
+/// initial load and reconnect backfill, never calls into this), so marking
+/// freshness has to happen there, store-side, to stay correct — matching
+/// the "verified web source overrides the brief's own paraphrase" precedent
+/// `StreamCards.swift`'s file header and `EventStreamColumn.swift`'s file
+/// header both already establish for this exact task/module pair.
+///
+/// Modeled as an explicit per-key EXPIRY timestamp map, not one real
+/// `Task.sleep`/timer per key (the direct transliteration of the web's
+/// per-key `setTimeout`) — so the fold is a pure function of `(current,
+/// arrivals, now)`, table-testable with an injected `now` and no real
+/// sleeps bracketing the assertions (#611). `SituationStore` advances this
+/// with `Date()` on every live arrival plus a light periodic real-time
+/// prune tick, so a highlight still clears on schedule even when no
+/// further events land to trigger another fold.
+///
+/// Prunes every entry whose expiry has already passed `now`, then
+/// (re)marks every key in `arrivals` fresh for `duration` starting at
+/// `now`. Generic over `Key` rather than fixed to `String`/`CPEvent` — the
+/// identity this module tracks freshness by is `CPEvent` itself (this
+/// file's sibling `SituationStore.seenEventKeys` already keys the same
+/// dedup ledger on it), not the `StreamCard.key` string `RupuSituation`
+/// computes downstream from it.
+func foldFreshMarks<Key: Hashable>(
+    _ current: [Key: Date],
+    arrivals: [Key],
+    now: Date,
+    duration: TimeInterval = freshHighlightSeconds
+) -> [Key: Date] {
+    var next = current.filter { $0.value > now }
+    for key in arrivals {
+        next[key] = now.addingTimeInterval(duration)
+    }
+    return next
+}
+
 /// Deterministic secondary sort key for `SituationStore.mergeIncoming(_:)`'s
 /// merge sort — review fix round 2, ruling 1: `Array.sort(by:)` is NOT a
 /// stability-guaranteed API (an earlier doc comment on this file's sole
