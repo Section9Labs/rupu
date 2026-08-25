@@ -80,7 +80,7 @@ private func assertJSONEqualsFixture<T: Encodable>(_ value: T, fixture: String) 
 
 @Test func agentLaunchBodyEncodesToFixture() throws {
     try assertJSONEqualsFixture(
-        AgentLaunchBody(prompt: "investigate the failing test", mode: "bypass", target: "main", workingDir: "/tmp/project", host: "mini"),
+        AgentLaunchBody(prompt: "investigate the failing test", mode: "bypass", target: "main", workingDir: "/tmp/project", host: "mini", scopeKind: "project", scopeID: "ws_a"),
         fixture: "agent_run_body.json"
     )
 }
