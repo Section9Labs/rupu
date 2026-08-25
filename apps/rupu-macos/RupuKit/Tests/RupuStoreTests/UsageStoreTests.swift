@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import RupuStore
 import RupuAPI
-import RupuUsage
+import RupuUsageKit
 
 // MARK: - Test doubles
 

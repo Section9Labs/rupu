@@ -1,16 +1,20 @@
 import Foundation
 import Observation
 import RupuAPI
-import RupuUsage
+import RupuUsageKit
 
 /// Owns the Usage screen's (Phase 5B, Task 6) three independent blocks —
 /// `usage` (fleet-wide summary + server-grouped breakdown, `GET /api/usage`),
 /// `usageRuns` (the flat per-`(run × model)` rows that feed the client-side
-/// spend chart via `RupuUsage.buildSpendTimeline`, `GET /api/usage/runs`),
+/// spend chart via `RupuUsageKit.buildSpendTimeline`, `GET /api/usage/runs`),
 /// and `outliers` (`GET /api/usage/outliers`) — plus the active `pivot`
-/// (`RupuUsage.UsagePivot`), which only `usage`'s own fetch depends on (its
-/// `group_by` query param; `usageRuns`/`outliers` are pivot-independent flat
-/// rows, pivoted client-side on demand via `RupuUsage.aggregateRows`).
+/// (`RupuUsageKit.UsagePivot`), which only `usage`'s own fetch depends on
+/// (its `group_by` query param; `usageRuns`/`outliers` are pivot-independent
+/// flat rows, pivoted client-side on demand via `RupuUsageKit.aggregateRows`).
+/// (`RupuUsageKit` was `RupuUsage` in Task 5 — renamed in Task 6 so the
+/// screen module could take the screen-convention name; see
+/// `UsageAggregation.swift`'s file-header doc comment for the full
+/// rationale.)
 ///
 /// **CONTROLLER RULING (single server-side fan-out fetch)**: unlike
 /// `DashboardStore`, there is no per-host client-side fan-out here — `GET
