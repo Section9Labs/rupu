@@ -232,6 +232,61 @@ private func makeStore(
     #expect(groupBys.snapshot == ["model", "host"])
 }
 
+/// Review fix (round 1, Important): a pivot change landing while
+/// `usageRuns`/`outliers` are still in flight (from an `activate`/
+/// `setRange` cycle that hasn't finished) must NOT strand either block at
+/// `.loading` forever — `setPivot` only touches `usage`'s own generation
+/// counter (see `UsageStore`'s doc comment), so `usageRuns`/`outliers`
+/// keep the SAME `generation` their in-flight fetches were dispatched
+/// under and their real results still apply once unblocked. Same "spins
+/// forever" class PR #501 fixed on the run-status side.
+@MainActor @Test func pivotChangeWhileUsageRunsAndOutliersAreInFlightLetsBothStillResolve() async {
+    var releaseRuns: (() -> Void)?
+    let runsReleased = AsyncStream<Void> { continuation in
+        releaseRuns = { continuation.yield(); continuation.finish() }
+    }
+    var releaseOutliers: (() -> Void)?
+    let outliersReleased = AsyncStream<Void> { continuation in
+        releaseOutliers = { continuation.yield(); continuation.finish() }
+    }
+
+    let store = makeStore(
+        usageResult: { _, _, _ in usageResponse() },
+        usageRunsResult: { _, _ in
+            for await _ in runsReleased { break }
+            return [runRow()]
+        },
+        outliersResult: { _, _ in
+            for await _ in outliersReleased { break }
+            return [outlierRow()]
+        }
+    )
+
+    let activateTask = Task { await store.activate(range: .d30) }
+    // Give `activate`'s three concurrent fetches a chance to actually
+    // start (and usageRuns/outliers to block).
+    try? await Task.sleep(for: .milliseconds(20))
+
+    // The pivot change lands while usageRuns/outliers are still blocked.
+    await store.setPivot(.workflow)
+
+    guard case .loading = store.usageRuns else {
+        Issue.record("expected usageRuns still .loading (blocked, not yet stranded)")
+        return
+    }
+    guard case .loading = store.outliers else {
+        Issue.record("expected outliers still .loading (blocked, not yet stranded)")
+        return
+    }
+
+    releaseRuns?()
+    releaseOutliers?()
+    _ = await activateTask.value
+
+    #expect(store.usageRuns.value?.count == 1, "usageRuns must still resolve after the pivot change, not be stranded at .loading")
+    #expect(store.outliers.value?.count == 1, "outliers must still resolve after the pivot change, not be stranded at .loading")
+}
+
 // MARK: - setRange(_:) refetches all three and drops stale in-flight results
 
 @MainActor @Test func setRangeRefetchesAllThreeBlocks() async {

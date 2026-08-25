@@ -253,6 +253,13 @@ private func toPivotRow(pivot: UsagePivot, key: String, agg: Agg) -> PivotRow {
 /// an excluded row's own checkbox permanently unreachable — same rationale
 /// the web source documents). Output rows are sorted by key ascending, one
 /// row per distinct pivot-key. Empty input -> empty output.
+///
+/// **Sort deviation**: the web sorts with `.localeCompare` (locale-aware);
+/// this uses Swift's plain `String` `<` (Unicode canonical ordering, not
+/// locale-aware). Every real pivot key today (model/provider/agent/
+/// workflow/host ids, workspace ids) is ASCII, where the two orderings
+/// agree — this would only diverge for a future non-ASCII pivot key, which
+/// none of the six dimensions currently produce.
 public func aggregateRows(rows: [APIUsageRunRow], pivot: UsagePivot) -> [PivotRow] {
     var byKey: [String: Agg] = [:]
     for row in rows {
@@ -264,31 +271,60 @@ public func aggregateRows(rows: [APIUsageRunRow], pivot: UsagePivot) -> [PivotRo
     return byKey.keys.sorted().map { toPivotRow(pivot: pivot, key: $0, agg: byKey[$0]!) }
 }
 
-/// Buckets `rows` by UTC calendar day and gap-fills every day from
-/// `max(since, earliest contributing row)` to `until` inclusive — a
-/// composite port: the per-row day-keying is `bucketKeyOf`'s `'day'` branch
-/// from the web's client-side `buildTimeline` (`buildTimeline.ts`); the
-/// gap-fill-across-an-explicit-window behavior is `timeline_fill_start`/
-/// `enumerate_bucket_keys`/`build_timeline` from the Rust server
-/// (`crates/rupu-cp/src/api/usage.rs`) — necessary because there is no
-/// client method for `GET /api/usage/timeline` (Task 2's `CPClient` surface
-/// exposes only `usage`/`usageRuns`/`usageOutliers`), so this function IS
-/// the client-side substitute for that endpoint, built from the same flat
+/// Buckets `rows` by UTC calendar day and gap-fills every day of
+/// `[fillStart, until]` inclusive — a composite port: the per-row
+/// day-keying is `bucketKeyOf`'s `'day'` branch from the web's client-side
+/// `buildTimeline` (`buildTimeline.ts`); the gap-fill-across-an-explicit-
+/// window behavior is `timeline_fill_start`/`enumerate_bucket_keys`/
+/// `build_timeline` from the Rust server (`crates/rupu-cp/src/api/
+/// usage.rs`) — necessary because there is no client method for `GET
+/// /api/usage/timeline` (Task 2's `CPClient` surface exposes only
+/// `usage`/`usageRuns`/`usageOutliers`), so this function IS the
+/// client-side substitute for that endpoint, built from the same flat
 /// `usageRuns` rows the web's own `buildTimeline` consumes.
+///
+/// **`fillStart` (review fix, round 1 — Important)**: the Rust source's
+/// `timeline_fill_start` clamps `since` up against the STORE-WIDE earliest
+/// run — computed over EVERY run ever, before the `[since, until]` filter
+/// — specifically so a bounded 7d/30d window still renders its FULL span
+/// with leading zero-buckets whenever the project has any history at all
+/// predating the window (`window_start.max(earliest_run)` resolves to
+/// `window_start` in that ordinary case). This function only ever sees
+/// `rows` already filtered to the window, so it has no store-wide earliest
+/// run to clamp against — using the window-scoped earliest row instead (the
+/// original implementation) would silently DROP the lead-in empty days
+/// whenever the first activity inside the window isn't on day one, which is
+/// wrong for the overwhelmingly common case of an established project.
+/// Fixed by mirroring the value the Rust clamp actually RESOLVES TO for a
+/// bounded window rather than reproducing the clamp itself:
+/// - **Bounded window** (`since` after the epoch, i.e. 7d/30d): fill from
+///   `since` UNCONDITIONALLY — the value `timeline_fill_start` resolves to
+///   for any project with history predating the window.
+/// - **Unbounded `.all` window** (`since == epoch`): keep the
+///   `max(since, earliestSeen)` clamp against the WINDOW-scoped earliest
+///   row — for `.all`, `usageRuns` was fetched with no lower bound at all,
+///   so its window-scoped earliest row IS the store-wide earliest run,
+///   exactly what the Rust clamp needs. Skipping this clamp would chart
+///   potentially decades of empty days back to the epoch — same rationale
+///   `timeline_fill_start`'s own doc comment gives.
 ///
 /// A row with an unparseable `startedAt` is dropped rather than guessed —
 /// same convention `RupuOverview.chartRows` already establishes for
 /// unparseable server timestamps.
 ///
 /// `rows` is expected to already be scoped to `[since, until]` (the same
-/// bounds the caller fetched `GET /api/usage/runs` with) — `since` is only
-/// a defensive floor on the fill start (mirroring the Rust source's
-/// `window_start.max(earliest_run)`), not a re-filter of `rows` itself; a
-/// row outside `[since, until]` still contributes to `rows.first`'s day
-/// bucket if that day happens to fall within the generated range, but
-/// otherwise silently has no bucket to land in. Empty `rows` (or every row
-/// unparseable) -> empty output, mirroring the Rust source's "no runs at
-/// all -> empty series" short-circuit.
+/// bounds the caller fetched `GET /api/usage/runs` with) — a row outside
+/// that range still contributes to its own day's bucket if that day happens
+/// to fall within the generated range, but otherwise silently has no bucket
+/// to land in. Empty `rows` (or every row unparseable) -> empty output,
+/// mirroring the Rust source's "no runs at all -> empty series"
+/// short-circuit — a divergence from the Rust source in the OTHER
+/// direction worth naming: the Rust source's "no runs at all" check is also
+/// store-wide (predates the window filter), so a bounded window with
+/// genuinely zero activity but a non-empty project history would still
+/// gap-fill server-side; this function can't distinguish that case from a
+/// truly empty store without a store-wide fetch outside this surface, so it
+/// returns empty for both.
 public func buildSpendTimeline(rows: [APIUsageRunRow], since: Date, until: Date) -> [SpendBucket] {
     var byDay: [String: [APIUsageRunRow]] = [:]
     var earliest: Date?
@@ -300,7 +336,10 @@ public func buildSpendTimeline(rows: [APIUsageRunRow], since: Date, until: Date)
     }
     guard let earliestSeen = earliest else { return [] }
 
-    let fillStart = utcStartOfDay(max(since, earliestSeen))
+    let epoch = Date(timeIntervalSince1970: 0)
+    let fillStart = since > epoch
+        ? utcStartOfDay(since)
+        : utcStartOfDay(max(since, earliestSeen))
     let fillEnd = utcStartOfDay(until)
     guard fillStart <= fillEnd else { return [] }
 
