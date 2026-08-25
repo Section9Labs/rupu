@@ -86,6 +86,14 @@ public func nextStreamRenderState(
 /// `deferredCount` can include held-back findings too; `EventStreamColumn`'s
 /// bar text says "items", not "events", for exactly this reason.
 ///
+/// **Interplay with the fresh-arrival highlight (final-review note):** a
+/// card arriving during suspension is held out of the list here while its
+/// 2.5s fresh window runs on the wall clock (`SituationStore.freshMarks`) —
+/// so by the time the operator jumps to latest, the held-back cards the bar
+/// advertised usually render WITHOUT the arrival highlight. Deliberate:
+/// the web's expiry is wall-clock too, and re-arming highlights on flush
+/// would mark stale cards as fresh.
+///
 /// **Why this diverges from the web's own mechanism, stated honestly**
 /// (this task's interface note: "port the web's actual approach: check
 /// whether the web inserts always and relies on scroll anchoring, or defers

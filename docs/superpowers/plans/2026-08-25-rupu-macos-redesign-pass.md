@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- NEVER touch `ShellToolbar.swift` or the top-bar region — PR #612 owns it (spec §0). Backlog row 27 stays parked there.
+- NEVER touch `ShellToolbar.swift` or the top-bar region — PR #612 owns it (spec §0). Backlog row 27 stays parked there. **AMENDED mid-pass** (spec §0 amendment): after #612 merged and the branch rebased onto it, the embargo became "extend, never restructure" — T3 edits `customizeMenu`'s content only.
 - The web CP + `docs/macOS_design/V2-CONTRACT.md` are the visual authority; every fidelity change cites the web source it matches (file:line for code-derived values like radii/tints).
 - Every task: full `make macos-test` + `make macos-build` green, actual numbers reported; `@Test @MainActor` on ANY View-type member (statics included); generation-token stubs; semaphore-gated slow stubs (never timed sleeps); condition-poll terminal states.
 - Truthful citations (program record: 5 fabrication incidents, last 3 phases clean — verify before writing).

@@ -39,7 +39,8 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
     public var fleet: Bool
 
     /// Block-id order for the Customize menu's reorder affordance (Task 3).
-    /// Always exactly `defaultOrder`'s set of ids, in whatever order the
+    /// After `init`/`decode(_:)` (which route through `normalized(_:)`):
+    /// exactly `defaultOrder`'s set of ids, in whatever order the
     /// operator dragged them to — see `normalized(_:)` for the forward-compat
     /// contract that guarantees that invariant on every decode.
     public var order: [String]
