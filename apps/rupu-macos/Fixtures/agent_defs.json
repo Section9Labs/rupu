@@ -7,6 +7,7 @@
     "model": "claude-sonnet-4-6",
     "effort": "Medium",
     "max_tokens": 8192,
+    "permission_mode": "ask",
     "tools": [
       "Read",
       "Grep",

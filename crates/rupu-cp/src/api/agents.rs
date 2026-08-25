@@ -367,6 +367,22 @@ pub(crate) struct AgentDto {
     pub(crate) effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
+    /// The agent's frontmatter `permissionMode:` (`AgentSpec::permission_mode`)
+    /// verbatim — `"ask"` / `"bypass"` / `"readonly"`, or absent when the
+    /// frontmatter omits it entirely (the effective mode then falls back to
+    /// CLI flag / project config / global config / the runtime default of
+    /// `ask`, per `rupu_agent::permission::resolve_mode`'s precedence chain
+    /// — none of those other layers are visible from a single agent
+    /// definition, so this DTO deliberately does not attempt to resolve or
+    /// guess an effective mode). Not validated against the three known
+    /// values here — an unrecognized string round-trips as-is, the same
+    /// "unknown → treat as absent" tolerance `rupu_agent::permission::
+    /// parse_mode` already gives the runtime. Added for the macOS Library
+    /// screen's permission-tone badge (Phase 5A, Task 7): `read-only` =
+    /// done, `ask` = await, `bypass` = fail (always loud) — see
+    /// `docs/macOS_design/HANDOFF.md`'s Library line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) permission_mode: Option<String>,
     /// The agent's frontmatter `tools:` allowlist — the runtime grant a step's
     /// `actions:` narrows (never extends) per the step-`actions:`-enforcement
     /// design. An agent whose frontmatter omits `tools:` (unrestricted — every
@@ -453,6 +469,7 @@ impl AgentDto {
             model: spec.model,
             effort: spec.effort.map(|e| format!("{e:?}")),
             max_tokens: spec.max_tokens,
+            permission_mode: spec.permission_mode,
             tools: spec.tools.unwrap_or_default(),
             scope: scope.into(),
             scope_kind,
@@ -2964,6 +2981,7 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             effort: Some("Medium".into()),
             max_tokens: Some(8192),
+            permission_mode: Some("ask".into()),
             tools: vec!["Read".into(), "Grep".into(), "Edit".into()],
             scope: "global".into(),
             scope_kind: ScopeKind::Global,
@@ -2988,6 +3006,10 @@ mod tests {
             model: None,
             effort: None,
             max_tokens: None,
+            // `None` locks the "frontmatter omits permissionMode entirely"
+            // wire shape (key absent, not `null` — `skip_serializing_if`) —
+            // the Swift-side badge mapping's "no override" case.
+            permission_mode: None,
             tools: vec![],
             scope: "widgets".into(),
             scope_kind: ScopeKind::Project,
@@ -2997,6 +3019,23 @@ mod tests {
             last_run: None,
         };
         check_fixture("agent_defs.json", &vec![global, project]);
+    }
+
+    /// `GET /api/agents/:name` (Phase 5A, Task 7) — locks `AgentDetailDto`'s
+    /// flattened wire shape (every `AgentDto` field alongside
+    /// `system_prompt`/`raw`) for the macOS Library screen's Agent detail
+    /// view. Built via the real `detail_from_spec` (not a hand-built
+    /// `AgentDetailDto` literal) so the fixture also pins `system_prompt`/
+    /// `raw` deriving correctly from a genuine parsed `.md` file, same
+    /// rationale `workflow_detail_fixture_is_current` (`api/workflows.rs`)
+    /// gives for parsing `SAMPLE_WORKFLOW_YAML` instead of hand-building its
+    /// `Workflow`.
+    #[test]
+    fn agent_detail_fixture_is_current() {
+        const RAW: &str = "---\nname: code-reviewer\ndescription: Reviews code for correctness and style\nprovider: anthropic\nmodel: claude-sonnet-4-6\neffort: medium\nmaxTokens: 8192\ntools: [Read, Grep, Edit]\npermissionMode: ask\n---\nYou are a meticulous code reviewer. Review the diff for correctness, security, and style issues before approving.\n";
+        let spec = rupu_agent::AgentSpec::parse(RAW).expect("RAW should parse");
+        let detail = detail_from_spec(spec, "global", ScopeKind::Global, "code-reviewer", None);
+        check_fixture("agent_detail.json", &detail);
     }
 
     #[test]
