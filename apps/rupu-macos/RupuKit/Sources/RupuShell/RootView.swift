@@ -64,6 +64,10 @@ public struct RootView: View {
                 .navigationSplitViewColumnWidth(204)
         } detail: {
             detail
+                // The one screen title: the toolbar's leading slot AND the
+                // window title, in sync — `ShellToolbar` carries no title
+                // item of its own (see its doc comment).
+                .navigationTitle(model.route.screenTitle)
                 .toolbar { ShellToolbar(model: model, showLauncher: $model.showLauncher, backend: backend, palette: palette) }
         }
         // Hidden, zero-visual buttons rather than the toolbar controls
