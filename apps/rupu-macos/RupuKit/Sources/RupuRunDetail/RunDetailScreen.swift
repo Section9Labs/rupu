@@ -30,6 +30,17 @@ import RupuDesign
 /// block below (`detail`/`graph`/`netflow`/`findings`) still fails
 /// independently: one `.failed` block renders its own failure box without
 /// blanking the other three.
+///
+/// **Does NOT need `OverviewScreen`'s `.onChange(of: backend.health)`
+/// cold-launch fix**: that fix exists because `.overview` is
+/// `AppModel.route`'s default and never persisted (see `AppModel.swift`),
+/// so it is *always* the very first screen a cold launch renders —
+/// sometimes before `backend.client()` resolves, with nothing to
+/// re-trigger `activate()` once it does. `RunDetailScreen` is only ever
+/// reached by pushing onto `AppModel.routeStack` (an `ActivityRow`/
+/// `NeedsYouRow` tap) — never a cold-launch route — so its `.task(id: runID)`
+/// always runs for the first time well after the shell's own connection
+/// attempt has already resolved.
 public struct RunDetailScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
