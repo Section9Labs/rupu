@@ -12,9 +12,9 @@ import RupuAPI
 /// which capture fetch closures at `init` for a fake-closure test seam, this
 /// store's produced surface (Task 4 brief) takes `client: CPClient`
 /// directly on every method. Tests therefore drive it through a real
-/// `CPClient` pointed at a stub `URLProtocol`, same rig
-/// `DashboardStore`/`ActivityStore`/`LauncherStore`'s tests already use for
-/// their own per-call-`client` methods.
+/// `CPClient` pointed at a stub `URLProtocol` — the same rig
+/// `DashboardStoreTests` already uses (`DashboardStubURLProtocol`), just
+/// with the client handed in per call instead of captured at `init`.
 ///
 /// **Generation-guarded `load`** — same idiom `UsageStore`/`DashboardStore`
 /// already establish: `load(client:project:)` bumps a counter and only

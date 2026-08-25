@@ -78,9 +78,9 @@ final class ConfigStubURLProtocol: URLProtocol {
 }
 
 /// Thread-safe call counter — same rationale as
-/// `LauncherStoreTests.Counter`/`DashboardStoreTests.HitCounter` (both
-/// `private` to their own files): a plain captured `var` can't cross into a
-/// `@Sendable` fetch-handler closure under Swift 6 strict concurrency.
+/// `DashboardStoreTests.HitCounter` (`private` to its own file): a plain
+/// captured `var` can't cross into a `@Sendable` fetch-handler closure under
+/// Swift 6 strict concurrency.
 private final class Counter: @unchecked Sendable {
     private let lock = NSLock()
     private var v = 0
