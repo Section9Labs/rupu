@@ -44,7 +44,6 @@ public enum LucideIcon: String, CaseIterable, Sendable {
     case moreHorizontal
     case search
     case lock
-    case unlock
 }
 
 /// Renders a `LucideIcon` by stroking its constituent SVG paths (`LucideIconData.paths(for:)`,

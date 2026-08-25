@@ -21,11 +21,12 @@ import Testing
 }
 
 @Test func iconCaseCountMatchesExtractorTable() {
-    // 36 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
+    // 35 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
     // pinning the count here means an enum case silently dropped from that table (rather than
-    // failing to parse) still fails a test. Phase 6A Task 6 added `lock`/`unlock` for the Config
-    // tab's Policy lock glyphs (was 34).
-    #expect(LucideIcon.allCases.count == 36)
+    // failing to parse) still fails a test. Phase 6A Task 6 added `lock` for the Config tab's
+    // Policy lock glyphs (was 34); it also added an `unlock` that nothing ever rendered, removed
+    // end-to-end in the final-review wave (M5) — extractor entry, svg asset, and generated case.
+    #expect(LucideIcon.allCases.count == 35)
 }
 
 @Test func repeatIconRawValueIsRepeat() {

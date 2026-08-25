@@ -286,3 +286,55 @@ private let runCompletedEvent = CPEvent.runCompleted(runID: "run-1", status: "su
     await notifier.syncAuthorizationStatus()
     #expect(notifier.authorizationDenied == false)
 }
+
+// MARK: - Final-review fix (I1): rebinding requires deactivate + activate
+
+/// Thread-safe invocation counter for a `streamFactory` closure — the
+/// closure is `@escaping () -> EventStreamClient?` (not `@Sendable`), but
+/// it's called from inside `RunNotifier`'s own `Task`, so its captured
+/// state still has to be safe to read back from the test body.
+private final class FactoryCallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0
+    func increment() { lock.withLock { v += 1 } }
+    var value: Int { lock.withLock { v } }
+}
+
+/// **The mechanism behind the I1 backend-rebinding bug.** `activate` is
+/// idempotent by design (`guard task == nil`), and the running loop only
+/// re-enters `streamFactory()` when the current stream's `events()` ends —
+/// which `JSONEventStream` never lets happen, since it reconnects
+/// internally, forever, to its construction-time URL and token. So handing
+/// `activate` a NEW factory after a backend identity change does nothing at
+/// all: the old factory's binding stays live. Only `deactivate()` first
+/// re-enters the factory, which is exactly what `RupuApp.
+/// activateHealthDependents()` now does on a `backend.clientIdentity()`
+/// change.
+///
+/// Both factories return `nil` (no stream), which drives the loop's
+/// backoff path — enough to observe WHICH factory the loop is calling
+/// without standing up a real SSE endpoint.
+@MainActor @Test func activateWithANewFactoryIsIgnoredUntilDeactivateAndThenRebinds() async {
+    let notifier = makeNotifier()
+    let first = FactoryCallCounter()
+    let second = FactoryCallCounter()
+
+    notifier.activate(streamFactory: { first.increment(); return nil })
+    #expect(await pollUntil { first.value >= 1 }, "the first factory must be entered immediately on activate")
+
+    // A bare re-`activate` with a different factory: the guard makes it a
+    // no-op, so the SECOND factory is never reached. Bounded negative wait
+    // — the loop's own retry backoff starts at 1s, so 400ms is comfortably
+    // inside the window where a rebind, if it happened at all, would have
+    // had to come from this call rather than a later backoff tick.
+    notifier.activate(streamFactory: { second.increment(); return nil })
+    try? await Task.sleep(for: .milliseconds(400))
+    #expect(second.value == 0, "activate() while already running must not rebind — this is the I1 bug's mechanism")
+
+    // Deactivate first, and the new factory takes over.
+    notifier.deactivate()
+    notifier.activate(streamFactory: { second.increment(); return nil })
+    #expect(await pollUntil { second.value >= 1 }, "deactivate() + activate() must rebind to the new factory")
+
+    notifier.deactivate()
+}

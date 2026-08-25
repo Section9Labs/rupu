@@ -1,5 +1,6 @@
 import SwiftUI
 import RupuAPI
+import RupuBackend
 import RupuStore
 import RupuDesign
 import RupuOverview
@@ -65,17 +66,63 @@ public struct MenuBarView: View {
         self.openMainWindow = openMainWindow
     }
 
+    /// Final-review fix (M4): `MenuBarStore.pollOnce` deliberately keeps
+    /// its last good data when a poll fails ("never blank on a hiccup"), so
+    /// with the backend actually down this popover renders a full set of
+    /// counts and gate rows that are simply the last thing that was true —
+    /// presented, before this fix, exactly as if they were live. This is
+    /// the minimal honest correction: say so in a footer line, and disable
+    /// the gate Approve/Reject buttons, which cannot succeed anyway
+    /// (`backend.client()` is nil or its POST will fail) and whose whole
+    /// premise — that the run is still parked on that gate — is the part
+    /// that can no longer be checked. Everything else stays visible; stale
+    /// counts labeled as stale are still useful, and blanking them would
+    /// throw away the only information available.
+    var isBackendHealthy: Bool {
+        Self.isHealthy(backend.health)
+    }
+
+    /// Pure seam over `isBackendHealthy` — non-`private` so
+    /// `MenuBarViewTests` can pin the per-`BackendHealth`-case decision
+    /// without constructing a `BackendController` whose `health` is
+    /// `private(set)` and only movable by a real health monitor.
+    /// `.starting` deliberately counts as NOT healthy: at launch there is
+    /// no data yet, so the caption is accurate rather than premature, and
+    /// a gate action posted before the first successful probe has nothing
+    /// to post through.
+    static func isHealthy(_ health: BackendHealth) -> Bool {
+        if case .healthy = health { return true }
+        return false
+    }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             statTiles
             Divider()
             needsYouSection
             Divider()
+            if !isBackendHealthy {
+                unreachableCaption
+            }
             localOnlyCaption
             footer
         }
         .frame(width: 320)
         .background(Color.rupuBg)
+    }
+
+    private var unreachableCaption: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(Color.status(.failed))
+                .frame(width: 6, height: 6)
+            Text("Backend unreachable — showing last known")
+                .font(.metaText)
+                .foregroundStyle(Color.rupuErr)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
     }
 
     // MARK: - Stat tiles
@@ -119,7 +166,13 @@ public struct MenuBarView: View {
                     .padding(.horizontal, 12)
             } else {
                 ForEach(store.needsYou) { item in
-                    MenuBarNeedsYouRow(item: item, store: store, backend: backend, onOpen: openRoute)
+                    MenuBarNeedsYouRow(
+                        item: item,
+                        store: store,
+                        backend: backend,
+                        gateActionsEnabled: isBackendHealthy,
+                        onOpen: openRoute
+                    )
                     if item.id != store.needsYou.last?.id {
                         Divider()
                     }
@@ -225,6 +278,9 @@ private struct MenuBarNeedsYouRow: View {
     let item: NeedsYouItem
     let store: MenuBarStore
     let backend: BackendController
+    /// `false` while the backend is unhealthy — see `MenuBarView.
+    /// isBackendHealthy` (final-review fix, M4).
+    let gateActionsEnabled: Bool
     let onOpen: (Route) -> Void
 
     private var tone: StatusTone {
@@ -250,7 +306,13 @@ private struct MenuBarNeedsYouRow: View {
             }
             subjectButton
             if item.kind == .gate, case .run(let runID, let host) = item.row.navigation {
-                MenuBarGateActions(runID: runID, host: host, store: store, backend: backend)
+                MenuBarGateActions(
+                    runID: runID,
+                    host: host,
+                    store: store,
+                    backend: backend,
+                    enabled: gateActionsEnabled
+                )
             }
         }
         .padding(.horizontal, 12)
@@ -327,6 +389,12 @@ private struct MenuBarGateActions: View {
     let host: String?
     let store: MenuBarStore
     let backend: BackendController
+    /// Final-review fix (M4): `false` while the backend is unhealthy. Both
+    /// buttons disable — an approve/reject posted against a backend that
+    /// isn't answering can't succeed, and the row it's acting on is
+    /// last-known data whose "still awaiting" premise is precisely what
+    /// can't be re-checked right now.
+    let enabled: Bool
 
     @State private var isBusy = false
     @State private var resolvedGate: String?
@@ -388,7 +456,7 @@ private struct MenuBarGateActions: View {
                 }
                 .buttonStyle(RupuButtonStyle.primaryOk)
                 .controlSize(.small)
-                .disabled(isBusy || anyPending)
+                .disabled(!enabled || isBusy || anyPending)
 
                 Button {
                     Task { await resolveAndReject() }
@@ -402,7 +470,7 @@ private struct MenuBarGateActions: View {
                 }
                 .buttonStyle(RupuButtonStyle.dangerOutline)
                 .controlSize(.small)
-                .disabled(isBusy || anyPending)
+                .disabled(!enabled || isBusy || anyPending)
             }
             if isStale {
                 Text("Still pending — this may be stuck")
