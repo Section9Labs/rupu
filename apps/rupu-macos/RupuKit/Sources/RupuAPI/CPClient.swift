@@ -102,6 +102,41 @@ public actor CPClient {
         try await get("api/runs/\(id)/netflow")
     }
 
+    /// `GET /api/runs/:id/source?path=&line=&context=[&host=]` — a windowed
+    /// slice of source lines centered on `line`, for the run detail source
+    /// preview panel. `line` defaults server-side to `1`; `context` defaults
+    /// server-side to `20` and is clamped to `[0, 200]` — see `SourceQuery`
+    /// (`crates/rupu-cp/src/api/source.rs`). This client always sends both
+    /// explicitly rather than relying on the server default, so callers get
+    /// deterministic behavior across server versions. An explicit `host`
+    /// other than `"local"` always soft-fails (`available: false`) — this
+    /// endpoint never proxies to a remote host.
+    public func runSource(id: String, path: String, line: Int, context: Int, host: String? = nil) async throws -> APISourceSlice {
+        var query = [
+            URLQueryItem(name: "path", value: path),
+            URLQueryItem(name: "line", value: String(line)),
+            URLQueryItem(name: "context", value: String(context)),
+        ]
+        query.append(contentsOf: hostQuery(host))
+        return try await get("api/runs/\(id)/source", query: query)
+    }
+
+    /// `GET /api/runs/:id/ast?path=&line=&col=[&host=]` — a bounded
+    /// tree-sitter subtree around the 1-based `(line, col)` target, for the
+    /// run detail CST viewer. `line`/`col` both default server-side to `1`
+    /// (`AstQuery`, same file as `SourceQuery`); sent explicitly here for
+    /// the same determinism reason as `runSource`. Same remote-host
+    /// soft-fail policy as `runSource`.
+    public func runAst(id: String, path: String, line: Int, col: Int, host: String? = nil) async throws -> APIAstResponse {
+        var query = [
+            URLQueryItem(name: "path", value: path),
+            URLQueryItem(name: "line", value: String(line)),
+            URLQueryItem(name: "col", value: String(col)),
+        ]
+        query.append(contentsOf: hostQuery(host))
+        return try await get("api/runs/\(id)/ast", query: query)
+    }
+
     public func runFindings(id: String) async throws -> APIFindings {
         try await get("api/findings", query: [URLQueryItem(name: "run_id", value: id)])
     }
@@ -237,6 +272,32 @@ public actor CPClient {
     /// block.
     public func projectAutoflows(wsID: String) async throws -> [AutoflowDefinition] {
         try await get("api/projects/\(wsID)/autoflows")
+    }
+
+    // MARK: - Project code (read)
+
+    /// `GET /api/projects/:ws_id/tree?path=` — the immediate children of one
+    /// workspace-relative directory (`path` defaults server-side to `""`,
+    /// the workspace root — see `TreeQuery`, `crates/rupu-cp/src/api/
+    /// code.rs`). Local-only, same rationale as every other
+    /// `/api/projects/:ws_id/...` route — no `host` parameter.
+    public func projectTree(wsID: String, path: String) async throws -> APITreeResult {
+        try await get("api/projects/\(wsID)/tree", query: [URLQueryItem(name: "path", value: path)])
+    }
+
+    /// `GET /api/projects/:ws_id/source?path=` — one workspace file, read
+    /// whole (up to 2 MiB; see `FileContent`'s doc comment on the Rust
+    /// side). Same `TreeQuery` shape (just `path`) as `projectTree`. Local-
+    /// only, same as `projectTree`.
+    public func projectFile(wsID: String, path: String) async throws -> APIFileContent {
+        try await get("api/projects/\(wsID)/source", query: [URLQueryItem(name: "path", value: path)])
+    }
+
+    /// `GET /api/projects/:ws_id/files` — every workspace-relative file path
+    /// (capped at 20,000, `truncated: true` past the cap), for the
+    /// project-wide file search box. Local-only, same as `projectTree`.
+    public func projectFiles(wsID: String) async throws -> APIFileList {
+        try await get("api/projects/\(wsID)/files")
     }
 
     // MARK: - Coverage (read)
@@ -419,6 +480,40 @@ public actor CPClient {
     ) async throws -> AutoflowSetEnabledResponse {
         let path = enabled ? "api/autoflows/\(name)/enable" : "api/autoflows/\(name)/disable"
         return try await post(path, query: scopeQuery(scopeKind: scopeKind, scopeID: scopeID), body: EmptyBody?.none)
+    }
+
+    // MARK: - Autoflow claims (read/write)
+
+    /// `GET /api/autoflows/claims` — every tracked autoflow issue claim.
+    /// Local-only, like `workers()` (`crates/rupu-cp/src/api/run_streams.rs`
+    /// notes claims stay local-only, unlike the `/api/runs*` firehose routes)
+    /// — no `host` fan-out.
+    public func autoflowClaims() async throws -> [APIClaimRow] {
+        try await get("api/autoflows/claims")
+    }
+
+    /// `POST /api/autoflows/claims/release` — release (delete) the tracked
+    /// claim for `issueRef`. **Idempotent**: releasing an untracked issue
+    /// still returns `200` with `released: false`, not a 404.
+    public func releaseClaim(issueRef: String) async throws -> Bool {
+        let response: ReleaseClaimResponse = try await post(
+            "api/autoflows/claims/release", body: ReleaseClaimBody(issueRef: issueRef)
+        )
+        return response.released
+    }
+
+    /// `POST /api/autoflows/claims/requeue` — enqueue a manual wake for the
+    /// issue behind `issueRef`, reusing its claim's `repo_ref`. `404` when
+    /// no claim is tracked for the ref. The server's `RequeueBody` also
+    /// accepts an optional `not_before` to defer the wake; there is no UI
+    /// surface for that deferral, so this always omits it and the server
+    /// defaults to "now" — see `build_manual_wake` (`crates/rupu-cp/src/api/
+    /// autoflow_claims.rs`). The response's `wake_id` isn't useful to any
+    /// caller today, so this returns `Void` rather than threading it through.
+    public func requeueClaim(issueRef: String) async throws {
+        let _: RequeueClaimResponse = try await post(
+            "api/autoflows/claims/requeue", body: RequeueClaimBody(issueRef: issueRef)
+        )
     }
 
     // MARK: - Config (read/write)
