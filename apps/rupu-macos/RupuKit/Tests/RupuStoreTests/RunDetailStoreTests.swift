@@ -220,6 +220,87 @@ private func makeStore(
     store.deactivate()
 }
 
+// MARK: - Single-block retries (the failed-block Retry buttons)
+
+/// `loadGraph()` — the single-block reload the step-graph failed block's
+/// Retry button calls — retries ONLY the graph from a `.failed` state,
+/// never refetching `detail` the way a full `activate()` would.
+@MainActor @Test func loadGraphAloneRetriesAFailedGraphBlock() async {
+    let detailCounter = Counter()
+    let graphCounter = Counter()
+    let store = makeStore(
+        detailResult: { detailCounter.increment(); return detail(run: runRecord()) },
+        graphResult: {
+            graphCounter.increment()
+            if graphCounter.value == 1 { throw StubError(description: "graph down") }
+            return graph(run: runRecord())
+        }
+    )
+    await store.activate()
+    guard case .failed = store.graph else {
+        Issue.record("expected graph to be .failed after activate, got \(store.graph)")
+        return
+    }
+
+    await store.loadGraph()
+
+    #expect(store.graph.value != nil)
+    #expect(detailCounter.value == 1) // activate's one fetch — the retry never refetched detail
+    store.deactivate()
+}
+
+/// Same contract as `loadGraphAloneRetriesAFailedGraphBlock`, for the
+/// Netflow tab's failed block.
+@MainActor @Test func loadNetflowAloneRetriesAFailedNetflowBlock() async {
+    let detailCounter = Counter()
+    let netflowCounter = Counter()
+    let store = makeStore(
+        detailResult: { detailCounter.increment(); return detail(run: runRecord()) },
+        netflowResult: {
+            netflowCounter.increment()
+            if netflowCounter.value == 1 { throw StubError(description: "netflow down") }
+            return netflow()
+        }
+    )
+    await store.activate()
+    guard case .failed = store.netflow else {
+        Issue.record("expected netflow to be .failed after activate, got \(store.netflow)")
+        return
+    }
+
+    await store.loadNetflow()
+
+    #expect(store.netflow.value != nil)
+    #expect(detailCounter.value == 1)
+    store.deactivate()
+}
+
+/// Same contract as `loadGraphAloneRetriesAFailedGraphBlock`, for the
+/// Findings tab's failed block.
+@MainActor @Test func loadFindingsAloneRetriesAFailedFindingsBlock() async {
+    let detailCounter = Counter()
+    let findingsCounter = Counter()
+    let store = makeStore(
+        detailResult: { detailCounter.increment(); return detail(run: runRecord()) },
+        findingsResult: {
+            findingsCounter.increment()
+            if findingsCounter.value == 1 { throw StubError(description: "findings down") }
+            return findings()
+        }
+    )
+    await store.activate()
+    guard case .failed = store.findings else {
+        Issue.record("expected findings to be .failed after activate, got \(store.findings)")
+        return
+    }
+
+    await store.loadFindings()
+
+    #expect(store.findings.value != nil)
+    #expect(detailCounter.value == 1)
+    store.deactivate()
+}
+
 // MARK: - (b) stepAwaitingApproval updates liveStates
 
 @MainActor @Test func stepAwaitingApprovalEventSetsGatePendingLiveState() async {

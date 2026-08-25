@@ -147,7 +147,10 @@ public struct CoverageDetailScreen: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                FailedNote(message: message)
+                // `activate()` — `loadDetail` is deliberately private; a
+                // full re-activate is the store's reload surface (it also
+                // resets `catalogRequested`, harmless here).
+                FailedBlock(subject: "coverage detail", message: message, retry: { await store.activate() })
             case .empty:
                 EmptyView()
             case .content(let detail):
@@ -234,9 +237,16 @@ public struct CoverageDetailScreen: View {
     private func tabContent(store: CoverageDetailStore) -> some View {
         switch tab {
         case .overview:
-            OverviewTabContent(detail: store.detail, onSelect: { model.navigate(to: $0) })
+            OverviewTabContent(
+                detail: store.detail, onSelect: { model.navigate(to: $0) },
+                onRetryDetail: { await store.activate() }
+            )
         case .catalog:
-            CatalogTabContent(detail: store.detail, catalog: store.catalog)
+            CatalogTabContent(
+                detail: store.detail, catalog: store.catalog,
+                onRetryDetail: { await store.activate() },
+                onRetryCatalog: { await store.loadCatalog() }
+            )
         }
     }
 
@@ -304,6 +314,10 @@ private struct CoverageDetailTabBar: View {
 private struct OverviewTabContent: View {
     let detail: BlockState<APICoverageDetail>
     let onSelect: (Route) -> Void
+    /// `CoverageDetailStore.activate()` — the failed block's Retry target,
+    /// threaded in because this view holds only the `BlockState`, never the
+    /// store.
+    let onRetryDetail: () async -> Void
 
     var body: some View {
         Group {
@@ -311,7 +325,7 @@ private struct OverviewTabContent: View {
             case .loading:
                 securityLoadingBlock()
             case .failed(let message):
-                securityFailedBlock(message, subject: "coverage detail")
+                FailedBlock(subject: "coverage detail", message: message, retry: onRetryDetail)
             case .empty:
                 securityEmptyBlock("No data")
             case .content(let value):
@@ -482,6 +496,12 @@ private struct CoverageFindingRow: View {
 private struct CatalogTabContent: View {
     let detail: BlockState<APICoverageDetail>
     let catalog: BlockState<APICoverageCatalog>
+    /// Two distinct Retry targets for the two blocks this tab gates on:
+    /// `CoverageDetailStore.activate()` for `detail`, `loadCatalog()` for
+    /// `catalog` — threaded in because this view holds only the
+    /// `BlockState`s, never the store.
+    let onRetryDetail: () async -> Void
+    let onRetryCatalog: () async -> Void
 
     var body: some View {
         Group {
@@ -489,7 +509,7 @@ private struct CatalogTabContent: View {
             case .loading:
                 securityLoadingBlock()
             case .failed(let message):
-                securityFailedBlock(message, subject: "coverage detail")
+                FailedBlock(subject: "coverage detail", message: message, retry: onRetryDetail)
             case .empty:
                 securityEmptyBlock("No data")
             case .content(let value):
@@ -509,7 +529,7 @@ private struct CatalogTabContent: View {
         case .loading:
             securityLoadingBlock()
         case .failed(let message):
-            securityFailedBlock(message, subject: "catalog")
+            FailedBlock(subject: "catalog", message: message, retry: onRetryCatalog)
         case .empty:
             securityEmptyBlock("No concerns in catalog")
         case .content(let value):
@@ -581,27 +601,5 @@ private struct ConcernRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-    }
-}
-
-// MARK: - Shared header failure note
-
-/// Same rendering `ProjectDetailScreen`'s (private) `FailedNote` uses for
-/// its own header — re-derived locally rather than shared, same "not worth
-/// the indirection for one more screen" reasoning that type's neighbors
-/// already give.
-private struct FailedNote: View {
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .lineLimit(3)
-        }
     }
 }

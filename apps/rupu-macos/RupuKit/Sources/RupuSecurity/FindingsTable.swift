@@ -152,6 +152,10 @@ struct FindingsTabView: View {
     let findings: BlockState<APIFindings>
     @Binding var sort: ListSort<FindingsSortKey>
     let onSelect: (Route) -> Void
+    /// `SecurityStore.loadFindings()` — the failed block's Retry target,
+    /// threaded in because this view holds only the `BlockState`, never the
+    /// store.
+    let onRetry: () async -> Void
 
     /// See the type doc comment's "Contained, lazy, windowed" section.
     /// Deliberately local `@State`, not routed through `SecurityStore` — a
@@ -165,7 +169,7 @@ struct FindingsTabView: View {
             case .loading:
                 securityLoadingBlock()
             case .failed(let message):
-                securityFailedBlock(message, subject: "findings")
+                FailedBlock(subject: "findings", message: message, retry: onRetry)
             case .empty:
                 securityEmptyBlock("No findings")
             case .content(let value):

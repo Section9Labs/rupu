@@ -142,7 +142,9 @@ public struct FleetScreen: View {
             case .loading:
                 loadingBlock
             case .failed(let message):
-                failedBlock(message, subject: "hosts")
+                // `activate()` reconciles both blocks immediately and is
+                // loop-idempotent (`startReconcileLoop` guards on `task`).
+                FailedBlock(subject: "hosts", message: message, retry: { await store.activate() })
             case .empty:
                 emptyBlock("No hosts registered")
             case .content(let rows):
@@ -177,7 +179,7 @@ public struct FleetScreen: View {
             case .loading:
                 loadingBlock
             case .failed(let message):
-                failedBlock(message, subject: "workers")
+                FailedBlock(subject: "workers", message: message, retry: { await store.activate() })
             case .empty:
                 emptyBlock("No workers registered")
             case .content(let rows):
@@ -246,20 +248,6 @@ public struct FleetScreen: View {
         }
         .frame(maxWidth: .infinity, minHeight: 100)
         .panelStyle(.panel)
-    }
-
-    private func failedBlock(_ message: String, subject: String) -> some View {
-        TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Failed to load \(subject)")
-                    .font(.noteText.weight(.semibold))
-                    .foregroundStyle(Color.status(.failed))
-                Text(message)
-                    .font(.noteText)
-                    .foregroundStyle(Color.status(.failed))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
     }
 
     private func centeredLabel(_ label: String) -> some View {

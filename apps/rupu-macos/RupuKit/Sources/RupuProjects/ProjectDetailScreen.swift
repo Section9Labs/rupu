@@ -184,7 +184,11 @@ public struct ProjectDetailScreen: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                FailedNote(message: message)
+                // `activate()` — `loadDetail` is deliberately private; a
+                // full re-activate is the store's reload surface (it also
+                // resets the six lazy-tab request flags, which is exactly
+                // right after a detail failure: every tab refetches fresh).
+                FailedBlock(subject: "project", message: message, retry: { await store.activate() })
             case .empty:
                 EmptyView()
             case .content(let detail):
@@ -322,7 +326,7 @@ public struct ProjectDetailScreen: View {
         case .sessions:
             SessionsTabContent(store: store, onSelect: { model.navigate(to: $0) })
         case .findings:
-            ProjectFindingsTabContent(findings: store.findings)
+            ProjectFindingsTabContent(findings: store.findings, onRetry: { await store.loadFindings() })
         case .coverage:
             CoverageTabContent()
         case .code:
@@ -407,7 +411,8 @@ private struct OverviewTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small).padding(12)
             case .failed(let message):
-                FailedNote(message: message).padding(12)
+                FailedBlock(subject: "overview", message: message, retry: { await store.activate() })
+                    .padding(12)
             case .empty:
                 Text("No data").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
             case .content(let detail):
@@ -532,7 +537,8 @@ private struct RunsTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small).padding(12)
             case .failed(let message):
-                FailedNote(message: message).padding(12)
+                FailedBlock(subject: "runs", message: message, retry: { await store.loadRuns() })
+                    .padding(12)
             case .empty:
                 Text("No runs yet").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
             case .content(let rows):
@@ -590,7 +596,8 @@ private struct SessionsTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small).padding(12)
             case .failed(let message):
-                FailedNote(message: message).padding(12)
+                FailedBlock(subject: "sessions", message: message, retry: { await store.loadSessions() })
+                    .padding(12)
             case .empty:
                 Text("No sessions yet").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
             case .content(let rows):
@@ -651,6 +658,10 @@ private struct SessionsTabContent: View {
 /// swift`.
 private struct ProjectFindingsTabContent: View {
     let findings: BlockState<APIFindings>
+    /// `ProjectDetailStore.loadFindings()` — the failed block's Retry
+    /// target, threaded in because this view holds only the `BlockState`,
+    /// never the store.
+    let onRetry: () async -> Void
 
     var body: some View {
         Group {
@@ -658,7 +669,8 @@ private struct ProjectFindingsTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small).padding(12)
             case .failed(let message):
-                FailedNote(message: message).padding(12)
+                FailedBlock(subject: "findings", message: message, retry: onRetry)
+                    .padding(12)
             case .empty:
                 Text("No findings").font(.noteText).foregroundStyle(Color.rupuMute).padding(12)
             case .content(let value):
@@ -801,7 +813,7 @@ private struct DefinitionsTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                FailedNote(message: message)
+                FailedBlock(subject: "agents", message: message, retry: { await store.loadAgents() })
             case .empty:
                 Text("None").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let rows):
@@ -827,7 +839,7 @@ private struct DefinitionsTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                FailedNote(message: message)
+                FailedBlock(subject: "workflows", message: message, retry: { await store.loadWorkflows() })
             case .empty:
                 Text("None").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let rows):
@@ -863,7 +875,7 @@ private struct DefinitionsTabContent: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                FailedNote(message: message)
+                FailedBlock(subject: "autoflows", message: message, retry: { await store.loadAutoflows() })
             case .empty:
                 Text("None").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let rows):
@@ -1138,20 +1150,4 @@ private let headerRelativeFormatter: RelativeDateTimeFormatter = {
 private func relativeLabel(_ iso: String?) -> String {
     guard let iso, let date = ActivityRow.parseISO(iso) else { return "—" }
     return headerRelativeFormatter.localizedString(for: date, relativeTo: Date())
-}
-
-private struct FailedNote: View {
-    let message: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .lineLimit(3)
-        }
-    }
 }

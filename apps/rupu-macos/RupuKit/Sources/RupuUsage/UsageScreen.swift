@@ -159,7 +159,10 @@ public struct UsageScreen: View {
         case .loading:
             usageLoadingBlock()
         case .failed(let message):
-            usageFailedBlock(message, subject: "usage")
+            // `activate(range:)` refetches all three blocks — the per-block
+            // loaders are deliberately private (one generation-guarded
+            // cycle), so this is the store's narrowest public reload.
+            FailedBlock(subject: "usage", message: message, retry: { await store.activate(range: model.range) })
         case .empty:
             // Never actually produced — `UsageStore.loadUsage` always
             // resolves `.content` on success (`GET /api/usage` always
@@ -208,7 +211,7 @@ public struct UsageScreen: View {
         case .loading:
             usageLoadingBlock()
         case .failed(let message):
-            usageFailedBlock(message, subject: "usage runs")
+            FailedBlock(subject: "usage runs", message: message, retry: { await store.activate(range: model.range) })
         case .empty:
             usageRunsContent(store: store, rows: [])
         case .content(let rows):
@@ -264,7 +267,7 @@ public struct UsageScreen: View {
             case .loading:
                 usageLoadingBlock()
             case .failed(let message):
-                usageFailedBlock(message, subject: "outliers")
+                FailedBlock(subject: "outliers", message: message, retry: { await store.activate(range: model.range) })
             case .empty:
                 OutlierPanel(outliers: [], onSelect: { model.navigate(to: $0) })
             case .content(let rows):
@@ -340,8 +343,8 @@ func usageHostSlice(_ freshness: APIHostFreshness) -> HostSlice {
 // MARK: - Shared block chrome (used by this file + `BreakdownTable.swift`/
 // `OutlierPanel.swift` — reproduced here since this screen is split across
 // files, same "hoisted, not per-file duplicated" reasoning `SecurityScreen`
-// gives for its own `securityLoadingBlock`/`securityEmptyBlock`/
-// `securityFailedBlock` trio.)
+// gives for its own `securityLoadingBlock`/`securityEmptyBlock` pair. The
+// failed counterpart is `RupuDesign.FailedBlock`, shared app-wide.)
 
 @MainActor
 func usageLoadingBlock() -> some View {
@@ -352,19 +355,4 @@ func usageLoadingBlock() -> some View {
     }
     .frame(maxWidth: .infinity, minHeight: 120)
     .panelStyle(.panel)
-}
-
-@MainActor
-func usageFailedBlock(_ message: String, subject: String) -> some View {
-    TintBanner(tone: Color.status(.failed), toneBg: Color.status(.failed).opacity(0.08)) {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Failed to load \(subject)")
-                .font(.noteText.weight(.semibold))
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
 }

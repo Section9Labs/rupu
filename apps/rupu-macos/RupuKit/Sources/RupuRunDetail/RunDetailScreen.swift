@@ -528,7 +528,10 @@ public struct RunDetailScreen: View {
         case .loading:
             blockShell { ProgressView().controlSize(.small) }
         case .failed(let message):
-            blockShell { failedContent(message) }
+            blockShell {
+                FailedBlock(subject: "workflow steps", message: message, retry: { await store.loadGraph() })
+                    .padding(12)
+            }
         case .empty:
             blockShell { Text("No workflow steps").font(.noteText).foregroundStyle(Color.rupuMute) }
         case .content(let g):
@@ -573,19 +576,6 @@ public struct RunDetailScreen: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .panelStyle(.panel)
-    }
-
-    private func failedContent(_ message: String) -> some View {
-        VStack(spacing: 4) {
-            Text("Failed to load")
-                .font(.noteText)
-                .foregroundStyle(Color.status(.failed))
-            Text(message)
-                .font(.noteText)
-                .foregroundStyle(Color.rupuDim)
-                .multilineTextAlignment(.center)
-                .lineLimit(2)
-        }
     }
 
     private func centeredLabel(_ label: String) -> some View {
