@@ -82,7 +82,7 @@ enum FreshnessTone {
         case .unavailable:
             return .awaiting
         case .ok(let capturedAt):
-            guard let capturedAt, let date = parseBucketTimestamp(capturedAt) else { return .pending }
+            guard let capturedAt, let date = ActivityRow.parseISO(capturedAt) else { return .pending }
             return now.timeIntervalSince(date) > freshnessStaleThreshold ? .pending : .done
         }
     }
@@ -106,7 +106,7 @@ private struct FreshnessPill: View {
         case .loading:
             return "loading…"
         case .ok(let capturedAt):
-            guard let capturedAt, let date = parseBucketTimestamp(capturedAt) else { return "unknown" }
+            guard let capturedAt, let date = ActivityRow.parseISO(capturedAt) else { return "unknown" }
             return freshnessAgeLabel(capturedAt: date, now: now)
         case .offline:
             return "offline"

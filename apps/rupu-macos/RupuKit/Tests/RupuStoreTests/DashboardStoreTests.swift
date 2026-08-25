@@ -842,4 +842,99 @@ struct DashboardStoreTests {
         store.deactivate()
         box.latest.finish()
     }
+
+    // (j) Final-review fix (Task 1): a THROWN `GET /api/hosts` call on a
+    // mid-life cycle (the 60s reconcile tick — stood in for here by a second
+    // `setRange(_:)` call, same engine) must not be conflated with a
+    // genuinely empty fleet. The prior `(try? await client.hosts()) ?? []`
+    // idiom reseeded `hostStates`/`okResponses`/`merged` to empty on a
+    // transient blip and stamped a lying "no hosts registered" `pageError` —
+    // this proves the cycle now leaves every existing slice untouched
+    // instead, and that the very next successful cycle still works
+    // (recovers), rather than the store being permanently wedged by the
+    // fix.
+    @MainActor @Test func hostsFetchFailureOnAMidLifeCycleLeavesExistingStateUntouchedAndRecoversNextCycle() async {
+        let hostsAttempts = HitCounter()
+        let (store, _) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                let attempt = hostsAttempts.incrementAndGet()
+                if attempt == 2 {
+                    // The mid-life (second) cycle's own host-discovery call:
+                    // fails outright.
+                    return (500, Data(#"{"error":"boom"}"#.utf8))
+                }
+                return (200, Self.hostsJSON([("local", "online")]))
+            }
+            return (200, Self.dashboardJSON(hostID: "local", state: "ok", capturedAt: "2026-08-20T10:00:00Z", workers: 1))
+        }
+
+        await store.activate(range: .d7)
+        #expect(store.merged?.fleet.workers == 1)
+        #expect(store.pageError == nil)
+        let hostStatesBeforeFailure = store.hostStates
+        let mergedBeforeFailure = store.merged
+
+        // Second cycle: `GET /api/hosts` throws. Must be a pure no-op for
+        // every piece of client-visible state.
+        await store.setRange(.d7)
+        #expect(store.hostStates == hostStatesBeforeFailure, "a thrown hosts() fetch must not reseed hostStates")
+        #expect(store.merged == mergedBeforeFailure, "must keep the last-known-good merged aggregate")
+        #expect(store.pageError == nil, "must never lie that no hosts are registered on a transient hosts() failure")
+
+        // Third cycle: `GET /api/hosts` succeeds again — the store recovers
+        // on its own, not permanently wedged by the failure-handling fix.
+        await store.setRange(.d7)
+        #expect(store.merged?.fleet.workers == 1)
+        #expect(store.pageError == nil)
+
+        store.deactivate()
+    }
+
+    // (k) Final-review fix (Task 4): `pendingFetchCount`'s old raw-counter
+    // accounting could be double-decremented by a debounced local-only
+    // refresh landing mid-cycle (`performFetch` is reachable from both the
+    // cycle proper and `refreshLocalOnly()`), which could flash a false
+    // "no host reported dashboard data" `pageError` while a slow remote
+    // host was still genuinely in flight. Local fails immediately every
+    // time it's asked; mini is deliberately slow but WILL eventually report
+    // ok — an extra local-only refresh (fired via a firehose signal, same
+    // burst-coalescing path task (g) exercises) landing while mini is still
+    // pending must never manufacture a premature "nothing reported" verdict.
+    @MainActor @Test func debouncedLocalOnlyRefreshDuringAFailingLocalNeverFalselyFlashesPageErrorWhileARemoteHostIsStillPending() async {
+        let (store, box) = makeStore(debounceInterval: .milliseconds(20)) { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("local", "online"), ("mini", "online")]))
+            }
+            guard url.path == "/api/dashboard" else { return (200, Data("{}".utf8)) }
+            let hostID = Self.queryValue("host", in: req) ?? ""
+            if hostID == "local" {
+                return (500, Data(#"{"error":"boom"}"#.utf8))
+            }
+            // mini: slow but eventually ok — still in flight when the extra
+            // local-only refresh below lands.
+            Thread.sleep(forTimeInterval: 0.12)
+            return (200, Self.dashboardJSON(hostID: "mini", state: "ok", workers: 5))
+        }
+
+        await store.activate(range: .d7)
+        #expect(store.pageError == nil, "mini hasn't resolved yet — too early to say nothing reported")
+
+        // A firehose signal schedules the debounced local-only refresh,
+        // which re-fetches (and re-fails) local entirely outside the
+        // cycle's own pending-tracking, while mini is still in flight.
+        box.latest.yield(.connection(true))
+        try? await Task.sleep(for: .milliseconds(60)) // let the debounced refresh land and settle
+
+        #expect(store.pageError == nil, "the extra local-only refresh must not manufacture false completion while mini is still pending")
+
+        await expectEventually("mini's slow fetch eventually lands") {
+            store.merged?.fleet.workers == 5
+        }
+        #expect(store.pageError == nil, "mini reported ok — never an error")
+
+        store.deactivate()
+        box.latest.finish()
+    }
 }
