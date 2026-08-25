@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-fixtures
+.PHONY: build release sign-dev sign-release run install sync bump fmt lint test gates cp cp-web clean help macos-gen macos-build macos-test macos-run macos-release macos-fixtures
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -118,6 +118,23 @@ macos-test:
 macos-run: macos-build
 	open apps/rupu-macos/DerivedData/Build/Products/Debug/rupu.app
 
+# macos-release builds the Release configuration (hardened runtime on) and
+# ad-hoc-signs it locally (CODE_SIGN_IDENTITY=-) so the app launches without
+# a paid Developer ID during local testing. CI re-signs the product with a
+# real identity afterward, so the project file itself stays identity-less —
+# ad-hoc signing is only ever applied here, at the xcodebuild invocation.
+# RUPU_RELEASE_VERSION stamps both CFBundleShortVersionString and
+# CFBundleVersion (default 0.0.0-dev); see project.yml's MARKETING_VERSION /
+# CURRENT_PROJECT_VERSION settings and Info.plist properties.
+macos-release: macos-gen
+	xcodebuild -project apps/rupu-macos/rupu.xcodeproj -scheme rupu \
+		-configuration Release -derivedDataPath apps/rupu-macos/DerivedData build \
+		CODE_SIGN_IDENTITY=- \
+		MARKETING_VERSION=$(or $(RUPU_RELEASE_VERSION),0.0.0-dev) \
+		CURRENT_PROJECT_VERSION=$(or $(RUPU_RELEASE_VERSION),0.0.0-dev)
+	@echo "Built: apps/rupu-macos/DerivedData/Build/Products/Release/rupu.app"
+	@echo "Version: $(or $(RUPU_RELEASE_VERSION),0.0.0-dev)"
+
 # Regenerate the golden JSON fixtures the Swift app's decode/encode tests
 # check against (apps/rupu-macos/Fixtures/*.json,
 # apps/rupu-macos/Fixtures/requests/*.json). Run this after changing
@@ -148,6 +165,8 @@ help:
 	@echo "  macos-build    macos-gen + xcodebuild the rupu scheme (Debug, unsigned)"
 	@echo "  macos-test     swift test the RupuKit package"
 	@echo "  macos-run      macos-build + open the built rupu.app"
+	@echo "  macos-release  macos-gen + xcodebuild Release, ad-hoc signed, hardened runtime on"
+	@echo "                 (usage: make macos-release RUPU_RELEASE_VERSION=X.Y.Z)"
 	@echo "  macos-fixtures regenerate apps/rupu-macos/Fixtures/*.json golden fixtures"
 	@echo ""
 	@echo "Refresh-my-install flow:  make sync && make install"
