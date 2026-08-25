@@ -1,6 +1,7 @@
 import Foundation
 import RupuStore
 import UserNotifications
+import os
 
 /// Prod `NotificationPosting` — the only thing in this arc allowed to touch
 /// `UNUserNotificationCenter`. Lives in the App target, not `RupuStore`,
@@ -14,8 +15,21 @@ import UserNotifications
 /// Stateless: every call reads `UNUserNotificationCenter.current()` fresh,
 /// so there's nothing here to share or leak across calls.
 struct UNCenterNotificationPoster: NotificationPosting {
+    private static let logger = Logger(subsystem: "com.section9labs.rupu", category: "notifications")
+
     func requestAuthorization() async -> Bool {
-        (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])) ?? false
+        do {
+            return try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+        } catch {
+            // A throw here is NOT the user declining (that's a normal
+            // `false` return) — it's the OS refusing to register the app at
+            // all, most commonly because the bundle is unsigned ("notifications
+            // are not allowed for this application"; the reason macos-build
+            // ad-hoc signs). Silently mapping it to `false` once masked
+            // exactly that for every `make macos-run` build.
+            Self.logger.error("notification authorization request failed: \(error, privacy: .public)")
+            return false
+        }
     }
 
     func post(_ content: NotificationContent) async {
@@ -25,7 +39,11 @@ struct UNCenterNotificationPoster: NotificationPosting {
         payload.sound = .default
         payload.userInfo = ["runID": content.runID]
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: payload, trigger: nil)
-        try? await UNUserNotificationCenter.current().add(request)
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+        } catch {
+            Self.logger.error("posting notification failed: \(error, privacy: .public)")
+        }
     }
 
     func currentAuthorizationStatus() async -> NotificationAuthorizationStatus {
