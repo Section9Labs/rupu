@@ -1,0 +1,82 @@
+{
+  "breakdown": [
+    {
+      "agent": "rupuso",
+      "cached_tokens": 10000,
+      "cost_usd": 6.0,
+      "host_id": "",
+      "input_tokens": 1000000,
+      "model": "claude-sonnet-4-6",
+      "output_tokens": 200000,
+      "priced": true,
+      "provider": "anthropic",
+      "runs": 4,
+      "total_tokens": 1200000,
+      "workflow": "",
+      "workspace_id": ""
+    },
+    {
+      "agent": "fixer",
+      "cached_tokens": 2000,
+      "cost_usd": 6.71,
+      "host_id": "",
+      "input_tokens": 500000,
+      "model": "claude-opus-4-8",
+      "output_tokens": 100000,
+      "priced": true,
+      "provider": "anthropic",
+      "runs": 1,
+      "total_tokens": 600000,
+      "workflow": "",
+      "workspace_id": ""
+    },
+    {
+      "agent": "explorer",
+      "cached_tokens": 0,
+      "cost_usd": null,
+      "host_id": "",
+      "input_tokens": 5000,
+      "model": "llama-3-70b",
+      "output_tokens": 5050,
+      "priced": false,
+      "provider": "internal-vllm",
+      "runs": 1,
+      "total_tokens": 10050,
+      "workflow": "",
+      "workspace_id": ""
+    }
+  ],
+  "hosts": [
+    {
+      "captured_at": "2026-08-20T12:00:00Z",
+      "host_id": "local",
+      "name": "local",
+      "reason": null,
+      "state": "ok",
+      "transport_kind": "local"
+    },
+    {
+      "captured_at": null,
+      "host_id": "kuki",
+      "name": "kuki",
+      "reason": "connection refused",
+      "state": "offline",
+      "transport_kind": "ssh"
+    }
+  ],
+  "summary": {
+    "cached_tokens": 12000,
+    "cost_usd": 12.71,
+    "input_tokens": 1505000,
+    "output_tokens": 305050,
+    "priced": false,
+    "runs": 6,
+    "total_tokens": 1810050
+  },
+  "unpriced": {
+    "models": [
+      "llama-3-70b"
+    ],
+    "rows": 1
+  }
+}

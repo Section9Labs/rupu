@@ -1,0 +1,118 @@
+{
+  "findings": [
+    {
+      "ws_id": "ws-1",
+      "project": "rupu",
+      "target_id": "auth-core",
+      "workflow_name": "nightly-security",
+      "permalink": "https://github.com/section9labs/rupu/blob/main/src/auth/session.rs#L42-L58",
+      "id": "fnd_critical_1",
+      "file_path": "src/auth/session.rs",
+      "line_range": [
+        42,
+        58
+      ],
+      "scope": "line",
+      "summary": "Session token comparison uses non-constant-time equality",
+      "severity": "critical",
+      "concern_id": "timing-attack",
+      "evidence": {
+        "code_excerpt": "if token == stored_token {",
+        "rationale": "The session token is compared with `==`, a non-constant-time equality check. An attacker with network access to this unauthenticated, rate-limit-exempt health endpoint can recover a valid session token one byte at a time by measuring response latency across repeated requests, eventually forging a fully authenticated session without ever guessing the token outright.",
+        "references": [
+          "https://cwe.mitre.org/data/definitions/208.html"
+        ]
+      },
+      "declared_by": {
+        "run_id": "run_9k2f",
+        "model": "claude-sonnet-4-6",
+        "surface": "workflow"
+      },
+      "declared_at": "2026-08-20T12:00:00Z"
+    },
+    {
+      "ws_id": "ws-1",
+      "project": "rupu",
+      "target_id": "web-api",
+      "workflow_name": "nightly-security",
+      "id": "fnd_high_1",
+      "file_path": null,
+      "line_range": null,
+      "scope": "repo",
+      "summary": "No rate limiting on the public API surface",
+      "severity": "high",
+      "concern_id": "no-rate-limit",
+      "evidence": {
+        "code_excerpt": null,
+        "rationale": "repo-wide scan found no rate-limiting middleware",
+        "references": []
+      },
+      "declared_by": {
+        "run_id": "run_9k2f",
+        "model": "claude-sonnet-4-6",
+        "surface": "workflow"
+      },
+      "declared_at": "2026-08-20T11:00:00Z"
+    },
+    {
+      "ws_id": "ws-2",
+      "project": "phi-cell",
+      "target_id": "ml-pipeline",
+      "workflow_name": null,
+      "permalink": "https://github.com/section9labs/phi-cell/blob/main/src/train.rs#L100-L112",
+      "id": "fnd_medium_1",
+      "file_path": "src/train.rs",
+      "line_range": [
+        100,
+        112
+      ],
+      "scope": "line",
+      "summary": "Model checkpoint path built from an unsanitized config value, allowing a malicious workflow input to write outside the checkpoint directory via a crafted `cfg.name` containing `../` segments.",
+      "severity": "medium",
+      "concern_id": "path-traversal",
+      "evidence": {
+        "code_excerpt": "let p = format!(\"{}/{}\", base, cfg.name);",
+        "rationale": "cfg.name is operator-supplied and not sanitized",
+        "references": []
+      },
+      "declared_by": {
+        "run_id": "run_am4d",
+        "model": "claude-sonnet-4-6",
+        "surface": "workflow"
+      },
+      "declared_at": "2026-08-19T12:00:00Z"
+    },
+    {
+      "ws_id": "ws-2",
+      "project": "phi-cell",
+      "target_id": "ml-pipeline",
+      "workflow_name": "weekly-audit",
+      "id": "fnd_info_1",
+      "file_path": null,
+      "line_range": null,
+      "scope": "repo",
+      "summary": "No CODEOWNERS file configured",
+      "severity": "info",
+      "concern_id": null,
+      "evidence": {
+        "code_excerpt": null,
+        "rationale": "repository has no CODEOWNERS file",
+        "references": []
+      },
+      "declared_by": {
+        "run_id": "run_am4d",
+        "model": "claude-sonnet-4-6",
+        "surface": "workflow"
+      },
+      "declared_at": "2026-08-18T12:00:00Z"
+    }
+  ],
+  "summary": {
+    "total": 4,
+    "critical": 1,
+    "high": 1,
+    "medium": 1,
+    "low": 0,
+    "info": 1
+  }
+}

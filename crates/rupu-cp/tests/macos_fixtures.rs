@@ -3,17 +3,26 @@
 //! `cargo test -p rupu-cp --test macos_fixtures` asserts no drift;
 //! `REGEN_FIXTURES=1` rewrites. Swift decodes these in RupuAPITests.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{TimeZone, Utc};
+use rupu_coverage::{
+    AssertionStatus, Attribution as CoverageAttribution, CatalogMode, Concern, ConcernAssertion,
+    Evidence as CoverageEvidence, FileView, FindingEvidence as CoverageFindingEvidence,
+    FindingRecord as CoverageFindingRecord, FindingScope as CoverageFindingScope, FlatCatalog,
+    Severity as CoverageSeverity, Surface as CoverageSurface, TouchStrength,
+};
+use rupu_cp::api::findings::{FindingOut, FindingsResponse, FindingsSummary};
 use rupu_cp::api::graph::{ApprovalGateDto, GateDto, StepDag, StepNodeDto, SubStepDto};
 use rupu_cp::api::projects::ProjectRow;
 use rupu_cp::api::runs::RunListRow;
+use rupu_cp::api::usage_outliers::OutlierRun;
 use rupu_cp::host::dashboard_summary::{
     ActiveCounts, ActiveLongest, CycleCounts, DashboardSummary, FleetCounts, TerminalBucket,
     ThroughputBucket,
 };
-use rupu_cp::usage::UsageSummary;
+use rupu_cp::usage::{UsageBreakdownRow, UsageSummary};
 use rupu_netflow::{Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome};
 use rupu_orchestrator::executor::Event;
 use rupu_orchestrator::runs::{AwaitingGate, RunStatus, StepKind};
@@ -1281,4 +1290,541 @@ fn project_sessions_fixture_is_current() {
         },
     ]);
     check_fixture("project_sessions.json", &value);
+}
+
+// ── Security & Usage (Phase 5B) ─────────────────────────────────────────────
+//
+// `FindingsResponse`/`FindingOut`/`FindingsSummary` (api/findings.rs) and
+// `OutlierRun` (api/usage_outliers.rs) are `pub` — mirrored for real below.
+// `CoverageSummary`, the `/api/coverage/:target` detail shape, and
+// `UsageResponse`/`UnpricedGap`/`HostFreshness`/`UsageRunRow` (all in
+// api/coverage.rs / api/usage.rs) are private to their modules — hand-built
+// `json!` per the `project_detail_fixture_is_current` precedent above,
+// embedding the REAL `rupu_cp::usage::{UsageSummary, UsageBreakdownRow}` and
+// `rupu_coverage::{ConcernAssertion, FindingRecord, FileView, FlatCatalog}`
+// types wherever one exists so drift on THOSE types still shows up here.
+
+/// A `rupu_coverage::Attribution` pinned to a run id, model held constant —
+/// shared by every coverage/finding fixture below.
+fn coverage_attribution(run_id: &str) -> CoverageAttribution {
+    CoverageAttribution {
+        run_id: run_id.into(),
+        model: "claude-sonnet-4-6".into(),
+        surface: CoverageSurface::Workflow,
+    }
+}
+
+#[test]
+fn findings_global_fixture_is_current() {
+    // `GET /api/findings` with no filters: 4 findings across 4 severities
+    // from 2 workspaces, one long-form critical write-up (the "critical"/
+    // "medium" wire-string case the brief calls out), a permalink on two
+    // rows, and one finding with no joined `workflow_name` (unresolved run).
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+
+    let findings = vec![
+        FindingOut {
+            ws_id: "ws-1".into(),
+            project: "rupu".into(),
+            target_id: "auth-core".into(),
+            workflow_name: Some("nightly-security".into()),
+            permalink: Some(
+                "https://github.com/section9labs/rupu/blob/main/src/auth/session.rs#L42-L58".into(),
+            ),
+            record: CoverageFindingRecord {
+                id: "fnd_critical_1".into(),
+                file_path: Some("src/auth/session.rs".into()),
+                line_range: Some([42, 58]),
+                scope: CoverageFindingScope::Line,
+                summary: "Session token comparison uses non-constant-time equality".into(),
+                severity: CoverageSeverity::Critical,
+                concern_id: Some("timing-attack".into()),
+                evidence: CoverageFindingEvidence {
+                    code_excerpt: Some("if token == stored_token {".into()),
+                    rationale: "The session token is compared with `==`, a non-constant-time \
+                                equality check. An attacker with network access to this \
+                                unauthenticated, rate-limit-exempt health endpoint can recover \
+                                a valid session token one byte at a time by measuring response \
+                                latency across repeated requests, eventually forging a fully \
+                                authenticated session without ever guessing the token outright."
+                        .into(),
+                    references: vec!["https://cwe.mitre.org/data/definitions/208.html".into()],
+                },
+                declared_by: coverage_attribution("run_9k2f"),
+                declared_at: t,
+            },
+        },
+        FindingOut {
+            ws_id: "ws-1".into(),
+            project: "rupu".into(),
+            target_id: "web-api".into(),
+            workflow_name: Some("nightly-security".into()),
+            permalink: None,
+            record: CoverageFindingRecord {
+                id: "fnd_high_1".into(),
+                file_path: None,
+                line_range: None,
+                scope: CoverageFindingScope::Repo,
+                summary: "No rate limiting on the public API surface".into(),
+                severity: CoverageSeverity::High,
+                concern_id: Some("no-rate-limit".into()),
+                evidence: CoverageFindingEvidence {
+                    code_excerpt: None,
+                    rationale: "repo-wide scan found no rate-limiting middleware".into(),
+                    references: vec![],
+                },
+                declared_by: coverage_attribution("run_9k2f"),
+                declared_at: t - chrono::Duration::hours(1),
+            },
+        },
+        FindingOut {
+            ws_id: "ws-2".into(),
+            project: "phi-cell".into(),
+            target_id: "ml-pipeline".into(),
+            workflow_name: None,
+            permalink: Some(
+                "https://github.com/section9labs/phi-cell/blob/main/src/train.rs#L100-L112".into(),
+            ),
+            record: CoverageFindingRecord {
+                id: "fnd_medium_1".into(),
+                file_path: Some("src/train.rs".into()),
+                line_range: Some([100, 112]),
+                scope: CoverageFindingScope::Line,
+                summary: "Model checkpoint path built from an unsanitized config value, \
+                          allowing a malicious workflow input to write outside the checkpoint \
+                          directory via a crafted `cfg.name` containing `../` segments."
+                    .into(),
+                severity: CoverageSeverity::Medium,
+                concern_id: Some("path-traversal".into()),
+                evidence: CoverageFindingEvidence {
+                    code_excerpt: Some("let p = format!(\"{}/{}\", base, cfg.name);".into()),
+                    rationale: "cfg.name is operator-supplied and not sanitized".into(),
+                    references: vec![],
+                },
+                declared_by: coverage_attribution("run_am4d"),
+                declared_at: t - chrono::Duration::days(1),
+            },
+        },
+        FindingOut {
+            ws_id: "ws-2".into(),
+            project: "phi-cell".into(),
+            target_id: "ml-pipeline".into(),
+            workflow_name: Some("weekly-audit".into()),
+            permalink: None,
+            record: CoverageFindingRecord {
+                id: "fnd_info_1".into(),
+                file_path: None,
+                line_range: None,
+                scope: CoverageFindingScope::Repo,
+                summary: "No CODEOWNERS file configured".into(),
+                severity: CoverageSeverity::Info,
+                concern_id: None,
+                evidence: CoverageFindingEvidence {
+                    code_excerpt: None,
+                    rationale: "repository has no CODEOWNERS file".into(),
+                    references: vec![],
+                },
+                declared_by: coverage_attribution("run_am4d"),
+                declared_at: t - chrono::Duration::days(2),
+            },
+        },
+    ];
+
+    let response = FindingsResponse {
+        summary: FindingsSummary {
+            total: findings.len(),
+            critical: 1,
+            high: 1,
+            medium: 1,
+            low: 0,
+            info: 1,
+        },
+        findings,
+    };
+    check_fixture("findings_global.json", &response);
+}
+
+#[test]
+fn coverage_summary_fixture_is_current() {
+    // `GET /api/coverage` (`list_coverage`, api/coverage.rs): `CoverageSummary`
+    // is private to that module, so this hand-builds the exact wire shape —
+    // 3 targets across 2 projects, one with `has_catalog: false` and one with
+    // zero findings.
+    let value = serde_json::json!([
+        {
+            "ws_id": "ws-1",
+            "project": "rupu",
+            "target_id": "auth-core",
+            "assertion_lines": 128,
+            "has_catalog": true,
+            "findings": 3,
+        },
+        {
+            "ws_id": "ws-1",
+            "project": "rupu",
+            "target_id": "web-api",
+            "assertion_lines": 64,
+            "has_catalog": false,
+            "findings": 0,
+        },
+        {
+            "ws_id": "ws-2",
+            "project": "phi-cell",
+            "target_id": "ml-pipeline",
+            "assertion_lines": 40,
+            "has_catalog": true,
+            "findings": 5,
+        },
+    ]);
+    check_fixture("coverage_summary.json", &value);
+}
+
+#[test]
+fn coverage_detail_fixture_is_current() {
+    // `GET /api/coverage/:target` (`get_coverage`, api/coverage.rs) returns a
+    // hand-built `json!({ws_id, project, target_id, assertion_lines,
+    // has_catalog, assertions, findings, files})` — mirrored here with the
+    // REAL `ConcernAssertion` / `rupu_coverage::FindingRecord` / `FileView`
+    // types. A `catalog` key (the target's `FlatCatalog`, normally served by
+    // the sibling `GET /api/coverage/:target/catalog` route) is bundled into
+    // this SAME fixture file per the Task 1 brief, so the Swift decode test
+    // exercises assertions + findings + catalog from one file.
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+
+    let assertions = vec![
+        ConcernAssertion {
+            concern_id: "timing-attack".into(),
+            file_path: "src/auth/session.rs".into(),
+            status: AssertionStatus::Finding,
+            evidence: CoverageEvidence {
+                summary: "Token compared with `==`, not constant-time".into(),
+                line_ranges: vec![[42, 58]],
+                finding_ids: vec!["fnd_critical_1".into()],
+            },
+            declared_by: coverage_attribution("run_9k2f"),
+            declared_at: t,
+        },
+        ConcernAssertion {
+            concern_id: "sql-injection".into(),
+            file_path: "src/auth/login.rs".into(),
+            status: AssertionStatus::Clean,
+            evidence: CoverageEvidence {
+                summary: "All queries are parameterized".into(),
+                line_ranges: vec![[1, 80]],
+                finding_ids: vec![],
+            },
+            declared_by: coverage_attribution("run_9k2f"),
+            declared_at: t - chrono::Duration::hours(1),
+        },
+    ];
+
+    let findings = vec![CoverageFindingRecord {
+        id: "fnd_critical_1".into(),
+        file_path: Some("src/auth/session.rs".into()),
+        line_range: Some([42, 58]),
+        scope: CoverageFindingScope::Line,
+        summary: "Session token comparison uses non-constant-time equality".into(),
+        severity: CoverageSeverity::Critical,
+        concern_id: Some("timing-attack".into()),
+        evidence: CoverageFindingEvidence {
+            code_excerpt: Some("if token == stored_token {".into()),
+            rationale: "non-constant-time comparison enables a timing side-channel".into(),
+            references: vec!["https://cwe.mitre.org/data/definitions/208.html".into()],
+        },
+        declared_by: coverage_attribution("run_9k2f"),
+        declared_at: t,
+    }];
+
+    let files = vec![FileView {
+        path: "src/auth/session.rs".into(),
+        touch_modes: vec![TouchStrength::Read, TouchStrength::Edit],
+        strongest: TouchStrength::Edit,
+        read_lines: vec![[1, 120], [42, 58]],
+        grep_matches: 0,
+        edits: 1,
+        first_at: t - chrono::Duration::hours(2),
+        last_at: t,
+        touched_by: vec![coverage_attribution("run_9k2f")],
+    }];
+
+    let catalog = FlatCatalog {
+        concerns: vec![
+            Concern {
+                id: "timing-attack".into(),
+                name: "Timing side-channel".into(),
+                description: "Secret comparisons must be constant-time.".into(),
+                severity: CoverageSeverity::Critical,
+                applicable_globs: vec!["**/auth/**".into()],
+                min_strength: TouchStrength::Read,
+                references: vec!["https://cwe.mitre.org/data/definitions/208.html".into()],
+                tags: vec!["stride:spoofing".into()],
+            },
+            Concern {
+                id: "sql-injection".into(),
+                name: "SQL injection".into(),
+                description: "Queries must be parameterized, never string-built.".into(),
+                severity: CoverageSeverity::High,
+                applicable_globs: vec!["**".into()],
+                min_strength: TouchStrength::Read,
+                references: vec![],
+                tags: vec![],
+            },
+        ],
+        sources: BTreeMap::from([
+            ("timing-attack".to_string(), "stride".to_string()),
+            ("sql-injection".to_string(), "stride".to_string()),
+        ]),
+        render_modes: BTreeMap::from([
+            ("timing-attack".to_string(), CatalogMode::Full),
+            ("sql-injection".to_string(), CatalogMode::Index),
+        ]),
+    };
+
+    let value = serde_json::json!({
+        "ws_id": "ws-1",
+        "project": "rupu",
+        "target_id": "auth-core",
+        "assertion_lines": 128,
+        "has_catalog": true,
+        "assertions": assertions,
+        "findings": findings,
+        "files": files,
+        "catalog": catalog,
+    });
+    check_fixture("coverage_detail.json", &value);
+}
+
+#[test]
+fn usage_fixture_is_current() {
+    // `GET /api/usage` (`get_usage`, api/usage.rs): `UsageResponse`/
+    // `UnpricedGap`/`HostFreshness` are private to that module — hand-built
+    // `json!`, embedding the REAL `rupu_cp::usage::{UsageSummary,
+    // UsageBreakdownRow}` for the priced pieces. 3 breakdown rows (2 priced
+    // models, 1 unpriced), 2 hosts (one ok, one offline) — mirrors
+    // `dashboard_fixture_is_current`'s `HostFreshness` shape exactly.
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+
+    let summary = UsageSummary {
+        input_tokens: 1_505_000,
+        output_tokens: 305_050,
+        cached_tokens: 12_000,
+        total_tokens: 1_810_050,
+        cost_usd: Some(12.71),
+        priced: false, // at least one contributing model is unpriced
+        runs: 6,
+    };
+
+    let breakdown = vec![
+        UsageBreakdownRow {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            agent: "rupuso".into(),
+            workflow: String::new(),
+            host_id: String::new(),
+            workspace_id: String::new(),
+            input_tokens: 1_000_000,
+            output_tokens: 200_000,
+            cached_tokens: 10_000,
+            total_tokens: 1_200_000,
+            cost_usd: Some(6.0),
+            priced: true,
+            runs: 4,
+        },
+        UsageBreakdownRow {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+            agent: "fixer".into(),
+            workflow: String::new(),
+            host_id: String::new(),
+            workspace_id: String::new(),
+            input_tokens: 500_000,
+            output_tokens: 100_000,
+            cached_tokens: 2_000,
+            total_tokens: 600_000,
+            cost_usd: Some(6.71),
+            priced: true,
+            runs: 1,
+        },
+        UsageBreakdownRow {
+            provider: "internal-vllm".into(),
+            model: "llama-3-70b".into(),
+            agent: "explorer".into(),
+            workflow: String::new(),
+            host_id: String::new(),
+            workspace_id: String::new(),
+            input_tokens: 5_000,
+            output_tokens: 5_050,
+            cached_tokens: 0,
+            total_tokens: 10_050,
+            cost_usd: None,
+            priced: false,
+            runs: 1,
+        },
+    ];
+
+    let value = serde_json::json!({
+        "summary": summary,
+        "breakdown": breakdown,
+        "unpriced": {
+            "models": ["llama-3-70b"],
+            "rows": 1,
+        },
+        "hosts": [
+            {
+                "host_id": "local",
+                "name": "local",
+                "transport_kind": "local",
+                "state": "ok",
+                "captured_at": t,
+                "reason": null,
+            },
+            {
+                "host_id": "kuki",
+                "name": "kuki",
+                "transport_kind": "ssh",
+                "state": "offline",
+                "captured_at": null,
+                "reason": "connection refused",
+            },
+        ],
+    });
+    check_fixture("usage.json", &value);
+}
+
+#[test]
+fn usage_runs_fixture_is_current() {
+    // `GET /api/usage/runs` (`get_usage_runs`, api/usage.rs): `UsageRunRow`
+    // is private to that module — hand-built. 6 flat `(run × model)` rows
+    // spanning 2 days and 3 models (2 priced + 1 unpriced/nil-cost row, per
+    // the brief). `host_id` is always `"local"` — this endpoint is
+    // local-only, no host fan-out (see the doc comment on `get_usage_runs`).
+    let day1 = Utc.with_ymd_and_hms(2026, 8, 19, 9, 0, 0).unwrap();
+    let day2 = Utc.with_ymd_and_hms(2026, 8, 20, 9, 0, 0).unwrap();
+
+    let rows = serde_json::json!([
+        {
+            "run_id": "run-01",
+            "started_at": day1,
+            "workflow_name": "nightly-health",
+            "agent": "rupuso",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "workspace_id": "ws-1",
+            "host_id": "local",
+            "input_tokens": 100_000,
+            "output_tokens": 20_000,
+            "cached_tokens": 1_000,
+            "total_tokens": 120_000,
+            "cost_usd": 0.12,
+            "priced": true,
+        },
+        {
+            "run_id": "run-02",
+            "started_at": day1,
+            "workflow_name": "nightly-health",
+            "agent": "fixer",
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "workspace_id": "ws-1",
+            "host_id": "local",
+            "input_tokens": 50_000,
+            "output_tokens": 10_000,
+            "cached_tokens": 0,
+            "total_tokens": 60_000,
+            "cost_usd": 0.30,
+            "priced": true,
+        },
+        {
+            "run_id": "run-03",
+            "started_at": day1,
+            "workflow_name": "issue-triage",
+            "agent": "rupuso",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "workspace_id": "ws-2",
+            "host_id": "local",
+            "input_tokens": 20_000,
+            "output_tokens": 4_000,
+            "cached_tokens": 500,
+            "total_tokens": 24_000,
+            "cost_usd": 0.05,
+            "priced": true,
+        },
+        {
+            "run_id": "run-04",
+            "started_at": day2,
+            "workflow_name": "nightly-health",
+            "agent": "rupuso",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "workspace_id": "ws-1",
+            "host_id": "local",
+            "input_tokens": 150_000,
+            "output_tokens": 30_000,
+            "cached_tokens": 2_000,
+            "total_tokens": 180_000,
+            "cost_usd": 0.20,
+            "priced": true,
+        },
+        {
+            "run_id": "run-05",
+            "started_at": day2,
+            "workflow_name": "hotfix",
+            "agent": "fixer",
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "workspace_id": "ws-2",
+            "host_id": "local",
+            "input_tokens": 80_000,
+            "output_tokens": 16_000,
+            "cached_tokens": 0,
+            "total_tokens": 96_000,
+            "cost_usd": 0.40,
+            "priced": true,
+        },
+        {
+            "run_id": "run-06",
+            "started_at": day2,
+            "workflow_name": "experimental",
+            "agent": "explorer",
+            "provider": "internal-vllm",
+            "model": "llama-3-70b",
+            "workspace_id": "ws-1",
+            "host_id": "local",
+            "input_tokens": 5_000,
+            "output_tokens": 5_050,
+            "cached_tokens": 0,
+            "total_tokens": 10_050,
+            "cost_usd": null,
+            "priced": false,
+        },
+    ]);
+    check_fixture("usage_runs.json", &rows);
+}
+
+#[test]
+fn usage_outliers_fixture_is_current() {
+    // `GET /api/usage/outliers` (api/usage_outliers.rs): `OutlierRun` is
+    // `pub` — mirrored for real. 2 outliers across 2 workflows.
+    let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+
+    let outliers = vec![
+        OutlierRun {
+            run_id: "run-06".into(),
+            workflow_name: "nightly-health".into(),
+            cost_usd: 12.50,
+            baseline_usd: 1.20,
+            ratio: 12.50 / 1.20,
+            started_at: t,
+        },
+        OutlierRun {
+            run_id: "run-09".into(),
+            workflow_name: "hotfix".into(),
+            cost_usd: 8.0,
+            baseline_usd: 2.0,
+            ratio: 4.0,
+            started_at: t + chrono::Duration::days(1),
+        },
+    ];
+    check_fixture("usage_outliers.json", &outliers);
 }

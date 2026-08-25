@@ -1,0 +1,151 @@
+{
+  "assertion_lines": 128,
+  "assertions": [
+    {
+      "concern_id": "timing-attack",
+      "declared_at": "2026-08-20T12:00:00Z",
+      "declared_by": {
+        "model": "claude-sonnet-4-6",
+        "run_id": "run_9k2f",
+        "surface": "workflow"
+      },
+      "evidence": {
+        "finding_ids": [
+          "fnd_critical_1"
+        ],
+        "line_ranges": [
+          [
+            42,
+            58
+          ]
+        ],
+        "summary": "Token compared with `==`, not constant-time"
+      },
+      "file_path": "src/auth/session.rs",
+      "status": "finding"
+    },
+    {
+      "concern_id": "sql-injection",
+      "declared_at": "2026-08-20T11:00:00Z",
+      "declared_by": {
+        "model": "claude-sonnet-4-6",
+        "run_id": "run_9k2f",
+        "surface": "workflow"
+      },
+      "evidence": {
+        "finding_ids": [],
+        "line_ranges": [
+          [
+            1,
+            80
+          ]
+        ],
+        "summary": "All queries are parameterized"
+      },
+      "file_path": "src/auth/login.rs",
+      "status": "clean"
+    }
+  ],
+  "catalog": {
+    "concerns": [
+      {
+        "applicable_globs": [
+          "**/auth/**"
+        ],
+        "description": "Secret comparisons must be constant-time.",
+        "id": "timing-attack",
+        "min_strength": "read",
+        "name": "Timing side-channel",
+        "references": [
+          "https://cwe.mitre.org/data/definitions/208.html"
+        ],
+        "severity": "critical",
+        "tags": [
+          "stride:spoofing"
+        ]
+      },
+      {
+        "applicable_globs": [
+          "**"
+        ],
+        "description": "Queries must be parameterized, never string-built.",
+        "id": "sql-injection",
+        "min_strength": "read",
+        "name": "SQL injection",
+        "references": [],
+        "severity": "high",
+        "tags": []
+      }
+    ],
+    "render_modes": {
+      "sql-injection": "index",
+      "timing-attack": "full"
+    },
+    "sources": {
+      "sql-injection": "stride",
+      "timing-attack": "stride"
+    }
+  },
+  "files": [
+    {
+      "edits": 1,
+      "first_at": "2026-08-20T10:00:00Z",
+      "grep_matches": 0,
+      "last_at": "2026-08-20T12:00:00Z",
+      "path": "src/auth/session.rs",
+      "read_lines": [
+        [
+          1,
+          120
+        ],
+        [
+          42,
+          58
+        ]
+      ],
+      "strongest": "edit",
+      "touch_modes": [
+        "read",
+        "edit"
+      ],
+      "touched_by": [
+        {
+          "model": "claude-sonnet-4-6",
+          "run_id": "run_9k2f",
+          "surface": "workflow"
+        }
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "concern_id": "timing-attack",
+      "declared_at": "2026-08-20T12:00:00Z",
+      "declared_by": {
+        "model": "claude-sonnet-4-6",
+        "run_id": "run_9k2f",
+        "surface": "workflow"
+      },
+      "evidence": {
+        "code_excerpt": "if token == stored_token {",
+        "rationale": "non-constant-time comparison enables a timing side-channel",
+        "references": [
+          "https://cwe.mitre.org/data/definitions/208.html"
+        ]
+      },
+      "file_path": "src/auth/session.rs",
+      "id": "fnd_critical_1",
+      "line_range": [
+        42,
+        58
+      ],
+      "scope": "line",
+      "severity": "critical",
+      "summary": "Session token comparison uses non-constant-time equality"
+    }
+  ],
+  "has_catalog": true,
+  "project": "rupu",
+  "target_id": "auth-core",
+  "ws_id": "ws-1"
+}
