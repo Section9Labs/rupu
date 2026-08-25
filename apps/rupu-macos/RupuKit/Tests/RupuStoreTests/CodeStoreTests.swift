@@ -399,6 +399,67 @@ struct CodeStoreTests {
             return
         }
     }
+
+    // MARK: - Final-review fix, item 2: a cancelled filter fetch leaves the
+    // store re-dispatchable (the file header's own claim, now true here too).
+
+    /// `filter` is presence-gated, so a cancelled `reloadFilter()` that left
+    /// it latched at `.loading` made `loadFilter()`'s `filter == nil` guard
+    /// reject every later keystroke — a permanently "loading" filter field
+    /// with no list and no Retry (`CodeTab`'s filter Retry only renders for
+    /// `.failed`).
+    @Test func aCancelledFilterFetchLeavesTheStoreReDispatchable() async {
+        let hits = LockedCounter()
+        let client = makeClient { req in
+            guard req.url?.path == "/api/projects/ws1/files" else { return (404, Data()) }
+            hits.increment()
+            Thread.sleep(forTimeInterval: 0.08)
+            return (200, try! Fixtures.data("code_files.json"))
+        }
+        let store = CodeStore(wsID: "ws1", client: client)
+
+        let typing = Task { await store.loadFilter() }
+        try? await Task.sleep(for: .milliseconds(20)) // let the slow request actually fire
+        typing.cancel()
+        await typing.value
+
+        #expect(
+            store.filter == nil,
+            "a cancelled filter fetch must reset `filter` to nil, not latch it at .loading"
+        )
+
+        await store.loadFilter() // a later keystroke must actually fetch
+
+        #expect(hits.value == 2, "the re-request after a cancel must reach the stub a second time")
+        guard case .content = store.filter else {
+            Issue.record("expected .content after the re-request, got \(String(describing: store.filter))")
+            return
+        }
+    }
+
+    /// The reset is conditional on `filter` still being `.loading`, so a
+    /// cancelled call can never wipe out a CONCURRENT live fetch's result —
+    /// either interleaving must end on `.content`.
+    @Test func aCancelledFilterFetchNeverWipesOutAConcurrentFetchsResult() async {
+        let client = makeClient { req in
+            guard req.url?.path == "/api/projects/ws1/files" else { return (404, Data()) }
+            Thread.sleep(forTimeInterval: 0.05)
+            return (200, try! Fixtures.data("code_files.json"))
+        }
+        let store = CodeStore(wsID: "ws1", client: client)
+
+        let doomed = Task { await store.reloadFilter() }
+        let survivor = Task { await store.reloadFilter() }
+        try? await Task.sleep(for: .milliseconds(15))
+        doomed.cancel()
+        await doomed.value
+        await survivor.value
+
+        guard case .content = store.filter else {
+            Issue.record("expected .content, got \(String(describing: store.filter))")
+            return
+        }
+    }
 }
 
 /// Thread-safe call counter — same rationale as every other store test's

@@ -41,6 +41,23 @@ public struct SituationRoomScreen: View {
     @State private var storeClientID: ObjectIdentifier?
     @State private var filter: StreamFilter = .all
 
+    /// Screen-level teardown epoch, bumped by `.onDisappear` (final-review
+    /// fix, item 3). The two `.onChange` handlers below spawn UNSTRUCTURED
+    /// `Task { await activate() }`s — unstructured because an `.onChange`
+    /// closure is synchronous, so unlike `.task` they are NOT tied to this
+    /// View's lifetime and SwiftUI never cancels them. A health flip or
+    /// client-identity change landing just as the window closes could
+    /// therefore run `activate()` AFTER `.onDisappear` had already called
+    /// `store?.deactivate()` and cleared `store` — rebuilding a store and
+    /// starting a fresh firehose subscription for a scene that no longer
+    /// exists, i.e. exactly the "live tail must not outlive this window"
+    /// invariant `.onDisappear` is there to hold. Each spawned task captures
+    /// the epoch at spawn time and re-checks it (via `shouldActivate`)
+    /// immediately before calling `activate()`; a bump in between means
+    /// teardown won the race and the task returns without touching
+    /// anything.
+    @State private var teardownEpoch = 0
+
     public init(model: AppModel, backend: BackendController, frontMainWindow: @escaping () -> Void) {
         self.model = model
         self.backend = backend
@@ -62,7 +79,7 @@ public struct SituationRoomScreen: View {
         }
         .onChange(of: backend.health) { _, newHealth in
             guard case .healthy = newHealth else { return }
-            Task { await activate() }
+            activateUnlessTornDown()
         }
         // Review fix round 1, ruling 8: a client swap that stays healthy
         // throughout (a remote reconnect to a DIFFERENT CP that never dips
@@ -75,14 +92,41 @@ public struct SituationRoomScreen: View {
         // here a no-op, so firing on every identity change, not just a
         // "real" swap, is safe.
         .onChange(of: backend.clientIdentity()) { _, _ in
-            Task { await activate() }
+            activateUnlessTornDown()
         }
         .onDisappear {
             // The live tail must not outlive this window — see
-            // `SituationStore.deactivate()`'s doc comment.
+            // `SituationStore.deactivate()`'s doc comment. Bumping
+            // `teardownEpoch` FIRST closes the window in which an already-
+            // spawned `activateUnlessTornDown()` task could start a fresh
+            // stream after this teardown — see `teardownEpoch`'s doc
+            // comment.
+            teardownEpoch += 1
             store?.deactivate()
             store = nil
         }
+    }
+
+    /// Spawns the unstructured `activate()` task the two `.onChange`
+    /// handlers need, guarded by `teardownEpoch` — see that property's doc
+    /// comment for the race this closes.
+    private func activateUnlessTornDown() {
+        let spawnEpoch = teardownEpoch
+        Task {
+            guard Self.shouldActivate(spawnEpoch: spawnEpoch, currentEpoch: teardownEpoch) else { return }
+            await activate()
+        }
+    }
+
+    /// The pure half of the teardown guard, extracted so it can be tested
+    /// without a SwiftUI host (same "view-member pure logic gets its own
+    /// testable static func" idiom `SourcePreview.taskID` /
+    /// `CodeTab.lineNumberGutterWidth` already establish). `true` only while
+    /// the epoch captured when the task was spawned still matches the
+    /// screen's current one — any `.onDisappear` in between bumps it and
+    /// this returns `false`.
+    static func shouldActivate(spawnEpoch: Int, currentEpoch: Int) -> Bool {
+        spawnEpoch == currentEpoch
     }
 
     /// Builds the store lazily (once `backend.client()` exists) and

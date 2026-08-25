@@ -124,10 +124,36 @@ struct MergeSortKeyTests {
             a.ts != b.ts ? a.ts > b.ts : mergeSortKey(a.event) < mergeSortKey(b.event)
         }
         let runIDs = sortedOnce.map { $0.event.runID }
-        #expect(runIDs == ["a", "m", "z"], "runPaused|a < runPaused|m < runPaused|z lexicographically")
+        #expect(runIDs == ["a", "m", "z"], "the runPaused keys for a/m/z order a < m < z lexicographically")
         #expect(
             sortedAgain.map { $0.event.runID } == runIDs,
             "the same input set, given to the sort in a different starting order, must land in the identical order"
         )
+    }
+
+    // MARK: - Final-review fix, item 4: delimiter-safe composition
+
+    /// The shifted-boundary collision a bare `joined(separator: "|")` allows:
+    /// two DIFFERENT events whose field values shift the delimiter across a
+    /// boundary produced the identical key (`"stepFailed|r1|s|t|u"` both
+    /// ways). Two distinct events comparing EQUAL under the tie-break key
+    /// hands their relative order back to the unstable sort — exactly the
+    /// non-determinism round 2's ruling 1 set out to remove.
+    @Test func doesNotCollideOnAShiftedDelimiterBoundary() {
+        let a = CPEvent.stepFailed(runID: "r1", stepID: "s|t", error: "u")
+        let b = CPEvent.stepFailed(runID: "r1", stepID: "s", error: "t|u")
+        #expect(mergeSortKey(a) != mergeSortKey(b))
+    }
+
+    /// The same hazard on an optional field: `nil` must stay distinguishable
+    /// from the empty string (and from a value that happens to contain the
+    /// delimiter).
+    @Test func distinguishesANilOptionalFromAnEmptyStringAndFromADelimiterValue() {
+        let nilAgent = CPEvent.stepStarted(runID: "r1", stepID: "s", kind: "agent", agent: nil, host: "h")
+        let emptyAgent = CPEvent.stepStarted(runID: "r1", stepID: "s", kind: "agent", agent: "", host: "h")
+        let shifted = CPEvent.stepStarted(runID: "r1", stepID: "s", kind: "agent|h", agent: nil, host: nil)
+        #expect(mergeSortKey(nilAgent) != mergeSortKey(emptyAgent))
+        #expect(mergeSortKey(nilAgent) != mergeSortKey(shifted))
+        #expect(mergeSortKey(emptyAgent) != mergeSortKey(shifted))
     }
 }

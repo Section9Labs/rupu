@@ -303,6 +303,106 @@ struct SourcePreviewStoreTests {
             return
         }
     }
+
+    // MARK: - Final-review fix, item 1: a cancelled fetch leaves the key
+    // re-dispatchable (collapse-while-loading must not strand a re-expand).
+
+    /// The exact operator sequence: expand a preview on a slow fetch,
+    /// collapse before it lands (SwiftUI cancels the `.task`), re-expand.
+    /// Before the fix the cancelled call left `.loading` latched, so
+    /// `loadSourceIfNeeded`'s `!= nil` presence guard swallowed the
+    /// re-expand and the row sat on "Loading source…" forever with no
+    /// Retry affordance (Retry only renders for `.failed`).
+    @Test func aCancelledSourceFetchLeavesTheKeyReDispatchable() async {
+        let hits = LockedCounter()
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/source" else { return (404, Data()) }
+            hits.increment()
+            Thread.sleep(forTimeInterval: 0.08)
+            return (200, Data(Self.sourceJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        // Expand → fetch in flight.
+        let expand = Task { await store.loadSourceIfNeeded(path: "src/a.rs", line: 10) }
+        try? await Task.sleep(for: .milliseconds(20)) // let the slow request actually fire
+        // Collapse → SwiftUI cancels the mounted `.task`.
+        expand.cancel()
+        await expand.value
+
+        #expect(
+            store.sourceState(path: "src/a.rs", line: 10) == nil,
+            "a cancelled fetch must remove its .loading entry, not latch it — otherwise the presence guard blocks every later expand"
+        )
+
+        // Re-expand → must actually re-fetch and land content.
+        await store.loadSourceIfNeeded(path: "src/a.rs", line: 10)
+
+        #expect(hits.value == 2, "the re-expand after a cancel must reach the stub a second time")
+        guard case .content(let slice) = store.sourceState(path: "src/a.rs", line: 10) else {
+            Issue.record("expected .content after the re-expand, got \(String(describing: store.sourceState(path: "src/a.rs", line: 10)))")
+            return
+        }
+        #expect(slice.available)
+    }
+
+    /// Same contract on the AST path — `AstTreeView` mounts its fetch from
+    /// the same kind of `.task(id:)` and gets cancelled the same way.
+    @Test func aCancelledAstFetchLeavesTheKeyReDispatchable() async {
+        let hits = LockedCounter()
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/ast" else { return (404, Data()) }
+            hits.increment()
+            Thread.sleep(forTimeInterval: 0.08)
+            return (200, Data(Self.astJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        let expand = Task { await store.loadAstIfNeeded(path: "src/a.rs", line: 2, col: 8) }
+        try? await Task.sleep(for: .milliseconds(20))
+        expand.cancel()
+        await expand.value
+
+        #expect(store.astState(path: "src/a.rs", line: 2, col: 8) == nil)
+
+        await store.loadAstIfNeeded(path: "src/a.rs", line: 2, col: 8)
+
+        #expect(hits.value == 2, "the re-expand after a cancel must reach the stub a second time")
+        guard case .content(let response) = store.astState(path: "src/a.rs", line: 2, col: 8) else {
+            Issue.record("expected .content after the re-expand, got \(String(describing: store.astState(path: "src/a.rs", line: 2, col: 8)))")
+            return
+        }
+        #expect(response.available)
+    }
+
+    /// The removal is conditional on the entry still being `.loading`, so a
+    /// cancelled call can never wipe out a CONCURRENT live fetch's result
+    /// for the same key. Whichever way the two interleave — the cancelled
+    /// call's `catch` first (entry is still `.loading`, removed; the live
+    /// call then writes its content) or the live call's success first
+    /// (entry is `.content`, so the `catch` leaves it alone) — the key must
+    /// end on `.content`, never blanked back to "Loading…".
+    @Test func aCancelledFetchNeverWipesOutAConcurrentFetchsResultForTheSameKey() async {
+        let client = makeClient { req in
+            guard req.url?.path == "/api/runs/run-1/source" else { return (404, Data()) }
+            Thread.sleep(forTimeInterval: 0.05)
+            return (200, Data(Self.sourceJSON(available: true).utf8))
+        }
+        let store = SourcePreviewStore(runID: "run-1", host: nil, client: client)
+
+        let doomed = Task { await store.reloadSource(path: "src/a.rs", line: 10) }
+        let survivor = Task { await store.reloadSource(path: "src/a.rs", line: 10) }
+        try? await Task.sleep(for: .milliseconds(15)) // let both requests actually fire
+        doomed.cancel()
+        await doomed.value
+        await survivor.value
+
+        guard case .content(let slice) = store.sourceState(path: "src/a.rs", line: 10) else {
+            Issue.record("expected .content, got \(String(describing: store.sourceState(path: "src/a.rs", line: 10)))")
+            return
+        }
+        #expect(slice.available)
+    }
 }
 
 // MARK: - View-member pure seams (no SwiftUI rendering — same idiom

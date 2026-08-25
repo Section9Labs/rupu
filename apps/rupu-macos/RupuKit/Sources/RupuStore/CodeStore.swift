@@ -59,6 +59,17 @@ import RupuAPI
 /// `file` at whatever they were synchronously set to at the top of the
 /// call (typically `.loading`) — a fresh `navigate`/`open` call re-sets
 /// that state and proceeds exactly as if nothing had been in flight.
+///
+/// `reloadFilter()` is the one path here that DID have such a latch, and
+/// the claim above was false for it until the final-review fix (item 2):
+/// `filter` is presence-gated, so a cancelled `reloadFilter()` that left
+/// `filter` latched at `.loading` made `loadFilter()`'s `filter == nil`
+/// guard reject every later keystroke — the filter field stayed
+/// permanently "loading" with no list and no Retry (`CodeTab`'s filter
+/// Retry only renders for `.failed`). A cancelled `reloadFilter()` now
+/// RESETS `filter` to `nil`, restoring the invariant this section claims;
+/// see that method's own doc comment for the conditional-on-`.loading`
+/// detail.
 @MainActor
 @Observable
 public final class CodeStore {
@@ -177,13 +188,25 @@ public final class CodeStore {
     /// `loadFilter()`'s one-shot guard would otherwise never let a failed
     /// fetch be retried, since `filter` is already non-nil once it reaches
     /// `.failed`.
+    ///
+    /// **Cancellation resets `filter` to `nil`** rather than leaving it
+    /// latched at `.loading` — see the type doc comment's "Cancellation
+    /// always leaves the store re-dispatchable" section for the bug that
+    /// latch caused. The reset is conditional on `filter` still being
+    /// `.loading` so an older cancelled call's late-running `catch` can
+    /// never clobber a NEWER call's already-landed `.content`/`.empty`/
+    /// `.failed` (clearing a newer call's own `.loading` is harmless — that
+    /// call still writes its result when it lands).
     public func reloadFilter() async {
         filter = .loading
         do {
             let result = try await client.projectFiles(wsID: wsID)
             filter = result.files.isEmpty ? .empty : .content(result)
         } catch {
-            guard !isCancellation(error) else { return }
+            guard !isCancellation(error) else {
+                if case .loading? = filter { filter = nil }
+                return
+            }
             filter = .failed(String(describing: error))
         }
     }

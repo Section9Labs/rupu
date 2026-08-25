@@ -179,9 +179,34 @@ private func formatTenthsSeconds(_ durationMS: UInt64) -> String {
 /// explicit, stable composition rather than `String(describing:)`
 /// reflection, whose output format Swift does not document as stable across
 /// compiler versions (fix round 1, finding 6).
+///
+/// **Delimiter-safe composition** (final-review fix, item 4). A plain
+/// `joined(separator: "|")` is NOT injective once a component can itself
+/// contain the delimiter — and these components are free-form server text
+/// (`error`, `reason`, `note`, `unit_key`, paths), so a `|` in one is
+/// entirely possible. `stepFailed(stepID: "s|t", error: "u")` and
+/// `stepFailed(stepID: "s", error: "t|u")` are DIFFERENT events that joined
+/// to the identical string, which would make the stream's dedup (this key
+/// is `StreamCard.key`) collapse two genuinely distinct rows into one. The
+/// web's `identityOf` doesn't have the problem because it stable-stringifies
+/// a JS object, which is delimiter-safe by construction.
+///
+/// Each component is therefore LENGTH-PREFIXED as `"<count>:<value>"`
+/// (`count` in `Character`s) before joining, with `nil` encoded as the
+/// marker `"~"` — a prefix no length-prefixed component can produce, since
+/// those always start with a digit. That makes the concatenation uniquely
+/// decodable left-to-right (read digits to `:`, take exactly that many
+/// characters, expect `|` or end), i.e. injective, so distinct field tuples
+/// can never share a key regardless of what the fields contain. `mergeSortKey`
+/// (`RupuStore/SituationSelection.swift`) applies the same encoding for the
+/// same reason — separately, per the module-boundary note in that function's
+/// own doc comment; the two need not stay byte-identical, only both safe.
 private func contentIdentityKey(_ e: CPEvent) -> String {
     func key(_ parts: String?...) -> String {
-        parts.map { $0 ?? "\u{0}" }.joined(separator: "|")
+        parts.map { part in
+            guard let part else { return "~" }
+            return "\(part.count):\(part)"
+        }.joined(separator: "|")
     }
     switch e {
     case let .runStarted(runID, workflowPath, startedAt):
