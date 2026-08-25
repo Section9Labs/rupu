@@ -5,8 +5,9 @@ import RupuDesign
 
 /// The Settings **Notifications** tab (Phase 6A, Task 7) — three per-kind
 /// toggles bound directly to `RunNotifier`'s `@Observable` prefs, plus an
-/// authorization-denied banner (shown once a `requestAuthorization()` call
-/// has come back denied) with a deep link to this app's System Settings
+/// authorization-denied banner (shown while `notifier.authorizationDenied`
+/// is `true`, kept in sync by `syncAuthorizationStatus()` — see this view's
+/// own `.task` below) with a deep link to this app's System Settings
 /// notifications pane.
 ///
 /// `notifier` is owned by `RupuApp`, not this view — toggling a pref here is
@@ -38,8 +39,8 @@ public struct NotificationsTab: View {
                     isOn: $notifier.notifyFailures
                 )
                 toggleRow(
-                    title: "A run completes",
-                    detail: "Every run that finishes — successful or not.",
+                    title: "A run finishes",
+                    detail: "Completed, cancelled, or rejected. Failed runs are covered by Failures.",
                     isOn: $notifier.notifyCompletions
                 )
             }
@@ -50,6 +51,14 @@ public struct NotificationsTab: View {
         // the other three tabs when it's absent, same rationale as
         // `SettingsView.generalTab`'s own `minHeight`.
         .frame(minHeight: 200, alignment: .top)
+        .task {
+            // Non-prompting: syncs `authorizationDenied` against the OS's
+            // actual current status every time this tab is shown, catching
+            // a status the user changed directly in System Settings since
+            // the last sync (either direction — a stale `true` banner OR a
+            // stale `false` that should now show one).
+            await notifier.syncAuthorizationStatus()
+        }
     }
 
     private func toggleRow(title: String, detail: String, isOn: Binding<Bool>) -> some View {

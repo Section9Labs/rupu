@@ -1,7 +1,6 @@
 import Foundation
 import Observation
 import RupuAPI
-import UserNotifications
 
 /// One notification's content, ready to hand to a `NotificationPosting`
 /// implementation. `runID` rides along so `AppDelegate`'s tap handler
@@ -20,12 +19,30 @@ public struct NotificationContent: Equatable, Sendable {
     }
 }
 
+/// Non-prompting authorization read. Distinct from a `Bool` so `.notDetermined`
+/// (never asked yet) can't be conflated with `.denied` (asked, said no) —
+/// conflating them would either show the "go to System Settings" banner
+/// before the user has ever been prompted, or hide a genuine denial.
+public enum NotificationAuthorizationStatus: Sendable, Equatable {
+    case notDetermined
+    case authorized
+    case denied
+}
+
 /// Seam between `RunNotifier` and the real OS notification center.
 /// `UNUserNotificationCenter` throws (no bundle context) under `swift test`
 /// — every unit test run is in exactly that situation — so `RunNotifier`
 /// never talks to it directly, only through this protocol. Tests inject a
-/// recorder; only `RupuApp` (the App target, always inside a real bundle)
-/// ever constructs the prod implementation below.
+/// recorder.
+///
+/// The prod implementation (`UNCenterNotificationPoster`) deliberately does
+/// NOT live in this module — it lives in the App target
+/// (`App/NotificationPoster.swift`), the only place that's always inside a
+/// real bundle. Combined with `RunNotifier.init`'s `poster` parameter having
+/// no default, that's not just a comment's claim: nothing in `RupuStore` (or
+/// anything that imports it, including every test target) can even NAME a
+/// concrete `UNUserNotificationCenter`-backed type, let alone construct one
+/// by accident.
 public protocol NotificationPosting: Sendable {
     /// Requests `.alert`/`.sound` authorization (a no-op re-ask, never a
     /// second system prompt, once the user has already decided) and reports
@@ -33,28 +50,12 @@ public protocol NotificationPosting: Sendable {
     func requestAuthorization() async -> Bool
     /// Posts one local notification immediately (no trigger).
     func post(_ content: NotificationContent) async
-}
-
-/// Prod `NotificationPosting` — the only thing in this arc allowed to touch
-/// `UNUserNotificationCenter`. Stateless: every call reads
-/// `UNUserNotificationCenter.current()` fresh, so there's nothing here for a
-/// test to accidentally share.
-public struct UNCenterNotificationPoster: NotificationPosting {
-    public init() {}
-
-    public func requestAuthorization() async -> Bool {
-        (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])) ?? false
-    }
-
-    public func post(_ content: NotificationContent) async {
-        let payload = UNMutableNotificationContent()
-        payload.title = content.title
-        payload.body = content.body
-        payload.sound = .default
-        payload.userInfo = ["runID": content.runID]
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: payload, trigger: nil)
-        try? await UNUserNotificationCenter.current().add(request)
-    }
+    /// Reads the current authorization status WITHOUT prompting — never
+    /// shows a system dialog, unlike `requestAuthorization()`. This is what
+    /// lets `RunNotifier` keep `authorizationDenied` in sync with a status
+    /// the user changed from System Settings directly, without this app
+    /// ever calling `requestAuthorization()` again.
+    func currentAuthorizationStatus() async -> NotificationAuthorizationStatus
 }
 
 /// Firehose-driven local notifications for gate/failure/completion events
@@ -88,7 +89,8 @@ public final class RunNotifier {
     public var notifyGates: Bool = false {
         didSet {
             defaults.set(notifyGates, forKey: Keys.gates)
-            if notifyGates, !oldValue { ensureAuthorization() }
+            guard !isInitializing, notifyGates, !oldValue else { return }
+            ensureAuthorization()
         }
     }
 
@@ -97,38 +99,77 @@ public final class RunNotifier {
     public var notifyFailures: Bool = false {
         didSet {
             defaults.set(notifyFailures, forKey: Keys.failures)
-            if notifyFailures, !oldValue { ensureAuthorization() }
+            guard !isInitializing, notifyFailures, !oldValue else { return }
+            ensureAuthorization()
         }
     }
 
-    /// Post on `.runCompleted` (any terminal status — success or not; the
-    /// failure-shaped terminal events are `.runFailed`, covered by
-    /// `notifyFailures` instead). Backed by `"notify.completions"`; defaults
-    /// OFF.
+    /// Post on `.runCompleted` — a run that finishes as completed,
+    /// cancelled, or rejected. A FAILED run never emits `.runCompleted`; it
+    /// emits `.runFailed` instead (covered by `notifyFailures`), so this
+    /// pref never doubles up with that one. Backed by `"notify.completions"`;
+    /// defaults OFF.
     public var notifyCompletions: Bool = false {
         didSet {
             defaults.set(notifyCompletions, forKey: Keys.completions)
-            if notifyCompletions, !oldValue { ensureAuthorization() }
+            guard !isInitializing, notifyCompletions, !oldValue else { return }
+            ensureAuthorization()
         }
     }
 
-    /// `true` once a `requestAuthorization()` call has come back denied —
-    /// the Settings tab shows a banner with a System Settings deep link
-    /// while this is `true`. There's no OS API to be told "un-denied"
-    /// short of asking again, so this only clears on a later
-    /// `requestAuthorization()` call that comes back granted.
+    /// `true` once a `currentAuthorizationStatus()`/`requestAuthorization()`
+    /// check has come back denied — the Settings tab shows a banner with a
+    /// System Settings deep link while this is `true`. Kept in sync (both
+    /// directions — a stale `true` OR a stale `false`) by
+    /// `syncAuthorizationStatus()`, a non-prompting check called from
+    /// `activate()` (once, at app-lifetime startup) and from
+    /// `NotificationsTab`'s `onAppear` (every time the tab is shown) — that
+    /// is what catches the user re-enabling, or revoking, notifications from
+    /// System Settings directly, without ever touching a pref in this app
+    /// again.
     public private(set) var authorizationDenied = false
 
     private let defaults: UserDefaults
     private let poster: any NotificationPosting
     private var task: Task<Void, Never>?
-    private var recentlyNotified: [DedupKey: Date] = [:]
+
+    /// `true` only while `init` is running. Restoring persisted prefs in
+    /// `init` still fires `didSet` — `@Observable` rewrites stored
+    /// properties into computed ones over private backing storage, so
+    /// Swift's usual "no observer calls during a type's own init" carve-out
+    /// doesn't apply once a property is macro-rewritten (confirmed
+    /// empirically against this project's toolchain). This flag is the
+    /// explicit guard that keeps `init` a pure "read prefs, touch nothing
+    /// else" operation: no authorization request, no OS call, of any kind,
+    /// ever happens before `init` returns.
+    private var isInitializing = true
+
+    /// Bumped by both `activate()` and `deactivate()`. The running loop
+    /// re-checks this against the value it captured at spawn time on every
+    /// iteration — see `activate`'s doc comment for why `Task.isCancelled`
+    /// alone isn't enough to rule out a stale loop still doing work for a
+    /// moment after a `deactivate()` immediately followed by a re-`activate()`.
+    private var activationGeneration = 0
+
+    /// Non-private (unlike everything else here) specifically so
+    /// `RunNotifierTests` can assert on it directly via `@testable import` —
+    /// `private` stays file-scoped even under `@testable`, so the dedup
+    /// map's actual contents would otherwise be unobservable from a test.
+    var recentlyNotified: [DedupKey: Date] = [:]
 
     private static let dedupWindow: TimeInterval = 30
 
-    private struct DedupKey: Hashable {
+    /// Non-private for the same `@testable`-visibility reason as
+    /// `recentlyNotified` above. `stepID` is `nil` for the two run-scoped
+    /// kinds (`runFailed`/`runCompleted`) and non-nil for the two
+    /// step-scoped kinds (`stepAwaitingApproval`/`stepFailed`) — two
+    /// DIFFERENT gates parked on the same run must each notify (they're
+    /// different, still-actionable asks), so the dedup key has to include
+    /// which step a step-scoped event is about, not just which run.
+    struct DedupKey: Hashable {
         let runID: String
         let kindClass: String
+        let stepID: String?
     }
 
     private enum Pref {
@@ -139,43 +180,34 @@ public final class RunNotifier {
         let pref: Pref
         let kindClass: String
         let runID: String
+        let stepID: String?
         let title: String
         let body: String
     }
 
-    public init(defaults: UserDefaults = .standard, poster: any NotificationPosting = UNCenterNotificationPoster()) {
+    public init(defaults: UserDefaults = .standard, poster: any NotificationPosting) {
         self.defaults = defaults
         self.poster = poster
-        // Unlike a plain (non-`@Observable`) stored property, `didSet`
-        // FIRES for these three assignments: `@Observable` rewrites every
-        // stored property into a computed one over private backing storage,
-        // and once a property is computed, Swift's usual "no observer calls
-        // during a type's own init" carve-out no longer applies — every
-        // assignment, `init` included, goes through the same synthesized
-        // setter (confirmed empirically against this project's toolchain;
-        // do not assume the plain-stored-property carve-out here). That
-        // means a persisted `true` pref DOES call `ensureAuthorization()`
-        // right here at construction — which is the right behavior, not a
-        // bug to route around: it re-validates the actual OS authorization
-        // status (a user may have revoked it from System Settings since the
-        // last launch) every time the app starts with a pref already on,
-        // not just the first time it's ever switched on from this tab.
+        // Reads only — see `isInitializing`'s doc comment for why this is
+        // guaranteed to never call `ensureAuthorization()` (or anything
+        // else UN*-shaped), no matter what these three read back as.
         notifyGates = defaults.bool(forKey: Keys.gates)
         notifyFailures = defaults.bool(forKey: Keys.failures)
         notifyCompletions = defaults.bool(forKey: Keys.completions)
+        isInitializing = false
     }
 
     /// Pure seam: maps `event` to a pref + dedup key + display copy, checks
     /// the matching pref, and checks/updates the dedup map — all with no
     /// I/O. Returns `nil` when the event isn't one of the four notified
-    /// kinds, its pref is off, or the same `(runID, kindClass)` fired within
-    /// the last 30s (guards against a reconnect replaying events the
-    /// firehose already delivered once).
+    /// kinds, its pref is off, or the same dedup key fired within the last
+    /// 30s (guards against a reconnect replaying events the firehose
+    /// already delivered once).
     public func decision(for event: CPEvent, now: Date) -> NotificationContent? {
         guard let mapped = Self.map(event) else { return nil }
         guard isEnabled(mapped.pref) else { return nil }
 
-        let key = DedupKey(runID: mapped.runID, kindClass: mapped.kindClass)
+        let key = DedupKey(runID: mapped.runID, kindClass: mapped.kindClass, stepID: mapped.stepID)
         if let last = recentlyNotified[key], now.timeIntervalSince(last) < Self.dedupWindow {
             return nil
         }
@@ -187,21 +219,56 @@ public final class RunNotifier {
 
     /// Idempotent: a second `activate` call while already running is a
     /// no-op (same idiom as `HostsFooterStore.activate(client:)`). Spawns
-    /// one task that pulls `streamFactory()`'s stream to completion, calling
-    /// `decision`/`poster.post` per event; if `streamFactory()` returns
-    /// `nil` (backend not configured yet) or the stream itself ends, it
-    /// backs off (capped exponential, matching `JSONEventStream`'s own
-    /// internal reconnect backoff shape) and tries again. `self` is
-    /// captured weakly and re-checked on every event, not held for the
-    /// loop's whole lifetime, so a torn-down `RunNotifier` (e.g. mid-test)
-    /// can't be kept alive by an in-flight iteration.
+    /// one task that syncs `authorizationDenied` once (non-prompting; see
+    /// that property's doc comment) and then pulls `streamFactory()`'s
+    /// stream to completion, calling `decision`/`poster.post` per event.
+    ///
+    /// If `streamFactory()` returns `nil` (backend not configured yet) or
+    /// the stream itself ends, this backs off (capped exponential) and
+    /// tries again — `JSONEventStream` already reconnects internally on its
+    /// own capped backoff (see that type's `events()`), so in practice this
+    /// outer retry is a safety net for cases the inner reconnect can't
+    /// cover, not the primary reconnect path. `backoffSeconds` resets to 1
+    /// only once an event actually arrives, not merely once
+    /// `streamFactory()` hands back a non-nil stream — a stream that
+    /// connects but never emits anything shouldn't be treated as healthy
+    /// just because it exists.
+    ///
+    /// `self` is captured weakly and re-checked on every event, not held
+    /// for the loop's whole lifetime, so a torn-down `RunNotifier` (e.g.
+    /// mid-test) can't be kept alive by an in-flight iteration. Every
+    /// re-check also compares `activationGeneration` against the value
+    /// captured when this specific loop was spawned: `Task.isCancelled`
+    /// alone only reflects THIS task's own cancellation flag, propagated
+    /// cooperatively — a `deactivate()` immediately followed by a
+    /// re-`activate()` bumps the generation synchronously (on `MainActor`,
+    /// so strictly before the new loop can start), which means a stale loop
+    /// that hasn't yet reached its next cancellation checkpoint still
+    /// recognizes itself as superseded the moment it resumes, rather than
+    /// possibly processing one more event as a second, overlapping live
+    /// subscriber.
     public func activate(streamFactory: @escaping () -> EventStreamClient?) {
         guard task == nil else { return }
+        activationGeneration += 1
+        let generation = activationGeneration
+
+        // `notifier` (not `self`) is deliberately the name every checkpoint
+        // below unwraps into: `self` stays the ORIGINAL weak-optional
+        // capture for the whole closure body, so each checkpoint re-reads
+        // it fresh rather than reusing a strong local from an earlier
+        // checkpoint that would otherwise keep `self` alive for however
+        // long the surrounding scope takes to unwind.
         task = Task { [weak self] in
+            if let notifier = self {
+                await notifier.syncAuthorizationStatus()
+            }
+
             var backoffSeconds: UInt64 = 1
             let maxBackoffSeconds: UInt64 = 30
 
             while !Task.isCancelled {
+                guard let notifier = self, notifier.activationGeneration == generation else { return }
+
                 guard let stream = streamFactory() else {
                     do {
                         try await Task.sleep(nanoseconds: backoffSeconds * 1_000_000_000)
@@ -212,15 +279,15 @@ public final class RunNotifier {
                     continue
                 }
 
-                backoffSeconds = 1
                 for await event in stream.events() {
-                    guard !Task.isCancelled, let self else { return }
-                    if let content = self.decision(for: event, now: Date()) {
-                        await self.poster.post(content)
+                    guard !Task.isCancelled, let notifier = self, notifier.activationGeneration == generation else { return }
+                    backoffSeconds = 1
+                    if let content = notifier.decision(for: event, now: Date()) {
+                        await notifier.poster.post(content)
                     }
                 }
 
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, let notifier = self, notifier.activationGeneration == generation else { return }
                 do {
                     try await Task.sleep(nanoseconds: backoffSeconds * 1_000_000_000)
                 } catch {
@@ -231,7 +298,14 @@ public final class RunNotifier {
         }
     }
 
+    /// `RunNotifier` is app-lifetime (owned once by `RupuApp`, activated on
+    /// the first healthy backend connection, never explicitly torn down by
+    /// any production caller) — this exists for symmetry with `activate()`
+    /// and for tests. Bumping `activationGeneration` here, synchronously
+    /// before `task?.cancel()`, is what makes an immediate re-`activate()`
+    /// safe: see `activate`'s doc comment for the race it closes.
     public func deactivate() {
+        activationGeneration += 1
         task?.cancel()
         task = nil
     }
@@ -246,6 +320,17 @@ public final class RunNotifier {
 
     private func pruneStale(now: Date) {
         recentlyNotified = recentlyNotified.filter { now.timeIntervalSince($0.value) < Self.dedupWindow }
+    }
+
+    /// Non-prompting: reads `poster.currentAuthorizationStatus()` and syncs
+    /// `authorizationDenied` to match. Safe to call as often as needed
+    /// (`activate()` calls it once per activation; `NotificationsTab` calls
+    /// it on every `onAppear`) — it never shows a system prompt, so there's
+    /// no "asked too many times" concern the way `ensureAuthorization()`
+    /// has.
+    public func syncAuthorizationStatus() async {
+        let status = await poster.currentAuthorizationStatus()
+        authorizationDenied = (status == .denied)
     }
 
     private func ensureAuthorization() {
@@ -266,6 +351,7 @@ public final class RunNotifier {
                 pref: .gates,
                 kindClass: "step_awaiting_approval",
                 runID: runID,
+                stepID: stepID,
                 title: "Approval needed",
                 body: "Step \(stepID): \(reason)"
             )
@@ -274,6 +360,7 @@ public final class RunNotifier {
                 pref: .failures,
                 kindClass: "step_failed",
                 runID: runID,
+                stepID: stepID,
                 title: "Step failed",
                 body: "Step \(stepID): \(error)"
             )
@@ -282,6 +369,7 @@ public final class RunNotifier {
                 pref: .failures,
                 kindClass: "run_failed",
                 runID: runID,
+                stepID: nil,
                 title: "Run failed",
                 body: error
             )
@@ -290,6 +378,7 @@ public final class RunNotifier {
                 pref: .completions,
                 kindClass: "run_completed",
                 runID: runID,
+                stepID: nil,
                 title: "Run completed",
                 body: "Status: \(status)"
             )

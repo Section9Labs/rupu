@@ -139,7 +139,24 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
             model?.navigate(to: .runDetail(id: runID, host: nil))
         }
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        frontMainWindow()
+    }
+
+    /// `NSApp.windows.first` is unordered and is NOT guaranteed to be the
+    /// main content window — it can just as easily be the Settings window,
+    /// or (once it exists) Task 8's menu-bar status window. A notification
+    /// tap must always land on the app's real content, so this picks
+    /// deliberately: prefer the window carrying `RupuApp`'s own explicit
+    /// `WindowGroup(id: "main")` identifier, and if that's ever unavailable
+    /// for some reason, fall back to any window that ISN'T the Settings
+    /// scene's window (`"com_apple_SwiftUI_Settings_window"` is SwiftUI's
+    /// own stable internal identifier for a macOS `Settings { }` scene's
+    /// window) — the one hard requirement either way is that the Settings
+    /// window itself is never the one fronted.
+    private func frontMainWindow() {
+        let target = NSApp.windows.first(where: { $0.identifier?.rawValue == RupuApp.mainWindowID })
+            ?? NSApp.windows.first(where: { $0.identifier?.rawValue != RupuApp.settingsWindowID })
+        target?.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -158,8 +175,18 @@ struct RupuApp: App {
     @State private var runNotifier = RunNotifier(poster: UNCenterNotificationPoster())
     @AppStorage("appearance") private var appearance: String = "system"
 
+    /// The explicit identifier this app's one `WindowGroup` carries — see
+    /// `AppDelegate.frontMainWindow`'s doc comment for why a notification
+    /// tap needs to name a specific window rather than trusting
+    /// `NSApp.windows.first`'s undefined ordering.
+    static let mainWindowID = "main"
+    /// SwiftUI's own stable internal identifier for a macOS `Settings { }`
+    /// scene's window — not something this app assigns itself, but a
+    /// well-known constant `frontMainWindow` excludes by.
+    static let settingsWindowID = "com_apple_SwiftUI_Settings_window"
+
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: RupuApp.mainWindowID) {
             RootView(model: model, backend: backend)
                 .frame(minWidth: 1150, minHeight: 760)
                 .preferredColorScheme(preferredColorScheme)
