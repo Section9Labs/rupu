@@ -90,7 +90,10 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
 /// appear, deactivate `.onDisappear`) rather than `ActivityScreen`'s
 /// `.task(id:)`-per-kind shape — this screen has no per-instance identity
 /// that changes while mounted, so a single `.task` (built once, reused on
-/// any transient re-render) is enough:
+/// any transient re-render) is enough, EXCEPT that `activate()` still
+/// rebuilds both stores if `backend.client()`'s identity has changed since
+/// they were built (an embedded/remote switch, reconnect, or restart) —
+/// see `activate()`'s doc comment:
 /// - `DashboardStore` — the merged fleet aggregate behind blocks 3-6.
 /// - `ActivityStore` (kind `.all`, `liveTail` on by default, `scopeFilter`
 ///   **never set** — see `NeedsYouCard`'s doc comment: the needs-you queue
@@ -123,6 +126,11 @@ public struct OverviewScreen: View {
     @State private var dashboardStore: DashboardStore?
     @State private var activityStore: ActivityStore?
 
+    /// Tracked so `activate()` rebuilds both stores on a backend client swap
+    /// (embedded/remote switch, reconnect, restart) — see that method's doc
+    /// comment and `BackendController.clientIdentity()`.
+    @State private var storeClientID: ObjectIdentifier?
+
     @AppStorage(OverviewWidgets.storageKey) private var widgetsData: Data = Data()
 
     public init(model: AppModel, backend: BackendController) {
@@ -148,45 +156,66 @@ public struct OverviewScreen: View {
             await activate()
         }
         .onChange(of: model.range) { _, newRange in
-            Task { await dashboardStore?.setRange(newRange) }
+            // Fix round 1: a bare `Task { await dashboardStore?.setRange(...) }`
+            // reads `dashboardStore` fresh when the task actually runs (it's
+            // an `@State` box, not a frozen snapshot), so it isn't the race
+            // — the race is a range change firing this right before the
+            // screen disappears, where `onDisappear` below already
+            // deactivated (and nil'd) the store by the time this task's
+            // turn comes up. Capturing the store here and re-checking its
+            // identity against the *current* `dashboardStore` right before
+            // calling `setRange` makes a superseded task a no-op instead of
+            // kicking off an untracked refetch on a store nothing will ever
+            // deactivate again.
+            let capturedStore = dashboardStore
+            Task {
+                guard let capturedStore, capturedStore === dashboardStore else { return }
+                await capturedStore.setRange(newRange)
+            }
         }
         .onDisappear {
             dashboardStore?.deactivate()
             activityStore?.deactivate()
+            // Cleared, not just deactivated: this is what the range-change
+            // guard above checks, and it's what makes `activate()` rebuild
+            // rather than silently no-op if this exact screen instance ever
+            // reappears (see that method's `dashboardStore == nil` clause).
+            dashboardStore = nil
+            activityStore = nil
         }
     }
 
     /// Builds both stores lazily (once `backend.client()` exists — shouldn't
     /// stay `nil` by the time the shell can route here, same reasoning
     /// `ActivityScreen`/`RunDetailScreen` already document) and activates
-    /// them. Reuses an existing pair on a second call rather than rebuilding
-    /// — this screen has no changing identity to rebuild around, unlike
-    /// `RunDetailScreen`'s per-`runID` store.
+    /// them. Reuses an existing pair on a later call rather than rebuilding
+    /// — this screen has no per-instance identity (like `RunDetailScreen`'s
+    /// `runID`) to rebuild around — UNLESS either store is currently `nil`
+    /// (nothing built yet, or `onDisappear` cleared a torn-down screen's
+    /// pair) or `backend.client()`'s identity has changed since the current
+    /// pair was built: an embedded/remote mode switch, a manual reconnect,
+    /// or a restart all swap `backend.client()` to a brand-new `CPClient`
+    /// directly (never through `nil` in between — see
+    /// `BackendController.clientIdentity()`'s doc comment), so a plain "do I
+    /// already have a pair" check would never notice and would keep running
+    /// both stores against the abandoned connection.
     private func activate() async {
         guard let client = backend.client() else { return }
+        let clientID = backend.clientIdentity()
 
-        let dStore: DashboardStore
-        if let existing = dashboardStore {
-            dStore = existing
-        } else {
-            let newStore = DashboardStore(client: client, signalsFactory: Self.makeSignalsFactory(backend: backend))
-            dashboardStore = newStore
-            dStore = newStore
-        }
-
-        let aStore: ActivityStore
-        if let existing = activityStore {
-            aStore = existing
-        } else {
-            let newStore = ActivityStore(
+        if dashboardStore == nil || activityStore == nil || storeClientID != clientID {
+            dashboardStore?.deactivate()
+            activityStore?.deactivate()
+            dashboardStore = DashboardStore(client: client, signalsFactory: Self.makeSignalsFactory(backend: backend))
+            activityStore = ActivityStore(
                 client: client,
                 signalsFactory: Self.makeSignalsFactory(backend: backend),
                 pendingActions: backend.pendingActions
             )
-            activityStore = newStore
-            aStore = newStore
+            storeClientID = clientID
         }
 
+        guard let dStore = dashboardStore, let aStore = activityStore else { return }
         async let dashboardActivation: Void = dStore.activate(range: model.range)
         async let activityActivation: Void = aStore.activate(kind: .all)
         _ = await (dashboardActivation, activityActivation)

@@ -192,6 +192,23 @@ public final class BackendController {
         activeClient
     }
 
+    /// Identity of whatever `client()` currently returns — `nil` iff
+    /// `client()` itself is `nil`. `CPClient` is an `actor` (a reference
+    /// type), so wrapping it in `ObjectIdentifier` is a legitimate, honest
+    /// identity check: `startHealthMonitor(config:)` builds a brand-new
+    /// `CPClient` and swaps `activeClient` directly (never through `nil` in
+    /// between) on every `configureEmbedded`/`connectRemote` call — an
+    /// embedded/remote mode switch, a manual reconnect, or a restart all go
+    /// through there. A store-owning screen (`OverviewScreen`/
+    /// `ActivityScreen`/`RunDetailScreen`) that only checks "do I already
+    /// have a store" without also checking this would keep running its
+    /// store against an abandoned, disconnected `CPClient` forever — this
+    /// is the seam those screens compare against `client()`'s result to
+    /// detect that swap and rebuild.
+    public func clientIdentity() -> ObjectIdentifier? {
+        activeClient.map(ObjectIdentifier.init)
+    }
+
     public func eventStream() -> EventStreamClient? {
         activeEventStream
     }
