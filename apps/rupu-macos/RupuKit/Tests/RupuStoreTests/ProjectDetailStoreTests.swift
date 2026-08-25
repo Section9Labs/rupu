@@ -38,11 +38,11 @@ private func projectRow(wsID: String = "ws-1") -> APIProjectRow {
     APIProjectRow(wsID: wsID, name: "rupu", runCount: 14, lastRunAt: "2026-08-20T12:00:00Z", usage: usage())
 }
 
-private func projectDetail(wsID: String = "ws-1") -> APIProjectDetail {
+private func projectDetail(wsID: String = "ws-1", runsTotal: Int = 14, sessionsTotal: Int = 3) -> APIProjectDetail {
     APIProjectDetail(
         project: projectRow(wsID: wsID),
-        runs: APIProjectRunsSummary(total: 14, running: 1, byStatus: ["completed": 10], bySurface: APIProjectRunsBySurface(workflow: 9, autoflow: 5)),
-        sessions: APIProjectSessionsSummary(total: 3, active: 1),
+        runs: APIProjectRunsSummary(total: runsTotal, running: 1, byStatus: ["completed": 10], bySurface: APIProjectRunsBySurface(workflow: 9, autoflow: 5)),
+        sessions: APIProjectSessionsSummary(total: sessionsTotal, active: 1),
         coverage: APIProjectCoverageSummary(targets: 4, findings: 7),
         recentRuns: [],
         usage: usage()
@@ -184,7 +184,7 @@ private func makeStore(
     #expect(store.runsShowingAll == false)
 }
 
-@MainActor @Test func showAllRunsRefetchesWithTheShowAllLimitEvenAfterAlreadyLoaded() async {
+@MainActor @Test func showAllRunsSendsTheShowAllLimitAndStaysANoOpForLoadRunsIfNeededAfter() async {
     let log = LimitLog()
     let store = makeStore(runsResult: { _, limit in
         log.record(limit)
@@ -193,12 +193,69 @@ private func makeStore(
     await store.loadRunsIfNeeded()
     await store.showAllRuns()
     #expect(log.snapshot == [ProjectDetailStore.windowSize, ProjectDetailStore.showAllLimit])
-    #expect(store.runsShowingAll == true)
 
     // A subsequent loadRunsIfNeeded() (e.g. re-selecting the tab) stays a
     // no-op — "showing all" doesn't reset the lazy-load flag.
     await store.loadRunsIfNeeded()
     #expect(log.snapshot.count == 2)
+}
+
+// MARK: - "Show all" reconciliation (review fix: completeness must be
+// provable from `detail`'s own total, never inferred from fetch success —
+// see `ProjectDetailStore`'s type doc comment's "runsShowingAll/
+// sessionsShowingAll are an honesty gate" section).
+
+/// Total fits inside `showAllLimit`: `showAllRuns()` genuinely captures
+/// every row, so `runsShowingAll` flips `true` — the honest "complete"
+/// state the Runs tab's footer hides itself for.
+@MainActor @Test func runsShowingAllFlipsTrueOnlyOnceTheShowAllFetchActuallyReachesTheRealTotal() async {
+    let store = makeStore(
+        detailResult: { projectDetail(runsTotal: 200) },
+        runsResult: { _, limit in
+            // The server never returns more than the real total exists,
+            // regardless of how big a limit was requested.
+            (0..<min(limit, 200)).map { runRow(id: "run-\($0)") }
+        }
+    )
+    await store.activate()
+
+    await store.loadRunsIfNeeded()
+    #expect(store.runs.value?.count == ProjectDetailStore.windowSize)
+    #expect(store.runsShowingAll == false, "a 50-row window is not all 200 runs")
+
+    await store.showAllRuns()
+    #expect(store.runs.value?.count == 200)
+    #expect(store.runsShowingAll == true, "the show-all fetch reached every row the project has")
+}
+
+/// Total exceeds `showAllLimit`: `showAllRuns()` caps out at exactly
+/// `showAllLimit` rows and can never claim completeness — `runsShowingAll`
+/// stays `false` even after a successful fetch, per the review fix's core
+/// requirement.
+@MainActor @Test func runsShowingAllStaysFalseWhenTotalExceedsTheShowAllCapEvenAfterASuccessfulFetch() async {
+    let store = makeStore(
+        detailResult: { projectDetail(runsTotal: 5000) },
+        runsResult: { _, limit in
+            (0..<limit).map { runRow(id: "run-\($0)") }
+        }
+    )
+    await store.activate()
+    await store.showAllRuns()
+
+    #expect(store.runs.value?.count == ProjectDetailStore.showAllLimit)
+    #expect(store.runsShowingAll == false, "1,000 of 5,000 is not complete — must never read as showing all")
+}
+
+/// A total unknown to this store (`detail` never loaded, e.g. a lazy tab
+/// visited before the header's own fetch resolves) must never be read as
+/// "nothing more to show" — `runsShowingAll` stays `false` regardless of
+/// how many rows came back.
+@MainActor @Test func runsShowingAllStaysFalseWhenTotalIsUnknown() async {
+    let store = makeStore(runsResult: { _, limit in
+        (0..<limit).map { runRow(id: "run-\($0)") }
+    })
+    await store.showAllRuns()
+    #expect(store.runsShowingAll == false)
 }
 
 @MainActor @Test func loadRunsForcesARefetchEvenWhenAlreadyRequested() async {
@@ -225,7 +282,7 @@ private func makeStore(
     #expect(message.contains("runs boom"))
 }
 
-@MainActor @Test func loadSessionsIfNeededAndShowAllSessionsMirrorRunsWindowingContract() async {
+@MainActor @Test func loadSessionsIfNeededSendsTheWindowSizeThenShowAllSessionsSendsTheCap() async {
     let log = LimitLog()
     let store = makeStore(sessionsResult: { _, limit in
         log.record(limit)
@@ -238,7 +295,42 @@ private func makeStore(
 
     await store.showAllSessions()
     #expect(log.snapshot == [ProjectDetailStore.windowSize, ProjectDetailStore.showAllLimit])
+}
+
+/// Mirrors `runsShowingAllFlipsTrueOnlyOnceTheShowAllFetchActuallyReachesTheRealTotal`
+/// for sessions — same honesty-gate contract, same fix.
+@MainActor @Test func sessionsShowingAllFlipsTrueOnlyOnceTheShowAllFetchActuallyReachesTheRealTotal() async {
+    let store = makeStore(
+        detailResult: { projectDetail(sessionsTotal: 200) },
+        sessionsResult: { _, limit in
+            (0..<min(limit, 200)).map { sessionRow(id: "sess-\($0)") }
+        }
+    )
+    await store.activate()
+
+    await store.loadSessionsIfNeeded()
+    #expect(store.sessions.value?.count == ProjectDetailStore.windowSize)
+    #expect(store.sessionsShowingAll == false)
+
+    await store.showAllSessions()
+    #expect(store.sessions.value?.count == 200)
     #expect(store.sessionsShowingAll == true)
+}
+
+/// Mirrors `runsShowingAllStaysFalseWhenTotalExceedsTheShowAllCapEvenAfterASuccessfulFetch`
+/// for sessions.
+@MainActor @Test func sessionsShowingAllStaysFalseWhenTotalExceedsTheShowAllCapEvenAfterASuccessfulFetch() async {
+    let store = makeStore(
+        detailResult: { projectDetail(sessionsTotal: 5000) },
+        sessionsResult: { _, limit in
+            (0..<limit).map { sessionRow(id: "sess-\($0)") }
+        }
+    )
+    await store.activate()
+    await store.showAllSessions()
+
+    #expect(store.sessions.value?.count == ProjectDetailStore.showAllLimit)
+    #expect(store.sessionsShowingAll == false)
 }
 
 @MainActor @Test func loadAgentsIfNeededFetchesOnceAndEmptyResultSetsEmpty() async {
