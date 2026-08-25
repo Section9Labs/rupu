@@ -167,6 +167,22 @@ public final class LauncherStore {
     /// operator action even when it becomes several POSTs.
     public let pendingActions = PendingActions()
 
+    /// `true` exactly while the launch batch's one pending key
+    /// (`ActionKey("launcher", .launch)`) is `.pending` — the single seam the
+    /// sheet's Cancel button, Launch button, AND its
+    /// `interactiveDismissDisabled` gate all read. The three must agree: a
+    /// launch whose Cancel button is disabled but whose sheet still honors
+    /// Esc/click-outside would let a dismissal strand the in-flight
+    /// `launchResults` in a store nobody observes anymore (this store is
+    /// discarded on the next sheet open, per `LauncherSheet`'s doc comment).
+    /// A resolved batch — `.confirmed` or `.failed` alike — reads `false`:
+    /// a launch that already errored out must never trap the operator in an
+    /// undismissable sheet.
+    public var isLaunchInFlight: Bool {
+        if case .pending = pendingActions.state(ActionKey("launcher", .launch)) { return true }
+        return false
+    }
+
     private let client: CPClient
     private var hostsGeneration = 0
 

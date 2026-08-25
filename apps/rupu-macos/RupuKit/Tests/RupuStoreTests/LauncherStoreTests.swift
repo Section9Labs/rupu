@@ -844,6 +844,52 @@ struct LauncherStoreTests {
         #expect(LauncherStubURLProtocol.hitCount("/api/agents/rupuso/session") == 1) // still just "local"
     }
 
+    // (i) Dismiss-gating seam: `isLaunchInFlight` is the single
+    // pending-state read the sheet's Cancel button AND its
+    // `interactiveDismissDisabled` gate share — true exactly while the
+    // batch's `ActionKey("launcher", .launch)` key is `.pending`, false
+    // before any launch and false again once the batch resolves. The
+    // Esc/click-outside gating itself is view-only (SwiftUI modifier), but
+    // this proves the state it reads flips at the right moments.
+    @MainActor @Test func isLaunchInFlightTrueWhileLaunchPendingFalseOnceResolved() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            Thread.sleep(forTimeInterval: 0.3) // artificially slow, generous margin under load
+            return (200, Data(#"{"run_id":"run-1","host_id":"local"}"#.utf8))
+        }
+        store.kind = .agentRun
+        store.selectedDefinition = "rupuso"
+        store.prompt = "hi"
+
+        #expect(store.isLaunchInFlight == false) // nothing fired yet
+
+        let launchTask = Task { await store.launch() }
+        await expectEventually("the launch begins and reads as in flight") {
+            store.isLaunchInFlight
+        }
+
+        _ = await launchTask.value
+        #expect(store.isLaunchInFlight == false) // confirmed — no longer pending
+    }
+
+    // (i2) A failed launch resolves the pending key to `.failed`, which must
+    // read as NOT in flight — the sheet becomes dismissable again so the
+    // operator isn't trapped behind a launch that already errored out.
+    @MainActor @Test func isLaunchInFlightFalseAfterFailedLaunch() async {
+        let store = makeStore { req in
+            guard req.url?.path == "/api/agents/rupuso/run" else { return (200, Data("[]".utf8)) }
+            return (500, Data(#"{"error":"boom"}"#.utf8))
+        }
+        store.kind = .agentRun
+        store.selectedDefinition = "rupuso"
+        store.prompt = "hi"
+
+        let route = await store.launch()
+
+        #expect(route == nil)
+        #expect(store.isLaunchInFlight == false) // failed — not pending, dismiss is allowed
+    }
+
     // (h) The required-input client-side gap surfaces via `validationError`
     // rather than firing any request at all.
     @MainActor @Test func missingRequiredInputSetsValidationErrorWithoutPosting() async {
