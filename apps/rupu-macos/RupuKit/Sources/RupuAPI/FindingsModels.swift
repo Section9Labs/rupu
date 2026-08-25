@@ -34,6 +34,16 @@ public struct APIFindingsSummary: Decodable, Sendable {
 /// `FindingRecord` (the finding itself). `rationale` is nested one level
 /// down, inside `evidence`, so this needs a custom decoder rather than a
 /// flat `CodingKeys` mapping.
+///
+/// `wsID`/`targetID` were added for the global (unfiltered) `GET
+/// /api/findings` view (Phase 5B): every row on that view spans multiple
+/// workspaces/targets, so — unlike the single-project `findings(wsID:)` and
+/// `runFindings(id:)` views, which already carry `project` for display —
+/// the global view needs the raw ids too, to scope a click-through. Both
+/// keys are always present on the wire (`FindingOut.ws_id`/`.target_id` on
+/// the Rust side are plain `String`, never `Option`), so they decode as
+/// non-optional here; the memberwise `init` still defaults them to `""` so
+/// existing call sites built before this field existed keep compiling.
 public struct APIFinding: Decodable, Sendable {
     public let id: String
     public let summary: String
@@ -41,7 +51,9 @@ public struct APIFinding: Decodable, Sendable {
     public let scope: String
     public let filePath: String?
     public let lineRange: [UInt32]?
+    public let wsID: String
     public let project: String
+    public let targetID: String
     public let workflowName: String?
     public let permalink: String?
     public let rationale: String
@@ -54,7 +66,9 @@ public struct APIFinding: Decodable, Sendable {
         scope: String,
         filePath: String?,
         lineRange: [UInt32]?,
+        wsID: String = "",
         project: String,
+        targetID: String = "",
         workflowName: String?,
         permalink: String?,
         rationale: String,
@@ -66,7 +80,9 @@ public struct APIFinding: Decodable, Sendable {
         self.scope = scope
         self.filePath = filePath
         self.lineRange = lineRange
+        self.wsID = wsID
         self.project = project
+        self.targetID = targetID
         self.workflowName = workflowName
         self.permalink = permalink
         self.rationale = rationale
@@ -80,7 +96,9 @@ public struct APIFinding: Decodable, Sendable {
         case scope
         case filePath = "file_path"
         case lineRange = "line_range"
+        case wsID = "ws_id"
         case project
+        case targetID = "target_id"
         case workflowName = "workflow_name"
         case permalink
         case evidence
@@ -99,7 +117,9 @@ public struct APIFinding: Decodable, Sendable {
         scope = try container.decode(String.self, forKey: .scope)
         filePath = try container.decodeIfPresent(String.self, forKey: .filePath)
         lineRange = try container.decodeIfPresent([UInt32].self, forKey: .lineRange)
+        wsID = try container.decode(String.self, forKey: .wsID)
         project = try container.decode(String.self, forKey: .project)
+        targetID = try container.decode(String.self, forKey: .targetID)
         workflowName = try container.decodeIfPresent(String.self, forKey: .workflowName)
         permalink = try container.decodeIfPresent(String.self, forKey: .permalink)
         declaredAt = try container.decode(String.self, forKey: .declaredAt)

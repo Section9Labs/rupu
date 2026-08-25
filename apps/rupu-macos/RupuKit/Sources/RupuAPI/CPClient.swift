@@ -106,16 +106,22 @@ public actor CPClient {
         try await get("api/findings", query: [URLQueryItem(name: "run_id", value: id)])
     }
 
-    /// `GET /api/findings?ws_id=<id>` — every finding scoped to one project,
-    /// across every run that ever declared one (not just `recentRuns`).
+    /// `GET /api/findings[?ws_id=<id>]` — every finding scoped to one
+    /// project, across every run that ever declared one (not just
+    /// `recentRuns`), OR — with `wsID` omitted (Phase 5B's global Findings
+    /// view) — every finding across every registered workspace, unfiltered.
     /// Phase 5A's Projects Findings tab: the smallest honest addition over
     /// `runFindings(id:)` above — the server's `FindingsQuery` (`crates/
     /// rupu-cp/src/api/findings.rs`) already accepts `ws_id` as an
     /// independent filter from `run_id`, so this is a second thin method
     /// rather than overloading `runFindings`'s `id` parameter to mean two
     /// different query keys depending on caller.
-    public func findings(wsID: String) async throws -> APIFindings {
-        try await get("api/findings", query: [URLQueryItem(name: "ws_id", value: wsID)])
+    public func findings(wsID: String? = nil) async throws -> APIFindings {
+        var query: [URLQueryItem] = []
+        if let wsID {
+            query.append(URLQueryItem(name: "ws_id", value: wsID))
+        }
+        return try await get("api/findings", query: query)
     }
 
     public func sessionDetail(id: String) async throws -> APISessionRow {
@@ -231,6 +237,67 @@ public actor CPClient {
     /// block.
     public func projectAutoflows(wsID: String) async throws -> [AutoflowDefinition] {
         try await get("api/projects/\(wsID)/autoflows")
+    }
+
+    // MARK: - Coverage (read)
+
+    /// `GET /api/coverage` — every coverage target's rollup, aggregated
+    /// across every registered workspace (the firehose view, not scoped to
+    /// the CP's own launch dir). Local-only: no `host` fan-out.
+    public func coverage() async throws -> [APICoverageSummary] {
+        try await get("api/coverage")
+    }
+
+    /// `GET /api/coverage/:target[?ws_id=]` — one target's full detail
+    /// (assertions/findings/per-file heatmap). `wsID` disambiguates a
+    /// `target` id that collides across workspaces — omit only for
+    /// hand-typed URLs, where the server best-effort scans every registered
+    /// workspace for the first match.
+    public func coverageDetail(target: String, wsID: String? = nil) async throws -> APICoverageDetail {
+        try await get("api/coverage/\(target)", query: wsIDQuery(wsID))
+    }
+
+    /// `GET /api/coverage/:target/catalog[?ws_id=]` — the flattened concern
+    /// catalog effective for `target`. A SEPARATE route (and Rust type, no
+    /// relation to `CoverageSummary`/the `get_coverage` detail shape) from
+    /// `coverageDetail(target:wsID:)` — same `wsID` disambiguation rule.
+    public func coverageCatalog(target: String, wsID: String? = nil) async throws -> APICoverageCatalog {
+        try await get("api/coverage/\(target)/catalog", query: wsIDQuery(wsID))
+    }
+
+    // MARK: - Usage (read)
+
+    /// `GET /api/usage[?since=&until=&group_by=]` — fleet-wide token + cost
+    /// overview (summary + breakdown), fanned out across every registered
+    /// host. `since`/`until` are RFC-3339 timestamps; omitted, the server
+    /// defaults to the trailing 30 days. `groupBy` is one of `"provider"` |
+    /// `"model"` | `"agent"` | `"workflow"` | `"host"` | `"project"`;
+    /// omitted, the server groups by `"model"`.
+    public func usage(since: String? = nil, until: String? = nil, groupBy: String? = nil) async throws -> APIUsageResponse {
+        var query = sinceUntilQuery(since: since, until: until)
+        if let groupBy {
+            query.append(URLQueryItem(name: "group_by", value: groupBy))
+        }
+        return try await get("api/usage", query: query)
+    }
+
+    /// `GET /api/usage/runs[?since=&until=&workspace_id=]` — flat
+    /// per-`(run × model)` usage rows, local-only (no host fan-out) — see
+    /// `usage(since:until:groupBy:)`'s doc comment on the default window.
+    public func usageRuns(since: String? = nil, until: String? = nil, wsID: String? = nil) async throws -> [APIUsageRunRow] {
+        var query = sinceUntilQuery(since: since, until: until)
+        if let wsID {
+            query.append(URLQueryItem(name: "workspace_id", value: wsID))
+        }
+        return try await get("api/usage/runs", query: query)
+    }
+
+    /// `GET /api/usage/outliers[?since=&until=]` — runs costing far more
+    /// than their OWN workflow's median baseline, local-only (no host
+    /// fan-out) — see `usage(since:until:groupBy:)`'s doc comment on the
+    /// default window.
+    public func usageOutliers(since: String? = nil, until: String? = nil) async throws -> [APIOutlierRun] {
+        try await get("api/usage/outliers", query: sinceUntilQuery(since: since, until: until))
     }
 
     // MARK: - Run control (write)
@@ -368,6 +435,26 @@ public actor CPClient {
     private func hostQuery(_ host: String?) -> [URLQueryItem] {
         guard let host else { return [] }
         return [URLQueryItem(name: "host", value: host)]
+    }
+
+    /// `?ws_id=` when present, no query items when `nil` — shared by
+    /// `coverageDetail`/`coverageCatalog`.
+    private func wsIDQuery(_ wsID: String?) -> [URLQueryItem] {
+        guard let wsID else { return [] }
+        return [URLQueryItem(name: "ws_id", value: wsID)]
+    }
+
+    /// `?since=&until=` — either or both present when set, no query items
+    /// when both `nil`. Shared by every `/api/usage*` route.
+    private func sinceUntilQuery(since: String?, until: String?) -> [URLQueryItem] {
+        var items: [URLQueryItem] = []
+        if let since {
+            items.append(URLQueryItem(name: "since", value: since))
+        }
+        if let until {
+            items.append(URLQueryItem(name: "until", value: until))
+        }
+        return items
     }
 
     /// Same as `hostQuery`, except a literal `"local"` also omits the query
