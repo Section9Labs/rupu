@@ -6,12 +6,12 @@ import RupuStore
 /// **Connection** (embedded-server port, `rupu` binary override, keep-running
 /// — moved out of General so General stays about presentation only — plus a
 /// read-only current-connection line sourced from `backend.mode`/`.origin`),
-/// **Config** (`ConfigTab`, a `ConfigStore`-backed editor for `[cp]` and
-/// provider sections — Providers folds into this tab rather than getting its
-/// own), and **Notifications** (`NotificationsTab`, a `RunNotifier`-backed
-/// preferences editor). Both `ConfigTab` and `NotificationsTab` are
-/// placeholder shells in this task, wired for real in Tasks 6/7 of the same
-/// PR. There is no separate Dashboard tab: that disposition is covered by
+/// **Config** (`ConfigTab`, defined in `ConfigTab.swift` — a `ConfigStore`-
+/// backed editor for `[cp]` and provider sections; Providers folds into this
+/// tab rather than getting its own), and **Notifications** (`NotificationsTab`,
+/// a `RunNotifier`-backed preferences editor). `NotificationsTab` is still a
+/// placeholder shell in this task, wired for real in Task 7 of the same PR.
+/// There is no separate Dashboard tab: that disposition is covered by
 /// Overview's own Customize visibility menu, not Settings.
 public struct SettingsView: View {
     @AppStorage("appearance") private var appearance: String = "system"
@@ -133,23 +133,6 @@ public struct SettingsView: View {
         case nil:
             return "Not connected"
         }
-    }
-}
-
-/// Placeholder Config tab. Task 6 replaces this with a `ConfigStore`-backed
-/// editor over `[cp]`/provider config sections; deliberately store-less here
-/// since that wiring is next task's work, not this one's.
-// Replaced in Task 6
-struct ConfigTab: View {
-    let model: AppModel
-    let backend: BackendController
-
-    var body: some View {
-        Form {
-            Text("Config")
-                .foregroundStyle(.secondary)
-        }
-        .padding(.top, 12)
     }
 }
 

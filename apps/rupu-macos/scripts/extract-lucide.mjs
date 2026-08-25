@@ -95,6 +95,9 @@ const ICONS = [
   // REMAP: more-horizontal.js is an alias re-exporting ellipsis.js's default.
   { enumCase: "moreHorizontal", asset: "more-horizontal", source: "ellipsis" },
   { enumCase: "search", asset: "search", source: "search" },
+  { enumCase: "lock", asset: "lock", source: "lock" },
+  // REMAP: unlock.js is an alias re-exporting lock-open.js's default.
+  { enumCase: "unlock", asset: "unlock", source: "lock-open" },
 ];
 
 // --- number formatting: deterministic, minimal-digit output -----------------------------------
