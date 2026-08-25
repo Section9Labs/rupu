@@ -1,0 +1,26 @@
+[
+  {
+    "assertion_lines": 128,
+    "findings": 3,
+    "has_catalog": true,
+    "project": "rupu",
+    "target_id": "auth-core",
+    "ws_id": "ws-1"
+  },
+  {
+    "assertion_lines": 64,
+    "findings": 0,
+    "has_catalog": false,
+    "project": "rupu",
+    "target_id": "web-api",
+    "ws_id": "ws-1"
+  },
+  {
+    "assertion_lines": 40,
+    "findings": 5,
+    "has_catalog": true,
+    "project": "phi-cell",
+    "target_id": "ml-pipeline",
+    "ws_id": "ws-2"
+  }
+]
