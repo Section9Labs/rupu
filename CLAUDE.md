@@ -26,6 +26,7 @@
 - rupu.app (macOS) flows & composition plan (Plan 2 of design alignment, complete): `docs/superpowers/plans/2026-08-24-rupu-macos-flows-composition.md`
 - rupu.app (macOS) Phase 4 spec + plan (Overview dashboard, complete): `docs/superpowers/specs/2026-08-24-rupu-macos-phase-4-dashboard-design.md`, `docs/superpowers/plans/2026-08-24-rupu-macos-phase-4-dashboard.md`
 - rupu.app (macOS) Phase 5 spec (breadth, two plans): `docs/superpowers/specs/2026-08-24-rupu-macos-phase-5-breadth-design.md` — Plan A (Projects/Fleet/Library + scope-aware launch, complete): `docs/superpowers/plans/2026-08-24-rupu-macos-phase-5a-projects-fleet-library.md`; Plan B (Security/Usage, complete): `docs/superpowers/plans/2026-08-24-rupu-macos-phase-5b-security-usage.md`
+- rupu.app (macOS) Phase 6 spec (ambient, two plans): `docs/superpowers/specs/2026-08-25-rupu-macos-phase-6-ambient-design.md` — Plan A (Settings/config + notifications + menu bar): `docs/superpowers/plans/2026-08-25-rupu-macos-phase-6a-settings-notify-menubar.md`; Plan B (Situation Room + code viewers + claims): `docs/superpowers/plans/2026-08-25-rupu-macos-phase-6b-situation-code-claims.md`
 
 ## Architecture rules (enforced)
 1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` only knows traits.
