@@ -35,9 +35,20 @@ enum StreamFilter: Equatable {
 /// Situation Room — the center live stream. A newest-first `LazyVStack`
 /// (Phase 5B's "everything windowed" lesson) of editorial cards, filterable
 /// by the chips above. Port of `EventStream.tsx` + `EventCard.tsx`'s
-/// layout; see the type doc comments below for the two deliberate scope
+/// layout; see the type doc comments below for the deliberate scope
 /// reductions from the web (no "load older" pagination, no Parsed/Raw JSON
 /// toggle for error details, no syntax-highlighted code excerpt).
+///
+/// **Two more scope reductions, added honestly on review (round 1, ruling
+/// 11)** — neither is ported, both are parked for a future redesign pass
+/// rather than silently dropped:
+/// - **No `freshKeys`/`FRESH_MS` "just arrived" highlight** (`Events.tsx`
+///   lines 87, 139-144: a card flashes for 2.5s when it first lands).
+/// - **No follow/pin-to-top scroll behavior** (`EventStream.tsx` lines
+///   43, 57-59, 64-65: the stream auto-scrolls to the newest card unless
+///   the operator has scrolled down to read history, in which case new
+///   arrivals stop yanking the view). This screen's `ScrollView` today
+///   just stays wherever the operator left it.
 struct EventStreamColumn: View {
     let cards: [StreamCard]
     @Binding var filter: StreamFilter
@@ -106,7 +117,7 @@ struct EventStreamColumn: View {
 
     private func filterChip(_ f: StreamFilter, label: String) -> some View {
         let active = filter == f
-        let count: Int? = if case .group(let g) = f { counts[g] ?? 0 } else { nil }
+        let count = chipCount(for: f)
         return Button {
             filter = f
         } label: {
@@ -124,6 +135,17 @@ struct EventStreamColumn: View {
         .foregroundStyle(active ? Color.rupuBg : Color.rupuDim)
         .background(active ? Color.rupuInk.opacity(0.9) : Color.clear, in: Capsule())
         .overlay(Capsule().stroke(active ? Color.clear : Color.rupuBorder, lineWidth: 1))
+    }
+
+    /// A count badge shows only for Findings/Awaiting/Errors — never for
+    /// "All" or "Agent activity". Web parity, `EventStream.tsx` line 82:
+    /// `ff.key === 'finding' ? counts.finding : ff.key === 'await' ?
+    /// counts.await : ff.key === 'error' ? counts.error : undefined` —
+    /// review fix round 1, ruling 11 (the prior version showed a count for
+    /// `.activity` too, since it matched the general `.group` case).
+    private func chipCount(for f: StreamFilter) -> Int? {
+        guard case .group(let g) = f, g == .finding || g == .await_ || g == .error else { return nil }
+        return counts[g] ?? 0
     }
 
     private var emptyState: some View {
@@ -252,15 +274,22 @@ private struct EventCardView: View {
         }
     }
 
+    /// `.horizontal`-only (review fix round 1, ruling 6): a nested
+    /// `[.horizontal, .vertical]` `ScrollView` steals the outer stream's
+    /// mouse-wheel gestures the moment the cursor is over this card — the
+    /// operator scrolling the LIVE STREAM would instead scroll whichever
+    /// code excerpt happened to be under the pointer. Vertical containment
+    /// comes from `.lineLimit` instead (a truncating cap, not a scroll) —
+    /// web parity: `CodeExcerpt.tsx` has no inner vertical scroll either,
+    /// only horizontal (for long lines).
     private func codeExcerpt(_ code: String) -> some View {
-        ScrollView([.horizontal, .vertical]) {
+        ScrollView(.horizontal) {
             Text(code)
                 .font(.dataMono(11))
                 .foregroundStyle(Color.rupuInk)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(12)
                 .padding(8)
         }
-        .frame(maxHeight: 160)
         .background(Color.rupuSurface)
         .clipShape(RoundedRectangle(cornerRadius: 5))
     }
@@ -313,11 +342,41 @@ private struct EventCardView: View {
         }
     }
 
+    /// Review fix round 1, ruling 7: `approvable.stepID` is `String?`
+    /// (`Approvable`, `StreamCards.swift`) even though `cardForEvent`'s only
+    /// producer of an `await`-form card (`.stepAwaitingApproval`) always
+    /// carries a concrete step id today — the prior version silently
+    /// coerced a hypothetical `nil` to `""` and still posted it as
+    /// `?gate=`. The CP parses an explicitly-present-but-empty `gate` query
+    /// param as `Some("")`, which then fails lookup as `GateNotFound`
+    /// (`crates/rupu-cp/src/api/runs.rs` lines 96, 117-121) — turning "we
+    /// don't actually know which gate" into a confusing "gate not found"
+    /// server error instead of just not offering an action at all. Renders
+    /// the real controls only when a non-nil `stepID` exists, and passes it
+    /// straight through — never `?? ""`.
     @ViewBuilder
     private func awaitControls(_ approvable: Approvable) -> some View {
-        let stepID = approvable.stepID ?? ""
-        let approveKey = ActionKey.gate(runID: approvable.runID, stepID: stepID, verb: .approve)
-        let rejectKey = ActionKey.gate(runID: approvable.runID, stepID: stepID, verb: .reject)
+        if let stepID = approvable.stepID {
+            awaitActionControls(runID: approvable.runID, stepID: stepID)
+        } else {
+            Text("Awaiting approval")
+                .font(.noteText.weight(.semibold))
+                .foregroundStyle(Color.status(.awaiting))
+        }
+    }
+
+    /// Port of `RunDetailScreen.gateRow`'s control block (`RunDetailScreen.
+    /// swift` lines 441-503) — same gate-scoped `ActionKey.gate` pair,
+    /// inline Approve/Reject, per-key failure note + Retry
+    /// (`gateFailureNote`), and a stale-pending affordance
+    /// (`pendingActions.isStale`). Review fix round 1, ruling 3: the first
+    /// pass here only showed a bare failure message with no way to retry
+    /// and no "this looks stuck" signal — exactly the visibility a
+    /// fullscreen ops wall most needs for a gate that isn't resolving.
+    @ViewBuilder
+    private func awaitActionControls(runID: String, stepID: String) -> some View {
+        let approveKey = ActionKey.gate(runID: runID, stepID: stepID, verb: .approve)
+        let rejectKey = ActionKey.gate(runID: runID, stepID: stepID, verb: .reject)
         let approveState = pendingActions.state(approveKey)
         let rejectState = pendingActions.state(rejectKey)
         let anyPending = isPending(approveState) || isPending(rejectState)
@@ -327,34 +386,58 @@ private struct EventCardView: View {
         } else if isConfirmed(rejectState) {
             resolvedTag("rejected", tone: Color.status(.failed))
         } else {
-            HStack(spacing: 8) {
-                Button {
-                    Task { await onApprove(approvable.runID, stepID) }
-                } label: {
-                    HStack(spacing: 5) {
-                        if isPending(approveState) { ProgressView().controlSize(.mini) }
-                        Text("Approve")
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await onApprove(runID, stepID) }
+                    } label: {
+                        HStack(spacing: 5) {
+                            if isPending(approveState) { ProgressView().controlSize(.mini) }
+                            Text("Approve")
+                        }
                     }
-                }
-                .buttonStyle(RupuButtonStyle.primaryOk)
-                .disabled(anyPending)
+                    .buttonStyle(RupuButtonStyle.primaryOk)
+                    .disabled(anyPending)
 
-                Button {
-                    Task { await onReject(approvable.runID, stepID) }
-                } label: {
-                    HStack(spacing: 5) {
-                        if isPending(rejectState) { ProgressView().controlSize(.mini) }
-                        Text("Reject")
+                    Button {
+                        Task { await onReject(runID, stepID) }
+                    } label: {
+                        HStack(spacing: 5) {
+                            if isPending(rejectState) { ProgressView().controlSize(.mini) }
+                            Text("Reject")
+                        }
                     }
+                    .buttonStyle(RupuButtonStyle.dangerOutline)
+                    .disabled(anyPending)
                 }
-                .buttonStyle(RupuButtonStyle.dangerOutline)
-                .disabled(anyPending)
+
+                gateFailureNote(state: approveState) { await onApprove(runID, stepID) }
+                gateFailureNote(state: rejectState) { await onReject(runID, stepID) }
+
+                if pendingActions.isStale(approveKey) || pendingActions.isStale(rejectKey) {
+                    Text("Still pending — this may be stuck")
+                        .font(.noteText)
+                        .foregroundStyle(Color.rupuMute)
+                }
             }
-            if case .failed(let message) = approveState {
-                Text(message).font(.noteText).foregroundStyle(Color.status(.failed))
-            }
-            if case .failed(let message) = rejectState {
-                Text(message).font(.noteText).foregroundStyle(Color.status(.failed))
+        }
+    }
+
+    /// Inline failure text + Retry for one gate control — only renders when
+    /// `state` is `.failed`. Direct port of `RunDetailScreen.
+    /// gateFailureNote(state:retry:)`.
+    @ViewBuilder
+    private func gateFailureNote(state: ActionState, retry: @escaping () async -> Void) -> some View {
+        if case .failed(let message) = state {
+            HStack(spacing: 6) {
+                Text(message)
+                    .font(.noteText)
+                    .foregroundStyle(Color.status(.failed))
+                    .lineLimit(2)
+                Button("Retry") {
+                    Task { await retry() }
+                }
+                .buttonStyle(RupuButtonStyle.outline)
             }
         }
     }

@@ -410,7 +410,12 @@ struct RupuApp: App {
         // fullscreen" scene modifier).
         Window("Situation Room", id: RupuApp.situationWindowID) {
             SituationRoomScreen(model: model, backend: backend, frontMainWindow: { appDelegate.frontMainWindow() })
-                .frame(minWidth: 900, minHeight: 600)
+                // `minWidth` review fix round 1, ruling 11: 900 let a
+                // non-fullscreen window shrink narrower than `PulseStrip`'s
+                // own intrinsic width (brand cell + six KPI tiles, ~1050pt),
+                // clipping the instrument strip. 1060 gives a small margin
+                // above that estimate.
+                .frame(minWidth: 1060, minHeight: 600)
                 .preferredColorScheme(.dark)
                 .tint(Color.rupuBrand)
                 .onAppear {

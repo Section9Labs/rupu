@@ -64,6 +64,19 @@ public struct SituationRoomScreen: View {
             guard case .healthy = newHealth else { return }
             Task { await activate() }
         }
+        // Review fix round 1, ruling 8: a client swap that stays healthy
+        // throughout (a remote reconnect to a DIFFERENT CP that never dips
+        // unhealthy) fires no `backend.health` change at all, so the
+        // `.onChange` above alone would leave this scene's store bound to
+        // the abandoned backend. Same hazard, same fix `RupuApp.swift`'s
+        // `MenuBarExtra` label already applies for its own always-alive
+        // observers (`RupuApp.swift` around line 457) — `activate()`'s own
+        // `storeClientID != clientID` check (below) makes a redundant call
+        // here a no-op, so firing on every identity change, not just a
+        // "real" swap, is safe.
+        .onChange(of: backend.clientIdentity()) { _, _ in
+            Task { await activate() }
+        }
         .onDisappear {
             // The live tail must not outlive this window — see
             // `SituationStore.deactivate()`'s doc comment.
