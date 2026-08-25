@@ -174,6 +174,40 @@ private func makeStore(
     #expect(store.transcript == [.assistantMessage(content: "hi from t/run-3.jsonl", thinking: nil)])
 }
 
+/// `loadSession()` — the single-block reload the session header's
+/// failed-block Retry button calls — retries only the session from a
+/// `.failed` state: no runs refetch, and the user's focused run stays put
+/// (contrast `activate()`, which refetches runs and refocuses the newest).
+@MainActor @Test func loadSessionAloneRetriesAFailedSessionWithoutRefetchingRunsOrMovingFocus() async {
+    let sessionCounter = Counter()
+    let runsCounter = Counter()
+    let store = makeStore(
+        sessionResult: {
+            sessionCounter.increment()
+            if sessionCounter.value == 1 { throw StubError(description: "session down") }
+            return sessionRow()
+        },
+        runsResult: {
+            runsCounter.increment()
+            return [runRow(runID: "run-1"), runRow(runID: "run-2")]
+        }
+    )
+    await store.activate()
+    guard case .failed = store.session else {
+        Issue.record("expected session to be .failed after activate, got \(store.session)")
+        return
+    }
+    #expect(store.focusedRunID == "run-2")
+    await store.focusRun(runRow(runID: "run-1"))
+    #expect(store.focusedRunID == "run-1")
+
+    await store.loadSession()
+
+    #expect(store.session.value != nil)
+    #expect(store.focusedRunID == "run-1") // never re-focused
+    #expect(runsCounter.value == 1) // activate's one fetch — the retry never refetched runs
+}
+
 // MARK: - (c) focusRun loads that run's transcript snapshot
 
 @MainActor @Test func focusRunLoadsTheGivenRunsTranscriptSnapshot() async {

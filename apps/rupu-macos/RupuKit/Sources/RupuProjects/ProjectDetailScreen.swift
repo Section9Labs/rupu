@@ -185,9 +185,11 @@ public struct ProjectDetailScreen: View {
                 ProgressView().controlSize(.small)
             case .failed(let message):
                 // `activate()` — `loadDetail` is deliberately private; a
-                // full re-activate is the store's reload surface (it also
-                // resets the six lazy-tab request flags, which is exactly
-                // right after a detail failure: every tab refetches fresh).
+                // full re-activate is the store's reload surface. It also
+                // resets the six lazy-tab request flags, so tabs refetch on
+                // their next `.task(id:)` firing — i.e. when next switched
+                // to, NOT the currently mounted one (its task id is
+                // unchanged); a mounted failed tab has its own Retry.
                 FailedBlock(subject: "project", message: message, retry: { await store.activate() })
             case .empty:
                 EmptyView()

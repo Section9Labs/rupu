@@ -122,10 +122,10 @@ public struct SessionDetailScreen: View {
             case .loading:
                 ProgressView().controlSize(.small)
             case .failed(let message):
-                // `activate()` — `loadSession` is deliberately private; the
-                // full re-activate (session + runs + newest-run refocus) is
-                // the store's reload surface.
-                FailedBlock(subject: "session", message: message, retry: { await store.activate() })
+                // `loadSession()`, NOT `activate()` — the full re-activate
+                // would also refetch runs and refocus the newest run,
+                // discarding whichever run the user had focused.
+                FailedBlock(subject: "session", message: message, retry: { await store.loadSession() })
             case .empty:
                 EmptyView()
             case .content(let session):

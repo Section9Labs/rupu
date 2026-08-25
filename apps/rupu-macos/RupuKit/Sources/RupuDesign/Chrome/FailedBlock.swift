@@ -13,9 +13,15 @@ import SwiftUI
 /// force reloads (`SecurityStore.loadFindings`, `LibraryStore.loadAgents`)
 /// deliberately leave the block `.failed` until the refetch resolves rather
 /// than flashing back to `.loading`, so without this guard a slow retry
-/// would look like a dead button and invite double-fires. When the reload
-/// resolves, the block's `BlockState` moves off `.failed` and this view
-/// disappears wholesale — no local state to clean up.
+/// would look like a dead button and invite double-fires. (Reloads that DO
+/// flip to `.loading` mid-retry destroy this view and its `isRetrying`
+/// with it — harmless: a re-failed block reappears fresh with the button
+/// enabled, and by then nothing is in flight.)
+///
+/// The message is capped at 3 lines — the same bound every per-screen note
+/// this replaces carried. Messages are `String(describing: error)` and can
+/// embed entire HTML error bodies; uncapped they'd shove a header's tab bar
+/// and content off-screen.
 public struct FailedBlock: View {
     private let subject: String
     private let message: String
@@ -39,6 +45,7 @@ public struct FailedBlock: View {
                     Text(message)
                         .font(.noteText)
                         .foregroundStyle(Color.status(.failed))
+                        .lineLimit(3)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 Button("Retry") {
