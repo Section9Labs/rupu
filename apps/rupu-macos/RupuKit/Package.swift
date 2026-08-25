@@ -9,7 +9,7 @@ let package = Package(
             name: "RupuKit",
             targets: [
                 "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
-                "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsageKit", "RupuUsage", "RupuShell",
+                "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsageKit", "RupuUsage", "RupuShell", "RupuMenuBar",
             ]
         )
     ],
@@ -58,6 +58,11 @@ let package = Package(
                 "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsage",
             ]
         ),
+        // Task 8: the `MenuBarExtra` popover (`MenuBarStore` + `MenuBarView`)
+        // — needs `RupuOverview` for `deriveNeedsYou`/`NeedsYouItem` (reused,
+        // not duplicated) alongside the usual `RupuAPI`/`RupuStore`/
+        // `RupuDesign` trio every other screen module depends on.
+        .target(name: "RupuMenuBar", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuOverview"]),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
@@ -86,6 +91,10 @@ let package = Package(
         .testTarget(
             name: "RupuSecurityTests",
             dependencies: ["RupuSecurity", "RupuAPI", "RupuStore", "RupuDesign"]
+        ),
+        .testTarget(
+            name: "RupuMenuBarTests",
+            dependencies: ["RupuMenuBar", "RupuAPI", "RupuStore", "RupuDesign", "RupuOverview"]
         ),
     ]
 )

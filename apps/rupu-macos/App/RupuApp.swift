@@ -3,6 +3,7 @@ import SwiftUI
 import RupuShell
 import RupuStore
 import RupuDesign
+import RupuMenuBar
 import UserNotifications
 import os
 
@@ -144,16 +145,21 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
     /// `NSApp.windows.first` is unordered and is NOT guaranteed to be the
     /// main content window — it can just as easily be the Settings window,
-    /// or (once it exists) Task 8's menu-bar status window. A notification
-    /// tap must always land on the app's real content, so this picks
-    /// deliberately: prefer the window carrying `RupuApp`'s own explicit
-    /// `WindowGroup(id: "main")` identifier, and if that's ever unavailable
-    /// for some reason, fall back to any window that ISN'T the Settings
-    /// scene's window (`"com_apple_SwiftUI_Settings_window"` is SwiftUI's
-    /// own stable internal identifier for a macOS `Settings { }` scene's
-    /// window) — the one hard requirement either way is that the Settings
-    /// window itself is never the one fronted.
-    private func frontMainWindow() {
+    /// or the menu-bar status window (Task 8's `MenuBarExtra` popover). A
+    /// notification tap must always land on the app's real content, so this
+    /// picks deliberately: prefer the window carrying `RupuApp`'s own
+    /// explicit `WindowGroup(id: "main")` identifier, and if that's ever
+    /// unavailable for some reason, fall back to any window that ISN'T the
+    /// Settings scene's window (`"com_apple_SwiftUI_Settings_window"` is
+    /// SwiftUI's own stable internal identifier for a macOS `Settings { }`
+    /// scene's window) — the one hard requirement either way is that the
+    /// Settings window itself is never the one fronted.
+    ///
+    /// Non-`private` (Task 8): `RupuApp`'s `MenuBarExtra` scene reuses this
+    /// exact mechanism for "Open rupu" and every needs-you row's deep-link,
+    /// via `appDelegate.frontMainWindow()` — same target-window resolution
+    /// a notification tap already relies on, not a second copy of it.
+    func frontMainWindow() {
         let target = NSApp.windows.first(where: { $0.identifier?.rawValue == RupuApp.mainWindowID })
             ?? NSApp.windows.first(where: { $0.identifier?.rawValue != RupuApp.settingsWindowID })
         target?.makeKeyAndOrderFront(nil)
@@ -173,6 +179,12 @@ struct RupuApp: App {
     /// `RunNotifier.activate`'s doc comment for why re-activating on every
     /// healthy transition is safe).
     @State private var runNotifier = RunNotifier(poster: UNCenterNotificationPoster())
+    /// Task 8: the `MenuBarExtra` popover's data source. App-level, activated
+    /// from the SAME `.onChange(of: backend.health)` seam as `runNotifier`
+    /// just above (not from the `MenuBarExtra` scene's own appear/disappear)
+    /// — see `MenuBarStore`'s own doc comment for why the attention dot
+    /// needs live data even while the popover is closed.
+    @State private var menuBarStore = MenuBarStore()
     @AppStorage("appearance") private var appearance: String = "system"
 
     /// The explicit identifier this app's one `WindowGroup` carries — see
@@ -209,6 +221,15 @@ struct RupuApp: App {
                     runNotifier.activate(streamFactory: { [backend] in
                         MainActor.assumeIsolated { backend.makeFirehoseStream() }
                     })
+                    // `MenuBarStore.activate(client:)` is idempotent (same
+                    // idiom as `HostsFooterStore`) — a `client` swap on a
+                    // later healthy transition (embedded/remote mode
+                    // switch, a manual reconnect) just updates which client
+                    // the next poll tick uses, it never spawns a second
+                    // loop.
+                    if let client = backend.client() {
+                        menuBarStore.activate(client: client)
+                    }
                 }
         }
         .defaultSize(width: 1440, height: 900)
@@ -217,6 +238,31 @@ struct RupuApp: App {
             SettingsView(model: model, backend: backend, notifier: runNotifier)
                 .tint(Color.rupuBrand)
         }
+
+        // Task 8: the menu-bar extra. `.window` style (not `.menu`) so
+        // `MenuBarView`'s stat tiles / needs-you list / inline gate actions
+        // render as a real SwiftUI view popover rather than being forced
+        // into `NSMenuItem` rows. The label is the app's own wordmark with
+        // an attention dot (see `MenuBarStatusLabel`'s doc comment) —
+        // re-evaluated automatically whenever `menuBarStore`'s `@Observable`
+        // `counts` changes, no manual refresh wiring needed.
+        MenuBarExtra {
+            MenuBarView(store: menuBarStore, model: model, backend: backend, openMainWindow: openMainWindow)
+        } label: {
+            MenuBarStatusLabel(hasAttention: (menuBarStore.counts?.awaitingApproval ?? 0) > 0)
+        }
+        .menuBarExtraStyle(.window)
+    }
+
+    /// "Open rupu" / a needs-you row's deep-link, from the menu bar: bring
+    /// the app forward and front the real content window — same two-step
+    /// `NSApp.activate` + `frontMainWindow()` sequence
+    /// `AppDelegate.routeNotificationTap` already uses for a notification
+    /// tap, reused via `appDelegate.frontMainWindow()` rather than a second
+    /// copy of that window-resolution logic.
+    private func openMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        appDelegate.frontMainWindow()
     }
 
     private var preferredColorScheme: ColorScheme? {
