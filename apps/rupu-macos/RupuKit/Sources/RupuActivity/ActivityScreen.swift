@@ -3,10 +3,18 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// The real Activity table (replaces the Phase 1 `PlaceholderScreen` for
-/// `.activity` routes): `FilterBar` + a merged `ActivityTable` fed by
-/// `ActivityStore`, with loading/failed/empty states and a staleness
-/// banner.
+/// The real Activity screen (replaces the Phase 1 `PlaceholderScreen` for
+/// `.activity` routes). **Restructured in perf & interaction arc, Plan 5
+/// Task 4** (matt's direct feedback: stop showing one combined table with a
+/// kind-picker): the `.all` kind renders `ActivityStatsView` (KPI cards +
+/// a compact needs-attention list, no table, no kind picker); every other
+/// kind (`agents`/`workflows`/`autoflows`/`sessions`) renders its OWN
+/// dedicated table (`RupuActivity/KindTables/`) fed by the exact same
+/// `ActivityStore`, with `FilterBar` (status chips/live-tail/"+N new runs"
+/// pill) alongside it. The merged `ActivityTable` this screen used to show
+/// unconditionally, and the kind segmented picker that selected into it,
+/// are both deleted — every kind is reached via the sidebar's disclosure
+/// children (Task 0) instead.
 ///
 /// **Shared store, not owned** (perf & interaction arc, Plan 5 Task 2):
 /// `activityStore` is built once at `RootView` and injected here — this
@@ -91,7 +99,15 @@ public struct ActivityScreen: View {
         let claimsActive = Self.isClaimsActive(kind: kind, subTab: autoflowsSubTab)
         VStack(alignment: .leading, spacing: 12) {
             if let store = activityStore {
-                FilterBar(model: model, store: store, showRunsChrome: !claimsActive)
+                // `FilterBar` (status chips / live-tail / "+N new runs" pill)
+                // only ever renders on a KIND page now (perf & interaction
+                // arc, Plan 5 Task 4 — matt's restructure: the `.all` parent
+                // shows `ActivityStatsView` instead, which has no table for
+                // these controls to act on) — same no-dead-controls reasoning
+                // `showRunsChrome` already applied to the Claims sub-tab.
+                if kind != .all, !claimsActive {
+                    FilterBar(store: store)
+                }
                 if !claimsActive {
                     if store.freshness == .stale {
                         Text("Stream stale — reconnecting")
@@ -112,7 +128,14 @@ public struct ActivityScreen: View {
                 if kind == .autoflows {
                     autoflowsSubTabPicker
                 }
-                if claimsActive {
+                if kind == .all {
+                    // The Activity parent (perf & interaction arc, Plan 5 Task
+                    // 4 restructure): a stats surface, never a table or kind
+                    // picker — every kind's own table lives one level down at
+                    // the sidebar's disclosure children (already wired since
+                    // Task 0; unaffected by this change).
+                    ActivityStatsView(store: store, backend: backend, range: model.range, onNavigate: { model.navigate(to: $0) })
+                } else if claimsActive {
                     claimsBody
                 } else {
                     stateBody(store: store)
@@ -138,6 +161,14 @@ public struct ActivityScreen: View {
         }
     }
 
+    /// **Only ever called for a KIND page** (`kind != .all` — the `.all`
+    /// parent renders `ActivityStatsView` instead, never this). Routes to
+    /// the dedicated per-kind table (perf & interaction arc, Plan 5 Task 4)
+    /// — the merged `ActivityTable` this used to show unconditionally was
+    /// deleted along with the kind picker that selected into it; `.all`
+    /// itself is unreachable here (`fatalError` would be defensive
+    /// overkill for a `switch` this method's own doc comment already rules
+    /// out — see the caller in `body`, which never reaches this for `.all`).
     @ViewBuilder
     private func stateBody(store: ActivityStore) -> some View {
         switch store.state {
@@ -148,7 +179,18 @@ public struct ActivityScreen: View {
         case .empty:
             blockView(label: "No executions in range")
         case .content:
-            ActivityTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            switch kind {
+            case .all:
+                blockView(label: "No executions in range")
+            case .agents:
+                AgentRunsTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            case .workflows:
+                WorkflowRunsTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            case .autoflows:
+                AutoflowRunsTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            case .sessions:
+                SessionsTable(rows: store.rows, onSelect: handleSelect)
+            }
         }
     }
 
