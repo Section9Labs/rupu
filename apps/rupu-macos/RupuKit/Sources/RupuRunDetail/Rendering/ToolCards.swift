@@ -287,23 +287,27 @@ func parseSubrunPayload(_ output: String?) -> SubrunPayload? {
     return SubrunPayload(ok: ok, tokensUsed: tokensUsed, transcriptPath: transcriptPath, subRunID: subRunID)
 }
 
-/// `.subrun` — status + token Badge chips, plus a "View sub-run transcript
-/// →" affordance.
+/// `.subrun` — status + token Badge chips, plus the resolvable sub-run
+/// identifiers rendered as plain informational text.
 ///
-/// **Navigation decision (task brief's explicit instruction).** `runID`/
-/// `host` on `ToolCardView` carry the CURRENT run's context, not a
-/// navigation callback — nothing in `RupuRunDetail` today lets a leaf
-/// rendering view push navigation (every `model.navigate(to:)` call site
-/// in this codebase sits at a screen's own top level, wired from an
-/// explicit closure or the shared `AppModel`, never reached from inside a
-/// transcript row). Rather than invent a navigation path this module has
-/// no precedent for, this body renders the row as inert, ghost-styled
-/// TEXT (not a `Button`) whenever a sub-run target (`transcript_path`/
-/// `sub_run_id`) IS resolvable from the parsed payload — visible, honestly
-/// non-interactive — and omits the row entirely when nothing is
-/// resolvable. Task 7 (which owns feed wiring — CLAUDE.md's `RupuRunDetail`
-/// module note) is the right place to thread a real navigation callback
-/// through and turn this into a live `Button`.
+/// **No fake affordance (fix round 2, finding 2).** The original version of
+/// this body rendered "View sub-run transcript →" whenever a sub-run target
+/// was resolvable — dim, non-`Button` text, but styled and worded exactly
+/// like a clickable link with nothing behind it, which is precisely the
+/// "silent-noop code path" the no-mock-features rule bans: it visually
+/// promised navigation that could never fire. This body instead prints the
+/// actual resolvable identifiers (`sub_run_id`/`transcript_path`) as flat
+/// mono metadata — no arrow, no link styling, nothing implying
+/// interactivity.
+///
+/// **Real navigation stays a tracked follow-up.** `runID`/`host` on
+/// `ToolCardView` carry the CURRENT run's context, not a navigation
+/// callback — nothing in `RupuRunDetail` today lets a leaf rendering view
+/// push navigation (every `model.navigate(to:)` call site in this codebase
+/// sits at a screen's own top level, wired from an explicit closure or the
+/// shared `AppModel`, never reached from inside a transcript row). Wiring a
+/// real navigation callback through `ToolCardView`/`TranscriptFeed` so this
+/// can become a live `Button` is real, but out of scope for this fix.
 private struct SubrunBodyView: View {
     let entry: ToolEntry
     let runID: String?
@@ -322,9 +326,7 @@ private struct SubrunBodyView: View {
                     Spacer(minLength: 0)
                 }
                 if payload.hasResolvableTarget {
-                    Text("View sub-run transcript →")
-                        .font(.uiText)
-                        .foregroundStyle(Color.rupuDim)
+                    subrunIdentifiers(payload)
                 }
             }
         } else if let output = entry.output, !output.isEmpty {
@@ -333,6 +335,47 @@ private struct SubrunBodyView: View {
             MonoScrollBlock(text: output, lineCount: 16)
         }
     }
+
+    @ViewBuilder
+    private func subrunIdentifiers(_ payload: SubrunPayload) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let subRunID = payload.subRunID {
+                Text("sub_run_id: \(subRunID)")
+                    .font(.dataMono(10.5))
+                    .foregroundStyle(Color.rupuMute)
+                    .textSelection(.enabled)
+            }
+            if let transcriptPath = payload.transcriptPath {
+                Text("transcript_path: \(transcriptPath)")
+                    .font(.dataMono(10.5))
+                    .foregroundStyle(Color.rupuMute)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Body-value selection — `.coverage`/`.generic`'s `StructuredView` input
+// ---------------------------------------------------------------------------
+
+/// The JSON value `.coverage`/`.generic` render through `StructuredView` —
+/// `tool_result.structured` first, then a standalone action-node entry's own
+/// merged `with:` payload (`actionPayload` — `buildTranscriptViewModel`
+/// merges this onto a standalone `tool_audit` entry for an action-node call,
+/// which has no `tool_call`/`tool_result` shape of its own, so `structured`
+/// is always `nil` there), falling back to the raw `input` last (fix round
+/// 2, finding 1). Before this fix, an action-node entry (`input == .null`,
+/// `structured == nil`, `actionPayload` set but never read) fell straight
+/// through both `??`s to `.null`, and `StructuredView` rendered that as the
+/// literal text "null" — a real payload silently hidden behind an unrelated
+/// fallback value. Pulled out as its own pure, testable seam (`ToolCardsTests
+/// .bodyValueTests`) rather than inlined, so the three-way precedence is
+/// assertable without mounting `StructuredView`/`ToolCardView` at all.
+func bodyValue(for entry: ToolEntry) -> JSONValue {
+    entry.structured ?? entry.actionPayload ?? entry.input
 }
 
 // ---------------------------------------------------------------------------
@@ -716,7 +759,7 @@ public struct ToolCardView: View {
             // `TranscriptFeed` never routes a `.finding` entry through here.
             FindingCard(entry: entry, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore)
         case .coverage, .generic:
-            StructuredView(value: entry.structured ?? entry.input)
+            StructuredView(value: bodyValue(for: entry))
         }
     }
 }

@@ -50,3 +50,31 @@ private func distinctForegroundColors(_ attributed: AttributedString) -> Set<Str
         #expect(run.backgroundColor == nil)
     }
 }
+
+// MARK: - Memo cache (fix round 2, finding 4: promoted from deferred once
+// the live transcript feed made repeated re-highlighting of identical input
+// load-bearing — the expanded last turn re-renders on every event, and
+// `SourcePreview` calls this once per source line).
+
+@Test @MainActor func repeatedIdenticalCallsReturnEqualResultsAndOnlyMissTheCacheOnce() {
+    CodeHighlighter.resetCacheForTesting()
+
+    let first = CodeHighlighter.highlight("let x = 1", language: "swift", dark: false)
+    #expect(CodeHighlighter.highlightCallCount == 1, "the first call for a new key must be a cache miss")
+
+    let second = CodeHighlighter.highlight("let x = 1", language: "swift", dark: false)
+    #expect(CodeHighlighter.highlightCallCount == 1, "an identical (code, language, dark) call must be a cache hit, not a second miss")
+
+    #expect(first == second, "a cache hit must return the exact same rendering as the original computation")
+}
+
+@Test @MainActor func differentCacheKeysEachMissIndependently() {
+    CodeHighlighter.resetCacheForTesting()
+
+    _ = CodeHighlighter.highlight("let x = 1", language: "swift", dark: false)
+    _ = CodeHighlighter.highlight("let x = 1", language: "swift", dark: true) // different `dark`
+    _ = CodeHighlighter.highlight("let y = 2", language: "swift", dark: false) // different `code`
+    _ = CodeHighlighter.highlight("let x = 1", language: "rust", dark: false) // different `language`
+
+    #expect(CodeHighlighter.highlightCallCount == 4, "each distinct (code, language, dark) triple must miss independently")
+}

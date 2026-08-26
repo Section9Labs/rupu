@@ -1,4 +1,5 @@
 import Testing
+import RupuAPI
 @testable import RupuRunDetail
 
 /// `parseSubrunPayload` — pure JSON-field extraction off a `dispatch_agent`/
@@ -51,4 +52,44 @@ import Testing
     let payload = parseSubrunPayload(json)
     #expect(payload != nil)
     #expect(payload?.hasResolvableTarget == false)
+}
+
+// ---------------------------------------------------------------------------
+// `bodyValue(for:)` — `.coverage`/`.generic`'s `StructuredView` input
+// precedence (fix round 2, finding 1: a standalone action-node entry's
+// `actionPayload` was produced but never read, so it fell straight through
+// to `.null` and rendered the literal text "null").
+// ---------------------------------------------------------------------------
+
+private func makeEntry(
+    input: JSONValue = .null,
+    structured: JSONValue? = nil,
+    actionPayload: JSONValue? = nil
+) -> ToolEntry {
+    ToolEntry(id: "e1", tool: "some_action", kind: .generic, input: input, structured: structured, actionPayload: actionPayload)
+}
+
+@Test func bodyValueFallsBackToActionPayloadWhenStructuredIsAbsent() {
+    // The standalone action-node shape this fix targets: no tool_call/
+    // tool_result, so `input == .null` and `structured == nil`, but
+    // `buildTranscriptViewModel` merged a real `with:` payload on.
+    let payload: JSONValue = .object(["path": .string("a.rs")])
+    let entry = makeEntry(input: .null, structured: nil, actionPayload: payload)
+
+    #expect(bodyValue(for: entry) == payload, "actionPayload must win over the null input, not render as the literal 'null'")
+}
+
+@Test func bodyValuePrefersStructuredOverActionPayloadWhenBothArePresent() {
+    let structured: JSONValue = .object(["result": .string("structured")])
+    let actionPayload: JSONValue = .object(["result": .string("action")])
+    let entry = makeEntry(input: .null, structured: structured, actionPayload: actionPayload)
+
+    #expect(bodyValue(for: entry) == structured)
+}
+
+@Test func bodyValueFallsBackToInputWhenNeitherStructuredNorActionPayloadIsPresent() {
+    let input: JSONValue = .object(["path": .string("b.rs")])
+    let entry = makeEntry(input: input, structured: nil, actionPayload: nil)
+
+    #expect(bodyValue(for: entry) == input)
 }

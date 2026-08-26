@@ -486,6 +486,37 @@ struct SourcePreviewStoreTests {
     #expect(SourcePreview.gutterWidth(totalLines: 12345) == CGFloat(5) * 7 + 12)
 }
 
+// MARK: - `highlightedLineText` (fix round 2, finding 3: the ruling-3 scope
+// addition — per-line syntax highlighting over `SourcePreview.
+// highlightedLanguages` — shipped with zero tests of its own).
+
+@Test @MainActor func highlightedLineTextColorsARustLineInTheAllowlist() {
+    let attributed = SourcePreview.highlightedLineText("let x = 1;", language: "rust", dark: false)
+    var colors = Set<String>()
+    for run in attributed.runs {
+        colors.insert(run.foregroundColor.map { String(describing: $0) } ?? "<none>")
+    }
+    #expect(colors.count > 1, "a real keyword+literal rust line must produce more than one foreground color")
+}
+
+@Test @MainActor func highlightedLineTextPassesThroughPlainForALanguageOutsideTheAllowlist() {
+    let line = "let x = 1;"
+    let attributed = SourcePreview.highlightedLineText(line, language: "swift", dark: false)
+    #expect(String(attributed.characters) == line)
+    for run in attributed.runs {
+        #expect(run.foregroundColor == nil, "an out-of-allowlist language must never be sent through the highlighter")
+    }
+}
+
+@Test @MainActor func highlightedLineTextPassesThroughPlainForANilLanguage() {
+    let line = "let x = 1;"
+    let attributed = SourcePreview.highlightedLineText(line, language: nil, dark: false)
+    #expect(String(attributed.characters) == line)
+    for run in attributed.runs {
+        #expect(run.foregroundColor == nil)
+    }
+}
+
 // MARK: - Finding 2 (review fix): the `.task(id:)` key folds in run identity
 // so a same-slot run switch (surviving `@State`) re-fires the fetch against
 // the freshly-flushed store instead of stranding on "Loading…" forever.

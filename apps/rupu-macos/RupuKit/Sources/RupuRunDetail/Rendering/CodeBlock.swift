@@ -18,6 +18,52 @@ public enum CodeHighlighter {
     /// single instance suffices rather than a per-theme cache.
     private static let shared: Highlighter? = Highlighter()
 
+    // -------------------------------------------------------------------
+    // Memo cache — promoted from a deferred nice-to-have to load-bearing
+    // once the live transcript feed shipped (Task 7): the expanded LAST
+    // turn re-runs `body` on every SwiftUI diff pass while a run is
+    // streaming, and `SourcePreview` calls `highlightedLineText` once PER
+    // rendered source line — both re-ran a full highlight.js pass through
+    // the shared `JSContext` for byte-identical `(code, language, dark)`
+    // input on every one of those re-evaluations. Keyed on the exact
+    // triple; a plain dict with an LRU eviction order (capped at
+    // `cacheCapacity`) rather than `NSCache` — `NSCache` needs class-typed
+    // keys/values and `AttributedString` is a value type, so caching it
+    // there would need a wrapper box anyway, and this type is already
+    // `@MainActor`-confined, so a plain dict needs no locking either.
+    // -------------------------------------------------------------------
+
+    private struct CacheKey: Hashable {
+        let code: String
+        let language: String?
+        let dark: Bool
+    }
+
+    private static let cacheCapacity = 200
+    private static var cache: [CacheKey: AttributedString] = [:]
+    /// Oldest-first eviction order; a hit moves its key to the end (most
+    /// recently used), so eviction always drops the true LRU entry rather
+    /// than approximating "oldest inserted."
+    private static var cacheOrder: [CacheKey] = []
+
+    /// Bumped on every cache MISS only (never on a hit) — the pure counter
+    /// `CodeHighlighterCacheTests` asserts against to prove a repeated call
+    /// actually short-circuits the highlight.js pass rather than merely
+    /// happening to return an equal-looking result. Default (internal)
+    /// access so `@testable import RupuRunDetail` can read it.
+    static var highlightCallCount = 0
+
+    /// Test-only reset — clears the cache and miss counter to a clean
+    /// slate. This type's cache is process-wide static state, so a test
+    /// that wants a deterministic hit/miss count must reset first
+    /// regardless of what earlier tests (or earlier `CodeBlock`/
+    /// `SourcePreview` renders in the same process) already populated.
+    static func resetCacheForTesting() {
+        cache.removeAll()
+        cacheOrder.removeAll()
+        highlightCallCount = 0
+    }
+
     /// Highlights `code` as `language` (nil auto-detects) using the theme closest to the web
     /// app's `codeHighlight.css` pairing (`atom-one-light` / `atom-one-dark`, both bundled by
     /// HighlighterSwift verbatim — no substitution needed). `toml` is remapped to `ini` first:
@@ -27,6 +73,19 @@ public enum CodeHighlighter {
     /// Never throws and never crashes: a failed `Highlighter` init, an unrecognized language,
     /// or any other failure all fall back to plain mono-styled text instead.
     public static func highlight(_ code: String, language: String?, dark: Bool) -> AttributedString {
+        let key = CacheKey(code: code, language: language, dark: dark)
+        if let cached = cache[key] {
+            touch(key)
+            return cached
+        }
+
+        highlightCallCount += 1
+        let result = compute(code, language: language, dark: dark)
+        store(key, result)
+        return result
+    }
+
+    private static func compute(_ code: String, language: String?, dark: Bool) -> AttributedString {
         guard let highlighter = shared else {
             return fallback(code)
         }
@@ -42,6 +101,22 @@ public enum CodeHighlighter {
         }
 
         return convert(rendered)
+    }
+
+    private static func touch(_ key: CacheKey) {
+        if let index = cacheOrder.firstIndex(of: key) {
+            cacheOrder.remove(at: index)
+        }
+        cacheOrder.append(key)
+    }
+
+    private static func store(_ key: CacheKey, _ value: AttributedString) {
+        cache[key] = value
+        cacheOrder.append(key)
+        if cacheOrder.count > cacheCapacity {
+            let evicted = cacheOrder.removeFirst()
+            cache.removeValue(forKey: evicted)
+        }
     }
 
     /// Rebuilds `rendered` as an `AttributedString` carrying only SwiftUI-scoped `foregroundColor`

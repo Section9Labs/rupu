@@ -170,6 +170,17 @@ enum FeedRow {
 /// turn not yet dequeued once the walk ends (only possible if this gap
 /// actually fired) is flushed before `run_complete` regardless, so a turn
 /// is never silently dropped even then.
+///
+/// The identical gap, and the identical "never fires on a well-formed
+/// transcript" reasoning, applies to a MATCHED `tool_result` too: the real
+/// builder's matched branch (`toolByCallID[callID]` found) only mutates the
+/// existing `ToolBuilder` in place and likewise never calls `ensureTurn()`,
+/// while this walk again can't distinguish "matched" from "orphan" and
+/// would treat a `tool_result` arriving with no turn open as a boundary
+/// either way. A call's own result is always recorded before that same
+/// call's turn closes (the same ordering guarantee the audit case relies
+/// on), so a matched result is likewise never encountered with no turn
+/// open in practice.
 func buildFeedRows(events: [TranscriptEvent]) -> [FeedRow] {
     let turnVMs = buildTranscriptViewModel(events: events)
     let hasTurnEvents = events.contains {
