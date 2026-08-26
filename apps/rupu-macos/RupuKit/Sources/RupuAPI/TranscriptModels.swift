@@ -36,9 +36,12 @@ public enum JSONValue: Decodable, Equatable, Sendable {
 /// `type` with fields flattened into the same object), `TranscriptEvent` is
 /// **adjacently tagged**: `{"type": "<snake_case>", "data": {...}}`.
 ///
-/// `action_emitted`, `tool_audit`, and `net_flow` decode successfully but
-/// carry no associated payload this phase — nothing renders them yet, so
-/// their `data` bodies are intentionally left unparsed.
+/// `net_flow` decodes successfully but carries no associated payload —
+/// nothing renders it yet, so its `data` body is intentionally left
+/// unparsed. `tool_audit` and `action_emitted` DO carry payloads: the
+/// former mirrors the web's `lib/transcript.ts:22` fixed shape, the
+/// latter stays an opaque `JSONValue` (opaque on the web too, `lib/
+/// transcript.ts:21`).
 ///
 /// Unknown `type` tags decode as `.unknown(type:)` rather than throwing, so
 /// the client stays forward-compatible with variants added on the Rust side
@@ -56,8 +59,8 @@ public enum TranscriptEvent: Decodable, Equatable, Sendable {
     case commandRun(argv: [String], cwd: String, exitCode: Int32, stdoutBytes: UInt64, stderrBytes: UInt64)
     case usage(provider: String, model: String, servedModel: String?, inputTokens: UInt64, outputTokens: UInt64, cachedTokens: UInt64)
     case runComplete(runID: String, status: String, totalTokens: UInt64, durationMS: UInt64, error: String?)
-    case actionEmitted
-    case toolAudit
+    case actionEmitted(data: JSONValue)
+    case toolAudit(tool: String, declared: Bool, granted: Bool, blocked: Bool, restricted: Bool)
     case netFlow
     case unknown(type: String)
 
@@ -92,6 +95,7 @@ public enum TranscriptEvent: Decodable, Equatable, Sendable {
         case cachedTokens = "cached_tokens"
         case status
         case totalTokens = "total_tokens"
+        case declared, granted, blocked, restricted
     }
 
     public init(from decoder: Decoder) throws {
@@ -189,9 +193,16 @@ public enum TranscriptEvent: Decodable, Equatable, Sendable {
                 error: try data.decodeIfPresent(String.self, forKey: .error)
             )
         case "action_emitted":
-            self = .actionEmitted
+            self = .actionEmitted(data: try root.decode(JSONValue.self, forKey: .data))
         case "tool_audit":
-            self = .toolAudit
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .toolAudit(
+                tool: try data.decode(String.self, forKey: .tool),
+                declared: try data.decode(Bool.self, forKey: .declared),
+                granted: try data.decode(Bool.self, forKey: .granted),
+                blocked: try data.decode(Bool.self, forKey: .blocked),
+                restricted: try data.decode(Bool.self, forKey: .restricted)
+            )
         case "net_flow":
             self = .netFlow
         default:

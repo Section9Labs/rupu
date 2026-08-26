@@ -27,6 +27,13 @@ public enum RunDetailTab: String, CaseIterable, Sendable {
 struct RunDetailTabPanel: View {
     let store: RunDetailStore
     @Binding var tab: RunDetailTab
+    /// Forwarded to `TranscriptTabContent` alone (every other tab ignores
+    /// them) — `RunDetailStore` doesn't expose its own `runID`/`host`
+    /// publicly (plumbing, not display state), so `RunDetailScreen` (which
+    /// already holds both as its own properties) passes them straight
+    /// through rather than this panel reaching into the store.
+    let runID: String
+    let host: String?
     /// Phase 6B, Task 5: forwarded to `TranscriptTabContent` alone (every
     /// other tab ignores it) — see `TranscriptFeed`'s own doc comment for
     /// why this is the one screen that wires a `SourcePreviewStore` in.
@@ -54,7 +61,7 @@ struct RunDetailTabPanel: View {
     private var content: some View {
         switch tab {
         case .transcript:
-            TranscriptTabContent(store: store, sourcePreviewStore: sourcePreviewStore)
+            TranscriptTabContent(store: store, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore)
         case .events:
             EventsTabContent(store: store)
         case .findings:
@@ -123,12 +130,14 @@ struct RunDetailTabBar: View {
 /// `RunDetailScreen` rendered above the old transcript column.
 struct TranscriptTabContent: View {
     let store: RunDetailStore
+    let runID: String
+    let host: String?
     let sourcePreviewStore: SourcePreviewStore?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             liveIndicator
-            TranscriptFeed(events: store.transcript, sourcePreviewStore: sourcePreviewStore)
+            TranscriptFeed(events: store.transcript, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(12)

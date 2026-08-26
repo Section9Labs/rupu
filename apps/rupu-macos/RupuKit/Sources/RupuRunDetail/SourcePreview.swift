@@ -27,6 +27,8 @@ struct SourcePreview: View {
     let path: String
     let line: Int
 
+    @Environment(\.colorScheme) private var colorScheme
+
     init(store: SourcePreviewStore, path: String, line: Int) {
         self.store = store
         self.path = path
@@ -99,7 +101,7 @@ struct SourcePreview: View {
             ScrollView([.vertical, .horizontal]) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(slice.lines ?? [], id: \.n) { sourceLine in
-                        lineRow(sourceLine, target: slice.targetLine, gutterWidth: gutterWidth)
+                        lineRow(sourceLine, target: slice.targetLine, gutterWidth: gutterWidth, language: slice.language)
                     }
                 }
             }
@@ -108,14 +110,14 @@ struct SourcePreview: View {
         .panelStyle(.innerCard)
     }
 
-    private func lineRow(_ sourceLine: APISourceLine, target: Int?, gutterWidth: CGFloat) -> some View {
+    private func lineRow(_ sourceLine: APISourceLine, target: Int?, gutterWidth: CGFloat, language: String?) -> some View {
         let isTarget = sourceLine.n == target
         return HStack(spacing: 10) {
             Text("\(sourceLine.n)")
                 .font(.dataMono(10.5))
                 .foregroundStyle(Color.rupuMute)
                 .frame(width: gutterWidth, alignment: .trailing)
-            Text(sourceLine.text)
+            Text(Self.highlightedLineText(sourceLine.text, language: language, dark: colorScheme == .dark))
                 .font(.dataMono(10.5))
                 .foregroundStyle(Color.rupuInk)
                 .lineLimit(1)
@@ -124,6 +126,33 @@ struct SourcePreview: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 1)
         .background(isTarget ? Color.rupuWarnBg : Color.clear)
+    }
+
+    /// Languages this preview actually syntax-highlights (Task 6, design-
+    /// alignment spec §5's "per-line syntax highlighting" promise, wired
+    /// onto Task 1's `CodeHighlighter` on top of the plain rendering this
+    /// view shipped with in Phase 6B). Deliberately narrower than
+    /// `CodeHighlighter`'s own grammar coverage — kept to the backend
+    /// `language` field's actual emitted values (`crates/rupu-cp/src/api/
+    /// source.rs`'s `detect_language`) that this task was scoped to: `rust`,
+    /// `python`, `typescript`, `javascript`, `go`, `json`. Any other/absent
+    /// `language` falls back to the plain mono rendering this view already
+    /// had — never a crash, never a silently-wrong grammar guess.
+    static let highlightedLanguages: Set<String> = ["rust", "python", "typescript", "javascript", "go", "json"]
+
+    /// Highlights one source line as `language` when it's in
+    /// `highlightedLanguages`; returns it unstyled otherwise. Highlighting is
+    /// done per LINE (not over the whole slice) — a small, isolated choice
+    /// that keeps this view's existing per-line `ForEach`/gutter/target-tint
+    /// structure untouched; a construct spanning multiple lines (e.g. a block
+    /// comment) may highlight slightly differently than `CodeBlock`'s
+    /// whole-file `CodeHighlighter` call, which this view accepts as a minor,
+    /// documented trade-off for the isolated edit the task called for.
+    static func highlightedLineText(_ text: String, language: String?, dark: Bool) -> AttributedString {
+        guard let language, highlightedLanguages.contains(language) else {
+            return AttributedString(text)
+        }
+        return CodeHighlighter.highlight(text, language: language, dark: dark)
     }
 
     // MARK: - Pure seam (testable via `@testable import RupuRunDetail`, the

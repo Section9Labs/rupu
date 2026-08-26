@@ -147,7 +147,7 @@ public struct RunDetailScreen: View {
             }
             stepGraphSection(store: store)
                 .frame(height: 420)
-            RunDetailTabPanel(store: store, tab: $selectedTab, sourcePreviewStore: sourcePreviewStore)
+            RunDetailTabPanel(store: store, tab: $selectedTab, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore)
         }
         .padding(16)
     }

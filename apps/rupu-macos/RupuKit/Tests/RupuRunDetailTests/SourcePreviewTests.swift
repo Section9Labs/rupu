@@ -486,6 +486,37 @@ struct SourcePreviewStoreTests {
     #expect(SourcePreview.gutterWidth(totalLines: 12345) == CGFloat(5) * 7 + 12)
 }
 
+// MARK: - `highlightedLineText` (fix round 2, finding 3: the ruling-3 scope
+// addition — per-line syntax highlighting over `SourcePreview.
+// highlightedLanguages` — shipped with zero tests of its own).
+
+@Test @MainActor func highlightedLineTextColorsARustLineInTheAllowlist() {
+    let attributed = SourcePreview.highlightedLineText("let x = 1;", language: "rust", dark: false)
+    var colors = Set<String>()
+    for run in attributed.runs {
+        colors.insert(run.foregroundColor.map { String(describing: $0) } ?? "<none>")
+    }
+    #expect(colors.count > 1, "a real keyword+literal rust line must produce more than one foreground color")
+}
+
+@Test @MainActor func highlightedLineTextPassesThroughPlainForALanguageOutsideTheAllowlist() {
+    let line = "let x = 1;"
+    let attributed = SourcePreview.highlightedLineText(line, language: "swift", dark: false)
+    #expect(String(attributed.characters) == line)
+    for run in attributed.runs {
+        #expect(run.foregroundColor == nil, "an out-of-allowlist language must never be sent through the highlighter")
+    }
+}
+
+@Test @MainActor func highlightedLineTextPassesThroughPlainForANilLanguage() {
+    let line = "let x = 1;"
+    let attributed = SourcePreview.highlightedLineText(line, language: nil, dark: false)
+    #expect(String(attributed.characters) == line)
+    for run in attributed.runs {
+        #expect(run.foregroundColor == nil)
+    }
+}
+
 // MARK: - Finding 2 (review fix): the `.task(id:)` key folds in run identity
 // so a same-slot run switch (surviving `@State`) re-fires the fetch against
 // the freshly-flushed store instead of stranding on "Loading…" forever.
@@ -552,138 +583,9 @@ struct SourcePreviewStoreTests {
     #expect(AstTreeView.matchedAncestorPaths(root: root, path: "0") == [])
 }
 
-@Test @MainActor func fromStructuredParsesWellFormedMatchesAndSkipsMalformedOnes() {
-    let structured = JSONValue.object([
-        "matchCount": .number(1),
-        "truncated": .bool(false),
-        "matches": .array([
-            .object([
-                "file": .string("src/a.rs"),
-                "range": .object([
-                    "startLine": .number(12), "startCol": .number(3),
-                    "endLine": .number(12), "endCol": .number(9),
-                ]),
-                "text": .string("fn foo()"),
-            ]),
-            // Missing `range` — must be skipped, not crash or fabricate a location.
-            .object(["file": .string("src/b.rs")]),
-            // Missing `file` — must be skipped.
-            .object(["range": .object(["startLine": .number(1), "startCol": .number(1)])]),
-        ]),
-    ])
-
-    guard let result = AstGrepTranscriptParsing.fromStructured(structured) else {
-        Issue.record("expected a non-nil StructuredResult for a present matches array")
-        return
-    }
-
-    #expect(result.matches == [
-        AstGrepTranscriptParsing.Match(file: "src/a.rs", startLine: 12, startCol: 3, text: "fn foo()"),
-    ])
-    #expect(result.matchCount == 1)
-    #expect(!result.truncated)
-}
-
-@Test @MainActor func fromStructuredReturnsNilForAbsentOrShapelessInput() {
-    #expect(AstGrepTranscriptParsing.fromStructured(nil) == nil)
-    #expect(AstGrepTranscriptParsing.fromStructured(.object([:])) == nil, "no `matches` key at all must fall back, same as the web's own trigger")
-    #expect(AstGrepTranscriptParsing.fromStructured(.string("not an object")) == nil)
-}
-
-// MARK: - Finding 1 (review fix): truthful truncation — `matchCount`/
-// `truncated` are read off the wire, not discarded, and the label renders
-// the web's own "showing first N of M" shape under truncation.
-
-@Test @MainActor func fromStructuredReadsMatchCountAndTruncatedFromTheWire() {
-    let structured = JSONValue.object([
-        "matchCount": .number(250),
-        "truncated": .bool(true),
-        "matches": .array([
-            .object([
-                "file": .string("src/a.rs"),
-                "range": .object(["startLine": .number(1), "startCol": .number(1), "endLine": .number(1), "endCol": .number(1)]),
-            ]),
-        ]),
-    ])
-
-    guard let result = AstGrepTranscriptParsing.fromStructured(structured) else {
-        Issue.record("expected a non-nil StructuredResult")
-        return
-    }
-
-    #expect(result.matchCount == 250, "the server's real total, not matches.count (which is the capped prefix)")
-    #expect(result.truncated)
-}
-
-@Test @MainActor func fromStructuredFallsBackToMatchesCountWhenMatchCountFieldIsMissing() {
-    let structured = JSONValue.object([
-        "matches": .array([
-            .object([
-                "file": .string("src/a.rs"),
-                "range": .object(["startLine": .number(1), "startCol": .number(1), "endLine": .number(1), "endCol": .number(1)]),
-            ]),
-        ]),
-    ])
-
-    guard let result = AstGrepTranscriptParsing.fromStructured(structured) else {
-        Issue.record("expected a non-nil StructuredResult")
-        return
-    }
-
-    #expect(result.matchCount == 1, "an honest read of \"assume the total is exactly what we parsed,\" not a fabricated 0")
-    #expect(!result.truncated, "an absent `truncated` field must never be read as truncated")
-}
-
-@Test @MainActor func matchCountLabelRendersTheWebsShowingFirstNOfMShapeWhenTruncated() {
-    let structured = AstGrepTranscriptParsing.StructuredResult(
-        matches: [
-            AstGrepTranscriptParsing.Match(file: "a.rs", startLine: 1, startCol: 1, text: nil),
-            AstGrepTranscriptParsing.Match(file: "b.rs", startLine: 2, startCol: 1, text: nil),
-        ],
-        matchCount: 250,
-        truncated: true
-    )
-
-    let label = AstGrepTranscriptParsing.matchCountLabel(structured: structured, matches: structured.matches)
-
-    #expect(label == "showing first 2 of 250 matches")
-}
-
-@Test @MainActor func matchCountLabelIsAPlainCountWhenNotTruncated() {
-    let structured = AstGrepTranscriptParsing.StructuredResult(
-        matches: [AstGrepTranscriptParsing.Match(file: "a.rs", startLine: 1, startCol: 1, text: nil)],
-        matchCount: 1,
-        truncated: false
-    )
-
-    #expect(AstGrepTranscriptParsing.matchCountLabel(structured: structured, matches: structured.matches) == "1 match")
-    #expect(AstGrepTranscriptParsing.matchCountLabel(structured: nil, matches: structured.matches) == "1 match")
-
-    let two = [
-        AstGrepTranscriptParsing.Match(file: "a.rs", startLine: 1, startCol: 1, text: nil),
-        AstGrepTranscriptParsing.Match(file: "b.rs", startLine: 2, startCol: 1, text: nil),
-    ]
-    #expect(AstGrepTranscriptParsing.matchCountLabel(structured: nil, matches: two) == "2 matches", "the text-parsed fallback (structured == nil) carries no truncation signal — always a plain count")
-}
-
-@Test @MainActor func fromTextParsesTheCompactPathLineColFormatAndSkipsUnparseableLines() {
-    let output = """
-    src/a.rs:12:3: fn foo() {
-    this line has no match at all
-    src/b.rs:1:1: use bar;
-    """
-
-    let matches = AstGrepTranscriptParsing.fromText(output)
-
-    #expect(matches == [
-        AstGrepTranscriptParsing.Match(file: "src/a.rs", startLine: 12, startCol: 3, text: "fn foo() {"),
-        AstGrepTranscriptParsing.Match(file: "src/b.rs", startLine: 1, startCol: 1, text: "use bar;"),
-    ])
-}
-
-@Test @MainActor func fromTextReturnsEmptyForBlankOutput() {
-    #expect(AstGrepTranscriptParsing.fromText("").isEmpty)
-}
+// `AstGrepTranscriptParsing` model tests moved to `AstGrepModelTests.swift`
+// (Task 6, design-alignment Plan 4) alongside the type itself (`Rendering/
+// AstGrepBody.swift`).
 
 /// Thread-safe call counter — same rationale as every other store test's own
 /// copy of this pattern (`CodeStoreTests.LockedCounter`). Named distinctly
