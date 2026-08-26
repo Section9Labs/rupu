@@ -17,6 +17,36 @@ import Testing
     #expect(Fmt.cost(0) == "$0.00")
 }
 
+// MARK: - Equivalence pins (Plan 5, Task 1 — static-formatter cache)
+//
+// `Fmt.count`/`Fmt.cost` moved from a fresh `NumberFormatter()` per call to a shared, cached
+// `static let` instance (see `Formatters.swift`'s doc comments). These pin exact output strings
+// for the brief's representative values so a future formatter-config change can't silently drift
+// output — including the en_US_POSIX-pinned decimal separator and 2-digit rounding `cost` relies
+// on.
+
+@Test func countEquivalencePinnedValues() {
+    #expect(Fmt.count(nil) == "—")
+    #expect(Fmt.count(0) == "0")
+    #expect(Fmt.count(1) == "1")
+    #expect(Fmt.count(999) == "999")
+    #expect(Fmt.count(1_000) == "1,000")
+    #expect(Fmt.count(1_234_567) == "1,234,567")
+}
+
+@Test func costEquivalencePinnedValues() {
+    #expect(Fmt.cost(nil) == "—")
+    #expect(Fmt.cost(0.0) == "$0.00")
+    // NumberFormatter's default rounding mode is `.halfEven` ("banker's rounding"): 0.004999
+    // rounds down to 2 fraction digits (well under the 0.005 halfway point either way).
+    #expect(Fmt.cost(0.004999) == "$0.00")
+    // 1.005 isn't exactly representable in binary floating point — it's a hair under the
+    // mathematical 1.005, so `.halfEven` rounding lands on "$1.00", not "$1.01". Pinned here so a
+    // switch to a different rounding mode (or to raw arithmetic) can't silently change this.
+    #expect(Fmt.cost(1.005) == "$1.00")
+    #expect(Fmt.cost(1234.56) == "$1234.56")
+}
+
 @Test func durations() {
     #expect(Fmt.duration(ms: 850) == "0.9s")
     #expect(Fmt.duration(ms: 4_200) == "4.2s")

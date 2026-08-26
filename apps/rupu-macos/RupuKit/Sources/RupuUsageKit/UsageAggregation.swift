@@ -128,21 +128,13 @@ public struct SpendBucket: Equatable, Sendable {
 
 // MARK: - Timestamp parsing
 
-/// RFC-3339 parsing for `APIUsageRunRow.startedAt`, same two-formatter
-/// fallback (fractional-then-plain seconds) as the canonical
-/// `ActivityRow.parseISO` (`RupuStore`) — duplicated here rather than
-/// imported because this module cannot depend on `RupuStore` (see the file
-/// header's module-boundary note); `DashboardStore.parseTimestamp`'s own
-/// doc comment already documents this exact duplication happening more than
-/// once in this codebase.
+/// RFC-3339 parsing for `APIUsageRunRow.startedAt` — delegates to `RupuAPI.ISO8601Parsing`, the
+/// shared fractional-then-plain fallback every other timestamp-parsing site in the app now
+/// reuses too (`ActivityRow.parseISO` in `RupuStore`, `UsageStore.rfc3339`, `StreamCards.
+/// rfc3339ToMS`). This module depends only on `RupuAPI` (see the file header's module-boundary
+/// note), which is exactly where the shared parser lives, so no new dependency was needed.
 private func parseUsageTimestamp(_ s: String) -> Date? {
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = fractional.date(from: s) { return date }
-
-    let plain = ISO8601DateFormatter()
-    plain.formatOptions = [.withInternetDateTime]
-    return plain.date(from: s)
+    ISO8601Parsing.parse(s)
 }
 
 private let utcCalendar: Calendar = {

@@ -135,14 +135,13 @@ public final class UsageStore {
     }
 
     /// RFC-3339 with fractional seconds, matching the wire format every
-    /// other `startedAt`/`capturedAt` field in this API already uses. Built
-    /// fresh per call rather than cached — `ISO8601DateFormatter` isn't
-    /// `Sendable`, same rationale `ActivityRow.parseISO`'s doc comment
-    /// already documents for the parsing direction.
+    /// other `startedAt`/`capturedAt` field in this API already uses.
+    /// Formats via `RupuAPI.ISO8601Parsing.fractional` — the same shared,
+    /// `static let`-cached `Date.ISO8601FormatStyle` the parsing direction
+    /// (`ActivityRow.parseISO`, etc.) uses, since `ISO8601FormatStyle` is a
+    /// `FormatStyle` as well as a `ParseStrategy`.
     private static func rfc3339(_ date: Date) -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f.string(from: date)
+        ISO8601Parsing.fractional.format(date)
     }
 
     // MARK: - Activation

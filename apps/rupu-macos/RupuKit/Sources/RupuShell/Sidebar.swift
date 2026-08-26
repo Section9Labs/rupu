@@ -129,6 +129,8 @@ struct Sidebar: View {
     }
 
     var body: some View {
+        // RenderMeter seam (Plan 5, Task 1) — one line, safe to delete.
+        let _ = RenderMeter.tick("Sidebar")
         VStack(alignment: .leading, spacing: 0) {
             brandHeader
             nav

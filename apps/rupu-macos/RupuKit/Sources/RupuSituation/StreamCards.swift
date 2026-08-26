@@ -438,19 +438,12 @@ private let sevBadgeText: [Severity: String] = [
 /// fallback: an unparseable string yields `0`, matching `cards.ts` line
 /// 194's `Number.isNaN(ts) ? 0 : ts`. Shared with `Roster.swift`'s
 /// `lastActive` parsing (`roster.ts` line 160's `Date.parse(p.last_active)`
-/// / `NaN` fallback). Formatters are created per call (not cached as global
-/// state) — `ISO8601DateFormatter` isn't `Sendable`, and this is a pure,
-/// infrequently-called leaf function, not a hot loop.
+/// / `NaN` fallback). Delegates to `RupuAPI.ISO8601Parsing` — the shared,
+/// allocation-free fractional-then-plain fallback every other
+/// timestamp-parsing site in the app now reuses.
 func rfc3339ToMS(_ s: String) -> Int64 {
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let d = fractional.date(from: s) {
-        return Int64((d.timeIntervalSince1970 * 1000).rounded())
-    }
-    if let d = ISO8601DateFormatter().date(from: s) {
-        return Int64((d.timeIntervalSince1970 * 1000).rounded())
-    }
-    return 0
+    guard let d = ISO8601Parsing.parse(s) else { return 0 }
+    return Int64((d.timeIntervalSince1970 * 1000).rounded())
 }
 
 /// Map one finding to a `StreamCard`. Port of `cards.ts` lines 184-211's

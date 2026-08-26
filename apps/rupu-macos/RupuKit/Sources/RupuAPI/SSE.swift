@@ -3,6 +3,18 @@ import os
 
 private let sseLogger = Logger(subsystem: "com.section9labs.rupu", category: "sse")
 
+/// Shared decoder for every dispatched SSE frame, across every `JSONEventStream<T>`
+/// specialization. Used to be a fresh `JSONDecoder()` per frame — on a busy stream (Situation
+/// Room, Activity tail) that's one allocation per event, forever. Foundation's `JSONDecoder` is
+/// `Sendable` (`@unchecked`, since it's a mutable class), which is safe here because this
+/// instance's configuration is never touched after creation (no custom
+/// `dateDecodingStrategy`/`keyDecodingStrategy`), so `decode(_:from:)` carries no mutable state
+/// beyond the local decoding context each call builds for itself — concurrent decode calls from
+/// different streams' `Task`s are safe against one shared instance. Lives at file scope (not as a
+/// static on `JSONEventStream`) for the same reason `sseLogger` above does — see the note on
+/// `JSONEventStream.logger` below: a generic type can't hold a static stored property.
+private let sseJSONDecoder = JSONDecoder()
+
 /// One dispatched Server-Sent Events frame: an optional `event:` name plus
 /// the (possibly multi-line, `\n`-joined) accumulated `data:` payload.
 public struct SSEFrame: Equatable, Sendable {
@@ -228,7 +240,7 @@ public final class JSONEventStream<T: Decodable & Sendable>: Sendable {
                 if Task.isCancelled { return didSignalConnected }
                 guard let frame = parser.feed(line: line) else { continue }
                 guard let data = frame.data.data(using: .utf8),
-                      let event = try? JSONDecoder().decode(T.self, from: data) else {
+                      let event = try? sseJSONDecoder.decode(T.self, from: data) else {
                     continue // Undecodable frame — skip, not fatal.
                 }
                 continuation.yield(event)

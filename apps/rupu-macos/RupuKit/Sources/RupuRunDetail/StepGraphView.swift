@@ -39,6 +39,8 @@ public struct StepGraphView: View {
     }
 
     public var body: some View {
+        // RenderMeter seam (Plan 5, Task 1) — one line, safe to delete.
+        let _ = RenderMeter.tick("StepGraphView")
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 0) {
                 ForEach(Array(nodes.enumerated()), id: \.element.id) { index, node in
