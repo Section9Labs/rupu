@@ -160,30 +160,36 @@ public struct PanelNodeCard: View {
             .truncationMode(.tail)
             Spacer(minLength: 4)
             if node.state == .running {
-                PanelLoopSpinner()
+                PanelLoopSpinner(tint: node.kind.accent)
             }
         }
         .font(.dataMono(10))
         .foregroundStyle(node.kind.accent)
     }
 
+    /// KIND-channel decoration, not state — the gate-condition block is this card's own
+    /// identity (a panel step's fix-loop gate is always present, regardless of what the run is
+    /// currently doing), so its tint is `node.kind.accent` like every other kind-carrying surface
+    /// on this card, never a hardcoded `Color.status(...)`. (Panel's `kind.accent` happens to
+    /// equal `.status(.awaiting)` today per `KindBridge.swift` — same pixels, but the rule must
+    /// hold structurally in case that mapping ever changes.)
     private var gateLine: some View {
         HStack(spacing: 6) {
             subGlyph(node.state)
             Text(gateText)
                 .font(.metaText)
                 .fontWeight(.medium)
-                .foregroundStyle(Color.status(.awaiting))
+                .foregroundStyle(node.kind.accent)
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
-        .background(Color.status(.awaiting).opacity(0.12))
+        .background(node.kind.accent.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .stroke(Color.status(.awaiting).opacity(0.45), lineWidth: 1)
+                .stroke(node.kind.accent.opacity(0.45), lineWidth: 1)
         )
     }
 
@@ -219,14 +225,18 @@ public struct PanelNodeCard: View {
 /// under reduced motion. Same start/stop-on-change discipline as `StepNodeCard.swift`'s
 /// `RingPulse`: mount/unmount at the `.running`/not-`.running` boundary handles the state
 /// transition (a fresh `onAppear` per mount), and `onChange(of: reduceMotion)` still covers
-/// motion getting toggled mid-spin without a remount.
+/// motion getting toggled mid-spin without a remount. `tint` is the KIND channel (`node.kind.
+/// accent`, passed in by `PanelNodeCard`) — the spin icon decorates the panel card's own
+/// identity, not the run's current state, so it never reads a hardcoded `Color.status(...)`.
 private struct PanelLoopSpinner: View {
+    let tint: Color
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isSpinning = false
 
     var body: some View {
         Icon(.repeatIcon, size: 12)
-            .foregroundStyle(Color.status(.awaiting))
+            .foregroundStyle(tint)
             .rotationEffect(.degrees(active ? 360 : 0))
             .onAppear { update() }
             .onChange(of: reduceMotion) { _, _ in update() }
@@ -279,36 +289,27 @@ public struct FanoutNodeView: View {
                 }
             }
         } else {
-            ContainerChrome(accent: placeholderTone ?? Color.rupuBorder, isSelected: isSelected) {
+            ContainerChrome(accent: node.kind.accent, isSelected: isSelected) {
                 placeholder
             }
         }
     }
 
-    // MARK: total == 0 — state-aware placeholder
-
-    /// `nil` for every "nothing to say about color" state (`.done(true)`, `.skipped`,
-    /// `.gatePending`, `.paused`, `.pending`) — those fall back to a neutral border/mute label in
-    /// the two call sites above/below, matching the web's `isErr`/`isActive`/neutral 3-way split
-    /// collapsed onto this app's `NodeState` vocabulary.
-    private var placeholderTone: Color? {
-        switch node.state {
-        case .running: Color.status(.running)
-        case .done(false): Color.status(.failed)
-        default: nil
-        }
-    }
+    // MARK: total == 0 — placeholder (kind-tinted chrome/header; only the message string is
+    // state-aware, per the brief, and that string renders in neutral `rupuDim` rather than
+    // borrowing a state color — the KIND channel owns every colored surface on this card, the
+    // STATE channel only ever owns the words).
 
     private var placeholder: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("for each · \(node.id)")
                 .font(.dataMono(10))
-                .foregroundStyle(placeholderTone ?? Color.rupuMute)
+                .foregroundStyle(node.kind.accent)
                 .lineLimit(1)
                 .truncationMode(.tail)
             Text(placeholderMessage)
                 .font(.noteText)
-                .foregroundStyle(Color.rupuMute)
+                .foregroundStyle(Color.rupuDim)
         }
     }
 
