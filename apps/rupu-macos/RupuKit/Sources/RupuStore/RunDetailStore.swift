@@ -109,6 +109,23 @@ public final class RunDetailStore {
 
     public private(set) var liveStates: [String: NodeState] = [:]
 
+    /// Perf & interaction arc, Plan 5 Task 3: `layoutGraph(...)`'s
+    /// rendered node list, hoisted out of `RunDetailScreen`'s body (where it
+    /// ran inline, once per SwiftUI re-render — every single live `CPEvent`
+    /// during a streamed run) and into this store as ordinary derived
+    /// state. `RunDetailScreen` now just reads this directly; nothing in
+    /// the view calls `layoutGraph` anymore. See `scheduleGraphRecompute()`
+    /// for how per-`CPEvent` updates are coalesced rather than recomputed
+    /// once per event.
+    public private(set) var graphVM: [GraphNodeVM] = []
+
+    /// Test-only visibility (via `@testable import RupuStore`) into how
+    /// many times `recomputeGraphVM()` actually ran — the counter seam
+    /// `RunDetailStoreTests`' coalescing tests assert against, proving a
+    /// burst of graph-affecting `CPEvent`s inside one coalescing window
+    /// collapses to exactly one recompute rather than one per event.
+    internal private(set) var graphRecomputeCount = 0
+
     /// Task 5 (run-graph parity): live fan-out unit overlay, folded from
     /// `unitStarted`/`unitCompleted` `CPEvent`s on top of the REST
     /// `APIUnitRow` snapshot — see `layoutGraph`'s doc comment for how the
@@ -229,6 +246,17 @@ public final class RunDetailStore {
     /// same recipe, different seam.
     private var tailTeardownGeneration = 0
 
+    /// The in-flight coalescing window `Task` — non-`nil` exactly while a
+    /// batch of graph-affecting `CPEvent`s is being collected; see
+    /// `scheduleGraphRecompute()`.
+    private var graphRecomputeTask: Task<Void, Never>?
+
+    /// Perf & interaction arc, Plan 5 Task 3's injectable clock/delay seam:
+    /// production waits a real ~100ms; `RunDetailStoreTests` swaps in a
+    /// semaphore-gated stand-in so the coalescing test controls exactly
+    /// when the window closes, deterministically, with no real sleep.
+    private let graphCoalesceDelay: @Sendable () async -> Void
+
     /// Production entry point — `RunDetailScreen` calls this. `isRemote` is
     /// derived once, here, from `host` (`nil` or `"local"` means the
     /// embedded/attached local backend; anything else is a Fleet node, REST
@@ -280,7 +308,8 @@ public final class RunDetailStore {
         postRestore: @escaping @Sendable () async throws -> RunControlResponse = { throw CPError.transport("postRestore not wired") },
         runSignalsFactory: (@Sendable () -> AsyncStream<StreamSignal<CPEvent>>)?,
         transcriptTailFactory: (@Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>>)?,
-        pendingActions: PendingActions = PendingActions()
+        pendingActions: PendingActions = PendingActions(),
+        graphCoalesceDelay: @escaping @Sendable () async -> Void = { try? await Task.sleep(for: .milliseconds(100)) }
     ) {
         self.runID = runID
         self.host = host
@@ -300,6 +329,7 @@ public final class RunDetailStore {
         self.runSignalsFactory = runSignalsFactory
         self.transcriptTailFactory = transcriptTailFactory
         self.pendingActions = pendingActions
+        self.graphCoalesceDelay = graphCoalesceDelay
     }
 
     /// Fires all four REST loads concurrently (independent `BlockState`s —
@@ -348,6 +378,8 @@ public final class RunDetailStore {
         runLifecycle?.stop()
         runLifecycle = nil
         stopTail()
+        graphRecomputeTask?.cancel()
+        graphRecomputeTask = nil
     }
 
     // MARK: - Mutations (Phase 3, Task 5)
@@ -705,6 +737,13 @@ public final class RunDetailStore {
             guard !isCancellation(error) else { return }
             detail = .failed(String(describing: error))
         }
+        // Perf & interaction arc, Plan 5 Task 3: `detail.run.awaiting`
+        // feeds `effectiveLiveStates()`'s gate overlay, so any REST refresh
+        // of `detail` (not just `graph`) can change what `graphVM` should
+        // render. Recomputed directly (not through the coalescing window
+        // below) — a REST load is already a one-shot event, never a rapid
+        // per-`CPEvent` burst.
+        recomputeGraphVM()
     }
 
     /// Public (unlike `loadDetail`, which stays private behind `activate()`
@@ -719,6 +758,7 @@ public final class RunDetailStore {
             guard !isCancellation(error) else { return }
             graph = .failed(String(describing: error))
         }
+        recomputeGraphVM()
     }
 
     /// Public for the same reason as `loadGraph` — the Netflow tab's
@@ -740,6 +780,81 @@ public final class RunDetailStore {
         } catch {
             guard !isCancellation(error) else { return }
             findings = .failed(String(describing: error))
+        }
+    }
+
+    // MARK: - Step graph derivation (perf & interaction arc, Plan 5 Task 3)
+
+    /// Rebuilds `graphVM` from the current `graph`/`liveStates`/`liveUnits`/
+    /// `panelRounds`/`stepTranscripts`/`detail` — the exact same inputs
+    /// `RunDetailScreen`'s old `stepGraphSection(store:)` fed `layoutGraph`
+    /// with inline, on every body pass. `graph` not yet `.content` (still
+    /// loading, or failed) yields an empty `graphVM`; the view already
+    /// switches on `store.graph` itself and only ever reads `graphVM` in
+    /// the `.content` case, so this is a harmless default rather than a
+    /// special case callers need to know about.
+    private func recomputeGraphVM() {
+        graphRecomputeCount += 1
+        guard case .content(let g) = graph else {
+            graphVM = []
+            return
+        }
+        graphVM = layoutGraph(
+            nodes: g.workflow.steps,
+            results: g.stepResults,
+            units: g.units,
+            liveStates: effectiveLiveStates(),
+            liveUnits: liveUnits,
+            panelRounds: panelRounds,
+            stepTranscripts: stepTranscripts
+        )
+    }
+
+    /// Moved here from `RunDetailScreen`'s own `effectiveLiveStates(store:)`
+    /// (Task 3 hoist — same logic, same doc comment, now private to the
+    /// store since `graphVM` is the only consumer): `liveStates` wins
+    /// outright per step; a gate the run is *currently* parked on
+    /// (`detail.run.awaiting`) fills in `.gatePending` for any step with no
+    /// live entry at all — the remote case (no stream, so `liveStates`
+    /// never gets anything) and a local run whose gate was already parked
+    /// before this screen was ever opened (no live `stepAwaitingApproval`
+    /// event to replay). Never overrides an existing live entry.
+    private func effectiveLiveStates() -> [String: NodeState] {
+        var states = liveStates
+        guard case .content(let d) = detail else { return states }
+        for gate in d.run.awaiting where states[gate.stepID] == nil {
+            states[gate.stepID] = .gatePending
+        }
+        return states
+    }
+
+    /// Coalesces a burst of graph-affecting `CPEvent`s into a single
+    /// `recomputeGraphVM()` call, rather than recomputing once per event —
+    /// the fix for `layoutGraph` (and its `effectiveLiveStates()` overlay)
+    /// running inline in the view body on every single live event during a
+    /// streamed run.
+    ///
+    /// This is a fixed **batching window**, not a debounce: the first
+    /// graph-affecting event in a burst starts the window (schedules this
+    /// `Task`); every subsequent one that arrives before the window closes
+    /// rides the SAME window (the `guard graphRecomputeTask == nil`
+    /// short-circuits it) rather than restarting its own. A debounce that
+    /// restarts on every new event could starve indefinitely under a
+    /// steady drip of `stepStarted`/`stepCompleted` events from a
+    /// fast-moving run — this design guarantees the first event in a burst
+    /// is always visible within one window's length, never pushed out
+    /// forever.
+    ///
+    /// `graphCoalesceDelay` is the injectable seam — see that property's
+    /// own doc comment.
+    private func scheduleGraphRecompute() {
+        guard graphRecomputeTask == nil else { return }
+        graphRecomputeTask = Task { [weak self] in
+            guard let self else { return }
+            await self.graphCoalesceDelay()
+            self.graphRecomputeTask = nil
+            guard !Task.isCancelled else { return }
+            self.recomputeGraphVM()
         }
     }
 
@@ -783,9 +898,20 @@ public final class RunDetailStore {
             events.removeFirst(events.count - Self.eventsCap)
         }
 
+        // Perf & interaction arc, Plan 5 Task 3: set for every case below
+        // that actually mutates one of `graphVM`'s live-overlay inputs
+        // (`liveStates`/`liveUnits`/`panelRounds`/`stepTranscripts`) — a
+        // run-level event with no step/unit payload (`runResumed`/
+        // `runPaused`) never needs a graph recompute at all, and
+        // `runCompleted`/`runFailed` schedule their own via
+        // `handleTerminal()`'s REST refresh rather than this coalescing
+        // window (see that method's doc comment).
+        var graphAffected = false
+
         switch event {
         case .stepStarted(let runID, let stepID, _, _, _):
             liveStates[stepID] = .running
+            graphAffected = true
             // Phase 3, Task 5: the "fast path" half of the pending-mutation
             // contract. A step actually starting proves the run is
             // `.running` right now — in particular, that it left an
@@ -795,17 +921,21 @@ public final class RunDetailStore {
             pendingActions.resolve(runID: runID, observedStatus: .running)
         case .stepCompleted(_, let stepID, let success, _, _):
             liveStates[stepID] = .done(success: success)
+            graphAffected = true
         case .stepAwaitingApproval(let runID, let stepID, _):
             liveStates[stepID] = .gatePending
+            graphAffected = true
             pendingActions.resolve(runID: runID, observedStatus: .awaiting)
         case .stepSkipped(_, let stepID, _):
             liveStates[stepID] = .skipped
+            graphAffected = true
         case .stepFailed(_, let stepID, _):
             // Dispatch-level failure (connector error, timeout, panic) —
             // distinct from `stepCompleted{success:false}`, which is only
             // emitted when the step actually ran and reported failure. See
             // the type doc comment's "Live semantics" section.
             liveStates[stepID] = .done(success: false)
+            graphAffected = true
         case .stepWorking(_, let stepID, _, let transcriptPath):
             // Task 5: adopt a working step's own transcript path when it
             // supplies one — a `for_each`/panel container step in flight has
@@ -816,17 +946,21 @@ public final class RunDetailStore {
             // supplied one.
             if let transcriptPath {
                 stepTranscripts[stepID] = transcriptPath
+                graphAffected = true
             }
         case .unitStarted(_, let stepID, let index, let unitKey, _, let transcriptPath, _):
             liveUnits[stepID, default: [:]][index] = UnitLiveState(key: unitKey, transcriptPath: transcriptPath, success: nil)
+            graphAffected = true
         case .unitCompleted(_, let stepID, let index, let unitKey, let success, _, _, _):
             // `unitCompleted` carries no `transcriptPath` of its own (see the
             // `CPEvent` case) — preserve whatever `unitStarted` already
             // recorded for this unit rather than clobbering it with `nil`.
             let priorPath = liveUnits[stepID]?[index]?.transcriptPath
             liveUnits[stepID, default: [:]][index] = UnitLiveState(key: unitKey, transcriptPath: priorPath, success: success)
+            graphAffected = true
         case .panelRound(_, let stepID, let round, let maxIterations, _):
             panelRounds[stepID] = PanelRoundState(round: round, maxIterations: maxIterations)
+            graphAffected = true
         case .runResumed(let runID):
             // Same fast-path rationale as `stepStarted` above — the most
             // direct signal a run left a pause or an approval gate, per the
@@ -843,12 +977,14 @@ public final class RunDetailStore {
             // otherwise never reachable, since `layoutGraph` never infers it
             // on its own (see that type's doc comment).
             liveStates[stepID] = .paused
+            graphAffected = true
             pendingActions.resolve(runID: runID, observedStatus: .paused)
         case .stepResumed(let runID, let stepID):
             // Step-scoped counterpart to `runResumed` — same fast-path
             // rationale. Task 5: reverts the node back to `.running`, same
             // as `NodeState`'s doc comment documents for this pair.
             liveStates[stepID] = .running
+            graphAffected = true
             pendingActions.resolve(runID: runID, observedStatus: .running)
         case .runCompleted(let runID, let status, _):
             pendingActions.resolve(runID: runID, observedStatus: .normalize(status))
@@ -863,6 +999,10 @@ public final class RunDetailStore {
             handleTerminal()
         default:
             break
+        }
+
+        if graphAffected {
+            scheduleGraphRecompute()
         }
     }
 
@@ -908,6 +1048,16 @@ public final class RunDetailStore {
             _ = await (detailLoad, graphLoad, findingsLoad, netflowLoad)
 
             self.liveStates = [:]
+            // `loadDetail`/`loadGraph` above already each called
+            // `recomputeGraphVM()` on their own completion — but that ran
+            // BEFORE `liveStates` was cleared just above, so `graphVM` at
+            // that point still reflected the (about to be stale) live
+            // overlay. One more recompute here, now that `liveStates` is
+            // truly empty, is what actually lands `graphVM` on "the
+            // refetched `stepResults`/`units` are the only source of
+            // truth" — matching the type doc comment's "graph IS refetched
+            // on the terminal event" contract.
+            self.recomputeGraphVM()
 
             if let path = self.focusedTranscriptPath {
                 await self.reloadTranscriptSnapshot(path: path)

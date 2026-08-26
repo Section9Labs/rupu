@@ -392,17 +392,27 @@ public struct StructuredView: View {
     private let value: JSONValue
     private let depth: Int
 
+    /// Perf & interaction arc, Plan 5 Task 3: computed once in `init` rather
+    /// than in `body` — `body` re-evaluates on every SwiftUI diff pass for a
+    /// live-streaming turn, and `JSONSerialization` is not cheap to re-run
+    /// on unchanged data every single time. `nil` whenever `depth <=
+    /// depthCap` (the common case, and the only branch that doesn't need
+    /// it) — computing it unconditionally for every `StructuredView`
+    /// instance regardless of depth would trade one waste for another.
+    private let prettyPrintedFallback: String?
+
     private static let depthCap = 4
     private static let stringInlineMax = 120
 
     public init(value: JSONValue, depth: Int = 0) {
         self.value = value
         self.depth = depth
+        self.prettyPrintedFallback = depth > Self.depthCap ? Self.prettyPrinted(value) : nil
     }
 
     public var body: some View {
         if depth > Self.depthCap {
-            MonoScrollBlock(text: Self.prettyPrinted(value), lineCount: 12)
+            MonoScrollBlock(text: prettyPrintedFallback ?? "", lineCount: 12)
         } else {
             switch value {
             case .null:

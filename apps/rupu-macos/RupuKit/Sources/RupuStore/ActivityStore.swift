@@ -90,6 +90,19 @@ public final class ActivityStore {
 
     public var liveTail: Bool = true
 
+    /// The Activity table's current sort — perf & interaction arc, Plan 5
+    /// Task 3: moved here from `ActivityTable`'s own `@State` (where a
+    /// `sortedRows` computed property re-sorted `rows` on every single body
+    /// pass — every SSE `statusPatch`, every remote-host merge, every hover —
+    /// with ICU case-insensitive compares on every text column). `rows` is
+    /// now maintained ALREADY sorted per this descriptor by `recompute()`/
+    /// `patchRow`; the view only ever reads `rows` directly. Changing it
+    /// goes through `toggleSort(_:)`, not a direct setter — see that
+    /// method's doc comment for why a plain `didSet` re-sort isn't enough
+    /// here (it would have to redo the whole merge). Defaults exactly as
+    /// `ActivityTable`'s old `@State` did: today's merge-time order.
+    public private(set) var sort = ActivitySort(key: .started, ascending: false)
+
     public private(set) var rows: [ActivityRow] = []
 
     /// **The fleet-wide, always-unscoped projection** (perf & interaction
@@ -365,6 +378,28 @@ public final class ActivityStore {
         pendingNewRuns = 0
     }
 
+    // MARK: - Sort (perf & interaction arc, Plan 5 Task 3)
+
+    /// First tap on a new column makes it the active sort key (at
+    /// `key.defaultAscending`); tapping the already-active column flips
+    /// direction — same contract `ActivityTable`'s old view-local
+    /// `toggleSort` had. Re-sorts `rows` directly from its own current
+    /// (already-filtered) contents rather than re-running the whole
+    /// `recompute()` merge/filter pipeline — cheap, and correct, since
+    /// changing the sort descriptor never changes *which* rows are visible,
+    /// only their order. `unscopedRows` is deliberately never touched here —
+    /// it isn't rendered by any sortable table, and stays in its own fixed
+    /// startedAt-descending order regardless of what this table's operator
+    /// last clicked (see that property's own doc comment).
+    public func toggleSort(_ key: ActivitySort.Key) {
+        if sort.key == key {
+            sort.ascending.toggle()
+        } else {
+            sort = ActivitySort(key: key, ascending: key.defaultAscending)
+        }
+        rows = sortActivityRows(rows, by: sort)
+    }
+
     // MARK: - Mutations (Phase 3, Task 5)
 
     /// **Marker-only** (same contract as `RunDetailStore.approve(gate:mode:)`)
@@ -575,7 +610,16 @@ public final class ActivityStore {
         if let scopeFilter {
             filtered = filtered.filter { $0.project == scopeFilter }
         }
-        rows = filtered
+        // Perf & interaction arc, Plan 5 Task 3: honor the current sort
+        // descriptor here — every caller of `recompute()` (a live-tail
+        // refresh, a remote-host merge landing, a `statusFilter`/
+        // `scopeFilter` toggle) must leave `rows` in the operator's chosen
+        // order, not silently reset to merge-time order. `sortActivityRows`
+        // reproduces exactly the same order `isOrderedByStartedAtDescending`
+        // did for the default `.started`/descending sort (see that
+        // function's own doc comment), so this is behavior-preserving for
+        // every caller that never touches `sort` at all.
+        rows = sortActivityRows(filtered, by: sort)
         state = Self.aggregateState(activeSnapshots().map(\.state), rowsAreEmpty: filtered.isEmpty)
     }
 
@@ -802,13 +846,29 @@ public final class ActivityStore {
     /// durable record `recompute()` itself reapplies) is the single source
     /// of truth either patch reads from — this only fast-forwards the two
     /// already-materialized arrays to match it immediately.
+    /// Perf & interaction arc, Plan 5 Task 3: patching in place (rather than
+    /// re-sorting unconditionally) keeps this a fast, no-full-`recompute()`
+    /// path in the common case — but a patched `status`/`durationMS` CAN
+    /// invalidate `rows`' current order when the active `sort.key` is one
+    /// of those two columns (e.g. sorted by Duration, a patch that changes
+    /// a row's `durationMS` may need to move it). Only re-sorts `rows`
+    /// itself, and only when `rows` actually contains this run AND the
+    /// active key participates — every other key (`started`, text columns)
+    /// is untouched by a status/duration patch, so no re-sort is needed;
+    /// `unscopedRows` never needs one at all, since it isn't governed by
+    /// this table's `sort` (see that property's own doc comment).
     private func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
         statusOverrides[runID] = (status, durationMS)
+        var patchedRows = false
         if let index = rows.firstIndex(where: { Self.matchesRun($0, runID: runID) }) {
             rows[index] = rows[index].patchingStatus(status, durationMS: durationMS)
+            patchedRows = true
         }
         if let index = unscopedRows.firstIndex(where: { Self.matchesRun($0, runID: runID) }) {
             unscopedRows[index] = unscopedRows[index].patchingStatus(status, durationMS: durationMS)
+        }
+        if patchedRows, sort.key == .status || sort.key == .duration {
+            rows = sortActivityRows(rows, by: sort)
         }
     }
 

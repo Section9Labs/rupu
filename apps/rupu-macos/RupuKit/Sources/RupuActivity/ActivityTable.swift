@@ -34,28 +34,26 @@ struct ActivityTable: View {
     let backend: BackendController
     let onSelect: (ActivityRow) -> Void
 
-    /// View-local sort state (Phase 3, Task 5) — applied over `rows` (which
-    /// is `store.rows`) in the body below, so a live-tail patch that
-    /// mutates `store.rows` re-sorts on the next render with no separate
-    /// trigger needed. Defaults to today's merge-time order
-    /// (`ActivityStore.isOrderedByStartedAtDescending`, reproduced exactly
-    /// by `sortActivityRows(_:by:)`'s `.started`/descending case).
-    @State private var sort = ActivitySort(key: .started, ascending: false)
-
     private typealias Layout = ActivityTableLayout
-
-    private var sortedRows: [ActivityRow] {
-        sortActivityRows(rows, by: sort)
-    }
 
     var body: some View {
         // RenderMeter seam (Plan 5, Task 1) — one line, safe to delete.
         let _ = RenderMeter.tick("ActivityTable")
+        // One `Date()` read per body pass (perf & interaction arc, Plan 5
+        // Task 3), not one per row: the old per-row `startedLabel` called
+        // `Date()` itself, so a table with N rows re-read the clock N times
+        // on every single re-render. Threaded down into `ActivityTableRow`
+        // below instead.
+        let now = Date()
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            List(sortedRows) { row in
-                ActivityTableRow(row: row, store: store, backend: backend, onSelect: onSelect)
+            // `rows` (== `store.rows`) is already sorted per
+            // `store.sort` by `ActivityStore.recompute()`/`patchRow` — no
+            // view-side re-sort needed on every body pass anymore (Plan 5
+            // Task 3's fix; see `ActivityStore.sort`'s doc comment).
+            List(rows) { row in
+                ActivityTableRow(row: row, store: store, backend: backend, now: now, onSelect: onSelect)
                     .listRowBackground(rowBackground(row))
                     .listRowSeparator(.visible)
                     .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
@@ -128,19 +126,20 @@ struct ActivityTable: View {
 
     /// The active header's direction chevron — space is always reserved
     /// (an invisible chevron on every other sortable header) so toggling
-    /// the active column never jiggles the header row's layout.
+    /// the active column never jiggles the header row's layout. Reads
+    /// `store.sort` directly (Plan 5 Task 3 — sort state moved store-side;
+    /// see `ActivityStore.sort`'s doc comment).
     private func sortIndicator(for key: ActivitySort.Key) -> some View {
-        Icon(sort.key == key && !sort.ascending ? .chevronDown : .chevronUp, size: 9)
+        Icon(store.sort.key == key && !store.sort.ascending ? .chevronDown : .chevronUp, size: 9)
             .foregroundStyle(Color.rupuDim)
-            .opacity(sort.key == key ? 1 : 0)
+            .opacity(store.sort.key == key ? 1 : 0)
     }
 
+    /// Delegates to the store (Plan 5 Task 3) — see `ActivityStore.
+    /// toggleSort(_:)`'s doc comment for why the re-sort itself now happens
+    /// there rather than in this view's body.
     private func toggleSort(_ key: ActivitySort.Key) {
-        if sort.key == key {
-            sort.ascending.toggle()
-        } else {
-            sort = ActivitySort(key: key, ascending: key.defaultAscending)
-        }
+        store.toggleSort(key)
     }
 }
 
@@ -153,6 +152,11 @@ private struct ActivityTableRow: View {
     let row: ActivityRow
     let store: ActivityStore
     let backend: BackendController
+    /// One `Date()` per `ActivityTable` body pass, captured by the parent
+    /// and threaded down here (perf & interaction arc, Plan 5 Task 3) —
+    /// `startedLabel` below no longer reads the clock itself, so N rows no
+    /// longer mean N clock reads on every re-render.
+    let now: Date
     let onSelect: (ActivityRow) -> Void
 
     /// Local busy flag for the compact ✓/✕ pair — deliberately NOT read
@@ -330,7 +334,7 @@ private struct ActivityTableRow: View {
 
     private var startedLabel: String {
         guard let date = row.startedAt else { return "—" }
-        return Self.relativeFormatter.localizedString(for: date, relativeTo: Date())
+        return Self.relativeFormatter.localizedString(for: date, relativeTo: now)
     }
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {

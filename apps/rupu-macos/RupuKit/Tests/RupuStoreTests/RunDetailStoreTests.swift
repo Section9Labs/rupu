@@ -187,7 +187,16 @@ private func makeStore(
     restoreResult: @escaping @Sendable () async throws -> RunControlResponse = { runControlResponse(status: nil, archived: false) },
     runStreamBox: RunStreamBox? = nil,
     tailStreamBox: TailStreamBox? = nil,
-    pendingActions: PendingActions = PendingActions()
+    pendingActions: PendingActions = PendingActions(),
+    // Perf & interaction arc, Plan 5 Task 3: defaults to a near-instant real
+    // sleep (NOT the production ~100ms) — every EXISTING test in this file
+    // waits on `graphVM`/`liveStates` via a short real sleep or `pollUntil`
+    // of its own already, so this just keeps the coalescing window from
+    // adding meaningfully to every one of those waits. Tests that actually
+    // exercise the coalescing window itself override this with a
+    // semaphore-gated stand-in — see `graphRecomputeCoalescesABurstOfRapid
+    // GraphAffectingEventsIntoOneRecompute` below.
+    graphCoalesceDelay: @escaping @Sendable () async -> Void = { try? await Task.sleep(for: .milliseconds(1)) }
 ) -> RunDetailStore {
     var runSignalsFactory: (@Sendable () -> AsyncStream<StreamSignal<CPEvent>>)?
     if let runStreamBox {
@@ -215,7 +224,8 @@ private func makeStore(
         postRestore: restoreResult,
         runSignalsFactory: runSignalsFactory,
         transcriptTailFactory: transcriptTailFactory,
-        pendingActions: pendingActions
+        pendingActions: pendingActions,
+        graphCoalesceDelay: graphCoalesceDelay
     )
 }
 
@@ -1635,6 +1645,125 @@ private func makeStore(
         refreshedGraph.stepResults.first(where: { $0.stepID == "build" })?.success == true,
         "the rebuilt graph must reflect the finished step as .done, not stale/pending activation-time content"
     )
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+// MARK: - graphVM coalescing (perf & interaction arc, Plan 5 Task 3)
+
+private func stepNode(id: String, kind: String = "step", agent: String? = "rupuso") -> APIStepNode {
+    APIStepNode(
+        id: id, kind: kind, agent: agent, forEach: nil, parallel: nil,
+        panelists: nil, gate: nil, action: nil, approvalGate: nil
+    )
+}
+
+/// `layoutGraph(...)` used to run inline in `RunDetailScreen`'s body, once
+/// per SwiftUI re-render — every single live `CPEvent` during a streamed
+/// run. `RunDetailStore.graphVM` is the hoisted, coalesced replacement:
+/// this test proves a BURST of graph-affecting events collapses to exactly
+/// one `recomputeGraphVM()` call, not one per event.
+///
+/// `graphCoalesceDelay` is gated on an `AsyncGate` (this suite's own
+/// semaphore-bridged one-shot gate, not a timed sleep) — the whole point is
+/// that the coalescing window genuinely cannot close until the test says
+/// so, so "no recompute happened yet" is a deterministic fact while the
+/// gate is held, not a probabilistic one under a race with real elapsed
+/// time.
+@MainActor @Test func graphRecomputeCoalescesABurstOfRapidGraphAffectingEventsIntoOneRecompute() async {
+    let runBox = RunStreamBox()
+    let coalesceGate = AsyncGate()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        graphResult: {
+            APIRunGraph(
+                run: runRecord(),
+                workflow: APIStepDag(steps: [stepNode(id: "build"), stepNode(id: "test")]),
+                stepResults: [],
+                units: [],
+                usage: usage()
+            )
+        },
+        runStreamBox: runBox,
+        graphCoalesceDelay: { await coalesceGate.wait() }
+    )
+
+    await store.activate()
+    // `activate()`'s own `loadDetail`/`loadGraph` each call
+    // `recomputeGraphVM()` directly (a REST load, not a coalesced event) —
+    // this is the baseline every subsequent count is measured against, not
+    // an assumption that it's `0`.
+    let baseline = store.graphRecomputeCount
+    #expect(store.graphVM.first(where: { $0.id == "build" })?.state == .pending)
+
+    runBox.latest.yield(.connection(true))
+    // A rapid burst: five graph-affecting events, all landing while the
+    // coalescing window's delay is still gated closed.
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: "rupuso", host: nil)))
+    runBox.latest.yield(.event(.stepCompleted(runID: "run-1", stepID: "build", success: true, durationMS: 5, host: nil)))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "test", kind: "step", agent: "rupuso", host: nil)))
+    runBox.latest.yield(.event(.stepCompleted(runID: "run-1", stepID: "test", success: true, durationMS: 5, host: nil)))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "test", kind: "step", agent: "rupuso", host: nil)))
+
+    // Let every `apply(_:)` call in the burst actually land (liveStates is
+    // updated synchronously inside `apply`, before the coalesced recompute
+    // is even scheduled) — this wait is about the AsyncStream's delivery,
+    // not the coalescing window itself.
+    let allApplied = await pollUntil { store.liveStates["test"] == .running }
+    #expect(allApplied)
+
+    // The coalescing window is still gated shut — genuinely zero recomputes
+    // could have happened yet, deterministically (not "probably, if we
+    // haven't waited long enough").
+    #expect(store.graphRecomputeCount == baseline, "no recompute may run before the coalescing window closes")
+
+    coalesceGate.open()
+
+    let recomputed = await pollUntil { store.graphRecomputeCount == baseline + 1 }
+    #expect(recomputed, "the whole burst must collapse into exactly one recompute")
+    #expect(store.graphRecomputeCount == baseline + 1, "no additional recompute beyond the one the burst coalesced into")
+    #expect(store.graphVM.first(where: { $0.id == "test" })?.state == .running)
+    #expect(store.graphVM.first(where: { $0.id == "build" })?.state == .done(success: true))
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// A second burst AFTER the first window has already closed must start its
+/// own fresh window and recompute again — coalescing must never latch shut
+/// permanently.
+@MainActor @Test func graphRecomputeStartsAFreshWindowForEachSeparateBurst() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        graphResult: {
+            APIRunGraph(
+                run: runRecord(),
+                workflow: APIStepDag(steps: [stepNode(id: "build")]),
+                stepResults: [],
+                units: [],
+                usage: usage()
+            )
+        },
+        runStreamBox: runBox
+        // Default `graphCoalesceDelay` here (1ms real sleep) — this test is
+        // about two SEPARATE windows each firing, not about proving nothing
+        // happens before a gate opens.
+    )
+
+    await store.activate()
+    let baseline = store.graphRecomputeCount
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: "rupuso", host: nil)))
+    let firstRecomputed = await pollUntil { store.graphRecomputeCount == baseline + 1 }
+    #expect(firstRecomputed)
+
+    runBox.latest.yield(.event(.stepCompleted(runID: "run-1", stepID: "build", success: true, durationMS: 5, host: nil)))
+    let secondRecomputed = await pollUntil { store.graphRecomputeCount == baseline + 2 }
+    #expect(secondRecomputed, "a later, separate event must start its own coalescing window rather than being silently absorbed")
+    #expect(store.graphVM.first(where: { $0.id == "build" })?.state == .done(success: true))
 
     store.deactivate()
     runBox.latest.finish()

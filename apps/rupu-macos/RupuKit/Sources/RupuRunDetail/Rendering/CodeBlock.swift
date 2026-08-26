@@ -33,18 +33,62 @@ public enum CodeHighlighter {
     // `@MainActor`-confined, so a plain dict needs no locking either.
     // -------------------------------------------------------------------
 
+    /// Perf & interaction arc, Plan 5 Task 3: keyed on a cheap `Hasher`-based
+    /// digest of `(code, language, dark)`, not the full `code` string —
+    /// hashing (and therefore every dictionary lookup) no longer costs
+    /// O(code.length) per call. `code` is still carried on the key as a
+    /// collision guard: `==` re-confirms the full string matches before
+    /// trusting a hit, so two different code blocks that happen to digest
+    /// to the same value can never silently serve each other's rendering.
     private struct CacheKey: Hashable {
-        let code: String
+        let digest: Int
         let language: String?
         let dark: Bool
+        let code: String
+
+        init(code: String, language: String?, dark: Bool) {
+            self.code = code
+            self.language = language
+            self.dark = dark
+            var hasher = Hasher()
+            hasher.combine(code)
+            hasher.combine(language)
+            hasher.combine(dark)
+            self.digest = hasher.finalize()
+        }
+
+        static func == (lhs: CacheKey, rhs: CacheKey) -> Bool {
+            lhs.digest == rhs.digest && lhs.dark == rhs.dark && lhs.language == rhs.language && lhs.code == rhs.code
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(digest)
+        }
+    }
+
+    /// One cached rendering plus the tick it was last touched on — the
+    /// generation-stamped replacement (Plan 5 Task 3) for the old
+    /// oldest-first `cacheOrder` array, whose "touch" (`firstIndex(of:)` +
+    /// `remove` + `append`) scanned up to `cacheCapacity` entries on EVERY
+    /// cache hit. `lastUsed` makes a touch an O(1) dictionary write instead;
+    /// only eviction (a genuinely new key landing at capacity, not every
+    /// hit) still scans the whole cache for the minimum.
+    private struct CacheEntry {
+        let value: AttributedString
+        var lastUsed: UInt64
     }
 
     private static let cacheCapacity = 200
-    private static var cache: [CacheKey: AttributedString] = [:]
-    /// Oldest-first eviction order; a hit moves its key to the end (most
-    /// recently used), so eviction always drops the true LRU entry rather
-    /// than approximating "oldest inserted."
-    private static var cacheOrder: [CacheKey] = []
+    private static var cache: [CacheKey: CacheEntry] = [:]
+
+    /// Monotonic tick, bumped on every touch/insert — the LRU ordering
+    /// `evictLRU()` reads back via each entry's `lastUsed`.
+    private static var cacheTick: UInt64 = 0
+
+    private static func nextTick() -> UInt64 {
+        cacheTick += 1
+        return cacheTick
+    }
 
     /// Bumped on every cache MISS only (never on a hit) — the pure counter
     /// `CodeHighlighterCacheTests` asserts against to prove a repeated call
@@ -53,15 +97,26 @@ public enum CodeHighlighter {
     /// access so `@testable import RupuRunDetail` can read it.
     static var highlightCallCount = 0
 
-    /// Test-only reset — clears the cache and miss counter to a clean
-    /// slate. This type's cache is process-wide static state, so a test
-    /// that wants a deterministic hit/miss count must reset first
-    /// regardless of what earlier tests (or earlier `CodeBlock`/
-    /// `SourcePreview` renders in the same process) already populated.
+    /// The currently-applied `Highlighter` theme name, or `nil` before the
+    /// first successful `setTheme` call — `compute(_:language:dark:)` skips
+    /// re-calling `setTheme` when the requested theme already matches this
+    /// (Plan 5 Task 3): a burst of distinct code blocks in the SAME
+    /// light/dark mode used to re-parse the identical bundled theme CSS on
+    /// every one of them, even though the cache above already stops
+    /// re-highlighting identical CODE.
+    private static var currentThemeName: String?
+
+    /// Test-only reset — clears the cache, miss counter, and remembered
+    /// theme to a clean slate. This type's cache is process-wide static
+    /// state, so a test that wants a deterministic hit/miss count must
+    /// reset first regardless of what earlier tests (or earlier
+    /// `CodeBlock`/`SourcePreview` renders in the same process) already
+    /// populated.
     static func resetCacheForTesting() {
         cache.removeAll()
-        cacheOrder.removeAll()
+        cacheTick = 0
         highlightCallCount = 0
+        currentThemeName = nil
     }
 
     /// Highlights `code` as `language` (nil auto-detects) using the theme closest to the web
@@ -74,9 +129,10 @@ public enum CodeHighlighter {
     /// or any other failure all fall back to plain mono-styled text instead.
     public static func highlight(_ code: String, language: String?, dark: Bool) -> AttributedString {
         let key = CacheKey(code: code, language: language, dark: dark)
-        if let cached = cache[key] {
-            touch(key)
-            return cached
+        if var entry = cache[key] {
+            entry.lastUsed = nextTick()
+            cache[key] = entry
+            return entry.value
         }
 
         highlightCallCount += 1
@@ -91,8 +147,11 @@ public enum CodeHighlighter {
         }
 
         let themeName = dark ? "atom-one-dark" : "atom-one-light"
-        guard highlighter.setTheme(themeName) else {
-            return fallback(code)
+        if currentThemeName != themeName {
+            guard highlighter.setTheme(themeName) else {
+                return fallback(code)
+            }
+            currentThemeName = themeName
         }
 
         let mappedLanguage = language == "toml" ? "ini" : language
@@ -103,20 +162,22 @@ public enum CodeHighlighter {
         return convert(rendered)
     }
 
-    private static func touch(_ key: CacheKey) {
-        if let index = cacheOrder.firstIndex(of: key) {
-            cacheOrder.remove(at: index)
+    /// Inserts a brand-new key (the caller already confirmed a miss),
+    /// evicting the least-recently-used entry first if the cache is
+    /// already at capacity.
+    private static func store(_ key: CacheKey, _ value: AttributedString) {
+        if cache.count >= cacheCapacity {
+            evictLRU()
         }
-        cacheOrder.append(key)
+        cache[key] = CacheEntry(value: value, lastUsed: nextTick())
     }
 
-    private static func store(_ key: CacheKey, _ value: AttributedString) {
-        cache[key] = value
-        cacheOrder.append(key)
-        if cacheOrder.count > cacheCapacity {
-            let evicted = cacheOrder.removeFirst()
-            cache.removeValue(forKey: evicted)
-        }
+    /// O(cache size) — but only ever runs on a genuinely new key landing at
+    /// capacity, not on every touch (that's the whole point of the
+    /// `lastUsed` tick above: the HOT path — a repeated hit — stays O(1)).
+    private static func evictLRU() {
+        guard let oldestKey = cache.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key else { return }
+        cache.removeValue(forKey: oldestKey)
     }
 
     /// Rebuilds `rendered` as an `AttributedString` carrying only SwiftUI-scoped `foregroundColor`

@@ -54,22 +54,58 @@ public struct TranscriptFeed: View {
     private let runID: String?
     private let host: String?
     private let sourcePreviewStore: SourcePreviewStore?
+    private let computeRows: ([TranscriptEvent]) -> [FeedRow]
+
+    /// Perf & interaction arc, Plan 5 Task 3: `rows`/`sawRunComplete` used to
+    /// be computed properties — `buildFeedRows` ran TWICE per body (once
+    /// where `rowView`'s `ForEach` read `rows`, once more where `rows.
+    /// isEmpty` read it again), and `sawRunComplete`'s own full `events.
+    /// contains` scan ran once per body pass too, on top of that. Both are
+    /// now `@State`, computed once at init (the initial mount) and
+    /// recomputed exactly once per `.onChange(of: events.count)` firing —
+    /// SwiftUI's own contract for that modifier ("fires only when the
+    /// observed value actually changed") is what turns "once per distinct
+    /// event-count" into "not once per body pass".
+    ///
+    /// Default (internal) access, not `private` — reached directly from
+    /// `TranscriptFeedRecomputeTests` via `@testable import RupuRunDetail`
+    /// (this test target has no SwiftUI view-hosting harness to render the
+    /// body and observe `onChange`/`onAppear` firing instead).
+    @State var rows: [FeedRow]
+    @State var sawRunComplete: Bool
 
     public init(events: [TranscriptEvent], runID: String? = nil, host: String? = nil, sourcePreviewStore: SourcePreviewStore? = nil) {
+        self.init(events: events, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, computeRows: buildFeedRows)
+    }
+
+    /// Test-only seam (default `internal`, reached via `@testable import
+    /// RupuRunDetail`): `computeRows` is injectable so
+    /// `TranscriptFeedRecomputeTests` can wrap `buildFeedRows` with a
+    /// call-counting spy and assert the "computed once per event, not once
+    /// per body pass" contract directly, without a SwiftUI view-hosting
+    /// harness (this test target has none).
+    init(
+        events: [TranscriptEvent],
+        runID: String?,
+        host: String?,
+        sourcePreviewStore: SourcePreviewStore?,
+        computeRows: @escaping ([TranscriptEvent]) -> [FeedRow]
+    ) {
         self.events = events
         self.runID = runID
         self.host = host
         self.sourcePreviewStore = sourcePreviewStore
+        self.computeRows = computeRows
+        self._rows = State(initialValue: computeRows(events))
+        self._sawRunComplete = State(initialValue: Self.sawRunComplete(in: events))
     }
-
-    private var rows: [FeedRow] { buildFeedRows(events: events) }
 
     /// Whether the WHOLE transcript has reached its terminal `run_complete`
     /// event — every turn's result pill reads `.ok` once this is true
     /// (unless that turn itself `hasError`), `.running` otherwise. Ported
     /// from the web's own `sawRunComplete` (`transcriptView.ts:476`), which
     /// is likewise a transcript-global flag, not a per-turn one.
-    private var sawRunComplete: Bool {
+    private static func sawRunComplete(in events: [TranscriptEvent]) -> Bool {
         events.contains {
             if case .runComplete = $0 { return true }
             return false
@@ -82,7 +118,7 @@ public struct TranscriptFeed: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    ForEach(rows) { row in
                         rowView(row)
                     }
                     if rows.isEmpty {
@@ -97,6 +133,8 @@ public struct TranscriptFeed: View {
                 .padding(12)
             }
             .onChange(of: events.count) { _, _ in
+                rows = computeRows(events)
+                sawRunComplete = Self.sawRunComplete(in: events)
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
                 }
@@ -128,10 +166,28 @@ public struct TranscriptFeed: View {
 /// `run_complete` event — the same two variants the pre-Task-7 flat feed
 /// rendered as its own rows, restyled in place (`GateRequestedRow`/
 /// `RunCompleteRow` below) rather than removed.
-enum FeedRow {
+enum FeedRow: Identifiable {
     case turn(TurnVM)
     case gate(gateID: String, prompt: String, decision: String?, decidedBy: String?)
     case runComplete(runID: String, status: String, totalTokens: UInt64, durationMS: UInt64, error: String?)
+
+    /// Perf & interaction arc, Plan 5 Task 3: lets `TranscriptFeed`'s
+    /// `ForEach` key on stable row identity instead of positional
+    /// `\.offset` — a row's underlying turn/gate/run id never changes
+    /// across a recompute, so SwiftUI can diff/reuse rather than treating
+    /// every recompute as an entirely new row list. `TurnVM.id` is already
+    /// unique per transcript, including negative synthetic "gap turn" ids
+    /// (see that type's own doc comment); `gateID`/`runID` are likewise
+    /// unique per their own event kind. Kind-prefixed so the three variants
+    /// can never collide with each other even if their underlying ids ever
+    /// happened to share a value.
+    var id: String {
+        switch self {
+        case .turn(let turn): "turn:\(turn.id)"
+        case .gate(let gateID, _, _, _): "gate:\(gateID)"
+        case .runComplete(let runID, _, _, _, _): "runComplete:\(runID)"
+        }
+    }
 }
 
 /// Merges `buildTranscriptViewModel`'s turn list back against the two

@@ -1,8 +1,11 @@
 import Testing
 import Foundation
 import RupuAPI
+// Perf & interaction arc, Plan 5 Task 3: `layoutGraph`/`GraphNodeVM` (and
+// `StepKind`) moved from `RupuRunDetail` into `RupuStore` alongside
+// `RunDetailStore`'s new derived `graphVM` — this file no longer needs
+// `RupuRunDetail` at all, `@testable` or otherwise.
 import RupuStore
-@testable import RupuRunDetail
 
 /// Fixture-driven tests for `layoutGraph`. `run_graph.json` carries all
 /// seven `APIStepNode` kinds (`step`/`for_each`/`parallel`/`panel`/

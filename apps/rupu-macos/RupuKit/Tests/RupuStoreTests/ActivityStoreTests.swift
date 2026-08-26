@@ -442,6 +442,59 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // (d3) perf & interaction arc, Plan 5 Task 3: sort now lives on the
+    // store — `toggleSort(_:)` both flips `sort` and re-sorts `rows`
+    // immediately, from `rows`' own current contents (no view-side
+    // `sortedRows` computed property needed anymore, and no re-run of the
+    // whole merge/filter pipeline either).
+    @MainActor @Test func toggleSortSetsActiveKeyAndReSortsRowsImmediately() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        #expect(store.sort == ActivitySort(key: .started, ascending: false))
+        #expect(store.rows.map(\.id) == ["run-ag-1", "evt-1", "run-wf-1", "sess-1"])
+
+        // First tap on a new column: `defaultAscending` for `.subject` is
+        // `true`. Subjects: run-ag-1/sess-1 = "rupuso", evt-1/run-wf-1 =
+        // "nightly-health" — ties keep the pre-toggle relative order.
+        store.toggleSort(.subject)
+        #expect(store.sort == ActivitySort(key: .subject, ascending: true))
+        #expect(store.rows.map(\.id) == ["evt-1", "run-wf-1", "run-ag-1", "sess-1"])
+
+        // Tapping the already-active column flips direction rather than
+        // resetting to `defaultAscending`.
+        store.toggleSort(.subject)
+        #expect(store.sort == ActivitySort(key: .subject, ascending: false))
+        #expect(store.rows.map(\.id) == ["run-ag-1", "sess-1", "evt-1", "run-wf-1"])
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d4) `patchRow`'s re-sort guard: a live status patch only re-sorts
+    // `rows` when the active sort key actually participates (`.status`/
+    // `.duration`) — proven here by sorting on `.status` first, then
+    // patching `run-wf-1` (Running -> Completed) and confirming it moves to
+    // rejoin the other `.completed` rows rather than staying pinned at its
+    // pre-patch index.
+    @MainActor @Test func liveStatusPatchReSortsRowsWhenActiveSortKeyIsStatus() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        store.toggleSort(.status)
+        // Ascending by status display label: Completed (run-ag-1, sess-1,
+        // in their pre-sort relative order) < Failed (evt-1) < Running
+        // (run-wf-1).
+        #expect(store.rows.map(\.id) == ["run-ag-1", "sess-1", "evt-1", "run-wf-1"])
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 rejoins the Completed group after its live status patch") {
+            store.rows.map(\.id) == ["run-ag-1", "sess-1", "run-wf-1", "evt-1"]
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // (e) deactivate() stops the stream: the scripted continuation's
     // consumer task is torn down (observed via onTermination).
     @MainActor @Test func deactivateStopsTheStream() async {
