@@ -188,6 +188,14 @@ impl HostConnector for LocalHostConnector {
             workflow_only,
             None, // local host shows all runs regardless of worker_id
             &self.pricing,
+            // `RunListQuery` (the cross-host connector protocol) carries no
+            // since/until — a remote-per-gate style contract extension is
+            // out of scope for this task (perf & interaction arc, Plan 5
+            // Task 5); the CP's own `/api/runs/workflows` handler applies
+            // date-range filtering directly for its "host=local" fast path
+            // instead of routing through this trait method at all (see
+            // `api::runs::list_workflow_runs`).
+            &crate::pagination::DateRangeQuery::default(),
         )
         .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
         // Convert typed rows to Value so the trait's return type is uniform

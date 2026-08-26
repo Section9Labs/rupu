@@ -225,6 +225,23 @@ struct SessionsQuery {
     /// Any other value → proxy to that remote host.
     #[serde(default)]
     host: Option<String>,
+    /// Optional RFC-3339 date-range bounds on `created_at` (perf &
+    /// interaction arc, Plan 5 Task 5) — see
+    /// `crate::pagination::DateRangeQuery`'s doc comment for the
+    /// closed-boundary / lenient-parse contract.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+}
+
+impl SessionsQuery {
+    fn range(&self) -> crate::pagination::DateRangeQuery {
+        crate::pagination::DateRangeQuery {
+            since: self.since.clone(),
+            until: self.until.clone(),
+        }
+    }
 }
 
 /// Optional `?host=<id>` query param for single-session detail/runs/usage
@@ -279,6 +296,8 @@ async fn list_sessions(
         if let Some(scope) = q.scope.as_deref() {
             sessions.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
         }
+        let range = q.range();
+        sessions.retain(|v| range.contains_str(v.get("created_at").and_then(|x| x.as_str())));
         let paged: Vec<serde_json::Value> = crate::pagination::paginate(sessions, &page)
             .into_iter()
             .map(|mut v| {
@@ -307,6 +326,11 @@ async fn list_sessions(
     if let Some(scope) = q.scope.as_deref() {
         all_values.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
     }
+
+    // Date-range filter after merge, before paginate — same ordering as the
+    // local-only branch above.
+    let range = q.range();
+    all_values.retain(|v| range.contains_str(v.get("created_at").and_then(|x| x.as_str())));
 
     Ok(Json(crate::pagination::paginate(all_values, &page)))
 }
@@ -1280,5 +1304,79 @@ mod tests {
         let raw = check_request_fixture("send_body.json", "{\n  \"prompt\": \"hello\"\n}\n");
         let body: SendBody = serde_json::from_str(&raw).expect("deserialize SendBody");
         assert_eq!(body.prompt, "hello");
+    }
+
+    // ── Date-range filtering (perf & interaction arc, Plan 5 Task 5) ─────────
+
+    fn write_session_with_created_at(root: &std::path::Path, session_id: &str, created_at: &str) {
+        let dir = root.join("sessions").join(session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "session_id": session_id,
+            "agent_name": "agent",
+            "created_at": created_at,
+            "updated_at": created_at,
+        });
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_since_until_narrows_before_pagination() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_session_with_created_at(tmp.path(), "sess_early", "2026-08-01T12:00:00Z");
+        write_session_with_created_at(tmp.path(), "sess_mid", "2026-08-10T12:00:00Z");
+        write_session_with_created_at(tmp.path(), "sess_late", "2026-08-20T12:00:00Z");
+
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+
+        let Json(rows) = list_sessions(
+            State(s),
+            Query(SessionsQuery {
+                offset: None,
+                limit: None,
+                scope: None,
+                host: Some("local".into()),
+                since: Some("2026-08-05T00:00:00Z".into()),
+                until: Some("2026-08-15T00:00:00Z".into()),
+            }),
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(rows.len(), 1, "only sess_mid falls in [Aug 5, Aug 15]");
+        assert_eq!(rows[0]["session_id"], serde_json::json!("sess_mid"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_bad_until_degrades_to_unfiltered_not_500() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_session_with_created_at(tmp.path(), "sess_a", "2026-08-01T12:00:00Z");
+
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+
+        let Json(rows) = list_sessions(
+            State(s),
+            Query(SessionsQuery {
+                offset: None,
+                limit: None,
+                scope: None,
+                host: Some("local".into()),
+                since: None,
+                until: Some("not-a-timestamp".into()),
+            }),
+        )
+        .await
+        .expect("a malformed until must degrade, never error");
+        assert_eq!(rows.len(), 1);
     }
 }

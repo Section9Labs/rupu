@@ -554,6 +554,12 @@ impl RunListRow {
 /// `cancelled`) — silently no-op the filter entirely, since
 /// `in_lifecycle`'s `_ => true` fallback matches everything. See that
 /// module's doc comment on `list()` for the full reasoning.
+// perf & interaction arc, Plan 5 Task 5 added the trailing `range` param,
+// tipping this over clippy's default 7-argument threshold. Bundling these
+// into a params struct would touch every existing call site for no real
+// clarity gain (they're all positional today, hardly ambiguous) — allow
+// is the proportionate fix here.
+#[allow(clippy::too_many_arguments)]
 pub fn query_run_rows(
     store: &rupu_orchestrator::runs::RunStore,
     offset: usize,
@@ -562,6 +568,7 @@ pub fn query_run_rows(
     workflow_only: bool,
     worker_id: Option<&str>,
     pricing: &rupu_config::PricingConfig,
+    range: &crate::pagination::DateRangeQuery,
 ) -> Result<Vec<RunListRow>, rupu_orchestrator::RunStoreError> {
     let mut runs = store.list()?;
     if workflow_only {
@@ -573,6 +580,10 @@ pub fn query_run_rows(
     if let Some(wid) = worker_id {
         runs.retain(|r| r.worker_id.as_deref() == Some(wid));
     }
+    // `RunRecord::started_at` is a non-optional `DateTime<Utc>` — no
+    // "unknown timestamp" case to worry about here, unlike the string-typed
+    // timestamps `DateRangeQuery::contains_str` guards against elsewhere.
+    runs.retain(|r| range.contains(r.started_at));
     runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     let page = crate::pagination::PageQuery {
         offset: Some(offset),
@@ -676,6 +687,17 @@ struct WorkflowRunsQuery {
     /// When present, restrict to this host; absent → fan-out all hosts.
     #[serde(default)]
     host: Option<String>,
+    /// Optional RFC-3339 date-range bounds on `started_at` (perf &
+    /// interaction arc, Plan 5 Task 5) — see
+    /// `crate::pagination::DateRangeQuery`'s doc comment for the
+    /// closed-boundary / lenient-parse contract. Only honored on the
+    /// `host=local` fast path below (see `list_workflow_runs`'s doc
+    /// comment) — a remote-host or fan-out request degrades to unfiltered,
+    /// a deferred limitation of the cross-host `RunListQuery` protocol.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
 }
 
 impl WorkflowRunsQuery {
@@ -683,6 +705,13 @@ impl WorkflowRunsQuery {
         crate::pagination::PageQuery {
             offset: self.offset,
             limit: self.limit,
+        }
+    }
+
+    fn range(&self) -> crate::pagination::DateRangeQuery {
+        crate::pagination::DateRangeQuery {
+            since: self.since.clone(),
+            until: self.until.clone(),
         }
     }
 }
@@ -708,12 +737,48 @@ fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
 
 /// `GET /api/runs/workflows[?host=<id>]` — manual/direct runs only (no event or
 /// cron wake), with the same fan-out / single-host routing as `list_runs`.
+///
+/// **`host=local` bypasses the generic `HostConnector`/`RunListQuery` path**
+/// (perf & interaction arc, Plan 5 Task 5) and calls `query_run_rows`
+/// directly instead — the only way to thread `since`/`until` through to the
+/// filter-before-paginate site without extending `RunListQuery` (the
+/// cross-host connector protocol every `HostConnector` impl — HTTP/SSH/
+/// Tunnel, not just local — shares) for a date-range feature this task only
+/// needs against the local store. Behavior-preserving for every existing
+/// caller that never sets `since`/`until`: `query_run_rows` with an inactive
+/// `DateRangeQuery` retains everything, identical to what
+/// `LocalHostConnector::list_runs` → `query_run_rows` already produced. A
+/// remote `host=<id>` or an omitted `host` (fan-out) still goes through the
+/// connector trait as before and does not honor `since`/`until` — see
+/// `WorkflowRunsQuery.since`'s doc comment.
 async fn list_workflow_runs(
     State(s): State<AppState>,
     Query(q): Query<WorkflowRunsQuery>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
     let page = q.page();
     if let Some(host_id) = &q.host {
+        if host_id == "local" {
+            let rows = query_run_rows(
+                &s.run_store,
+                page.offset(),
+                page.limit(),
+                q.lifecycle.as_deref(),
+                true, // workflow_only
+                None,
+                &s.pricing,
+                &q.range(),
+            )
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+            let tagged: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|r| {
+                    let mut v = serde_json::to_value(r).unwrap();
+                    v["host_id"] = serde_json::json!("local");
+                    v
+                })
+                .collect();
+            return Ok(Json(tagged));
+        }
         let conn = resolve_host(&s, host_id)?;
         let params = RunListQuery {
             kind: RunKind::Workflow,
@@ -1297,6 +1362,7 @@ async fn list_archived_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::path::PathBuf;
 
     /// Build an `AppState` backed by a fresh tempdir run store.
@@ -2736,5 +2802,105 @@ mod tests {
         );
         let body: CancelBody = serde_json::from_str(&raw).expect("deserialize CancelBody");
         assert_eq!(body.reason.as_deref(), Some("operator cancelled"));
+    }
+
+    // ── Date-range filtering (perf & interaction arc, Plan 5 Task 5) ─────────
+
+    /// A run record with an explicit `started_at`, otherwise identical to
+    /// `terminal_record` — the "in range or not" fixture below only cares
+    /// about the timestamp, not the lifecycle status.
+    fn record_started_at(id: &str, started_at: chrono::DateTime<chrono::Utc>) -> RunRecord {
+        let mut rec = terminal_record(id);
+        rec.started_at = started_at;
+        rec
+    }
+
+    #[test]
+    fn query_run_rows_since_until_filters_before_pagination() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let d = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
+        s.run_store
+            .create(record_started_at("run_aug_01", d(1)), "name: x\n")
+            .unwrap();
+        s.run_store
+            .create(record_started_at("run_aug_10", d(10)), "name: x\n")
+            .unwrap();
+        s.run_store
+            .create(record_started_at("run_aug_20", d(20)), "name: x\n")
+            .unwrap();
+
+        let range = crate::pagination::DateRangeQuery {
+            since: Some("2026-08-05T00:00:00Z".into()),
+            until: Some("2026-08-15T00:00:00Z".into()),
+        };
+        let rows = query_run_rows(&s.run_store, 0, 20, None, false, None, &s.pricing, &range)
+            .expect("query_run_rows ok");
+        assert_eq!(rows.len(), 1, "only run_aug_10 falls in [Aug 5, Aug 15]");
+        assert_eq!(rows[0].id, "run_aug_10");
+
+        // No bounds at all → every run passes, same as before this task.
+        let unbounded = crate::pagination::DateRangeQuery::default();
+        let rows = query_run_rows(&s.run_store, 0, 20, None, false, None, &s.pricing, &unbounded)
+            .expect("query_run_rows ok");
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_workflow_runs_local_host_honors_since_until_bounds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let d = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
+        s.run_store
+            .create(record_started_at("run_early", d(1)), "name: x\n")
+            .unwrap();
+        s.run_store
+            .create(record_started_at("run_mid", d(10)), "name: x\n")
+            .unwrap();
+
+        let Json(rows) = list_workflow_runs(
+            State(s.clone()),
+            Query(WorkflowRunsQuery {
+                offset: None,
+                limit: None,
+                lifecycle: None,
+                host: Some("local".into()),
+                since: Some("2026-08-05T00:00:00Z".into()),
+                until: None,
+            }),
+        )
+        .await
+        .expect("list_workflow_runs ok");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], serde_json::json!("run_mid"));
+        assert_eq!(rows[0]["host_id"], serde_json::json!("local"));
+    }
+
+    #[tokio::test]
+    async fn list_workflow_runs_bad_since_degrades_to_unfiltered_not_500() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_x"), "name: x\n")
+            .unwrap();
+
+        let Json(rows) = list_workflow_runs(
+            State(s),
+            Query(WorkflowRunsQuery {
+                offset: None,
+                limit: None,
+                lifecycle: None,
+                host: Some("local".into()),
+                since: Some("not-a-real-timestamp".into()),
+                until: None,
+            }),
+        )
+        .await
+        .expect("a malformed since must degrade, never error");
+
+        assert_eq!(rows.len(), 1, "unparseable since imposes no bound");
     }
 }

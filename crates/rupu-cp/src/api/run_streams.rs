@@ -676,6 +676,15 @@ struct AgentRunsQuery {
     /// Any other value → proxy to that remote host.
     #[serde(default)]
     host: Option<String>,
+    /// Optional RFC-3339 date-range bounds on `started_at` (perf &
+    /// interaction arc, Plan 5 Task 5) — see `pagination::DateRangeQuery`'s
+    /// doc comment for the closed-boundary / lenient-parse contract. Flat,
+    /// same reason as every other field here — `#[serde(flatten)]` can't
+    /// deserialize through `axum::Query`.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
 }
 
 impl AgentRunsQuery {
@@ -683,6 +692,13 @@ impl AgentRunsQuery {
         crate::pagination::PageQuery {
             offset: self.offset,
             limit: self.limit,
+        }
+    }
+
+    fn range(&self) -> crate::pagination::DateRangeQuery {
+        crate::pagination::DateRangeQuery {
+            since: self.since.clone(),
+            until: self.until.clone(),
         }
     }
 }
@@ -771,6 +787,8 @@ async fn list_agent_runs(
     if host == "local" {
         let lifecycle = q.lifecycle.clone();
         local_rows.retain(|r| agent_in_lifecycle(r.status.as_deref(), lifecycle.as_deref()));
+        let range = q.range();
+        local_rows.retain(|r| range.contains_str(r.started_at.as_deref()));
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
         for row in &mut page_rows {
             row.host_id = Some("local".to_string());
@@ -810,6 +828,11 @@ async fn list_agent_runs(
     let lifecycle = q.lifecycle.as_deref();
     all_values.retain(|row| agent_in_lifecycle(row["status"].as_str(), lifecycle));
 
+    // Date-range filter after merge, same "filter before paginate" ordering
+    // as the local-only branch above.
+    let range = q.range();
+    all_values.retain(|row| range.contains_str(row["started_at"].as_str()));
+
     let mut page_values = crate::pagination::paginate(all_values, &q.page());
 
     // Fill usage for local rows on this page only (remote rows already have it)
@@ -843,6 +866,12 @@ struct AutoflowRunsQuery {
     /// Any other value → proxy to that remote host.
     #[serde(default)]
     host: Option<String>,
+    /// Optional RFC-3339 date-range bounds on `started_at` — see
+    /// `AgentRunsQuery.since/until`'s doc comment.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
 }
 
 impl AutoflowRunsQuery {
@@ -850,6 +879,13 @@ impl AutoflowRunsQuery {
         crate::pagination::PageQuery {
             offset: self.offset,
             limit: self.limit,
+        }
+    }
+
+    fn range(&self) -> crate::pagination::DateRangeQuery {
+        crate::pagination::DateRangeQuery {
+            since: self.since.clone(),
+            until: self.until.clone(),
         }
     }
 }
@@ -906,8 +942,14 @@ async fn list_autoflow_runs(
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
-        // list_recent already returns newest-first. Convert, paginate, then roll
-        // up usage across each cycle's runs on the page only.
+        // list_recent already returns newest-first. Filter by date range,
+        // paginate, then roll up usage across each cycle's runs on the page
+        // only.
+        let range = q.range();
+        let local_rows: Vec<AutoflowCycleRow> = local_rows
+            .into_iter()
+            .filter(|r| range.contains_str(Some(&r.started_at)))
+            .collect();
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
         for row in &mut page_rows {
             row.host_id = Some("local".to_string());
@@ -941,6 +983,9 @@ async fn list_autoflow_runs(
     .await;
 
     sort_values_newest_first(&mut all_values, "started_at");
+
+    let range = q.range();
+    all_values.retain(|row| range.contains_str(row["started_at"].as_str()));
 
     let mut page_values = crate::pagination::paginate(all_values, &q.page());
 
@@ -981,6 +1026,12 @@ struct AutoflowEventsQuery {
     /// Any other value → proxy to that remote host.
     #[serde(default)]
     host: Option<String>,
+    /// Optional RFC-3339 date-range bounds on `at` — see
+    /// `AgentRunsQuery.since/until`'s doc comment.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
 }
 
 impl AutoflowEventsQuery {
@@ -988,6 +1039,13 @@ impl AutoflowEventsQuery {
         crate::pagination::PageQuery {
             offset: self.offset,
             limit: self.limit,
+        }
+    }
+
+    fn range(&self) -> crate::pagination::DateRangeQuery {
+        crate::pagination::DateRangeQuery {
+            since: self.since.clone(),
+            until: self.until.clone(),
         }
     }
 }
@@ -1086,6 +1144,11 @@ async fn list_autoflow_events(
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
+        let range = q.range();
+        let local_rows: Vec<AutoflowEventRow> = local_rows
+            .into_iter()
+            .filter(|r| range.contains_str(Some(&r.at)))
+            .collect();
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
         for row in &mut page_rows {
             row.host_id = Some("local".to_string());
@@ -1120,6 +1183,9 @@ async fn list_autoflow_events(
     .await;
 
     sort_values_newest_first(&mut all_values, "at");
+
+    let range = q.range();
+    all_values.retain(|row| range.contains_str(row["at"].as_str()));
 
     let mut page_values = crate::pagination::paginate(all_values, &q.page());
 
@@ -2198,6 +2264,8 @@ mod tests {
                 offset: None,
                 limit: None,
                 host: Some("local".into()),
+                since: None,
+                until: None,
             }),
         )
         .await
@@ -2228,5 +2296,170 @@ mod tests {
             "no run_id to measure — must stay None, not a fabricated 0"
         );
         assert_eq!(awaiting["duration_ms"], serde_json::Value::Null);
+    }
+
+    // ── Date-range filtering (perf & interaction arc, Plan 5 Task 5) ─────────
+
+    fn day(d: u32) -> chrono::DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 8, d, 12, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_autoflow_events_since_until_narrows_before_pagination() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let history = AutoflowHistoryStore::new(s.global_dir.join("autoflows").join("history"));
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, day(1));
+
+        for (day_num, kind) in [
+            (1, AutoflowCycleEventKind::AwaitingHuman),
+            (10, AutoflowCycleEventKind::AwaitingHuman),
+            (20, AutoflowCycleEventKind::AwaitingHuman),
+        ] {
+            history
+                .append_cycle_event(
+                    &cycle,
+                    AutoflowCycleEvent {
+                        kind,
+                        ..Default::default()
+                    },
+                    day(day_num),
+                )
+                .unwrap();
+        }
+
+        let Json(rows) = list_autoflow_events(
+            State(s),
+            Query(AutoflowEventsQuery {
+                offset: None,
+                limit: None,
+                host: Some("local".into()),
+                since: Some("2026-08-05T00:00:00Z".into()),
+                until: Some("2026-08-15T00:00:00Z".into()),
+            }),
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(rows.len(), 1, "only the Aug 10 event falls in range");
+        assert_eq!(rows[0]["at"], serde_json::json!(day(10).to_rfc3339()));
+    }
+
+    #[tokio::test]
+    async fn list_autoflow_events_bad_since_degrades_to_unfiltered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let history = AutoflowHistoryStore::new(s.global_dir.join("autoflows").join("history"));
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, day(1));
+        history
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent {
+                    kind: AutoflowCycleEventKind::AwaitingHuman,
+                    ..Default::default()
+                },
+                day(1),
+            )
+            .unwrap();
+
+        let Json(rows) = list_autoflow_events(
+            State(s),
+            Query(AutoflowEventsQuery {
+                offset: None,
+                limit: None,
+                host: Some("local".into()),
+                since: Some("garbage-not-a-date".into()),
+                until: None,
+            }),
+        )
+        .await
+        .expect("a malformed since must degrade, never error");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_agent_runs_since_until_narrows_before_pagination() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "sess_1",
+            "run_early",
+            "2026-08-01T12:00:00Z",
+        );
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "sess_2",
+            "run_mid",
+            "2026-08-10T12:00:00Z",
+        );
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "sess_3",
+            "run_late",
+            "2026-08-20T12:00:00Z",
+        );
+
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+
+        let Json(rows) = list_agent_runs(
+            State(s),
+            Query(AgentRunsQuery {
+                offset: None,
+                limit: None,
+                lifecycle: None,
+                host: Some("local".into()),
+                since: Some("2026-08-05T00:00:00Z".into()),
+                until: Some("2026-08-15T00:00:00Z".into()),
+            }),
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(rows.len(), 1, "only run_mid falls in [Aug 5, Aug 15]");
+        assert_eq!(rows[0]["run_id"], serde_json::json!("run_mid"));
+    }
+
+    #[tokio::test]
+    async fn list_autoflow_runs_cycles_since_until_narrows_before_pagination() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let history = AutoflowHistoryStore::new(s.global_dir.join("autoflows").join("history"));
+        for d in [1, 10, 20] {
+            history
+                .save(&AutoflowCycleRecord::new(AutoflowCycleMode::Tick, day(d)))
+                .unwrap();
+        }
+
+        let Json(rows) = list_autoflow_runs(
+            State(s),
+            Query(AutoflowRunsQuery {
+                offset: None,
+                limit: None,
+                host: Some("local".into()),
+                since: Some("2026-08-05T00:00:00Z".into()),
+                until: Some("2026-08-15T00:00:00Z".into()),
+            }),
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(rows.len(), 1, "only the Aug 10 cycle falls in range");
+        assert_eq!(rows[0]["started_at"], serde_json::json!(day(10).to_rfc3339()));
     }
 }

@@ -534,6 +534,9 @@ pub(crate) fn mirror_list_runs(
         workflow_only,
         Some(worker_id),
         pricing,
+        // No since/until on `RunListQuery` yet — see `LocalHostConnector::
+        // list_runs`'s matching call site for why this is deferred.
+        &crate::pagination::DateRangeQuery::default(),
     )
     .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
