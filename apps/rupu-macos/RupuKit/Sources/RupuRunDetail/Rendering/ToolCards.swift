@@ -611,11 +611,19 @@ private struct FlowLayout: Layout {
 /// One tool call's card: a collapsed-by-default header (gear + tool name +
 /// input summary + audit/status badges) disclosing a kind-specific body.
 /// Direct port of `ToolCard`'s non-`finding` anatomy (`ToolCard.tsx:
-/// 916-951`) — `.finding` gets its own full-chrome card with no header in
-/// the web (`ToolCard.tsx:897-900`) and, in this app, its own `FindingCard`
-/// dispatch in Task 7; until then it falls through to `StructuredView` here
-/// so every `ToolKind` renders SOMETHING rather than a compile-time gap or a
-/// silent blank. `.astGrep` dispatches to `AstGrepBodyView` (Task 6).
+/// 916-951`). `.astGrep` dispatches to `AstGrepBodyView` (Task 6).
+///
+/// **`.finding` is handled here defensively only.** `TranscriptFeed` (Task
+/// 7) routes `.finding`-kind entries straight to `FindingCard` WITHOUT going
+/// through this view at all — `FindingCard` renders its own full chrome
+/// (severity hairline, header, body) with no outer header, matching
+/// `ToolCard.tsx`'s own dispatch comment ("`finding` → FindingCard, its own
+/// full chrome; no outer header", `ToolCard.tsx:6`). `ToolKind`'s switch
+/// still needs an exhaustive case, so a `.finding` entry reaching this view
+/// through some OTHER call site renders the same `FindingCard` — just
+/// (redundantly) wrapped in this view's own header/disclosure chrome rather
+/// than standing alone. No current call site does this (`TranscriptFeed` is
+/// this view's only consumer), so the wrap is inert in practice.
 public struct ToolCardView: View {
     private let entry: ToolEntry
     private let runID: String?
@@ -703,12 +711,11 @@ public struct ToolCardView: View {
             SubrunBodyView(entry: entry, runID: runID, host: host)
         case .astGrep:
             AstGrepBodyView(entry: entry, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore)
-        case .coverage, .generic, .finding:
-            // `.finding` → Task 7's `FindingCard`. Doesn't exist yet, so it
-            // falls through to the same generic `StructuredView` `.coverage`/
-            // `.generic` already use — compiles, and renders something
-            // honest, rather than a silent gap. See this view's own doc
-            // comment.
+        case .finding:
+            // See this view's own doc comment — inert in practice, since
+            // `TranscriptFeed` never routes a `.finding` entry through here.
+            FindingCard(entry: entry, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore)
+        case .coverage, .generic:
             StructuredView(value: entry.structured ?? entry.input)
         }
     }

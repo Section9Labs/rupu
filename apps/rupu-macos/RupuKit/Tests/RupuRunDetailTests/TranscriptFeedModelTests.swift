@@ -1,0 +1,170 @@
+import Testing
+import RupuAPI
+@testable import RupuRunDetail
+
+/// Pure tests for `TranscriptFeed.swift`'s two testable seams:
+/// `flattenedTurnSnippet` (the collapsed header's ~100-char preview) and
+/// `buildFeedRows` (turns re-merged against the standalone `gate_requested`/
+/// `run_complete` events `buildTranscriptViewModel` excludes — see that
+/// function's own doc comment for the exact positioning contract this
+/// exercises). No SwiftUI/`@MainActor` needed — both are plain synchronous
+/// functions over synthetic data.
+@Suite
+struct TranscriptFeedModelTests {
+
+    // MARK: - flattenedTurnSnippet
+
+    @Test func nilContentYieldsAnEmptySnippet() {
+        #expect(flattenedTurnSnippet(nil) == "")
+    }
+
+    @Test func shortContentPassesThroughUnchanged() {
+        #expect(flattenedTurnSnippet("Reading the config file.") == "Reading the config file.")
+    }
+
+    @Test func whitespaceRunsIncludingNewlinesCollapseToASingleSpaceAndTrim() {
+        let content = "  Reading\nthe   config\tfile.  "
+        #expect(flattenedTurnSnippet(content) == "Reading the config file.")
+    }
+
+    @Test func contentOver100CharsTruncatesToNinetyNineCharsPlusEllipsis() {
+        let content = String(repeating: "a", count: 150)
+        let snippet = flattenedTurnSnippet(content)
+        #expect(snippet.count == 100, "99 kept chars + the ellipsis glyph = 100")
+        #expect(snippet.hasSuffix("…"))
+        #expect(snippet == String(repeating: "a", count: 99) + "…")
+    }
+
+    @Test func contentExactlyAtTheLimitIsNotTruncated() {
+        let content = String(repeating: "a", count: 100)
+        #expect(flattenedTurnSnippet(content) == content)
+    }
+
+    // MARK: - buildFeedRows: turns only (no gate/run_complete)
+
+    @Test func turnOnlyEventsProduceOneTurnRowPerTurn() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "hi", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+        ]
+        let rows = buildFeedRows(events: events)
+        #expect(rows.count == 1)
+        guard case .turn(let turn) = rows[0] else {
+            Issue.record("expected a .turn row")
+            return
+        }
+        #expect(turn.id == 0)
+    }
+
+    // MARK: - buildFeedRows: run_complete is always last
+
+    @Test func runCompleteIsAlwaysTheLastRow() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "hi", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+            .runComplete(runID: "r1", status: "ok", totalTokens: 10, durationMS: 100, error: nil),
+        ]
+        let rows = buildFeedRows(events: events)
+        #expect(rows.count == 2)
+        guard case .runComplete(let runID, _, _, _, _) = rows.last else {
+            Issue.record("expected the last row to be .runComplete")
+            return
+        }
+        #expect(runID == "r1")
+    }
+
+    // MARK: - buildFeedRows: gate_requested positioned between turns
+
+    @Test func gateRequestedBetweenTwoTurnStartBoundedTurnsLandsBetweenThem() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "first", thinking: nil),
+            .toolCall(callID: "c1", tool: "read_file", input: .null),
+            .toolResult(callID: "c1", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+            .gateRequested(gateID: "g1", prompt: "continue?", decision: nil, decidedBy: nil),
+            .turnStart(turnIdx: 1),
+            .assistantMessage(content: "second", thinking: nil),
+            .turnEnd(turnIdx: 1, tokensIn: nil, tokensOut: nil),
+            .runComplete(runID: "r1", status: "ok", totalTokens: 10, durationMS: 100, error: nil),
+        ]
+        let rows = buildFeedRows(events: events)
+        #expect(rows.count == 4)
+
+        guard case .turn(let first) = rows[0] else { Issue.record("row 0 should be a turn"); return }
+        #expect(first.id == 0)
+
+        guard case .gate(let gateID, let prompt, _, _) = rows[1] else { Issue.record("row 1 should be the gate"); return }
+        #expect(gateID == "g1")
+        #expect(prompt == "continue?")
+
+        guard case .turn(let second) = rows[2] else { Issue.record("row 2 should be a turn"); return }
+        #expect(second.id == 1)
+
+        guard case .runComplete = rows[3] else { Issue.record("row 3 should be run_complete"); return }
+    }
+
+    @Test func gateRequestedBeforeAnyTurnStartsLandsFirst() {
+        let events: [TranscriptEvent] = [
+            .gateRequested(gateID: "g0", prompt: "proceed?", decision: "approved", decidedBy: "matt"),
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "go", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+        ]
+        let rows = buildFeedRows(events: events)
+        #expect(rows.count == 2)
+        guard case .gate(let gateID, _, let decision, let decidedBy) = rows[0] else {
+            Issue.record("row 0 should be the leading gate")
+            return
+        }
+        #expect(gateID == "g0")
+        #expect(decision == "approved")
+        #expect(decidedBy == "matt")
+        guard case .turn = rows[1] else { Issue.record("row 1 should be the turn"); return }
+    }
+
+    // MARK: - buildFeedRows: fallback mode (no turn_start/turn_end at all)
+
+    @Test func fallbackModeGapTurnBeforeTheFirstAssistantMessageStillGetsItsOwnRowAheadOfAMidStreamGate() {
+        // No turn_start/turn_end anywhere — `buildTranscriptViewModel` falls
+        // back to "each assistant_message opens its own synthetic turn",
+        // with any tool activity ahead of the first one landing in a gap
+        // turn (negative id). A gate arriving between the gap turn's tool
+        // activity and the first assistant_message should flush exactly
+        // that one gap turn first.
+        let events: [TranscriptEvent] = [
+            .toolCall(callID: "c0", tool: "bash", input: .null),
+            .toolResult(callID: "c0", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .gateRequested(gateID: "g1", prompt: "confirm?", decision: nil, decidedBy: nil),
+            .assistantMessage(content: "first reply", thinking: nil),
+            .toolCall(callID: "c1", tool: "grep", input: .null),
+            .toolResult(callID: "c1", output: "found", error: nil, durationMS: 2, structured: nil),
+            .runComplete(runID: "r1", status: "ok", totalTokens: 10, durationMS: 100, error: nil),
+        ]
+        let rows = buildFeedRows(events: events)
+        #expect(rows.count == 4)
+
+        guard case .turn(let gapTurn) = rows[0] else { Issue.record("row 0 should be the gap turn"); return }
+        #expect(gapTurn.id < 0)
+        #expect(gapTurn.tools.count == 1)
+        #expect(gapTurn.tools[0].id == "c0")
+
+        guard case .gate(let gateID, _, _, _) = rows[1] else { Issue.record("row 1 should be the gate"); return }
+        #expect(gateID == "g1")
+
+        guard case .turn(let secondTurn) = rows[2] else { Issue.record("row 2 should be the assistant turn"); return }
+        #expect(secondTurn.assistantText == "first reply")
+        #expect(secondTurn.tools.count == 1)
+        #expect(secondTurn.tools[0].id == "c1")
+
+        guard case .runComplete = rows[3] else { Issue.record("row 3 should be run_complete"); return }
+    }
+
+    // MARK: - buildFeedRows: no standalone events at all
+
+    @Test func emptyEventsProduceEmptyRows() {
+        #expect(buildFeedRows(events: []).isEmpty)
+    }
+}

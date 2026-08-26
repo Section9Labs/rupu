@@ -238,8 +238,12 @@ enum AstGrepTranscriptParsing {
     /// isn't misleading). `matches` is the list actually being RENDERED
     /// (post text-fallback if that's what fired) — always `structured?.
     /// matches` when `structured` is truncated, since truncation only ever
-    /// applies to the structured path. Kept for `TranscriptFeed`'s own
-    /// (pre-Task-7) flat-row rendering, which still calls this.
+    /// applies to the structured path. `AstGrepBodyView` inlines its own
+    /// equivalent count line rather than calling this (its header needs the
+    /// file count too, which this function doesn't take) — kept as its own
+    /// tested pure function regardless, and by the pre-Task-7 `TranscriptFeed`
+    /// flat-row rendering this superseded, whose own tests moved here (see
+    /// `AstGrepModelTests`'s "moved" note above this function's own tests).
     static func matchCountLabel(structured: StructuredResult?, matches: [Match]) -> String {
         if let structured, structured.truncated {
             return "showing first \(structured.matches.count) of \(structured.matchCount) matches"

@@ -327,7 +327,7 @@ public struct SessionDetailScreen: View {
                 Eyebrow(transcriptLabel(store: store))
                 Spacer(minLength: 0)
             }
-            TranscriptFeed(events: store.transcript)
+            TranscriptFeed(events: store.transcript, runID: store.focusedRunID, host: nil)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .panelStyle(.panel)
             sendBox(store: store)

@@ -122,11 +122,11 @@ public struct AgentRunDetailScreen: View {
             case .empty where store.resolvedPath == nil:
                 blockShell { Text("No transcript recorded").font(.noteText).foregroundStyle(Color.rupuMute) }
             case .empty:
-                TranscriptFeed(events: [])
+                TranscriptFeed(events: [], runID: runID, host: host)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .panelStyle(.panel)
             case .content(let events):
-                TranscriptFeed(events: events)
+                TranscriptFeed(events: events, runID: runID, host: host)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .panelStyle(.panel)
             }
