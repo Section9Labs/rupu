@@ -65,8 +65,30 @@ public final class BackendController {
     private var activeEventStream: EventStreamClient?
     private var activeConfig: CPConfig?
 
+    /// Bumped exactly once per `startHealthMonitor(config:)` call — i.e.
+    /// the instant `activeClient`/`activeEventStream` are swapped in to a
+    /// freshly usable pair, independent of whether `health` has reached
+    /// `.healthy` yet (perf & interaction arc, Plan 5 Task 2). `client()`
+    /// is usable — and the SSE endpoint reachable — the moment
+    /// `startHealthMonitor` runs, well before `HealthMonitor`'s own first
+    /// probe round-trip resolves `health` to `.healthy`; a screen that
+    /// waits for `health == .healthy` before activating (the old
+    /// `health -> onChange -> onChange` relay `RootView`/`OverviewScreen`
+    /// used to depend on) pays that extra, unnecessary round trip on every
+    /// cold start for no reason. Screens should key a `.task(id:
+    /// backend.clientGeneration)` off this directly instead — see
+    /// `RootView`/`OverviewScreen` for the converted call sites. `health`
+    /// keeps its own independent semantics for STATUS DISPLAY (the sidebar
+    /// footer dot, the toolbar pill) — this counter is purely an
+    /// activation signal, never surfaced in any UI itself.
+    public private(set) var clientGeneration = 0
+
     private static let modeKey = "backend.mode"
     private static let binaryPathOverrideKey = "rupu.binaryPath"
+    /// Cache key for the last successfully-started `rupu` binary path
+    /// (perf & interaction arc, Plan 5 Task 2) — see `configureEmbedded(port:)`'s
+    /// doc comment on the fast cold-start path this enables.
+    private static let cachedBinaryPathKey = "backend.binaryPath.cached"
 
     public init(
         defaults: UserDefaults = .standard,
@@ -83,11 +105,12 @@ public final class BackendController {
         self.mode = Self.loadPersistedMode(defaults)
     }
 
-    /// Discovers `rupu` (Settings override → `which` → standard paths),
-    /// attaches to (or spawns) `cp serve` on `port`, and starts polling its
-    /// health. A missing binary never touches `EmbeddedServer` — it sets
-    /// `.down` directly with an install hint and leaves `mode`/`origin` nil
-    /// so the caller knows nothing is configured.
+    /// Discovers `rupu` (Settings override → cached path → `which` →
+    /// standard paths), attaches to (or spawns) `cp serve` on `port`, and
+    /// starts polling its health. A missing binary never touches
+    /// `EmbeddedServer` — it sets `.down` directly with an install hint and
+    /// leaves `mode`/`origin` nil so the caller knows nothing is
+    /// configured.
     ///
     /// `discoverBinary` is synchronous and, in production, shells out to
     /// the user's login shell (`RupuDiscovery.loginShellWhich`) — a slow
@@ -95,21 +118,53 @@ public final class BackendController {
     /// calling it inline would hang the UI for that long; `Task.detached`
     /// hops it off the main actor while keeping the injected closure
     /// itself unchanged (tests still pass a fast synchronous fake).
+    ///
+    /// **Cached-path fast start** (perf & interaction arc, Plan 5 Task 2):
+    /// a Settings override always wins, same as before. Absent that, the
+    /// path that successfully started `cp serve` LAST time (persisted under
+    /// `Self.cachedBinaryPathKey`) is used OPTIMISTICALLY — skipping the
+    /// full `discoverBinary` shell-out entirely — since the installed
+    /// binary's location essentially never changes between launches. If
+    /// `EmbeddedServer.start()` then fails against that cached path (moved,
+    /// uninstalled, or otherwise no longer valid — `invalidCachedPath`
+    /// tracks which case this is), the cache is invalidated and this method
+    /// retries EXACTLY ONCE against a fresh full `discoverBinary` call —
+    /// self-healing rather than wedging the app against a stale path
+    /// forever, and `allowCacheRetry: false` on that retry prevents any
+    /// possibility of looping. A cold start with no cache yet (first ever
+    /// launch) always falls through to the full discovery path, same as
+    /// before this task.
     public func configureEmbedded(port: Int) async {
+        await attemptConfigureEmbedded(port: port, allowCacheRetry: true)
+    }
+
+    private func attemptConfigureEmbedded(port: Int, allowCacheRetry: Bool) async {
         await tearDownEmbeddedServer(keepRunning: false)
         healthMonitor?.stop()
         healthMonitor = nil
 
         let override = defaults.string(forKey: Self.binaryPathOverrideKey).flatMap { $0.isEmpty ? nil : $0 }
-        let discoverBinary = discoverBinary
-        let discovered = await Task.detached(priority: .userInitiated) {
-            discoverBinary(override)
-        }.value
-        guard let binaryPath = discovered else {
-            mode = nil
-            origin = nil
-            health = .down("rupu not found — install rupu or set the path in Settings")
-            return
+        let cachedPath = override == nil
+            ? defaults.string(forKey: Self.cachedBinaryPathKey).flatMap { $0.isEmpty ? nil : $0 }
+            : nil
+
+        let binaryPath: String
+        let usedCachedPath: Bool
+        if let cachedPath {
+            binaryPath = cachedPath
+            usedCachedPath = true
+        } else {
+            let discoverBinary = discoverBinary
+            guard let discovered = await Task.detached(priority: .userInitiated, operation: {
+                discoverBinary(override)
+            }).value else {
+                mode = nil
+                origin = nil
+                health = .down("rupu not found — install rupu or set the path in Settings")
+                return
+            }
+            binaryPath = discovered
+            usedCachedPath = false
         }
 
         let server = EmbeddedServer(binaryPath: binaryPath, port: port, probe: embeddedProbe)
@@ -118,8 +173,26 @@ public final class BackendController {
             origin = try await server.start()
         } catch {
             embeddedServer = nil
+            // The cached path may be stale (binary moved/uninstalled since
+            // it was last cached) — invalidate it and retry once against a
+            // fresh full discovery before reporting failure. Never retries
+            // a second time (`allowCacheRetry: false`): if the freshly
+            // rediscovered path ALSO fails to start, that's a real failure
+            // worth surfacing, not something a further retry would fix.
+            if usedCachedPath, allowCacheRetry {
+                defaults.removeObject(forKey: Self.cachedBinaryPathKey)
+                await attemptConfigureEmbedded(port: port, allowCacheRetry: false)
+                return
+            }
             health = .down("failed to start rupu cp serve: \(error)")
             return
+        }
+
+        // A successful start (cached or freshly discovered) is exactly
+        // what's worth caching for next launch — an override is deliberate
+        // operator configuration and is never cached over.
+        if override == nil {
+            defaults.set(binaryPath, forKey: Self.cachedBinaryPathKey)
         }
 
         let newMode = BackendMode.embedded(port: port)
@@ -295,6 +368,12 @@ public final class BackendController {
         health = monitor.health
         monitor.start()
         observe(monitor)
+
+        // `client()`/`eventStream()` are usable THIS INSTANT — bumped after
+        // both are already assigned above, so any observer reacting to the
+        // change sees a fully-wired pair, never a half-updated one. See
+        // `clientGeneration`'s own doc comment.
+        clientGeneration += 1
     }
 
     /// Bridges the child `HealthMonitor`'s `@Observable` state into this

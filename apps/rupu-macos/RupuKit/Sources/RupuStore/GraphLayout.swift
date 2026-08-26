@@ -1,5 +1,12 @@
 import RupuAPI
-import RupuStore
+
+// Perf & interaction arc, Plan 5 Task 3: moved here from `RupuRunDetail`
+// alongside `RunDetailStore`'s new derived `graphVM` — `layoutGraph` now
+// runs store-side (a coalesced recompute, not inline in the view body per
+// event), and `RupuStore` cannot depend back on `RupuRunDetail` (which
+// depends on it) to reach these types. `StepKind` moved the same way (see
+// `StepKind.swift`); `RupuRunDetail/StepGraphView.swift`/`Graph/*.swift`
+// still render all of this, unchanged, via their existing `import RupuStore`.
 
 /// One branch/panelist lane's view model — a leaf under a `parallel`/`panel`
 /// node's `subSteps`.
@@ -187,9 +194,21 @@ public func layoutGraph(
             return UnitVM(id: index, key: key, state: state, transcriptPath: transcriptPath)
         }
 
-        let done = unitVMs.filter { if case .done(true) = $0.state { true } else { false } }.count
-        let failed = unitVMs.filter { if case .done(false) = $0.state { true } else { false } }.count
-        let running = unitVMs.filter { $0.state == .running }.count
+        // Perf & interaction arc, Plan 5 Task 3: one pass over `unitVMs`
+        // rather than three separate `filter { }.count` passes — same
+        // counts, computed together instead of walking the (potentially
+        // large, for a wide fan-out) unit list three times over.
+        var done = 0
+        var failed = 0
+        var running = 0
+        for unit in unitVMs {
+            switch unit.state {
+            case .done(true): done += 1
+            case .done(false): failed += 1
+            case .running: running += 1
+            default: break
+            }
+        }
 
         return FanoutVM(units: unitVMs, done: done, failed: failed, running: running, total: unitVMs.count)
     }

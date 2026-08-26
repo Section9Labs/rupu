@@ -201,6 +201,87 @@ private func listItemComponents(_ line: String) -> (indent: Int, ordered: Bool, 
 
 // MARK: - Rendering
 
+/// One cached parse result — a class (not a struct) because `NSCache`
+/// requires a class-typed `ObjectType`. Holds the exact `source` string
+/// alongside the parsed `blocks` as a collision guard: `MarkdownBlockCache`
+/// keys by a cheap `Hasher`-based digest of `source`, not the full string
+/// (perf & interaction arc, Plan 5 Task 3), so a hash collision between two
+/// different sources must never silently serve the wrong entry's blocks —
+/// every lookup re-confirms the full string matches before trusting a hit.
+private final class CachedMarkdownBlocks {
+    let source: String
+    let blocks: [MarkdownBlock]
+
+    init(source: String, blocks: [MarkdownBlock]) {
+        self.source = source
+        self.blocks = blocks
+    }
+}
+
+/// Memoizes `parseMarkdownBlocks(_:)` by source text (perf & interaction arc,
+/// Plan 5 Task 3): `MarkdownView.init` used to re-parse its `source` on
+/// EVERY init — and a `Turn`'s `assistantText`/`thinking` never changes once
+/// a turn has landed, so the live transcript feed's expanded last turn was
+/// re-parsing byte-identical markdown on every single re-render while a run
+/// streamed. `NSCache` (not a plain dict, matching `CodeHighlighter`'s own
+/// `@MainActor`-confined choice of a plain dict for ITS cache — see that
+/// type's doc comment): this cache is reachable from any `MarkdownView`
+/// init, which is not actor-isolated at all (a `View`'s `init` runs
+/// wherever SwiftUI happens to construct it), so an actual cross-thread-safe
+/// cache is needed here, and `NSCache` already provides that plus automatic
+/// eviction under memory pressure for free.
+enum MarkdownBlockCache {
+    /// `nonisolated(unsafe)`: `NSCache` isn't `Sendable` in the type system,
+    /// but it IS documented thread-safe internally (Apple's own docs: "you
+    /// can add, remove, and query items in the cache from different threads
+    /// without having to lock the cache yourself") — no external lock is
+    /// needed the way `RenderMeter`'s plain `[String: Int]` dict required
+    /// one. `blocks(for:)` is called from `MarkdownView.init`, which runs on
+    /// whatever thread SwiftUI happens to construct that view on.
+    nonisolated(unsafe) private static let cache = NSCache<NSNumber, CachedMarkdownBlocks>()
+
+    /// Guards `parseCallCount` below — plain `NSLock`, same rationale as
+    /// `RenderMeter.lock`: `blocks(for:)` isn't actor-isolated, so a counter
+    /// bump needs its own synchronization independent of `NSCache`'s.
+    private static let countLock = NSLock()
+
+    /// Bumped on every actual `parseMarkdownBlocks` call (a cache MISS),
+    /// never on a hit — the pure counter `MarkdownBlockCacheTests` asserts
+    /// against, mirroring `CodeHighlighter.highlightCallCount`'s exact
+    /// rationale: proves a repeated call for the same source text actually
+    /// short-circuits the parse rather than merely happening to return an
+    /// equal-looking result. Default (internal) access so `@testable import
+    /// RupuRunDetail` can read it.
+    nonisolated(unsafe) static var parseCallCount = 0
+
+    static func blocks(for source: String) -> [MarkdownBlock] {
+        var hasher = Hasher()
+        hasher.combine(source)
+        let key = NSNumber(value: hasher.finalize())
+
+        if let cached = cache.object(forKey: key), cached.source == source {
+            return cached.blocks
+        }
+
+        countLock.lock()
+        parseCallCount += 1
+        countLock.unlock()
+        let parsed = parseMarkdownBlocks(source)
+        cache.setObject(CachedMarkdownBlocks(source: source, blocks: parsed), forKey: key)
+        return parsed
+    }
+
+    /// Test-only reset (default access — reached via `@testable import
+    /// RupuRunDetail`): clears the process-wide cache and miss counter to a
+    /// clean slate.
+    static func resetForTesting() {
+        cache.removeAllObjects()
+        countLock.lock()
+        parseCallCount = 0
+        countLock.unlock()
+    }
+}
+
 /// Renders a parsed markdown document per the V2-CONTRACT "Transcript" spec: prose is sans at
 /// `uiText` scale; inline code is `dataMono` on `rupuSurface`; quotes get a 2px `rupuBorder` left
 /// bar with `rupuDim` text; fenced code goes through Task 1's `CodeBlock` (syntax highlighting);
@@ -221,7 +302,7 @@ public struct MarkdownView: View {
     private let blocks: [MarkdownBlock]
 
     public init(_ source: String) {
-        self.blocks = parseMarkdownBlocks(source)
+        self.blocks = MarkdownBlockCache.blocks(for: source)
     }
 
     public var body: some View {

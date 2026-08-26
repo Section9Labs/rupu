@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Testing
 import RupuDesign
+import RupuStore
 @testable import RupuRunDetail
 
 /// Resolves a `Color` to its 8-bit sRGB components under a forced appearance — same technique

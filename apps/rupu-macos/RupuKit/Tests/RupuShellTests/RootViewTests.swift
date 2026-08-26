@@ -72,3 +72,37 @@ private func makeRootView() -> (root: RootView, model: AppModel, backend: Backen
     root.handleHealthChange(.incompatible(serverVersion: "0.1.0"))
     #expect(model.liveConnected == false, ".incompatible must force liveConnected false")
 }
+
+/// `activateOnClientAvailable()` (perf & interaction arc, Plan 5 Task 2 —
+/// the `.task(id: backend.clientGeneration)`-driven replacement for the old
+/// health-gated activation) is a safe no-op before any client exists, and
+/// safe to call repeatedly (idempotent) once one does — mirroring every
+/// other `activate`-style method's "safe to call more than once" contract
+/// in this codebase. `hostsFooter`/`palette` are private `@State`, so this
+/// only asserts the observable half: no client yet means nothing crashes
+/// and `backend.client()` stays `nil`; a real client (via `configureEmbedded`)
+/// lets repeated calls run without ever throwing/crashing.
+@MainActor @Test func activateOnClientAvailableIsANoOpWithoutAClientAndIdempotentOnceOneExists() async {
+    let (root, _, backend) = makeRootView()
+
+    // No client yet (discoverBinary returns nil in `makeRootView()`) — must
+    // not crash.
+    root.activateOnClientAvailable()
+    #expect(backend.client() == nil)
+
+    // Swap in a controller that DOES resolve a client, then call it twice.
+    let defaults = UserDefaults(suiteName: "test-\(UUID())")!
+    let model = AppModel(defaults: defaults)
+    let connectedBackend = BackendController(
+        defaults: defaults,
+        tokenStore: FakeTokenStore(),
+        discoverBinary: { _ in "/fake/path/to/rupu" },
+        embeddedProbe: { _ in true }
+    )
+    await connectedBackend.configureEmbedded(port: 7420)
+    #expect(connectedBackend.client() != nil)
+
+    let connectedRoot = RootView(model: model, backend: connectedBackend)
+    connectedRoot.activateOnClientAvailable()
+    connectedRoot.activateOnClientAvailable() // idempotent — must not crash or duplicate
+}

@@ -165,20 +165,30 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
 /// charts → cycles → fleet order — see `OverviewWidgets.defaultOrder`), in
 /// one vertical `ScrollView` stack.
 ///
-/// Owns two independent store lifecycles, mirroring `RunDetailScreen`'s
-/// pattern (build lazily once `backend.client()` exists, activate on
-/// appear, deactivate `.onDisappear`) rather than `ActivityScreen`'s
+/// Owns `DashboardStore`'s lifecycle, mirroring `RunDetailScreen`'s pattern
+/// (build lazily once `backend.client()` exists, activate on appear,
+/// deactivate `.onDisappear`) rather than `ActivityScreen`'s
 /// `.task(id:)`-per-kind shape — this screen has no per-instance identity
-/// that changes while mounted, so a single `.task` (built once, reused on
-/// any transient re-render) is enough, EXCEPT that `activate()` still
-/// rebuilds both stores if `backend.client()`'s identity has changed since
-/// they were built (an embedded/remote switch, reconnect, or restart) —
-/// see `activate()`'s doc comment:
-/// - `DashboardStore` — the merged fleet aggregate behind blocks 3-6.
+/// that changes while mounted, so a single `.task(id: backend.
+/// clientGeneration)` (fires on first appearance and on any client swap) is
+/// enough, EXCEPT that `activate()` still rebuilds `dashboardStore` if
+/// `backend.client()`'s identity has changed since it was built (an
+/// embedded/remote switch, reconnect, or restart) — see `activate()`'s doc
+/// comment:
+/// - `DashboardStore` — the merged fleet aggregate behind blocks 3-6. Built
+///   and owned here.
 /// - `ActivityStore` (kind `.all`, `liveTail` on by default, `scopeFilter`
 ///   **never set** — see `NeedsYouCard`'s doc comment: the needs-you queue
 ///   is fleet-wide by design, deliberately blind to the top bar's project
-///   scope) — feeds the needs-you queue alone.
+///   scope) — feeds the needs-you queue alone. **Shared, not owned** (perf
+///   & interaction arc, Plan 5 Task 2): `activityStore` is the SAME
+///   instance `ActivityScreen` drives, built once at `RootView` and
+///   injected here — this screen used to build a SECOND, independent
+///   instance purely for this, each with its own resting SSE connection;
+///   see `RootView.activityStore`'s doc comment. This screen still
+///   `activate(kind: .all)`s/`deactivate()`s it on its own appear/disappear
+///   — reconfiguring the shared instance to its own needs is safe since
+///   `ActivityScreen`/`OverviewScreen` are mutually exclusive routes.
 ///
 /// **Range reactivity**: `model.range` already drives the toolbar's
 /// segmented picker; this screen has no range selector of its own.
@@ -201,18 +211,21 @@ public struct OverviewWidgets: Codable, Equatable, Sendable {
 /// every other screen's initial-load state.
 public struct OverviewScreen: View {
     @Bindable var model: AppModel
-    /// `@Bindable`, not a plain `let`, so `.onChange(of: backend.health)`
-    /// below observes it the same way `RootView`/`OnboardingView` already
-    /// do — see the cold-launch fix note on `body`.
-    @Bindable var backend: BackendController
+    let backend: BackendController
 
     @State private var dashboardStore: DashboardStore?
-    @State private var activityStore: ActivityStore?
 
-    /// Tracked so `activate()` rebuilds both stores on a backend client swap
-    /// (embedded/remote switch, reconnect, restart) — see that method's doc
-    /// comment and `BackendController.clientIdentity()`.
-    @State private var storeClientID: ObjectIdentifier?
+    /// Tracked so `activate()` rebuilds `dashboardStore` on a backend client
+    /// swap (embedded/remote switch, reconnect, restart) — see that
+    /// method's doc comment and `BackendController.clientIdentity()`.
+    @State private var dashboardStoreClientID: ObjectIdentifier?
+
+    /// The single shared instance `RootView` constructs and injects — see
+    /// the type doc comment's "ActivityStore" bullet and `RootView.
+    /// activityStore`'s own doc comment. `nil` only while the backend isn't
+    /// connected yet (mirrors every other backend-dependent seam in this
+    /// screen).
+    let activityStore: ActivityStore?
 
     @AppStorage(OverviewWidgets.storageKey) private var widgetsData: Data = Data()
 
@@ -233,9 +246,10 @@ public struct OverviewScreen: View {
     /// Customize menu writing the same key from elsewhere).
     @State private var widgets: OverviewWidgets
 
-    public init(model: AppModel, backend: BackendController) {
+    public init(model: AppModel, backend: BackendController, activityStore: ActivityStore?) {
         self.model = model
         self.backend = backend
+        self.activityStore = activityStore
         _widgets = State(initialValue: OverviewWidgets.load(defaults: .standard))
     }
 
@@ -253,31 +267,25 @@ public struct OverviewScreen: View {
         .onChange(of: widgetsData) { _, newValue in
             widgets = OverviewWidgets.decode(newValue)
         }
-        .task {
+        // Direct client-availability signal (perf & interaction arc, Plan 5
+        // Task 2) — replaces the old `.task { }` + `.onChange(of: backend.
+        // health)` cold-launch relay. `.overview` is `AppModel.route`'s
+        // default and never persisted (see `AppModel.swift` — only
+        // `range`/`scopeWsID`/`onboardingComplete` are), so this is
+        // *always* the very first screen a launch renders — often before
+        // `backend.client()` resolves. `backend.clientGeneration` bumps the
+        // instant a client becomes usable, well before `backend.health`
+        // reaches `.healthy` (see that property's doc comment on
+        // `BackendController`) — waiting for the extra health round trip
+        // bought this screen nothing but delay. `.task(id:)` fires on this
+        // screen's first appearance (whatever the current generation is)
+        // AND on every later bump (an embedded/remote switch, reconnect,
+        // restart); `activate()`'s own client-identity rebuild makes a
+        // repeat call idempotent (reuses `dashboardStore` unless the client
+        // actually changed), so firing this on every bump — not just the
+        // first — is safe.
+        .task(id: backend.clientGeneration) {
             await activate()
-        }
-        // Cold-launch fix: `.overview` is `AppModel.route`'s default and
-        // never persisted (see `AppModel.swift` — only `range`/`scopeWsID`/
-        // `onboardingComplete` are), so this is *always* the very first
-        // screen a launch renders — before onboarding has necessarily
-        // finished attaching/spawning the embedded server. The `.task`
-        // above fires immediately on that first render, while
-        // `backend.health` is still `.starting` and `backend.client()` is
-        // `nil` — `activate()` early-returns, and with no *second* trigger,
-        // this screen was stuck showing `notReadyView` forever even after
-        // health reached `.healthy` and the toolbar/footer went live
-        // (`ActivityScreen`/`RunDetailScreen` never surfaced this because
-        // neither can be the cold-launch screen — see their own doc
-        // comments — so their `.task` always ran again on a subsequent,
-        // already-connected navigation). Re-running `activate()` on every
-        // transition to `.healthy` closes the gap; `activate()`'s
-        // client-identity rebuild (fix round 1) already makes a repeat call
-        // idempotent (reuses the existing pair unless the client actually
-        // changed), so firing this on every healthy transition — not just
-        // the first — is safe.
-        .onChange(of: backend.health) { _, newHealth in
-            guard case .healthy = newHealth else { return }
-            Task { await activate() }
         }
         .onChange(of: model.range) { _, newRange in
             // Fix round 1: a bare `Task { await dashboardStore?.setRange(...) }`
@@ -299,49 +307,51 @@ public struct OverviewScreen: View {
         }
         .onDisappear {
             dashboardStore?.deactivate()
-            activityStore?.deactivate()
             // Cleared, not just deactivated: this is what the range-change
             // guard above checks, and it's what makes `activate()` rebuild
             // rather than silently no-op if this exact screen instance ever
             // reappears (see that method's `dashboardStore == nil` clause).
             dashboardStore = nil
-            activityStore = nil
+            // `activityStore` is NOT owned here (see the type doc comment's
+            // "ActivityStore" bullet) — deactivated (this screen is done
+            // with it), but never nilled; it's `RootView`'s injected
+            // reference, and the next appearance's `activate()` below
+            // re-`activate(kind: .all)`s the SAME instance rather than
+            // rebuilding it.
+            activityStore?.deactivate()
         }
     }
 
-    /// Builds both stores lazily (once `backend.client()` exists — shouldn't
-    /// stay `nil` by the time the shell can route here, same reasoning
-    /// `ActivityScreen`/`RunDetailScreen` already document) and activates
-    /// them. Reuses an existing pair on a later call rather than rebuilding
-    /// — this screen has no per-instance identity (like `RunDetailScreen`'s
-    /// `runID`) to rebuild around — UNLESS either store is currently `nil`
-    /// (nothing built yet, or `onDisappear` cleared a torn-down screen's
-    /// pair) or `backend.client()`'s identity has changed since the current
-    /// pair was built: an embedded/remote mode switch, a manual reconnect,
-    /// or a restart all swap `backend.client()` to a brand-new `CPClient`
-    /// directly (never through `nil` in between — see
+    /// Builds/rebuilds `dashboardStore` lazily (once `backend.client()`
+    /// exists — shouldn't stay `nil` by the time the shell can route here,
+    /// same reasoning `ActivityScreen`/`RunDetailScreen` already document)
+    /// and activates it, and (re)activates the SHARED `activityStore` — see
+    /// the type doc comment's "ActivityStore" bullet — with THIS screen's
+    /// own `kind: .all`, no scope. Reuses an existing `dashboardStore` on a
+    /// later call rather than rebuilding — this screen has no per-instance
+    /// identity (like `RunDetailScreen`'s `runID`) to rebuild around —
+    /// UNLESS it's currently `nil` (nothing built yet, or `onDisappear`
+    /// cleared a torn-down screen's store) or `backend.client()`'s identity
+    /// has changed since it was built: an embedded/remote mode switch, a
+    /// manual reconnect, or a restart all swap `backend.client()` to a
+    /// brand-new `CPClient` directly (never through `nil` in between — see
     /// `BackendController.clientIdentity()`'s doc comment), so a plain "do I
-    /// already have a pair" check would never notice and would keep running
-    /// both stores against the abandoned connection.
+    /// already have a store" check would never notice and would keep
+    /// running it against the abandoned connection. `activityStore` needs
+    /// no such rebuild check here — `RootView` already handles that.
     private func activate() async {
         guard let client = backend.client() else { return }
         let clientID = backend.clientIdentity()
 
-        if dashboardStore == nil || activityStore == nil || storeClientID != clientID {
+        if dashboardStore == nil || dashboardStoreClientID != clientID {
             dashboardStore?.deactivate()
-            activityStore?.deactivate()
             dashboardStore = DashboardStore(client: client, signalsFactory: Self.makeSignalsFactory(backend: backend))
-            activityStore = ActivityStore(
-                client: client,
-                signalsFactory: Self.makeSignalsFactory(backend: backend),
-                pendingActions: backend.pendingActions
-            )
-            storeClientID = clientID
+            dashboardStoreClientID = clientID
         }
 
-        guard let dStore = dashboardStore, let aStore = activityStore else { return }
+        guard let dStore = dashboardStore else { return }
         async let dashboardActivation: Void = dStore.activate(range: model.range)
-        async let activityActivation: Void = aStore.activate(kind: .all)
+        async let activityActivation: Void? = activityStore?.activate(kind: .all)
         _ = await (dashboardActivation, activityActivation)
     }
 
@@ -528,18 +538,16 @@ public struct OverviewScreen: View {
 
     // MARK: - Firehose plumbing
 
-    /// Duplicated, deliberately, from `ActivityScreen.makeSignalsFactory`
-    /// (private to that type, so not a shared symbol to begin with) —
-    /// builds this screen's own independent firehose connection via
-    /// `backend.makeFirehoseStream(onConnectionChange:)`, same rationale as
-    /// that type's doc comment: `backend.eventStream()`'s
-    /// `onConnectionChange` slot is already claimed by `RootView`, so any
-    /// second consumer (here, feeding both `DashboardStore` and this
-    /// screen's own `ActivityStore`) needs its own connection paired
-    /// honestly with its own connection-state callback. Both stores call
-    /// this same static helper — each gets its OWN stream instance (the
-    /// closure is re-invoked per store, not shared), matching
-    /// `ActivityScreen`'s "captures only `backend`" `@Sendable` shape.
+    /// Builds `dashboardStore`'s own independent firehose connection via
+    /// `backend.makeFirehoseStream(onConnectionChange:)` — `backend.
+    /// eventStream()`'s `onConnectionChange` slot is already claimed by
+    /// `RootView`, so this consumer needs its own connection paired
+    /// honestly with its own connection-state callback, same rationale
+    /// `RootView.makeActivitySignalsFactory` documents for the shared
+    /// `ActivityStore`'s equivalent connection (that store no longer builds
+    /// its firehose connection here — see the type doc comment's
+    /// "ActivityStore" bullet — so this helper now backs `dashboardStore`
+    /// alone).
     private static func makeSignalsFactory(
         backend: BackendController
     ) -> @Sendable () -> AsyncStream<StreamSignal<CPEvent>> {

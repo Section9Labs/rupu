@@ -502,10 +502,55 @@ public final class DashboardStore {
     // MARK: - Fetch cycle
 
     /// The shared engine behind `activate(range:)`, `setRange(_:)`, and the
-    /// reconcile loop's tick: bumps `generation`, discovers the fleet
-    /// (`GET /api/hosts`), reseeds `hostStates` from the fresh host list,
-    /// then fetches `"local"` first (awaited — see the type's doc comment)
-    /// and every other seeded host as an independent background `Task`.
+    /// reconcile loop's tick: fetches `"local"` FIRST — AWAITED, so this
+    /// method (and therefore `activate(range:)`/`setRange(_:)`) doesn't
+    /// return until it lands — then kicks off fleet discovery (`GET
+    /// /api/hosts`) and every other host's fetch as an independent
+    /// background `Task`, entirely off this method's own critical path.
+    ///
+    /// **Local-first, not just remote-progressive** (perf & interaction
+    /// arc, Plan 5 Task 2): the original shape here awaited `GET
+    /// /api/hosts` — AND every seeded host's own fetch loop it drove —
+    /// before this method could return at all. `GET /api/hosts` itself
+    /// live-probes every registered remote host concurrently (`list_hosts`
+    /// in `crates/rupu-cp/src/api/hosts.rs`) and, being one `join_all`'d
+    /// HTTP response, still waits on the SLOWEST probe before answering —
+    /// so a fleet with one slow/offline node blocked `activate(range:)`
+    /// itself (not just `merged`) from returning until that whole probe
+    /// round finished, the exact class of stall this type's per-host
+    /// progressive loading otherwise exists to avoid. Discovery (and every
+    /// remote host's own fetch) is now dispatched from
+    /// `discoverFleetAndRemoteHosts(generation:)` below — a plain,
+    /// non-`async` function that spawns its own `Task` and returns
+    /// immediately, same "fire, don't await" shape
+    /// `ActivityStore.loadRemoteHosts(generation:)` already establishes —
+    /// so `refetchAll()` returns the instant `"local"`'s own fetch lands,
+    /// fully independent of fleet-discovery latency.
+    private func refetchAll() async {
+        generation += 1
+        let currentGeneration = generation
+        cancelHostTasks()
+
+        // Seed (or keep, on a later reconcile cycle — same "no flash"
+        // principle `discoverFleetAndRemoteHosts` below applies to every
+        // OTHER host) `"local"`'s own slice, then fetch it — the only
+        // AWAITED step in this method.
+        if !hostStates.contains(where: { $0.id == Self.localHostID }) {
+            hostStates.append(HostSlice(id: Self.localHostID, name: Self.localHostID, transportKind: "local", state: .loading))
+        }
+        await performLocalFetchFirst(generation: currentGeneration)
+        guard currentGeneration == generation else { return }
+
+        discoverFleetAndRemoteHosts(generation: currentGeneration)
+    }
+
+    /// Discovers the fleet (`GET /api/hosts`) and fires every OTHER seeded
+    /// host's own fetch as an independent `Task` — off `refetchAll`'s
+    /// critical path entirely (see that method's doc comment). Not `async`:
+    /// spawning its own `Task` and returning immediately is what lets
+    /// `refetchAll()` return right after `"local"` lands, rather than
+    /// waiting out this call's own (potentially slow) `GET /api/hosts`
+    /// round trip.
     ///
     /// Review fix (round 1, minor): a HOST ALREADY PRESENT in `hostStates`
     /// keeps its current slice `state` across the reseed rather than being
@@ -528,63 +573,103 @@ public final class DashboardStore {
     /// host list) are pruned — a host that's still registered keeps
     /// contributing its last-known-good numbers to `merged` until its own
     /// fresh fetch lands and replaces them.
-    private func refetchAll() async {
-        generation += 1
-        let currentGeneration = generation
-        cancelHostTasks()
-
-        let hosts: [APIHostRow]
-        do {
-            hosts = try await client.hosts()
-        } catch {
-            // Final-review fix (Task 1): a THROWN `GET /api/hosts` call is a
-            // transient failure, not evidence the fleet is empty. The prior
-            // `(try? await client.hosts()) ?? []` idiom conflated the two —
-            // a blip on this 60s reconcile tick reseeded `hostStates` empty,
-            // pruned every `okResponses` entry, nil'd `merged`, and stamped
-            // a lying "no hosts registered" `pageError` (this type keeps
-            // last-known-good on every OTHER failure path; this was the one
-            // exception). Leave every existing slice, `okResponses`, and
-            // `merged` exactly as they were — the cycle simply doesn't
-            // advance this tick. The next reconcile tick (or an explicit
-            // `activate`/`setRange`) retries from scratch.
-            return
-        }
-        guard currentGeneration == generation else { return }
-
-        let previousStates = Dictionary(uniqueKeysWithValues: hostStates.map { ($0.id, $0.state) })
-        hostStates = hosts.map { host in
-            HostSlice(
-                id: host.id, name: host.name, transportKind: host.transportKind,
-                state: previousStates[host.id] ?? .loading
-            )
-        }
-
-        let currentIDs = Set(hostStates.map(\.id))
-        okResponses = okResponses.filter { currentIDs.contains($0.key) }
-        recomputeMerged()
-
-        pendingHostIDs = currentIDs
-
-        // A genuinely EMPTY `GET /api/hosts` response (200, zero entries) —
-        // as opposed to the thrown case handled above — really does mean
-        // "no hosts registered", so this message stays honest here.
-        guard !hostStates.isEmpty else {
-            pageError = "no hosts registered"
-            return
-        }
-
-        if let localSlice = hostStates.first(where: { $0.id == Self.localHostID }) {
-            await performFetch(hostID: localSlice.id, generation: currentGeneration)
-        }
-
-        for slice in hostStates where slice.id != Self.localHostID {
-            let task = Task { [weak self] in
-                guard let self else { return }
-                await self.performFetch(hostID: slice.id, generation: currentGeneration)
+    private func discoverFleetAndRemoteHosts(generation: Int) {
+        let task = Task { [weak self] in
+            guard let self else { return }
+            let hosts: [APIHostRow]
+            do {
+                hosts = try await self.client.hosts()
+            } catch {
+                // Final-review fix (Task 1): a THROWN `GET /api/hosts` call
+                // is a transient failure, not evidence the fleet is empty.
+                // The prior `(try? await client.hosts()) ?? []` idiom
+                // conflated the two — a blip on this 60s reconcile tick
+                // reseeded `hostStates` empty, pruned every `okResponses`
+                // entry, nil'd `merged`, and stamped a lying "no hosts
+                // registered" `pageError` (this type keeps last-known-good
+                // on every OTHER failure path; this was the one exception).
+                // Leave every existing slice, `okResponses`, and `merged`
+                // exactly as they were — the cycle simply doesn't advance
+                // this tick. The next reconcile tick (or an explicit
+                // `activate`/`setRange`) retries from scratch.
+                return
             }
-            hostTasks.append(task)
+            guard generation == self.generation else { return }
+
+            let previousStates = Dictionary(uniqueKeysWithValues: self.hostStates.map { ($0.id, $0.state) })
+            self.hostStates = hosts.map { host in
+                HostSlice(
+                    id: host.id, name: host.name, transportKind: host.transportKind,
+                    state: previousStates[host.id] ?? .loading
+                )
+            }
+
+            let currentIDs = Set(self.hostStates.map(\.id))
+            self.okResponses = self.okResponses.filter { currentIDs.contains($0.key) }
+            self.recomputeMerged()
+
+            // `"local"` already resolved before this task ever started —
+            // excluded here so it isn't counted as still-pending a second
+            // time; every OTHER seeded host is freshly pending as of this
+            // reseed.
+            self.pendingHostIDs = currentIDs.subtracting([Self.localHostID])
+
+            // The one-time "zero ok, nothing left pending" check
+            // `performLocalFetchFirst` deliberately deferred: now that the
+            // full fleet is known, a fleet of `"local"` alone (no remote
+            // hosts at all) whose local fetch already failed has nothing
+            // left to ever resolve it — report honestly rather than
+            // sitting at `.loading` forever. A fleet WITH remote hosts
+            // leaves this false (they're still pending in
+            // `pendingHostIDs`), and `performFetch` picks up the same check
+            // once they resolve.
+            if self.pendingHostIDs.isEmpty && self.okResponses.isEmpty {
+                self.pageError = "no host reported dashboard data"
+            }
+
+            // A genuinely EMPTY `GET /api/hosts` response (200, zero
+            // entries) — as opposed to the thrown case handled above —
+            // really does mean "no hosts registered", so this message
+            // stays honest here.
+            guard !self.hostStates.isEmpty else {
+                self.pageError = "no hosts registered"
+                return
+            }
+
+            // `"local"` was already fetched before this task started —
+            // only every OTHER seeded host still needs firing.
+            for slice in self.hostStates where slice.id != Self.localHostID {
+                let hostTask = Task { [weak self] in
+                    guard let self else { return }
+                    await self.performFetch(hostID: slice.id, generation: generation)
+                }
+                self.hostTasks.append(hostTask)
+            }
         }
+        hostTasks.append(task)
+    }
+
+    /// `"local"`'s own FIRST fetch of a cycle, dispatched before `GET
+    /// /api/hosts` has even been called — see `refetchAll`'s "Local-first,
+    /// not just remote-progressive" doc comment section. Applies the
+    /// outcome to `hostStates`/`okResponses`/`merged` exactly like
+    /// `performFetch(hostID:generation:)`, but deliberately does NOT touch
+    /// `pendingHostIDs` or check for `pageError`: the full pending set
+    /// (which remote hosts exist, if any) isn't known until `GET
+    /// /api/hosts` resolves just after this returns, so checking "zero ok,
+    /// all resolved" now — based on local alone — could wrongly declare
+    /// "nothing reported" while a real remote host hasn't even been
+    /// discovered yet (this was a real regression the ordering flip
+    /// introduced, caught by
+    /// `debouncedLocalOnlyRefreshDuringAFailingLocalNeverFalselyFlashesPageErrorWhileARemoteHostIsStillPending`).
+    /// `refetchAll` performs that check itself, once, right after
+    /// `pendingHostIDs` is (re)established from the fresh host list — see
+    /// its "no host reported dashboard data" call site just below the
+    /// `!hostStates.isEmpty` guard.
+    private func performLocalFetchFirst(generation: Int) async {
+        let outcome = await fetchOutcome(hostID: Self.localHostID)
+        guard generation == self.generation else { return }
+        apply(outcome, hostID: Self.localHostID)
     }
 
     /// One host's fetch: resolves to an outcome, applies it (if this cycle

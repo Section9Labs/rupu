@@ -167,4 +167,64 @@ struct TranscriptFeedModelTests {
     @Test func emptyEventsProduceEmptyRows() {
         #expect(buildFeedRows(events: []).isEmpty)
     }
+
+    // MARK: - FeedRow.id (perf & interaction arc, Plan 5 Task 3: `ForEach`
+    // now keys on this instead of positional `\.offset`)
+
+    @Test func turnRowIDIsStableAcrossEqualTurnsIncludingNegativeGapTurnIDs() {
+        let events: [TranscriptEvent] = [
+            .toolCall(callID: "c0", tool: "bash", input: .null),
+            .toolResult(callID: "c0", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .assistantMessage(content: "hi", thinking: nil),
+        ]
+        let firstPass = buildFeedRows(events: events)
+        let secondPass = buildFeedRows(events: events)
+        #expect(firstPass.map(\.id) == secondPass.map(\.id), "identical input must always produce identical row ids")
+
+        guard case .turn(let gapTurn) = firstPass[0] else { Issue.record("expected the gap turn first"); return }
+        #expect(gapTurn.id < 0, "the gap turn's id is negative — this is the case the brief calls out by name")
+        #expect(firstPass[0].id == "turn:\(gapTurn.id)")
+    }
+
+    @Test func gateAndRunCompleteRowIDsAreKindPrefixedSoTheyCanNeverCollideWithATurn() {
+        let events: [TranscriptEvent] = [
+            .gateRequested(gateID: "42", prompt: "continue?", decision: nil, decidedBy: nil),
+            .runComplete(runID: "42", status: "ok", totalTokens: 1, durationMS: 1, error: nil),
+        ]
+        let rows = buildFeedRows(events: events)
+        #expect(rows.map(\.id) == ["gate:42", "runComplete:42"], "same underlying id string, but kind-prefixed so they never collide with each other or a turn")
+    }
+
+    // MARK: - TranscriptFeed's `computeRows` seam (perf & interaction arc,
+    // Plan 5 Task 3): `rows`/`sawRunComplete` are computed exactly once at
+    // init (the initial mount) via the injectable `computeRows` closure —
+    // this is the one part of the "computed once per event, not once per
+    // body pass" contract this test target can assert directly without a
+    // SwiftUI view-hosting harness (which it has none of); the ongoing
+    // "recomputed once per event, not once per body pass" half of that
+    // contract rests on `.onChange(of: events.count)`'s own documented
+    // "fires only when the tracked value changed" behavior.
+    @Test @MainActor func initComputesRowsAndSawRunCompleteExactlyOnceViaTheInjectedSeam() {
+        final class CallCounter {
+            var count = 0
+        }
+        let counter = CallCounter()
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "hi", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+            .runComplete(runID: "r1", status: "ok", totalTokens: 1, durationMS: 1, error: nil),
+        ]
+        let feed = TranscriptFeed(
+            events: events, runID: nil, host: nil, sourcePreviewStore: nil,
+            computeRows: { evts in
+                counter.count += 1
+                return buildFeedRows(events: evts)
+            }
+        )
+
+        #expect(counter.count == 1, "init must call computeRows exactly once, not twice (the old computed-property bug)")
+        #expect(feed.rows.count == 2, "one turn row + the run_complete row")
+        #expect(feed.sawRunComplete == true)
+    }
 }

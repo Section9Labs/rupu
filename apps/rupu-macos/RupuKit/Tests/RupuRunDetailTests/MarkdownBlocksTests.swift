@@ -209,4 +209,62 @@ struct MarkdownBlocksTests {
             #expect(run.link == nil)
         }
     }
+
+}
+
+// MARK: - MarkdownBlockCache (perf & interaction arc, Plan 5 Task 3:
+// `MarkdownView.init` used to re-run `parseMarkdownBlocks` on every init —
+// a live-streaming turn's expanded body re-parses the same byte-identical
+// markdown on every re-render otherwise.)
+//
+// A separate, `.serialized` suite (not folded into `MarkdownBlocksTests`
+// above): these tests share `MarkdownBlockCache`'s process-wide static
+// cache/counter, the same reason `ActivityStoreTests` needs `.serialized` —
+// Swift Testing runs a struct-based suite's tests concurrently by default,
+// which would race these against each other and against `resetForTesting()`.
+@Suite(.serialized)
+struct MarkdownBlockCacheTests {
+    @Test func repeatedIdenticalSourceReturnsEqualBlocksAndOnlyParsesOnce() {
+        MarkdownBlockCache.resetForTesting()
+        let source = "# Heading\n\nSome *text* and a [link](https://x.test)."
+
+        let first = MarkdownBlockCache.blocks(for: source)
+        #expect(MarkdownBlockCache.parseCallCount == 1, "the first call for new source text must be a cache miss")
+
+        let second = MarkdownBlockCache.blocks(for: source)
+        #expect(MarkdownBlockCache.parseCallCount == 1, "identical source text must be a cache hit, not a second parse")
+        #expect(first == second, "a cache hit must return the exact same blocks as the original parse")
+    }
+
+    @Test func differentSourceTextEachParsesIndependently() {
+        MarkdownBlockCache.resetForTesting()
+
+        _ = MarkdownBlockCache.blocks(for: "first paragraph")
+        _ = MarkdownBlockCache.blocks(for: "second, different paragraph")
+        _ = MarkdownBlockCache.blocks(for: "first paragraph") // repeat of the first — must hit
+
+        #expect(MarkdownBlockCache.parseCallCount == 2, "two distinct source strings must miss independently; the repeat must not")
+    }
+
+    /// The collision guard: `MarkdownBlockCache` keys by a digest of the
+    /// source, not the full string — `blocks(for:)` re-confirms the full
+    /// string on every lookup (`cached.source == source`) before trusting a
+    /// hit, so two different sources always parse independently and never
+    /// cross-contaminate even though many entries share the cache.
+    @Test func manyDistinctSourcesEachReturnTheirOwnBlocksNeverACachedNeighbors() {
+        MarkdownBlockCache.resetForTesting()
+        let sources = (0..<30).map { "paragraph number \($0)" }
+        for source in sources {
+            _ = MarkdownBlockCache.blocks(for: source)
+        }
+
+        for source in sources {
+            let blocks = MarkdownBlockCache.blocks(for: source)
+            guard case .paragraph(let text) = blocks.first else {
+                Issue.record("expected a single paragraph block for \"\(source)\"")
+                continue
+            }
+            #expect(text == source, "must return this source's OWN parsed text, never a different cached entry's")
+        }
+    }
 }

@@ -42,7 +42,14 @@ public struct StepGraphView: View {
         // RenderMeter seam (Plan 5, Task 1) — one line, safe to delete.
         let _ = RenderMeter.tick("StepGraphView")
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 0) {
+            // `LazyHStack`, not `HStack` (perf & interaction arc, Plan 5
+            // Task 3): a long-running workflow's step graph can grow wide
+            // enough that off-screen node cards no longer need to be
+            // instantiated/laid out on every re-render. Node identity stays
+            // step-id-stable (`id: \.element.id`, unchanged) — Plan 6's
+            // animation work needs that to keep working across a lazy
+            // container the same way it would under a plain `HStack`.
+            LazyHStack(spacing: 0) {
                 ForEach(Array(nodes.enumerated()), id: \.element.id) { index, node in
                     if index > 0 {
                         GraphEdge(source: nodes[index - 1], target: node)

@@ -307,6 +307,50 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // (b3) perf & interaction arc, Plan 5 Task 2 fix-round-1 (shared-store
+    // review Critical): `unscopedRows` is the projection `NeedsYouCard`
+    // reads instead of `rows` — it must NEVER be narrowed by
+    // `scopeFilter`/`statusFilter`, since `ActivityScreen` (which shares
+    // this exact instance with `OverviewScreen` — see `RootView.
+    // activityStore`) sets both on every activation with no reset when the
+    // operator navigates back to Overview. This is the regression repro: an
+    // awaiting workflow row (a gate — `project` is always `nil` for
+    // non-session rows, so it can never pass a non-nil scope) must still be
+    // visible in `unscopedRows` even while `scopeFilter`/`statusFilter` are
+    // set exactly the way `ActivityScreen.activate(kind:)` would leave them
+    // — while `rows` (the Activity table's own projection) still narrows
+    // exactly as before this fix.
+    @MainActor @Test func unscopedRowsIgnoresScopeAndStatusFilterWhileRowsStaysNarrowed() async {
+        let (store, box) = makeStore(respond: { req in
+            switch req.url?.path {
+            case "/api/runs/workflows":
+                let gate = Self.runListRowJSON(id: "run-gate-1", startedAt: "2026-08-20T13:00:00Z", status: "awaiting_approval")
+                return (200, Data("[\(gate)]".utf8))
+            default:
+                return (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+            }
+        })
+        await store.activate(kind: .all)
+        #expect(store.unscopedRows.map(\.id).contains("run-gate-1"))
+        #expect(store.rows.map(\.id).contains("run-gate-1"))
+
+        // Exactly what `ActivityScreen.activate(kind:)` does on a
+        // project-scoped visit — no other screen resets this.
+        store.scopeFilter = "some-other-project"
+        store.statusFilter = [.completed]
+
+        #expect(!store.rows.map(\.id).contains("run-gate-1"), "sanity: rows correctly narrows away the out-of-scope, wrong-status gate — Activity's own table behavior is unchanged")
+        #expect(store.unscopedRows.map(\.id).contains("run-gate-1"), "the gate must still be visible in unscopedRows regardless of scope/status")
+        guard let gateRow = store.unscopedRows.first(where: { $0.id == "run-gate-1" }) else {
+            Issue.record("expected run-gate-1 in unscopedRows")
+            return
+        }
+        #expect(gateRow.status == .awaiting)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // (c) liveTail off: a runStarted event increments pendingNewRuns and
     // leaves rows untouched; applyPendingRefresh() refetches and zeroes it.
     @MainActor @Test func liveTailOffCountsPendingNewRunsWithoutMutatingRows() async {
@@ -358,6 +402,166 @@ struct ActivityStoreTests {
         // Scoped to the four source paths — see `sourcePaths`'s doc comment
         // on why the plain global `requestCount` would be racy here.
         #expect(ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths) == requestsAfterActivate)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d2) perf & interaction arc, Plan 5 Task 2 fix-round-1 (shared-store
+    // review): `liveTail` gates only whether a genuinely NEW run (a
+    // `.newRun` delta for a run this store has never fetched) triggers an
+    // eager refresh vs. just incrementing `pendingNewRuns` — see
+    // `ActivityStore.apply(_:)`'s `.newRun` branch. It does NOT gate
+    // `.statusPatch` (an in-place correction to an ALREADY-visible row),
+    // which `patchRow` applies unconditionally. This matters for the shared
+    // store: `OverviewScreen`'s needs-you queue must never go stale on an
+    // existing gate's status just because `ActivityScreen` last paused live
+    // tail. Proven here with `liveTail = false`: `unscopedRows` (and
+    // `rows`) both still patch in place, immediately, no refetch.
+    @MainActor @Test func liveTailOffStillPatchesAlreadyVisibleRowsInUnscopedRowsAndRows() async {
+        let (store, box) = makeStore()
+        store.liveTail = false
+        await store.activate(kind: .all)
+        let requestsAfterActivate = ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths)
+        #expect(store.unscopedRows.first(where: { $0.id == "run-wf-1" })?.status == .running)
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1's status patches to .completed in unscopedRows even with liveTail off") {
+            store.unscopedRows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
+
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
+        #expect(store.unscopedRows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
+        // No refetch — the patch alone did this, exactly like the
+        // liveTail-on case; liveTail's cadence gate never applied here at
+        // all, since `.statusPatch` isn't the `.newRun` branch it guards.
+        #expect(ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths) == requestsAfterActivate)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d3) perf & interaction arc, Plan 5 Task 3: sort now lives on the
+    // store — `toggleSort(_:)` both flips `sort` and re-sorts `rows`
+    // immediately, from `rows`' own current contents (no view-side
+    // `sortedRows` computed property needed anymore, and no re-run of the
+    // whole merge/filter pipeline either).
+    @MainActor @Test func toggleSortSetsActiveKeyAndReSortsRowsImmediately() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        #expect(store.sort == ActivitySort(key: .started, ascending: false))
+        #expect(store.rows.map(\.id) == ["run-ag-1", "evt-1", "run-wf-1", "sess-1"])
+
+        // First tap on a new column: `defaultAscending` for `.subject` is
+        // `true`. Subjects: run-ag-1/sess-1 = "rupuso", evt-1/run-wf-1 =
+        // "nightly-health" — ties keep the pre-toggle relative order.
+        store.toggleSort(.subject)
+        #expect(store.sort == ActivitySort(key: .subject, ascending: true))
+        #expect(store.rows.map(\.id) == ["evt-1", "run-wf-1", "run-ag-1", "sess-1"])
+
+        // Tapping the already-active column flips direction rather than
+        // resetting to `defaultAscending`.
+        store.toggleSort(.subject)
+        #expect(store.sort == ActivitySort(key: .subject, ascending: false))
+        #expect(store.rows.map(\.id) == ["run-ag-1", "sess-1", "evt-1", "run-wf-1"])
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d4) `patchRow`'s re-sort guard: a live status patch only re-sorts
+    // `rows` when the active sort key actually participates (`.status`/
+    // `.duration`) — proven here by sorting on `.status` first, then
+    // patching `run-wf-1` (Running -> Completed) and confirming it moves to
+    // rejoin the other `.completed` rows rather than staying pinned at its
+    // pre-patch index.
+    @MainActor @Test func liveStatusPatchReSortsRowsWhenActiveSortKeyIsStatus() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        store.toggleSort(.status)
+        // Ascending by status display label: Completed (run-ag-1, sess-1,
+        // in their pre-sort relative order) < Failed (evt-1) < Running
+        // (run-wf-1).
+        #expect(store.rows.map(\.id) == ["run-ag-1", "sess-1", "evt-1", "run-wf-1"])
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 rejoins the Completed group after its live status patch") {
+            store.rows.map(\.id) == ["run-ag-1", "sess-1", "run-wf-1", "evt-1"]
+        }
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d5) review fix (Important, task-3 follow-up): the sort-guard's OTHER
+    // half — a patch under a NON-participating key (`.started`, the
+    // default) must leave row ORDER byte-identical, not just "didn't
+    // crash." Checked positionally (`rows.map(\.id)` before/after), not by
+    // per-id lookup, since a lookup-based check can't distinguish "stayed
+    // put" from "moved but is still findable."
+    @MainActor @Test func liveStatusPatchNeverReordersRowsWhenActiveSortKeyDoesNotParticipate() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        #expect(store.sort == ActivitySort(key: .started, ascending: false))
+        let idsBefore = store.rows.map(\.id)
+        let unscopedIDsBefore = store.unscopedRows.map(\.id)
+        #expect(idsBefore == ["run-ag-1", "evt-1", "run-wf-1", "sess-1"])
+
+        box.latest.yield(.connection(true))
+        // Patches the MIDDLE row (index 2 of 4) — a reorder bug that only
+        // ever moves a patched row to the front or back wouldn't show up on
+        // an edge row.
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 patches to .completed") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
+
+        #expect(
+            store.rows.map(\.id) == idsBefore,
+            "a patch under a non-participating sort key (.started) must never reorder rows"
+        )
+        #expect(
+            store.unscopedRows.map(\.id) == unscopedIDsBefore,
+            "unscopedRows is never governed by this table's sort at all — must never reorder either"
+        )
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d6) review fix (Important, task-3 follow-up): the `.duration` half
+    // of the guard was previously untested — only `.status` had live
+    // coverage. `ActivityDelta.reduce(_:)` never produces a non-nil
+    // `durationMS` from any live `CPEvent` today (every case it reduces
+    // sets `durationMS: nil` — see `patchRow`'s own doc comment on why it's
+    // `internal`), so this drives the store's `patchRow(runID:status:
+    // durationMS:)` seam directly via `@testable import` rather than
+    // through a live event, the same way `statusOverrides` is already
+    // reached directly for its own tests.
+    @MainActor @Test func liveDurationChangingPatchRepositionsRowsWhenActiveSortKeyIsDuration() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        store.toggleSort(.duration)
+        // Descending (defaultAscending == false for `.duration`). Only
+        // run-ag-1 has a non-nil duration (5000ms) in the fixture; the
+        // other three are nil, which sorts last regardless of direction —
+        // so the order is unchanged from the default merge order, with
+        // exactly one row having anything to compare against.
+        #expect(store.sort == ActivitySort(key: .duration, ascending: false))
+        #expect(store.rows.map(\.id) == ["run-ag-1", "evt-1", "run-wf-1", "sess-1"])
+
+        // Gives run-wf-1 (currently nil duration) a duration far larger
+        // than run-ag-1's 5000ms — under descending `.duration`, it must
+        // now sort AHEAD of run-ag-1, not stay pinned at its old index.
+        store.patchRow(runID: "run-wf-1", status: .completed, durationMS: 999_999)
+
+        #expect(
+            store.rows.map(\.id) == ["run-wf-1", "run-ag-1", "evt-1", "sess-1"],
+            "a duration-changing patch under an active .duration sort must reposition the row, not leave it in place"
+        )
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.durationMS == 999_999)
 
         store.deactivate()
         box.latest.finish()

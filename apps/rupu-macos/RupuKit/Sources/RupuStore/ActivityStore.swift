@@ -90,7 +90,59 @@ public final class ActivityStore {
 
     public var liveTail: Bool = true
 
+    /// The Activity table's current sort — perf & interaction arc, Plan 5
+    /// Task 3: moved here from `ActivityTable`'s own `@State` (where a
+    /// `sortedRows` computed property re-sorted `rows` on every single body
+    /// pass — every SSE `statusPatch`, every remote-host merge, every hover —
+    /// with ICU case-insensitive compares on every text column). `rows` is
+    /// now maintained ALREADY sorted per this descriptor by `recompute()`/
+    /// `patchRow`; the view only ever reads `rows` directly. Changing it
+    /// goes through `toggleSort(_:)`, not a direct setter — see that
+    /// method's doc comment for why a plain `didSet` re-sort isn't enough
+    /// here (it would have to redo the whole merge). Defaults exactly as
+    /// `ActivityTable`'s old `@State` did: today's merge-time order.
+    public private(set) var sort = ActivitySort(key: .started, ascending: false)
+
     public private(set) var rows: [ActivityRow] = []
+
+    /// **The fleet-wide, always-unscoped projection** (perf & interaction
+    /// arc, Plan 5 Task 2 fix-round-1 — the shared-store review's Critical):
+    /// every row for the currently active `kind` sources, sorted and
+    /// status-patched exactly like `rows`, but NEVER narrowed by
+    /// `scopeFilter` or `statusFilter`. `NeedsYouCard`/`deriveNeedsYou`
+    /// read this instead of `rows`.
+    ///
+    /// **Why this exists**: `ActivityStore` is now a single instance shared
+    /// by `ActivityScreen` (which legitimately narrows `rows` by
+    /// `scopeFilter`/`statusFilter` for its own table) and `OverviewScreen`
+    /// (whose needs-you queue must see every gate/failure fleet-wide,
+    /// regardless of whichever scope/status the OTHER screen last left the
+    /// shared instance in — see `NeedsYouCard`'s own doc comment). Before
+    /// sharing, `OverviewScreen` held a private `ActivityStore` that simply
+    /// never had `scopeFilter`/`statusFilter` set; that guarantee held "for
+    /// free" by construction. Sharing broke it: `ActivityScreen.activate(
+    /// kind:)` sets `scopeFilter = model.scopeWsID` on every activation, and
+    /// nothing reset it when the operator navigated back to Overview — a
+    /// project-scoped visit to Activity silently under-reported every
+    /// OTHER project's gates/failures on Overview afterward.
+    ///
+    /// The fix is structural, not "reset the shared state at the right
+    /// screen-transition point" choreography (which rots the next time a
+    /// third screen starts sharing this store, or the reset call is
+    /// forgotten): `unscopedRows` is unconditionally maintained alongside
+    /// `rows` by the SAME `recompute()` pass, so a scoped/status-filtered
+    /// store can never hide anything from a consumer that reads this
+    /// property instead — the invariant holds regardless of what any other
+    /// screen does to `scopeFilter`/`statusFilter`, with no caller
+    /// discipline required.
+    ///
+    /// `kind` narrowing is NOT lifted here, deliberately — `kind` selects
+    /// which underlying federated SOURCES are even fetched at all (a
+    /// fetch-scope decision, not a display-time filter over already-fetched
+    /// data), and `OverviewScreen` already asserts its own `kind: .all`
+    /// on every activation, the same way it always has.
+    public private(set) var unscopedRows: [ActivityRow] = []
+
     public private(set) var state: BlockState<Void> = .loading
     public private(set) var pendingNewRuns: Int = 0
     public private(set) var freshness: StreamLifecycle.Freshness = .idle
@@ -326,6 +378,28 @@ public final class ActivityStore {
         pendingNewRuns = 0
     }
 
+    // MARK: - Sort (perf & interaction arc, Plan 5 Task 3)
+
+    /// First tap on a new column makes it the active sort key (at
+    /// `key.defaultAscending`); tapping the already-active column flips
+    /// direction — same contract `ActivityTable`'s old view-local
+    /// `toggleSort` had. Re-sorts `rows` directly from its own current
+    /// (already-filtered) contents rather than re-running the whole
+    /// `recompute()` merge/filter pipeline — cheap, and correct, since
+    /// changing the sort descriptor never changes *which* rows are visible,
+    /// only their order. `unscopedRows` is deliberately never touched here —
+    /// it isn't rendered by any sortable table, and stays in its own fixed
+    /// startedAt-descending order regardless of what this table's operator
+    /// last clicked (see that property's own doc comment).
+    public func toggleSort(_ key: ActivitySort.Key) {
+        if sort.key == key {
+            sort.ascending.toggle()
+        } else {
+            sort = ActivitySort(key: key, ascending: key.defaultAscending)
+        }
+        rows = sortActivityRows(rows, by: sort)
+    }
+
     // MARK: - Mutations (Phase 3, Task 5)
 
     /// **Marker-only** (same contract as `RunDetailStore.approve(gate:mode:)`)
@@ -521,15 +595,32 @@ public final class ActivityStore {
             else { continue }
             merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
         }
+        merged.sort(by: Self.isOrderedByStartedAtDescending)
+
+        // Fleet-wide, unscoped projection — see `unscopedRows`'s own doc
+        // comment. Assigned BEFORE either filter narrows `merged` below, so
+        // it always carries every row for the active `kind` sources,
+        // patched and sorted, never scope/status-narrowed.
+        unscopedRows = merged
+
+        var filtered = merged
         if !statusFilter.isEmpty {
-            merged = merged.filter { statusFilter.contains($0.status) }
+            filtered = filtered.filter { statusFilter.contains($0.status) }
         }
         if let scopeFilter {
-            merged = merged.filter { $0.project == scopeFilter }
+            filtered = filtered.filter { $0.project == scopeFilter }
         }
-        merged.sort(by: Self.isOrderedByStartedAtDescending)
-        rows = merged
-        state = Self.aggregateState(activeSnapshots().map(\.state), rowsAreEmpty: merged.isEmpty)
+        // Perf & interaction arc, Plan 5 Task 3: honor the current sort
+        // descriptor here — every caller of `recompute()` (a live-tail
+        // refresh, a remote-host merge landing, a `statusFilter`/
+        // `scopeFilter` toggle) must leave `rows` in the operator's chosen
+        // order, not silently reset to merge-time order. `sortActivityRows`
+        // reproduces exactly the same order `isOrderedByStartedAtDescending`
+        // did for the default `.started`/descending sort (see that
+        // function's own doc comment), so this is behavior-preserving for
+        // every caller that never touches `sort` at all.
+        rows = sortActivityRows(filtered, by: sort)
+        state = Self.aggregateState(activeSnapshots().map(\.state), rowsAreEmpty: filtered.isEmpty)
     }
 
     // MARK: - Remote hosts (progressive per-host loading)
@@ -737,28 +828,75 @@ public final class ActivityStore {
     /// Session rows likewise never carry `.run` navigation — a session's
     /// status is derived from its `activeRunID`/`lastError` at fetch time,
     /// not live-patched from run events.
-    private func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
-        statusOverrides[runID] = (status, durationMS)
-        guard let index = rows.firstIndex(where: {
-            if case .run(let id, _) = $0.navigation { return id == runID }
-            return false
-        }) else { return }
-        rows[index] = rows[index].patchingStatus(status, durationMS: durationMS)
+    /// Matched by `navigation`'s run id — see this method's callers'
+    /// doc comments (`patchRow`/`isRunAlreadyVisible`) for why that's the
+    /// correct key rather than `row.id`.
+    private static func matchesRun(_ row: ActivityRow, runID: String) -> Bool {
+        if case .run(let id, _) = row.navigation { return id == runID }
+        return false
     }
 
-    /// True if `runID` is already represented in this store — either in the
-    /// current (possibly `statusFilter`-narrowed) `rows`, or in one of the
-    /// active snapshots' unfiltered rows (a run the filter is currently
-    /// hiding is still one this store has, just not one it's showing).
-    /// Matched by the same `.run(id:_)` navigation key `patchRow` resolves
-    /// rows by.
-    private func isRunAlreadyVisible(_ runID: String) -> Bool {
-        func matches(_ row: ActivityRow) -> Bool {
-            if case .run(let id, _) = row.navigation { return id == runID }
-            return false
+    /// Patches BOTH `rows` and `unscopedRows` in place (fix-round-1, perf &
+    /// interaction arc Plan 5 Task 2 review: `unscopedRows` is a SEPARATE
+    /// array from `rows`, not a superset view over it, so this fast,
+    /// no-full-`recompute()` path must patch each independently — a live
+    /// status patch that only touched `rows` would leave `unscopedRows`
+    /// (and therefore `NeedsYouCard`) showing a stale status for the same
+    /// row until the next full `recompute()`). `statusOverrides` (the
+    /// durable record `recompute()` itself reapplies) is the single source
+    /// of truth either patch reads from — this only fast-forwards the two
+    /// already-materialized arrays to match it immediately.
+    /// Perf & interaction arc, Plan 5 Task 3: patching in place (rather than
+    /// re-sorting unconditionally) keeps this a fast, no-full-`recompute()`
+    /// path in the common case — but a patched `status`/`durationMS` CAN
+    /// invalidate `rows`' current order when the active `sort.key` is one
+    /// of those two columns (e.g. sorted by Duration, a patch that changes
+    /// a row's `durationMS` may need to move it). Only re-sorts `rows`
+    /// itself, and only when `rows` actually contains this run AND the
+    /// active key participates — every other key (`started`, text columns)
+    /// is untouched by a status/duration patch, so no re-sort is needed;
+    /// `unscopedRows` never needs one at all, since it isn't governed by
+    /// this table's `sort` (see that property's own doc comment).
+    ///
+    /// `internal`, not `private` (task-3 review fix, closing an
+    /// under-tested gap): `ActivityDelta.reduce(_:)` — the only production
+    /// caller of this method, via `apply(_:)`'s `.statusPatch` case —
+    /// currently NEVER produces a non-nil `durationMS` (every live
+    /// `CPEvent` case it reduces sets `durationMS: nil`), so the `.duration`
+    /// half of the re-sort guard above is unreachable from a real event in
+    /// today's build. Exposed directly to `@testable import RupuStore` (the
+    /// same seam `statusOverrides` above already documents for itself) so
+    /// `ActivityStoreTests` can drive a genuine duration-changing patch and
+    /// prove the guard's `.duration` branch actually repositions rows —
+    /// this is defensive, forward-looking correctness (the day a live event
+    /// DOES carry a duration, this path must already be right), not dead
+    /// code to delete.
+    func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
+        statusOverrides[runID] = (status, durationMS)
+        var patchedRows = false
+        if let index = rows.firstIndex(where: { Self.matchesRun($0, runID: runID) }) {
+            rows[index] = rows[index].patchingStatus(status, durationMS: durationMS)
+            patchedRows = true
         }
-        if rows.contains(where: matches) { return true }
-        return activeSnapshots().contains { $0.rows.contains(where: matches) }
+        if let index = unscopedRows.firstIndex(where: { Self.matchesRun($0, runID: runID) }) {
+            unscopedRows[index] = unscopedRows[index].patchingStatus(status, durationMS: durationMS)
+        }
+        if patchedRows, sort.key == .status || sort.key == .duration {
+            rows = sortActivityRows(rows, by: sort)
+        }
+    }
+
+    /// True if `runID` is already represented in this store — either in
+    /// `unscopedRows` (kind-scoped but never status/scope-narrowed — a run
+    /// `rows` is currently hiding via `statusFilter`/`scopeFilter` is still
+    /// one this store has, just not one `rows` is showing), or in one of
+    /// the active snapshots' own unfiltered rows (covers a row not yet
+    /// folded into `unscopedRows` by a `recompute()` pass, e.g. a remote
+    /// host's contribution still in flight). Matched by the same
+    /// `.run(id:_)` navigation key `patchRow` resolves rows by.
+    private func isRunAlreadyVisible(_ runID: String) -> Bool {
+        if unscopedRows.contains(where: { Self.matchesRun($0, runID: runID) }) { return true }
+        return activeSnapshots().contains { $0.rows.contains(where: { Self.matchesRun($0, runID: runID) }) }
     }
 
     /// Coalesces a burst of `.newRun` deltas into one refresh: each new

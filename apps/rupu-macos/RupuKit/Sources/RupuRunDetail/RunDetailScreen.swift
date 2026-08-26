@@ -534,40 +534,19 @@ public struct RunDetailScreen: View {
             }
         case .empty:
             blockShell { Text("No workflow steps").font(.noteText).foregroundStyle(Color.rupuMute) }
-        case .content(let g):
+        case .content:
+            // Perf & interaction arc, Plan 5 Task 3: `layoutGraph` (and its
+            // `effectiveLiveStates` gate overlay) moved into
+            // `RunDetailStore` as the coalesced derived `graphVM` — this
+            // body no longer recomputes the graph inline on every render.
             StepGraphView(
-                nodes: layoutGraph(
-                    nodes: g.workflow.steps,
-                    results: g.stepResults,
-                    units: g.units,
-                    liveStates: effectiveLiveStates(store: store),
-                    liveUnits: store.liveUnits,
-                    panelRounds: store.panelRounds,
-                    stepTranscripts: store.stepTranscripts
-                ),
+                nodes: store.graphVM,
                 selectedID: store.selectedStepID,
                 onSelect: { stepID in Task { await store.select(step: stepID) } },
                 onSelectUnit: { stepID, index in Task { await store.select(stepID: stepID, unitIndex: index) } }
             )
             .panelStyle(.panel)
         }
-    }
-
-    /// `store.liveStates` (event-driven) wins outright per step; a gate the
-    /// run is *currently* parked on (`RunRecord.awaiting`) fills in
-    /// `.gatePending` for any step that has no live entry at all — the
-    /// remote case (no stream, so `liveStates` never gets anything) per the
-    /// brief, and also a local run whose gate was already parked before this
-    /// screen was ever opened (no live `stepAwaitingApproval` event to
-    /// replay). Never overrides an existing live entry, so a later
-    /// live-confirmed transition for that same step always wins.
-    private func effectiveLiveStates(store: RunDetailStore) -> [String: NodeState] {
-        var states = store.liveStates
-        guard case .content(let detail) = store.detail else { return states }
-        for gate in detail.run.awaiting where states[gate.stepID] == nil {
-            states[gate.stepID] = .gatePending
-        }
-        return states
     }
 
     // MARK: - Shared shells

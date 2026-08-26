@@ -6,49 +6,55 @@ import RupuDesign
 /// The real Activity table (replaces the Phase 1 `PlaceholderScreen` for
 /// `.activity` routes): `FilterBar` + a merged `ActivityTable` fed by
 /// `ActivityStore`, with loading/failed/empty states and a staleness
-/// banner. Owns the store's lifecycle — built lazily on first appearance
-/// (once `backend.client()` is available), `activate(kind:)`d on every kind
-/// change via `.task(id:)`, `deactivate()`d `.onDisappear` — matching the
-/// symmetric restart pair `ActivityStore` documents itself as needing.
+/// banner.
+///
+/// **Shared store, not owned** (perf & interaction arc, Plan 5 Task 2):
+/// `activityStore` is built once at `RootView` and injected here — this
+/// screen no longer constructs its own instance (see `RootView.
+/// activityStore`'s doc comment for why: `OverviewScreen` used to build a
+/// SECOND, independent `ActivityStore` purely for its needs-you queue, each
+/// with its own resting SSE connection). This screen still fully owns
+/// DRIVING it, though: `activate(kind:)`d on every kind change (and on a
+/// backend client swap — see `ActivityTaskID`) via `.task(id:)`,
+/// `deactivate()`d `.onDisappear` — the same symmetric restart pair
+/// `ActivityStore` documents itself as needing, just against an
+/// externally-owned instance rather than a locally-built one.
 ///
 /// Flows-composition Task 2: the top bar's `AppModel.scopeWsID` reaches
 /// `ActivityStore.scopeFilter` the same way `kind` reaches
 /// `activate(kind:)` — this screen is the single site that already owns
 /// both "read from `model`" and "drive the store", so it owns this
-/// relationship too rather than splitting it into `RootView` (which has no
-/// reason to know about `ActivityStore` at all) or `ShellToolbar` (which
-/// has no reference to the store — it only ever touches `model`). Unlike
-/// `kind`, `scopeFilter` needs no `.task(id:)`/async `activate` — it's a
-/// synchronous, no-refetch narrowing (see `ActivityStore.scopeFilter`'s
-/// doc comment) — so a plain `.onChange(of: model.scopeWsID)` is enough to
-/// keep it live; `activate(kind:)` additionally seeds a freshly-built
-/// store with the model's *current* value, since `.onChange` only fires on
-/// a change from here on, not on first appearance.
+/// relationship too. Unlike `kind`, `scopeFilter` needs no `.task(id:)`/
+/// async `activate` — it's a synchronous, no-refetch narrowing (see
+/// `ActivityStore.scopeFilter`'s doc comment) — so a plain `.onChange(of:
+/// model.scopeWsID)` is enough to keep it live; `activate(kind:)`
+/// additionally seeds the store with the model's *current* value on every
+/// activation, since `.onChange` only fires on a change from here on, not
+/// on activation itself.
 ///
-/// **Does NOT need `OverviewScreen`'s `.onChange(of: backend.health)`
-/// cold-launch fix**: that fix exists because `.overview` is
+/// **Does NOT need `OverviewScreen`'s old `.onChange(of: backend.health)`
+/// cold-launch fix**: that fix existed because `.overview` is
 /// `AppModel.route`'s default and never persisted, so it is *always* the
 /// very first screen a cold launch renders — sometimes before
-/// `backend.client()` resolves, with nothing to re-trigger `activate(kind:)`
-/// once it does. This screen can only ever be reached by navigating here
-/// (sidebar click, `AppModel.navigate(to:)`) — by the time that happens,
-/// the shell has already been up and running (and therefore already past
-/// its own connection attempt) for at least one prior screen's worth of
-/// time, so `.task(id: kind)`'s first run always finds `backend.client()`
-/// already resolved in practice. If `route` ever becomes persisted/restored
-/// across launches (it isn't today — see `AppModel.swift`), this reasoning
-/// would need revisiting.
+/// `backend.client()` resolves. This screen can only ever be reached by
+/// navigating here (sidebar click, `AppModel.navigate(to:)`) — by the time
+/// that happens, the shell has already been up and running for at least
+/// one prior screen's worth of time. If `route` ever becomes persisted/
+/// restored across launches (it isn't today — see `AppModel.swift`), this
+/// reasoning would need revisiting.
 public struct ActivityScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
 
-    @State private var store: ActivityStore?
-
-    /// Tracked so `activate(kind:)` rebuilds on a backend client swap
-    /// (embedded/remote switch, reconnect, restart), not just the first
-    /// build — see that method's doc comment and
-    /// `BackendController.clientIdentity()`.
-    @State private var storeClientID: ObjectIdentifier?
+    /// The single shared instance `RootView` constructs and injects (perf &
+    /// interaction arc, Plan 5 Task 2) — no longer built by this screen.
+    /// `OverviewScreen` shares the exact same instance for its own
+    /// needs-you derivation; the two are mutually exclusive routes, so each
+    /// safely reconfigures it (`kind`/`scopeFilter`) to its own needs on
+    /// activation without conflicting. See `RootView.activityStore`'s doc
+    /// comment for the full rationale (dropping a second, independent SSE
+    /// connection `OverviewScreen` used to open purely for this).
+    let activityStore: ActivityStore?
 
     /// Phase 6B, Task 3: the autoflows-kind Runs/Claims sub-toggle — a
     /// screen-local `@State`, never persisted, never read by anything
@@ -66,9 +72,10 @@ public struct ActivityScreen: View {
     /// reusing `storeClientID`.
     @State private var claimsStoreClientID: ObjectIdentifier?
 
-    public init(model: AppModel, backend: BackendController) {
+    public init(model: AppModel, backend: BackendController, activityStore: ActivityStore?) {
         self.model = model
         self.backend = backend
+        self.activityStore = activityStore
     }
 
     /// The kind this screen renders — read from `model.route`, never a
@@ -83,7 +90,7 @@ public struct ActivityScreen: View {
     public var body: some View {
         let claimsActive = Self.isClaimsActive(kind: kind, subTab: autoflowsSubTab)
         VStack(alignment: .leading, spacing: 12) {
-            if let store {
+            if let store = activityStore {
                 FilterBar(model: model, store: store, showRunsChrome: !claimsActive)
                 if !claimsActive {
                     if store.freshness == .stale {
@@ -117,17 +124,17 @@ public struct ActivityScreen: View {
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color.rupuBg)
-        .task(id: kind) {
+        .task(id: ActivityTaskID(kind: kind, clientID: backend.clientIdentity())) {
             await activate(kind: kind)
         }
         .task(id: ClaimsTaskID(kind: kind, subTab: autoflowsSubTab, clientID: backend.clientIdentity())) {
             await activateClaimsIfNeeded()
         }
         .onChange(of: model.scopeWsID) { _, newScope in
-            store?.scopeFilter = newScope
+            activityStore?.scopeFilter = newScope
         }
         .onDisappear {
-            store?.deactivate()
+            activityStore?.deactivate()
         }
     }
 
@@ -294,50 +301,29 @@ public struct ActivityScreen: View {
         .panelStyle(.panel)
     }
 
-    /// Builds the store on first successful call (once `backend.client()`
-    /// exists — by the time the shell can route here, onboarding has
-    /// already gated on a healthy connection, so this should never stay
-    /// nil in practice) and always (re)activates it for the current
-    /// `kind` — the only correct way to (re)start `ActivityStore`'s live
-    /// stream, per Task 5's report, whether this is the very first
-    /// activation or a kind switch mid-session.
+    /// (Re)activates the shared `activityStore` for the current `kind` —
+    /// the only correct way to (re)start `ActivityStore`'s live stream, per
+    /// Task 5's report, whether this is the very first activation, a kind
+    /// switch mid-session, or a re-activation after a client swap (the
+    /// `.task(id:)` this drives folds `backend.clientIdentity()` into
+    /// `ActivityTaskID`, so a swap — an embedded/remote mode switch, a
+    /// manual reconnect, a restart — always re-runs this, same as before
+    /// this screen stopped building its own store — see `RootView.
+    /// activityStore`'s doc comment for who builds it now). A `nil`
+    /// `activityStore` (backend not connected yet) is a no-op; `body`'s own
+    /// `if let store = activityStore` already renders the right "Backend
+    /// not connected" fallback for that case.
     ///
-    /// Also rebuilds — deactivating the old store first — whenever
-    /// `backend.client()`'s identity has changed since the store currently
-    /// held was built: an embedded/remote mode switch, a manual reconnect,
-    /// or a restart all swap `backend.client()` to a brand-new `CPClient`
-    /// directly (never through `nil` in between — see
-    /// `BackendController.clientIdentity()`'s doc comment), so a plain "do I
-    /// already have a store" check would never notice and would keep
-    /// running `store` against the abandoned connection until this screen
-    /// happened to be torn down and rebuilt some other way (e.g. navigating
-    /// away and back).
+    /// Seeds the store's scope with whatever the top bar's picker already
+    /// has selected (e.g. this is a relaunch that restored a persisted
+    /// `scopeWsID`, or the shared store was just rebuilt by `RootView` after
+    /// a client swap) — `.onChange(of: model.scopeWsID)` only fires on a
+    /// *change* from here on, not on activation, so this is the initial
+    /// sync every activation needs regardless.
     private func activate(kind: RunKindFilter) async {
-        guard let client = backend.client() else { return }
-        let clientID = backend.clientIdentity()
-
-        let activeStore: ActivityStore
-        if let existing = store, storeClientID == clientID {
-            activeStore = existing
-        } else {
-            store?.deactivate()
-            let newStore = ActivityStore(
-                client: client,
-                signalsFactory: Self.makeSignalsFactory(backend: backend),
-                pendingActions: backend.pendingActions
-            )
-            // Seed the store's scope with whatever the top bar's picker
-            // already has selected (e.g. this is a relaunch that restored
-            // a persisted `scopeWsID`) — `.onChange(of: model.scopeWsID)`
-            // below only fires on a *change*, so a store built after the
-            // picker already has a non-nil selection needs this initial
-            // sync too.
-            newStore.scopeFilter = model.scopeWsID
-            store = newStore
-            storeClientID = clientID
-            activeStore = newStore
-        }
-        await activeStore.activate(kind: kind)
+        guard let activityStore else { return }
+        activityStore.scopeFilter = model.scopeWsID
+        await activityStore.activate(kind: kind)
     }
 
     private func handleSelect(_ row: ActivityRow) {
@@ -354,71 +340,20 @@ public struct ActivityScreen: View {
         model.navigate(to: route)
     }
 
-    /// Composes `ActivityStore`'s required `signalsFactory` around the
-    /// store's **own**, fully independent connection — not `RootView`'s
-    /// shared `eventStream()` firehose. `BackendController.eventStream()`'s
-    /// `EventStreamClient` has its `onConnectionChange` fixed at
-    /// construction (already claimed by `RootView`, forwarded into
-    /// `model.liveConnected`), so a consumer that just pumped that
-    /// instance's `.events()` a second time would ride a *different*
-    /// physical SSE connection than the one `onConnectionChange` is
-    /// actually reporting on — this store's own stream could drop and
-    /// reconnect while `model.liveConnected` stays blissfully true, and
-    /// `freshness` would never notice.
-    ///
-    /// Fix: `backend.makeFirehoseStream(onConnectionChange:)` builds a
-    /// brand-new `JSONEventStream<CPEvent>` end-to-end for this store —
-    /// same endpoint/credentials, its own connection, its own callback —
-    /// bridged through `StreamLifecycle.makeSignalBridge`'s documented
-    /// two-phase recipe: `onChange` is threaded straight into that new
-    /// stream's `init`, so every connect/disconnect for *this specific*
-    /// connection lands in the same ordered `continuation` as that
-    /// connection's own frames, with the synchronous-yield ordering
-    /// `makeSignalBridge` guarantees (a connection signal for a given
-    /// attempt is always yielded before any frame of that same attempt).
-    /// No coalescing, no second independently-scheduled observer to race.
-    ///
-    /// This does not add a connection versus a naive "just reuse
-    /// eventStream()" approach — pumping `eventStream()`'s `.events()` a
-    /// second time (the prior design) already opened its own independent
-    /// underlying SSE connection; that connection is now just honestly
-    /// paired with its own connection-state callback instead of borrowing
-    /// `model.liveConnected` (which describes `RootView`'s connection).
-    ///
-    /// `store.freshness` (the staleness banner) and `model.liveConnected`
-    /// (the toolbar pill) can therefore disagree briefly — they now
-    /// describe two different physical connections to the same endpoint,
-    /// not one shared truth. That's intentional, not a bug: each is
-    /// truthful about the connection it actually owns.
-    ///
-    /// Captures only `backend` (a `@MainActor` reference) inside this
-    /// `@Sendable` closure; every access to it is wrapped in
-    /// `MainActor.assumeIsolated`, safe because the only real caller,
-    /// `ActivityStore.restartStream()`, is itself `@MainActor`.
-    private static func makeSignalsFactory(
-        backend: BackendController
-    ) -> @Sendable () -> AsyncStream<StreamSignal<CPEvent>> {
-        {
-            let (onChange, continuation, signals) = MainActor.assumeIsolated {
-                StreamLifecycle.makeSignalBridge(CPEvent.self)
-            }
-            guard let stream = MainActor.assumeIsolated({
-                backend.makeFirehoseStream(onConnectionChange: onChange)
-            }) else {
-                continuation.finish()
-                return signals
-            }
+}
 
-            let pump = Task {
-                for await event in stream.events() {
-                    continuation.yield(.event(event))
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in pump.cancel() }
-            return signals
-        }
-    }
+/// `.task(id:)` identity for the main kind-scoped activation
+/// (`ActivityScreen.activate(kind:)`). Folds in `kind` (fires on every kind
+/// switch) AND `clientID` (perf & interaction arc, Plan 5 Task 2 — since
+/// this screen no longer builds its own store, a client swap — embedded/
+/// remote toggle, reconnect, restart, which rebuilds the SHARED
+/// `activityStore` at `RootView` — must still re-run `activate(kind:)`
+/// against the fresh instance even when `kind` itself hasn't changed; same
+/// "fold the client identity into the task id" contract `ClaimsTaskID`
+/// right below already establishes for the Claims sub-tab).
+private struct ActivityTaskID: Equatable {
+    let kind: RunKindFilter
+    let clientID: ObjectIdentifier?
 }
 
 /// The autoflows-kind sub-toggle (Phase 6B, Task 3) — screen-local, not a
