@@ -38,6 +38,50 @@ import Foundation
     }
 }
 
+@Test func actionEmittedPreservesPayloadAsJSONValue() throws {
+    let events = try JSONDecoder().decode([TranscriptEvent].self, from: Fixtures.data("transcript_events.json"))
+
+    guard case let .actionEmitted(data) = events[10] else {
+        Issue.record("events[10] should be action_emitted"); return
+    }
+    guard case let .object(fields) = data else {
+        Issue.record("action_emitted data should decode as a JSON object"); return
+    }
+    #expect(fields["kind"] == .string("issues.create"))
+    #expect(fields["allowed"] == .bool(true))
+    #expect(fields["applied"] == .bool(true))
+    #expect(fields["reason"] == .string("auto-approved"))
+    guard case let .object(payload) = fields["payload"] else {
+        Issue.record("action_emitted payload should decode as a JSON object"); return
+    }
+    #expect(payload["title"] == .string("x"))
+
+    guard case let .actionEmitted(secondData) = events[11] else {
+        Issue.record("events[11] should be action_emitted"); return
+    }
+    guard case let .object(secondFields) = secondData else {
+        Issue.record("action_emitted data should decode as a JSON object"); return
+    }
+    #expect(secondFields["allowed"] == .bool(false))
+    #expect(secondFields["reason"] == nil)
+}
+
+@Test func toolAuditDecodesAllFieldsIncludingBlockedTrue() throws {
+    let events = try JSONDecoder().decode([TranscriptEvent].self, from: Fixtures.data("transcript_events.json"))
+
+    guard case let .toolAudit(tool, declared, granted, blocked, restricted) = events[20] else {
+        Issue.record("events[20] should be tool_audit"); return
+    }
+    #expect(tool == "issues.create")
+    #expect(declared && granted && !blocked && restricted)
+
+    guard case let .toolAudit(tool2, declared2, granted2, blocked2, restricted2) = events[21] else {
+        Issue.record("events[21] should be tool_audit"); return
+    }
+    #expect(tool2 == "bash")
+    #expect(!declared2 && !granted2 && blocked2 && restricted2)
+}
+
 @Test func unknownTranscriptEventTypeDecodesAsUnknownNotError() throws {
     let json = Data(#"{"type":"future","data":{}}"#.utf8)
     let event = try JSONDecoder().decode(TranscriptEvent.self, from: json)

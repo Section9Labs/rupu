@@ -463,6 +463,50 @@ fn transcript_events_fixture_is_current() {
             blocked: false,
             restricted: true,
         },
+        // A denied catalog call: narrowed out of the step's `actions:`
+        // allowlist, so it never reached the registry (macOS Task 2 —
+        // decode coverage for `blocked: true`, the one outcome operators
+        // must see; see rupu-cli/src/output/live_run.rs).
+        rupu_transcript::Event::ToolAudit {
+            tool: "bash".into(),
+            declared: false,
+            granted: false,
+            blocked: true,
+            restricted: true,
+        },
+        // ast_grep's real `tool_result.structured` shape (rupu-tools's
+        // `ast_grep.rs` emitter) — locks the Swift decode Task 6 will add.
+        rupu_transcript::Event::ToolResult {
+            call_id: "call-3".into(),
+            output: "src/lib.rs:10:5: fn process(x: i32) -> i32 {\n".into(),
+            error: None,
+            duration_ms: 8,
+            structured: Some(serde_json::json!({
+                "tool": "ast_grep",
+                "pattern": "fn $NAME($$$ARGS)",
+                "lang": "rust",
+                "matchCount": 1,
+                "fileCount": 1,
+                "truncated": false,
+                "matches": [
+                    {
+                        "file": "src/lib.rs",
+                        "range": { "startLine": 10, "startCol": 5, "endLine": 12, "endCol": 6 },
+                        "text": "fn process(x: i32) -> i32 {\n    x + 1\n}",
+                        "metaVars": {
+                            "single": {
+                                "NAME": { "text": "process", "textOffset": { "start": 3, "end": 10 } }
+                            },
+                            "multi": {
+                                "ARGS": [
+                                    { "text": "x: i32", "textOffset": { "start": 11, "end": 17 } }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            })),
+        },
         rupu_transcript::Event::NetFlow {
             flow: Box::new(FlowRecord {
                 id: FlowId::from_parts(1, 1),

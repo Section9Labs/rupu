@@ -192,6 +192,66 @@
     }
   },
   {
+    "type": "tool_audit",
+    "data": {
+      "tool": "bash",
+      "declared": false,
+      "granted": false,
+      "blocked": true,
+      "restricted": true
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "call_id": "call-3",
+      "output": "src/lib.rs:10:5: fn process(x: i32) -> i32 {\n",
+      "duration_ms": 8,
+      "structured": {
+        "fileCount": 1,
+        "lang": "rust",
+        "matchCount": 1,
+        "matches": [
+          {
+            "file": "src/lib.rs",
+            "metaVars": {
+              "multi": {
+                "ARGS": [
+                  {
+                    "text": "x: i32",
+                    "textOffset": {
+                      "end": 17,
+                      "start": 11
+                    }
+                  }
+                ]
+              },
+              "single": {
+                "NAME": {
+                  "text": "process",
+                  "textOffset": {
+                    "end": 10,
+                    "start": 3
+                  }
+                }
+              }
+            },
+            "range": {
+              "endCol": 6,
+              "endLine": 12,
+              "startCol": 5,
+              "startLine": 10
+            },
+            "text": "fn process(x: i32) -> i32 {\n    x + 1\n}"
+          }
+        ],
+        "pattern": "fn $NAME($$$ARGS)",
+        "tool": "ast_grep",
+        "truncated": false
+      }
+    }
+  },
+  {
     "type": "net_flow",
     "data": {
       "flow": {
