@@ -80,6 +80,39 @@ public struct SSELineParser: Sendable {
     }
 }
 
+/// Dedicated `URLSession` for long-lived SSE streams.
+///
+/// `URLSession.shared` caps concurrent connections per host at 6
+/// (`URLSessionConfiguration`'s default `httpMaximumConnectionsPerHost`),
+/// and that pool is shared with every REST call `CPClient` makes. SSE
+/// streams are immortal occupants of their slot: with one connection per
+/// consumer (shell footer, Activity tail, Situation Room, Overview,
+/// RunNotifier, run-detail event + transcript streams) the app can hold six
+/// streams, at which point the seventh stream — or any REST request —
+/// queues **silently** behind them: no response callback, no frame, no
+/// error until the 60 s request timeout, then a reconnect straight back
+/// into the same full pool. Which six streams win the slots after an app
+/// restart is a race, so the starved consumer varies — pills driven by
+/// winning connections honestly report Live while the losing consumer
+/// shows zero events forever (reproduced live against `cp serve`
+/// 0.75.0-beta.3, 2026-08-25).
+///
+/// Routing every stream through this dedicated session removes both halves
+/// of the failure: streams stop competing with REST for `.shared`'s six
+/// slots, and the raised per-host cap gives stream fan-out headroom far
+/// beyond any real screen combination.
+public enum SSETransport {
+    /// Generous headroom over the worst observed concurrent-stream count
+    /// (~7); connections to the local control plane are cheap.
+    public static let maxConnectionsPerHost = 16
+
+    public static let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.httpMaximumConnectionsPerHost = maxConnectionsPerHost
+        return URLSession(configuration: config)
+    }()
+}
+
 /// Reconnecting SSE client that decodes each dispatched frame's `data` as a
 /// `T`. Undecodable frames are skipped (never fatal); the connection is
 /// retried with capped exponential backoff on stream end or error, and torn
@@ -96,7 +129,9 @@ public final class JSONEventStream<T: Decodable & Sendable>: Sendable {
 
     private let url: URL
     private let token: String?
-    private let session: URLSession
+    /// Internal (not `private`) so tests can assert streams default onto
+    /// [`SSETransport.session`] rather than `URLSession.shared`.
+    let session: URLSession
     private let onConnectionChange: (@Sendable (Bool) -> Void)?
 
     /// `onConnectionChange`, when provided, fires `true` the moment a
@@ -112,7 +147,7 @@ public final class JSONEventStream<T: Decodable & Sendable>: Sendable {
     public init(
         url: URL,
         token: String?,
-        session: URLSession = .shared,
+        session: URLSession = SSETransport.session,
         onConnectionChange: (@Sendable (Bool) -> Void)? = nil
     ) {
         self.url = url

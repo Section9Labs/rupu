@@ -4,7 +4,7 @@
  * EventSource subscribe helpers are not covered here (fiddly to mock in jsdom).
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { api, ApiError, presetWindow, windowFromDayRange } from './api';
 
 // ---------------------------------------------------------------------------
@@ -842,5 +842,128 @@ describe('encodeURIComponent in paths', () => {
     await api.getCoverageDetail('foo/bar');
     const calledUrl = (fetchSpy.mock.calls[0][0] as string);
     expect(calledUrl).toBe('/api/coverage/foo%2Fbar');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared firehose EventSource — subscribeEvents without run/host
+// ---------------------------------------------------------------------------
+
+class FakeEventSource {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 2;
+  static instances: FakeEventSource[] = [];
+
+  url: string;
+  readyState = FakeEventSource.CONNECTING;
+  closed = false;
+  onmessage: ((m: { data: string }) => void) | null = null;
+  onerror: ((e: unknown) => void) | null = null;
+  onopen: ((e?: unknown) => void) | null = null;
+
+  constructor(url: string) {
+    this.url = url;
+    FakeEventSource.instances.push(this);
+  }
+
+  close(): void {
+    this.closed = true;
+    this.readyState = FakeEventSource.CLOSED;
+  }
+
+  emitOpen(): void {
+    this.readyState = FakeEventSource.OPEN;
+    this.onopen?.();
+  }
+
+  emitMessage(data: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(data) });
+  }
+}
+
+describe('subscribeEvents shared firehose', () => {
+  beforeEach(() => {
+    FakeEventSource.instances = [];
+    vi.stubGlobal('EventSource', FakeEventSource);
+  });
+
+  it('shares one EventSource across parameterless subscribers and fans events out', () => {
+    const got1: unknown[] = [];
+    const got2: unknown[] = [];
+    const unsub1 = api.subscribeEvents((e) => got1.push(e));
+    const unsub2 = api.subscribeEvents((e) => got2.push(e));
+
+    expect(FakeEventSource.instances).toHaveLength(1);
+    FakeEventSource.instances[0].emitMessage({ type: 'run_started', run_id: 'r1' });
+    expect(got1).toEqual([{ type: 'run_started', run_id: 'r1' }]);
+    expect(got2).toEqual([{ type: 'run_started', run_id: 'r1' }]);
+
+    unsub1();
+    unsub2();
+  });
+
+  it('closes the shared stream only when the last subscriber releases', () => {
+    const unsub1 = api.subscribeEvents(() => {});
+    const unsub2 = api.subscribeEvents(() => {});
+    const es = FakeEventSource.instances[0];
+
+    unsub1();
+    expect(es.closed).toBe(false);
+    unsub2();
+    expect(es.closed).toBe(true);
+
+    // A fresh subscription after full release opens a new connection.
+    const unsub3 = api.subscribeEvents(() => {});
+    expect(FakeEventSource.instances).toHaveLength(2);
+    unsub3();
+  });
+
+  it('fires onOpen on connect, and for late subscribers to an open stream', async () => {
+    const open1 = vi.fn();
+    const unsub1 = api.subscribeEvents(() => {}, undefined, undefined, open1);
+    expect(open1).not.toHaveBeenCalled();
+
+    FakeEventSource.instances[0].emitOpen();
+    expect(open1).toHaveBeenCalledTimes(1);
+
+    // Late subscriber: stream already OPEN → onOpen still delivered (async).
+    const open2 = vi.fn();
+    const unsub2 = api.subscribeEvents(() => {}, undefined, undefined, open2);
+    expect(open2).not.toHaveBeenCalled();
+    await Promise.resolve();
+    expect(open2).toHaveBeenCalledTimes(1);
+
+    unsub1();
+    unsub2();
+  });
+
+  it('fans onError out to every subscriber', () => {
+    const err1 = vi.fn();
+    const err2 = vi.fn();
+    const unsub1 = api.subscribeEvents(() => {}, undefined, err1);
+    const unsub2 = api.subscribeEvents(() => {}, undefined, err2);
+
+    FakeEventSource.instances[0].onerror?.(new Event('error'));
+    expect(err1).toHaveBeenCalledTimes(1);
+    expect(err2).toHaveBeenCalledTimes(1);
+
+    unsub1();
+    unsub2();
+  });
+
+  it('gives run/host-filtered subscriptions their own dedicated connection', () => {
+    const unsubShared = api.subscribeEvents(() => {});
+    const unsubRun = api.subscribeEvents(() => {}, { run: 'r1' });
+
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(FakeEventSource.instances[1].url).toContain('run=r1');
+
+    // Closing the dedicated stream never touches the shared one.
+    unsubRun();
+    expect(FakeEventSource.instances[0].closed).toBe(false);
+    expect(FakeEventSource.instances[1].closed).toBe(true);
+    unsubShared();
+    expect(FakeEventSource.instances[0].closed).toBe(true);
   });
 });

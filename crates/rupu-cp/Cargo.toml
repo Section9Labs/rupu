@@ -56,7 +56,7 @@ git2.workspace = true
 rupu-config = { path = "../rupu-config" }
 rupu-transcript = { path = "../rupu-transcript" }
 httpmock.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "test-util"] }
 tokio-util = { workspace = true, features = ["io"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

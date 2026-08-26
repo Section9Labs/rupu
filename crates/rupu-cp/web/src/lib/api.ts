@@ -1709,6 +1709,60 @@ function listQuery(params?: ListParams): string {
 }
 
 // ---------------------------------------------------------------------------
+// Shared firehose EventSource
+// ---------------------------------------------------------------------------
+
+interface FirehoseSubscriber {
+  onEvent: (e: RunEvent) => void;
+  onError?: (e: Event) => void;
+  onOpen?: () => void;
+}
+
+/**
+ * The one shared connection behind every parameterless `subscribeEvents`
+ * call. Browsers cap concurrent HTTP/1.1 connections per host at ~6, and an
+ * SSE stream occupies its slot for as long as it lives — with the shell's
+ * live pill, the Events page, and the dashboard each opening their own
+ * EventSource (plus per-run streams on run detail), a couple of CP tabs
+ * exhaust the pool and the next EventSource sits in CONNECTING forever:
+ * no `open`, no frames, no error, while the server is perfectly healthy
+ * (reproduced live against `cp serve` 0.75.0-beta.3). Fanning every
+ * firehose consumer out from a single refcounted EventSource keeps the
+ * page's footprint at one connection no matter how many components listen.
+ */
+let sharedFirehose: { es: EventSource; subs: Set<FirehoseSubscriber> } | null = null;
+
+function subscribeSharedFirehose(sub: FirehoseSubscriber): () => void {
+  if (!sharedFirehose) {
+    const es = new EventSource('/api/events/stream');
+    const state = { es, subs: new Set<FirehoseSubscriber>() };
+    es.onmessage = (m) => {
+      const ev = JSON.parse(m.data) as RunEvent;
+      state.subs.forEach((s) => s.onEvent(ev));
+    };
+    es.onerror = (e) => state.subs.forEach((s) => s.onError?.(e));
+    es.onopen = () => state.subs.forEach((s) => s.onOpen?.());
+    sharedFirehose = state;
+  } else if (sharedFirehose.es.readyState === EventSource.OPEN) {
+    // Late subscriber to an already-open stream: it still deserves the
+    // "connected" signal its own EventSource would have delivered.
+    // Deferred so subscribing never re-enters the caller synchronously.
+    queueMicrotask(() => {
+      if (sharedFirehose?.subs.has(sub)) sub.onOpen?.();
+    });
+  }
+  const state = sharedFirehose;
+  state.subs.add(sub);
+  return () => {
+    state.subs.delete(sub);
+    if (sharedFirehose === state && state.subs.size === 0) {
+      state.es.close();
+      sharedFirehose = null;
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // API object
 // ---------------------------------------------------------------------------
 
@@ -2432,21 +2486,35 @@ export const api = {
    * Subscribe to the global events stream, optionally filtered by run id.
    * The backend sends unnamed SSE data events → arrives on `es.onmessage`.
    *
-   * @returns Unsubscribe function — call it to close the EventSource.
+   * The parameterless (no `run`/`host`) form — the firehose — is served by
+   * ONE shared, refcounted EventSource for the whole page, however many
+   * components subscribe: see `subscribeSharedFirehose` for why (browser
+   * per-host connection caps starve extra SSE connections silently).
+   * Filtered forms still get their own dedicated connection.
+   *
+   * `onOpen` fires when the underlying stream connects (and again after
+   * each successful auto-reconnect) — the honest "connected" signal, since
+   * a healthy-but-idle stream may not deliver a frame for a long time.
+   *
+   * @returns Unsubscribe function — call it to release the subscription
+   * (the shared EventSource closes when the last subscriber releases).
    */
   subscribeEvents(
     onEvent: (e: RunEvent) => void,
     opts?: { run?: string; host?: string },
     onError?: (e: Event) => void,
+    onOpen?: () => void,
   ): () => void {
+    if (!opts?.run && !opts?.host) {
+      return subscribeSharedFirehose({ onEvent, onError, onOpen });
+    }
     const q = new URLSearchParams();
     if (opts?.run) q.set('run', opts.run);
     if (opts?.host) q.set('host', opts.host);
-    const qs = q.toString();
-    const url = qs ? `/api/events/stream?${qs}` : '/api/events/stream';
-    const es = new EventSource(url);
+    const es = new EventSource(`/api/events/stream?${q.toString()}`);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
     if (onError) es.onerror = onError;
+    if (onOpen) es.onopen = () => onOpen();
     return () => es.close();
   },
 

@@ -167,6 +167,9 @@ function LivePill() {
       () => setState('live'),
       undefined,
       () => setState('reconnecting'),
+      // Connection-open is the honest "live" signal — an idle stream may
+      // not deliver a frame for a long time (see Events.tsx's pill).
+      () => setState('live'),
     );
     return unsub;
   }, []);
