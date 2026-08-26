@@ -1,6 +1,7 @@
 import Foundation
 import RupuAPI
 import RupuDesign
+import RupuStore
 import SwiftUI
 
 // ---------------------------------------------------------------------------
@@ -336,7 +337,7 @@ private struct SubrunBodyView: View {
 
 // ---------------------------------------------------------------------------
 // StructuredView (StructuredView.tsx) — .coverage/.generic, and the
-// .finding/.astGrep fallthrough documented on `ToolCardView` below.
+// .finding fallthrough documented on `ToolCardView` below.
 // ---------------------------------------------------------------------------
 
 /// Dependency-free recursive key/value renderer for arbitrary `JSONValue`
@@ -612,21 +613,27 @@ private struct FlowLayout: Layout {
 /// Direct port of `ToolCard`'s non-`finding` anatomy (`ToolCard.tsx:
 /// 916-951`) — `.finding` gets its own full-chrome card with no header in
 /// the web (`ToolCard.tsx:897-900`) and, in this app, its own `FindingCard`
-/// dispatch in Task 7; until then (and permanently for `.astGrep`, whose
-/// rich body is Task 6's), both fall through to `StructuredView` here so
-/// every `ToolKind` renders SOMETHING rather than a compile-time gap or a
-/// silent blank.
+/// dispatch in Task 7; until then it falls through to `StructuredView` here
+/// so every `ToolKind` renders SOMETHING rather than a compile-time gap or a
+/// silent blank. `.astGrep` dispatches to `AstGrepBodyView` (Task 6).
 public struct ToolCardView: View {
     private let entry: ToolEntry
     private let runID: String?
     private let host: String?
+    /// Optional (defaulted `nil`) — threaded straight through to
+    /// `AstGrepBodyView`'s own `sourcePreviewStore`, following the same
+    /// "omit the toggle rather than invent plumbing" convention `TranscriptFeed`
+    /// established in Phase 6B, Task 5. No existing call site passes this yet;
+    /// Task 7's transcript rewrite is the seam that will.
+    private let sourcePreviewStore: SourcePreviewStore?
 
     @State private var expanded = false
 
-    public init(entry: ToolEntry, runID: String?, host: String?) {
+    public init(entry: ToolEntry, runID: String?, host: String?, sourcePreviewStore: SourcePreviewStore? = nil) {
         self.entry = entry
         self.runID = runID
         self.host = host
+        self.sourcePreviewStore = sourcePreviewStore
     }
 
     public var body: some View {
@@ -694,12 +701,14 @@ public struct ToolCardView: View {
             GlobBodyView(entry: entry)
         case .subrun:
             SubrunBodyView(entry: entry, runID: runID, host: host)
-        case .coverage, .generic, .finding, .astGrep:
-            // `.finding` → Task 7's `FindingCard`; `.astGrep` → Task 6's
-            // `AstGrepBodyView`. Neither exists yet, so both fall through
-            // to the same generic `StructuredView` `.coverage`/`.generic`
-            // already use — compiles, and renders something honest, rather
-            // than a silent gap. See this view's own doc comment.
+        case .astGrep:
+            AstGrepBodyView(entry: entry, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore)
+        case .coverage, .generic, .finding:
+            // `.finding` → Task 7's `FindingCard`. Doesn't exist yet, so it
+            // falls through to the same generic `StructuredView` `.coverage`/
+            // `.generic` already use — compiles, and renders something
+            // honest, rather than a silent gap. See this view's own doc
+            // comment.
             StructuredView(value: entry.structured ?? entry.input)
         }
     }

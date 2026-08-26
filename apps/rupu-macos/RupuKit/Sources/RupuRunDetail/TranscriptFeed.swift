@@ -548,142 +548,15 @@ private struct AstGrepMatchRow: View {
     }
 }
 
-/// Pure `ast_grep` match parsing — no view/state dependency, so it's
-/// directly `@Test`-able via `@testable import RupuRunDetail` without any
-/// SwiftUI rendering. Two sources: `fromStructured` reads `tool_result.
-/// structured` (camelCase `{matchCount, fileCount, truncated, matches: [{
-/// file, range?: {startLine,startCol,endLine,endCol}, text? }]}` — built as
-/// a raw `serde_json::json!` object by the actual wire producer,
-/// `crates/rupu-tools/src/ast_grep.rs:299-332` (there is no Rust
-/// `AstGrepStructured` struct; the TS interface of the same name the web
-/// side decodes into is `crates/rupu-cp/web/src/components/transcript/
-/// ToolCard.tsx:177`). `fromText` falls back to a line-by-line
-/// `path:line:col: text` parse of the plain output for a run recorded
-/// before structured `ast_grep` output existed.
-///
-/// **Fallback trigger diverges from the web, by omission, not by design.**
-/// The web's `asAstGrepStructured` (`ToolCard.tsx`) falls back to
-/// `parseAstGrepText` ONLY when `structured` is absent or its `matches`
-/// field isn't an array — a present-but-malformed individual match (e.g.
-/// missing `range`) still renders as a range-less row, never triggers a
-/// wholesale re-parse of `output`. `astGrepMatches` (below) falls back
-/// whenever `fromStructured(...).matches.isEmpty` instead — which also
-/// fires if EVERY match in an otherwise-present `matches` array individually
-/// failed to parse (dropped by the `compactMap` below, since a match missing
-/// `file` or a well-formed `range` is skipped rather than surfaced with
-/// fabricated coordinates). This divergence is unreachable against today's
-/// emitter (`crates/rupu-tools/src/ast_grep.rs` always populates a real
-/// `range` on every match it emits), so it's left as-is and documented
-/// rather than restructured to match the web's narrower trigger.
-///
-/// Deliberately narrower than the web's own `AstGrepMatch` (no metavar
-/// bindings/highlight table) — this phase only needs enough per match to
-/// target `SourcePreview`/`AstTreeView`'s `(path, line, col)`, not to
-/// reproduce the web's full match-card rendering.
-enum AstGrepTranscriptParsing {
-    struct Match: Equatable {
-        let file: String
-        let startLine: Int
-        let startCol: Int
-        let text: String?
-    }
-
-    /// `fromStructured`'s full result: the parsed (possibly match-dropping,
-    /// see the type doc comment) match list alongside the wire's own
-    /// `matchCount`/`truncated` — the server-reported TOTAL match count and
-    /// whether the `matches` array is a truncated prefix of it (capped at
-    /// `MAX_STRUCTURED_MATCHES = 200`, `crates/rupu-tools/src/
-    /// ast_grep.rs:34`), needed to render the web's honest "showing first N
-    /// of M" label (`ToolCard.tsx:697-701`) instead of a plain count that
-    /// would silently imply `matches.count` IS the total.
-    struct StructuredResult: Equatable {
-        let matches: [Match]
-        /// The wire's own `matchCount` when present; falls back to
-        /// `matches.count` for a malformed/absent field rather than reading
-        /// as `0` — an honest reading of "we don't know the true total, so
-        /// assume it's exactly what we parsed," never a fabricated number.
-        let matchCount: Int
-        let truncated: Bool
-    }
-
-    /// Parses `tool_result.structured`'s `{matchCount, truncated, matches:
-    /// [{ file, range?: {startLine,startCol,endLine,endCol}, text? }]}`
-    /// shape — see the type doc comment for the exact wire producer and the
-    /// documented fallback-trigger divergence from the web parser. `nil`
-    /// when `structured` is absent or its `matches` field isn't present as
-    /// an array at all (the web's own fallback trigger); a present-but-
-    /// empty-after-parsing `matches` list still returns a non-`nil`
-    /// `StructuredResult` with an empty `matches` array — `astGrepMatches`
-    /// (below) is what decides whether THAT case additionally falls back to
-    /// `fromText`.
-    static func fromStructured(_ value: JSONValue?) -> StructuredResult? {
-        guard case .object(let root)? = value, case .array(let rawMatches)? = root["matches"] else { return nil }
-        let matches = rawMatches.compactMap { raw -> Match? in
-            guard case .object(let m) = raw, case .string(let file)? = m["file"] else { return nil }
-            guard case .object(let range)? = m["range"],
-                  case .number(let startLine)? = range["startLine"],
-                  case .number(let startCol)? = range["startCol"]
-            else { return nil }
-            let text: String? = {
-                if case .string(let t)? = m["text"] { return t }
-                return nil
-            }()
-            return Match(file: file, startLine: Int(startLine), startCol: Int(startCol), text: text)
-        }
-        let matchCount: Int = {
-            if case .number(let n)? = root["matchCount"] { return Int(n) }
-            return matches.count
-        }()
-        let truncated: Bool = {
-            if case .bool(let t)? = root["truncated"] { return t }
-            return false
-        }()
-        return StructuredResult(matches: matches, matchCount: matchCount, truncated: truncated)
-    }
-
-    /// The matches section's count label — the web's own truthful-under-
-    /// truncation shape (`ToolCard.tsx:697-701`, `"showing first N of M
-    /// matches"`) whenever `structured` is present AND its own `truncated`
-    /// flag is set (its `matches` array is a capped prefix of the server's
-    /// real total, `MAX_STRUCTURED_MATCHES = 200` — `crates/rupu-tools/src/
-    /// ast_grep.rs:34`); a plain `"N matches"` otherwise — including for the
-    /// text-parsed fallback (`structured == nil`), which carries no
-    /// truncation signal at all, and for an untruncated structured result
-    /// (where `matches.count` already equals `matchCount`, so a plain count
-    /// isn't misleading). `matches` is the list actually being RENDERED
-    /// (post text-fallback if that's what fired) — always `structured?.
-    /// matches` when `structured` is truncated, since truncation only ever
-    /// applies to the structured path.
-    static func matchCountLabel(structured: StructuredResult?, matches: [Match]) -> String {
-        if let structured, structured.truncated {
-            return "showing first \(structured.matches.count) of \(structured.matchCount) matches"
-        }
-        let count = matches.count
-        return "\(count) match\(count == 1 ? "" : "es")"
-    }
-
-    /// Parses the compact `path:line:col: text` line format `ast_grep`'s
-    /// plain-text output uses — direct port of the web `parseAstGrepText`'s
-    /// regex, minus the per-file grouping this phase's flat row list doesn't
-    /// need.
-    static func fromText(_ output: String) -> [Match] {
-        output.split(separator: "\n", omittingEmptySubsequences: true).compactMap { substring -> Match? in
-            let line = String(substring)
-            guard let match = Self.lineRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
-                  match.numberOfRanges == 5,
-                  let fileRange = Range(match.range(at: 1), in: line),
-                  let lineRange = Range(match.range(at: 2), in: line),
-                  let colRange = Range(match.range(at: 3), in: line),
-                  let textRange = Range(match.range(at: 4), in: line),
-                  let lineNumber = Int(line[lineRange]),
-                  let colNumber = Int(line[colRange])
-            else { return nil }
-            return Match(file: String(line[fileRange]), startLine: lineNumber, startCol: colNumber, text: String(line[textRange]))
-        }
-    }
-
-    private static let lineRegex = try! NSRegularExpression(pattern: #"^(.*?):(\d+):(\d+): (.*)$"#)
-}
+// `AstGrepTranscriptParsing` — moved to `Rendering/AstGrepBody.swift` (Task
+// 6, design-alignment Plan 4) alongside the new `AstGrepBodyView`, which
+// extends it with flattened metavar bindings. Same module (`RupuRunDetail`),
+// so every reference to it below (`astGrepStructured`, `astGrepMatches`,
+// `astGrepMatchCountLabel`, `AstGrepMatchRow`) still resolves without an
+// import change. This file's own `ast_grep` preview-mounting code (below)
+// is superseded by `AstGrepBodyView` in Task 7's transcript rewrite — left
+// as-is here per that task's explicit "minimal TranscriptFeed edit, keep it
+// compiling" instruction.
 
 // MARK: - JSON pretty printing
 
