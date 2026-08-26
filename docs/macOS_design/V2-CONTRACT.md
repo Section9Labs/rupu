@@ -101,9 +101,14 @@ Actions: back `ArrowLeft` · archive `Archive` · delete/danger `Trash2` · grap
 - Dialog/sheet: centered card over 40% black scrim.
 
 ## Composition rules
-- Shell: rail (204pt, flat 7-item IA + pinned Settings + host footer
-  "N hosts / M down") + 48pt top bar (scope select · range 7d/30d/all · ⌘K search
-  field · live pill · theme toggle).
+- Shell: rail (204pt, 7-item IA **with disclosure sub-items** — Activity ▸
+  Agents/Workflows/Autoflows/Sessions · Security ▸ Findings/Coverage/Network ·
+  Library ▸ Agents/Workflows/Autoflows · Fleet ▸ Hosts/Workers — + pinned
+  Settings + host footer "N hosts / M down"; amended 2026-08-25). Parent rows
+  navigate AND disclose; child rows deep-link to the page's kind tab; child
+  rows indent one level at the same 30pt height; a parent containing the
+  active route tints brand. Top bar 48pt (scope select · range 7d/30d/all ·
+  ⌘K search field · live pill · theme toggle).
 - Tables (SortableTable contract): sortable headers with chevrons; exactly ONE
   truncating subject column (tooltip on truncation); metadata columns fit-width,
   nowrap; numeric/time columns right-aligned tabular numerals.
@@ -111,3 +116,26 @@ Actions: back `ArrowLeft` · archive `Archive` · delete/danger `Trash2` · grap
   meta line) → banners → primary visualization → tabbed panel following
   selection (≈65% viewport, min 420pt). No side rails.
 - Null discipline: unknown renders `—`, never 0; partial sums `+`.
+
+## Run graph (added 2026-08-25, sources: kindVisuals.ts / stepStyle.ts / rg-* keyframes)
+- Two-channel rule: 3px top accent bar + kind pill = KIND color; glyph badge +
+  state label = STATE color. Never mix the channels.
+- Kind accents: step→status-running · for_each→brand-500 · parallel→sev-critical
+  · panel→status-awaiting · gate→status-paused · action→sev-info ·
+  run→sev-medium. Kind icons (lucide): Bot · Repeat · Columns3 · ShieldCheck ·
+  UserCheck · Zap · Terminal.
+- Gate nodes: dashed 1px border. Action nodes: mono tool-name headline.
+- Edges: 2px source-kind accent; untraversed 35% alpha; amber into an awaiting
+  target; marching-ants dash (7/7, ~0.7s) into running/awaiting targets.
+- Motion: expanding ring-pulse (~1.7s) for running/awaiting; 2.4s loop spin on
+  panel rounds; all `accessibilityReduceMotion`-guarded.
+- Selection: 2px brand-500 ring on the selected node (app-only; web has none).
+
+## Transcript (added 2026-08-25)
+- Turns: earlier collapsed to snippet + pills, last open. Assistant prose =
+  markdown (sans); code/ids/diff = mono. Thinking: dim, 2px left border quote.
+- Code highlighting: HighlighterSwift (highlight.js) — the ONE third-party
+  Swift dependency, exact-pinned; theme pair chosen to match
+  `components/codeHighlight.css`, background overridden to `surface`.
+- Diff rows: add=ok-bg/ok · del=err-bg/err · hunk=ink-mute. Target/matched
+  lines in previews and CST: warn-bg tint.
