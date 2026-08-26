@@ -326,13 +326,29 @@ public struct APIUnitRow: Decodable, Sendable {
     public let success: Bool?
     public let host: String?
 
+    /// Whole-branch review fix (Important): the underlying `for_each:`
+    /// list item this unit was rendered from (e.g. `"crates/a"`) — the web
+    /// labels a REST-only unit (nothing live has supplied a `unit_key` yet)
+    /// with this, and this app was dropping it entirely, always falling
+    /// straight through to the positional `"#index"` label instead. Decoded
+    /// as `String?` rather than the wire's raw `serde_json::Value`: the
+    /// Rust side's `UnitCheckpoint.item`/the events-only synthesis in
+    /// `rupu-cp`'s `merge_event_units` both carry whatever JSON value the
+    /// `for_each:` list rendered to — usually a string, but a workflow can
+    /// render numbers/bools/objects too (see `parse_fanout_items`'s doc
+    /// comment on the Rust side). Only the string case has a natural
+    /// display label; see `init(from:)` below for why a non-string value
+    /// decodes to `nil` rather than failing the whole row.
+    public let item: String?
+
     public init(
         stepID: String,
         index: Int,
         runID: String?,
         transcriptPath: String,
         success: Bool?,
-        host: String?
+        host: String?,
+        item: String? = nil
     ) {
         self.stepID = stepID
         self.index = index
@@ -340,6 +356,7 @@ public struct APIUnitRow: Decodable, Sendable {
         self.transcriptPath = transcriptPath
         self.success = success
         self.host = host
+        self.item = item
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -349,5 +366,34 @@ public struct APIUnitRow: Decodable, Sendable {
         case transcriptPath = "transcript_path"
         case success
         case host
+        case item
+    }
+
+    /// Custom, rather than synthesized, `Decodable` conformance: `item` is
+    /// an arbitrary `serde_json::Value` on the wire (see the property's doc
+    /// comment), so decoding it straight as `String?` via the synthesized
+    /// initializer would *throw* — not decode to `nil` — the moment a
+    /// workflow's `for_each:` list happens to render a number/bool/object
+    /// instead of a string, taking the entire `units` array (and so the
+    /// whole run-graph response) down with it over one cosmetic label.
+    /// `item` alone is decoded leniently: present-and-a-string decodes
+    /// normally; missing, explicit `null`, or present-but-not-a-string all
+    /// fall back to `nil` exactly as an absent field would. `layoutGraph`
+    /// already treats `nil` the same as "no REST item to fall back to" —
+    /// falling through to the positional `"#index"` label — so this never
+    /// needs its own separate "not a string" representation.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        stepID = try container.decode(String.self, forKey: .stepID)
+        index = try container.decode(Int.self, forKey: .index)
+        runID = try container.decodeIfPresent(String.self, forKey: .runID)
+        transcriptPath = try container.decode(String.self, forKey: .transcriptPath)
+        success = try container.decodeIfPresent(Bool.self, forKey: .success)
+        host = try container.decodeIfPresent(String.self, forKey: .host)
+        if let decodedItem = try? container.decodeIfPresent(String.self, forKey: .item) {
+            item = decodedItem
+        } else {
+            item = nil
+        }
     }
 }

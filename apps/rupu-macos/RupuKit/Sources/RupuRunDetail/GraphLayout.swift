@@ -174,7 +174,12 @@ public func layoutGraph(
             let restRow = restUnits[index]
             let live = liveOverlay[index]
 
-            let key = live?.key ?? "#\(index)"
+            // Whole-branch review fix (Important): a live `unit_key` wins
+            // outright; otherwise fall back to the REST row's own `item`
+            // (the underlying `for_each:` list value, e.g. "crates/a" — web
+            // parity) before the ultimate positional "#index" label, which
+            // is now only reached when neither is available.
+            let key = live?.key ?? restRow?.item ?? "#\(index)"
             let transcriptPath = live?.transcriptPath ?? restRow?.transcriptPath
             let success = live?.success ?? restRow?.success
             let state: NodeState = success == nil ? .running : .done(success: success!)

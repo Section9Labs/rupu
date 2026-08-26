@@ -34,6 +34,29 @@ private final class PathBox: @unchecked Sendable {
     }
 }
 
+/// Async-safe one-shot gate — same class as `FleetStoreTests.AsyncGate` (see
+/// that type's doc comment for the full rationale): a "slow" stub held back
+/// by `Thread.sleep`/`Task.sleep` only *probabilistically* brackets the state
+/// a test asserts, and under parallel-suite load either side can win. This
+/// store's REST seams (`fetchGraph` etc.) are plain `async` closures, so the
+/// wait must not park a cooperative thread — it bridges a `DispatchSemaphore`
+/// through a continuation resumed off a global (non-cooperative) queue
+/// instead. The 10s cap only bounds a hung test; it is never a timing knob.
+private final class AsyncGate: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                _ = self.semaphore.wait(timeout: .now() + 10)
+                continuation.resume()
+            }
+        }
+    }
+
+    func open() { semaphore.signal() }
+}
+
 /// Fakes the run-scoped `runSignalsFactory` seam: each call records a fresh
 /// `AsyncStream<StreamSignal<CPEvent>>` + continuation pair so a test can
 /// reach into the specific cycle `RunDetailStore.activate()`/`startRunStream`
@@ -1535,6 +1558,83 @@ private func makeStore(
     let cleared = await pollUntil { store.liveStates["build"] == nil }
     #expect(cleared, "a terminal event must clear liveStates so a step left .running doesn't stay stuck rendering that stale pulse forever")
     #expect(store.liveStates.isEmpty)
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// Whole-branch review fix (Critical): a terminal event must refetch
+/// `graph` and only clear `liveStates` *after* that refetch lands — never
+/// the reverse, which would leave a run watched live from running through
+/// completion with nothing but its stale, mostly-`.pending`
+/// activation-time `graph` snapshot to fall back to. The terminal
+/// refetch's `fetchGraph` call is held open on an `AsyncGate` until the
+/// test has confirmed `liveStates` is STILL populated with the live
+/// `.done` state (proving the clear cannot have run yet); only once the
+/// gate is released does `liveStates` clear, and by then `graph`'s content
+/// already carries the finished `stepResult`. De-flaked per the suite's
+/// async-gate convention (`FleetStoreTests.AsyncGate`'s sibling here)
+/// rather than a timed sleep, which could only ever *probabilistically*
+/// bracket the ordering under test.
+@MainActor @Test func terminalEventRefetchesGraphBeforeClearingLiveStatesSoTheRebuiltGraphStillShowsDone() async {
+    let runBox = RunStreamBox()
+    let graphCalls = Counter()
+    let refetchGate = AsyncGate()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        graphResult: {
+            graphCalls.increment()
+            if graphCalls.value == 1 {
+                // Activation snapshot: no result for "build" yet.
+                return graph(run: runRecord())
+            }
+            // The terminal refetch — held open until the test says so.
+            await refetchGate.wait()
+            return APIRunGraph(
+                run: runRecord(status: "completed"),
+                workflow: APIStepDag(steps: []),
+                stepResults: [stepResult(stepID: "build", transcriptPath: "t/build.jsonl", success: true)],
+                units: [],
+                usage: usage()
+            )
+        },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    #expect(graphCalls.value == 1)
+
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: nil, host: nil)))
+    let running = await pollUntil { store.liveStates["build"] == .running }
+    #expect(running)
+
+    runBox.latest.yield(.event(.stepCompleted(runID: "run-1", stepID: "build", success: true, durationMS: 10, host: nil)))
+    let liveDone = await pollUntil { store.liveStates["build"] == .done(success: true) }
+    #expect(liveDone)
+
+    runBox.latest.yield(.event(.runCompleted(runID: "run-1", status: "completed", finishedAt: "2026-08-20T13:00:00Z")))
+
+    // The terminal refetch is now in flight, gated open. This is exactly
+    // the window the pre-fix (synchronous-clear) shape would already have
+    // collapsed -- prove liveStates is untouched while the refetch is
+    // still pending.
+    let refetchStarted = await pollUntil { graphCalls.value == 2 }
+    #expect(refetchStarted)
+    #expect(store.liveStates["build"] == .done(success: true), "liveStates must not clear before the refetched graph lands")
+
+    refetchGate.open()
+
+    let clearedAfterRefetch = await pollUntil { store.liveStates["build"] == nil }
+    #expect(clearedAfterRefetch)
+
+    guard case .content(let refreshedGraph) = store.graph else {
+        Issue.record("expected graph to still be .content after the terminal refetch")
+        return
+    }
+    #expect(
+        refreshedGraph.stepResults.first(where: { $0.stepID == "build" })?.success == true,
+        "the rebuilt graph must reflect the finished step as .done, not stale/pending activation-time content"
+    )
 
     store.deactivate()
     runBox.latest.finish()

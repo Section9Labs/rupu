@@ -22,18 +22,31 @@ import RupuAPI
 /// same event: the Rust runner emits `stepCompleted{success:false}` when a
 /// step actually ran and *reported* failure, and a separate `stepFailed`
 /// for dispatch-level failure (connector error, timeout, panic — the step
-/// never got to report anything). Without reducing `stepFailed` too, a
-/// dispatch-failed step stayed visually `.running` in the graph forever —
-/// `graph` is deliberately never refetched on the terminal event (see
-/// below), so nothing else would ever correct it. Every other `CPEvent`
-/// case is ignored here. A terminal run event
+/// never got to report anything). `unitStarted`/`unitCompleted`/
+/// `panelRound`/`stepWorking` (Task 5) similarly patch `liveUnits`/
+/// `panelRounds`/`stepTranscripts` rather than `liveStates`; every other
+/// `CPEvent` case is ignored here. A terminal run event
 /// (`runCompleted`/`runFailed`) stops the run stream and refreshes
-/// `detail`/`findings`/`netflow` exactly once — `didHandleTerminal` guards
-/// against a duplicate terminal event (or an `.unknown` fallback racing a
-/// real one) firing the refresh twice; `graph` is deliberately not
-/// refreshed here (the brief's terminal-refresh list is `detail`/`findings`/
-/// `netflow` only — the step graph's terminal state already arrived via the
-/// `stepCompleted`/`stepSkipped` deltas that got it there).
+/// `detail`/`findings`/`netflow`/`graph` exactly once — `didHandleTerminal`
+/// guards against a duplicate terminal event (or an `.unknown` fallback
+/// racing a real one) firing the refresh twice.
+///
+/// **`graph` IS refetched on the terminal event** (whole-branch review fix,
+/// Critical — this reverses an earlier version of this comment, and of
+/// `apply`, that left `graph` stale here on purpose): `layoutGraph`'s
+/// rendered node state falls back to `graph`'s own REST `stepResults`/
+/// `units` the moment a step has no entry in `liveStates` — so a run
+/// watched live from running straight through to completion, whose
+/// `graph` block was only ever fetched once at `activate()`-time, would
+/// otherwise have every in-flight step's live `.running`/`.done` state
+/// wiped by the terminal cleanup below and nothing left to fall back to
+/// but that stale, mostly-`.pending` activation-time snapshot. Refetching
+/// `graph` alongside `detail`/`findings`/`netflow` is what gives the
+/// now-finished run's real `stepResults` to fall back to instead.
+/// `liveStates` itself is cleared only *after* this refetch lands (see
+/// `handleTerminal`'s doc comment) — not synchronously when the terminal
+/// `CPEvent` is applied — specifically to avoid a `.pending`-flash window
+/// between "live state cleared" and "the refreshed graph has arrived".
 ///
 /// **`focusStep`**: resolves the target step's transcript path — a finished
 /// `APIStepResult` first, else a matching `APIUnitRow` (first match; a
@@ -840,21 +853,13 @@ public final class RunDetailStore {
         case .runCompleted(let runID, let status, _):
             pendingActions.resolve(runID: runID, observedStatus: .normalize(status))
             // Controller ruling (Task 5, terminal-event live-state cleanup —
-            // the web's "phase 5b" replacement): clear `liveStates` once the
-            // run is over so step results (the REST `graph`/`detail` blocks)
-            // become the sole source of truth again and no step is left
-            // stuck rendering a stale `.running`/`.paused`/... pulse forever.
-            // `liveUnits`/`panelRounds` are deliberately left as-is — they
-            // aren't part of this reconciliation. Deliberately NOT porting
-            // the web's fabricate-done reconciliation: a step this clears
-            // that has no REST result yet renders honestly `.pending` rather
-            // than a synthesized "done".
-            liveStates = [:]
+            // the web's "phase 5b" replacement) — but NOT cleared here,
+            // synchronously: see `handleTerminal`'s doc comment (whole-branch
+            // review fix, Critical) for why the clear now happens only after
+            // `graph` has been refetched.
             handleTerminal()
         case .runFailed(let runID, _, _):
             pendingActions.resolve(runID: runID, observedStatus: .failed)
-            // Same terminal cleanup as `runCompleted` above.
-            liveStates = [:]
             handleTerminal()
         default:
             break
@@ -864,16 +869,29 @@ public final class RunDetailStore {
     /// Guarded by `didHandleTerminal` so a duplicate terminal event never
     /// double-fires the refresh. Stops the run stream synchronously (no
     /// more deltas make sense once the run is over) and refreshes
-    /// `detail`/`findings`/`netflow` — not `graph`, see the type doc
-    /// comment — in one fire-and-forget `Task` (an event's `apply` callback
-    /// itself is synchronous, so the refresh can't be `await`ed inline
-    /// here).
+    /// `detail`/`findings`/`netflow`/`graph` in one fire-and-forget `Task`
+    /// (an event's `apply` callback itself is synchronous, so the refresh
+    /// can't be `await`ed inline here).
     /// Review fix: a terminal run event also stops any live transcript tail
     /// and reloads the focused step's transcript once via REST — the run is
     /// over, so there's nothing left to tail, and without this the feed
     /// could be left showing a truncated view (whatever arrived before the
     /// tail's underlying connection tore down) with `transcriptTailActive`
     /// stuck `true` forever.
+    ///
+    /// **Whole-branch review fix (Critical)**: `graph` is now part of this
+    /// refresh — see the type doc comment's "`graph` IS refetched on the
+    /// terminal event" section for why leaving it stale here collapsed a
+    /// live-watched run's rendering back to mostly-`.pending` once
+    /// `liveStates` no longer had anything to fall back on. `liveStates` is
+    /// cleared here, in this `Task`, only *after* `graphLoad` (alongside the
+    /// other three) has actually landed — not synchronously back in `apply`
+    /// where the terminal `CPEvent` itself was handled. Ordering it this way
+    /// closes the window a synchronous clear would otherwise leave open:
+    /// between "liveStates cleared" and "the refetched graph's real
+    /// `stepResults` are in", `layoutGraph` would have nothing but the
+    /// stale activation-time `graph` snapshot to render from, flashing
+    /// finished steps as `.pending` for however long the refetch took.
     private func handleTerminal() {
         guard !didHandleTerminal else { return }
         didHandleTerminal = true
@@ -884,9 +902,12 @@ public final class RunDetailStore {
         Task { [weak self] in
             guard let self else { return }
             async let detailLoad: Void = self.loadDetail()
+            async let graphLoad: Void = self.loadGraph()
             async let findingsLoad: Void = self.loadFindings()
             async let netflowLoad: Void = self.loadNetflow()
-            _ = await (detailLoad, findingsLoad, netflowLoad)
+            _ = await (detailLoad, graphLoad, findingsLoad, netflowLoad)
+
+            self.liveStates = [:]
 
             if let path = self.focusedTranscriptPath {
                 await self.reloadTranscriptSnapshot(path: path)

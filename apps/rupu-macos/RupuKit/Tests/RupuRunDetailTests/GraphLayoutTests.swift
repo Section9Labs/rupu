@@ -152,7 +152,12 @@ private func layout(
     #expect(unit0.state == .done(success: false))
 }
 
-@Test func fanoutOverlayFallsBackToIndexKeyWithoutLiveOverlay() throws {
+/// Whole-branch review fix (Important): without a live overlay, the key
+/// chain's middle rung — the REST row's own `item` (the underlying
+/// `for_each:` list value, web parity) — is what a unit falls back to, not
+/// straight to the positional `"#index"` label. `run_graph.json`'s "fan"
+/// units carry `item: "crates/a"`/`"crates/b"`.
+@Test func fanoutOverlayFallsBackToRESTItemLabelWithoutLiveOverlay() throws {
     let graph = try loadGraph()
     let vms = layout(graph)
     let fan = try #require(vms.first { $0.id == "fan" })
@@ -160,11 +165,43 @@ private func layout(
 
     let unit0 = try #require(fanout.units.first { $0.id == 0 })
     let unit1 = try #require(fanout.units.first { $0.id == 1 })
-    #expect(unit0.key == "#0")
-    #expect(unit1.key == "#1")
+    #expect(unit0.key == "crates/a")
+    #expect(unit1.key == "crates/b")
     // Unit 1 has no terminal success in REST (nil) -> still running.
     #expect(unit1.state == .running)
     #expect(unit0.state == .done(success: true))
+}
+
+/// The key chain's ultimate fallback — `"#index"` — is only reached when
+/// neither a live `unit_key` NOR a REST `item` is available (a unit row
+/// with `item: nil`, e.g. decoded from a wire value that wasn't a string —
+/// see `APIUnitRow.init(from:)`'s doc comment).
+@Test func fanoutFallsBackToIndexKeyWhenNeitherLiveKeyNorRESTItemIsPresent() throws {
+    let node = APIStepNode(
+        id: "fan3",
+        kind: "for_each",
+        agent: "reviewer",
+        forEach: "{{ files }}",
+        parallel: nil,
+        panelists: nil,
+        gate: nil,
+        action: nil,
+        approvalGate: nil
+    )
+    let unit = APIUnitRow(stepID: "fan3", index: 0, runID: nil, transcriptPath: "t/u0.jsonl", success: true, host: nil, item: nil)
+    let vms = layoutGraph(
+        nodes: [node],
+        results: [],
+        units: [unit],
+        liveStates: [:],
+        liveUnits: [:],
+        panelRounds: [:],
+        stepTranscripts: [:]
+    )
+    let fan = try #require(vms.first { $0.id == "fan3" })
+    let fanout = try #require(fan.fanout)
+    let unit0 = try #require(fanout.units.first { $0.id == 0 })
+    #expect(unit0.key == "#0")
 }
 
 @Test func fanoutCountsAreDerivedNotStored() throws {
