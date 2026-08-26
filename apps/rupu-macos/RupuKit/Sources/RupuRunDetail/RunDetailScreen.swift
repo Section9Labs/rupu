@@ -146,7 +146,7 @@ public struct RunDetailScreen: View {
                 awaitingBanner(store: store, detail: detail)
             }
             stepGraphSection(store: store)
-                .frame(height: 140)
+                .frame(height: 420)
             RunDetailTabPanel(store: store, tab: $selectedTab, sourcePreviewStore: sourcePreviewStore)
         }
         .padding(16)
@@ -550,7 +550,11 @@ public struct RunDetailScreen: View {
                     stepTranscripts: [:]
                 ),
                 selectedID: store.selectedStepID,
-                onSelect: { stepID in Task { await store.select(step: stepID) } }
+                onSelect: { stepID in Task { await store.select(step: stepID) } },
+                // TODO(Task 5): wire the real fan-out unit selection —
+                // this screen properly threads it through `RunDetailStore`
+                // there; Task 4 only needed the call site to compile.
+                onSelectUnit: { _, _ in }
             )
             .panelStyle(.panel)
         }

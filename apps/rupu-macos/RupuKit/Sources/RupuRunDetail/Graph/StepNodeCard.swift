@@ -139,8 +139,9 @@ struct StateBadge: View {
 /// Ring-pulse behind a running/awaiting badge: an expanding stroked circle (scale 1 -> ~1.5,
 /// fading out) on a 1.7s ease-in-out repeat — port of the web's `rg-pulse-run`/`rg-pulse-await`
 /// CSS keyframes (`.gatePending` renders in the `.awaiting` color, everything else in
-/// `.running`). Reuses the restart discipline from `StepGraphView.swift`'s `StatusGlyph.
-/// updatePulse`: start/stop on `onAppear` + `onChange(of:)` for both `state` and reduce-motion,
+/// `.running`). Reuses the restart discipline every animated element in this run graph follows
+/// (see also `GraphEdge.swift`'s marching ants, `ContainerNodes.swift`'s `PanelLoopSpinner`):
+/// start/stop on `onAppear` + `onChange(of:)` for both `state` and reduce-motion,
 /// and never restart an already-running pulse between two animated states — mounting this view
 /// only at the animated <-> non-animated boundary (its parent's `if state.isPulsing` in
 /// `StateBadge`) means a `.running` -> `.gatePending` transition keeps this view's identity, so
