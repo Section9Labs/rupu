@@ -76,7 +76,7 @@ import Testing
 /// sidebar-selectable" contract `.projectDetail` already has for Projects.
 @MainActor @Test func agentAndWorkflowDefinitionKeepSidebarHighlightOnLibrary() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
-    model.route = .library
+    model.route = .library(.agents)
 
     model.route = .agentDefinition(name: "code-reviewer")
     #expect(model.selectedSidebarItem == SidebarItem.library)
@@ -89,14 +89,14 @@ import Testing
 /// other pushed detail route.
 @MainActor @Test func navigateBackFromAgentDefinitionReturnsToLibrary() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
-    model.route = .library
+    model.route = .library(.agents)
 
     model.navigate(to: .agentDefinition(name: "code-reviewer"))
     #expect(model.route == .agentDefinition(name: "code-reviewer"))
-    #expect(model.routeStack == [.library])
+    #expect(model.routeStack == [.library(.agents)])
 
     model.navigateBack()
-    #expect(model.route == .library)
+    #expect(model.route == .library(.agents))
 }
 
 /// Final-review fix wave: `.agentDefinition`/`.workflowDefinition` gained
@@ -135,14 +135,14 @@ import Testing
 /// mechanics, only what the pushed route carries.
 @MainActor @Test func navigateBackFromScopedWorkflowDefinitionReturnsToLibrary() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
-    model.route = .library
+    model.route = .library(.agents)
 
     model.navigate(to: .workflowDefinition(name: "issue-triage", scopeKind: "project", scopeID: "ws-1"))
     #expect(model.route == .workflowDefinition(name: "issue-triage", scopeKind: "project", scopeID: "ws-1"))
-    #expect(model.routeStack == [.library])
+    #expect(model.routeStack == [.library(.agents)])
 
     model.navigateBack()
-    #expect(model.route == .library)
+    #expect(model.route == .library(.agents))
 }
 
 @MainActor @Test func navigateBackRestoresPriorActivityFilterDefaultingToAll() {
@@ -311,7 +311,7 @@ import Testing
 /// Projects/Library.
 @MainActor @Test func coverageDetailKeepsSidebarHighlightOnSecurity() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
-    model.route = .security
+    model.route = .security(.coverage)
 
     model.route = .coverageDetail(target: "auth-core", wsID: "ws-1")
     #expect(model.selectedSidebarItem == SidebarItem.security)
@@ -321,14 +321,14 @@ import Testing
 /// every other pushed detail route.
 @MainActor @Test func navigateBackFromCoverageDetailReturnsToSecurity() {
     let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
-    model.route = .security
+    model.route = .security(.coverage)
 
     model.navigate(to: .coverageDetail(target: "auth-core", wsID: "ws-1"))
     #expect(model.route == .coverageDetail(target: "auth-core", wsID: "ws-1"))
-    #expect(model.routeStack == [.security])
+    #expect(model.routeStack == [.security(.coverage)])
 
     model.navigateBack()
-    #expect(model.route == .security)
+    #expect(model.route == .security(.coverage))
 }
 
 /// `Route` equality distinguishes `.coverageDetail` instances by both
@@ -340,4 +340,88 @@ import Testing
     #expect(base == Route.coverageDetail(target: "auth-core", wsID: "ws-1"))
     #expect(base != Route.coverageDetail(target: "web-api", wsID: "ws-1"))
     #expect(base != Route.coverageDetail(target: "auth-core", wsID: "ws-2"))
+}
+
+// MARK: - Tabbed routes (Task 0, sidebar disclosure sub-items)
+//
+// `.security`/`.library`/`.fleet` gained an associated tab enum
+// (`SecurityTab`/`LibraryTab`/`FleetTab`) so `Route` can carry which of a
+// composite screen's tabs is showing — the sidebar's disclosure children
+// and each screen's own in-page tab picker both read/write it directly.
+// Swift has no default-associated-value shorthand, so every construction
+// site spells the default out explicitly; these tests pin down the
+// equality/mapping contract that default relies on.
+
+/// Constructing a route with its screen's explicit default tab equals
+/// itself and any other route built the same way — the "default-tab
+/// equality" the design-alignment amendment's ruling calls for in place of
+/// `case security(SecurityTab = .findings)` (which Swift doesn't support).
+@MainActor @Test func tabbedRoutesConstructedWithTheirExplicitDefaultAreEqual() {
+    #expect(Route.security(.findings) == Route.security(.findings))
+    #expect(Route.library(.agents) == Route.library(.agents))
+    #expect(Route.fleet(.hosts) == Route.fleet(.hosts))
+}
+
+/// Two `.security`/`.library`/`.fleet` routes at different tabs are NOT
+/// equal — a regression here would silently break SwiftUI's `.task(id:)`
+/// re-triggering on a tab switch, the same class of bug
+/// `agentRunDetailRoutesWithDifferentFieldsAreNotEqual` (`RouteTests`)
+/// guards against for `.agentRunDetail`.
+@MainActor @Test func tabbedRoutesAtDifferentTabsAreNotEqual() {
+    #expect(Route.security(.findings) != Route.security(.coverage))
+    #expect(Route.library(.agents) != Route.library(.workflows))
+    #expect(Route.library(.workflows) != Route.library(.autoflows))
+    #expect(Route.fleet(.hosts) != Route.fleet(.workers))
+}
+
+/// Every tab of `.security`/`.library`/`.fleet` maps back to the same
+/// parent `SidebarItem` — `selectedSidebarItem`'s getter ignores which tab
+/// is showing, same "every kind collapses to one row" contract
+/// `allActivityKindsMapToTheSingleActivitySidebarItem` already establishes
+/// for `.activity`.
+@MainActor @Test func everyTabOfASecurityRouteMapsToTheSingleSecuritySidebarItem() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    for tab in SecurityTab.allCases {
+        model.route = .security(tab)
+        #expect(model.selectedSidebarItem == SidebarItem.security)
+    }
+}
+
+@MainActor @Test func everyTabOfALibraryRouteMapsToTheSingleLibrarySidebarItem() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    for tab in LibraryTab.allCases {
+        model.route = .library(tab)
+        #expect(model.selectedSidebarItem == SidebarItem.library)
+    }
+}
+
+@MainActor @Test func everyTabOfAFleetRouteMapsToTheSingleFleetSidebarItem() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+    for tab in FleetTab.allCases {
+        model.route = .fleet(tab)
+        #expect(model.selectedSidebarItem == SidebarItem.fleet)
+    }
+}
+
+/// Unlike `.activity` (whose parent-row click restores `lastActivityRoute`),
+/// a bare `selectedSidebarItem = .security`/`.library`/`.fleet` assignment
+/// always resets to that screen's fixed default tab — it does NOT remember
+/// whichever tab was showing before the user navigated away. This is the
+/// controller ruling's explicit amendment to the brief's original
+/// `case security(SecurityTab = .findings)` shorthand: the default lives at
+/// the setter, not on the enum case itself.
+@MainActor @Test func selectingSecurityLibraryOrFleetFromTheSidebarAlwaysResetsToTheDefaultTab() {
+    let model = AppModel(defaults: .init(suiteName: "test-\(UUID())")!)
+
+    model.route = .security(.coverage)
+    model.selectedSidebarItem = .security
+    #expect(model.route == .security(.findings))
+
+    model.route = .library(.workflows)
+    model.selectedSidebarItem = .library
+    #expect(model.route == .library(.agents))
+
+    model.route = .fleet(.workers)
+    model.selectedSidebarItem = .fleet
+    #expect(model.route == .fleet(.hosts))
 }

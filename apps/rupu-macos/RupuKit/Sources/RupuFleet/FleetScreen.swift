@@ -38,6 +38,16 @@ private enum FleetLayout {
 /// `.fleet` is only ever reached by a sidebar click, well after the shell's
 /// own connection attempt has already resolved.
 ///
+/// **Route-driven tab (Task 0, sidebar disclosure sub-items)**: previously
+/// this screen had no tab at all — hosts and workers both rendered stacked
+/// in one scroll view. `FleetTab` gives it the same route-driven picker
+/// idiom `SecurityScreen`/`LibraryScreen` already follow (see
+/// `SecurityScreen.tab`'s doc comment): `tab` reads/writes `model.route`
+/// directly rather than local `@State`, so the sidebar's Hosts/Workers
+/// children and this screen's own segmented control share one source of
+/// truth. All prior content is preserved, just gated by tab instead of
+/// always-both.
+///
 /// **No add-host forms** — the Phase 5 breadth spec's disposition
 /// (`docs/superpowers/specs/2026-08-24-rupu-macos-phase-5-breadth-design.md`
 /// §2, "Fleet": "**Deferred (tracked): add-host/enroll forms** (node/ssh/
@@ -121,11 +131,38 @@ public struct FleetScreen: View {
 
     // MARK: - Layout
 
+    /// `model.route`'s associated tab — see `SecurityScreen.tab`'s identical
+    /// doc comment for the fallback rationale.
+    private var tab: FleetTab {
+        if case .fleet(let tab) = model.route { return tab }
+        return .hosts
+    }
+
+    private var tabBinding: Binding<FleetTab> {
+        Binding(get: { tab }, set: { model.route = .fleet($0) })
+    }
+
+    private var tabPicker: some View {
+        Picker("Tab", selection: tabBinding) {
+            ForEach(FleetTab.allCases, id: \.self) { candidate in
+                Text(candidate.title).tag(candidate)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(maxWidth: 240)
+    }
+
     private func content(store: FleetStore) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                hostsSection(store: store)
-                workersSection(store: store)
+                tabPicker
+                switch tab {
+                case .hosts:
+                    hostsSection(store: store)
+                case .workers:
+                    workersSection(store: store)
+                }
                 footerNote
             }
             .padding(16)

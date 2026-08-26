@@ -281,9 +281,9 @@ public final class PaletteStore {
             PaletteItem(id: "page:overview", kind: .page, title: "Overview", subtitle: nil, action: .navigate(.overview)),
             PaletteItem(id: "page:activity", kind: .page, title: "Activity", subtitle: nil, action: .navigate(.activity(.all))),
             PaletteItem(id: "page:projects", kind: .page, title: "Projects", subtitle: nil, action: .navigate(.projects)),
-            PaletteItem(id: "page:security", kind: .page, title: "Security", subtitle: nil, action: .navigate(.security)),
-            PaletteItem(id: "page:library", kind: .page, title: "Library", subtitle: nil, action: .navigate(.library)),
-            PaletteItem(id: "page:fleet", kind: .page, title: "Fleet", subtitle: nil, action: .navigate(.fleet)),
+            PaletteItem(id: "page:security", kind: .page, title: "Security", subtitle: nil, action: .navigate(.security(.findings))),
+            PaletteItem(id: "page:library", kind: .page, title: "Library", subtitle: nil, action: .navigate(.library(.agents))),
+            PaletteItem(id: "page:fleet", kind: .page, title: "Fleet", subtitle: nil, action: .navigate(.fleet(.hosts))),
             PaletteItem(id: "page:usage", kind: .page, title: "Usage", subtitle: nil, action: .navigate(.usage)),
         ]
     }
@@ -328,7 +328,7 @@ public final class PaletteStore {
         definitions.map { definition in
             PaletteItem(
                 id: "agent:\(definition.slug)", kind: .agent, title: definition.name,
-                subtitle: definition.description ?? "Agent", action: .navigate(.library)
+                subtitle: definition.description ?? "Agent", action: .navigate(.library(.agents))
             )
         }
     }
@@ -337,7 +337,7 @@ public final class PaletteStore {
         definitions.map { definition in
             PaletteItem(
                 id: "workflow:\(definition.name)", kind: .workflow, title: definition.name,
-                subtitle: "Workflow", action: .navigate(.library)
+                subtitle: "Workflow", action: .navigate(.library(.workflows))
             )
         }
     }

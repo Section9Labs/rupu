@@ -1,13 +1,65 @@
 /// Which slice of run history the Activity screen (Phase 2) is filtered to.
 ///
-/// The Activity screen's own `FilterBar` segmented control is the only UI
-/// that picks a specific kind — the sidebar (v2 rail, flows-composition
-/// Task 1) collapsed to a single `SidebarItem.activity` entry that always
-/// selects whichever kind was last active (`AppModel.lastActivityRoute`),
-/// so this enum is no longer a sidebar discriminator, only the Activity
-/// screen's own filter state.
+/// The Activity screen's own `FilterBar` segmented control was, for a while
+/// (flows-composition Task 1), the only UI that picked a specific kind — the
+/// sidebar had collapsed to a single `SidebarItem.activity` entry that
+/// always selected whichever kind was last active (`AppModel.
+/// lastActivityRoute`). Design-alignment Task 0 restores a sidebar-level
+/// picker too (`RupuShell.Sidebar`'s disclosure children, one row per case
+/// here) — but `SidebarItem` granularity is unchanged, see that enum's own
+/// doc comment.
 public enum RunKindFilter: String, CaseIterable, Sendable {
     case all, agents, workflows, autoflows, sessions
+}
+
+/// Which tab the Security screen is showing (Task 0, sidebar disclosure
+/// sub-items — moved here from `RupuSecurity/SecurityScreen.swift` so
+/// `Route` can carry it without an upward dependency on that module).
+/// Segmented control, same idiom `LibraryTab`/`ProjectDetailTab` already use.
+///
+/// **No `.network` case** — deliberately deferred: the app has no netflow
+/// aggregate surface yet, and a sidebar child that navigates to nothing
+/// would be worse than one that's simply absent.
+public enum SecurityTab: String, CaseIterable, Sendable {
+    case findings, coverage
+
+    public var title: String {
+        switch self {
+        case .findings: "Findings"
+        case .coverage: "Coverage"
+        }
+    }
+}
+
+/// Which definition tab the Library screen is showing (Task 0 — moved here
+/// from `RupuLibrary/LibraryScreen.swift`, same rationale as `SecurityTab`
+/// above). Segmented control, same idiom `FilterBar`'s kind picker uses for
+/// Activity.
+public enum LibraryTab: String, CaseIterable, Sendable {
+    case agents, workflows, autoflows
+
+    public var title: String {
+        switch self {
+        case .agents: "Agents"
+        case .workflows: "Workflows"
+        case .autoflows: "Autoflows"
+        }
+    }
+}
+
+/// Which tab the Fleet screen is showing (Task 0 — `FleetScreen` previously
+/// had no tab at all, stacking hosts and workers content in one scroll view;
+/// this gives it the same route-driven tab idiom `SecurityTab`/`LibraryTab`
+/// already follow).
+public enum FleetTab: String, CaseIterable, Sendable {
+    case hosts, workers
+
+    public var title: String {
+        switch self {
+        case .hosts: "Hosts"
+        case .workers: "Workers"
+        }
+    }
 }
 
 /// Every screen the shell can show in its detail pane.
@@ -41,7 +93,12 @@ public enum Route: Hashable, Sendable {
     /// follow. `selectedSidebarItem`'s getter maps this to
     /// `SidebarItem.projects`, same as those two map to `.activity`.
     case projectDetail(wsID: String)
-    case security
+    /// The Security screen's tab (Task 0, sidebar disclosure sub-items) —
+    /// there is no default-associated-value shorthand in Swift, so every
+    /// construction site spells the default out explicitly:
+    /// `.security(.findings)`. `AppModel.selectedSidebarItem`'s setter is the
+    /// canonical "what does a bare parent-row click mean" answer.
+    case security(SecurityTab)
     /// One coverage target's detail view (Phase 5B, Task 3 stubs the route;
     /// Task 4 builds `CoverageDetailScreen`) — pushed from a `.security`
     /// Coverage-tab row tap via `AppModel.navigate(to:)`, same "pushed, not
@@ -50,7 +107,10 @@ public enum Route: Hashable, Sendable {
     /// row — see its doc comment), carried straight through to
     /// `CPClient.coverageDetail(target:wsID:)`'s disambiguation query param.
     case coverageDetail(target: String, wsID: String)
-    case library
+    /// The Library screen's tab (Task 0) — same "spell the default out at
+    /// every construction site" contract `.security` documents above;
+    /// default is `.library(.agents)`.
+    case library(LibraryTab)
     /// One agent definition's detail view (Phase 5A, Task 7) — pushed from
     /// a `.library` agents-tab row tap via `AppModel.navigate(to:)`, same
     /// "pushed, not directly sidebar-selectable" contract `.projectDetail`
@@ -74,7 +134,10 @@ public enum Route: Hashable, Sendable {
     /// same push/sidebar-highlight contract as `.agentDefinition` above.
     /// `scopeKind`/`scopeID`: see `.agentDefinition`'s doc comment.
     case workflowDefinition(name: String, scopeKind: String? = nil, scopeID: String? = nil)
-    case fleet
+    /// The Fleet screen's tab (Task 0) — same "no default-associated-value
+    /// shorthand, spell it out at every construction site" contract
+    /// `.security`/`.library` document above; default is `.fleet(.hosts)`.
+    case fleet(FleetTab)
     case usage
 }
 
@@ -93,8 +156,17 @@ public enum TimeRange: String, CaseIterable, Sendable {
 ///
 /// Flows-composition Task 1 collapsed the old `.runs`/`.runsLeaf(_:)` pair
 /// (a "Runs" section with one row per `RunKindFilter`) into the single
-/// `.activity` row per the v2 flat rail — kind selection now lives entirely
-/// in the Activity screen's own `FilterBar`, not the sidebar.
+/// `.activity` row per the v2 flat rail — kind selection lived entirely in
+/// the Activity screen's own `FilterBar`, not the sidebar.
+///
+/// **Design-alignment Task 0 amendment**: `RupuShell.Sidebar` restores
+/// sidebar-level reachability via disclosure children (Activity's `.all`/
+/// `.agents`/`.workflows`/`.autoflows`/`.sessions`; Security's/Library's/
+/// Fleet's own tab enums) — but the *sidebar item* granularity here is
+/// unchanged: every tab of a composite screen still maps to that screen's
+/// one `SidebarItem` (`selectedSidebarItem`'s getter ignores the associated
+/// tab), the same way every `.activity(kind)` already collapses to
+/// `.activity`. Only the rail's own child rows discriminate tabs.
 public enum SidebarItem: Hashable {
     case overview
     case activity

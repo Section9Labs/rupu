@@ -4,19 +4,6 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// Which tab the Security screen is showing. Segmented control, same idiom
-/// `LibraryTab`/`ProjectDetailTab` already use.
-public enum SecurityTab: String, CaseIterable, Sendable {
-    case findings, coverage
-
-    var title: String {
-        switch self {
-        case .findings: "Findings"
-        case .coverage: "Coverage"
-        }
-    }
-}
-
 /// The Security screen (Phase 5B, Task 3), replacing the `.security`
 /// placeholder: segmented Findings/Coverage tabs, both scoped across every
 /// registered workspace (unlike `ProjectDetailScreen`'s own Findings tab,
@@ -46,13 +33,21 @@ public enum SecurityTab: String, CaseIterable, Sendable {
 /// **No `.onDisappear`/`deactivate()`** — same "one-shot `activate()`,
 /// nothing running in the background to tear down" reasoning `LibraryScreen`
 /// documents for itself: `SecurityStore` has no reconcile loop.
+///
+/// **Route-driven tab (Task 0, sidebar disclosure sub-items)**: `tab` is no
+/// longer local `@State` — `SecurityTab` moved to `RupuStore.Route` so the
+/// sidebar's Findings/Coverage children and this screen's own segmented
+/// control both read/write the same `model.route`, the same "tab survives a
+/// round trip" contract `AppModel.swift`'s doc comment documents for
+/// Activity's kind tabs. A tab click writes `model.route` directly (never
+/// `navigate(to:)`) — it's a context switch, not a push, same as every other
+/// direct sidebar/tab selection.
 public struct SecurityScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
 
     @State private var store: SecurityStore?
     @State private var storeClientID: ObjectIdentifier?
-    @State private var tab: SecurityTab = .findings
     @State private var findingsSort = ListSort<FindingsSortKey>(key: .severity, ascending: false)
     @State private var coverageSort = ListSort<CoverageSortKey>(key: .target, ascending: true)
 
@@ -101,8 +96,21 @@ public struct SecurityScreen: View {
         .padding(16)
     }
 
+    /// `model.route`'s associated tab, defaulting to `.findings` for any
+    /// route that isn't `.security(_)` at all (unreached in practice — this
+    /// screen only ever renders while `model.route` is `.security(_)` — but
+    /// an honest fallback beats a force-unwrap).
+    private var tab: SecurityTab {
+        if case .security(let tab) = model.route { return tab }
+        return .findings
+    }
+
+    private var tabBinding: Binding<SecurityTab> {
+        Binding(get: { tab }, set: { model.route = .security($0) })
+    }
+
     private var tabPicker: some View {
-        Picker("Tab", selection: $tab) {
+        Picker("Tab", selection: tabBinding) {
             ForEach(SecurityTab.allCases, id: \.self) { candidate in
                 Text(candidate.title).tag(candidate)
             }

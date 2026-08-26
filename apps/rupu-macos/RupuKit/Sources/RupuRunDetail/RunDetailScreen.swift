@@ -146,7 +146,7 @@ public struct RunDetailScreen: View {
                 awaitingBanner(store: store, detail: detail)
             }
             stepGraphSection(store: store)
-                .frame(height: 140)
+                .frame(height: 420)
             RunDetailTabPanel(store: store, tab: $selectedTab, sourcePreviewStore: sourcePreviewStore)
         }
         .padding(16)
@@ -540,10 +540,14 @@ public struct RunDetailScreen: View {
                     nodes: g.workflow.steps,
                     results: g.stepResults,
                     units: g.units,
-                    liveStates: effectiveLiveStates(store: store)
+                    liveStates: effectiveLiveStates(store: store),
+                    liveUnits: store.liveUnits,
+                    panelRounds: store.panelRounds,
+                    stepTranscripts: store.stepTranscripts
                 ),
                 selectedID: store.selectedStepID,
-                onSelect: { stepID in Task { await store.select(step: stepID) } }
+                onSelect: { stepID in Task { await store.select(step: stepID) } },
+                onSelectUnit: { stepID, index in Task { await store.select(stepID: stepID, unitIndex: index) } }
             )
             .panelStyle(.panel)
         }
