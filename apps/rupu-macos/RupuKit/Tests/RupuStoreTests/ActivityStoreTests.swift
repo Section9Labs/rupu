@@ -495,6 +495,78 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // (d5) review fix (Important, task-3 follow-up): the sort-guard's OTHER
+    // half — a patch under a NON-participating key (`.started`, the
+    // default) must leave row ORDER byte-identical, not just "didn't
+    // crash." Checked positionally (`rows.map(\.id)` before/after), not by
+    // per-id lookup, since a lookup-based check can't distinguish "stayed
+    // put" from "moved but is still findable."
+    @MainActor @Test func liveStatusPatchNeverReordersRowsWhenActiveSortKeyDoesNotParticipate() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        #expect(store.sort == ActivitySort(key: .started, ascending: false))
+        let idsBefore = store.rows.map(\.id)
+        let unscopedIDsBefore = store.unscopedRows.map(\.id)
+        #expect(idsBefore == ["run-ag-1", "evt-1", "run-wf-1", "sess-1"])
+
+        box.latest.yield(.connection(true))
+        // Patches the MIDDLE row (index 2 of 4) — a reorder bug that only
+        // ever moves a patched row to the front or back wouldn't show up on
+        // an edge row.
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1 patches to .completed") {
+            store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
+
+        #expect(
+            store.rows.map(\.id) == idsBefore,
+            "a patch under a non-participating sort key (.started) must never reorder rows"
+        )
+        #expect(
+            store.unscopedRows.map(\.id) == unscopedIDsBefore,
+            "unscopedRows is never governed by this table's sort at all — must never reorder either"
+        )
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d6) review fix (Important, task-3 follow-up): the `.duration` half
+    // of the guard was previously untested — only `.status` had live
+    // coverage. `ActivityDelta.reduce(_:)` never produces a non-nil
+    // `durationMS` from any live `CPEvent` today (every case it reduces
+    // sets `durationMS: nil` — see `patchRow`'s own doc comment on why it's
+    // `internal`), so this drives the store's `patchRow(runID:status:
+    // durationMS:)` seam directly via `@testable import` rather than
+    // through a live event, the same way `statusOverrides` is already
+    // reached directly for its own tests.
+    @MainActor @Test func liveDurationChangingPatchRepositionsRowsWhenActiveSortKeyIsDuration() async {
+        let (store, box) = makeStore()
+        await store.activate(kind: .all)
+        store.toggleSort(.duration)
+        // Descending (defaultAscending == false for `.duration`). Only
+        // run-ag-1 has a non-nil duration (5000ms) in the fixture; the
+        // other three are nil, which sorts last regardless of direction —
+        // so the order is unchanged from the default merge order, with
+        // exactly one row having anything to compare against.
+        #expect(store.sort == ActivitySort(key: .duration, ascending: false))
+        #expect(store.rows.map(\.id) == ["run-ag-1", "evt-1", "run-wf-1", "sess-1"])
+
+        // Gives run-wf-1 (currently nil duration) a duration far larger
+        // than run-ag-1's 5000ms — under descending `.duration`, it must
+        // now sort AHEAD of run-ag-1, not stay pinned at its old index.
+        store.patchRow(runID: "run-wf-1", status: .completed, durationMS: 999_999)
+
+        #expect(
+            store.rows.map(\.id) == ["run-wf-1", "run-ag-1", "evt-1", "sess-1"],
+            "a duration-changing patch under an active .duration sort must reposition the row, not leave it in place"
+        )
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.durationMS == 999_999)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // (e) deactivate() stops the stream: the scripted continuation's
     // consumer task is torn down (observed via onTermination).
     @MainActor @Test func deactivateStopsTheStream() async {

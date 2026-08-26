@@ -857,7 +857,21 @@ public final class ActivityStore {
     /// is untouched by a status/duration patch, so no re-sort is needed;
     /// `unscopedRows` never needs one at all, since it isn't governed by
     /// this table's `sort` (see that property's own doc comment).
-    private func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
+    ///
+    /// `internal`, not `private` (task-3 review fix, closing an
+    /// under-tested gap): `ActivityDelta.reduce(_:)` — the only production
+    /// caller of this method, via `apply(_:)`'s `.statusPatch` case —
+    /// currently NEVER produces a non-nil `durationMS` (every live
+    /// `CPEvent` case it reduces sets `durationMS: nil`), so the `.duration`
+    /// half of the re-sort guard above is unreachable from a real event in
+    /// today's build. Exposed directly to `@testable import RupuStore` (the
+    /// same seam `statusOverrides` above already documents for itself) so
+    /// `ActivityStoreTests` can drive a genuine duration-changing patch and
+    /// prove the guard's `.duration` branch actually repositions rows —
+    /// this is defensive, forward-looking correctness (the day a live event
+    /// DOES carry a duration, this path must already be right), not dead
+    /// code to delete.
+    func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
         statusOverrides[runID] = (status, durationMS)
         var patchedRows = false
         if let index = rows.firstIndex(where: { Self.matchesRun($0, runID: runID) }) {
