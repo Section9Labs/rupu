@@ -96,7 +96,17 @@ struct Sidebar: View {
     /// route) until the operator actually clicks a chevron.
     @AppStorage(SidebarGroups.storageKey) private var groupsData: Data = Data()
 
-    private var groups: SidebarGroups { SidebarGroups.decode(groupsData) }
+    /// Decode-cached mirror of `groupsData` (Task 0 perf fix): the old
+    /// `groups` computed property re-ran `JSONDecoder` on every access — 4×+
+    /// per `body` pass, and `body` re-evaluates on every hover change (every
+    /// row's `onHover`). `groupsData` (the `@AppStorage`) stays the single
+    /// source of truth and the only thing anyone writes to; this `@State`
+    /// is just a cached decode of it, kept in sync by `.onChange(of:
+    /// groupsData)` below. Seeded from the live `@AppStorage` value in
+    /// `.onAppear` rather than `init` — `@AppStorage`'s wrapped value is
+    /// already backed by `UserDefaults` by the time `body` runs, so
+    /// `onAppear` reads the real persisted blob, not the `Data()` default.
+    @State private var groups = SidebarGroups()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -111,6 +121,10 @@ struct Sidebar: View {
         .frame(width: 204)
         .background(Color.rupuPanel)
         .overlay(alignment: .trailing) { Color.rupuBorder.frame(width: 1) }
+        .onAppear { groups = SidebarGroups.decode(groupsData) }
+        .onChange(of: groupsData) { _, newValue in
+            groups = SidebarGroups.decode(newValue)
+        }
     }
 
     /// App-name header row — height 48, bottom border, same row rhythm as
@@ -289,8 +303,31 @@ struct Sidebar: View {
     /// showing, unlike `.activity`'s own `lastActivityRoute` restore).
     /// Clicking the label never changes `expanded` either way — "parent row
     /// click navigates to the default tab AND keeps its expand state."
+    ///
+    /// Task 0 hit-testing fix (audit #6): the old version put the row's
+    /// `.background(...)`/`.clipShape(...)` on the OUTER `HStack`, outside
+    /// both `Button`s — a `.plain`-styled button hit-tests only its own
+    /// label content, so neither button's tap target ever included that
+    /// background, and the chevron's label (a *stroked*, unfilled `Icon`
+    /// inside an empty `.frame`) drew almost no content at all, leaving a
+    /// ~1pt-wide clickable sliver. Fix: give each button its OWN background
+    /// fill + `.contentShape(Rectangle())` inside its label (the `railRow`/
+    /// `childRow` pattern), so each button's tap target is its own declared
+    /// frame regardless of what's actually painted there. The single visual
+    /// pill both buttons used to share is preserved by splitting the
+    /// rounded corners across the two labels (leading corners on the
+    /// chevron, trailing corners on the nav label) rather than rounding all
+    /// four corners of each — from the outside this still reads as one
+    /// continuous rounded row, just as before.
     private func groupParentRow(_ item: SidebarItem, fullActive: Bool, tinted: Bool, expanded: Bool) -> some View {
         let key = AnyHashable(item)
+        let rowBackground = fullActive ? Color.rupuSurface : hovered == key ? Color.rupuSurfaceHover : Color.clear
+        let leadingCorners = UnevenRoundedRectangle(
+            topLeadingRadius: 5, bottomLeadingRadius: 5, bottomTrailingRadius: 0, topTrailingRadius: 0
+        )
+        let trailingCorners = UnevenRoundedRectangle(
+            topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 5, topTrailingRadius: 5
+        )
         return HStack(spacing: 0) {
             Button {
                 var next = groups
@@ -300,7 +337,13 @@ struct Sidebar: View {
                 Icon(.chevronDown, size: 10, weight: 2.5)
                     .foregroundStyle(Color.rupuMute)
                     .rotationEffect(.degrees(expanded ? 0 : -90))
-                    .frame(width: 16, height: 30)
+                    .frame(width: 24, height: 30)
+                    .background(rowBackground)
+                    .overlay(alignment: .leading) {
+                        if fullActive { Color.rupuBrand.frame(width: 2) }
+                    }
+                    .clipShape(leadingCorners)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -308,14 +351,12 @@ struct Sidebar: View {
                 model.selectedSidebarItem = item
             } label: {
                 railLabel(title(for: item), icon: icon(for: item), active: fullActive, tinted: tinted)
+                    .background(rowBackground)
+                    .clipShape(trailingCorners)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
         }
-        .background(fullActive ? Color.rupuSurface : hovered == key ? Color.rupuSurfaceHover : .clear)
-        .overlay(alignment: .leading) {
-            if fullActive { Color.rupuBrand.frame(width: 2) }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 5))
         .onHover { hovered = $0 ? key : (hovered == key ? nil : hovered) }
     }
 
