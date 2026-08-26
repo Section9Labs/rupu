@@ -94,7 +94,9 @@ RupuKit/Sources/RupuActivity/{ActivityScreen,ActivityTable,FilterBar}.swift  # T
 - [ ] **Step 1:** TDD store-side derivations → implement view rewires → GREEN.
 - [ ] **Step 2:** Full suite + build. **Commit** — `perf(macos): store-side derived state — sorted rows, memoized feed, coalesced graph VM, O(1) highlight cache`
 
-### Task 4: Per-kind tables (web parity)
+### Task 4: Activity restructure + per-kind tables (amended 2026-08-26 per matt's build feedback)
+
+**Restructure (new, overrides earlier text where they conflict):** the Activity PARENT page shows NO combined table and NO kind-picker buttons — navigation between kinds is the SIDEBAR's job (matt: "no need to have the above buttons"). The parent becomes a lightweight stats surface: KPI cards (counts by kind; running/awaiting/failed today; oldest awaiting age) derived from the store's loaded rows + a compact "needs attention" list reusing the existing awaiting machinery — honest client-side numbers over loaded data, labeled as such. `FilterBar`'s kind segmented picker is DELETED; status chips + live-tail toggle move to the kind pages (they apply per-table). Sidebar kind children render ONLY their kind's dedicated table.
 
 **Files:**
 - Create: `RupuActivity/KindTables/{AgentRunsTable,WorkflowRunsTable,AutoflowRunsTable,SessionsTable}.swift` + a shared `KindTableColumn` helper if it stays clean (the existing generic `ActivityTable` remains for the "All runs" parent view ONLY)
@@ -112,7 +114,9 @@ RupuKit/Sources/RupuActivity/{ActivityScreen,ActivityTable,FilterBar}.swift  # T
 - [ ] **Step 1:** TDD the pure row→cells mappers per kind → implement tables + routing → GREEN.
 - [ ] **Step 2:** Full suite + build. **Commit** — `feat(macos-activity): per-kind tables — agents/workflows/autoflows/sessions columns per web parity`
 
-### Task 5: Infinite scroll + honesty footers
+### Task 5: Infinite scroll + real filters (amended 2026-08-26 per matt's build feedback)
+
+**Filters (new scope — replaces the 7d/30d/all idea entirely on lists):** each kind page gets a filter bar: text search (client-side over loaded rows, web-parity, with the "{n} matches of {m} loaded" honesty footer), the existing status chips, and a CUSTOM DATE RANGE (from/to date pickers). Deep time filtering must be server-side to be honest: add optional `since`/`until` (RFC-3339) query params to the rupu-cp list endpoints (`/api/runs/agents`, `/api/runs/workflows`, `/api/runs/autoflows/events`, `/api/sessions`) filtering on the rows' started/created timestamps BEFORE offset/limit paging (Rust: extend the handlers' query structs + store queries; follow `pagination.rs` conventions — bad params degrade to defaults, never 500; unit-test the Rust filtering; `make macos-fixtures` + `cargo test -p rupu-cp` drift gate). Client: `CPClient` list methods gain `since:`/`until:`; the store threads them; setting a date range resets paging (generation-guarded). The top-bar 7d/30d/all is REMOVED from Activity routes (stays for Overview/Usage).
 
 **Files:**
 - Modify: `RupuStore/ActivityStore.swift` (verify/adapt `loadMore()` for per-kind paging: page size 20 for kind views — the server clamps ≤200; `.all` may keep its current merged snapshot size; expose `hasMore`/`isLoadingMore`/`loadedCount`)
@@ -123,7 +127,15 @@ RupuKit/Sources/RupuActivity/{ActivityScreen,ActivityTable,FilterBar}.swift  # T
 - [ ] **Step 1:** TDD store paging → wire sentinel + footers → GREEN.
 - [ ] **Step 2:** Full suite + build. **Commit** — `feat(macos-activity): infinite scroll — loadMore finally wired, honesty footers, range scoped to Overview/Usage`
 
-### Task 6: Gates + measured checkpoint
+### Task 7: Sidebar IA & alignment (added 2026-08-26 per matt's build feedback; runs before the Task 6 close-out)
+
+**Files:** `RupuShell/Sidebar.swift` (+ `RupuStore` route/order if reorder needs it); test: sidebar-mapping tests adapt.
+
+- **Alignment:** every row (with or without children) reserves the same leading chevron gutter (24pt) so icons and labels align in one column; rows without children (Overview, Projects, Usage, Settings) render an empty gutter, not a shifted label — matt: "Projects… by not having a > looks out of order".
+- **IA reorder (matt vetoes at checkpoint):** order by operation — OPERATE: Overview · Activity (▸ kinds); SUBJECTS: Projects · Library (▸ Agents/Workflows/Autoflows); OBSERVE: Security (▸ Findings/Coverage) · Usage; INFRA: Fleet (▸ Hosts/Workers); Settings pinned bottom. Thin uppercase `Eyebrow` section captions (web v1 group-header idiom, v2 chrome). Routes unchanged — presentation-only reorder + captions.
+- [ ] **Step 1:** implement; `make macos-test` + `make macos-build` green. **Commit** — `feat(macos-shell): sidebar IA — aligned chevron gutter, operation-ordered sections`
+
+### Task 6: Gates + measured checkpoint (runs LAST, after Task 7)
 
 **Files:** `CLAUDE.md` (module-map perf notes: local-first everywhere, per-kind tables, infinite scroll), full gates.
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give the run graph the web's direct manipulation — wheel/pinch zoom, drag-pan, double-click zoom, fit-on-open, zoom controls — and make the live pulse/ants effects reliably visible across live updates and when opening an already-running run.
+**Goal:** Give the run graph the web's direct manipulation — wheel/pinch zoom, drag-pan, double-click zoom, fit-on-open, zoom controls, minimap — plus smoothstep-curved kind-colored edges and animation-stable live effects; and fix the fan-out transcript experience by porting the web's per-unit transcript browser (matt 2026-08-26: graphs need to be dramatically better; for_each unit transcripts "not working").
 
 **Architecture:** The graph canvas moves into an `NSScrollView`-backed representable with `allowsMagnification` (native trackpad pinch + ⌘-wheel zoom, momentum pan) hosting the existing SwiftUI node/edge content via `NSHostingView`; zoom bounds mirror React Flow defaults (0.5–2.0) with fit-on-open ≤1.0. Animation stability rides Plan 5's coalesced store-side `graphVM`: node/edge views keyed by stable step ids so live rebuilds diff instead of remount, keeping pulse/ants animations alive.
 
@@ -66,7 +66,24 @@ RupuKit/Sources/RupuRunDetail/RunDetailScreen.swift            # non-content sta
 - [ ] **Step 1:** TDD identity/replay tests → implement Equatable + stable keys → GREEN.
 - [ ] **Step 2:** Full suite + build. **Commit** — `fix(macos-graph): stable node/edge identity — live pulse/ants survive live updates`
 
-### Task 4: Gates + checkpoint
+### Task 4: Curved edges, minimap, layout polish (added 2026-08-26 — the "1000x better" pass)
+
+**Files:** `Graph/GraphEdge.swift`, `StepGraphView.swift`, new `Graph/GraphMinimap.swift`; test: pure path-geometry tests for the smoothstep curve.
+
+- **Smoothstep edges:** replace the straight 40pt stick with a web-parity smoothstep bezier connecting the SOURCE node's trailing anchor to the TARGET node's leading anchor at each node's true vertical midline (nodes have different heights — containers vs leaf cards — so edges currently miss centers). Color/ghost/ants/awaiting rules unchanged; ants march along the curved path (`strokeDashPhase` on the bezier). Pure helper `smoothstepPath(from:to:) -> Path` unit-tested (endpoints, monotonic x, curvature bounds).
+- **Minimap:** a small (≈160×64) inset overview bottom-right inside the canvas — scaled node rectangles in kind accents + a viewport rectangle; click-to-jump pans the scroll view. Un-deferred from the spec per matt's feedback; spec note updated at close-out.
+- **Layout polish:** consistent vertical centering of the chain on the canvas midline; node spacing from the 4px grid (24pt gaps); container cards get matching vertical rhythm; canvas background gets the web's subtle dot grid (Canvas-drawn, cheap, reduced-motion-irrelevant).
+- [ ] **Step 1:** TDD the path helper → implement edges + minimap + polish → gates green. **Commit** — `feat(macos-graph): smoothstep edges, minimap, layout polish`
+
+### Task 5: Fan-out unit transcript browser (added 2026-08-26 — matt: for_each transcripts "not working")
+
+**Files:** new `RupuRunDetail/StepTranscriptBrowser.swift`; modify `RunDetailTabs.swift` (Transcript tab three-way), `RupuStore/RunDetailStore.swift` (unit-list projection if needed); tests in `RupuRunDetailTests` + store tests.
+
+- **Root-cause first:** trace why unit transcripts don't load today — instrument `select(stepID:unitIndex:)` → `focusPath` with a failing-path test against fixture unit rows (candidate causes: unit `transcriptPath` resolution/relative-path handling, remote-host guard, the tab panel not switching to the focused unit transcript, or fan-out unit taps not registering through the container gesture). Fix the actual defect with a regression test; document the found cause in the report.
+- **Port the web's `StepTranscriptBrowser`** (`components/run/StepTranscriptBrowser.tsx`): when the SELECTED node has a fanout, the Transcript tab renders a two-pane browser — left rail (≈34% width): step id header, unit count, `all/running/done/failed` filter pills WITH counts, per-unit rows (state glyph square + mono key + uppercase state label), row cap 300 + "+N more"; selected row `rupuBrand`-tinted; right pane: the existing TranscriptFeed for the selected unit's path, live-tailing while that unit is running (this closes the parked "units never tail" gap — route the unit path through the same tail machinery focusStep uses, gated on unit state == running, local runs only as today). Selecting a unit in the rail = the same `select(stepID:unitIndex:)` cursor the graph's unit squares drive — one selection model, two entry points.
+- [ ] **Step 1:** failing root-cause test → fix → browser TDD (rail filter counts, cap, selection sync) → gates green. **Commit** — `feat(macos-rundetail): fan-out unit transcript browser + unit transcript loading fix`
+
+### Task 6: Gates + checkpoint
 
 - [ ] **Step 1:** Full gates (`make macos-test && make macos-build && cargo test -p rupu-cp`); CLAUDE.md graph note (zoomable canvas).
 - [ ] **Step 2:** matt's GUI checkpoint items recorded in the PR: pinch/wheel zoom, drag pan, double-click zoom, fit button, pulse/ants visible when opening an already-running run and across its updates. **Commit** — `feat(macos-graph): Plan 6 close-out`
