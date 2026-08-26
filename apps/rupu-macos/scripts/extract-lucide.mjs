@@ -97,6 +97,13 @@ const ICONS = [
   { enumCase: "moreHorizontal", asset: "more-horizontal", source: "ellipsis" },
   { enumCase: "search", asset: "search", source: "search" },
   { enumCase: "lock", asset: "lock", source: "lock" },
+  // Plan 3, Task 1: run-graph kind icons (RupuRunDetail's KindBridge). All five are direct
+  // lucide-react 0.468.0 modules — no alias remaps needed.
+  { enumCase: "bot", asset: "bot", source: "bot" },
+  { enumCase: "columns3", asset: "columns-3", source: "columns-3" },
+  { enumCase: "userCheck", asset: "user-check", source: "user-check" },
+  { enumCase: "zap", asset: "zap", source: "zap" },
+  { enumCase: "terminal", asset: "terminal", source: "terminal" },
 ];
 
 // --- number formatting: deterministic, minimal-digit output -----------------------------------
