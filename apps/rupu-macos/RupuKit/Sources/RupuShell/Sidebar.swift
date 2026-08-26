@@ -102,11 +102,31 @@ struct Sidebar: View {
     /// row's `onHover`). `groupsData` (the `@AppStorage`) stays the single
     /// source of truth and the only thing anyone writes to; this `@State`
     /// is just a cached decode of it, kept in sync by `.onChange(of:
-    /// groupsData)` below. Seeded from the live `@AppStorage` value in
-    /// `.onAppear` rather than `init` — `@AppStorage`'s wrapped value is
-    /// already backed by `UserDefaults` by the time `body` runs, so
-    /// `onAppear` reads the real persisted blob, not the `Data()` default.
-    @State private var groups = SidebarGroups()
+    /// groupsData)` below. Seeded from `UserDefaults` directly in `init`
+    /// (review round 1 caught that seeding only in `.onAppear` let the very
+    /// first `body` render for a returning operator flash the all-unset
+    /// `SidebarGroups()` — every group's `defaultOpen` fallback, not
+    /// whatever the operator last explicitly toggled — for one frame before
+    /// `onAppear` corrected it); `.onAppear`/`.onChange` stay as the ongoing
+    /// sync path for later writes.
+    @State private var groups: SidebarGroups
+
+    /// Only reason this `init` exists at all: to seed `groups` from
+    /// `UserDefaults` ahead of the first `body` render. Reads the raw key
+    /// directly (`SidebarGroups.storageKey`, the exact string
+    /// `@AppStorage(SidebarGroups.storageKey) private var groupsData` above
+    /// also resolves to) rather than through `groupsData` — `@AppStorage`'s
+    /// backing storage isn't guaranteed set up yet at this point in `init`,
+    /// same reasoning `OverviewScreen.init` uses `OverviewWidgets.load(
+    /// defaults:)` instead of reading its own `@AppStorage` property.
+    /// `model`/`hostsFooter` are otherwise assigned exactly as the
+    /// compiler-synthesized memberwise init would have.
+    init(model: AppModel, hostsFooter: HostsFooterStore) {
+        self.model = model
+        self.hostsFooter = hostsFooter
+        let persisted = UserDefaults.standard.data(forKey: SidebarGroups.storageKey) ?? Data()
+        _groups = State(initialValue: SidebarGroups.decode(persisted))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
