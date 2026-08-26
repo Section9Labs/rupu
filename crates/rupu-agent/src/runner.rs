@@ -74,6 +74,7 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
         | E::NotImplemented { .. }
         | E::BadRequest { .. }
         | E::ModelUnavailable { .. }
+        | E::Preflight(_)
         | E::Other(_) => false,
     }
 }
@@ -491,6 +492,12 @@ async fn compact_context(
 pub enum RunError {
     #[error("provider: {0}")]
     Provider(String),
+    /// A `ProviderError::Preflight` — the failure happened before any
+    /// provider request was attempted (e.g. the step's agent file failed to
+    /// load), so the message passes through verbatim with no `provider:`
+    /// attribution.
+    #[error("{0}")]
+    Preflight(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("transcript: {0}")]
@@ -1076,22 +1083,36 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             tokio::time::sleep(backoff).await;
                             continue;
                         }
+                        // A Preflight failure never involved a provider
+                        // request (e.g. the step's agent file failed to
+                        // load) — surface the message verbatim instead of
+                        // attributing it to a provider.
+                        let is_preflight =
+                            matches!(e, rupu_providers::ProviderError::Preflight(_));
                         writer.write(&Event::RunComplete {
                             run_id: opts.run_id.clone(),
                             status: RunStatus::Error,
                             total_tokens: total_in + total_out,
                             duration_ms: started.elapsed().as_millis() as u64,
-                            error: Some(format!(
-                                "provider: {e_str}{}",
-                                if http_retries > 0 {
-                                    format!(" (after {http_retries} retries)")
-                                } else {
-                                    String::new()
-                                }
-                            )),
+                            error: Some(if is_preflight {
+                                e_str.clone()
+                            } else {
+                                format!(
+                                    "provider: {e_str}{}",
+                                    if http_retries > 0 {
+                                        format!(" (after {http_retries} retries)")
+                                    } else {
+                                        String::new()
+                                    }
+                                )
+                            }),
                         })?;
                         writer.flush()?;
-                        return Err(RunError::Provider(e_str));
+                        return Err(if is_preflight {
+                            RunError::Preflight(e_str)
+                        } else {
+                            RunError::Provider(e_str)
+                        });
                     }
                 }
             };

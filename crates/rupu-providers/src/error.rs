@@ -29,6 +29,14 @@ pub enum ProviderError {
     #[error("auth config error: {0}")]
     AuthConfig(String),
 
+    /// A failure detected before any provider request could be attempted —
+    /// e.g. a workflow step whose agent file failed to load. Displays the
+    /// message verbatim: the caller owns the whole text, so no provider
+    /// attribution or auth hint gets prepended to a failure that never
+    /// involved a provider. Never retryable.
+    #[error("{0}")]
+    Preflight(String),
+
     #[error("provider {provider} is not yet implemented")]
     NotImplemented { provider: String },
 

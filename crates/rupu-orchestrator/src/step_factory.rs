@@ -288,11 +288,7 @@ impl StepFactory for DefaultStepFactory {
             Some(msg) => {
                 provider_name = "unresolved".to_string();
                 model = "-".to_string();
-                Box::new(provider_build_error_stub(
-                    provider_name.clone(),
-                    model.clone(),
-                    msg,
-                ))
+                Box::new(agent_load_error_stub(msg))
             }
             None => {
                 provider_name = provider_factory::resolve_provider_name(
@@ -747,16 +743,52 @@ pub(crate) fn provider_build_error_stub(
     error: String,
 ) -> ProviderBuildErrorStub {
     ProviderBuildErrorStub {
+        kind: ErrorStubKind::ProviderBuild,
         provider_name,
         model,
         error,
     }
 }
 
+/// The stub for a step whose agent file failed to load. Unlike a provider
+/// build failure this is not a credentials problem, so it must NOT surface
+/// as `auth config error:` with a `rupu auth login` hint (it used to point
+/// at a provider literally named `unresolved`). The loader's message goes
+/// out verbatim via `ProviderError::Preflight`, plus a where-to-look hint.
+pub(crate) fn agent_load_error_stub(error: String) -> ProviderBuildErrorStub {
+    ProviderBuildErrorStub {
+        kind: ErrorStubKind::AgentLoad,
+        provider_name: "unresolved".to_string(),
+        model: "-".to_string(),
+        error,
+    }
+}
+
+enum ErrorStubKind {
+    ProviderBuild,
+    AgentLoad,
+}
+
 pub(crate) struct ProviderBuildErrorStub {
+    kind: ErrorStubKind,
     provider_name: String,
     model: String,
     error: String,
+}
+
+impl ProviderBuildErrorStub {
+    fn to_error(&self) -> rupu_providers::ProviderError {
+        match self.kind {
+            ErrorStubKind::ProviderBuild => rupu_providers::ProviderError::AuthConfig(format!(
+                "{}: {}\n  Run: rupu auth login --provider {} --mode <api-key|sso>",
+                self.provider_name, self.error, self.provider_name,
+            )),
+            ErrorStubKind::AgentLoad => rupu_providers::ProviderError::Preflight(format!(
+                "{}\n  Checked the project agents dir (.rupu/agents/) and the global agents dir.",
+                self.error,
+            )),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -765,10 +797,7 @@ impl rupu_providers::LlmProvider for ProviderBuildErrorStub {
         &mut self,
         _request: &rupu_providers::LlmRequest,
     ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
-        Err(rupu_providers::ProviderError::AuthConfig(format!(
-            "{}: {}\n  Run: rupu auth login --provider {} --mode <api-key|sso>",
-            self.provider_name, self.error, self.provider_name,
-        )))
+        Err(self.to_error())
     }
 
     async fn stream(
@@ -776,10 +805,7 @@ impl rupu_providers::LlmProvider for ProviderBuildErrorStub {
         _request: &rupu_providers::LlmRequest,
         _on_event: &mut (dyn FnMut(rupu_providers::StreamEvent) + Send),
     ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
-        Err(rupu_providers::ProviderError::AuthConfig(format!(
-            "{}: {}\n  Run: rupu auth login --provider {} --mode <api-key|sso>",
-            self.provider_name, self.error, self.provider_name,
-        )))
+        Err(self.to_error())
     }
 
     fn default_model(&self) -> &str {
@@ -837,6 +863,36 @@ mod provider_build_error_stub_tests {
         assert!(
             msg.contains("rupu auth login --provider openai"),
             "missing actionable login hint: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_agent_load_error_is_plain_not_found_without_auth_hint() {
+        // A step naming a nonexistent agent used to surface as
+        // `auth config error: unresolved: agent … not found` plus a bogus
+        // `Run: rupu auth login --provider unresolved` hint — an agent-file
+        // problem dressed up as a credentials problem. The agent-load stub
+        // must surface the loader's message verbatim.
+        let mut stub = agent_load_error_stub(
+            "agent `dispatch-smoke` not found or failed to load: agent not found: dispatch-smoke"
+                .to_string(),
+        );
+        let err = stub.send(&empty_request()).await.expect_err("must error");
+        let ProviderError::Preflight(msg) = err else {
+            panic!("expected Preflight variant, got {err:?}");
+        };
+        assert!(
+            msg.contains("agent `dispatch-smoke` not found or failed to load"),
+            "missing loader message: {msg}",
+        );
+        assert!(
+            msg.contains(".rupu/agents/"),
+            "missing where-to-look hint: {msg}",
+        );
+        let rendered = ProviderError::Preflight(msg).to_string();
+        assert!(
+            !rendered.contains("auth config error") && !rendered.contains("rupu auth login"),
+            "agent-load failure must not masquerade as an auth failure: {rendered}",
         );
     }
 }

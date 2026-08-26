@@ -65,6 +65,78 @@ async fn provider_error_propagates_and_writes_run_complete() {
     assert_eq!(summary.status, rupu_transcript::RunStatus::Error);
 }
 
+/// A provider whose first call fails with `ProviderError::Preflight` — the
+/// shape rupu-orchestrator's agent-load error stub produces for a step whose
+/// agent file failed to load.
+struct PreflightErrorProvider;
+
+#[async_trait::async_trait]
+impl rupu_providers::LlmProvider for PreflightErrorProvider {
+    async fn send(
+        &mut self,
+        _request: &rupu_providers::LlmRequest,
+    ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+        Err(rupu_providers::ProviderError::Preflight(
+            "agent `ghost` not found or failed to load: agent not found: ghost".into(),
+        ))
+    }
+
+    async fn stream(
+        &mut self,
+        request: &rupu_providers::LlmRequest,
+        _on_event: &mut (dyn FnMut(rupu_providers::StreamEvent) + Send),
+    ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+        self.send(request).await
+    }
+
+    fn default_model(&self) -> &str {
+        "-"
+    }
+
+    fn provider_id(&self) -> rupu_providers::ProviderId {
+        rupu_providers::ProviderId::Anthropic
+    }
+}
+
+#[tokio::test]
+async fn preflight_error_surfaces_verbatim_without_provider_prefix() {
+    // An agent-load failure is not a provider failure: the run error and the
+    // transcript's RunComplete must carry the loader's message verbatim, not
+    // `provider: auth config error: unresolved: …` with an auth-login hint.
+    let mut o = opts(
+        MockProvider::new(vec![]),
+        5,
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+    );
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let path = tmp.path().join("run.jsonl");
+    o.provider = Box::new(PreflightErrorProvider);
+    o.transcript_path = path.clone();
+    o.workspace_path = tmp.path().to_path_buf();
+    let res = run_agent(o).await;
+    let msg = match res {
+        Err(RunError::Preflight(m)) => m,
+        Err(e) => panic!("expected RunError::Preflight, got {e:?}"),
+        Ok(_) => panic!("expected the run to fail"),
+    };
+    assert!(msg.contains("agent `ghost` not found"), "got: {msg}");
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let complete_line = raw
+        .lines()
+        .find(|l| l.contains("RunComplete") || l.contains("run_complete"))
+        .expect("transcript must contain a RunComplete event");
+    assert!(
+        complete_line.contains("agent `ghost` not found"),
+        "RunComplete missing loader message: {complete_line}",
+    );
+    assert!(
+        !complete_line.contains("provider:") && !complete_line.contains("auth"),
+        "RunComplete must not attribute an agent-load failure to a provider: {complete_line}",
+    );
+}
+
 #[tokio::test]
 async fn max_turns_aborts_with_run_complete() {
     // A script that genuinely keeps requesting tool calls — each tool call
