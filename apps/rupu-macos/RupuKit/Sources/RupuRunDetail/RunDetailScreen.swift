@@ -540,7 +540,14 @@ public struct RunDetailScreen: View {
                     nodes: g.workflow.steps,
                     results: g.stepResults,
                     units: g.units,
-                    liveStates: effectiveLiveStates(store: store)
+                    liveStates: effectiveLiveStates(store: store),
+                    // TODO(Task 5): thread real live-overlay state
+                    // (unit/panel-round/transcript events) from
+                    // `RunDetailStore` — this screen is properly rewired
+                    // there; Task 2 only needed the tree to compile.
+                    liveUnits: [:],
+                    panelRounds: [:],
+                    stepTranscripts: [:]
                 ),
                 selectedID: store.selectedStepID,
                 onSelect: { stepID in Task { await store.select(step: stepID) } }

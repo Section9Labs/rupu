@@ -58,15 +58,18 @@ private struct GraphNodeCapsule: View {
         VStack(spacing: 6) {
             StatusGlyph(state: node.state)
             VStack(spacing: 2) {
-                Eyebrow(node.kindLabel)
+                Eyebrow(node.kind.label)
                 if let agentLabel = node.agentLabel {
                     Text(agentLabel)
                         .font(.noteText)
                         .foregroundStyle(Color.rupuInk)
                         .lineLimit(1)
                 }
-                if let unitProgress = node.unitProgress {
-                    Text("\(unitProgress.done)/\(unitProgress.total)")
+                if let fanout = node.fanout {
+                    // TODO(Task 3): temporary done/total readout — the real
+                    // fan-out visual (per-unit chips, failed count) lands
+                    // when this view is properly rewritten.
+                    Text("\(fanout.done)/\(fanout.total)")
                         .font(.dataMono(11))
                         .foregroundStyle(Color.rupuDim)
                 }
@@ -114,6 +117,12 @@ private struct StatusGlyph: View {
                     .frame(width: diameter, height: diameter)
                     .scaleEffect(pulseActive ? 1.3 : 1)
                     .opacity(pulseActive ? 0.5 : 1)
+            case .paused:
+                // TODO(Task 3): temporary glyph — a dedicated paused
+                // treatment lands when this view is properly rewritten.
+                Circle()
+                    .strokeBorder(Color.status(.paused), lineWidth: 2)
+                    .frame(width: diameter, height: diameter)
             case .pending:
                 Circle()
                     .strokeBorder(Color.rupuBorder, style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))

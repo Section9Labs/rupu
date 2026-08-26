@@ -274,8 +274,10 @@ public struct APISubStep: Decodable, Sendable {
     }
 }
 
-/// The panel-review gate config on a `"panel"` step node.
-public struct APIPanelGate: Decodable, Sendable {
+/// The panel-review gate config on a `"panel"` step node. `Equatable` so
+/// `GraphNodeVM` (which threads this through as `panelGate`) can derive its
+/// own `Equatable` conformance.
+public struct APIPanelGate: Decodable, Equatable, Sendable {
     public let maxIterations: UInt32
     public let untilSeverity: String
     public let fixWith: String
