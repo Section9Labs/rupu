@@ -612,6 +612,19 @@ mod tests {
         assert!(!is_retryable(&ProviderError::BadRequest {
             message: String::new()
         }));
+        // Preflight failures happen before any request is attempted (e.g. a
+        // workflow step whose agent file failed to load) — retrying the
+        // identical request can never succeed.
+        assert!(!is_retryable(&ProviderError::Preflight("x".into())));
+    }
+
+    #[test]
+    fn preflight_displays_its_message_verbatim() {
+        // No `provider error:`/`auth config error:` attribution — the caller
+        // owns the whole message (it describes a failure that happened before
+        // any provider was involved).
+        let e = ProviderError::Preflight("agent not found: x".into());
+        assert_eq!(e.to_string(), "agent not found: x");
     }
 
     // ── I-83: server-supplied Retry-After wins over the computed backoff ────
