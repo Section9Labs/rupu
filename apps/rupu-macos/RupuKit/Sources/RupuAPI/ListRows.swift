@@ -254,6 +254,82 @@ public struct APIAutoflowEventRow: Decodable, Equatable, Sendable {
     }
 }
 
+/// Row from `GET /api/runs/autoflows` (`AutoflowCycleRow` on the Rust side,
+/// `crates/rupu-cp/src/api/run_streams.rs`) — one autoflow-worker cycle
+/// (a single batch tick, zero or more dispatched workflow runs). Distinct
+/// from `APIAutoflowEventRow` (`GET /api/runs/autoflows/events`, one
+/// launched-run-or-signal event) — the web's Autoflows page shows both as
+/// separate sub-tables (Runs=events, Cycles=this), and this app's Activity
+/// screen's autoflows-kind Runs/Cycles/Claims sub-toggle (perf & interaction
+/// arc, Plan 5 Task 4b) mirrors that.
+///
+/// **`finishedAt` is non-optional** (unlike every duration-bearing field
+/// elsewhere in this file) — verified against `AutoflowCycleRecord`
+/// (`crates/rupu-runtime/src/autoflow_history.rs`): a cycle is only ever
+/// persisted to the history store once it has actually finished, so every
+/// row this endpoint can return already has both timestamps.
+public struct APIAutoflowCycleRow: Decodable, Equatable, Sendable, Identifiable {
+    public let cycleID: String
+    public let mode: String
+    public let workerName: String?
+    public let startedAt: String
+    public let finishedAt: String
+    public let workflowCount: Int
+    public let ranCycles: Int
+    public let skippedCycles: Int
+    public let failedCycles: Int
+    public let runIDs: [String]
+    public let usage: APIUsageSummary
+    public let hostID: String?
+
+    /// `cycleID` is the natural, verified-unique identity (one history file
+    /// per cycle — see `AutoflowHistoryStore`) — no synthetic id needed.
+    public var id: String { cycleID }
+
+    public init(
+        cycleID: String,
+        mode: String,
+        workerName: String?,
+        startedAt: String,
+        finishedAt: String,
+        workflowCount: Int,
+        ranCycles: Int,
+        skippedCycles: Int,
+        failedCycles: Int,
+        runIDs: [String],
+        usage: APIUsageSummary,
+        hostID: String?
+    ) {
+        self.cycleID = cycleID
+        self.mode = mode
+        self.workerName = workerName
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.workflowCount = workflowCount
+        self.ranCycles = ranCycles
+        self.skippedCycles = skippedCycles
+        self.failedCycles = failedCycles
+        self.runIDs = runIDs
+        self.usage = usage
+        self.hostID = hostID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case cycleID = "cycle_id"
+        case mode
+        case workerName = "worker_name"
+        case startedAt = "started_at"
+        case finishedAt = "finished_at"
+        case workflowCount = "workflow_count"
+        case ranCycles = "ran_cycles"
+        case skippedCycles = "skipped_cycles"
+        case failedCycles = "failed_cycles"
+        case runIDs = "run_ids"
+        case usage
+        case hostID = "host_id"
+    }
+}
+
 /// Row from `GET /api/sessions` (`SessionDto` on the Rust side, with
 /// `scope`, `usage`, and `host_id` injected). `status` is deliberately not
 /// decoded this phase — it is a raw JSON value of varying shape on the

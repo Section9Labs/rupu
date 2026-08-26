@@ -1,0 +1,45 @@
+[
+  {
+    "cycle_id": "cycle-1",
+    "mode": "tick",
+    "worker_name": "worker-a",
+    "started_at": "2026-08-20T12:00:00Z",
+    "finished_at": "2026-08-20T12:05:00Z",
+    "workflow_count": 2,
+    "ran_cycles": 2,
+    "skipped_cycles": 0,
+    "failed_cycles": 0,
+    "run_ids": ["run-20", "run-21"],
+    "usage": {
+      "input_tokens": 400,
+      "output_tokens": 90,
+      "cached_tokens": 0,
+      "total_tokens": 490,
+      "cost_usd": 0.04,
+      "priced": true,
+      "runs": 2
+    },
+    "host_id": "local"
+  },
+  {
+    "cycle_id": "cycle-2",
+    "mode": "serve",
+    "worker_name": null,
+    "started_at": "2026-08-20T13:00:00Z",
+    "finished_at": "2026-08-20T13:00:30Z",
+    "workflow_count": 1,
+    "ran_cycles": 0,
+    "skipped_cycles": 0,
+    "failed_cycles": 1,
+    "run_ids": [],
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_tokens": 0,
+      "total_tokens": 0,
+      "cost_usd": null,
+      "priced": false,
+      "runs": 0
+    }
+  }
+]

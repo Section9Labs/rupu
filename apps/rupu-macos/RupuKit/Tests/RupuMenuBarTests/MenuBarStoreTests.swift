@@ -3,7 +3,6 @@ import Foundation
 @testable import RupuMenuBar
 import RupuAPI
 import RupuStore
-import RupuOverview
 
 // MARK: - Test infra
 //

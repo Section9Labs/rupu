@@ -93,10 +93,14 @@ let package = Package(
             ]
         ),
         // Task 8: the `MenuBarExtra` popover (`MenuBarStore` + `MenuBarView`)
-        // — needs `RupuOverview` for `deriveNeedsYou`/`NeedsYouItem` (reused,
-        // not duplicated) alongside the usual `RupuAPI`/`RupuStore`/
-        // `RupuDesign` trio every other screen module depends on.
-        .target(name: "RupuMenuBar", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuOverview"]),
+        // reuses `deriveNeedsYou`/`NeedsYouItem` (not duplicated) — those
+        // moved from `RupuOverview` to `RupuStore/NeedsYou.swift` (perf &
+        // interaction arc, Plan 5 Task 4, for `RupuActivity`'s own stats
+        // surface to reuse them too without a `RupuActivity`→`RupuOverview`
+        // edge), so this target no longer needs `RupuOverview` at all — just
+        // the usual `RupuAPI`/`RupuStore`/`RupuDesign` trio every other
+        // screen module depends on.
+        .target(name: "RupuMenuBar", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign"]),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
@@ -129,7 +133,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RupuMenuBarTests",
-            dependencies: ["RupuMenuBar", "RupuAPI", "RupuStore", "RupuBackend", "RupuDesign", "RupuOverview"]
+            dependencies: ["RupuMenuBar", "RupuAPI", "RupuStore", "RupuBackend", "RupuDesign"]
         ),
         // Phase 6B, Task 3: `ClaimsTableTests` — the first test file for
         // `RupuActivity`'s own View-member pure logic (`ClaimsTable`'s

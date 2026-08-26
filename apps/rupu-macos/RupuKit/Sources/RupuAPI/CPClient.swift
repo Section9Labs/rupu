@@ -48,6 +48,23 @@ public actor CPClient {
         try await get("api/runs/autoflows/events", query: offsetLimitQuery(offset: offset, limit: limit, host: host))
     }
 
+    /// `GET /api/runs/autoflows` — autoflow-worker CYCLES (one row per batch
+    /// tick), not events. Named `autoflowCycles`, not `autoflowRuns` — the
+    /// web's own `api.ts` calls this `getAutoflowRuns` (matching the Rust
+    /// route's `/api/runs/autoflows` path literally), but this app already
+    /// uses "Runs" for the EVENTS sub-tab (`AutoflowsSubTab.runs`,
+    /// `autoflowEvents` above) — reusing that name here for a different
+    /// endpoint returning a different row shape would be a footgun for the
+    /// next reader, not a fidelity requirement (the wire path/row shape is
+    /// what has to match the server, not this client's internal method
+    /// name). See `runs(offset:limit:host:)`'s doc comment on the fan-out
+    /// cost of an omitted `host`; host-aware exactly like the other list
+    /// routes above (verified against `crates/rupu-cp/src/api/
+    /// run_streams.rs`'s top-of-file fan-out note).
+    public func autoflowCycles(offset: Int, limit: Int, host: String? = nil) async throws -> [APIAutoflowCycleRow] {
+        try await get("api/runs/autoflows", query: offsetLimitQuery(offset: offset, limit: limit, host: host))
+    }
+
     /// See `runs(offset:limit:host:)`'s doc comment on the fan-out cost of
     /// an omitted `host`.
     public func sessions(offset: Int, limit: Int, host: String? = nil) async throws -> [APISessionRow] {
