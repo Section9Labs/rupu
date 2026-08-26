@@ -107,10 +107,17 @@ clean:
 macos-gen:
 	xcodegen generate --spec apps/rupu-macos/project.yml
 
+# Ad-hoc signed (CODE_SIGN_IDENTITY=-), same as macos-release, NOT
+# CODE_SIGNING_ALLOWED=NO: an entirely unsigned app cannot register with
+# UserNotifications — UNUserNotificationCenter.requestAuthorization throws
+# "notifications are not allowed for this application" and the app never
+# appears in System Settings > Notifications, so the Settings > Notifications
+# toggles could never work from a `make macos-run` build. Ad-hoc needs no
+# identity/keychain, so CI's macos-app job builds identically.
 macos-build: macos-gen
 	xcodebuild -project apps/rupu-macos/rupu.xcodeproj -scheme rupu \
 		-configuration Debug -derivedDataPath apps/rupu-macos/DerivedData \
-		CODE_SIGNING_ALLOWED=NO build
+		CODE_SIGN_IDENTITY=- build
 
 macos-test:
 	swift test --package-path apps/rupu-macos/RupuKit
@@ -162,7 +169,7 @@ help:
 	@echo "  clean          cargo clean"
 	@echo ""
 	@echo "  macos-gen      xcodegen generate apps/rupu-macos/project.yml"
-	@echo "  macos-build    macos-gen + xcodebuild the rupu scheme (Debug, unsigned)"
+	@echo "  macos-build    macos-gen + xcodebuild the rupu scheme (Debug, ad-hoc signed)"
 	@echo "  macos-test     swift test the RupuKit package"
 	@echo "  macos-run      macos-build + open the built rupu.app"
 	@echo "  macos-release  macos-gen + xcodebuild Release, ad-hoc signed, hardened runtime on"
