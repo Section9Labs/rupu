@@ -1419,3 +1419,235 @@ private func makeStore(
     store.deactivate()
     runBox.latest.finish()
 }
+
+// MARK: - Task 5: live unit/round/pause patching + selection cursor
+
+/// `unitStarted` lands a fresh `UnitLiveState` (no `success` yet);
+/// `unitCompleted` (which carries no `transcriptPath` of its own — see the
+/// `CPEvent` case) must preserve the path `unitStarted` already recorded
+/// rather than clobbering it with `nil`.
+@MainActor @Test func unitEventsOverlayLiveUnitLifecycleOntoLiveUnits() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) }, // activeStepID nil -> no auto focusStep
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.unitStarted(runID: "run-1", stepID: "fanout", index: 0, unitKey: "u0", agent: "rupuso", transcriptPath: "t/u0.jsonl", host: nil)))
+
+    let started = await pollUntil { store.liveUnits["fanout"]?[0] != nil }
+    #expect(started)
+    #expect(store.liveUnits["fanout"]?[0] == UnitLiveState(key: "u0", transcriptPath: "t/u0.jsonl", success: nil))
+
+    runBox.latest.yield(.event(.unitCompleted(runID: "run-1", stepID: "fanout", index: 0, unitKey: "u0", success: true, tokensIn: 10, tokensOut: 20, host: nil)))
+
+    let completed = await pollUntil { store.liveUnits["fanout"]?[0]?.success == true }
+    #expect(completed)
+    #expect(store.liveUnits["fanout"]?[0]?.transcriptPath == "t/u0.jsonl", "unitCompleted must not clobber the path unitStarted already recorded")
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+@MainActor @Test func panelRoundEventPatchesPanelRoundsKeyedByStep() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.panelRound(runID: "run-1", stepID: "review-panel", round: 2, maxIterations: 3, maxSeverityRemaining: "medium")))
+
+    let got = await pollUntil { store.panelRounds["review-panel"] != nil }
+    #expect(got)
+    #expect(store.panelRounds["review-panel"] == PanelRoundState(round: 2, maxIterations: 3))
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+@MainActor @Test func stepWorkingEventAdoptsItsTranscriptPathIntoStepTranscripts() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepWorking(runID: "run-1", stepID: "panel-a", note: "iterating", transcriptPath: "t/panel-a.jsonl")))
+
+    let got = await pollUntil { store.stepTranscripts["panel-a"] == "t/panel-a.jsonl" }
+    #expect(got)
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// `stepPaused` -> `.paused`, `stepResumed` -> `.running` — the round trip
+/// `NodeState`'s own doc comment documents (`layoutGraph` never infers
+/// `.paused` on its own; only a live event ever supplies it).
+@MainActor @Test func stepPausedThenResumedRoundTripsLiveStateBetweenPausedAndRunning() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: nil, host: nil)))
+    let running = await pollUntil { store.liveStates["build"] == .running }
+    #expect(running)
+
+    runBox.latest.yield(.event(.stepPaused(runID: "run-1", stepID: "build")))
+    let paused = await pollUntil { store.liveStates["build"] == .paused }
+    #expect(paused)
+
+    runBox.latest.yield(.event(.stepResumed(runID: "run-1", stepID: "build")))
+    let resumed = await pollUntil { store.liveStates["build"] == .running }
+    #expect(resumed)
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// Controller ruling (web "phase 5b" replacement): a terminal run event
+/// clears `liveStates` outright so a step left `.running` (or `.paused`/...)
+/// doesn't stay stuck rendering that stale pulse forever — step results
+/// become the sole source of truth again. Deliberately NOT the web's
+/// fabricate-done reconciliation: a step with no REST result yet just goes
+/// back to rendering `.pending`, honestly.
+@MainActor @Test func terminalEventClearsLiveStatesSoResultsBecomeSourceOfTruthAgain() async {
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: nil, host: nil)))
+    let running = await pollUntil { store.liveStates["build"] == .running }
+    #expect(running)
+
+    runBox.latest.yield(.event(.runCompleted(runID: "run-1", status: "completed", finishedAt: "2026-08-20T13:00:00Z")))
+
+    let cleared = await pollUntil { store.liveStates["build"] == nil }
+    #expect(cleared, "a terminal event must clear liveStates so a step left .running doesn't stay stuck rendering that stale pulse forever")
+    #expect(store.liveStates.isEmpty)
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// Seed-once guard: `activate()`'s own initial auto-focus must never yank
+/// the tab panel away from a step the user has already explicitly selected
+/// — mirrors the web's `seededSelRef` discipline. A second `activate()`
+/// call on the same store instance (a rebuild/refresh) models a screen
+/// reappearing.
+@MainActor @Test func secondActivateDrivenRebuildDoesNotMoveAnExplicitSelection() async {
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(activeStepID: "first"),
+                steps: [
+                    stepResult(stepID: "first", transcriptPath: "t/first.jsonl"),
+                    stepResult(stepID: "other", transcriptPath: "t/other.jsonl"),
+                ]
+            )
+        }
+    )
+    await store.activate()
+    #expect(store.selectedStepID == "first") // auto-seeded from activeStepID
+
+    await store.select(step: "other")
+    #expect(store.selectedStepID == "other")
+
+    // Re-activation must not re-seed "first" now that the user picked "other".
+    await store.activate()
+    #expect(store.selectedStepID == "other")
+
+    store.deactivate()
+}
+
+/// `select(stepID:unitIndex:)`'s path resolution: the live `liveUnits`
+/// overlay wins outright over the REST `APIUnitRow` for that same
+/// `stepID`/`index` pair.
+@MainActor @Test func selectUnitFocusesLiveUnitTranscriptPathOverRESTUnitRow() async {
+    let unitRow = APIUnitRow(stepID: "fanout", index: 0, runID: "run-1", transcriptPath: "rest/u0.jsonl", success: nil, host: nil)
+    let runBox = RunStreamBox()
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        graphResult: { graph(run: runRecord(), units: [unitRow]) },
+        transcriptResult: { path in
+            path == "live/u0.jsonl"
+                ? APITranscriptPage(events: [.assistantMessage(content: "live", thinking: nil)], summary: nil)
+                : APITranscriptPage(events: [.assistantMessage(content: "rest", thinking: nil)], summary: nil)
+        },
+        runStreamBox: runBox
+    )
+    await store.activate()
+    runBox.latest.yield(.connection(true))
+    runBox.latest.yield(.event(.unitStarted(runID: "run-1", stepID: "fanout", index: 0, unitKey: "u0", agent: nil, transcriptPath: "live/u0.jsonl", host: nil)))
+    let started = await pollUntil { store.liveUnits["fanout"]?[0] != nil }
+    #expect(started)
+
+    await store.select(stepID: "fanout", unitIndex: 0)
+
+    #expect(store.selectedStepID == "fanout")
+    #expect(store.selectedUnitIndex == 0)
+    #expect(store.focusedTranscriptPath == "live/u0.jsonl")
+    #expect(store.transcript == [.assistantMessage(content: "live", thinking: nil)])
+
+    store.deactivate()
+    runBox.latest.finish()
+}
+
+/// With no live overlay for the unit at all, `select(stepID:unitIndex:)`
+/// falls back to the REST `APIUnitRow`'s own `transcriptPath` for that exact
+/// `stepID`/`index` pair.
+@MainActor @Test func selectUnitFallsBackToRESTUnitRowTranscriptPathWhenNoLiveOverlay() async {
+    let unitRow = APIUnitRow(stepID: "fanout", index: 1, runID: "run-1", transcriptPath: "rest/u1.jsonl", success: true, host: nil)
+    let store = makeStore(
+        detailResult: { detail(run: runRecord()) },
+        graphResult: { graph(run: runRecord(), units: [unitRow]) },
+        transcriptResult: { path in
+            APITranscriptPage(events: [.assistantMessage(content: "rest-\(path)", thinking: nil)], summary: nil)
+        }
+    )
+    await store.activate()
+
+    await store.select(stepID: "fanout", unitIndex: 1)
+
+    #expect(store.selectedStepID == "fanout")
+    #expect(store.selectedUnitIndex == 1)
+    #expect(store.focusedTranscriptPath == "rest/u1.jsonl")
+    #expect(store.transcript == [.assistantMessage(content: "rest-rest/u1.jsonl", thinking: nil)])
+
+    store.deactivate()
+}
+
+/// `select(step:)` (whole-step focus) always means "not a fan-out unit" —
+/// it must clear any prior `selectedUnitIndex` rather than leaving a stale
+/// unit index pointed at a different step.
+@MainActor @Test func selectStepClearsAnyPriorUnitSelection() async {
+    let unitRow = APIUnitRow(stepID: "fanout", index: 0, runID: "run-1", transcriptPath: "rest/u0.jsonl", success: nil, host: nil)
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(),
+                steps: [stepResult(stepID: "other", transcriptPath: "t/other.jsonl")]
+            )
+        },
+        graphResult: { graph(run: runRecord(), units: [unitRow]) }
+    )
+    await store.activate()
+    await store.select(stepID: "fanout", unitIndex: 0)
+    #expect(store.selectedUnitIndex == 0)
+
+    await store.select(step: "other")
+    #expect(store.selectedStepID == "other")
+    #expect(store.selectedUnitIndex == nil)
+
+    store.deactivate()
+}

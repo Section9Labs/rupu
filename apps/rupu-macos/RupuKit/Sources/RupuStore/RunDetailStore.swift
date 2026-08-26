@@ -96,6 +96,22 @@ public final class RunDetailStore {
 
     public private(set) var liveStates: [String: NodeState] = [:]
 
+    /// Task 5 (run-graph parity): live fan-out unit overlay, folded from
+    /// `unitStarted`/`unitCompleted` `CPEvent`s on top of the REST
+    /// `APIUnitRow` snapshot — see `layoutGraph`'s doc comment for how the
+    /// two are merged. Keyed `[stepID: [index: UnitLiveState]]`.
+    public private(set) var liveUnits: [String: [Int: UnitLiveState]] = [:]
+
+    /// Task 5: live panel-review iteration counter, folded from `panelRound`
+    /// `CPEvent`s, keyed by step id.
+    public private(set) var panelRounds: [String: PanelRoundState] = [:]
+
+    /// Task 5: `stepWorking`'s own `transcriptPath` adoption — a step whose
+    /// transcript path isn't known from a finished result or the run's
+    /// `activeStepTranscriptPath` yet (e.g. a `for_each`/panel container
+    /// still in flight) can still surface one this way, keyed by step id.
+    public private(set) var stepTranscripts: [String: String] = [:]
+
     public private(set) var transcript: [TranscriptEvent] = []
     public private(set) var transcriptTailActive: Bool = false
     public private(set) var focusedTranscriptPath: String?
@@ -106,6 +122,13 @@ public final class RunDetailStore {
     /// when the workflow has no steps to focus at all (`initialFocusStepID()`
     /// returned `nil`).
     public private(set) var selectedStepID: String?
+
+    /// Task 5: the fan-out unit index the tab panel currently follows within
+    /// `selectedStepID` — `nil` means "whole step" (the normal case; every
+    /// non-fan-out selection, and the seed-once initial focus). Set only by
+    /// `select(stepID:unitIndex:)`; cleared by `select(step:)`, which always
+    /// means "focus the step as a whole" again.
+    public private(set) var selectedUnitIndex: Int?
 
     /// Flows-composition Task 4: every `CPEvent` the run stream has
     /// delivered this activation, oldest first, capped at 500 (drop
@@ -294,7 +317,13 @@ public final class RunDetailStore {
             startRunStream()
         }
 
-        if let stepID = initialFocusStepID() {
+        // Task 5, seed-once guard: only ever auto-seed the initial focus
+        // once per store — a rebuild/refresh that re-runs `activate()` (this
+        // store's construction is otherwise fresh per screen appearance, but
+        // nothing stops a caller from reactivating the same instance) must
+        // never yank the tab panel away from a step the user has already
+        // explicitly selected. Mirrors the web's `seededSelRef` discipline.
+        if selectedStepID == nil, let stepID = initialFocusStepID() {
             await select(step: stepID)
         }
     }
@@ -495,10 +524,28 @@ public final class RunDetailStore {
     /// section for why this only tears down / applies state once it's
     /// confirmed to still be the most recent call.
     public func focusStep(_ stepID: String) async {
+        let path = resolveTranscriptPath(stepID: stepID)
+        // Review fix: when this step is about to be tailed, skip the REST
+        // snapshot entirely — `/api/transcript/stream`'s byte-0 replay is
+        // already a superset of it (see the type doc comment's "REST
+        // snapshot vs. tail" section).
+        let willTail = path != nil && !isRemote && isStepRunning(stepID) && transcriptTailFactory != nil
+        await focusPath(path, tail: willTail)
+    }
+
+    /// Task 5: the shared generation-guarded core `focusStep` and
+    /// `select(stepID:unitIndex:)` both delegate to — extracted so the unit
+    /// focus path reuses the exact same "resolve a path, then fetch-or-tail
+    /// under `focusGeneration`'s guard" machinery rather than duplicating it.
+    /// `path` is already resolved by the caller (nil means "nothing to focus
+    /// — clear"); `tail` is the caller's own "should this be tailed instead
+    /// of REST-fetched" decision (units never tail this phase — see
+    /// `select(stepID:unitIndex:)`).
+    private func focusPath(_ path: String?, tail: Bool) async {
         focusGeneration += 1
         let generation = focusGeneration
 
-        guard let path = resolveTranscriptPath(stepID: stepID) else {
+        guard let path else {
             // Nothing here has awaited yet — this call ran fully
             // synchronously up to this point, so it cannot have been
             // superseded by a later call. Always safe to tear down whatever
@@ -509,14 +556,10 @@ public final class RunDetailStore {
             return
         }
 
-        // Review fix: when this step is about to be tailed, skip the REST
-        // snapshot entirely — `/api/transcript/stream`'s byte-0 replay is
-        // already a superset of it (see the type doc comment's "REST
-        // snapshot vs. tail" section). This branch never awaits, so — same
-        // reasoning as the `guard let path` branch above — it cannot have
-        // been superseded by a later call either; always safe to apply.
-        let willTail = !isRemote && isStepRunning(stepID) && transcriptTailFactory != nil
-        if willTail, let transcriptTailFactory {
+        // This branch never awaits, so — same reasoning as the `guard let
+        // path` branch above — it cannot have been superseded by a later
+        // call either; always safe to apply.
+        if tail, let transcriptTailFactory {
             focusedTranscriptPath = path
             startTail(path: path, factory: transcriptTailFactory)
             return
@@ -544,11 +587,12 @@ public final class RunDetailStore {
             events = []
         }
 
-        // A newer `focusStep` call started while this one was suspended
-        // awaiting `fetchTranscript` above — that later call owns the focus
-        // now. Discard these now-stale results rather than applying them:
-        // this is what guarantees only the most recent call ever mutates
-        // `transcript`/`focusedTranscriptPath` or starts a tail.
+        // A newer `focusStep`/`select(stepID:unitIndex:)` call started while
+        // this one was suspended awaiting `fetchTranscript` above — that
+        // later call owns the focus now. Discard these now-stale results
+        // rather than applying them: this is what guarantees only the most
+        // recent call ever mutates `transcript`/`focusedTranscriptPath` or
+        // starts a tail.
         guard generation == focusGeneration else { return }
 
         stopTail()
@@ -567,7 +611,26 @@ public final class RunDetailStore {
     /// synchronous assignment with nothing to race.
     public func select(step stepID: String) async {
         selectedStepID = stepID
+        // Task 5: whole-step focus always means "not a fan-out unit" — clear
+        // any prior unit-level selection so the tab panel doesn't keep
+        // following a unit index that belonged to a previous step.
+        selectedUnitIndex = nil
         await focusStep(stepID)
+    }
+
+    /// Task 5: fan-out unit selection — sets both `selectedStepID` and
+    /// `selectedUnitIndex`, then focuses the unit's own transcript path
+    /// (`liveUnits[stepID][index]`'s path first, else the REST
+    /// `APIUnitRow`'s for that `stepID`/`index`) through the same
+    /// generation-guarded `focusPath` machinery `focusStep` uses — see that
+    /// method's doc comment. Units never tail this phase (`tail: false`
+    /// unconditionally); a running unit's transcript is only ever available
+    /// via the REST snapshot until it completes.
+    public func select(stepID: String, unitIndex: Int) async {
+        selectedStepID = stepID
+        selectedUnitIndex = unitIndex
+        let path = resolveUnitTranscriptPath(stepID: stepID, index: unitIndex)
+        await focusPath(path, tail: false)
     }
 
     /// The Events tab's filtered feed: with a step selected, only events
@@ -730,6 +793,27 @@ public final class RunDetailStore {
             // emitted when the step actually ran and reported failure. See
             // the type doc comment's "Live semantics" section.
             liveStates[stepID] = .done(success: false)
+        case .stepWorking(_, let stepID, _, let transcriptPath):
+            // Task 5: adopt a working step's own transcript path when it
+            // supplies one — a `for_each`/panel container step in flight has
+            // no finished result and may not be the run's `activeStepID`
+            // either, so this is otherwise the only way `focusStep` can ever
+            // resolve a path for it. No path on this event is a no-op, not a
+            // clear — a later event or the REST snapshot may already have
+            // supplied one.
+            if let transcriptPath {
+                stepTranscripts[stepID] = transcriptPath
+            }
+        case .unitStarted(_, let stepID, let index, let unitKey, _, let transcriptPath, _):
+            liveUnits[stepID, default: [:]][index] = UnitLiveState(key: unitKey, transcriptPath: transcriptPath, success: nil)
+        case .unitCompleted(_, let stepID, let index, let unitKey, let success, _, _, _):
+            // `unitCompleted` carries no `transcriptPath` of its own (see the
+            // `CPEvent` case) — preserve whatever `unitStarted` already
+            // recorded for this unit rather than clobbering it with `nil`.
+            let priorPath = liveUnits[stepID]?[index]?.transcriptPath
+            liveUnits[stepID, default: [:]][index] = UnitLiveState(key: unitKey, transcriptPath: priorPath, success: success)
+        case .panelRound(_, let stepID, let round, let maxIterations, _):
+            panelRounds[stepID] = PanelRoundState(round: round, maxIterations: maxIterations)
         case .runResumed(let runID):
             // Same fast-path rationale as `stepStarted` above — the most
             // direct signal a run left a pause or an approval gate, per the
@@ -738,20 +822,39 @@ public final class RunDetailStore {
             pendingActions.resolve(runID: runID, observedStatus: .running)
         case .runPaused(let runID):
             pendingActions.resolve(runID: runID, observedStatus: .paused)
-        case .stepPaused(let runID, _):
+        case .stepPaused(let runID, let stepID):
             // Fix round 1 (folded minor): the step-scoped counterpart to
             // `runPaused` — a detached/step-level pause still implies the
             // run is now `.paused` for this store's confirmation purposes.
+            // Task 5: also patch `liveStates` itself — `NodeState.paused` is
+            // otherwise never reachable, since `layoutGraph` never infers it
+            // on its own (see that type's doc comment).
+            liveStates[stepID] = .paused
             pendingActions.resolve(runID: runID, observedStatus: .paused)
-        case .stepResumed(let runID, _):
+        case .stepResumed(let runID, let stepID):
             // Step-scoped counterpart to `runResumed` — same fast-path
-            // rationale.
+            // rationale. Task 5: reverts the node back to `.running`, same
+            // as `NodeState`'s doc comment documents for this pair.
+            liveStates[stepID] = .running
             pendingActions.resolve(runID: runID, observedStatus: .running)
         case .runCompleted(let runID, let status, _):
             pendingActions.resolve(runID: runID, observedStatus: .normalize(status))
+            // Controller ruling (Task 5, terminal-event live-state cleanup —
+            // the web's "phase 5b" replacement): clear `liveStates` once the
+            // run is over so step results (the REST `graph`/`detail` blocks)
+            // become the sole source of truth again and no step is left
+            // stuck rendering a stale `.running`/`.paused`/... pulse forever.
+            // `liveUnits`/`panelRounds` are deliberately left as-is — they
+            // aren't part of this reconciliation. Deliberately NOT porting
+            // the web's fabricate-done reconciliation: a step this clears
+            // that has no REST result yet renders honestly `.pending` rather
+            // than a synthesized "done".
+            liveStates = [:]
             handleTerminal()
         case .runFailed(let runID, _, _):
             pendingActions.resolve(runID: runID, observedStatus: .failed)
+            // Same terminal cleanup as `runCompleted` above.
+            liveStates = [:]
             handleTerminal()
         default:
             break
@@ -891,6 +994,20 @@ public final class RunDetailStore {
         }
         if case .content(let detail) = detail, detail.run.activeStepID == stepID {
             return detail.run.activeStepTranscriptPath
+        }
+        return nil
+    }
+
+    /// Task 5: `select(stepID:unitIndex:)`'s path resolution — the live
+    /// `liveUnits` overlay wins outright (same precedence `layoutGraph` gives
+    /// it), falling back to the REST `APIUnitRow` for this exact `stepID`/
+    /// `index` pair from the loaded `graph` block.
+    private func resolveUnitTranscriptPath(stepID: String, index: Int) -> String? {
+        if let livePath = liveUnits[stepID]?[index]?.transcriptPath {
+            return livePath
+        }
+        if case .content(let graph) = graph, let unit = graph.units.first(where: { $0.stepID == stepID && $0.index == index }) {
+            return unit.transcriptPath
         }
         return nil
     }

@@ -541,20 +541,13 @@ public struct RunDetailScreen: View {
                     results: g.stepResults,
                     units: g.units,
                     liveStates: effectiveLiveStates(store: store),
-                    // TODO(Task 5): thread real live-overlay state
-                    // (unit/panel-round/transcript events) from
-                    // `RunDetailStore` — this screen is properly rewired
-                    // there; Task 2 only needed the tree to compile.
-                    liveUnits: [:],
-                    panelRounds: [:],
-                    stepTranscripts: [:]
+                    liveUnits: store.liveUnits,
+                    panelRounds: store.panelRounds,
+                    stepTranscripts: store.stepTranscripts
                 ),
                 selectedID: store.selectedStepID,
                 onSelect: { stepID in Task { await store.select(step: stepID) } },
-                // TODO(Task 5): wire the real fan-out unit selection —
-                // this screen properly threads it through `RunDetailStore`
-                // there; Task 4 only needed the call site to compile.
-                onSelectUnit: { _, _ in }
+                onSelectUnit: { stepID, index in Task { await store.select(stepID: stepID, unitIndex: index) } }
             )
             .panelStyle(.panel)
         }
