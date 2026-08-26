@@ -43,6 +43,18 @@ public func agentPermissionTone(mode: String?) -> StatusTone? {
 /// (`FleetStore`/`ProjectDetailStore`) already follows — one block failing
 /// never blanks the others.
 ///
+/// **Audited, not converted, for local-first (perf & interaction arc, Plan
+/// 5 Task 2)**: this store was on that task's list of screens suspected of
+/// blocking first paint on a fleet-wide fan-out. Verified against
+/// `list_agents`/`list_workflows`/`list_autoflows` (`crates/rupu-cp/src/
+/// api/{agents,workflows,autoflows}.rs`): none has a `host` query param or
+/// any host-fan-out mechanism — all three read `.md`/YAML definitions
+/// straight off `s.global_dir`/this CP's own `WorkspaceStore`, and
+/// `list_autoflows` is explicitly documented Rust-side as "Local-only, no
+/// `?host=`". There is no per-host progressive merge to build here;
+/// converting this store would mean fabricating a `host` param the server
+/// ignores, which the task brief explicitly forbids. Left unchanged.
+///
 /// **`setAutoflowEnabled` is IMMEDIATE, not confirm-on-refetch** (contrast
 /// `FleetStore.removeHost`'s "row disappearing IS the confirmation"):
 /// `POST /api/autoflows/:name/enable|disable`'s response body IS the

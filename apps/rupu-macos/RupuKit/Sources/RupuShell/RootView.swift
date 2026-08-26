@@ -1,4 +1,5 @@
 import SwiftUI
+import RupuAPI
 import RupuStore
 import RupuBackend
 import RupuDesign
@@ -40,6 +41,26 @@ public struct RootView: View {
     /// "no client yet" degrade every other backend-dependent affordance in
     /// this view already uses.
     @State private var palette: PaletteStore?
+
+    /// The single shared `ActivityStore` (perf & interaction arc, Plan 5
+    /// Task 2): built once here — not by `ActivityScreen`/`OverviewScreen`
+    /// each building their own — and injected into both. Before this,
+    /// `OverviewScreen` built a SECOND, independent `ActivityStore` purely
+    /// to derive its needs-you queue, each with its own resting SSE
+    /// connection replaying history on connect; this collapses that to
+    /// one. Built (and rebuilt on a client swap) the same lazy,
+    /// client-identity-tracked way `hostsFooter`/`palette` already are —
+    /// see `activateOnClientAvailable()`. Whichever screen is currently
+    /// visible reconfigures it to its own needs on activation (`kind`/
+    /// `scopeFilter` for `ActivityScreen`; `kind: .all` with no scope for
+    /// `OverviewScreen`'s needs-you derivation) — safe since the two
+    /// screens are mutually exclusive routes, never simultaneously visible.
+    @State private var activityStore: ActivityStore?
+    /// Same rebuild-on-client-swap rationale as `storeClientID` in
+    /// `ActivityScreen`/`OverviewScreen` — tracked independently of
+    /// `palette`'s own construction since a future divergence in when each
+    /// needs rebuilding shouldn't accidentally couple them.
+    @State private var activityStoreClientID: ObjectIdentifier?
 
     public init(model: AppModel, backend: BackendController) {
         self.model = model
@@ -103,17 +124,6 @@ public struct RootView: View {
         .task {
             await backend.reconnectIfNeeded()
         }
-        .onAppear {
-            // Re-activate on reappearance too, not just on a health
-            // transition below: a RootView that disappears/reappears
-            // without `backend.health` ever changing (still `.healthy`)
-            // would otherwise show "— hosts" until the next flap.
-            // `activate(client:)` is idempotent, so this is a no-op when
-            // already running.
-            if let client = backend.client() {
-                hostsFooter.activate(client: client)
-            }
-        }
         .sheet(isPresented: onboardingSheetBinding) {
             OnboardingView(backend: backend, model: model)
                 .interactiveDismissDisabled()
@@ -127,6 +137,9 @@ public struct RootView: View {
         // reads is the sheet's own `@State` — invisible from here.
         .sheet(isPresented: $model.showLauncher) {
             LauncherSheet(model: model, backend: backend)
+        }
+        .task(id: backend.clientGeneration) {
+            activateOnClientAvailable()
         }
         .onChange(of: backend.health) { _, newHealth in
             handleHealthChange(newHealth)
@@ -157,19 +170,26 @@ public struct RootView: View {
     }
 
     /// Mirrors backend health into the model the existing sidebar
-    /// footer/toolbar pill already read (Task 8), and — the Phase 1
-    /// end-to-end proof — starts exactly one task consuming the live event
-    /// stream the first time health reaches `.healthy`. Dropping all the
-    /// way to `.down`/`.incompatible` is a backstop that also flips
-    /// `liveConnected` false (the stream client itself keeps reconnecting,
-    /// and normally `backend.onLiveConnectionChange` — set in `init`,
-    /// connection-level, not frame-level — already caught the disconnect);
-    /// `.degraded` (a single failed health poll) deliberately does NOT
-    /// force it false, since the SSE stream can still be connected against
-    /// a momentarily-flaky health endpoint — forcing it here would fight
-    /// `onLiveConnectionChange`'s ownership of that signal. None of this
-    /// tears down or respawns the consumer, per the brief's "don't spawn a
-    /// second consumer on re-health" — `liveEventTask == nil` is the guard.
+    /// footer/toolbar pill already read (Task 8) — STATUS DISPLAY only.
+    /// Dropping all the way to `.down`/`.incompatible` is a backstop that
+    /// also flips `liveConnected` false (the stream client itself keeps
+    /// reconnecting, and normally `backend.onLiveConnectionChange` — set in
+    /// `init`, connection-level, not frame-level — already caught the
+    /// disconnect); `.degraded` (a single failed health poll) deliberately
+    /// does NOT force it false, since the SSE stream can still be connected
+    /// against a momentarily-flaky health endpoint — forcing it here would
+    /// fight `onLiveConnectionChange`'s ownership of that signal.
+    ///
+    /// **No longer where client-dependent activation lives** (perf &
+    /// interaction arc, Plan 5 Task 2): `hostsFooter`/`palette`/
+    /// `liveEventTask` used to be built here, gated on `health == .healthy`
+    /// — but `backend.client()`/`backend.eventStream()` are both usable the
+    /// instant `BackendController` wires them up, well before its
+    /// `HealthMonitor`'s own first probe round-trip resolves `health` to
+    /// `.healthy`. That extra round trip bought nothing but delay, so
+    /// `activateOnClientAvailable()` (driven by `.task(id:
+    /// backend.clientGeneration)` in `body`) now owns all of that instead —
+    /// see its own doc comment.
     func handleHealthChange(_ health: BackendHealth) {
         model.backendHealth = health
 
@@ -179,24 +199,47 @@ public struct RootView: View {
         case .starting, .degraded, .healthy:
             break
         }
+    }
 
-        guard case .healthy = health else { return }
+    /// Activates everything that depends on a live `CPClient`/
+    /// `EventStreamClient` pair — `hostsFooter`, `palette`, and the one
+    /// live-event-count consumer — directly off `backend.clientGeneration`
+    /// (perf & interaction arc, Plan 5 Task 2), collapsing the old
+    /// `health -> onChange -> onChange` relay: this now runs the instant a
+    /// client becomes available (or is swapped — an embedded/remote
+    /// switch, a manual reconnect, a restart), independent of whether
+    /// `backend.health` has reached `.healthy` yet. `.task(id:
+    /// backend.clientGeneration)` in `body` re-runs this on every
+    /// generation bump (including the first, on initial appearance) and is
+    /// otherwise a no-op if the generation hasn't changed — so this being
+    /// idempotent (every check below is a guarded "build/refresh, don't
+    /// duplicate") is what makes calling it unconditionally on every bump
+    /// safe, same contract `activate(kind:)`-style methods elsewhere in
+    /// this codebase already follow.
+    func activateOnClientAvailable() {
+        guard let client = backend.client() else { return }
+        let clientID = backend.clientIdentity()
 
-        // `CPClient` is only available once `backend` has an active
-        // connection (`BackendController.client()` is `nil` until then), so
-        // the sidebar's `HostsFooterStore` is activated here — the first
-        // healthy transition — rather than from an `.onAppear`, mirroring
-        // how `ActivityScreen` waits on `backend.client()` before building
-        // its own store. `activate(client:)` is idempotent (guards its own
-        // poll task), so a later re-healthy transition after a `.degraded`
-        // blip just refreshes the client rather than spawning a second loop.
-        if let client = backend.client() {
-            hostsFooter.activate(client: client)
-            if palette == nil {
-                palette = PaletteStore(client: client, pendingActions: backend.pendingActions, onNavigate: { [model] route in
-                    model.navigate(to: route)
-                })
-            }
+        hostsFooter.activate(client: client)
+        if palette == nil {
+            palette = PaletteStore(client: client, pendingActions: backend.pendingActions, onNavigate: { [model] route in
+                model.navigate(to: route)
+            })
+        }
+
+        // The shared `ActivityStore` (see that property's doc comment) —
+        // rebuilt on a client swap exactly like `palette`, just tracked
+        // with its own watermark. Not activated here: whichever of
+        // `ActivityScreen`/`OverviewScreen` is currently visible calls
+        // `activate(kind:)` itself, with its own `kind`/`scopeFilter`.
+        if activityStore == nil || activityStoreClientID != clientID {
+            activityStore?.deactivate()
+            activityStore = ActivityStore(
+                client: client,
+                signalsFactory: Self.makeActivitySignalsFactory(backend: backend),
+                pendingActions: backend.pendingActions
+            )
+            activityStoreClientID = clientID
         }
 
         guard liveEventTask == nil, let stream = backend.eventStream() else { return }
@@ -207,13 +250,46 @@ public struct RootView: View {
         }
     }
 
+    /// Builds the shared `ActivityStore`'s required `signalsFactory` around
+    /// its OWN fully independent connection — not `RootView`'s shared
+    /// `eventStream()` firehose, whose `onConnectionChange` slot is already
+    /// claimed (forwarded into `model.liveConnected`). Lifted here from
+    /// `ActivityScreen`/`OverviewScreen`, which each used to duplicate an
+    /// identical private copy of this same helper to build their own
+    /// (separate) `ActivityStore` instances — now there is exactly one
+    /// instance, so exactly one copy of this helper.
+    private static func makeActivitySignalsFactory(
+        backend: BackendController
+    ) -> @Sendable () -> AsyncStream<StreamSignal<CPEvent>> {
+        {
+            let (onChange, continuation, signals) = MainActor.assumeIsolated {
+                StreamLifecycle.makeSignalBridge(CPEvent.self)
+            }
+            guard let stream = MainActor.assumeIsolated({
+                backend.makeFirehoseStream(onConnectionChange: onChange)
+            }) else {
+                continuation.finish()
+                return signals
+            }
+
+            let pump = Task {
+                for await event in stream.events() {
+                    continuation.yield(.event(event))
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+            return signals
+        }
+    }
+
     @ViewBuilder
     private var detail: some View {
         switch model.route {
         case .overview:
-            OverviewScreen(model: model, backend: backend)
+            OverviewScreen(model: model, backend: backend, activityStore: activityStore)
         case .activity:
-            ActivityScreen(model: model, backend: backend)
+            ActivityScreen(model: model, backend: backend, activityStore: activityStore)
         case .runDetail(let id, let host):
             RunDetailScreen(model: model, backend: backend, runID: id, host: host)
         case .sessionDetail(let id):

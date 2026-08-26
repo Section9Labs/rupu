@@ -11,6 +11,18 @@ import RupuAPI
 /// this module (`ProjectDetailStore`/`FleetStore`/`LibraryStore`) already
 /// follows — one tab failing never blanks the other.
 ///
+/// **Audited, not converted, for local-first (perf & interaction arc, Plan
+/// 5 Task 2)**: this store was on that task's list of screens suspected of
+/// blocking first paint on a fleet-wide fan-out. Verified against the Rust
+/// handlers (`list_findings`/`list_coverage` in `crates/rupu-cp/src/api/
+/// findings.rs`/`coverage.rs`): neither has a `host` query param, a
+/// `HostRegistry` reference, or any other host-fan-out mechanism at all —
+/// both walk every workspace REGISTERED ON THIS CP instance's own
+/// filesystem, exactly like `CPClient.findings(wsID:)`'s own doc comment
+/// already states. There is no per-host progressive merge to build here;
+/// converting this store would mean fabricating a `host` param the server
+/// ignores, which the task brief explicitly forbids. Left unchanged.
+///
 /// **Lazy per-tab loading, same recipe as `ProjectDetailStore`**: `activate()`
 /// itself fetches nothing — there is no shared "header" fetch here (unlike
 /// `ProjectDetailStore`'s `detail`; the Security screen's summary strip is

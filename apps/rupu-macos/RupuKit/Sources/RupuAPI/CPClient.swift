@@ -64,6 +64,14 @@ public actor CPClient {
 
     /// `GET /api/projects` — every registered workspace, newest-activity
     /// first. Drives the v2 top bar's scope picker.
+    ///
+    /// **No `host` param — genuinely local-only, not a documentation gap to
+    /// close later.** Verified against `list_projects` in `crates/rupu-cp/
+    /// src/api/projects.rs`: it has no `Query` extractor at all and reads
+    /// straight from `s.run_store`/this CP's own `WorkspaceStore` — a
+    /// "project" is a workspace REGISTERED ON THIS CP instance, not a
+    /// per-Fleet-host concept the server ever fans out across (unlike
+    /// `runs`/`dashboard`/`usage`, which proxy to remote hosts).
     public func projects() async throws -> [APIProjectRow] {
         try await get("api/projects")
     }
@@ -151,6 +159,12 @@ public actor CPClient {
     /// independent filter from `run_id`, so this is a second thin method
     /// rather than overloading `runFindings`'s `id` parameter to mean two
     /// different query keys depending on caller.
+    ///
+    /// **No `host` param — genuinely local-only, not a documentation gap to
+    /// close later.** Verified against `list_findings` (`findings.rs`):
+    /// `FindingsQuery` has no `host` field and the handler enumerates every
+    /// workspace REGISTERED ON THIS CP instance, never proxying to a remote
+    /// Fleet host.
     public func findings(wsID: String? = nil) async throws -> APIFindings {
         var query: [URLQueryItem] = []
         if let wsID {
@@ -169,10 +183,22 @@ public actor CPClient {
 
     // MARK: - Definitions (read)
 
+    /// **No `host` param — genuinely local-only, not a documentation gap to
+    /// close later.** Verified against `list_agents` (`crates/rupu-cp/src/
+    /// api/agents.rs`): no `Query` extractor at all, reads `.md` definitions
+    /// straight off `s.global_dir`/this CP's own `WorkspaceStore`. Every
+    /// other `host`-bearing route in this file's doc comments notes the
+    /// same "host-unaware by design" rationale the Rust source itself
+    /// states for the sibling `resolve_agent_scoped` — definitions live on
+    /// THIS CP's filesystem, never proxied to a remote Fleet host.
     public func agentDefinitions() async throws -> [AgentDefinition] {
         try await get("api/agents")
     }
 
+    /// **No `host` param — genuinely local-only, not a documentation gap to
+    /// close later.** Same rationale as `agentDefinitions()` — verified
+    /// against `list_workflows` (`crates/rupu-cp/src/api/workflows.rs`): no
+    /// `Query` extractor, local-filesystem read only.
     public func workflowDefinitions() async throws -> [WorkflowDefinition] {
         try await get("api/workflows")
     }
@@ -203,6 +229,13 @@ public actor CPClient {
     /// `autoflow:` block, enabled and disabled alike (global layer merged
     /// with every distinct registered repo's `.rupu/workflows/`; project
     /// shadows global by name).
+    ///
+    /// **No `host` param — genuinely local-only, not a documentation gap to
+    /// close later.** Same rationale as `agentDefinitions()`/
+    /// `workflowDefinitions()` — `list_autoflows` (`crates/rupu-cp/src/api/
+    /// autoflows.rs`) is explicitly documented there as "Local-only, no
+    /// `?host=`: unlike the run-launch endpoints, this never proxies to a
+    /// remote host."
     public func autoflowDefinitions() async throws -> [AutoflowDefinition] {
         try await get("api/autoflows")
     }
@@ -304,7 +337,11 @@ public actor CPClient {
 
     /// `GET /api/coverage` — every coverage target's rollup, aggregated
     /// across every registered workspace (the firehose view, not scoped to
-    /// the CP's own launch dir). Local-only: no `host` fan-out.
+    /// the CP's own launch dir). Local-only: no `host` fan-out — verified
+    /// against `list_coverage` (`crates/rupu-cp/src/api/coverage.rs`), which
+    /// has no `Query` extractor at all. Not a documentation gap to close
+    /// later: coverage targets are discovered by walking each registered
+    /// workspace's own filesystem path, never proxied to a remote host.
     public func coverage() async throws -> [APICoverageSummary] {
         try await get("api/coverage")
     }
@@ -328,17 +365,23 @@ public actor CPClient {
 
     // MARK: - Usage (read)
 
-    /// `GET /api/usage[?since=&until=&group_by=]` — fleet-wide token + cost
-    /// overview (summary + breakdown), fanned out across every registered
-    /// host. `since`/`until` are RFC-3339 timestamps; omitted, the server
-    /// defaults to the trailing 30 days. `groupBy` is one of `"provider"` |
-    /// `"model"` | `"agent"` | `"workflow"` | `"host"` | `"project"`;
-    /// omitted, the server groups by `"model"`.
-    public func usage(since: String? = nil, until: String? = nil, groupBy: String? = nil) async throws -> APIUsageResponse {
+    /// `GET /api/usage[?since=&until=&group_by=&host=]` — fleet-wide token +
+    /// cost overview (summary + breakdown). `since`/`until` are RFC-3339
+    /// timestamps; omitted, the server defaults to the trailing 30 days.
+    /// `groupBy` is one of `"provider"` | `"model"` | `"agent"` |
+    /// `"workflow"` | `"host"` | `"project"`; omitted, the server groups by
+    /// `"model"`. `host` (default `nil`) scopes to a single host, same
+    /// param/semantics as `runs(offset:limit:host:)` — see that method's doc
+    /// comment on the fan-out cost of an omitted `host` (confirmed present on
+    /// this route by `UsageQuery.host` in `crates/rupu-cp/src/api/usage.rs`).
+    /// Callers that want progressive per-host loading (`UsageStore`) always
+    /// pass an explicit `host`, never omit it.
+    public func usage(since: String? = nil, until: String? = nil, groupBy: String? = nil, host: String? = nil) async throws -> APIUsageResponse {
         var query = sinceUntilQuery(since: since, until: until)
         if let groupBy {
             query.append(URLQueryItem(name: "group_by", value: groupBy))
         }
+        query.append(contentsOf: hostQuery(host))
         return try await get("api/usage", query: query)
     }
 

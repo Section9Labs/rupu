@@ -12,6 +12,18 @@ import RupuAPI
 /// `spend`) is view-local state (`ProjectsScreen`'s own `ListSort`), applied
 /// over `rows` the same way `ActivityTable`'s view-local sort is applied
 /// over `ActivityStore.rows` — not this store's concern.
+///
+/// **Audited, not converted, for local-first (perf & interaction arc, Plan
+/// 5 Task 2)**: this store was on that task's list of screens suspected of
+/// blocking first paint on a fleet-wide fan-out. Verified against
+/// `list_projects` (`crates/rupu-cp/src/api/projects.rs`): no `Query`
+/// extractor at all, reads straight from `s.run_store`/this CP's own
+/// `WorkspaceStore` — a "project" is a workspace REGISTERED ON THIS CP
+/// instance, not a per-Fleet-host concept the server ever fans out across
+/// (unlike `runs`/`dashboard`/`usage`, which proxy to remote hosts). There
+/// is no per-host progressive merge to build here; converting this store
+/// would mean fabricating a `host` param the server ignores, which the task
+/// brief explicitly forbids. Left unchanged.
 @MainActor
 @Observable
 public final class ProjectsStore {

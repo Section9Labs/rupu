@@ -39,3 +39,62 @@ final class CallCounter: @unchecked Sendable {
     #expect(second == .attached)
     #expect(probeCalls.value == 1)
 }
+
+// MARK: - Fast cold-start probe race (perf & interaction arc, Plan 5 Task 2)
+
+/// The overwhelmingly common case — a `cp serve` already listening —
+/// resolves `start()` in well under the probe's own (much longer, ~3s in
+/// production) timeout: a probe that answers immediately attaches almost
+/// instantly, called exactly once.
+@Test func startAttachesQuicklyWhenTheProbeAnswersFast() async throws {
+    let probeCalls = CallCounter()
+    let server = EmbeddedServer(binaryPath: "/nonexistent/rupu", port: 65535, probe: { _ in
+        probeCalls.increment()
+        return true
+    })
+
+    let clock = ContinuousClock()
+    let start = clock.now
+    let origin = try await server.start()
+    let elapsed = clock.now - start
+
+    #expect(origin == .attached)
+    #expect(probeCalls.value == 1)
+    #expect(elapsed < .milliseconds(250), "a fast-answering probe must not pay the 300ms fast-path deadline at all")
+}
+
+/// A probe that takes LONGER than the 300ms fast-path deadline to answer
+/// (but still well within its own real timeout) must still resolve
+/// correctly — via the SAME in-flight call, never a second, redundant
+/// probe invocation — rather than being misclassified as "not running"
+/// just because it didn't answer within the first 300ms.
+@Test func startStillAttachesCorrectlyWhenTheProbeAnswersSlowerThanTheFastDeadline() async throws {
+    let probeCalls = CallCounter()
+    let server = EmbeddedServer(binaryPath: "/nonexistent/rupu", port: 65535, probe: { _ in
+        probeCalls.increment()
+        try? await Task.sleep(for: .milliseconds(600))
+        return true
+    })
+
+    let origin = try await server.start()
+
+    #expect(origin == .attached)
+    #expect(probeCalls.value == 1, "the fast deadline elapsing must fall through to awaiting the SAME call, never invoke the probe a second time")
+}
+
+/// The false/"not running" case still works exactly as before the fast-path
+/// race was added — a probe that quickly reports "nothing there" leads to
+/// a real spawn attempt (which fails immediately against a nonexistent
+/// binary path here), never misreported as `.attached`.
+@Test func startAttemptsSpawnWhenTheProbeReportsNotRunning() async {
+    let probeCalls = CallCounter()
+    let server = EmbeddedServer(binaryPath: "/nonexistent/rupu", port: 65535, probe: { _ in
+        probeCalls.increment()
+        return false
+    })
+
+    await #expect(throws: (any Error).self) {
+        try await server.start()
+    }
+    #expect(probeCalls.value == 1)
+}

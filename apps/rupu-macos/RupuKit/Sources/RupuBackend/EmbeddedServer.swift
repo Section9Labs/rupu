@@ -37,7 +37,7 @@ public actor EmbeddedServer {
     public func start() async throws -> Origin {
         if let origin { return origin }
 
-        if await probe(probeURL) {
+        if await isAlreadyRunning() {
             origin = .attached
             return .attached
         }
@@ -51,6 +51,56 @@ public actor EmbeddedServer {
         let result = Origin.spawned(pid: pid)
         origin = result
         return result
+    }
+
+    /// Fast cold start (perf & interaction arc, Plan 5 Task 2): races the
+    /// injected `probe` against a short 300ms deadline before falling back
+    /// to just awaiting it out for as long as its own (much longer — 3s in
+    /// production, `BackendController.defaultEmbeddedProbe`) timeout
+    /// allows. The overwhelmingly common case — a `cp serve` already
+    /// listening, whether attached from an earlier app launch or started
+    /// manually — answers in single-digit milliseconds on loopback, so this
+    /// resolves `start()` far faster than always paying the probe's full
+    /// timeout before ever getting an answer.
+    ///
+    /// **Never a second, redundant probe call**: `probe(probeURL)` is
+    /// invoked exactly once, as an unstructured `Task` (`probeTask`) created
+    /// OUTSIDE the racing `withTaskGroup` below — the race only decides
+    /// which of "the probe answered" or "300ms elapsed" to act on FIRST; if
+    /// the deadline wins, this falls through to simply awaiting
+    /// `probeTask.value` (the SAME in-flight call, still running), never
+    /// starting a fresh one. This is what keeps a server that's merely slow
+    /// to answer (as opposed to genuinely absent, which fails fast with a
+    /// loopback connection refusal) from being misclassified as needing a
+    /// spawn — the probe still gets its full timeout to answer, just not
+    /// on this call's own critical path once 300ms have passed.
+    ///
+    /// `group.cancelAll()` below only cancels the race's own two child
+    /// tasks (the wrapper awaiting `probeTask` and the sleep) — `probeTask`
+    /// itself is a sibling `Task`, not a structured child of the group, so
+    /// cancelling the group's race can never cancel the real probe still
+    /// running in the background.
+    private func isAlreadyRunning() async -> Bool {
+        let probeTask = Task { await probe(probeURL) }
+
+        enum RaceOutcome { case answered(Bool), deadlineElapsed }
+        let outcome = await withTaskGroup(of: RaceOutcome.self) { group -> RaceOutcome in
+            group.addTask { .answered(await probeTask.value) }
+            group.addTask {
+                try? await Task.sleep(for: .milliseconds(300))
+                return .deadlineElapsed
+            }
+            let first = await group.next() ?? .deadlineElapsed
+            group.cancelAll()
+            return first
+        }
+
+        switch outcome {
+        case .answered(let ok):
+            return ok
+        case .deadlineElapsed:
+            return await probeTask.value
+        }
     }
 
     public func stop(keepRunning: Bool) {

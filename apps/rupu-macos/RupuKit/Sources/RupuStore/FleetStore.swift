@@ -11,7 +11,27 @@ import RupuAPI
 /// concurrently by `activate()`/the reconcile loop below, and — same
 /// per-block-independence contract every other multi-block detail store in
 /// this module (`ProjectDetailStore`'s tabs) already follows — one block
-/// failing never blanks the other.
+/// failing never blanks the other. Concretely: `workers` (a fast, local
+/// call — see the audit note below) is never blocked by `hosts` (which live-
+/// probes every registered remote host and can be slow with one offline —
+/// `list_hosts`'s own doc comment, `crates/rupu-cp/src/api/hosts.rs`), since
+/// `reconcile(includeWorkers:)` below fires both via `async let`, not a
+/// sequential await.
+///
+/// **Audited, not converted, for local-first (perf & interaction arc, Plan
+/// 5 Task 2)**: `workers` was on that task's list of fetches suspected of
+/// blocking first paint on a fleet-wide fan-out. Verified against
+/// `list_workers` (`crates/rupu-cp/src/api/workers.rs`): no `Query`
+/// extractor at all, reads a local `WorkerStore` off `s.global_dir` — a
+/// worker record only ever lives on the host that registered it (see
+/// `CPClient.workers()`'s own doc comment), with no host-fan-out mechanism
+/// server-side to converge multiple hosts' workers into one list. There is
+/// no per-host progressive merge to build for `workers` here; the ACTUAL
+/// fan-out cost in this screen is `hosts`'s own live probe, which is
+/// already fired concurrently with (never blocking) `workers` — see the
+/// paragraph above. Converting `workers` itself would mean fabricating a
+/// `host` param the server ignores, which the task brief explicitly
+/// forbids. Left unchanged.
 ///
 /// **60s reconcile loop**: `activate()` performs an immediate load (so the
 /// screen never sits on a blank grid for up to 60s on first appearance —

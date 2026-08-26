@@ -567,9 +567,11 @@ struct DashboardStoreTests {
         // actor is starved and the assertions then fail on a store that
         // behaved correctly. "mini"'s response is now held until they have
         // been made. (Safe to hold inline here — `refetchAll` fetches
-        // `/api/hosts` and "local" BEFORE dispatching any remote host's
-        // request, so nothing else is waiting on this stub's shared queue
-        // while the gate is closed.)
+        // `"local"` and THEN `/api/hosts` before dispatching any remote
+        // host's request (Task 2's local-first reordering — see
+        // `activateNeverWaitsOnASlowGetApiHostsBeforePaintingLocal` right
+        // below for the ordering itself), so nothing else is waiting on
+        // this stub's shared queue while the gate is closed.)
         let miniGate = DispatchSemaphore(value: 0)
         let (store, box) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
@@ -588,9 +590,15 @@ struct DashboardStoreTests {
         await store.activate(range: .d7)
 
         // Local truth already showing; the gated remote host hasn't been
-        // waited on at all.
+        // waited on at all — `activate(range:)` itself returns as soon as
+        // `"local"` lands, with fleet discovery (and therefore "mini" even
+        // being *seeded* into `hostStates`) running fully in the
+        // background, per Task 2's fix. Whether "mini" has been discovered
+        // yet by this exact point is a race this test doesn't need to pin
+        // down; only that it can never be `.ok` yet (the gate is provably
+        // still closed).
         #expect(store.merged?.fleet.workers == 1)
-        #expect(store.hostStates.first(where: { $0.id == "mini" })?.state == .loading)
+        #expect(store.hostStates.first(where: { $0.id == "mini" })?.state != .ok(capturedAt: "2026-08-20T09:00:00Z"))
 
         // Only now let the remote host answer.
         miniGate.signal()
@@ -604,6 +612,44 @@ struct DashboardStoreTests {
         // The oldest capturedAt (mini's) wins.
         #expect(store.merged?.capturedAt == "2026-08-20T09:00:00Z")
         #expect(store.pageError == nil)
+
+        store.deactivate()
+        box.latest.finish()
+        await drainAfterDeactivate()
+    }
+
+    // (a2) perf & interaction arc, Plan 5 Task 2: `refetchAll` fetches
+    // `"local"` BEFORE ever calling `GET /api/hosts` — that endpoint itself
+    // live-probes every registered remote host (`list_hosts` in
+    // `crates/rupu-cp/src/api/hosts.rs`) and can be slow with an offline
+    // node registered, which used to block `merged` from showing ANYTHING
+    // (not even local truth) until the whole probe round finished. Gate
+    // `/api/hosts` itself here (not `/api/dashboard`) and prove local still
+    // paints while it's held.
+    @MainActor @Test func activateNeverWaitsOnASlowGetApiHostsBeforePaintingLocal() async {
+        let hostsGate = DispatchSemaphore(value: 0)
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                _ = hostsGate.wait(timeout: .now() + 10) // 10s caps a hung test only
+                return (200, Self.hostsJSON([("local", "online")]))
+            }
+            guard url.path == "/api/dashboard" else { return (200, Data("{}".utf8)) }
+            return (200, Self.dashboardJSON(hostID: "local", state: "ok", capturedAt: "2026-08-20T10:00:00Z", workers: 1))
+        }
+
+        await store.activate(range: .d7)
+
+        // Local truth already showing, even though `/api/hosts` is still
+        // gated closed — the whole point of the reordering.
+        #expect(store.merged?.fleet.workers == 1)
+        #expect(store.hostStates.first(where: { $0.id == "local" })?.state == .ok(capturedAt: "2026-08-20T10:00:00Z"))
+        #expect(store.pageError == nil)
+
+        hostsGate.signal()
+        await expectEventually("the gated /api/hosts call resolves and hostStates settles") {
+            store.hostStates.count == 1
+        }
 
         store.deactivate()
         box.latest.finish()
