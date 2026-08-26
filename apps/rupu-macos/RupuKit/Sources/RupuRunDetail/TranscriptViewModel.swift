@@ -56,11 +56,15 @@ import RupuAPI
 /// `tokens_in`/`tokens_out` — at the matching `turn_end`), falling back to
 /// "each `assistant_message` opens a synthetic turn" only when the
 /// transcript has NEITHER event at all. Tool-bearing events that arrive
-/// before any turn has been opened (rare: a transcript with turn events
-/// whose very first line isn't `turn_start`) fall into a single leading
-/// turn with a synthetic negative id, the same "leading turn with no
-/// assistant" shape the web's own `ensureTurn()` produces for pre-first-
-/// assistant tools.
+/// while no turn is currently open in turn-bounded mode — before the
+/// first `turn_start`, or in a second (or later) gap between one
+/// `turn_end` and the next `turn_start` — fall into a "gap" turn with a
+/// synthetic negative id, the same "leading turn with no assistant" shape
+/// the web's own `ensureTurn()` produces for pre-first-assistant tools.
+/// Each gap gets its OWN id (-1, -2, -3, ...) via a decrementing counter,
+/// never a fixed `-1` reused across gaps — a review fix: a shared
+/// sentinel produced duplicate ids across two non-adjacent gaps, which
+/// breaks SwiftUI `ForEach` identity on the `Identifiable` result array.
 ///
 /// Excluded from `TurnVM` entirely (per the task brief): `assistant_delta`
 /// (the turn's consolidated `assistant_message` already carries the same
@@ -263,13 +267,22 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
     var current: TurnBuilder?
     var nextSyntheticID = 0
     var standaloneAuditCounter = 0
+    // Decrementing counter for "gap" turns — content (a standalone audit,
+    // an orphan tool_result, a stray tool_call) that arrives while no turn
+    // is open: before the first turn_start, or in a SECOND (or later) gap
+    // between one turn_end and the next turn_start. A fixed `-1` sentinel
+    // here previously collided across multiple gaps (review fix: two
+    // non-adjacent gaps both produced `id == -1`, a duplicate id in the
+    // `Identifiable` result array that breaks SwiftUI ForEach identity).
+    // Each NEW gap turn now takes the next id down (-1, -2, -3, ...),
+    // guaranteed distinct from every other gap turn and from any real
+    // (>= 0) turn_idx.
+    var nextGapID = -1
 
     func ensureTurn() -> TurnBuilder {
         if let current { return current }
-        // A leading turn for content that arrives before any turn has been
-        // opened — negative ids never collide with a real (>= 0) turn_idx
-        // or with the synthetic-mode counter below.
-        let t = TurnBuilder(id: -1)
+        let t = TurnBuilder(id: nextGapID)
+        nextGapID -= 1
         turns.append(t)
         current = t
         return t

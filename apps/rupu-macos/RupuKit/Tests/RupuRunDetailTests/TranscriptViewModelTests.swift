@@ -275,6 +275,37 @@ struct TranscriptViewModelTests {
         #expect(turns[1].tokensOut == 5)
     }
 
+    /// Review fix (Critical): two non-adjacent gaps — content arriving
+    /// while no turn is open — must never collide on the same synthesized
+    /// id. Exact repro from the review: `turnStart(0)…turnEnd(0)`, a
+    /// standalone tool_audit (gap 1), `turnStart(1)…turnEnd(1)`, a second
+    /// standalone tool_audit (gap 2) -> `[id:0, id:<gap1>, id:1,
+    /// id:<gap2>]`, where a fixed `-1` sentinel previously produced
+    /// `[id:0, id:-1, id:1, id:-1]` — a duplicate id in the `Identifiable`
+    /// result array, which breaks SwiftUI `ForEach` identity/diffing.
+    @Test func twoNonAdjacentGapTurnsGetDistinctIdsAndAllIdsInTheResultAreUnique() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .turnEnd(turnIdx: 0, tokensIn: 1, tokensOut: 1),
+            .toolAudit(tool: "notify_slack", declared: true, granted: true, blocked: false, restricted: true),
+            .turnStart(turnIdx: 1),
+            .turnEnd(turnIdx: 1, tokensIn: 2, tokensOut: 2),
+            .toolAudit(tool: "notify_email", declared: true, granted: true, blocked: false, restricted: true),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns.count == 4)
+        #expect(turns[0].id == 0)
+        #expect(turns[1].id < 0, "the first gap turn (after turn 0's turn_end) must be a negative synthesized id")
+        #expect(turns[2].id == 1)
+        #expect(turns[3].id < 0, "the second gap turn (after turn 1's turn_end) must also be a negative synthesized id")
+        #expect(turns[1].id != turns[3].id, "the two gap turns must NOT collide on the same id")
+
+        let allIDs = turns.map(\.id)
+        #expect(Set(allIDs).count == allIDs.count, "every TurnVM in the result must have a unique id — duplicates break SwiftUI ForEach identity")
+    }
+
     // MARK: - finding/error counts
 
     @Test func findingCountAndHasErrorAreDerivedFromTheTurnsTools() {
