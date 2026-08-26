@@ -216,13 +216,27 @@ public struct OverviewScreen: View {
 
     @AppStorage(OverviewWidgets.storageKey) private var widgetsData: Data = Data()
 
+    /// Decode-cached mirror of `widgetsData` (Task 0 perf fix): the old
+    /// `widgets` computed property re-ran `JSONDecoder` on every access —
+    /// ~9× per `body` pass. `widgetsData` (the `@AppStorage`, which is also
+    /// what `ShellToolbar`'s own `@AppStorage(OverviewWidgets.storageKey)`
+    /// writes through — same key, so `UserDefaults`/`@AppStorage` itself
+    /// carries that external write here) stays the single source of truth;
+    /// this `@State` is just a cached decode of it, refreshed by
+    /// `.onChange(of: widgetsData)` below. Seeded from `UserDefaults`
+    /// directly in `init` (via the existing `OverviewWidgets.load(defaults:)`
+    /// seam — review round 1 caught that seeding only in `.onAppear` let the
+    /// very first `body` render for a returning operator flash the
+    /// all-default `OverviewWidgets()` for one frame before `onAppear`
+    /// corrected it); `.onAppear`/`.onChange` stay as the ongoing sync path
+    /// for later writes (this screen's own re-appearance, or `ShellToolbar`'s
+    /// Customize menu writing the same key from elsewhere).
+    @State private var widgets: OverviewWidgets
+
     public init(model: AppModel, backend: BackendController) {
         self.model = model
         self.backend = backend
-    }
-
-    private var widgets: OverviewWidgets {
-        OverviewWidgets.decode(widgetsData)
+        _widgets = State(initialValue: OverviewWidgets.load(defaults: .standard))
     }
 
     public var body: some View {
@@ -235,6 +249,10 @@ public struct OverviewScreen: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color.rupuBg)
+        .onAppear { widgets = OverviewWidgets.decode(widgetsData) }
+        .onChange(of: widgetsData) { _, newValue in
+            widgets = OverviewWidgets.decode(newValue)
+        }
         .task {
             await activate()
         }

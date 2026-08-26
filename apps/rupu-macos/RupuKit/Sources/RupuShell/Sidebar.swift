@@ -96,9 +96,41 @@ struct Sidebar: View {
     /// route) until the operator actually clicks a chevron.
     @AppStorage(SidebarGroups.storageKey) private var groupsData: Data = Data()
 
-    private var groups: SidebarGroups { SidebarGroups.decode(groupsData) }
+    /// Decode-cached mirror of `groupsData` (Task 0 perf fix): the old
+    /// `groups` computed property re-ran `JSONDecoder` on every access — 4×+
+    /// per `body` pass, and `body` re-evaluates on every hover change (every
+    /// row's `onHover`). `groupsData` (the `@AppStorage`) stays the single
+    /// source of truth and the only thing anyone writes to; this `@State`
+    /// is just a cached decode of it, kept in sync by `.onChange(of:
+    /// groupsData)` below. Seeded from `UserDefaults` directly in `init`
+    /// (review round 1 caught that seeding only in `.onAppear` let the very
+    /// first `body` render for a returning operator flash the all-unset
+    /// `SidebarGroups()` — every group's `defaultOpen` fallback, not
+    /// whatever the operator last explicitly toggled — for one frame before
+    /// `onAppear` corrected it); `.onAppear`/`.onChange` stay as the ongoing
+    /// sync path for later writes.
+    @State private var groups: SidebarGroups
+
+    /// Only reason this `init` exists at all: to seed `groups` from
+    /// `UserDefaults` ahead of the first `body` render. Reads the raw key
+    /// directly (`SidebarGroups.storageKey`, the exact string
+    /// `@AppStorage(SidebarGroups.storageKey) private var groupsData` above
+    /// also resolves to) rather than through `groupsData` — `@AppStorage`'s
+    /// backing storage isn't guaranteed set up yet at this point in `init`,
+    /// same reasoning `OverviewScreen.init` uses `OverviewWidgets.load(
+    /// defaults:)` instead of reading its own `@AppStorage` property.
+    /// `model`/`hostsFooter` are otherwise assigned exactly as the
+    /// compiler-synthesized memberwise init would have.
+    init(model: AppModel, hostsFooter: HostsFooterStore) {
+        self.model = model
+        self.hostsFooter = hostsFooter
+        let persisted = UserDefaults.standard.data(forKey: SidebarGroups.storageKey) ?? Data()
+        _groups = State(initialValue: SidebarGroups.decode(persisted))
+    }
 
     var body: some View {
+        // RenderMeter seam (Plan 5, Task 1) — one line, safe to delete.
+        let _ = RenderMeter.tick("Sidebar")
         VStack(alignment: .leading, spacing: 0) {
             brandHeader
             nav
@@ -111,6 +143,10 @@ struct Sidebar: View {
         .frame(width: 204)
         .background(Color.rupuPanel)
         .overlay(alignment: .trailing) { Color.rupuBorder.frame(width: 1) }
+        .onAppear { groups = SidebarGroups.decode(groupsData) }
+        .onChange(of: groupsData) { _, newValue in
+            groups = SidebarGroups.decode(newValue)
+        }
     }
 
     /// App-name header row — height 48, bottom border, same row rhythm as
@@ -289,8 +325,31 @@ struct Sidebar: View {
     /// showing, unlike `.activity`'s own `lastActivityRoute` restore).
     /// Clicking the label never changes `expanded` either way — "parent row
     /// click navigates to the default tab AND keeps its expand state."
+    ///
+    /// Task 0 hit-testing fix (audit #6): the old version put the row's
+    /// `.background(...)`/`.clipShape(...)` on the OUTER `HStack`, outside
+    /// both `Button`s — a `.plain`-styled button hit-tests only its own
+    /// label content, so neither button's tap target ever included that
+    /// background, and the chevron's label (a *stroked*, unfilled `Icon`
+    /// inside an empty `.frame`) drew almost no content at all, leaving a
+    /// ~1pt-wide clickable sliver. Fix: give each button its OWN background
+    /// fill + `.contentShape(Rectangle())` inside its label (the `railRow`/
+    /// `childRow` pattern), so each button's tap target is its own declared
+    /// frame regardless of what's actually painted there. The single visual
+    /// pill both buttons used to share is preserved by splitting the
+    /// rounded corners across the two labels (leading corners on the
+    /// chevron, trailing corners on the nav label) rather than rounding all
+    /// four corners of each — from the outside this still reads as one
+    /// continuous rounded row, just as before.
     private func groupParentRow(_ item: SidebarItem, fullActive: Bool, tinted: Bool, expanded: Bool) -> some View {
         let key = AnyHashable(item)
+        let rowBackground = fullActive ? Color.rupuSurface : hovered == key ? Color.rupuSurfaceHover : Color.clear
+        let leadingCorners = UnevenRoundedRectangle(
+            topLeadingRadius: 5, bottomLeadingRadius: 5, bottomTrailingRadius: 0, topTrailingRadius: 0
+        )
+        let trailingCorners = UnevenRoundedRectangle(
+            topLeadingRadius: 0, bottomLeadingRadius: 0, bottomTrailingRadius: 5, topTrailingRadius: 5
+        )
         return HStack(spacing: 0) {
             Button {
                 var next = groups
@@ -300,7 +359,13 @@ struct Sidebar: View {
                 Icon(.chevronDown, size: 10, weight: 2.5)
                     .foregroundStyle(Color.rupuMute)
                     .rotationEffect(.degrees(expanded ? 0 : -90))
-                    .frame(width: 16, height: 30)
+                    .frame(width: 24, height: 30)
+                    .background(rowBackground)
+                    .overlay(alignment: .leading) {
+                        if fullActive { Color.rupuBrand.frame(width: 2) }
+                    }
+                    .clipShape(leadingCorners)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -308,14 +373,12 @@ struct Sidebar: View {
                 model.selectedSidebarItem = item
             } label: {
                 railLabel(title(for: item), icon: icon(for: item), active: fullActive, tinted: tinted)
+                    .background(rowBackground)
+                    .clipShape(trailingCorners)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
         }
-        .background(fullActive ? Color.rupuSurface : hovered == key ? Color.rupuSurfaceHover : .clear)
-        .overlay(alignment: .leading) {
-            if fullActive { Color.rupuBrand.frame(width: 2) }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 5))
         .onHover { hovered = $0 ? key : (hovered == key ? nil : hovered) }
     }
 

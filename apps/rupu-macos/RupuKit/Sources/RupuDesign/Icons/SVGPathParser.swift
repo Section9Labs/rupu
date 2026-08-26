@@ -6,8 +6,13 @@ import CoreGraphics
 ///
 /// `SVGPath` is deliberately the only public surface — the intermediate drawing-op representation
 /// stays internal so `cgPath(in:viewBox:)` is the one thing callers (and tests) go through.
-public struct SVGPath {
-    enum DrawOp {
+///
+/// `Sendable`: every stored value (`DrawOp`'s `CGPoint` payloads) is itself `Sendable`, and this
+/// conformance is what lets `Icon.swift`'s `IconShape.parsedPaths` cache a `[LucideIcon:
+/// [SVGPath]]` table as a plain `static let` — without it, Swift 6 treats that dictionary as
+/// non-concurrency-safe global mutable state.
+public struct SVGPath: Sendable {
+    enum DrawOp: Sendable {
         case moveTo(CGPoint)
         case lineTo(CGPoint)
         case curveTo(CGPoint, CGPoint, CGPoint)

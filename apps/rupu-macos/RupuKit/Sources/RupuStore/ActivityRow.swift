@@ -267,21 +267,13 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
     /// Parses an RFC3339 timestamp with or without fractional seconds
     /// (server payloads use both — e.g. plain-second `started_at` fields
     /// vs. millisecond-precision transcript/event timestamps): tries the
-    /// fractional-seconds formatter first, falling back to the plain one.
+    /// fractional-seconds form first, falling back to the plain one.
     ///
-    /// Builds a fresh `ISO8601DateFormatter` per call rather than caching
-    /// one in a `static let`: `ISO8601DateFormatter` isn't `Sendable`, so a
-    /// shared static instance trips Swift 6's mutable-global-state check
-    /// on this `Sendable` struct; a formatter is cheap enough to construct
-    /// that this isn't a meaningful hot path either way.
+    /// Delegates to `RupuAPI.ISO8601Parsing` — the shared, allocation-free (`static let`
+    /// `Date.ISO8601FormatStyle`) home for this exact fractional-then-plain fallback, now reused
+    /// by every site in the app that used to build its own fresh, per-call
+    /// `ISO8601DateFormatter` pair (see that type's doc comment for the full list and rationale).
     public static func parseISO(_ s: String?) -> Date? {
-        guard let s else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: s) { return date }
-
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: s)
+        ISO8601Parsing.parse(s)
     }
 }

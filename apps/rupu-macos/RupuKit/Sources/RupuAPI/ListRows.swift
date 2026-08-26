@@ -1,5 +1,39 @@
 import Foundation
 
+/// Shared RFC-3339 timestamp parsing for every list-row/usage/event surface in the app.
+///
+/// `RupuAPI` is the one module every duplicated-parser site already depends on (`RupuStore`,
+/// `RupuUsageKit`, and `RupuSituation` all sit downstream of it — see `Package.swift`), so it's
+/// the natural shared home: `ActivityRow.parseISO` (`RupuStore`), `UsageAggregation`'s
+/// `parseUsageTimestamp` (`RupuUsageKit`), `UsageStore`'s `rfc3339` (`RupuStore`), and
+/// `StreamCards`' `rfc3339ToMS` (`RupuSituation`) each used to build their own fresh
+/// `ISO8601DateFormatter` pair (fractional-then-plain fallback) per call — `ISO8601DateFormatter`
+/// is a mutable, non-`Sendable` class, so none of those sites could cache one as a `static let`
+/// under Swift 6 without an `unsafe` opt-out.
+///
+/// `Date.ISO8601FormatStyle` sidesteps that: it's a `Sendable` value type (a plain struct of
+/// configuration flags), so these two format styles are built exactly once, ever, and every parse
+/// call is just `try? style.parse(_:)` — no per-call allocation, no actor-isolation workaround
+/// needed.
+public enum ISO8601Parsing {
+    /// RFC-3339 with fractional seconds (`2026-08-25T12:34:56.789Z`) — the precision most
+    /// transcript/event timestamps use.
+    public static let fractional = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+
+    /// RFC-3339 without fractional seconds (`2026-08-25T12:34:56Z`) — the precision most
+    /// `started_at`/`created_at` REST fields use.
+    public static let plain = Date.ISO8601FormatStyle(includingFractionalSeconds: false)
+
+    /// Parses `s` as RFC-3339, trying the fractional-seconds form first and falling back to the
+    /// plain form (server payloads use both). Returns `nil` for `nil` input or a string matching
+    /// neither form.
+    public static func parse(_ s: String?) -> Date? {
+        guard let s else { return nil }
+        if let date = try? fractional.parse(s) { return date }
+        return try? plain.parse(s)
+    }
+}
+
 /// Shared usage-summary shape embedded in every list-row endpoint
 /// (`UsageSummary` on the Rust side): `{input_tokens, output_tokens,
 /// cached_tokens, total_tokens, cost_usd?, priced, runs}`.

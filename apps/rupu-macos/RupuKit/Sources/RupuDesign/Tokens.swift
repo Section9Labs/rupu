@@ -125,7 +125,9 @@ public enum ChromeShape {
 }
 
 public extension Color {
-    static func status(_ tone: StatusTone) -> Color {
+    /// The per-tone RGB pairs, unchanged from the original `switch` — split out so it can be
+    /// called once per tone (below) instead of once per `status(_:)` call.
+    private static func computeStatusColor(_ tone: StatusTone) -> Color {
         switch tone {
         case .running: dynamicColor((59, 130, 246), (96, 165, 250))
         case .done: dynamicColor((34, 197, 94), (74, 222, 128))
@@ -139,22 +141,47 @@ public extension Color {
         }
     }
 
+    /// Precomputed once, at first access, over all 9 `StatusTone` cases — `status(_:)` used to
+    /// call `dynamicColor(...)` (a fresh `NSColor`-backed `Color` wrapper) on every invocation;
+    /// this builds each tone's color exactly once and every subsequent lookup is a dictionary
+    /// read. `statusPillBackground`/`Ring`/`Ink` below are themselves derived from this table
+    /// rather than re-invoking `status(_:)`, so a status pill render touches no allocation beyond
+    /// the dictionary lookups.
+    private static let statusColorTable: [StatusTone: Color] =
+        Dictionary(uniqueKeysWithValues: StatusTone.allCases.map { ($0, computeStatusColor($0)) })
+
+    static func status(_ tone: StatusTone) -> Color {
+        statusColorTable[tone] ?? computeStatusColor(tone)
+    }
+
     /// `StatusPill`'s background per web's `pillClass` policy
     /// (`crates/rupu-cp/web/src/lib/status.ts`): the three flat tones
     /// (`StatusTone.isFlatPill`) get `bg-surface` → `rupuSurface`; every
     /// other tone keeps a 12%-opacity fill of its own status color (this
     /// design's own fill step, ported from web's `/10` Tailwind opacity —
     /// see `StatusPill.swift`'s doc comment).
+    private static let pillBackgroundTable: [StatusTone: Color] = Dictionary(
+        uniqueKeysWithValues: StatusTone.allCases.map { tone in
+            (tone, tone.isFlatPill ? Color.rupuSurface : (statusColorTable[tone] ?? computeStatusColor(tone)).opacity(0.12))
+        }
+    )
+
     static func statusPillBackground(_ tone: StatusTone) -> Color {
-        tone.isFlatPill ? .rupuSurface : Color.status(tone).opacity(0.12)
+        pillBackgroundTable[tone] ?? (tone.isFlatPill ? .rupuSurface : Color.status(tone).opacity(0.12))
     }
 
     /// `StatusPill`'s ring stroke color, same flat/tinted split as
     /// `statusPillBackground` — flat tones get `ring-border` → `rupuBorder`
     /// at full opacity; tinted tones keep the status color at 30% (web's
     /// `ring-status-x/30`).
+    private static let pillRingTable: [StatusTone: Color] = Dictionary(
+        uniqueKeysWithValues: StatusTone.allCases.map { tone in
+            (tone, tone.isFlatPill ? Color.rupuBorder : (statusColorTable[tone] ?? computeStatusColor(tone)).opacity(0.3))
+        }
+    )
+
     static func statusPillRing(_ tone: StatusTone) -> Color {
-        tone.isFlatPill ? .rupuBorder : Color.status(tone).opacity(0.3)
+        pillRingTable[tone] ?? (tone.isFlatPill ? .rupuBorder : Color.status(tone).opacity(0.3))
     }
 
     /// `StatusPill`'s icon/label ink color. Web's flat pills use
@@ -162,15 +189,22 @@ public extension Color {
     /// but `text-ink-mute` for `skipped` (`status.ts:129-135`) — a
     /// deliberately dimmer step for the least-consequential terminal state.
     /// Tinted tones render in their own status color, same as today.
-    static func statusPillInk(_ tone: StatusTone) -> Color {
+    private static func computePillInk(_ tone: StatusTone) -> Color {
         switch tone {
         case .skipped: .rupuMute
         case .pending, .cancelled: .rupuDim
-        default: Color.status(tone)
+        default: statusColorTable[tone] ?? computeStatusColor(tone)
         }
     }
 
-    static func severity(_ s: Severity) -> Color {
+    private static let pillInkTable: [StatusTone: Color] =
+        Dictionary(uniqueKeysWithValues: StatusTone.allCases.map { ($0, computePillInk($0)) })
+
+    static func statusPillInk(_ tone: StatusTone) -> Color {
+        pillInkTable[tone] ?? computePillInk(tone)
+    }
+
+    private static func computeSeverityColor(_ s: Severity) -> Color {
         switch s {
         case .crit: dynamicColor((147, 51, 234), (168, 85, 247))
         case .high: dynamicColor((220, 38, 38), (248, 113, 113))
@@ -180,7 +214,14 @@ public extension Color {
         }
     }
 
-    static func severityBg(_ s: Severity) -> Color {
+    private static let severityColorTable: [Severity: Color] =
+        Dictionary(uniqueKeysWithValues: Severity.allCases.map { ($0, computeSeverityColor($0)) })
+
+    static func severity(_ s: Severity) -> Color {
+        severityColorTable[s] ?? computeSeverityColor(s)
+    }
+
+    private static func computeSeverityBgColor(_ s: Severity) -> Color {
         switch s {
         case .crit: dynamicColor((250, 245, 255), (42, 28, 56))
         case .high: dynamicColor((254, 242, 242), (48, 24, 24))
@@ -188,6 +229,13 @@ public extension Color {
         case .low: dynamicColor((254, 252, 232), (46, 40, 16))
         case .info: dynamicColor((248, 250, 252), (30, 31, 35))
         }
+    }
+
+    private static let severityBgColorTable: [Severity: Color] =
+        Dictionary(uniqueKeysWithValues: Severity.allCases.map { ($0, computeSeverityBgColor($0)) })
+
+    static func severityBg(_ s: Severity) -> Color {
+        severityBgColorTable[s] ?? computeSeverityBgColor(s)
     }
 }
 

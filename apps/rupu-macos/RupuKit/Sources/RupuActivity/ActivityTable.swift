@@ -49,6 +49,8 @@ struct ActivityTable: View {
     }
 
     var body: some View {
+        // RenderMeter seam (Plan 5, Task 1) — one line, safe to delete.
+        let _ = RenderMeter.tick("ActivityTable")
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()

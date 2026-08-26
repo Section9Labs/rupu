@@ -77,6 +77,8 @@ public struct TranscriptFeed: View {
     }
 
     public var body: some View {
+        // RenderMeter seam (Plan 5, Task 1) — one line, safe to delete.
+        let _ = RenderMeter.tick("TranscriptFeed")
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {

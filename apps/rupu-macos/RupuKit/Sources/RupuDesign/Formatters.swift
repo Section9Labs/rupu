@@ -2,15 +2,25 @@ import Foundation
 
 /// Null-discipline formatters shared across the macOS app's read surfaces.
 public enum Fmt {
+    /// Shared `NumberFormatter` for `count`/`partial`. `Fmt.count`/`Fmt.cost` used to allocate and
+    /// configure a fresh `NumberFormatter` on every call — a hot path across 174+ table/pill call
+    /// sites. Foundation's `NumberFormatter` is `Sendable` (`@unchecked`, since it's a mutable
+    /// class — but safe here because this instance's configuration is set once below and never
+    /// mutated again, and `NumberFormatter.string(from:)` doesn't mutate that configuration; every
+    /// call site is also a SwiftUI view body, i.e. `@MainActor`-confined, on top of that).
+    private static let countFormatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.usesGroupingSeparator = true
+        f.groupingSeparator = ","
+        f.decimalSeparator = "."
+        return f
+    }()
+
     /// Renders `nil` as an em dash and otherwise as a grouped integer (e.g. `1,234`).
     public static func count(_ n: Int?) -> String {
         guard let n else { return "—" }
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.usesGroupingSeparator = true
-        formatter.groupingSeparator = ","
-        formatter.decimalSeparator = "."
-        return formatter.string(from: NSNumber(value: n)) ?? String(n)
+        return countFormatter.string(from: NSNumber(value: n)) ?? String(n)
     }
 
     /// Marks a possibly-incomplete sum with a trailing `+` when the underlying data is partial.
@@ -30,6 +40,22 @@ public enum Fmt {
     /// `deciseconds` and `totalSeconds` are each rounded independently from `ms` — not chained
     /// through one another — so a value near the 1h boundary doesn't pick up a second helping of
     /// rounding error from an intermediate decisecond rounding it never needed.
+
+    /// Shared `en_US_POSIX`-pinned `NumberFormatter` for `cost`. Same rationale as
+    /// `countFormatter` above for why a shared instance is safe: configuration (including the
+    /// locale, which is the whole reason `cost` doesn't render `,` decimals under EU locales) is
+    /// set once below and never mutated again.
+    private static let costFormatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.numberStyle = .decimal
+        f.minimumFractionDigits = 2
+        f.maximumFractionDigits = 2
+        f.decimalSeparator = "."
+        f.usesGroupingSeparator = false
+        return f
+    }()
+
     /// Renders `nil` as an em dash and otherwise a fixed-point USD amount
     /// (`"$0.12"`, `"$12.50"`). Locale-independent by construction: a plain
     /// `String(format: "$%.2f", ...)` (or a `NumberFormatter` left on the
@@ -41,14 +67,7 @@ public enum Fmt {
     /// rather than depending on `%f`'s own locale sensitivity.
     public static func cost(_ usd: Double?) -> String {
         guard let usd else { return "—" }
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.numberStyle = .decimal
-        formatter.minimumFractionDigits = 2
-        formatter.maximumFractionDigits = 2
-        formatter.decimalSeparator = "."
-        formatter.usesGroupingSeparator = false
-        let digits = formatter.string(from: NSNumber(value: usd)) ?? String(format: "%.2f", usd)
+        let digits = costFormatter.string(from: NSNumber(value: usd)) ?? String(format: "%.2f", usd)
         return "$\(digits)"
     }
 

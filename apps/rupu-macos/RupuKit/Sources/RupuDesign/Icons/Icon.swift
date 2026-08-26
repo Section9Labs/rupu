@@ -82,12 +82,38 @@ public struct Icon: View {
 private struct IconShape: Shape {
     let icon: LucideIcon
 
+    /// Every icon's path strings, parsed exactly once. `SVGPath(d:)` is a full character-scan
+    /// parse; `path(in:)` used to re-run it for every path string on every `body` evaluation
+    /// (every icon, every render). Swift's `static let` initializer runs at most once and is
+    /// thread-safe, so this builds the whole table in one pass over `LucideIcon.allCases` at
+    /// first access and every subsequent `path(in:)` call is a dictionary lookup + `cgPath`
+    /// scale — zero string parsing per render.
+    ///
+    /// `fileprivate` (not `private`) so `cachedSVGPaths(for:)` below — a narrow, file-scoped test
+    /// seam — can read it without making the cache genuinely public API.
+    fileprivate static let parsedPaths: [LucideIcon: [SVGPath]] = {
+        var table: [LucideIcon: [SVGPath]] = [:]
+        table.reserveCapacity(LucideIcon.allCases.count)
+        for icon in LucideIcon.allCases {
+            table[icon] = LucideIconData.paths(for: icon).compactMap { SVGPath(d: $0) }
+        }
+        return table
+    }()
+
     func path(in rect: CGRect) -> Path {
         let combined = CGMutablePath()
-        for d in LucideIconData.paths(for: icon) {
-            guard let svgPath = SVGPath(d: d) else { continue }
+        for svgPath in IconShape.parsedPaths[icon] ?? [] {
             combined.addPath(svgPath.cgPath(in: rect, viewBox: 24))
         }
         return Path(combined)
     }
+}
+
+/// Test-only seam (Plan 5, Task 1 — allocation-storm fixes): exposes `IconShape`'s cached,
+/// already-parsed `SVGPath`s for `icon` so `RupuDesignTests` can assert the cache produces
+/// output identical to a fresh `SVGPath(d:)` parse, without promoting `IconShape` (a SwiftUI
+/// `Shape` implementation detail) to public API. Internal visibility only — reachable from this
+/// package's own `@testable import`, not from outside `RupuKit`.
+func cachedSVGPaths(for icon: LucideIcon) -> [SVGPath] {
+    IconShape.parsedPaths[icon] ?? []
 }
