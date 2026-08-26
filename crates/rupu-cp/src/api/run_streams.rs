@@ -1264,6 +1264,66 @@ mod tests {
         check_fixture("autoflow_event_rows.json", &rows);
     }
 
+    /// Drift-locks `AutoflowCycleRow` — the macOS app's `APIAutoflowCycleRow`
+    /// (Swift) mirrors this shape for the Cycles sub-table (perf &
+    /// interaction arc, Plan 5 Task 4b). Same "private type, build it
+    /// directly in this file's own test module" precedent as
+    /// `agent_run_rows_fixture_is_current`/`autoflow_event_rows_fixture_is_current`
+    /// right above — `AutoflowCycleRow` is private to this module too, and
+    /// this test module already has `use super::*`, so there's no need to
+    /// fall back to a hand-typed `serde_json::json!` mirror the way
+    /// `tests/macos_fixtures.rs` has to for a type it can't reach at all.
+    ///
+    /// Two rows: one with every field populated (`worker_name`/`host_id`
+    /// present, non-empty `run_ids`, priced usage), one with the optional
+    /// fields absent (`worker_name: None`, no `host_id` at all — the
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` case — empty
+    /// `run_ids`, unpriced zero usage) — matching the two rows the Swift
+    /// side's `autoflow_cycle_rows.json` decode test
+    /// (`RupuAPITests/ListRowDecodingTests.swift`) already asserts against.
+    #[test]
+    fn autoflow_cycle_rows_fixture_is_current() {
+        let rows = vec![
+            AutoflowCycleRow {
+                cycle_id: "cycle-1".into(),
+                mode: "tick".into(),
+                worker_name: Some("worker-a".into()),
+                started_at: "2026-08-20T12:00:00Z".into(),
+                finished_at: "2026-08-20T12:05:00Z".into(),
+                workflow_count: 2,
+                ran_cycles: 2,
+                skipped_cycles: 0,
+                failed_cycles: 0,
+                run_ids: vec!["run-20".into(), "run-21".into()],
+                usage: crate::usage::UsageSummary {
+                    input_tokens: 400,
+                    output_tokens: 90,
+                    cached_tokens: 0,
+                    total_tokens: 490,
+                    cost_usd: Some(0.04),
+                    priced: true,
+                    runs: 2,
+                },
+                host_id: Some("local".into()),
+            },
+            AutoflowCycleRow {
+                cycle_id: "cycle-2".into(),
+                mode: "serve".into(),
+                worker_name: None,
+                started_at: "2026-08-20T13:00:00Z".into(),
+                finished_at: "2026-08-20T13:00:30Z".into(),
+                workflow_count: 1,
+                ran_cycles: 0,
+                skipped_cycles: 0,
+                failed_cycles: 1,
+                run_ids: vec![],
+                usage: crate::usage::UsageSummary::default(),
+                host_id: None,
+            },
+        ];
+        check_fixture("autoflow_cycle_rows.json", &rows);
+    }
+
     #[test]
     fn agent_lifecycle_classifies() {
         assert!(agent_in_lifecycle(Some("running"), Some("active")));

@@ -9,7 +9,10 @@
     "ran_cycles": 2,
     "skipped_cycles": 0,
     "failed_cycles": 0,
-    "run_ids": ["run-20", "run-21"],
+    "run_ids": [
+      "run-20",
+      "run-21"
+    ],
     "usage": {
       "input_tokens": 400,
       "output_tokens": 90,
