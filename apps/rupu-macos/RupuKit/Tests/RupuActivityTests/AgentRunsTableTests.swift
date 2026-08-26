@@ -65,4 +65,23 @@ struct AgentRunsTableTests {
         let r = row(status: .awaiting)
         expectText(AgentRunsTable.sortValue(r, .status), "Awaiting approval")
     }
+
+    // MARK: - Find (perf & interaction arc, Plan 5 Task 5) — web-parity fields:
+    // [r.agent, r.run_id, r.session_id, r.host_id]
+
+    @Test func matchesAgentNameRunIDAndHost() {
+        let r = row(id: "run-xyz", subject: "codegen-agent")
+        #expect(AgentRunsTable.matches(r, query: "codegen"))
+        #expect(AgentRunsTable.matches(r, query: "run-xyz"))
+        #expect(AgentRunsTable.matches(r, query: "local")) // host, always "local" from this row() helper
+        #expect(!AgentRunsTable.matches(r, query: "nope"))
+    }
+
+    @Test func matchesSessionIDOnlyWhenNavigationIsSession() {
+        let sessionRow = row(navigation: .session(id: "sess-abc12345"))
+        #expect(AgentRunsTable.matches(sessionRow, query: "abc12345"))
+
+        let standaloneRow = row(navigation: .agentRun(id: "run-1", transcriptPath: nil, host: nil))
+        #expect(!AgentRunsTable.matches(standaloneRow, query: "abc12345"))
+    }
 }

@@ -152,3 +152,205 @@ struct KindTableStatusCell: View {
         }
     }
 }
+
+// MARK: - Infinite scroll + Find (perf & interaction arc, Plan 5 Task 5)
+
+/// The compact Find text field every per-kind table renders above its list —
+/// client-side substring search over already-loaded rows (never a server
+/// round trip; the fields matched against are per-kind, see each table's own
+/// `matches(_:query:)`). Bound directly to the RAW query — debouncing into a
+/// second `debouncedQuery` (what the table actually filters by) is the
+/// caller's job via `.debouncedKindTableSearch(query:into:)` below, so the
+/// text field itself always feels instant to type into even though the
+/// filter it drives lags slightly behind.
+struct KindTableSearchField: View {
+    let placeholder: String
+    @Binding var query: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Icon(.search, size: 12)
+                .foregroundStyle(Color.rupuMute)
+            TextField(placeholder, text: $query)
+                .textFieldStyle(.plain)
+                .font(.uiText)
+                .foregroundStyle(Color.rupuInk)
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                } label: {
+                    Icon(.xCircle, size: 12)
+                        .foregroundStyle(Color.rupuMute)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color.rupuPanel)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.rupuBorder, lineWidth: 1))
+        .frame(maxWidth: 220)
+    }
+}
+
+/// Debounces `query` into `debouncedQuery` after a short pause in typing —
+/// `.task(id: query)` cancels its own prior debounce automatically whenever
+/// `query` changes again before the delay elapses (SwiftUI's standard
+/// `.task(id:)` contract), so this needs no manual timer bookkeeping. The
+/// filter itself is a cheap in-memory `Array.filter` over already-loaded
+/// rows — this debounce exists to avoid re-filtering/re-rendering the whole
+/// visible list on every keystroke of a fast typist, not because the filter
+/// is expensive.
+private struct KindTableSearchDebounce: ViewModifier {
+    let query: String
+    @Binding var debouncedQuery: String
+
+    func body(content: Content) -> some View {
+        content.task(id: query) {
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled else { return }
+            debouncedQuery = query
+        }
+    }
+}
+
+extension View {
+    func debouncedKindTableSearch(query: String, into debouncedQuery: Binding<String>) -> some View {
+        modifier(KindTableSearchDebounce(query: query, debouncedQuery: debouncedQuery))
+    }
+}
+
+/// The trailing sentinel/footer row every per-kind table (+ the Cycles
+/// sub-table) renders as its list's last row — ports the web's four honesty
+/// states verbatim (`pages/runs/*.tsx`, `Sessions.tsx`,
+/// `ProjectRunsTab.tsx`/`ProjectSessionsTab.tsx`):
+///   - a client-side Find query is active → "{n} matches of {m} loaded"
+///     (never competes with the loading/scroll states below — a narrowed
+///     view doesn't need "scroll for more" to keep making sense of the same
+///     honesty contract for a narrower slice; matches the web precedent,
+///     which also short-circuits to this state first)
+///   - otherwise: "loading more…" while a `loadMore()` fetch is in flight,
+///     "scroll for more" while more pages exist and none is in flight, or
+///     "— end of {m} —" once the source is exhausted.
+///
+/// `onAppear` fires `loadMore()` (guarded by `hasMore && !isLoadingMore`) —
+/// this row IS the scroll sentinel, exactly like the web's `<div
+/// ref={sentinelRef}>` doubles as its own footer text; a `List` naturally
+/// re-triggers `.onAppear` each time this row scrolls back into view (or is
+/// visible from the start on a short list), which is what drives paging.
+struct KindTableFooter: View {
+    let visibleCount: Int
+    let loadedCount: Int
+    let hasMore: Bool
+    let isLoadingMore: Bool
+    let isSearchActive: Bool
+    let onLoadMore: () -> Void
+
+    var body: some View {
+        Text(label)
+            .font(.noteText)
+            .foregroundStyle(Color.rupuMute)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .onAppear {
+                guard hasMore, !isLoadingMore else { return }
+                onLoadMore()
+            }
+    }
+
+    private var label: String {
+        if isSearchActive {
+            return "\(visibleCount) matches of \(loadedCount) loaded"
+        }
+        if isLoadingMore {
+            return "loading more…"
+        }
+        if hasMore {
+            return "scroll for more"
+        }
+        return "— end of \(loadedCount) —"
+    }
+}
+
+// MARK: - Custom date range (perf & interaction arc, Plan 5 Task 5)
+
+/// One optional date bound ("From" or "To") — a checkbox that toggles
+/// whether this bound is set at all, revealing a compact native `DatePicker`
+/// once it is. Plain SwiftUI has no first-class "optional date" control, and
+/// a bound that's merely blank-until-touched (rather than explicitly
+/// enabled/disabled) would leave no way to CLEAR it back to "no bound" once
+/// set — the checkbox is what makes "no filter" a reachable state again.
+private struct KindTableDateBound: View {
+    let label: String
+    let date: Date?
+    let onChange: (Date?) -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { date != nil },
+                set: { isOn in onChange(isOn ? (date ?? Date()) : nil) }
+            )) {
+                Text(label)
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuDim)
+            }
+            .toggleStyle(.checkbox)
+            .controlSize(.small)
+
+            if let date {
+                DatePicker(
+                    "",
+                    selection: Binding(get: { date }, set: onChange),
+                    displayedComponents: .date
+                )
+                .datePickerStyle(.field)
+                .labelsHidden()
+                .frame(width: 108)
+            }
+        }
+    }
+}
+
+/// The "From"/"To" custom date-range filter every per-kind table renders in
+/// its `FilterBar` — server-side (unlike the status chips alongside it):
+/// picking a date reaches `onChange`, which the caller wires to
+/// `ActivityStore.setDateRange(since:until:)`/`CyclesStore.setDateRange(
+/// since:until:)`, resetting paging back to page 0 against the server's
+/// narrowed result set (see those methods' own doc comments).
+///
+/// **Day-boundary normalization happens here, not in the store**: a
+/// `DatePicker(displayedComponents: .date)` always yields midnight of the
+/// selected day. Passed straight through, a closed-range `since <= ts <=
+/// until` server-side filter (see `pagination::DateRangeQuery`'s Rust doc
+/// comment) would make "To Aug 26" exclude nearly all of Aug 26 itself — so
+/// "From" is sent as the start of that day (a no-op normalization, but
+/// explicit) and "To" as the LAST instant of that day, matching the web's
+/// own `windowFromDayRange` convention (`23:59:59.999`) for the same
+/// whole-day-inclusive semantics.
+struct KindTableDateRangeFilter: View {
+    let since: Date?
+    let until: Date?
+    let onChange: (_ since: Date?, _ until: Date?) -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            KindTableDateBound(label: "From", date: since) { newSince in
+                onChange(newSince.map(Self.startOfDay), until)
+            }
+            KindTableDateBound(label: "To", date: until) { newUntil in
+                onChange(since, newUntil.map(Self.endOfDay))
+            }
+        }
+    }
+
+    private static func startOfDay(_ date: Date) -> Date {
+        Calendar.current.startOfDay(for: date)
+    }
+
+    private static func endOfDay(_ date: Date) -> Date {
+        let start = Calendar.current.startOfDay(for: date)
+        return start.addingTimeInterval(86_400 - 0.001)
+    }
+}

@@ -80,4 +80,15 @@ struct SessionsTableTests {
         let r = row(startedAt: Date(timeIntervalSince1970: 0), updatedAt: Date(timeIntervalSince1970: 5))
         expectNumber(SessionsTable.sortValue(r, .duration), 5_000)
     }
+
+    // MARK: - Find (perf & interaction arc, Plan 5 Task 5) — web-parity fields:
+    // [r.agent_name, r.session_id, r.host_id]
+
+    @Test func matchesAgentNameSessionIDAndHost() {
+        let r = row(id: "sess-xyz", subject: "rupuso", host: "mini")
+        #expect(SessionsTable.matches(r, query: "rupuso"))
+        #expect(SessionsTable.matches(r, query: "sess-xyz"))
+        #expect(SessionsTable.matches(r, query: "mini"))
+        #expect(!SessionsTable.matches(r, query: "nope"))
+    }
 }

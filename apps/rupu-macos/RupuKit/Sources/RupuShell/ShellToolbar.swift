@@ -72,6 +72,15 @@ struct ShellToolbar: CustomizableToolbarContent {
 
         ToolbarItem(id: "range", placement: .principal) {
             rangeControl
+                // Perf & interaction arc, Plan 5 Task 5: the 7d/30d/all range
+                // never applied to Activity's lists (they page through raw
+                // history, not a time-bucketed window) — showing it live
+                // there implied a filter that didn't exist. Same "always
+                // present, `.disabled` off-route" idiom `customizeOverview`
+                // above already uses, not an `if` (a customizable toolbar
+                // builder rejects conditional items — see the type doc
+                // comment).
+                .disabled(isActivity)
         }
 
         ToolbarItem(id: "customizeOverview", placement: .primaryAction) {
@@ -90,6 +99,13 @@ struct ShellToolbar: CustomizableToolbarContent {
 
     private var isOverview: Bool {
         if case .overview = model.route { return true }
+        return false
+    }
+
+    /// Perf & interaction arc, Plan 5 Task 5 — see `rangeControl`'s
+    /// `.disabled(isActivity)` call site.
+    private var isActivity: Bool {
+        if case .activity = model.route { return true }
         return false
     }
 

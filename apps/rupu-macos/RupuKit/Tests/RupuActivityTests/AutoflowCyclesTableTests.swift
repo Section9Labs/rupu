@@ -104,4 +104,20 @@ struct AutoflowCyclesTableTests {
         expectDate(AutoflowCyclesTable.sortValue(row, .started), ISO8601Parsing.parse("2026-08-20T12:00:00Z"))
         expectNumber(AutoflowCyclesTable.sortValue(row, .duration), 10_000)
     }
+
+    // MARK: - Find (perf & interaction arc, Plan 5 Task 5) — web-parity fields:
+    // [c.cycle_id, c.host_id, c.worker_name]
+
+    @Test func matchesCycleIDHostAndWorker() {
+        let row = cycle(cycleID: "cycle-abc", workerName: "worker-z", hostID: "mini")
+        #expect(AutoflowCyclesTable.matches(row, query: "cycle-abc"))
+        #expect(AutoflowCyclesTable.matches(row, query: "mini"))
+        #expect(AutoflowCyclesTable.matches(row, query: "worker-z"))
+        #expect(!AutoflowCyclesTable.matches(row, query: "nope"))
+    }
+
+    @Test func matchesHostFallsBackToLocalWhenNilHostID() {
+        let row = cycle(hostID: nil)
+        #expect(AutoflowCyclesTable.matches(row, query: "local"))
+    }
 }

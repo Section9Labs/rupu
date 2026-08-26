@@ -26,26 +26,64 @@ struct AgentRunsTable: View {
     let onSelect: (ActivityRow) -> Void
 
     @State private var sort = ListSort<AgentRunsSortKey>(key: .started, ascending: false)
+    @State private var query = ""
+    @State private var debouncedQuery = ""
 
     var body: some View {
         let _ = RenderMeter.tick("AgentRunsTable")
         let now = Date()
         let sorted = sortRows(rows, sort: sort, value: Self.sortValue)
-        VStack(alignment: .leading, spacing: 0) {
-            SortableHeaderRow(columns: columns, sort: $sort)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-            Divider()
-            List(sorted) { row in
-                AgentRunRowView(row: row, store: store, backend: backend, now: now, onSelect: onSelect)
-                    .listRowBackground(row.status == .awaiting ? Color.status(.awaiting).opacity(0.04) : .clear)
-                    .listRowSeparator(.visible)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+        let q = debouncedQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visible = q.isEmpty ? sorted : sorted.filter { Self.matches($0, query: q) }
+        VStack(alignment: .leading, spacing: 8) {
+            KindTableSearchField(placeholder: "Find agents…", query: $query)
+            VStack(alignment: .leading, spacing: 0) {
+                SortableHeaderRow(columns: columns, sort: $sort)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                Divider()
+                List {
+                    ForEach(visible) { row in
+                        AgentRunRowView(row: row, store: store, backend: backend, now: now, onSelect: onSelect)
+                            .listRowBackground(row.status == .awaiting ? Color.status(.awaiting).opacity(0.04) : .clear)
+                            .listRowSeparator(.visible)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                    }
+                    KindTableFooter(
+                        visibleCount: visible.count,
+                        loadedCount: store.loadedCount,
+                        hasMore: store.hasMore,
+                        isLoadingMore: store.isLoadingMore,
+                        // Brief: the honesty footer switches to "N matches
+                        // of M loaded" whenever ANY client-side narrowing is
+                        // active — Find text OR the FilterBar status chips
+                        // (both narrow `rows` before this table ever sees
+                        // it), not just Find.
+                        isSearchActive: !q.isEmpty || !store.statusFilter.isEmpty,
+                        onLoadMore: { Task { await store.loadMore() } }
+                    )
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets())
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
+            .panelStyle(.panel)
         }
-        .panelStyle(.panel)
+        .debouncedKindTableSearch(query: query, into: $debouncedQuery)
+    }
+
+    /// Find — case-insensitive substring across the fields the web's own
+    /// `AgentRuns.tsx` Find box matches (`[r.agent, r.run_id, r.session_id,
+    /// r.host_id]`): agent name (`subject`), run id (`id`), session id (only
+    /// resolvable when `navigation` is `.session` — see `ActivityRow.init(_:
+    /// APIAgentRunRow)`), host.
+    static func matches(_ row: ActivityRow, query: String) -> Bool {
+        var fields = [row.subject, row.id, row.host]
+        if case .session(let sessionID) = row.navigation {
+            fields.append(sessionID)
+        }
+        return fields.contains { $0.lowercased().contains(query) }
     }
 
     private var columns: [SortableColumn<AgentRunsSortKey>] {

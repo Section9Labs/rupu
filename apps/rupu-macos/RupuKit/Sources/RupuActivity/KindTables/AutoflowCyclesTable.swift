@@ -54,38 +54,74 @@ private enum AutoflowCyclesLayout {
 /// mirrors the web's `CycleDetail`, which always renders one of the two.
 struct AutoflowCyclesTable: View {
     let rows: [APIAutoflowCycleRow]
+    let store: CyclesStore
     let onSelectRun: (Route) -> Void
 
     @State private var sort = ListSort<AutoflowCyclesSortKey>(key: .started, ascending: false)
     @State private var expandedIDs: Set<String> = []
+    @State private var query = ""
+    @State private var debouncedQuery = ""
 
     var body: some View {
         let _ = RenderMeter.tick("AutoflowCyclesTable")
         let now = Date()
         let sorted = sortRows(rows, sort: sort, value: Self.sortValue)
-        VStack(alignment: .leading, spacing: 0) {
-            SortableHeaderRow(columns: columns, sort: $sort)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-            Divider()
-            List(sorted) { row in
-                VStack(alignment: .leading, spacing: 0) {
-                    AutoflowCycleRowView(
-                        row: row, now: now,
-                        isExpanded: expandedIDs.contains(row.id),
-                        onToggleExpand: { toggleExpand(row.id) }
-                    )
-                    if expandedIDs.contains(row.id) {
-                        detailView(for: row)
-                    }
+        let q = debouncedQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visible = q.isEmpty ? sorted : sorted.filter { Self.matches($0, query: q) }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                KindTableSearchField(placeholder: "Find cycles…", query: $query)
+                Spacer(minLength: 0)
+                KindTableDateRangeFilter(since: store.since, until: store.until) { since, until in
+                    Task { await store.setDateRange(since: since, until: until) }
                 }
-                .listRowSeparator(.visible)
-                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
+            VStack(alignment: .leading, spacing: 0) {
+                SortableHeaderRow(columns: columns, sort: $sort)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                Divider()
+                List {
+                    ForEach(visible) { row in
+                        VStack(alignment: .leading, spacing: 0) {
+                            AutoflowCycleRowView(
+                                row: row, now: now,
+                                isExpanded: expandedIDs.contains(row.id),
+                                onToggleExpand: { toggleExpand(row.id) }
+                            )
+                            if expandedIDs.contains(row.id) {
+                                detailView(for: row)
+                            }
+                        }
+                        .listRowSeparator(.visible)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                    }
+                    KindTableFooter(
+                        visibleCount: visible.count,
+                        loadedCount: store.loadedCount,
+                        hasMore: store.hasMore,
+                        isLoadingMore: store.isLoadingMore,
+                        isSearchActive: !q.isEmpty,
+                        onLoadMore: { Task { await store.loadMore() } }
+                    )
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets())
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+            }
+            .panelStyle(.panel)
         }
-        .panelStyle(.panel)
+        .debouncedKindTableSearch(query: query, into: $debouncedQuery)
+    }
+
+    /// Find — case-insensitive substring across the fields the web's own
+    /// `AutoflowRuns.tsx` `matchesAutoflowQuery` call matches for cycles:
+    /// `[c.cycle_id, c.host_id, c.worker_name]`.
+    static func matches(_ row: APIAutoflowCycleRow, query: String) -> Bool {
+        var fields = [row.cycleID, row.hostID ?? "local"]
+        if let worker = row.workerName { fields.append(worker) }
+        return fields.contains { $0.lowercased().contains(query) }
     }
 
     private func toggleExpand(_ id: String) {

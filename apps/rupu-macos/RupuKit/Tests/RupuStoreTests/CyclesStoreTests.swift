@@ -261,4 +261,70 @@ struct CyclesStoreTests {
         #expect(store.pendingHosts == 0)
         #expect(store.rows.map(\.cycleID) == ["cycle-local"])
     }
+
+    // MARK: - Infinite scroll + custom date range (perf & interaction arc, Plan 5 Task 5)
+
+    private static func queryParams(_ req: URLRequest) -> (offset: Int, limit: Int, since: String?) {
+        let items = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
+        return (value("offset").flatMap(Int.init) ?? 0, value("limit").flatMap(Int.init) ?? 20, value("since"))
+    }
+
+    /// Cycles pages at the same web-parity 20 this task gives every kind
+    /// table — `hasMore`/`loadedCount` mirror `ActivityStore`'s own contract,
+    /// backed here by a single local `PagedSnapshot` instead of a federated
+    /// set of sources.
+    @MainActor @Test func loadMorePagesAtTwentyAndHasMoreTracksExhaustion() async {
+        let allCycles = (0..<24).map { i in Self.cycleJSON(id: "cycle-\(i)") }
+        let store = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" { return (200, Data("[]".utf8)) }
+            guard url.path == "/api/runs/autoflows" else { return (200, Data("[]".utf8)) }
+            let (offset, limit, _) = Self.queryParams(req)
+            guard offset < allCycles.count else { return (200, Data("[]".utf8)) }
+            let end = min(offset + limit, allCycles.count)
+            return (200, Data(("[" + allCycles[offset..<end].joined(separator: ",") + "]").utf8))
+        }
+
+        await store.activate()
+        #expect(store.rows.count == 20)
+        #expect(store.loadedCount == 20)
+        #expect(store.hasMore == true)
+
+        await store.loadMore()
+        #expect(store.rows.count == 24)
+        #expect(store.hasMore == false)
+
+        store.deactivate()
+    }
+
+    /// `setDateRange(since:until:)` sends `since` on the next fetch and
+    /// resets back to offset 0 — same server-side-filter contract
+    /// `ActivityStore.setDateRange` documents for itself.
+    @MainActor @Test func setDateRangeSendsSinceAndResetsToOffsetZero() async {
+        let unfiltered = (0..<24).map { i in Self.cycleJSON(id: "cycle-\(i)") }
+        let filtered = [Self.cycleJSON(id: "cycle-narrow")]
+        let store = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" { return (200, Data("[]".utf8)) }
+            guard url.path == "/api/runs/autoflows" else { return (200, Data("[]".utf8)) }
+            let (offset, limit, since) = Self.queryParams(req)
+            if since != nil {
+                return (200, Data(("[" + filtered.joined(separator: ",") + "]").utf8))
+            }
+            guard offset < unfiltered.count else { return (200, Data("[]".utf8)) }
+            let end = min(offset + limit, unfiltered.count)
+            return (200, Data(("[" + unfiltered[offset..<end].joined(separator: ",") + "]").utf8))
+        }
+
+        await store.activate()
+        #expect(store.rows.count == 20)
+
+        let since = Date(timeIntervalSince1970: 1_755_000_000)
+        await store.setDateRange(since: since, until: nil)
+        #expect(store.rows.map(\.cycleID) == ["cycle-narrow"])
+        #expect(store.since == since)
+
+        store.deactivate()
+    }
 }

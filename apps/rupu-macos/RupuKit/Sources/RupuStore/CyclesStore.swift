@@ -48,20 +48,75 @@ public final class CyclesStore {
     /// documents; never part of `state`, which reflects the local load only.
     public private(set) var pendingHosts: Int = 0
 
+    /// Server-side date-range bounds (perf & interaction arc, Plan 5 Task 5)
+    /// — see `ActivityStore.since`/`.until`'s doc comment for the same
+    /// "changes what the server returns, so it resets paging" contract.
+    public private(set) var since: Date?
+    public private(set) var until: Date?
+
+    /// Whether the local source has more pages to load — same "meaningful
+    /// only while this sub-tab is showing a table" contract as
+    /// `ActivityStore.hasMore`. Remote-host rows contribute at most one page
+    /// (see `loadRemoteHost`), so this is local-only, matching `loadMore()`.
+    public var hasMore: Bool { !local.exhausted }
+
+    /// True while `loadMore()`'s fetch is actually in flight.
+    public var isLoadingMore: Bool { local.isLoadingMore }
+
+    /// Raw row count loaded so far (local + whatever remote hosts have
+    /// contributed), before any client-side search narrowing.
+    public var loadedCount: Int { rows.count }
+
     private let client: CPClient
     private let local: PagedSnapshot<APIAutoflowCycleRow>
     private var remoteRows: [APIAutoflowCycleRow] = []
     private var remoteGeneration = 0
     private var remoteHostTasks: [Task<Void, Never>] = []
 
+    /// Mutable holder for `since`/`until`, threaded into `local`'s fetch
+    /// closure — same rationale as `ActivityStore.DateRangeBox`'s doc
+    /// comment (built before `self` is a valid capture target, MainActor
+    /// confinement documented rather than enforced by the type system).
+    private final class DateRangeBox: @unchecked Sendable {
+        var since: Date?
+        var until: Date?
+    }
+    private let dateRangeBox: DateRangeBox
+
     private static let localHost = "local"
     private static let remotePageSize = 50
+    /// Web-parity page size for this sub-tab's table (perf & interaction arc,
+    /// Plan 5 Task 5) — Cycles is always a kind-page-shaped table (never an
+    /// `.all`-style aggregate view), so unlike `ActivityStore`'s shared
+    /// sources, this is a fixed constant rather than something toggled per
+    /// mode.
+    private static let pageSize = 20
 
     public init(client: CPClient) {
         self.client = client
-        self.local = PagedSnapshot { offset, limit in
-            try await client.autoflowCycles(offset: offset, limit: limit, host: Self.localHost)
+        let dateRangeBox = DateRangeBox()
+        self.dateRangeBox = dateRangeBox
+        self.local = PagedSnapshot(pageSize: Self.pageSize) { offset, limit in
+            try await client.autoflowCycles(
+                offset: offset, limit: limit, host: Self.localHost,
+                since: dateRangeBox.since.map { ISO8601Parsing.fractional.format($0) },
+                until: dateRangeBox.until.map { ISO8601Parsing.fractional.format($0) }
+            )
         }
+    }
+
+    /// Sets `since`/`until` and resets paging to page 0 — see
+    /// `ActivityStore.setDateRange(since:until:)`'s doc comment for why this
+    /// is one call setting both bounds together, and why it uses
+    /// `resetAndRefresh()` rather than `refresh()`.
+    public func setDateRange(since: Date?, until: Date?) async {
+        guard since != self.since || until != self.until else { return }
+        self.since = since
+        self.until = until
+        dateRangeBox.since = since
+        dateRangeBox.until = until
+        await local.resetAndRefresh()
+        recompute()
     }
 
     /// (Re)activates: refreshes local page 0 (returns once that lands —

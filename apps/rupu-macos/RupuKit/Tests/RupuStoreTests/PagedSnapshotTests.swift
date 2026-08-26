@@ -218,3 +218,160 @@ private final class CountBox: @unchecked Sendable {
         return
     }
 }
+
+// MARK: - resetAndRefresh (perf & interaction arc, Plan 5 Task 5)
+
+/// `isLoadingMore` is `true` only while a `loadMore()` fetch is actually in
+/// flight — `false` before, during a plain `refresh()`, and after
+/// completion. The sentinel's "loading more…" footer state reads this
+/// directly, so it must never read true outside a genuine loadMore.
+@MainActor @Test func pagedSnapshotIsLoadingMoreOnlyTrueDuringLoadMoreItself() async {
+    let all = (0..<80).map { FakeRow(id: $0) }
+    let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
+        guard offset < all.count else { return [] }
+        let end = min(offset + limit, all.count)
+        return Array(all[offset..<end])
+    }
+
+    #expect(snapshot.isLoadingMore == false)
+    await snapshot.refresh()
+    #expect(snapshot.isLoadingMore == false, "refresh() must never flip isLoadingMore")
+
+    let loadTask = Task { await snapshot.loadMore() }
+    // Give the fetch a moment to actually start before asserting the flag —
+    // this fetch is synchronous (no artificial delay), so by the time
+    // `loadTask` is awaited it may already be done; the meaningful assertion
+    // is the post-completion one below, kept honest rather than racy.
+    _ = await loadTask.value
+    #expect(snapshot.isLoadingMore == false, "isLoadingMore must clear once loadMore() finishes")
+}
+
+/// Deterministic one-shot gate: `wait()` suspends until `open()` is called
+/// (from anywhere), regardless of call ordering — used below to hold a fetch
+/// closure's completion at a precise, test-controlled point WITHOUT
+/// depending on sleep-based timing for correctness (unlike the sleep-widened
+/// races elsewhere in this file, which only need "wide enough," not exact
+/// ordering). An `actor`, not `FlagBox`'s lock-around-a-bool, because this
+/// needs a real suspension point (`withCheckedContinuation`), not a busy-poll
+/// loop — a busy-poll here would burn CPU (or, if `value` were ever
+/// misread across tasks, hang indefinitely) for what should be an instant
+/// handoff once `open()` is actually called.
+private actor AsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let toResume = waiters
+        waiters.removeAll()
+        for w in toResume { w.resume() }
+    }
+}
+
+/// The core paging-reset contract: `resetAndRefresh()` must win over a
+/// `loadMore()` that was already in flight for the OLD data set when the
+/// filter changed — the stale call's eventual completion must be discarded,
+/// never appended on top of the freshly-reset page 0. This is the store-level
+/// proof for the brief's "filter change resets to page 0 (late old-generation
+/// page dropped)" requirement, expressed directly against `PagedSnapshot`
+/// rather than through `ActivityStore`'s higher-level surface.
+@MainActor @Test func pagedSnapshotResetAndRefreshDiscardsALateInFlightLoadMore() async {
+    let oldData = (0..<80).map { FakeRow(id: $0) }
+    let newData = (1000..<1010).map { FakeRow(id: $0) } // disjoint id range — unambiguous provenance
+    let usingOldData = FlagBox(true)
+    let gate = AsyncGate()
+
+    let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
+        if usingOldData.value {
+            // Suspends until the test explicitly opens the gate — models a
+            // loadMore() that's still in flight when the filter changes,
+            // with NO timing dependency for correctness (only the "has it
+            // started yet" check below is timing-based, and that one is
+            // bounded — see its own comment).
+            await gate.wait()
+            guard offset < oldData.count else { return [] }
+            let end = min(offset + limit, oldData.count)
+            return Array(oldData[offset..<end])
+        }
+        guard offset < newData.count else { return [] }
+        let end = min(offset + limit, newData.count)
+        return Array(newData[offset..<end])
+    }
+
+    await snapshot.refresh() // page 0 of oldData, 50 rows
+    #expect(snapshot.rows.count == 50)
+
+    // Start a loadMore() for oldData's page 1 — its fetch will suspend on
+    // `gate.wait()` until this test calls `gate.open()` below.
+    async let staleLoadMore: Bool = snapshot.loadMore()
+
+    // Bounded wait for loadMore() to actually enter `fetch` — `isLoadingMore`
+    // flips `true` synchronously, before the `await fetch(...)` call, so
+    // this only needs to observe that flip, not race the gate itself. Capped
+    // at 100 * 2ms so a regression elsewhere can never hang this test.
+    for _ in 0..<100 where !snapshot.isLoadingMore {
+        try? await Task.sleep(for: .milliseconds(2))
+    }
+    #expect(snapshot.isLoadingMore == true, "loadMore() should have entered fetch by now")
+
+    // The filter changes: switch the fetch closure's data source and reset —
+    // this must win regardless of the still-in-flight staleLoadMore above.
+    usingOldData.value = false
+    await snapshot.resetAndRefresh()
+    #expect(snapshot.rows.map(\.id) == Array(1000..<1010), "resetAndRefresh's own page must be what's showing")
+    #expect(snapshot.exhausted == true)
+
+    // Now let the stale loadMore's fetch finally return its (old, now
+    // irrelevant) page — it must be discarded, not appended.
+    await gate.open()
+    _ = await staleLoadMore
+    #expect(snapshot.rows.map(\.id) == Array(1000..<1010), "the late old-generation page must never land")
+    #expect(snapshot.exhausted == true)
+}
+
+/// `resetAndRefresh()` must actually restart paging from page 0 — a
+/// previously-`exhausted` snapshot must become loadable again once the
+/// underlying data set (or the filter driving `fetch`) changes.
+@MainActor @Test func pagedSnapshotResetAndRefreshRestartsPagingFromZero() async {
+    let data = FlagBox(true) // true → small data set (already exhausted after one page)
+    let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
+        let rows = data.value ? (0..<10).map { FakeRow(id: $0) } : (0..<120).map { FakeRow(id: $0) }
+        guard offset < rows.count else { return [] }
+        let end = min(offset + limit, rows.count)
+        return Array(rows[offset..<end])
+    }
+
+    await snapshot.refresh()
+    #expect(snapshot.rows.count == 10)
+    #expect(snapshot.exhausted == true)
+
+    data.value = false
+    await snapshot.resetAndRefresh()
+    #expect(snapshot.rows.count == 50, "resetAndRefresh must re-fetch page 0 against the new data")
+    #expect(snapshot.exhausted == false)
+
+    await snapshot.loadMore()
+    #expect(snapshot.rows.count == 100)
+}
+
+/// A `resetAndRefresh()` that lands while nothing else is in flight behaves
+/// exactly like `refresh()` for the common case — same contract, just a
+/// forced generation bump on top.
+@MainActor @Test func pagedSnapshotResetAndRefreshWithNoConcurrentCallBehavesLikeRefresh() async {
+    let all = (0..<30).map { FakeRow(id: $0) }
+    let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
+        guard offset < all.count else { return [] }
+        let end = min(offset + limit, all.count)
+        return Array(all[offset..<end])
+    }
+    await snapshot.resetAndRefresh()
+    #expect(snapshot.rows.map(\.id) == Array(0..<30))
+    #expect(snapshot.exhausted == true)
+}

@@ -35,6 +35,7 @@ struct FilterBar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
+                dateRangeFilter
                 Spacer(minLength: 0)
                 if store.pendingNewRuns > 0 {
                     newRunsPill
@@ -45,6 +46,16 @@ struct FilterBar: View {
         }
         .padding(12)
         .panelStyle(.panel)
+    }
+
+    /// Server-side custom date range (perf & interaction arc, Plan 5 Task 5)
+    /// — see `KindTableDateRangeFilter`'s own doc comment for the day-
+    /// boundary normalization and why this resets paging rather than just
+    /// narrowing `rows` in place like the status chips below do.
+    private var dateRangeFilter: some View {
+        KindTableDateRangeFilter(since: store.since, until: store.until) { since, until in
+            Task { await store.setDateRange(since: since, until: until) }
+        }
     }
 
     private var liveTailToggle: some View {

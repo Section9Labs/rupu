@@ -37,26 +37,53 @@ struct WorkflowRunsTable: View {
     let onSelect: (ActivityRow) -> Void
 
     @State private var sort = ListSort<WorkflowRunsSortKey>(key: .started, ascending: false)
+    @State private var query = ""
+    @State private var debouncedQuery = ""
 
     var body: some View {
         let _ = RenderMeter.tick("WorkflowRunsTable")
         let now = Date()
         let sorted = sortRows(rows, sort: sort, value: Self.sortValue)
-        VStack(alignment: .leading, spacing: 0) {
-            SortableHeaderRow(columns: columns, sort: $sort)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-            Divider()
-            List(sorted) { row in
-                WorkflowRunRowView(row: row, store: store, backend: backend, now: now, onSelect: onSelect)
-                    .listRowBackground(row.status == .awaiting ? Color.status(.awaiting).opacity(0.04) : .clear)
-                    .listRowSeparator(.visible)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+        let q = debouncedQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visible = q.isEmpty ? sorted : sorted.filter { Self.matches($0, query: q) }
+        VStack(alignment: .leading, spacing: 8) {
+            KindTableSearchField(placeholder: "Find workflows…", query: $query)
+            VStack(alignment: .leading, spacing: 0) {
+                SortableHeaderRow(columns: columns, sort: $sort)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                Divider()
+                List {
+                    ForEach(visible) { row in
+                        WorkflowRunRowView(row: row, store: store, backend: backend, now: now, onSelect: onSelect)
+                            .listRowBackground(row.status == .awaiting ? Color.status(.awaiting).opacity(0.04) : .clear)
+                            .listRowSeparator(.visible)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                    }
+                    KindTableFooter(
+                        visibleCount: visible.count,
+                        loadedCount: store.loadedCount,
+                        hasMore: store.hasMore,
+                        isLoadingMore: store.isLoadingMore,
+                        isSearchActive: !q.isEmpty || !store.statusFilter.isEmpty,
+                        onLoadMore: { Task { await store.loadMore() } }
+                    )
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets())
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
+            .panelStyle(.panel)
         }
-        .panelStyle(.panel)
+        .debouncedKindTableSearch(query: query, into: $debouncedQuery)
+    }
+
+    /// Find — case-insensitive substring across the fields the web's own
+    /// `WorkflowRuns.tsx` Find box matches (`[r.workflow_name, r.id,
+    /// r.host_id]`): workflow name (`subject`), run id (`id`), host.
+    static func matches(_ row: ActivityRow, query: String) -> Bool {
+        [row.subject, row.id, row.host].contains { $0.lowercased().contains(query) }
     }
 
     private var columns: [SortableColumn<WorkflowRunsSortKey>] {

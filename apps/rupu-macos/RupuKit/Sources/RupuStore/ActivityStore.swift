@@ -90,6 +90,40 @@ public final class ActivityStore {
 
     public var liveTail: Bool = true
 
+    /// Server-side date-range bounds on the active kind's rows (perf &
+    /// interaction arc, Plan 5 Task 5) — unlike `statusFilter`/`scopeFilter`,
+    /// this is NOT a display-time narrowing over already-fetched rows: it
+    /// changes what the server returns, so it must reset paging back to page
+    /// 0 rather than just re-filtering `rows` in place. Set together via
+    /// `setDateRange(since:until:)`, never individually — see that method's
+    /// doc comment for why. `private(set)`: the two values must only ever
+    /// change as a pair, through that method, so a caller can't set one half
+    /// without going through the paging-reset it triggers.
+    public private(set) var since: Date?
+    public private(set) var until: Date?
+
+    /// Whether the currently active kind-page source(s) have more pages to
+    /// load. Meaningful only for a kind page (`kind != .all`, exactly one
+    /// active source) — `.all` renders no table and never reads this.
+    public var hasMore: Bool {
+        let snapshots = activeSnapshots()
+        guard !snapshots.isEmpty else { return false }
+        return snapshots.contains { !$0.exhausted }
+    }
+
+    /// True while `loadMore()` is actually fetching the next page — the
+    /// sentinel's "loading more…" footer state reads this.
+    public var isLoadingMore: Bool {
+        activeSnapshots().contains { $0.isLoadingMore }
+    }
+
+    /// Raw row count loaded so far for the active kind-page source(s),
+    /// BEFORE any client-side status/scope/search narrowing — the "{m}" half
+    /// of the honesty footer's "{n} matches of {m} loaded".
+    public var loadedCount: Int {
+        activeSnapshots().reduce(0) { $0 + $1.rows.count }
+    }
+
     /// The Activity table's current sort — perf & interaction arc, Plan 5
     /// Task 3: moved here from `ActivityTable`'s own `@State` (where a
     /// `sortedRows` computed property re-sorted `rows` on every single body
@@ -169,6 +203,31 @@ public final class ActivityStore {
     private var lifecycle: StreamLifecycle?
     private let debounceInterval: Duration
     private var debounceTask: Task<Void, Never>?
+
+    /// Mutable holder for the operator-chosen `since`/`until` bounds, threaded
+    /// into every `Source`'s `fetch`/`remoteFetch` closures (perf & interaction
+    /// arc, Plan 5 Task 5). A plain reference type, not `self` — `sources` is
+    /// built inside `init` before `self` is a valid capture target (see
+    /// `sources`'s own doc comment for the same constraint on `client`).
+    /// `@unchecked Sendable`: every mutation (`setDateRange(since:until:)`)
+    /// and every read (inside a `PagedSnapshot`'s `fetch` closure, always
+    /// invoked via `await fetch(...)` from this `@MainActor` class) happens on
+    /// `@MainActor` — that confinement is what makes plain `var` mutation
+    /// safe here, not the type system, so this documents the invariant rather
+    /// than actually synchronizing anything.
+    private final class DateRangeBox: @unchecked Sendable {
+        var since: Date?
+        var until: Date?
+    }
+    private let dateRangeBox: DateRangeBox
+
+    /// Kind-page tables get the web-parity page size (20); `.all` (which
+    /// renders no table, just `ActivityStatsView`'s KPI cards +
+    /// `unscopedRows`-derived needs-attention list) keeps its pre-existing
+    /// merged-snapshot size. Applied to every source's `PagedSnapshot` on
+    /// every `activate(kind:)` — see that method's doc comment.
+    private static let kindPageSize = 20
+    private static let allPageSize = 50
 
     /// One entry per federated source, pairing its local `PagedSnapshot`
     /// (host=local, paged, live-patchable — the existing machinery) with a
@@ -265,41 +324,67 @@ public final class ActivityStore {
         self.signalsFactory = signalsFactory
         self.debounceInterval = debounceInterval
         self.pendingActions = pendingActions
+        let dateRangeBox = DateRangeBox()
+        self.dateRangeBox = dateRangeBox
         self.sources = [
             Source(
                 kind: .workflow,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.workflowRuns(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.workflowRuns(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
-                    try await client.workflowRuns(offset: offset, limit: limit, host: host).map(ActivityRow.init)
+                    try await client.workflowRuns(
+                        offset: offset, limit: limit, host: host,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 }
             ),
             Source(
                 kind: .agent,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.agentRuns(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.agentRuns(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
-                    try await client.agentRuns(offset: offset, limit: limit, host: host).map(ActivityRow.init)
+                    try await client.agentRuns(
+                        offset: offset, limit: limit, host: host,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 }
             ),
             Source(
                 kind: .autoflow,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.autoflowEvents(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.autoflowEvents(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
-                    try await client.autoflowEvents(offset: offset, limit: limit, host: host).map(ActivityRow.init)
+                    try await client.autoflowEvents(
+                        offset: offset, limit: limit, host: host,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 }
             ),
             Source(
                 kind: .session,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.sessions(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.sessions(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
-                    try await client.sessions(offset: offset, limit: limit, host: host).map(ActivityRow.init)
+                    try await client.sessions(
+                        offset: offset, limit: limit, host: host,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 }
             ),
         ]
@@ -307,6 +392,13 @@ public final class ActivityStore {
 
     private static let localHost = "local"
     private static let remotePageSize = 50
+
+    /// RFC-3339 encoding for the `since`/`until` query params — `nil` in,
+    /// `nil` out (no query item at all, matching `CPClient`'s "`nil` omits
+    /// the filter" convention).
+    private static func rfc3339(_ date: Date?) -> String? {
+        date.map { ISO8601Parsing.fractional.format($0) }
+    }
 
     /// Sets `kind`, refreshes page 0 of the *local* sources it implies
     /// (parallel across sources, never blocking on a remote host — see
@@ -327,6 +419,9 @@ public final class ActivityStore {
     /// gets that more may still arrive.
     public func activate(kind: RunKindFilter) async {
         self.kind = kind
+        for source in sources {
+            source.snapshot.setPageSize(kind == .all ? Self.allPageSize : Self.kindPageSize)
+        }
         remoteGeneration += 1
         let generation = remoteGeneration
         cancelRemoteHostTasks()
@@ -374,8 +469,45 @@ public final class ActivityStore {
     /// current `activate(kind:)` cycle; re-discovering the fleet on every
     /// pill click isn't worth the extra round trips this phase.
     public func applyPendingRefresh() async {
-        await refreshActiveSources()
+        await refreshActiveSources(preservingScrolledPages: true)
         pendingNewRuns = 0
+    }
+
+    // MARK: - Date range (perf & interaction arc, Plan 5 Task 5)
+
+    /// Sets the server-side `since`/`until` bounds and resets paging back to
+    /// page 0 for the active kind-page source(s) — a date-range change is
+    /// NOT a display-time narrowing like `statusFilter`/`scopeFilter`; it
+    /// changes what the SERVER returns, so `rows` already loaded under the
+    /// old bounds can't just be re-filtered in place.
+    ///
+    /// Both bounds are set together, in one call, rather than as two
+    /// independent `didSet`s on separate properties: setting `since` then
+    /// `until` as two separate property writes would fire two separate
+    /// resets (two round trips, the second superseding the first) for what
+    /// the operator experiences as one logical change (dragging a date
+    /// range). One call, one reset.
+    ///
+    /// Uses `PagedSnapshot.resetAndRefresh()` (not `refresh()`): a
+    /// `loadMore()` that was already in flight for the OLD bounds when this
+    /// lands must never win the race and append a stale page onto the
+    /// freshly-reset `rows` — see that method's own doc comment for the
+    /// generation-guard mechanics that guarantee this.
+    public func setDateRange(since: Date?, until: Date?) async {
+        guard since != self.since || until != self.until else { return }
+        self.since = since
+        self.until = until
+        dateRangeBox.since = since
+        dateRangeBox.until = until
+        for snapshot in activeSnapshots() {
+            await snapshot.resetAndRefresh()
+        }
+        // A stale live-patch override from before the reset must not shadow
+        // the freshly-reset page — same reasoning `refreshActiveSources()`
+        // already documents for why it clears this on every real REST
+        // refresh.
+        statusOverrides.removeAll()
+        recompute()
     }
 
     // MARK: - Sort (perf & interaction arc, Plan 5 Task 3)
@@ -521,7 +653,7 @@ public final class ActivityStore {
     /// unrefreshed with zero signal, so it retries once (see
     /// `scheduleDebouncedRefresh`).
     @discardableResult
-    private func refreshActiveSources() async -> Bool {
+    private func refreshActiveSources(preservingScrolledPages: Bool = false) async -> Bool {
         let snapshots = activeSnapshots()
         let allPerformed: Bool
         if snapshots.isEmpty {
@@ -529,7 +661,27 @@ public final class ActivityStore {
         } else {
             allPerformed = await withTaskGroup(of: Bool.self) { group in
                 for snapshot in snapshots {
-                    group.addTask { await snapshot.refresh() }
+                    group.addTask {
+                        // perf & interaction arc, Plan 5 Task 5: a plain
+                        // `refresh()` replaces `rows` wholesale with page 0
+                        // — exactly right for `activate(kind:)`'s own fresh
+                        // navigation into a kind (and it also generation-
+                        // guards away any straggler `loadMore()` from a
+                        // PRIOR visit to this same kind, via
+                        // `resetAndRefresh()`), but wrong for a refresh the
+                        // operator didn't ask for while already scrolled
+                        // several pages deep (the live-tail debounce, a
+                        // reconnect resnapshot, the "N new runs" pill) —
+                        // those use `refreshHead()` instead, which splices
+                        // the fresh head onto whatever pages `loadMore()`
+                        // already appended rather than discarding them. See
+                        // `PagedSnapshot.refreshHead()`'s doc comment.
+                        if preservingScrolledPages {
+                            await snapshot.refreshHead()
+                        } else {
+                            await snapshot.resetAndRefresh()
+                        }
+                    }
                 }
                 var performedAll = true
                 for await performed in group {
@@ -748,7 +900,7 @@ public final class ActivityStore {
             signals: signalsFactory(),
             resnapshot: { [weak self] in
                 guard let self else { return }
-                await self.refreshActiveSources()
+                await self.refreshActiveSources(preservingScrolledPages: true)
             },
             apply: { [weak self] event in
                 self?.apply(event)
@@ -917,7 +1069,7 @@ public final class ActivityStore {
         debounceTask = Task { [weak self, debounceInterval] in
             try? await Task.sleep(for: debounceInterval)
             guard !Task.isCancelled, let self else { return }
-            let allPerformed = await self.refreshActiveSources()
+            let allPerformed = await self.refreshActiveSources(preservingScrolledPages: true)
             if !allPerformed && !isRetry {
                 self.scheduleDebouncedRefresh(isRetry: true)
             }

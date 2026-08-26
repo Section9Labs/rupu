@@ -68,4 +68,23 @@ struct WorkflowRunsTableTests {
         #expect(TriggerTone.color("manual") == Color.rupuMute)
         #expect(TriggerTone.color("something-else") == Color.rupuMute)
     }
+
+    // MARK: - Find (perf & interaction arc, Plan 5 Task 5) — web-parity fields:
+    // [r.workflow_name, r.id, r.host_id]
+
+    @Test func matchesWorkflowNameCaseInsensitively() {
+        let r = row(subject: "Nightly Health Check")
+        #expect(WorkflowRunsTable.matches(r, query: "health"))
+        #expect(!WorkflowRunsTable.matches(r, query: "nope"))
+    }
+
+    @Test func matchesRunID() {
+        let r = row(id: "run-abc123")
+        #expect(WorkflowRunsTable.matches(r, query: "abc123"))
+    }
+
+    @Test func matchesHost() {
+        let r = row(host: "mini")
+        #expect(WorkflowRunsTable.matches(r, query: "mini"))
+    }
 }

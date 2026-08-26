@@ -921,6 +921,174 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // MARK: - Infinite scroll + custom date range (perf & interaction arc, Plan 5 Task 5)
+
+    /// Parses `offset`/`limit`/`since`/`until` off a stubbed request's query
+    /// string — shared by the tests below.
+    private static func queryParams(_ req: URLRequest) -> (offset: Int, limit: Int, since: String?, until: String?) {
+        guard let url = req.url else { return (0, 20, nil, nil) }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> String? { items.first(where: { $0.name == name })?.value }
+        let offset = value("offset").flatMap(Int.init) ?? 0
+        let limit = value("limit").flatMap(Int.init) ?? 20
+        return (offset, limit, value("since"), value("until"))
+    }
+
+    // (l) a KIND page (not `.all`) uses the web-parity page size of 20 —
+    // `hasMore`/`loadedCount` track the single active source's own
+    // `PagedSnapshot`, and `hasMore` flips false once a short page (fewer
+    // than 20 rows) comes back.
+    @MainActor @Test func kindPageUsesPageSizeTwentyAndHasMoreTracksExhaustion() async {
+        let allRows = (0..<25).map { i in
+            Self.runListRowJSON(id: "wf-\(i)", startedAt: String(format: "2026-08-20T10:%02d:00Z", i), status: "running")
+        }
+        let requestedLimits = Counter()
+        let (store, box) = makeStore { req in
+            guard req.url?.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            let (offset, limit, _, _) = Self.queryParams(req)
+            requestedLimits.increment()
+            guard offset < allRows.count else { return (200, Data("[]".utf8)) }
+            let end = min(offset + limit, allRows.count)
+            return (200, Data(("[" + allRows[offset..<end].joined(separator: ",") + "]").utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        #expect(store.rows.count == 20, "kind pages page at 20, not the .all merged size of 50")
+        #expect(store.loadedCount == 20)
+        #expect(store.hasMore == true)
+        #expect(store.isLoadingMore == false)
+
+        await store.loadMore()
+        #expect(store.rows.count == 25, "only 5 rows remained — a short page")
+        #expect(store.loadedCount == 25)
+        #expect(store.hasMore == false, "a page shorter than the page size marks the source exhausted")
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (m) `setDateRange(since:until:)` sends `since`/`until` on the NEXT
+    // fetch, resets the active source back to offset 0, and — the
+    // generation-guard contract — discards a `loadMore()` that was already
+    // in flight for the OLD (unfiltered) data when the range changed, rather
+    // than letting its stale page land on top of the freshly-reset one.
+    @MainActor @Test func setDateRangeSendsBoundsResetsOffsetAndDropsAStaleInFlightLoadMore() async {
+        let unfiltered = (0..<40).map { i in
+            Self.runListRowJSON(id: "wf-\(i)", startedAt: String(format: "2026-08-20T10:%02d:00Z", i), status: "running")
+        }
+        let filtered = (0..<3).map { i in
+            Self.runListRowJSON(id: "narrow-\(i)", startedAt: String(format: "2026-08-15T10:%02d:00Z", i), status: "running")
+        }
+        // `URLProtocol.startLoading()` is synchronous (the stub handler
+        // can't `await`), and — as found live in this exact test (an earlier
+        // indefinite-`DispatchSemaphore`-block version starved OTHER
+        // concurrently-running suites' own stubbed fetches, timing them out)
+        // — blocking one request's handler INDEFINITELY is unsafe here: it
+        // can hold onto a thread/slot the whole `URLSession`-stub machinery
+        // (shared across every test in this parallel-testing run) needs.
+        // A bounded `Thread.sleep`, same fixed-delay "widen the race window"
+        // technique `debouncedRefreshCollidingWithInFlightRefreshRetriesOnceAfterItCompletes`
+        // already uses for two concurrent same-path fetches, avoids that:
+        // the stale fetch is slow, not stuck.
+        let sawSince = FlagBox()
+
+        let (store, box) = makeStore { req in
+            guard req.url?.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            let (offset, limit, since, _) = Self.queryParams(req)
+            if since != nil {
+                sawSince.value = true
+                guard offset < filtered.count else { return (200, Data("[]".utf8)) }
+                let end = min(offset + limit, filtered.count)
+                return (200, Data(("[" + filtered[offset..<end].joined(separator: ",") + "]").utf8))
+            }
+            // Unfiltered fetches beyond page 0 (i.e. a `loadMore()`) are
+            // slowed down — models a loadMore() still in flight when the
+            // date range changes, and gives the reset's own (fast,
+            // since-bound) fetch above time to land first. Page 0 itself
+            // (the initial `activate`) stays instant so the test can get to
+            // a known starting state.
+            if offset > 0 {
+                Thread.sleep(forTimeInterval: 0.3)
+            }
+            guard offset < unfiltered.count else { return (200, Data("[]".utf8)) }
+            let end = min(offset + limit, unfiltered.count)
+            return (200, Data(("[" + unfiltered[offset..<end].joined(separator: ",") + "]").utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        #expect(store.rows.count == 20)
+
+        async let staleLoadMore: Void = store.loadMore()
+        await expectEventually("loadMore() enters its (slow) fetch") { store.isLoadingMore }
+
+        let since = Date(timeIntervalSince1970: 1_755_000_000) // 2026-08-12ish, exact value irrelevant
+        await store.setDateRange(since: since, until: nil)
+
+        #expect(sawSince.value == true, "the reset fetch must carry the since bound")
+        #expect(Set(store.rows.map(\.id)) == Set((0..<3).map { "narrow-\($0)" }))
+        #expect(store.rows.count == 3, "offset reset to 0 against the narrowed 3-row result, not appended onto 20")
+        #expect(store.since == since)
+
+        // Let the stale loadMore's (slow, unfiltered, now irrelevant) fetch
+        // finally land — it must be discarded, never appended.
+        _ = await staleLoadMore
+        #expect(Set(store.rows.map(\.id)) == Set((0..<3).map { "narrow-\($0)" }), "the late unfiltered page must be discarded")
+        #expect(store.rows.count == 3)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (n) the live-tail path (`refreshActiveSources(preservingScrolledPages:
+    // true)`, exercised here via `applyPendingRefresh()`) must SPLICE a
+    // fresh page 0 onto whatever `loadMore()` already appended, not replace
+    // `rows` wholesale — the brief's "SSE head splice must not reset scroll
+    // or drop appended pages" contract.
+    @MainActor @Test func applyPendingRefreshPreservesLoadMoreAppendedPagesViaHeadSplice() async {
+        let page0 = (0..<20).map { i in
+            Self.runListRowJSON(id: "wf-\(i)", startedAt: String(format: "2026-08-20T10:%02d:00Z", i), status: "running")
+        }
+        let page1 = (20..<25).map { i in
+            Self.runListRowJSON(id: "wf-\(i)", startedAt: String(format: "2026-08-20T09:%02d:00Z", i), status: "running")
+        }
+        let refreshedPage0 = [Self.runListRowJSON(id: "wf-new", startedAt: "2026-08-20T11:00:00Z", status: "running")] + page0.dropLast()
+
+        let servingRefresh = FlagBox()
+        let (store, box) = makeStore { req in
+            guard req.url?.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            let (offset, _, _, _) = Self.queryParams(req)
+            if offset == 0 && servingRefresh.value {
+                return (200, Data(("[" + refreshedPage0.joined(separator: ",") + "]").utf8))
+            }
+            if offset == 0 { return (200, Data(("[" + page0.joined(separator: ",") + "]").utf8)) }
+            return (200, Data(("[" + page1.joined(separator: ",") + "]").utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        #expect(store.rows.count == 20)
+        await store.loadMore()
+        #expect(store.rows.count == 25, "loadMore() appended page 1 (5 more rows)")
+
+        // A live refresh lands (the "N new runs" pill, or the debounced
+        // live-tail path it shares `refreshActiveSources` with) — page 0 has
+        // changed (one new row at the head, one old row fell off it), but
+        // the operator's scrolled-in page 1 rows must survive untouched.
+        servingRefresh.value = true
+        await store.applyPendingRefresh()
+
+        #expect(store.rows.contains { $0.id == "wf-new" }, "the fresh head row must appear")
+        for id in (20..<25).map({ "wf-\($0)" }) {
+            #expect(store.rows.contains { $0.id == id }, "page-1 row \(id) must survive the head refresh")
+        }
+        // Fresh head (20: wf-new + wf-0...wf-18) + preserved tail (6: wf-19,
+        // which fell off the fresh head, plus wf-20...wf-24 from page 1) —
+        // never collapsed back down to a bare fresh page 0 (20).
+        #expect(store.rows.count == 26)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // (k) coverage gap: `loadMore()` advances every active source
     // independently (each keeps its own offset) with no duplicate rows
     // across pages, for a merged `.all` view.

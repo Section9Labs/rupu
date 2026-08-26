@@ -80,4 +80,26 @@ struct AutoflowRunsTableTests {
         expectText(AutoflowRunsTable.sortValue(scheduling, .issueRef), "#123")
         expectText(AutoflowRunsTable.sortValue(scheduling, .event), "cycle_failed")
     }
+
+    // MARK: - Find (perf & interaction arc, Plan 5 Task 5) — web-parity fields:
+    // [e.workflow, KIND_LABEL[e.kind], e.run_id, e.issue_display_ref, e.host_id, e.worker_name]
+
+    @Test func matchesWorkflowKindLabelHostIssueRefWorkerAndRunID() {
+        let r = row(
+            subject: "nightly-health", navigation: .run(id: "run-42", host: "local"),
+            eventKind: "run_launched", issueRef: "I-9", worker: "worker-z"
+        )
+        #expect(AutoflowRunsTable.matches(r, query: "nightly"))
+        #expect(AutoflowRunsTable.matches(r, query: "launched")) // AutoflowEventBadge.label, not the raw kind
+        #expect(AutoflowRunsTable.matches(r, query: "local"))
+        #expect(AutoflowRunsTable.matches(r, query: "i-9"))
+        #expect(AutoflowRunsTable.matches(r, query: "worker-z"))
+        #expect(AutoflowRunsTable.matches(r, query: "run-42"))
+        #expect(!AutoflowRunsTable.matches(r, query: "nope"))
+    }
+
+    @Test func matchesRunIDOnlyWhenNavigationIsRun() {
+        let scheduling = row(navigation: .none, eventKind: "awaiting_human")
+        #expect(!AutoflowRunsTable.matches(scheduling, query: "run-20"))
+    }
 }

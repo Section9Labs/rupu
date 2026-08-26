@@ -42,41 +42,77 @@ struct AutoflowRunsTable: View {
 
     @State private var sort = ListSort<AutoflowRunsSortKey>(key: .started, ascending: false)
     @State private var expandedIDs: Set<String> = []
+    @State private var query = ""
+    @State private var debouncedQuery = ""
 
     var body: some View {
         let _ = RenderMeter.tick("AutoflowRunsTable")
         let now = Date()
         let sorted = sortRows(rows, sort: sort, value: Self.sortValue)
-        VStack(alignment: .leading, spacing: 0) {
-            SortableHeaderRow(columns: columns, sort: $sort)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-            Divider()
-            List(sorted) { row in
-                VStack(alignment: .leading, spacing: 0) {
-                    AutoflowRunRowView(
-                        row: row, store: store, backend: backend, now: now,
-                        isExpanded: expandedIDs.contains(row.id),
-                        onToggleExpand: { toggleExpand(row.id) },
-                        onSelect: onSelect
-                    )
-                    if expandedIDs.contains(row.id), let detail = row.detail {
-                        Text(detail)
-                            .font(.dataMono(11))
-                            .foregroundStyle(Color.status(.failed))
-                            .padding(.horizontal, 12)
-                            .padding(.bottom, 8)
-                            .padding(.leading, AutoflowRunsLayout.chevron + 8)
+        let q = debouncedQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visible = q.isEmpty ? sorted : sorted.filter { Self.matches($0, query: q) }
+        VStack(alignment: .leading, spacing: 8) {
+            KindTableSearchField(placeholder: "Find autoflow activity…", query: $query)
+            VStack(alignment: .leading, spacing: 0) {
+                SortableHeaderRow(columns: columns, sort: $sort)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                Divider()
+                List {
+                    ForEach(visible) { row in
+                        VStack(alignment: .leading, spacing: 0) {
+                            AutoflowRunRowView(
+                                row: row, store: store, backend: backend, now: now,
+                                isExpanded: expandedIDs.contains(row.id),
+                                onToggleExpand: { toggleExpand(row.id) },
+                                onSelect: onSelect
+                            )
+                            if expandedIDs.contains(row.id), let detail = row.detail {
+                                Text(detail)
+                                    .font(.dataMono(11))
+                                    .foregroundStyle(Color.status(.failed))
+                                    .padding(.horizontal, 12)
+                                    .padding(.bottom, 8)
+                                    .padding(.leading, AutoflowRunsLayout.chevron + 8)
+                            }
+                        }
+                        .listRowBackground(row.status == .awaiting ? Color.status(.awaiting).opacity(0.04) : .clear)
+                        .listRowSeparator(.visible)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                     }
+                    KindTableFooter(
+                        visibleCount: visible.count,
+                        loadedCount: store.loadedCount,
+                        hasMore: store.hasMore,
+                        isLoadingMore: store.isLoadingMore,
+                        isSearchActive: !q.isEmpty || !store.statusFilter.isEmpty,
+                        onLoadMore: { Task { await store.loadMore() } }
+                    )
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets())
                 }
-                .listRowBackground(row.status == .awaiting ? Color.status(.awaiting).opacity(0.04) : .clear)
-                .listRowSeparator(.visible)
-                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
+            .panelStyle(.panel)
         }
-        .panelStyle(.panel)
+        .debouncedKindTableSearch(query: query, into: $debouncedQuery)
+    }
+
+    /// Find — case-insensitive substring across the fields the web's own
+    /// `AutoflowRuns.tsx` `matchesAutoflowQuery` call matches for events:
+    /// `[e.workflow, KIND_LABEL[e.kind], e.run_id, e.issue_display_ref,
+    /// e.host_id, e.worker_name]`. `subject` already carries `workflow ??
+    /// kind` (see `ActivityRow.init(_: APIAutoflowEventRow)`) and
+    /// `AutoflowEventBadge.label` is this table's own `KIND_LABEL`
+    /// equivalent, so both are matched against directly rather than
+    /// re-deriving the raw `workflow` field separately.
+    static func matches(_ row: ActivityRow, query: String) -> Bool {
+        var fields = [row.subject, AutoflowEventBadge.label(row.eventKind ?? ""), row.host]
+        if let issueRef = row.issueRef { fields.append(issueRef) }
+        if let worker = row.worker { fields.append(worker) }
+        if case .run(let runID, _) = row.navigation { fields.append(runID) }
+        return fields.contains { $0.lowercased().contains(query) }
     }
 
     private func toggleExpand(_ id: String) {

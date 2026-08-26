@@ -43,30 +43,60 @@ private enum SessionsLayout {
 /// takes over completely, same as every other kind table.
 struct SessionsTable: View {
     let rows: [ActivityRow]
+    let store: ActivityStore
     let onSelect: (ActivityRow) -> Void
 
     @State private var sort = ListSort<SessionsSortKey>(key: .none, ascending: false)
     @State private var hasExplicitSort = false
+    @State private var query = ""
+    @State private var debouncedQuery = ""
 
     var body: some View {
         let _ = RenderMeter.tick("SessionsTable")
         let now = Date()
         let sorted = hasExplicitSort ? sortRows(rows, sort: sort, value: Self.sortValue) : Self.updatedAtDescending(rows)
-        VStack(alignment: .leading, spacing: 0) {
-            SortableHeaderRow(columns: columns, sort: $sort)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .onChange(of: sort) { _, _ in hasExplicitSort = true }
-            Divider()
-            List(sorted) { row in
-                SessionRowView(row: row, now: now, onSelect: onSelect)
-                    .listRowSeparator(.visible)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+        let q = debouncedQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visible = q.isEmpty ? sorted : sorted.filter { Self.matches($0, query: q) }
+        VStack(alignment: .leading, spacing: 8) {
+            KindTableSearchField(placeholder: "Find sessions…", query: $query)
+            VStack(alignment: .leading, spacing: 0) {
+                SortableHeaderRow(columns: columns, sort: $sort)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .onChange(of: sort) { _, _ in hasExplicitSort = true }
+                Divider()
+                List {
+                    ForEach(visible) { row in
+                        SessionRowView(row: row, now: now, onSelect: onSelect)
+                            .listRowSeparator(.visible)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                    }
+                    KindTableFooter(
+                        visibleCount: visible.count,
+                        loadedCount: store.loadedCount,
+                        hasMore: store.hasMore,
+                        isLoadingMore: store.isLoadingMore,
+                        isSearchActive: !q.isEmpty || !store.statusFilter.isEmpty,
+                        onLoadMore: { Task { await store.loadMore() } }
+                    )
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets())
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
+            .panelStyle(.panel)
         }
-        .panelStyle(.panel)
+        .debouncedKindTableSearch(query: query, into: $debouncedQuery)
+    }
+
+    /// Find — case-insensitive substring across the fields the web's own
+    /// `Sessions.tsx` Find box matches (`[r.agent_name, r.session_id,
+    /// r.host_id]`): agent name (`subject`), session id (`id` — a session
+    /// row's `id` IS its session id, see `ActivityRow.init(_:
+    /// APISessionRow)`), host.
+    static func matches(_ row: ActivityRow, query: String) -> Bool {
+        [row.subject, row.id, row.host].contains { $0.lowercased().contains(query) }
     }
 
     private var columns: [SortableColumn<SessionsSortKey>] {

@@ -211,7 +211,7 @@ public struct ActivityScreen: View {
             case .autoflows:
                 AutoflowRunsTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
             case .sessions:
-                SessionsTable(rows: store.rows, onSelect: handleSelect)
+                SessionsTable(rows: store.rows, store: store, onSelect: handleSelect)
             }
         }
     }
@@ -354,7 +354,7 @@ public struct ActivityScreen: View {
                 case .empty:
                     blockView(label: "No autoflow cycles yet")
                 case .content:
-                    AutoflowCyclesTable(rows: cyclesStore.rows, onSelectRun: { model.navigate(to: $0) })
+                    AutoflowCyclesTable(rows: cyclesStore.rows, store: cyclesStore, onSelectRun: { model.navigate(to: $0) })
                 }
             }
         } else {
