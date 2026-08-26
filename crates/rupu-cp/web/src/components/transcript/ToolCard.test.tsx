@@ -7,7 +7,7 @@
 
 import { it, expect, describe, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
-import { summarizeInput, parseAstGrepText } from './ToolCard';
+import { summarizeInput, parseAstGrepText, parseSubrunOutput } from './ToolCard';
 import ToolCard from './ToolCard';
 import type { ToolView, FindingView } from './transcriptView';
 import { api } from '../../lib/api';
@@ -243,23 +243,60 @@ it('error ToolView shows red error block', () => {
   expect(screen.getByText('File not found: missing.ts')).not.toBeNull();
 });
 
-it('subrun ToolView with transcript_path and callback renders button', () => {
+// The subrun output fixtures below mirror the ACTUAL wire shape emitted by
+// crates/rupu-tools/src/dispatch_agent.rs (single: top-level `ok` /
+// `tokens_used` / `transcript_path` / `sub_run_id`) and
+// dispatch_agents_parallel.rs (top-level `ok` + `all_succeeded`, per-request
+// fields nested under `results` keyed by request id). The previous fixtures
+// used `status` / `total_tokens`, which no producer emits.
+
+it('subrun ToolView (dispatch_agent shape) renders ok + token chips and transcript button', () => {
   let clicked = '';
   const tv: ToolView = {
     tool: 'dispatch_agent',
     kind: 'subrun',
     input: { agent: 'scanner' },
     output: JSON.stringify({
-      status: 'completed',
-      total_tokens: 4200,
+      ok: true,
+      agent: 'scanner',
+      output: 'done',
+      findings: [],
+      tokens_used: 4200,
+      duration_ms: 500,
       transcript_path: '/runs/abc/transcript.jsonl',
+      sub_run_id: 'sub_abc',
     }),
   };
   render(<ToolCard tool={tv} onOpenTranscript={(p) => { clicked = p; }} />);
+  // The card header has its own muted "ok" chip; the body's status badge is
+  // the green-toned one.
+  expect(screen.getAllByText('ok').some((el) => el.className.includes('bg-ok-bg'))).toBe(true);
+  expect(screen.getByText('4,200 tokens')).not.toBeNull();
   const btn = screen.getByRole('button', { name: /View sub-run transcript/ });
   expect(btn).not.toBeNull();
   btn.click();
   expect(clicked).toBe('/runs/abc/transcript.jsonl');
+});
+
+it('subrun ToolView with ok:false renders a failed chip', () => {
+  const tv: ToolView = {
+    tool: 'dispatch_agent',
+    kind: 'subrun',
+    input: { agent: 'scanner' },
+    output: JSON.stringify({
+      ok: false,
+      agent: 'scanner',
+      output: 'boom',
+      findings: [],
+      tokens_used: 0,
+      duration_ms: 10,
+      transcript_path: '/runs/x/transcript.jsonl',
+      sub_run_id: 'sub_x',
+    }),
+  };
+  render(<ToolCard tool={tv} />);
+  expect(screen.getByText('failed')).not.toBeNull();
+  expect(screen.getByText('0 tokens')).not.toBeNull();
 });
 
 it('subrun ToolView without callback renders path as chip (no button)', () => {
@@ -268,7 +305,10 @@ it('subrun ToolView without callback renders path as chip (no button)', () => {
     kind: 'subrun',
     input: { agent: 'scanner' },
     output: JSON.stringify({
+      ok: true,
+      tokens_used: 12,
       transcript_path: '/runs/abc/transcript.jsonl',
+      sub_run_id: 'sub_abc',
     }),
   };
   render(<ToolCard tool={tv} />);
@@ -276,6 +316,106 @@ it('subrun ToolView without callback renders path as chip (no button)', () => {
   expect(screen.queryByRole('button', { name: /View sub-run transcript/ })).toBeNull();
   // Path shown as chip text
   expect(screen.getByText('/runs/abc/transcript.jsonl')).not.toBeNull();
+});
+
+it('subrun ToolView (dispatch_agents_parallel shape) renders per-request rows', () => {
+  const opened: string[] = [];
+  const tv: ToolView = {
+    tool: 'dispatch_agents_parallel',
+    kind: 'subrun',
+    input: { requests: [] },
+    output: JSON.stringify({
+      ok: false,
+      results: {
+        reviewer: {
+          ok: true,
+          agent: 'reviewer',
+          output: 'lgtm',
+          findings: [],
+          tokens_used: 1500,
+          duration_ms: 900,
+          transcript_path: '/runs/p/sub_r/transcript.jsonl',
+          sub_run_id: 'sub_r',
+        },
+        scanner: {
+          ok: false,
+          agent: 'scanner',
+          error: 'dispatch failed: agent not found',
+        },
+      },
+      all_succeeded: false,
+    }),
+  };
+  render(<ToolCard tool={tv} onOpenTranscript={(p) => { opened.push(p); }} />);
+  // Per-request ids shown
+  expect(screen.getByText('reviewer')).not.toBeNull();
+  expect(screen.getByText('scanner')).not.toBeNull();
+  // reviewer row: ok chip (green-toned; the header has its own muted "ok"
+  // chip) + tokens + working transcript button
+  expect(screen.getAllByText('ok').some((el) => el.className.includes('bg-ok-bg'))).toBe(true);
+  expect(screen.getByText('1,500 tokens')).not.toBeNull();
+  const btn = screen.getByRole('button', { name: /View sub-run transcript/ });
+  btn.click();
+  expect(opened).toEqual(['/runs/p/sub_r/transcript.jsonl']);
+  // scanner row: failed chips (top-level + row) + error text
+  expect(screen.getAllByText('failed').length).toBe(2);
+  expect(screen.getByText(/agent not found/)).not.toBeNull();
+});
+
+it('subrun ToolView with unparseable output falls back to raw pre', () => {
+  const tv: ToolView = {
+    tool: 'dispatch_agent',
+    kind: 'subrun',
+    input: { agent: 'scanner' },
+    output: 'not json at all',
+  };
+  render(<ToolCard tool={tv} />);
+  expect(screen.getByText('not json at all')).not.toBeNull();
+});
+
+describe('parseSubrunOutput', () => {
+  it('parses a real dispatch_agent result body', () => {
+    const json = JSON.stringify({
+      ok: true, agent: 'reviewer', output: 'done', findings: [],
+      tokens_used: 1234, duration_ms: 500,
+      transcript_path: '/tmp/sub_TEST/transcript.jsonl', sub_run_id: 'sub_TEST',
+    });
+    const parsed = parseSubrunOutput(json);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.top).toEqual({
+      ok: true,
+      tokensUsed: 1234,
+      transcriptPath: '/tmp/sub_TEST/transcript.jsonl',
+      subRunID: 'sub_TEST',
+      error: null,
+    });
+    expect(parsed?.requests).toEqual([]);
+  });
+
+  it('parses the parallel shape into per-request payloads', () => {
+    const json = JSON.stringify({
+      ok: true,
+      results: {
+        a: { ok: true, agent: 'a1', tokens_used: 10, transcript_path: '/t/a.jsonl', sub_run_id: 'sub_a' },
+        b: { ok: false, agent: 'b1', error: 'boom' },
+      },
+      all_succeeded: true,
+    });
+    const parsed = parseSubrunOutput(json);
+    expect(parsed?.top?.ok).toBe(true);
+    expect(parsed?.requests.map((r) => r.id)).toEqual(['a', 'b']);
+    expect(parsed?.requests[0].payload.tokensUsed).toBe(10);
+    expect(parsed?.requests[0].payload.transcriptPath).toBe('/t/a.jsonl');
+    expect(parsed?.requests[1].payload.ok).toBe(false);
+    expect(parsed?.requests[1].payload.error).toBe('boom');
+  });
+
+  it('returns null for non-JSON, non-object JSON, and objects with none of the wire fields', () => {
+    expect(parseSubrunOutput(undefined)).toBeNull();
+    expect(parseSubrunOutput('nope')).toBeNull();
+    expect(parseSubrunOutput('[1,2]')).toBeNull();
+    expect(parseSubrunOutput('{"status": "completed", "total_tokens": 5}')).toBeNull();
+  });
 });
 
 it('read ToolView renders output in a pre block with path in header', () => {

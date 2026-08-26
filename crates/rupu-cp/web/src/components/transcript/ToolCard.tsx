@@ -434,7 +434,120 @@ function GlobBody({ tool }: { tool: ToolView }) {
   );
 }
 
-/** subrun — callout with transcript_path link / button */
+// ---------------------------------------------------------------------------
+// subrun output parsing — exported for unit tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields one dispatched sub-run reports on the wire. The producers are
+ * `crates/rupu-tools/src/dispatch_agent.rs` (`ok` / `tokens_used` /
+ * `transcript_path` / `sub_run_id`, all top-level) and
+ * `dispatch_agents_parallel.rs` (same fields per request under `results`,
+ * with `error` replacing them on a failed dispatch). There is no `status`
+ * or `total_tokens` field — those were never emitted.
+ */
+export interface SubrunPayload {
+  ok: boolean | null;
+  tokensUsed: number | null;
+  transcriptPath: string | null;
+  subRunID: string | null;
+  error: string | null;
+}
+
+export interface ParsedSubrunOutput {
+  /** Single-dispatch fields, or the parallel body's own top-level `ok`. */
+  top: SubrunPayload | null;
+  /** Parallel-dispatch per-request payloads, keyed by request id. */
+  requests: Array<{ id: string; payload: SubrunPayload }>;
+}
+
+function subrunPayloadFromRecord(rec: Record<string, unknown>): SubrunPayload | null {
+  const ok = typeof rec.ok === 'boolean' ? rec.ok : null;
+  const tokensUsed = typeof rec.tokens_used === 'number' ? rec.tokens_used : null;
+  const transcriptPath = typeof rec.transcript_path === 'string' ? rec.transcript_path : null;
+  const subRunID = typeof rec.sub_run_id === 'string' ? rec.sub_run_id : null;
+  const error = typeof rec.error === 'string' ? rec.error : null;
+  if (ok === null && tokensUsed === null && transcriptPath === null && subRunID === null && error === null) {
+    return null;
+  }
+  return { ok, tokensUsed, transcriptPath, subRunID, error };
+}
+
+/**
+ * Parse a subrun tool's output body into renderable payloads. Returns null
+ * when the output is absent, isn't JSON, isn't a top-level object, or
+ * carries none of the wire fields — an honest "nothing to show" that routes
+ * the body to the raw fallback instead of rendering empty chips.
+ */
+export function parseSubrunOutput(output: string | undefined): ParsedSubrunOutput | null {
+  const parsed = tryParseJson(output);
+  if (!isRecord(parsed)) return null;
+
+  const top = subrunPayloadFromRecord(parsed);
+
+  const requests: Array<{ id: string; payload: SubrunPayload }> = [];
+  if (isRecord(parsed.results)) {
+    for (const [id, entry] of Object.entries(parsed.results)) {
+      if (!isRecord(entry)) continue;
+      const payload = subrunPayloadFromRecord(entry);
+      if (payload) requests.push({ id, payload });
+    }
+  }
+
+  if (!top && requests.length === 0) return null;
+  return { top, requests };
+}
+
+/** Chips + transcript affordance for one sub-run's payload. */
+function SubrunPayloadRow({
+  payload,
+  onOpenTranscript,
+}: {
+  payload: SubrunPayload;
+  onOpenTranscript?: (path: string) => void;
+}) {
+  const { ok, tokensUsed, transcriptPath, error } = payload;
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-1.5 items-center">
+        {ok !== null && (
+          <Badge tone={ok ? 'green' : 'red'} className="px-2 font-mono">
+            {ok ? 'ok' : 'failed'}
+          </Badge>
+        )}
+        {tokensUsed !== null && (
+          <Badge tone="neutral" className="px-2 font-mono">
+            {tokensUsed.toLocaleString()} tokens
+          </Badge>
+        )}
+      </div>
+
+      {error && (
+        <p className="font-mono text-[10.5px] text-err break-all">{error}</p>
+      )}
+
+      {transcriptPath && (
+        <div className="flex items-center gap-2">
+          {onOpenTranscript ? (
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => onOpenTranscript(transcriptPath)}
+            >
+              View sub-run transcript →
+            </Button>
+          ) : (
+            <span className="inline-block font-mono text-[10.5px] text-brand-700 bg-surface border border-border rounded px-2 py-0.5 break-all">
+              {transcriptPath}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** subrun — status/token chips + transcript_path link / button */
 function SubrunBody({
   tool,
   onOpenTranscript,
@@ -444,57 +557,25 @@ function SubrunBody({
 }) {
   if (tool.error) return null;
 
-  const parsed = tryParseJson(tool.output);
-  const rec = isRecord(parsed) ? parsed : null;
-  const transcriptPath =
-    rec && typeof rec.transcript_path === 'string' ? rec.transcript_path : null;
+  const parsed = parseSubrunOutput(tool.output);
 
-  // Sub-run metadata from parsed object
-  const totalTokens =
-    rec && typeof rec.total_tokens === 'number' ? rec.total_tokens : null;
-  const status =
-    rec && typeof rec.status === 'string' ? rec.status : null;
-
-  if (rec) {
+  if (parsed) {
     return (
       <div className="px-3 py-2 space-y-2">
-        {/* Summary chips */}
-        <div className="flex flex-wrap gap-1.5 items-center">
-          {status && (
-            <Badge tone="neutral" className="px-2 font-mono">
-              status: {status}
-            </Badge>
-          )}
-          {totalTokens !== null && (
-            <Badge tone="neutral" className="px-2 font-mono">
-              {totalTokens.toLocaleString()} tokens
-            </Badge>
-          )}
-        </div>
-
-        {/* Transcript path / button */}
-        {transcriptPath && (
-          <div className="flex items-center gap-2">
-            {onOpenTranscript ? (
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={() => onOpenTranscript(transcriptPath)}
-              >
-                View sub-run transcript →
-              </Button>
-            ) : (
-              <span className="inline-block font-mono text-[10.5px] text-brand-700 bg-surface border border-border rounded px-2 py-0.5 break-all">
-                {transcriptPath}
-              </span>
-            )}
-          </div>
+        {parsed.top && (
+          <SubrunPayloadRow payload={parsed.top} onOpenTranscript={onOpenTranscript} />
         )}
+        {parsed.requests.map(({ id, payload }) => (
+          <div key={id} className="border-t border-border pt-2 space-y-1.5">
+            <p className="font-mono text-[10.5px] text-ink-mute">{id}</p>
+            <SubrunPayloadRow payload={payload} onOpenTranscript={onOpenTranscript} />
+          </div>
+        ))}
       </div>
     );
   }
 
-  // Parse failed — fall back to StructuredView / pre
+  // Parse failed / no wire fields — fall back to raw pre
   if (tool.output) {
     return (
       <div className="px-3 py-2">
