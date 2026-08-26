@@ -14,6 +14,15 @@ let package = Package(
             ]
         )
     ],
+    dependencies: [
+        // The app's FIRST third-party Swift dependency, under an explicit carve-out (matt,
+        // 2026-08-25) — see CLAUDE.md's macOS rule 4. Exact-pinned to 3.1.0 (latest tagged
+        // release at the time this was added): a Swift wrapper bundling highlight.js, MIT/
+        // BSD-family licensed, with no dependencies of its own. Used by `RupuRunDetail`'s
+        // `CodeHighlighter`/`CodeBlock` (`Rendering/CodeBlock.swift`) for transcript code-block
+        // syntax highlighting.
+        .package(url: "https://github.com/smittytone/HighlighterSwift", exact: "3.1.0")
+    ],
     targets: [
         .target(name: "RupuAPI"),
         .target(name: "RupuBackend", dependencies: ["RupuAPI"]),
@@ -51,7 +60,13 @@ let package = Package(
         .target(name: "RupuSituation", dependencies: ["RupuAPI", "RupuDesign", "RupuStore"]),
         .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign", "RupuUsageKit"]),
         .target(name: "RupuActivity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
-        .target(name: "RupuRunDetail", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(
+            name: "RupuRunDetail",
+            dependencies: [
+                "RupuAPI", "RupuStore", "RupuDesign",
+                .product(name: "Highlighter", package: "HighlighterSwift"),
+            ]
+        ),
         .target(name: "RupuLauncher", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(name: "RupuOverview", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(name: "RupuProjects", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
