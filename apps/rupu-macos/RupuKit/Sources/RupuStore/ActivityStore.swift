@@ -91,6 +91,45 @@ public final class ActivityStore {
     public var liveTail: Bool = true
 
     public private(set) var rows: [ActivityRow] = []
+
+    /// **The fleet-wide, always-unscoped projection** (perf & interaction
+    /// arc, Plan 5 Task 2 fix-round-1 — the shared-store review's Critical):
+    /// every row for the currently active `kind` sources, sorted and
+    /// status-patched exactly like `rows`, but NEVER narrowed by
+    /// `scopeFilter` or `statusFilter`. `NeedsYouCard`/`deriveNeedsYou`
+    /// read this instead of `rows`.
+    ///
+    /// **Why this exists**: `ActivityStore` is now a single instance shared
+    /// by `ActivityScreen` (which legitimately narrows `rows` by
+    /// `scopeFilter`/`statusFilter` for its own table) and `OverviewScreen`
+    /// (whose needs-you queue must see every gate/failure fleet-wide,
+    /// regardless of whichever scope/status the OTHER screen last left the
+    /// shared instance in — see `NeedsYouCard`'s own doc comment). Before
+    /// sharing, `OverviewScreen` held a private `ActivityStore` that simply
+    /// never had `scopeFilter`/`statusFilter` set; that guarantee held "for
+    /// free" by construction. Sharing broke it: `ActivityScreen.activate(
+    /// kind:)` sets `scopeFilter = model.scopeWsID` on every activation, and
+    /// nothing reset it when the operator navigated back to Overview — a
+    /// project-scoped visit to Activity silently under-reported every
+    /// OTHER project's gates/failures on Overview afterward.
+    ///
+    /// The fix is structural, not "reset the shared state at the right
+    /// screen-transition point" choreography (which rots the next time a
+    /// third screen starts sharing this store, or the reset call is
+    /// forgotten): `unscopedRows` is unconditionally maintained alongside
+    /// `rows` by the SAME `recompute()` pass, so a scoped/status-filtered
+    /// store can never hide anything from a consumer that reads this
+    /// property instead — the invariant holds regardless of what any other
+    /// screen does to `scopeFilter`/`statusFilter`, with no caller
+    /// discipline required.
+    ///
+    /// `kind` narrowing is NOT lifted here, deliberately — `kind` selects
+    /// which underlying federated SOURCES are even fetched at all (a
+    /// fetch-scope decision, not a display-time filter over already-fetched
+    /// data), and `OverviewScreen` already asserts its own `kind: .all`
+    /// on every activation, the same way it always has.
+    public private(set) var unscopedRows: [ActivityRow] = []
+
     public private(set) var state: BlockState<Void> = .loading
     public private(set) var pendingNewRuns: Int = 0
     public private(set) var freshness: StreamLifecycle.Freshness = .idle
@@ -521,15 +560,23 @@ public final class ActivityStore {
             else { continue }
             merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
         }
+        merged.sort(by: Self.isOrderedByStartedAtDescending)
+
+        // Fleet-wide, unscoped projection — see `unscopedRows`'s own doc
+        // comment. Assigned BEFORE either filter narrows `merged` below, so
+        // it always carries every row for the active `kind` sources,
+        // patched and sorted, never scope/status-narrowed.
+        unscopedRows = merged
+
+        var filtered = merged
         if !statusFilter.isEmpty {
-            merged = merged.filter { statusFilter.contains($0.status) }
+            filtered = filtered.filter { statusFilter.contains($0.status) }
         }
         if let scopeFilter {
-            merged = merged.filter { $0.project == scopeFilter }
+            filtered = filtered.filter { $0.project == scopeFilter }
         }
-        merged.sort(by: Self.isOrderedByStartedAtDescending)
-        rows = merged
-        state = Self.aggregateState(activeSnapshots().map(\.state), rowsAreEmpty: merged.isEmpty)
+        rows = filtered
+        state = Self.aggregateState(activeSnapshots().map(\.state), rowsAreEmpty: filtered.isEmpty)
     }
 
     // MARK: - Remote hosts (progressive per-host loading)
@@ -737,28 +784,45 @@ public final class ActivityStore {
     /// Session rows likewise never carry `.run` navigation — a session's
     /// status is derived from its `activeRunID`/`lastError` at fetch time,
     /// not live-patched from run events.
-    private func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
-        statusOverrides[runID] = (status, durationMS)
-        guard let index = rows.firstIndex(where: {
-            if case .run(let id, _) = $0.navigation { return id == runID }
-            return false
-        }) else { return }
-        rows[index] = rows[index].patchingStatus(status, durationMS: durationMS)
+    /// Matched by `navigation`'s run id — see this method's callers'
+    /// doc comments (`patchRow`/`isRunAlreadyVisible`) for why that's the
+    /// correct key rather than `row.id`.
+    private static func matchesRun(_ row: ActivityRow, runID: String) -> Bool {
+        if case .run(let id, _) = row.navigation { return id == runID }
+        return false
     }
 
-    /// True if `runID` is already represented in this store — either in the
-    /// current (possibly `statusFilter`-narrowed) `rows`, or in one of the
-    /// active snapshots' unfiltered rows (a run the filter is currently
-    /// hiding is still one this store has, just not one it's showing).
-    /// Matched by the same `.run(id:_)` navigation key `patchRow` resolves
-    /// rows by.
-    private func isRunAlreadyVisible(_ runID: String) -> Bool {
-        func matches(_ row: ActivityRow) -> Bool {
-            if case .run(let id, _) = row.navigation { return id == runID }
-            return false
+    /// Patches BOTH `rows` and `unscopedRows` in place (fix-round-1, perf &
+    /// interaction arc Plan 5 Task 2 review: `unscopedRows` is a SEPARATE
+    /// array from `rows`, not a superset view over it, so this fast,
+    /// no-full-`recompute()` path must patch each independently — a live
+    /// status patch that only touched `rows` would leave `unscopedRows`
+    /// (and therefore `NeedsYouCard`) showing a stale status for the same
+    /// row until the next full `recompute()`). `statusOverrides` (the
+    /// durable record `recompute()` itself reapplies) is the single source
+    /// of truth either patch reads from — this only fast-forwards the two
+    /// already-materialized arrays to match it immediately.
+    private func patchRow(runID: String, status: ActivityStatus, durationMS: UInt64?) {
+        statusOverrides[runID] = (status, durationMS)
+        if let index = rows.firstIndex(where: { Self.matchesRun($0, runID: runID) }) {
+            rows[index] = rows[index].patchingStatus(status, durationMS: durationMS)
         }
-        if rows.contains(where: matches) { return true }
-        return activeSnapshots().contains { $0.rows.contains(where: matches) }
+        if let index = unscopedRows.firstIndex(where: { Self.matchesRun($0, runID: runID) }) {
+            unscopedRows[index] = unscopedRows[index].patchingStatus(status, durationMS: durationMS)
+        }
+    }
+
+    /// True if `runID` is already represented in this store — either in
+    /// `unscopedRows` (kind-scoped but never status/scope-narrowed — a run
+    /// `rows` is currently hiding via `statusFilter`/`scopeFilter` is still
+    /// one this store has, just not one `rows` is showing), or in one of
+    /// the active snapshots' own unfiltered rows (covers a row not yet
+    /// folded into `unscopedRows` by a `recompute()` pass, e.g. a remote
+    /// host's contribution still in flight). Matched by the same
+    /// `.run(id:_)` navigation key `patchRow` resolves rows by.
+    private func isRunAlreadyVisible(_ runID: String) -> Bool {
+        if unscopedRows.contains(where: { Self.matchesRun($0, runID: runID) }) { return true }
+        return activeSnapshots().contains { $0.rows.contains(where: { Self.matchesRun($0, runID: runID) }) }
     }
 
     /// Coalesces a burst of `.newRun` deltas into one refresh: each new

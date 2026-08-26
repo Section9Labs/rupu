@@ -307,6 +307,50 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // (b3) perf & interaction arc, Plan 5 Task 2 fix-round-1 (shared-store
+    // review Critical): `unscopedRows` is the projection `NeedsYouCard`
+    // reads instead of `rows` — it must NEVER be narrowed by
+    // `scopeFilter`/`statusFilter`, since `ActivityScreen` (which shares
+    // this exact instance with `OverviewScreen` — see `RootView.
+    // activityStore`) sets both on every activation with no reset when the
+    // operator navigates back to Overview. This is the regression repro: an
+    // awaiting workflow row (a gate — `project` is always `nil` for
+    // non-session rows, so it can never pass a non-nil scope) must still be
+    // visible in `unscopedRows` even while `scopeFilter`/`statusFilter` are
+    // set exactly the way `ActivityScreen.activate(kind:)` would leave them
+    // — while `rows` (the Activity table's own projection) still narrows
+    // exactly as before this fix.
+    @MainActor @Test func unscopedRowsIgnoresScopeAndStatusFilterWhileRowsStaysNarrowed() async {
+        let (store, box) = makeStore(respond: { req in
+            switch req.url?.path {
+            case "/api/runs/workflows":
+                let gate = Self.runListRowJSON(id: "run-gate-1", startedAt: "2026-08-20T13:00:00Z", status: "awaiting_approval")
+                return (200, Data("[\(gate)]".utf8))
+            default:
+                return (200, ActivityStoreTests.fourSourceBody(for: req.url?.path ?? ""))
+            }
+        })
+        await store.activate(kind: .all)
+        #expect(store.unscopedRows.map(\.id).contains("run-gate-1"))
+        #expect(store.rows.map(\.id).contains("run-gate-1"))
+
+        // Exactly what `ActivityScreen.activate(kind:)` does on a
+        // project-scoped visit — no other screen resets this.
+        store.scopeFilter = "some-other-project"
+        store.statusFilter = [.completed]
+
+        #expect(!store.rows.map(\.id).contains("run-gate-1"), "sanity: rows correctly narrows away the out-of-scope, wrong-status gate — Activity's own table behavior is unchanged")
+        #expect(store.unscopedRows.map(\.id).contains("run-gate-1"), "the gate must still be visible in unscopedRows regardless of scope/status")
+        guard let gateRow = store.unscopedRows.first(where: { $0.id == "run-gate-1" }) else {
+            Issue.record("expected run-gate-1 in unscopedRows")
+            return
+        }
+        #expect(gateRow.status == .awaiting)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // (c) liveTail off: a runStarted event increments pendingNewRuns and
     // leaves rows untouched; applyPendingRefresh() refetches and zeroes it.
     @MainActor @Test func liveTailOffCountsPendingNewRunsWithoutMutatingRows() async {
@@ -357,6 +401,41 @@ struct ActivityStoreTests {
         #expect(store.rows.filter { $0.id != "run-wf-1" }.count == 3)
         // Scoped to the four source paths — see `sourcePaths`'s doc comment
         // on why the plain global `requestCount` would be racy here.
+        #expect(ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths) == requestsAfterActivate)
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (d2) perf & interaction arc, Plan 5 Task 2 fix-round-1 (shared-store
+    // review): `liveTail` gates only whether a genuinely NEW run (a
+    // `.newRun` delta for a run this store has never fetched) triggers an
+    // eager refresh vs. just incrementing `pendingNewRuns` — see
+    // `ActivityStore.apply(_:)`'s `.newRun` branch. It does NOT gate
+    // `.statusPatch` (an in-place correction to an ALREADY-visible row),
+    // which `patchRow` applies unconditionally. This matters for the shared
+    // store: `OverviewScreen`'s needs-you queue must never go stale on an
+    // existing gate's status just because `ActivityScreen` last paused live
+    // tail. Proven here with `liveTail = false`: `unscopedRows` (and
+    // `rows`) both still patch in place, immediately, no refetch.
+    @MainActor @Test func liveTailOffStillPatchesAlreadyVisibleRowsInUnscopedRowsAndRows() async {
+        let (store, box) = makeStore()
+        store.liveTail = false
+        await store.activate(kind: .all)
+        let requestsAfterActivate = ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths)
+        #expect(store.unscopedRows.first(where: { $0.id == "run-wf-1" })?.status == .running)
+
+        box.latest.yield(.connection(true))
+        box.latest.yield(.event(.runCompleted(runID: "run-wf-1", status: "completed", finishedAt: "2026-08-20T10:05:00Z")))
+        await expectEventually("run-wf-1's status patches to .completed in unscopedRows even with liveTail off") {
+            store.unscopedRows.first(where: { $0.id == "run-wf-1" })?.status == .completed
+        }
+
+        #expect(store.rows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
+        #expect(store.unscopedRows.first(where: { $0.id == "run-wf-1" })?.status == .completed)
+        // No refetch — the patch alone did this, exactly like the
+        // liveTail-on case; liveTail's cadence gate never applied here at
+        // all, since `.statusPatch` isn't the `.newRun` branch it guards.
         #expect(ActivityStubURLProtocol.requestCount(forPaths: Self.sourcePaths) == requestsAfterActivate)
 
         store.deactivate()

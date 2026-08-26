@@ -132,15 +132,22 @@ private func isOrderedNewestFirst(_ lhs: ActivityRow, _ rhs: ActivityRow) -> Boo
 /// `deriveNeedsYou`'s output, with inline gate approve/reject wired through
 /// `ActivityStore`'s gate-scoped mutations.
 public struct NeedsYouCard: View {
-    /// **Must always be unscoped** (Task 6, read this before wiring):
-    /// `store.scopeFilter` must never be set on the instance passed in here.
-    /// The fleet-wide "needs you" queue has to see every gate/failure
-    /// regardless of the v2 top bar's project-scope selection — scope
-    /// narrowing lives entirely in `ActivityStore.scopeFilter` itself, and
-    /// this view has no scope knowledge of its own to apply or ignore, so a
-    /// scoped store handed in here would silently hide out-of-scope
-    /// gates/failures from the one place they're supposed to always be
-    /// visible.
+    /// **Fleet-wide by construction, not by caller discipline** (perf &
+    /// interaction arc, Plan 5 Task 2 fix-round-1): this reads
+    /// `store.unscopedRows`, never `store.scopeFilter`-or-`statusFilter`-
+    /// narrowed `store.rows` — see `ActivityStore.unscopedRows`'s own doc
+    /// comment. The needs-you queue has to see every gate/failure
+    /// regardless of the v2 top bar's project-scope selection AND
+    /// regardless of whatever `scopeFilter`/`statusFilter` `ActivityScreen`
+    /// (which shares this exact `ActivityStore` instance — see `RootView.
+    /// activityStore`'s doc comment) may have last left the store in.
+    /// Originally this was an invariant the CALLER had to uphold ("never
+    /// pass a scoped store in here") — that broke the moment the store
+    /// became shared, since nothing reset `scopeFilter` when the operator
+    /// navigated from Activity back to Overview. Reading `unscopedRows`
+    /// instead makes the guarantee structural: no store state any other
+    /// screen sets can make this view hide anything, because this view
+    /// never reads the narrowed projection at all.
     private let store: ActivityStore
     private let backend: BackendController
     private let range: TimeRange
@@ -161,7 +168,7 @@ public struct NeedsYouCard: View {
     /// nothing would still read as a card with content, just an
     /// unusually terse one.
     public var body: some View {
-        let result = deriveNeedsYou(rows: store.rows, range: range, now: Date())
+        let result = deriveNeedsYou(rows: store.unscopedRows, range: range, now: Date())
 
         if result.items.isEmpty {
             emptyRow
