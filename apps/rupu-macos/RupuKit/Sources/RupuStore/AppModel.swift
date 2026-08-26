@@ -153,11 +153,23 @@ public final class AppModel {
     ///
     /// Flows-composition Task 1: every `.activity(_:)` kind (and every
     /// pushed detail route reached from one) maps to the single
-    /// `SidebarItem.activity` — the v2 rail no longer has a kind-per-row
-    /// "Runs" section, kind selection lives in the Activity screen's own
-    /// `FilterBar`. Selecting `.activity` from the rail restores
-    /// `lastActivityRoute` rather than forcing `.all`, so the user's kind
-    /// tab survives a round trip through another sidebar item.
+    /// `SidebarItem.activity` — kind selection used to live only in the
+    /// Activity screen's own `FilterBar`; design-alignment Task 0 restores a
+    /// sidebar-level picker too (`RupuShell.Sidebar`'s disclosure children),
+    /// but the mapping here is unchanged. Selecting `.activity` from the
+    /// rail restores `lastActivityRoute` rather than forcing `.all`, so the
+    /// user's kind tab survives a round trip through another sidebar item.
+    ///
+    /// **Task 0**: `.security(_)`/`.library(_)`/`.fleet(_)` gained an
+    /// associated tab so `Route` can carry which of a composite screen's
+    /// tabs is showing (`RupuShell.Sidebar`'s children, and each screen's
+    /// own in-page tab picker, both read/write it directly) — every tab
+    /// still maps to the same parent `SidebarItem` here, ignoring which one.
+    /// Unlike `.activity`, a bare parent-row click does NOT restore
+    /// whichever tab was last showing — it resets to that screen's fixed
+    /// default (`.findings`/`.agents`/`.hosts`), per the design-alignment
+    /// amendment's explicit ruling (no default-associated-value shorthand
+    /// exists in Swift, so the default is spelled out here instead).
     public var selectedSidebarItem: SidebarItem {
         get {
             switch route {
@@ -176,9 +188,9 @@ public final class AppModel {
             case .overview: route = .overview
             case .activity: route = lastActivityRoute
             case .projects: route = .projects
-            case .security: route = .security
-            case .library: route = .library
-            case .fleet: route = .fleet
+            case .security: route = .security(.findings)
+            case .library: route = .library(.agents)
+            case .fleet: route = .fleet(.hosts)
             case .usage: route = .usage
             }
         }

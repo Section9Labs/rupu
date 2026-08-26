@@ -4,20 +4,6 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// Which definition tab the Library screen is showing. Segmented control,
-/// same idiom `FilterBar`'s kind picker uses for Activity.
-public enum LibraryTab: String, CaseIterable, Sendable {
-    case agents, workflows, autoflows
-
-    var title: String {
-        switch self {
-        case .agents: "Agents"
-        case .workflows: "Workflows"
-        case .autoflows: "Autoflows"
-        }
-    }
-}
-
 public enum AgentsSortKey: Hashable, CaseIterable, Sendable {
     case name, scope, model, runs, lastRun
 }
@@ -58,13 +44,17 @@ private enum LibraryLayout {
 /// has no reconcile loop to stop (a one-shot `activate()` per appearance,
 /// same as `ProjectsStore`); there is nothing running in the background to
 /// tear down.
+///
+/// **Route-driven tab (Task 0, sidebar disclosure sub-items)**: `tab` is no
+/// longer local `@State` — `LibraryTab` moved to `RupuStore.Route`, same
+/// "sidebar children and the in-page picker share `model.route`" contract
+/// `SecurityScreen`'s doc comment documents for `SecurityTab`.
 public struct LibraryScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
 
     @State private var store: LibraryStore?
     @State private var storeClientID: ObjectIdentifier?
-    @State private var tab: LibraryTab = .agents
     @State private var agentsSort = ListSort<AgentsSortKey>(key: .name, ascending: true)
     @State private var workflowsSort = ListSort<WorkflowsSortKey>(key: .name, ascending: true)
     @State private var autoflowsSort = ListSort<AutoflowsSortKey>(key: .name, ascending: true)
@@ -117,12 +107,23 @@ public struct LibraryScreen: View {
         }
     }
 
+    /// `model.route`'s associated tab — see `SecurityScreen.tab`'s identical
+    /// doc comment for the fallback rationale.
+    private var tab: LibraryTab {
+        if case .library(let tab) = model.route { return tab }
+        return .agents
+    }
+
+    private var tabBinding: Binding<LibraryTab> {
+        Binding(get: { tab }, set: { model.route = .library($0) })
+    }
+
     private var tabPicker: some View {
         // `.labelsHidden()` (review fix, final wave) — without it the
         // `Picker`'s "Tab" label string rendered visibly above the
         // segmented control (GUI-only nit; `make macos-test` stayed green
         // throughout since nothing asserted the label's visibility).
-        Picker("Tab", selection: $tab) {
+        Picker("Tab", selection: tabBinding) {
             ForEach(LibraryTab.allCases, id: \.self) { candidate in
                 Text(candidate.title).tag(candidate)
             }
