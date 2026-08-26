@@ -84,7 +84,8 @@ superseded banner (not deleted — it documents the Phase 1–3 baseline).
   brand (the web v1 "contains active" idiom). Active row: surface fill +
   inset 2px left brand accent; child rows indented one level, same 30pt
   height. This is "web look, native feel" applied to IA: v2 visual language,
-  the v1 tree's reachability.
+  the v1 tree's reachability. *(Plan 2 shipped the flat rail before this
+  amendment; the sub-items retrofit executes as Plan 3 Task 0.)*
 - **Top bar (48pt)**: scope select (project or "all projects" — wired to the
   workspace filter where list APIs accept ws_id, honest "all" otherwise), range
   segmented (7d/30d/all — existing state), **⌘K search field** opening a native
@@ -179,9 +180,11 @@ FindingCard, SourcePreview, AstTree, StructuredView), `transcriptView.ts`
   full ast_grep rich body: per-file groups, metavariable-highlighted snippet,
   bindings table, inline SourcePreview (line-numbered, target line tinted
   warn-bg, per-line highlighting) and AstTree (CST viewer, matched node tinted
-  + ancestors auto-expanded). New client surface: `readSource` / `readAst`
-  against the existing `/api/runs/:id/source` and `/ast` endpoints (+ fixture
-  coverage via the drift rig).
+  + ancestors auto-expanded). The source/CST client surface (`runSource` /
+  `runAst`, `SourceModels.swift`, the preview views) shipped with Phase 6B and
+  is reused; what's new is the metavar extension of `AstGrepTranscriptParsing`
+  (deliberately omitted then), the tool_audit/action_emitted payload decode,
+  and fixture coverage for both via the drift rig.
 - Session detail and agent-run detail inherit everything (same feed).
 
 ## 6. Verification & sequencing

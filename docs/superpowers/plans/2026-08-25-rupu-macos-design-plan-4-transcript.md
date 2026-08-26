@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- Plans 1–3 have landed (tokens/`StatusTone`/`Icon`/chrome kit; tabbed run-detail panel; graph selection driving `focusStep`). If not, STOP and say so.
+- Plans 1–2 are MERGED and Plan 3 precedes this plan (tokens/`StatusTone`/`Icon`/chrome kit; `RunDetailTabs.swift`; graph selection driving `focusStep`). Branch from refreshed `origin/main`.
+- ALREADY ON MAIN (Phase 6B) — reuse, do not recreate: `CPClient.runSource(id:path:line:context:host:)` (`CPClient.swift:114`) and `runAst(id:path:line:col:host:)` (`:130`); `APISourceSlice`/`APIAstNode`/`APIAstResponse` (`RupuAPI/SourceModels.swift`); `SourcePreview.swift` + `AstTreeView.swift` views; `AstGrepTranscriptParsing` (embedded in `TranscriptFeed.swift`, deliberately WITHOUT metavar bindings/highlight — extending it is Task 6's job).
 - **Dependency carve-out (matt, 2026-08-25):** `https://github.com/smittytone/HighlighterSwift` is the ONE permitted third-party Swift package, pinned `.exact` in `RupuKit/Package.swift`. No other package may ride in with it.
 - Typography discipline: prose sans (`uiText` 12pt base), code/ids/diff mono (`dataMono`). Null discipline `—` never 0.
 - Highlight language set: mirror the web — full set for markdown fences (highlight.js auto/name lookup), and previews highlight only when `language ∈ {rust, python, typescript, javascript, go, json}` (`CodeHighlight.tsx` `SOURCE_PREVIEW_LANGUAGES`); `ini` doubles for `toml`.
@@ -25,15 +26,15 @@
 RupuKit/Package.swift                                  # + HighlighterSwift (exact pin)
 RupuKit/Sources/RupuRunDetail/Rendering/CodeBlock.swift        # NEW: highlighted code view
 RupuKit/Sources/RupuAPI/TranscriptModels.swift         # toolAudit/actionEmitted payloads
-RupuKit/Sources/RupuAPI/SourceAstModels.swift          # NEW: APISourceSlice, APIAstNode
-RupuKit/Sources/RupuAPI/CPClient.swift                 # + readSource / readAst
 RupuKit/Sources/RupuRunDetail/TranscriptViewModel.swift        # NEW: pure pairing model
 RupuKit/Sources/RupuRunDetail/Rendering/MarkdownView.swift     # NEW
 RupuKit/Sources/RupuRunDetail/Rendering/ToolCards.swift        # NEW: header + simple bodies
 RupuKit/Sources/RupuRunDetail/Rendering/DiffView.swift         # NEW
-RupuKit/Sources/RupuRunDetail/Rendering/AstGrepBody.swift      # NEW (+ SourcePreview, AstTree)
+RupuKit/Sources/RupuRunDetail/Rendering/AstGrepBody.swift      # NEW body view; AstGrepTranscriptParsing
+                                                       #   moves here from TranscriptFeed and gains metavars
 RupuKit/Sources/RupuRunDetail/Rendering/FindingCard.swift      # NEW
 RupuKit/Sources/RupuRunDetail/TranscriptFeed.swift     # Rewrite: turns + card dispatch
+(SourcePreview.swift / AstTreeView.swift / SourceModels.swift / runSource / runAst: reused as-is)
 CLAUDE.md                                              # rule-4 carve-out + module notes
 ```
 
@@ -64,50 +65,27 @@ CLAUDE.md                                              # rule-4 carve-out + modu
 - [ ] **Step 2:** Add the pinned dependency, implement, GREEN (`make macos-test`; `make macos-gen` if the app target needs the transitive product linked).
 - [ ] **Step 3:** CLAUDE.md rule edit. **Commit** — `feat(macos-transcript): HighlighterSwift (exact-pinned) + CodeBlock view; CLAUDE.md dependency carve-out`
 
-### Task 2: API surface — audit payloads + source/AST endpoints
+### Task 2: API surface — audit payloads
+
+(`runSource`/`runAst` + `SourceModels.swift` already exist — Global Constraints. This task is only the transcript-event payloads Phase 2 deliberately skipped.)
 
 **Files:**
 - Modify: `RupuKit/Sources/RupuAPI/TranscriptModels.swift`
-- Create: `RupuKit/Sources/RupuAPI/SourceAstModels.swift`
-- Modify: `RupuKit/Sources/RupuAPI/CPClient.swift`
-- Modify: fixture rig — `crates/rupu-cp` fixture emitter + `apps/rupu-macos/Fixtures/` (run `make macos-fixtures`)
-- Test: `RupuKit/Tests/RupuAPITests/` (extend transcript decode suite; new SourceAstDecodeTests against fixtures)
+- Modify: fixture rig — `crates/rupu-cp` fixture emitter + `apps/rupu-macos/Fixtures/` (run `make macos-fixtures`) — a transcript fixture gains `tool_audit`, `action_emitted`, and (if absent) an `ast_grep` structured `tool_result` sample for Task 6
+- Test: extend the RupuAPI transcript decode suite
 
 **Interfaces:**
-- `TranscriptEvent` payload upgrades (replacing the empty cases at `TranscriptModels.swift:59-61`):
+- `TranscriptEvent` payload upgrades (replacing the payload-less `.toolAudit` / `.actionEmitted` cases in `TranscriptModels.swift`):
   ```swift
   case toolAudit(tool: String, declared: Bool, granted: Bool, blocked: Bool, restricted: Bool)
+  // wire shape per web lib/transcript.ts:22
   case actionEmitted(data: JSONValue)   // opaque on the web too (lib/transcript.ts:21)
   // netFlow stays payload-less (nothing renders it).
   ```
-- New models (serde mirrors of the Rust responses — `SourceSlice` / `AstResponse` in `web/src/lib/api.ts:1656-1692` name the fields):
-  ```swift
-  public struct APISourceLine: Decodable, Sendable { public let n: Int; public let text: String }
-  public struct APISourceSlice: Decodable, Sendable {
-      public let available: Bool; public let path: String?; public let language: String?
-      public let startLine: Int?; public let endLine: Int?; public let targetLine: Int?
-      public let totalLines: Int?; public let lines: [APISourceLine]?; public let reason: String?
-  }   // camelCase keys on the wire, same as the web
-  public struct APIAstNode: Decodable, Sendable {
-      public let kind: String; public let named: Bool; public let field: String?
-      public let startLine: Int; public let startCol: Int; public let endLine: Int; public let endCol: Int
-      public let matched: Bool; public let children: [APIAstNode]
-  }
-  public struct APIAstResponse: Decodable, Sendable {
-      public let available: Bool; public let language: String?; public let root: APIAstNode?
-      public let truncated: Bool?; public let reason: String?
-  }
-  ```
-- `CPClient`:
-  ```swift
-  public func readSource(runID: String, path: String, line: Int, context: Int? = nil, host: String? = nil) async throws -> APISourceSlice
-  // GET /api/runs/:id/source?path=&line=[&context=][&host=]
-  public func readAst(runID: String, path: String, line: Int, col: Int, host: String? = nil) async throws -> APIAstResponse
-  // GET /api/runs/:id/ast?path=&line=&col=[&host=]
-  ```
-- [ ] **Step 1:** Extend the rupu-cp fixture emitter with a source-slice and an ast-response sample (plus a transcript fixture containing `tool_audit` + `action_emitted` lines); `make macos-fixtures`; `cargo test -p rupu-cp` green (drift gate).
-- [ ] **Step 2: Failing Swift decode tests** against the new fixtures (toolAudit field round-trip; actionEmitted payload preserved; source slice with `available:false` + `reason`; ast tree with a `matched` grandchild). RED → implement → GREEN.
-- [ ] **Step 3: Commit** — `feat(macos-api): tool_audit/action_emitted payloads + readSource/readAst with fixture drift coverage`
+  Update every exhaustive `switch` over `TranscriptEvent` that the associated-value change breaks (TranscriptFeed's drop arms keep dropping them until Task 7).
+- [ ] **Step 1:** Extend the fixture emitter; `make macos-fixtures`; `cargo test -p rupu-cp` green (drift gate).
+- [ ] **Step 2: Failing Swift decode tests** against the new fixture lines (toolAudit field round-trip incl. `blocked:true`; actionEmitted payload preserved as `JSONValue`). RED → implement → GREEN (`make macos-test`).
+- [ ] **Step 3: Commit** — `feat(macos-api): decode tool_audit/action_emitted payloads with fixture drift coverage`
 
 ### Task 3: TranscriptViewModel (pure pairing port)
 
@@ -205,24 +183,25 @@ CLAUDE.md                                              # rule-4 carve-out + modu
 - [ ] **Step 1: Failing diff-parse tests** — hunk/add/del/ctx classification; `---`/`+++`/`diff --git` as meta not del/add; empty diff.
 - [ ] **Step 2:** RED → implement all views → GREEN; `make macos-build`. **Commit** — `feat(macos-transcript): tool cards — audit/status badges, diff/terminal/read/grep/glob/structured bodies`
 
-### Task 6: ast_grep body + SourcePreview + AstTree
+### Task 6: ast_grep rich body — metavars + reuse of the existing previews
+
+(`SourcePreview.swift` and `AstTreeView.swift` already exist and are reused UNCHANGED — this task extracts `AstGrepTranscriptParsing` out of `TranscriptFeed.swift`, extends it with the metavar bindings it deliberately omitted, and builds the web-parity body view on top.)
 
 **Files:**
-- Create: `RupuKit/Sources/RupuRunDetail/Rendering/AstGrepBody.swift` (includes `SourcePreviewView`, `AstTreeView`)
-- Test: `RupuKit/Tests/RupuRunDetailTests/AstGrepModelTests.swift`
+- Create: `RupuKit/Sources/RupuRunDetail/Rendering/AstGrepBody.swift` (receives the moved + extended `AstGrepTranscriptParsing`)
+- Modify: `RupuKit/Sources/RupuRunDetail/TranscriptFeed.swift` (delete the embedded parser; the Task 7 rewrite consumes the moved one)
+- Test: `RupuKit/Tests/RupuRunDetailTests/AstGrepModelTests.swift` (existing parser tests move with the code)
 
 **Interfaces:**
-- Decode model (from `entry.structured`; authoritative shape = the ast_grep structured serde in `crates/rupu-tools` — the CP rich-rendering arc — cross-checked against `ToolCard.tsx:806-874`; lock it with a fixture extracted in Task 2 if the sample there lacks ast_grep, extend that fixture now):
+- Extend the existing `AstGrepTranscriptParsing.Match` (currently `{file, startLine, startCol, text?}` — its doc comment says "deliberately narrower than the web's own AstGrepMatch (no metavar bindings/highlight table)"; this task closes exactly that):
   ```swift
-  public struct AstGrepMetaVar: Equatable, Sendable { public let name: String; public let text: String; public let start: Int; public let end: Int } // codepoint offsets
-  public struct AstGrepMatch: Equatable, Sendable { public let path: String; public let line: Int; public let col: Int; public let text: String; public let metaVars: [AstGrepMetaVar] }
-  public func parseAstGrepStructured(_ value: JSONValue) -> (matches: [AstGrepMatch], pattern: String?, lang: String?, shownOf: (Int, Int)?)?
+  struct MetaVar: Equatable { let name: String; let text: String; let start: Int; let end: Int } // codepoint offsets into Match.text
+  // Match gains: let metaVars: [MetaVar]
   ```
-- `AstGrepBodyView(entry: ToolEntry, runID: String?, host: String?)`: header `N matches in M files` + `pattern`/`lang` Badges + amber `showing first N of M` when truncated; per-file collapsible groups (path + count Badge, default open); per match: `path:line:col` link-styled `dataMono` + `tree` ghost button, the snippet with each metavar range tinted `rupuWarnBg`/`rupuWarn` (`AttributedString` ranges built with `String.unicodeScalars`-safe codepoint slicing — mirror `HighlightedMatch`'s `Array.from` discipline, `ToolCard.tsx:610-640`), a `$name = text` bindings grid, and independent toggles for inline `SourcePreviewView` / `AstTreeView`. Structured payload absent → plain text fallback rendering of `entry.output`.
-- `SourcePreviewView(runID: String, path: String, line: Int, host: String?)` — lazy `readSource` on first expand: gutter `n` (`dataMono`, `rupuMute`, right-aligned) + line text; the `targetLine` row tinted `rupuWarnBg`; per-line `CodeHighlighter` when `language ∈` the preview set; `available:false` → `reason` text; loading → `ProgressView`.
-- `AstTreeView(runID: String, path: String, line: Int, col: Int, host: String?)` — lazy `readAst`: recursive `DisclosureGroup` rows — optional `field:` prefix (`rupuDim`), `kind` `dataMono`, range `start:col–end:col` (`metaText`, `rupuMute`); `matched` row tinted `rupuWarnBg` with its ancestor chain auto-expanded (compute the path to the matched node first); named-only by default + `show anonymous` Toggle (anonymous at 70% opacity); `truncated` → "tree truncated (large file)" note.
-- [ ] **Step 1: Failing tests** — `parseAstGrepStructured` against the Task 2 fixture (paths/metavar offsets); codepoint-slicing correctness on a snippet containing a multibyte char before the metavar; matched-ancestor path computation on a 3-deep tree.
-- [ ] **Step 2:** RED → implement → GREEN. **Commit** — `feat(macos-transcript): ast_grep rich body + source preview + CST tree`
+  Authoritative wire shape = the structured emitter in `crates/rupu-tools/src/ast_grep.rs` (read it FIRST — verify the metavar field names/offset semantics there, cross-checked against the web consumer `ToolCard.tsx` `HighlightedMatch`/`MetaVarTable` L610-676), locked by the Task 2 fixture. Keep the parser's existing documented fallback semantics (`fromStructured`/`fromText` + `matchCount`/`truncated` honesty) untouched.
+- `AstGrepBodyView(entry: ToolEntry, runID: String?, host: String?)`: header `N matches in M files` + `pattern`/`lang` Badges + amber `showing first N of M` when truncated; per-file collapsible groups (path + count Badge, default open); per match: `path:line:col` link-styled `dataMono` + `tree` ghost button, the snippet with each metavar range tinted `rupuWarnBg`/`rupuWarn` (`AttributedString` ranges built by codepoint — mirror the web's `Array.from` slicing discipline, `ToolCard.tsx:610-640` — the wire offsets are Rust char offsets), a `$name = text` bindings grid, and independent toggles mounting the EXISTING `SourcePreview` / `AstTreeView` views at the match's `(path, line, col)`. Structured payload absent → the parser's existing text fallback.
+- [ ] **Step 1: Failing tests** — metavar decode against the Task 2 fixture; codepoint-slicing correctness on a snippet containing a multibyte char before the metavar; moved parser tests still green.
+- [ ] **Step 2:** RED → implement → GREEN (`make macos-test`). **Commit** — `feat(macos-transcript): ast_grep metavar bindings + rich body over existing source/CST previews`
 
 ### Task 7: Turn feed, FindingCard, screen sweep + checkpoint
 
@@ -234,7 +213,7 @@ CLAUDE.md                                              # rule-4 carve-out + modu
 - Test: existing `TranscriptFeed`-adjacent suites adapt to the new row structure
 
 **Interfaces:**
-- `FindingCard(entry: ToolEntry, runID: String?, host: String?)` — reads the finding fields from `entry.structured` (a `.finding`-kind entry); per `FindingCard.tsx`: severity hairline bar (`Color.severity`), severity pill + scope/concern-id chips, severity-tinted bold summary, clickable `path:start–end` chip toggling `SourcePreviewView`, rationale via `MarkdownView`, code excerpt `CodeBlock`, reference links.
+- `FindingCard(entry: ToolEntry, runID: String?, host: String?)` — reads the finding fields from `entry.structured` (a `.finding`-kind entry); per `FindingCard.tsx`: severity hairline bar (`Color.severity`), severity pill + scope/concern-id chips, severity-tinted bold summary, clickable `path:start–end` chip toggling the existing `SourcePreview` view, rationale via `MarkdownView`, code excerpt `CodeBlock`, reference links.
 - `TranscriptFeed` rewrite: `buildTranscriptViewModel(events:)` → one collapsible `TurnRow` per `TurnVM` — collapsed: chevron + ~100-char snippet (`uiText`) + tool-count pill (`Icon` + count), finding pill (warn, only >0), result pill (ok/err/running); expanded: `assistant` Eyebrow, `MarkdownView(assistantText)`, collapsible thinking (dim, 2px left border, collapsed default), then `ToolCardView`/`FindingCard`/`AstGrepBodyView` per entry (dispatch on `ToolKind`). `gate_requested` and `run_complete` rows keep their current standalone treatments, restyled with `TintBanner`/tokens. Auto-scroll live tail preserved exactly as today (`TranscriptFeed.swift:58-62` semantics).
 - [ ] **Step 1:** Implement; adapt tests; `make macos-test` + `make macos-build` green. Grep `RupuRunDetail` for `JSONSerialization` pretty-print leftovers and the old `ProseRow`/`ToolCallRow` names → 0.
 - [ ] **Step 2:** CLAUDE.md notes. Full gates: `make macos-test && make macos-build && cargo test -p rupu-cp`.
@@ -244,7 +223,7 @@ CLAUDE.md                                              # rule-4 carve-out + modu
 
 ## Self-review notes
 
-- Spec §5 coverage: carve-out→T1; turn structure→T3/T7; markdown→T4; pairing/audit badges→T3/T5; bodies incl. diff-finally-rendered→T5; ast_grep/source/AST + new client surface→T2/T6; finding card→T7; session/agent inherit→T7 (same feed).
-- Type consistency: `ToolEntry`/`TurnVM`/`ToolKind`/`CodeHighlighter`/`APISourceSlice`/`APIAstNode` names identical across tasks; T5/T6/T7 dispatch on the T3 model.
-- Order matters: T1 (CodeBlock) before T4/T6; T2 (models) before T3/T6; T3 before T5/T7.
+- Spec §5 coverage: carve-out→T1; turn structure→T3/T7; markdown→T4; pairing/audit badges→T3/T5; bodies incl. diff-finally-rendered→T5; ast_grep metavars over the existing source/CST previews→T2/T6 (client surface already existed — Phase 6B); finding card→T7; session/agent inherit→T7 (same feed).
+- Type consistency: `ToolEntry`/`TurnVM`/`ToolKind`/`CodeHighlighter`/`AstGrepTranscriptParsing.MetaVar` names identical across tasks; T5/T6/T7 dispatch on the T3 model.
+- Order matters: T1 (CodeBlock) before T4/T6; T2 (payloads+fixtures) before T3/T6; T3 before T5/T7.
 - Known deltas vs web, accepted: GFM tables render as mono block; no intra-line word diff (web lacks it too); netflow transcript events stay unrendered (web drops them as well).

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the app's status-only capsule strip with the web run graph's full visual system — per-kind accents/icons (two-channel rule), gate/action/parallel/fan-out/panel node treatments, kind-colored animated edges, live unit/round/pause patching, and node selection driving the tabbed panel — with a real selected-node highlight the web doesn't have.
+**Goal:** Replace the app's status-only capsule strip with the web run graph's full visual system — per-kind accents/icons (two-channel rule), gate/action/parallel/fan-out/panel node treatments, kind-colored animated edges, live unit/round/pause patching, and node selection driving the tabbed panel — with a real selected-node highlight the web doesn't have; plus the sidebar disclosure sub-items retrofit (Task 0, spec §3 amendment).
 
 **Architecture:** The pure `layoutGraph` grows into a v2 view model (`GraphNodeVM` gains kind/action/gate/sub-steps/fan-out/round + transcript path) fed by `RunDetailStore`'s extended live maps; a `KindBridge` mirrors the web's `kindBridge.ts`/`kindVisuals.ts` palette; node views implement the web's per-kind treatments (`components/graph/*`); edges and motion port the `rg-*` keyframes as SwiftUI animations. Selection taps route through the already-built `RunDetailStore.focusStep`.
 
@@ -12,11 +12,11 @@
 
 ## Global Constraints
 
-- Plans 1 and 2 have landed: v2 tokens (`StatusTone`, `Color.status(_:)`, `Color.severity(_:)`), lucide `Icon` view, chrome kit, and the Plan 2 run-detail recomposition (header → graph → tabbed panel) all exist. If Plan 2's tabbed panel is NOT yet merged when this plan executes, STOP and say so — Task 5's selection wiring targets it.
+- Plans 1 and 2 are MERGED (PRs #598/#599; plus the 2026-08-25 redesign pass): v2 tokens (`StatusTone`, `Color.status(_:)`, `Color.severity(_:)`), lucide `Icon` view, chrome kit, the tabbed run-detail recomposition (`RupuRunDetail/RunDetailTabs.swift`), AND a first selection wiring already exist — `StepGraphView(nodes:selectedID:onSelect:)` (capsule tap → `RunDetailStore.select(stepID:)` → `focusStep`, `selectedStepID` at `RunDetailStore.swift:108`). This plan REPLACES the capsule visuals and EXTENDS that selection; do not re-invent it. Branch from refreshed `origin/main` (never the stale `feat/macos-*` locals).
 - **Two-channel rule (never violate):** kind color only on the 3px top accent bar + kind pill; state color only on the glyph badge + state label.
 - Kind accents (from `kindVisuals.ts:17-48`): step→`Color.status(.running)` · for_each→`.rupuBrand` · parallel→`Color.severity(.crit)` · panel→`Color.status(.awaiting)` · gate→`Color.status(.paused)` · action→`Color.severity(.info)` · run→`Color.severity(.med)`.
 - Merge precedence in the model: live SSE > step results > `.pending`. Never infer `.running` from position.
-- All motion guarded by `accessibilityReduceMotion` (follow `StepGraphView.swift`'s existing `updatePulse` pattern — including its `onChange(of: state)` restart fix).
+- All motion guarded by `accessibilityReduceMotion` (follow `StepGraphView.swift`'s existing `updatePulse` pattern in `StatusGlyph` — including its `onChange(of: state)` restart fix; find it by symbol, not line number).
 - Store/contract discipline: `make macos-test` + `make macos-build` green after every task; only files this plan names change. Never bare `git stash pop`.
 - Null discipline unchanged (`—` never 0).
 
@@ -36,6 +36,25 @@ RupuKit/Tests/RupuRunDetailTests/{KindBridgeTests,GraphLayoutTests}.swift
 ```
 
 ---
+
+### Task 0: Sidebar disclosure sub-items (spec §3 amendment retrofit)
+
+(Plan 2 shipped the FLAT rail; matt's 2026-08-25 amendment restores the web's sub-item reachability on it. Independent of the graph work — first because it's the smallest and unblocks matt's most-felt complaint.)
+
+**Files:**
+- Modify: `RupuKit/Sources/RupuStore/Route.swift`, `RupuKit/Sources/RupuStore/AppModel.swift` (`selectedSidebarItem` mapping)
+- Modify: `RupuKit/Sources/RupuShell/Sidebar.swift` (`railItems`/`railRow` at `:18-131`)
+- Modify: the three composite screens' tab state pickup (`RupuShell`/security, library, fleet screens — wherever each stores its selected tab)
+- Test: extend the existing sidebar-mapping + route tests in `RupuKit/Tests/RupuStoreTests/`
+
+**Interfaces:**
+- Route tabs follow the `.activity(RunKindFilter)` precedent (`Route.swift:28`): `.security`, `.library`, `.fleet` gain an associated tab enum with a default — `case security(SecurityTab = .findings)`, `case library(LibraryTab = .agents)`, `case fleet(FleetTab = .hosts)` — with `SecurityTab { findings, coverage, network }`, `LibraryTab { agents, workflows, autoflows }`, `FleetTab { hosts, workers }` (`String, CaseIterable, Sendable`, defined beside `RunKindFilter`). Each composite screen adopts the route tab as its selection source the same way Activity's kind tabs already do (see the "tab survives a round trip" contract, `AppModel.swift:160`); `selectedSidebarItem` maps any tab back to the parent item.
+- Sidebar rows: parents with children (Activity → All runs + Agents/Workflows/Autoflows/Sessions via `RunKindFilter`; Security/Library/Fleet via the new tab enums) render a disclosure chevron; parent row click navigates to the default tab AND keeps its expand state; child click sets the tabbed route. Child rows: same 30pt `railRow` chrome, indented one level (+16pt leading). Disclosure state: `@AppStorage("sidebar.groups")`-backed per-parent Bool, defaulting open when the group contains the active route; a parent whose child is active tints its label `rupuBrand` when the parent row itself isn't the active row (web v1 "contains active" idiom).
+- Network child navigates to `.security(.network)` — the netflow surface lives in the Security screen (mirror of web v1's Security → Network leaf).
+
+- [ ] **Step 1: Failing tests** — route round-trip per new tab case; `selectedSidebarItem` maps tabbed routes to the parent; default-tab equality (`.security() == .security(.findings)`).
+- [ ] **Step 2:** RED → implement routes + screens pickup → GREEN.
+- [ ] **Step 3:** Sidebar disclosure UI; `make macos-test` + `make macos-build` green. **Commit** — `feat(macos-shell): sidebar disclosure sub-items — tabbed routes for Security/Library/Fleet, kind children for Activity`
 
 ### Task 1: KindBridge + five new lucide icons
 
@@ -156,13 +175,13 @@ RupuKit/Tests/RupuRunDetailTests/{KindBridgeTests,GraphLayoutTests}.swift
 - Rewrite: `RupuKit/Sources/RupuRunDetail/StepGraphView.swift`
 
 **Interfaces:**
-- Produces: `StepGraphView(nodes: [GraphNodeVM], selectedStepID: String?, onSelect: (String) -> Void, onSelectUnit: (String, Int) -> Void)`.
+- Produces: `StepGraphView(nodes: [GraphNodeVM], selectedID: String?, onSelect: @escaping (String) -> Void, onSelectUnit: @escaping (String, Int) -> Void)` — the first three parameters keep the EXISTING signature (`StepGraphView.swift:21`) so `RunDetailScreen`'s current call site only adds `onSelectUnit`.
 - `GraphEdge(source: GraphNodeVM, target: GraphNodeVM)` — 2pt horizontal line + arrowhead, 40pt long, vertically centered on the cards:
   - color: `Color.status(.awaiting)` when `target.state == .gatePending`; else `source.kind.accent`, at full alpha when target is `.running`/`.done`, `opacity(0.35)` otherwise (ghosted untraversed).
   - marching ants when target is `.running`/`.gatePending`: dash `[7,7]`, `strokeDashPhase` animated −28 over 0.7s linear repeat; reduced-motion → static dashes.
 - Canvas: horizontal `ScrollView` of node views joined by edges (topology stays the linear chain, same as the web); container height moves from 140 → 420 in `RunDetailScreen` (that one-line height change happens here). Node tap → `onSelect(node.id)` — except fan-out unit squares, which call `onSelectUnit(stepID, index)` (mirror the web's body-click skip for containers: container background tap still selects the node).
 
-- [ ] **Step 1:** Implement; wire `RunDetailScreen` to pass the new arguments (selection state arrives Task 5 — pass `selectedStepID: nil` + no-op closures for now). `make macos-build` + `make macos-test` green.
+- [ ] **Step 1:** Implement; `RunDetailScreen` keeps passing `store.selectedStepID` / `select(stepID:)` as today and adds a no-op `onSelectUnit` (real one arrives Task 5). `make macos-build` + `make macos-test` green.
 - [ ] **Step 2: Commit** — `feat(macos-graph): kind-colored animated edges + canvas rewrite with tap routing`
 
 ### Task 5: Live patching + selection wiring
@@ -173,18 +192,20 @@ RupuKit/Tests/RupuRunDetailTests/{KindBridgeTests,GraphLayoutTests}.swift
 - Test: extend `RupuKit/Tests/RupuStoreTests/RunDetailStoreTests.swift`
 
 **Interfaces:**
-- Produces on `RunDetailStore`:
+- `RunDetailStore` ALREADY HAS `selectedStepID` (`:108`) and `select(stepID:)` (`:561-569`, delegating to `focusStep`). This task ADDS:
   ```swift
   public private(set) var liveUnits: [String: [Int: UnitLiveState]] = [:]
   public private(set) var panelRounds: [String: PanelRoundState] = [:]
   public private(set) var stepTranscripts: [String: String] = [:]   // step_working adoption
-  public private(set) var selection: GraphSelection?                // struct {stepID: String; unitIndex: Int?}
-  public func select(stepID: String) async      // sets selection, calls focusStep(stepID)
-  public func select(stepID: String, unitIndex: Int) async  // focuses the unit's transcriptPath
+  public private(set) var selectedUnitIndex: Int?   // nil = whole step; cleared by select(stepID:)
+  public func select(stepID: String, unitIndex: Int) async
+  // sets selectedStepID + selectedUnitIndex, then focuses the unit's transcript path
+  // (liveUnits transcriptPath first, else the REST APIUnitRow's) via the same
+  // generation-guarded machinery focusStep uses.
   ```
-- `apply(_ event:)` extensions (`RunDetailStore.swift:616`): `unitStarted` → `liveUnits[stepID][index] = UnitLiveState(key:transcriptPath:success:nil)`; `unitCompleted` → same with `success`; `panelRound` → `panelRounds[stepID]`; `stepPaused` → `liveStates[stepID] = .paused`; `stepResumed` → `.running`; `stepWorking` with `transcriptPath` → `stepTranscripts[stepID]`.
-- Selection seeding: on `activate()`, seed ONCE — prefer a `.running` node with a transcript, else the last node with a result/transcript (this generalizes the existing auto-focus at `RunDetailStore.swift:280`); live rebuilds must never overwrite a non-nil user `selection` (guard flag, mirroring the web's `seededSelRef`).
-- `RunDetailScreen` threads `selection?.stepID` and the two closures into `StepGraphView`; the graph call site now passes the full v2 `layoutGraph` argument list.
+- `apply(_ event:)` extensions (find the `switch` in `RunDetailStore.apply` — currently handles stepStarted/Working/Completed/AwaitingApproval/Failed/Skipped): `unitStarted` → `liveUnits[stepID][index] = UnitLiveState(key:transcriptPath:success:nil)`; `unitCompleted` → same with `success`; `panelRound` → `panelRounds[stepID]`; `stepPaused` → `liveStates[stepID] = .paused`; `stepResumed` → `.running`; `stepWorking` with a `transcriptPath` → `stepTranscripts[stepID]` (keep its existing behavior too).
+- Seed-once guard: the existing auto-focus in `activate()` must not fire when the user has already selected (check `selectedStepID != nil` before auto-focusing on refresh/rebuild paths — mirror the web's `seededSelRef` discipline); add a regression test that a store refresh does not move an explicit selection.
+- `RunDetailScreen`'s graph call site passes the full v2 `layoutGraph` argument list and the new `onSelectUnit`.
 
 - [ ] **Step 1: Failing store tests** — unit event overlay lands in `liveUnits`; panel round; paused→resumed round-trip; seed-once (a second `activate`-driven rebuild does not move an explicit selection); `select(stepID:unitIndex:)` focuses the unit transcript path.
 - [ ] **Step 2:** RED → implement → GREEN (`make macos-test`).
@@ -204,6 +225,6 @@ RupuKit/Tests/RupuRunDetailTests/{KindBridgeTests,GraphLayoutTests}.swift
 
 ## Self-review notes
 
-- Spec §4 coverage: two-channel + accents/icons→T1/T3; node treatments→T3; edges→T4; state model + live patching→T2/T5; selection + seed + brand-ring highlight→T3/T4/T5; motion→T3/T4; 420pt height→T4.
-- Type consistency: `StepKind`/`GraphNodeVM`/`UnitLiveState`/`PanelRoundState`/`GraphSelection` names used identically across tasks; `layoutGraph` v2 signature in T2 matches the T5 call site.
+- Spec coverage: §3 sidebar sub-items retrofit→T0; §4 two-channel + accents/icons→T1/T3; node treatments→T3; edges→T4; state model + live patching→T2/T5; selection + seed + brand-ring highlight→T3/T4/T5; motion→T3/T4; 420pt height→T4.
+- Type consistency: `StepKind`/`GraphNodeVM`/`UnitLiveState`/`PanelRoundState`/`selectedUnitIndex` names used identically across tasks; `layoutGraph` v2 signature in T2 matches the T5 call site; T4 keeps the existing `StepGraphView(nodes:selectedID:onSelect:)` prefix.
 - Known deltas vs web, accepted: no minimap/zoom (native scroll suffices, YAGNI); panelist chips non-interactive until Plan 4; REST unit rows lack `unit_key` so `#index` is the fallback label.
