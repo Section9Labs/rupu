@@ -24,21 +24,23 @@ import SwiftUI
 /// `ActivityStore`'s gate-scoped mutations.
 public struct NeedsYouCard: View {
     /// **Fleet-wide by construction, not by caller discipline** (perf &
-    /// interaction arc, Plan 5 Task 2 fix-round-1): this reads
+    /// interaction arc, Plan 5 Task 2 fix-round-1; the rule extended to the
+    /// date range in Plan 5 Task 5 fix-round-2): this reads
     /// `store.unscopedRows`, never `store.scopeFilter`-or-`statusFilter`-
-    /// narrowed `store.rows` — see `ActivityStore.unscopedRows`'s own doc
-    /// comment. The needs-you queue has to see every gate/failure
-    /// regardless of the v2 top bar's project-scope selection AND
-    /// regardless of whatever `scopeFilter`/`statusFilter` `ActivityScreen`
-    /// (which shares this exact `ActivityStore` instance — see `RootView.
-    /// activityStore`'s doc comment) may have last left the store in.
-    /// Originally this was an invariant the CALLER had to uphold ("never
-    /// pass a scoped store in here") — that broke the moment the store
-    /// became shared, since nothing reset `scopeFilter` when the operator
-    /// navigated from Activity back to Overview. Reading `unscopedRows`
-    /// instead makes the guarantee structural: no store state any other
-    /// screen sets can make this view hide anything, because this view
-    /// never reads the narrowed projection at all.
+    /// or-date-range-narrowed `store.rows` — see `ActivityStore.
+    /// unscopedRows`'s own doc comment. The needs-you queue has to see every
+    /// gate/failure regardless of the v2 top bar's project-scope selection
+    /// AND regardless of whatever `scopeFilter`/`statusFilter`/`since`/
+    /// `until` `ActivityScreen` (which shares this exact `ActivityStore`
+    /// instance — see `RootView.activityStore`'s doc comment) may have last
+    /// left the store in. Originally this was an invariant the CALLER had to
+    /// uphold ("never pass a scoped store in here") — that broke the moment
+    /// the store became shared, since nothing reset `scopeFilter` when the
+    /// operator navigated from Activity back to Overview. Reading
+    /// `unscopedRows` instead makes the guarantee structural: no store state
+    /// any other screen sets — including a date range set while browsing
+    /// Activity history — can make this view hide anything, because this
+    /// view never reads the narrowed projection at all.
     private let store: ActivityStore
     private let backend: BackendController
     private let range: TimeRange

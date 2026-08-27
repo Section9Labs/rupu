@@ -120,4 +120,36 @@ struct NeedsYouSharedStoreScopeLeakTests {
 
         store.deactivate()
     }
+
+    /// Same leak, same fix, same test shape — for the `since`/`until` date
+    /// range instead of `scopeFilter` (perf & interaction arc, Plan 5 Task 5
+    /// fix round 2 — the controller's ruling on the reviewer's out-of-scope
+    /// observation from round 1's fix: `dateFilteredForDisplay` narrowed
+    /// `unscopedRows` too, which is exactly the invariant this whole file
+    /// exists to guard). `ActivityScreen`'s `FilterBar` sets a date range
+    /// the same screen-local way it sets `scopeFilter` — nothing resets it
+    /// when the operator navigates back to Overview, so a gate parked
+    /// outside whatever range was last set on Activity must still reach
+    /// needs-you.
+    @MainActor @Test func dateRangedActivityScreenVisitNeverHidesTheGateFromNeedsYouDerivation() async {
+        let store = makeStore()
+        await store.activate(kind: .all)
+        #expect(store.rows.map(\.id).contains("run-gate-1"), "sanity: the gate is fetched before any date range is applied")
+
+        // Exactly what `ActivityScreen`'s date-range UI does — sets a range
+        // that excludes the gate (fetched with `startedAt`
+        // "2026-08-20T13:00:00Z" in `makeStore()` above).
+        await store.setDateRange(since: nil, until: ISO8601Parsing.parse("2026-08-01T00:00:00Z")!)
+
+        // The Activity table's own projection correctly narrows away from
+        // the out-of-range gate.
+        #expect(!store.rows.map(\.id).contains("run-gate-1"))
+
+        // `NeedsYouCard.body`'s actual call — the out-of-range gate must
+        // still reach it, exactly like the out-of-scope one above.
+        let result = deriveNeedsYou(rows: store.unscopedRows, range: .d7, now: Date())
+        #expect(result.items.contains(where: { $0.row.id == "run-gate-1" && $0.kind == .gate }), "the out-of-range gate must still reach the needs-you derivation")
+
+        store.deactivate()
+    }
 }

@@ -140,11 +140,29 @@ public final class ActivityStore {
     public private(set) var rows: [ActivityRow] = []
 
     /// **The fleet-wide, always-unscoped projection** (perf & interaction
-    /// arc, Plan 5 Task 2 fix-round-1 — the shared-store review's Critical):
-    /// every row for the currently active `kind` sources, sorted and
-    /// status-patched exactly like `rows`, but NEVER narrowed by
-    /// `scopeFilter` or `statusFilter`. `NeedsYouCard`/`deriveNeedsYou`
+    /// arc, Plan 5 Task 2 fix-round-1 — the shared-store review's Critical;
+    /// extended Plan 5 Task 5 fix-round-2): every row for the currently
+    /// active `kind` sources, sorted and status-patched exactly like `rows`,
+    /// but NEVER narrowed by `scopeFilter`, `statusFilter`, OR the
+    /// `since`/`until` date range — the full rule is **no scope, no status,
+    /// no date narrowing, ever**, regardless of what any other property on
+    /// this shared store is currently set to. `NeedsYouCard`/`deriveNeedsYou`
     /// read this instead of `rows`.
+    ///
+    /// **The date-range exclusion specifically** (fix round 2 — an earlier
+    /// version of this task's date-range work applied the filter before this
+    /// property was assigned, reasoning a date range was a fetch-scope
+    /// decision like `kind` rather than a display toggle like
+    /// `statusFilter`/`scopeFilter`; that broke the invariant this doc
+    /// comment documents): a gate or failure parked outside whatever date
+    /// range an operator has set while browsing Activity history still
+    /// needs attention on Overview — `unscopedRows` existing at all IS the
+    /// promise that no screen-local narrowing can hide it from needs-you,
+    /// and a date range is exactly such a narrowing (screen-local state on
+    /// `ActivityStore`, set by `ActivityScreen`'s `FilterBar`/kind-page UI,
+    /// same as `statusFilter`). This holds for remote-host rows too — see
+    /// `dateFilteredForDisplay(_:)`'s own doc comment for where the date
+    /// filter actually applies instead (only on the branch feeding `rows`).
     ///
     /// **Why this exists**: `ActivityStore` is now a single instance shared
     /// by `ActivityScreen` (which legitimately narrows `rows` by
@@ -757,30 +775,36 @@ public final class ActivityStore {
             merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
         }
 
-        // Review fix, perf & interaction arc Plan 5 Task 5: enforce the
-        // active `since`/`until` range client-side against the WHOLE merged
-        // set (local rows included, not just remote) — see
-        // `dateFilteredForDisplay(_:)`'s own doc comment for why. Applied
-        // BEFORE `unscopedRows` is assigned, deliberately: a date range is a
-        // narrowing of "what's honestly in scope right now" the same way
-        // `kind` is, not a display-time toggle like `statusFilter`/
-        // `scopeFilter` (which `unscopedRows` exists specifically to bypass
-        // — see that property's own doc comment) — `NeedsYouCard` reading
-        // `unscopedRows` while an operator has a date range active on the
-        // OTHER screen sharing this store must not resurrect rows outside
-        // that range either.
-        merged = dateFilteredForDisplay(merged)
         merged.sort(by: Self.isOrderedByStartedAtDescending)
 
         // Fleet-wide, unscoped projection — see `unscopedRows`'s own doc
-        // comment. Assigned BEFORE either filter narrows `merged` below, so
-        // it always carries every row for the active `kind` sources,
-        // patched and sorted, never scope/status-narrowed (but IS already
-        // date-range-narrowed — see the `dateFilteredForDisplay` call just
-        // above).
+        // comment. Assigned BEFORE any filter narrows `merged` below —
+        // `unscopedRows` always carries every row for the active `kind`
+        // sources, patched and sorted, and is NEVER narrowed by
+        // `scopeFilter`/`statusFilter`/the date range. See that property's
+        // own doc comment (updated, fix round 2) for why a date range
+        // doesn't get an exception here the way it might seem to deserve.
         unscopedRows = merged
 
-        var filtered = merged
+        // Controller fix round 2: `dateFilteredForDisplay` runs HERE — after
+        // `unscopedRows` is captured, only on the branch feeding `rows` —
+        // not on `merged` itself. An earlier version of this fix ran it
+        // before the `unscopedRows` assignment (so a date range narrowed
+        // BOTH projections), reasoning that a date range was a fetch-scope
+        // decision like `kind` rather than a display toggle like
+        // `statusFilter`/`scopeFilter`. That reasoning was wrong: it broke
+        // the Task-2 invariant `unscopedRows`/`NeedsYouCard` were built to
+        // guarantee — needs-you must surface EVERY gate/failure fleet-wide,
+        // regardless of whatever an operator has narrowed the OTHER screen
+        // to. A gate parked outside whatever date range someone set while
+        // browsing Activity history still needs attention; `unscopedRows`
+        // existing at all is precisely the promise that no screen-local
+        // narrowing (scope, status, kind's own display-time siblings, and
+        // now explicitly date) can hide it. Remote-host rows in
+        // `unscopedRows` are therefore genuinely date-UNfiltered too — not
+        // an oversight, the same "unscoped" guarantee applying uniformly
+        // regardless of a row's source.
+        var filtered = dateFilteredForDisplay(merged)
         if !statusFilter.isEmpty {
             filtered = filtered.filter { statusFilter.contains($0.status) }
         }
@@ -831,6 +855,16 @@ public final class ActivityStore {
     /// (`since == nil && until == nil`) is a true no-op, returning `rows`
     /// unchanged, unknown timestamps included — a range nobody asked for
     /// must never start hiding anything.
+    ///
+    /// **Only ever applied on the branch feeding `rows`, never to
+    /// `unscopedRows`** (fix round 2): `recompute()` calls this AFTER
+    /// `unscopedRows` is already assigned from the unfiltered `merged`, on a
+    /// separate `filtered` copy — see `unscopedRows`'s own doc comment for
+    /// the invariant this preserves (needs-you must never be narrowed by any
+    /// screen-local filter, and a date range is exactly that, the same as
+    /// `statusFilter`/`scopeFilter`). A remote-host row outside the active
+    /// range is therefore excluded from `rows` (the Activity table) but
+    /// still present in `unscopedRows` (needs-you) — deliberate, not a gap.
     private func dateFilteredForDisplay(_ rows: [ActivityRow]) -> [ActivityRow] {
         guard since != nil || until != nil else { return rows }
         return rows.filter { row in

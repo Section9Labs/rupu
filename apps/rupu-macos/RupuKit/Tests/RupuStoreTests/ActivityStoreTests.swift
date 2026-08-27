@@ -1312,7 +1312,14 @@ struct ActivityStoreTests {
     // narrowing but must still respect an active date range — see
     // `dateFilteredForDisplay`'s doc comment). A remote row inside the
     // bounds merges in normally.
-    @MainActor @Test func remoteHostRowsOutsideActiveDateRangeAreExcludedFromRowsAndUnscopedRows() async {
+    // (r fix round 2 — controller ruling) `unscopedRows` must NEVER be
+    // date-range-narrowed, the same "no scope, no status narrowing, ever"
+    // rule `ActivityStore.unscopedRows`'s own doc comment documents — a
+    // gate/failure outside the active date range still needs to reach
+    // needs-you. Renamed from `...AreExcludedFromRowsAndUnscopedRows` (fix
+    // round 1's name, now factually wrong — the whole point of round 2 is
+    // that unscopedRows does NOT exclude these rows).
+    @MainActor @Test func remoteHostRowsOutsideActiveDateRangeAreExcludedFromRowsButKeptInUnscopedRows() async {
         let (store, box) = makeStore { req in
             guard let url = req.url else { return (200, Data("[]".utf8)) }
             if url.path == "/api/hosts" {
@@ -1350,7 +1357,10 @@ struct ActivityStoreTests {
         )
 
         #expect(Set(store.rows.map(\.id)) == Set(["run-wf-local", "run-remote-in"]), "the out-of-range remote row must not reach `rows`")
-        #expect(Set(store.unscopedRows.map(\.id)) == Set(["run-wf-local", "run-remote-in"]), "…nor `unscopedRows` — a date range narrows this feed too, not just status/scope")
+        #expect(
+            Set(store.unscopedRows.map(\.id)) == Set(["run-wf-local", "run-remote-in", "run-remote-out"]),
+            "…but `unscopedRows` stays completely date-UNfiltered — a date range is screen-local state, same as scope/status, and unscopedRows is the invariant projection none of those may narrow"
+        )
 
         store.deactivate()
         box.latest.finish()
