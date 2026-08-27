@@ -164,8 +164,35 @@ public final class CyclesStore {
     }
 
     private func recompute() {
-        rows = local.rows + remoteRows
+        rows = dateFilteredForDisplay(local.rows + remoteRows)
         state = Self.aggregateState(local.state, rowsAreEmpty: rows.isEmpty)
+    }
+
+    /// Client-side enforcement of the active `since`/`until` bounds (review
+    /// fix, perf & interaction arc Plan 5 Task 5) — same rationale
+    /// `ActivityStore.dateFilteredForDisplay(_:)` documents for itself:
+    /// `loadRemoteHost` below never sends `since`/`until` (the server's
+    /// single-remote-host proxy branch for `GET /api/runs/autoflows` has no
+    /// date-range params), so a remote host's cycle row must be checked
+    /// against the active range HERE rather than trusted to already satisfy
+    /// it. Applied to `local.rows` too (already server-filtered, so a no-op
+    /// there) rather than threading provenance through — simpler, and
+    /// provably correct rather than leaning on an unenforced "local rows are
+    /// always already in range" invariant.
+    ///
+    /// Boundary/missing-timestamp semantics mirror the server's own
+    /// (`crate::pagination::DateRangeQuery`): closed at both ends, and —
+    /// only once a bound is active — a row whose `startedAt` fails to parse
+    /// is excluded (no honest basis to claim it's in range). An inactive
+    /// range is a true no-op.
+    private func dateFilteredForDisplay(_ rows: [APIAutoflowCycleRow]) -> [APIAutoflowCycleRow] {
+        guard since != nil || until != nil else { return rows }
+        return rows.filter { row in
+            guard let startedAt = ISO8601Parsing.parse(row.startedAt) else { return false }
+            if let since, startedAt < since { return false }
+            if let until, startedAt > until { return false }
+            return true
+        }
     }
 
     private static func aggregateState(_ localState: BlockState<Void>, rowsAreEmpty: Bool) -> BlockState<Void> {

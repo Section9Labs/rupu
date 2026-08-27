@@ -1297,6 +1297,106 @@ struct ActivityStoreTests {
         box.latest.finish()
     }
 
+    // MARK: - Client-side date filtering of remote-host rows (review fix,
+    // perf & interaction arc Plan 5 Task 5 — the server's single-remote-host
+    // proxy branch has no `since`/`until` params on any endpoint, so
+    // `Source.remoteFetch` never sends them; the active range must instead
+    // be enforced client-side against remote rows at merge time, in
+    // `ActivityStore.dateFilteredForDisplay(_:)`, or a date-ranged Activity
+    // view would silently show unfiltered remote-host history alongside
+    // correctly-narrowed local history.)
+
+    // (r) A remote host's row outside the active `since`/`until` bounds
+    // never reaches the operator — excluded from BOTH `rows` (the table)
+    // AND `unscopedRows` (the needs-you feed, which bypasses status/scope
+    // narrowing but must still respect an active date range — see
+    // `dateFilteredForDisplay`'s doc comment). A remote row inside the
+    // bounds merges in normally.
+    @MainActor @Test func remoteHostRowsOutsideActiveDateRangeAreExcludedFromRowsAndUnscopedRows() async {
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                // Never asked for since/until — the fix under test is that
+                // this app-side stub receiving no date params at all is
+                // exactly what SHOULD happen (see `Source.remoteFetch`'s
+                // doc comment); a regression back to sending them would
+                // still pass this particular assertion (the stub ignores
+                // extra query items), which is why the request-count-based
+                // test below is the one that actually pins "no refetch".
+                let inRange = Self.runListRowJSON(id: "run-remote-in", startedAt: "2026-08-10T12:00:00Z", status: "running")
+                let outOfRange = Self.runListRowJSON(id: "run-remote-out", startedAt: "2026-08-01T12:00:00Z", status: "running")
+                return (200, Data("[\(inRange),\(outOfRange)]".utf8))
+            }
+            let row = Self.runListRowJSON(id: "run-wf-local", startedAt: "2026-08-12T12:00:00Z", status: "running")
+            return (200, Data("[\(row)]".utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        await expectEventually("the remote host's two rows land") {
+            store.pendingHosts == 0 && store.unscopedRows.count == 3
+        }
+        // Before any date range is set, every row (local + both remote) is visible.
+        #expect(Set(store.rows.map(\.id)) == Set(["run-wf-local", "run-remote-in", "run-remote-out"]))
+
+        // Narrow to a range that includes the local row and the "in" remote
+        // row, but excludes the "out" remote row.
+        await store.setDateRange(
+            since: ISO8601Parsing.parse("2026-08-10T00:00:00Z")!,
+            until: nil
+        )
+
+        #expect(Set(store.rows.map(\.id)) == Set(["run-wf-local", "run-remote-in"]), "the out-of-range remote row must not reach `rows`")
+        #expect(Set(store.unscopedRows.map(\.id)) == Set(["run-wf-local", "run-remote-in"]), "…nor `unscopedRows` — a date range narrows this feed too, not just status/scope")
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
+    // (s) Narrowing (or widening) the active date range re-filters
+    // remote-host rows ALREADY sitting in `remoteRowsBySource` — no second
+    // fetch to the remote host is needed for the narrowing itself to take
+    // effect, since it's enforced client-side at `recompute()` time, not by
+    // asking the server again with different bounds.
+    @MainActor @Test func dateRangeChangeReFiltersAlreadyMergedRemoteRowsWithoutRefetchingTheRemoteHost() async {
+        let (store, box) = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/workflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                let inRange = Self.runListRowJSON(id: "run-remote-in", startedAt: "2026-08-10T12:00:00Z", status: "running")
+                let outOfRange = Self.runListRowJSON(id: "run-remote-out", startedAt: "2026-08-01T12:00:00Z", status: "running")
+                return (200, Data("[\(inRange),\(outOfRange)]".utf8))
+            }
+            let row = Self.runListRowJSON(id: "run-wf-local", startedAt: "2026-08-12T12:00:00Z", status: "running")
+            return (200, Data("[\(row)]".utf8))
+        }
+
+        await store.activate(kind: .workflows)
+        await expectEventually("the remote host's two rows land, unfiltered (no range active yet)") {
+            store.unscopedRows.count == 3
+        }
+        let remoteFetchCountBeforeRangeChange = ActivityStubURLProtocol.pathHits["/api/runs/workflows"] ?? 0
+
+        await store.setDateRange(since: ISO8601Parsing.parse("2026-08-10T00:00:00Z")!, until: nil)
+
+        #expect(Set(store.rows.map(\.id)) == Set(["run-wf-local", "run-remote-in"]), "the narrowing must apply immediately, client-side")
+        // The local snapshot's own `resetAndRefresh()` (inside `setDateRange`)
+        // legitimately adds ONE more request (host=local, now carrying the
+        // new since/until) — but the REMOTE host must not be asked again at
+        // all; its already-merged rows are just re-filtered in place.
+        let remoteFetchCountAfterRangeChange = ActivityStubURLProtocol.pathHits["/api/runs/workflows"] ?? 0
+        #expect(remoteFetchCountAfterRangeChange == remoteFetchCountBeforeRangeChange + 1, "exactly one new request (host=local's reset) — never a second remote-host fetch")
+
+        store.deactivate()
+        box.latest.finish()
+    }
+
     // MARK: - statusOverrides pruning (Phase 3, Task 4 carry-over)
 
     // (q) A live status-patch override for a runID is dropped once the

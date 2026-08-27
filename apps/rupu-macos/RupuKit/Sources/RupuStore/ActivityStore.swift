@@ -278,6 +278,22 @@ public final class ActivityStore {
     /// local-only; see its doc comment), so a remote fetch is always a
     /// single page-0 call, never something that needs `PagedSnapshot`'s
     /// offset bookkeeping or live-patch integration.
+    ///
+    /// **`remoteFetch` never sends `since`/`until`** (review fix, perf &
+    /// interaction arc, Plan 5 Task 5): the server's single-remote-host proxy
+    /// branch (`GET .../:kind?host=<remote-id>`) has no date-range query
+    /// params on ANY of the 5 endpoints — only the `host=local` and
+    /// `host=all` fan-out branches filter server-side (see
+    /// `crate::pagination::DateRangeQuery`'s wiring in `run_streams.rs`/
+    /// `runs.rs`/`sessions.rs`). Sending `since`/`until` to a remote host
+    /// would silently do nothing there, which is worse than not sending them
+    /// at all — a caller reading the request might reasonably assume the
+    /// server was honoring the filter. Instead, the active range is enforced
+    /// **client-side** against every remote row at merge time — see
+    /// `dateFilteredForDisplay(_:)`, called from `recompute()` — so the
+    /// operator-visible result stays honestly date-filtered regardless of
+    /// which host a row came from, even though the server-side proxy path
+    /// doesn't support the filter yet.
     private struct Source {
         let kind: ActivityKindTag
         let snapshot: PagedSnapshot<ActivityRow>
@@ -335,11 +351,13 @@ public final class ActivityStore {
                         since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
                     ).map(ActivityRow.init)
                 },
+                // No `since`/`until` here — see this doc comment on `Source.remoteFetch`
+                // for why a remote host's proxy path has no date params to
+                // receive them at all, and `recompute()`'s
+                // `dateFilteredForDisplay(_:)` for where the active range is
+                // actually enforced against these rows instead.
                 remoteFetch: { host, offset, limit in
-                    try await client.workflowRuns(
-                        offset: offset, limit: limit, host: host,
-                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
-                    ).map(ActivityRow.init)
+                    try await client.workflowRuns(offset: offset, limit: limit, host: host).map(ActivityRow.init)
                 }
             ),
             Source(
@@ -351,10 +369,7 @@ public final class ActivityStore {
                     ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
-                    try await client.agentRuns(
-                        offset: offset, limit: limit, host: host,
-                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
-                    ).map(ActivityRow.init)
+                    try await client.agentRuns(offset: offset, limit: limit, host: host).map(ActivityRow.init)
                 }
             ),
             Source(
@@ -366,10 +381,7 @@ public final class ActivityStore {
                     ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
-                    try await client.autoflowEvents(
-                        offset: offset, limit: limit, host: host,
-                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
-                    ).map(ActivityRow.init)
+                    try await client.autoflowEvents(offset: offset, limit: limit, host: host).map(ActivityRow.init)
                 }
             ),
             Source(
@@ -381,10 +393,7 @@ public final class ActivityStore {
                     ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
-                    try await client.sessions(
-                        offset: offset, limit: limit, host: host,
-                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
-                    ).map(ActivityRow.init)
+                    try await client.sessions(offset: offset, limit: limit, host: host).map(ActivityRow.init)
                 }
             ),
         ]
@@ -747,12 +756,28 @@ public final class ActivityStore {
             else { continue }
             merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
         }
+
+        // Review fix, perf & interaction arc Plan 5 Task 5: enforce the
+        // active `since`/`until` range client-side against the WHOLE merged
+        // set (local rows included, not just remote) — see
+        // `dateFilteredForDisplay(_:)`'s own doc comment for why. Applied
+        // BEFORE `unscopedRows` is assigned, deliberately: a date range is a
+        // narrowing of "what's honestly in scope right now" the same way
+        // `kind` is, not a display-time toggle like `statusFilter`/
+        // `scopeFilter` (which `unscopedRows` exists specifically to bypass
+        // — see that property's own doc comment) — `NeedsYouCard` reading
+        // `unscopedRows` while an operator has a date range active on the
+        // OTHER screen sharing this store must not resurrect rows outside
+        // that range either.
+        merged = dateFilteredForDisplay(merged)
         merged.sort(by: Self.isOrderedByStartedAtDescending)
 
         // Fleet-wide, unscoped projection — see `unscopedRows`'s own doc
         // comment. Assigned BEFORE either filter narrows `merged` below, so
         // it always carries every row for the active `kind` sources,
-        // patched and sorted, never scope/status-narrowed.
+        // patched and sorted, never scope/status-narrowed (but IS already
+        // date-range-narrowed — see the `dateFilteredForDisplay` call just
+        // above).
         unscopedRows = merged
 
         var filtered = merged
@@ -773,6 +798,47 @@ public final class ActivityStore {
         // every caller that never touches `sort` at all.
         rows = sortActivityRows(filtered, by: sort)
         state = Self.aggregateState(activeSnapshots().map(\.state), rowsAreEmpty: filtered.isEmpty)
+    }
+
+    /// Enforces the active `since`/`until` bounds against already-fetched
+    /// rows, client-side (review fix, perf & interaction arc Plan 5 Task 5).
+    ///
+    /// **Why this exists at all, given `since`/`until` are already sent as
+    /// server-side query params**: only for the *local* (`host=local`)
+    /// fetch — a remote host's row comes back from the single-remote-host
+    /// proxy branch (`GET .../:kind?host=<remote-id>`), which has no
+    /// date-range query params on any of the 5 endpoints server-side (see
+    /// `Source.remoteFetch`'s own doc comment). Without this, a date range
+    /// would silently narrow local rows while leaving every remote-host row
+    /// unfiltered in the SAME merged table — an honesty violation matching
+    /// the exact kind of "the UI implies a filter that isn't really applied"
+    /// bug this whole task's date-range feature exists to avoid elsewhere
+    /// (see the top-bar range's `.disabled` treatment on Activity routes).
+    /// Applying this to every row uniformly (not just remote ones) rather
+    /// than threading provenance through is deliberate: a local row is
+    /// already within `[since, until]` by construction (the server already
+    /// filtered it), so re-checking it here is a no-op, not a correctness
+    /// risk — and it keeps this function simple and provably correct rather
+    /// than trusting an unenforced "local rows are always already in range"
+    /// invariant.
+    ///
+    /// **Boundary/missing-timestamp semantics mirror the server's own**
+    /// (`crate::pagination::DateRangeQuery` — `crates/rupu-cp/src/
+    /// pagination.rs`): closed at both ends (`since <= startedAt <= until`),
+    /// and — only once a bound is actually active — a row with no
+    /// `startedAt` at all is EXCLUDED (no honest basis to claim an unknown
+    /// timestamp falls inside an operator-chosen window). An inactive range
+    /// (`since == nil && until == nil`) is a true no-op, returning `rows`
+    /// unchanged, unknown timestamps included — a range nobody asked for
+    /// must never start hiding anything.
+    private func dateFilteredForDisplay(_ rows: [ActivityRow]) -> [ActivityRow] {
+        guard since != nil || until != nil else { return rows }
+        return rows.filter { row in
+            guard let startedAt = row.startedAt else { return false }
+            if let since, startedAt < since { return false }
+            if let until, startedAt > until { return false }
+            return true
+        }
     }
 
     // MARK: - Remote hosts (progressive per-host loading)

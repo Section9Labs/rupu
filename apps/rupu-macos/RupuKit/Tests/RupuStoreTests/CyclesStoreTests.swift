@@ -327,4 +327,67 @@ struct CyclesStoreTests {
 
         store.deactivate()
     }
+
+    // MARK: - Client-side date filtering of remote-host rows (review fix,
+    // perf & interaction arc Plan 5 Task 5 — same gap `ActivityStore` had:
+    // `loadRemoteHost` never sends `since`/`until` to the server, so the
+    // active range must be enforced client-side against remote cycle rows
+    // in `recompute()`'s `dateFilteredForDisplay(_:)`, or they'd merge in
+    // unfiltered while local rows narrow correctly.)
+
+    @MainActor @Test func remoteHostCycleRowOutsideActiveDateRangeIsExcluded() async {
+        let store = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/autoflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                let inRange = Self.cycleJSON(id: "cycle-remote-in", startedAt: "2026-08-10T12:00:00Z", hostID: "mini")
+                let outOfRange = Self.cycleJSON(id: "cycle-remote-out", startedAt: "2026-08-01T12:00:00Z", hostID: "mini")
+                return (200, Data("[\(inRange),\(outOfRange)]".utf8))
+            }
+            return (200, Data("[\(Self.cycleJSON(id: "cycle-local", startedAt: "2026-08-12T12:00:00Z"))]".utf8))
+        }
+
+        await store.activate()
+        await expectEventually("both remote cycles land, unfiltered (no range active yet)") {
+            store.rows.count == 3
+        }
+        #expect(Set(store.rows.map(\.cycleID)) == Set(["cycle-local", "cycle-remote-in", "cycle-remote-out"]))
+
+        await store.setDateRange(since: ISO8601Parsing.parse("2026-08-10T00:00:00Z")!, until: nil)
+
+        #expect(Set(store.rows.map(\.cycleID)) == Set(["cycle-local", "cycle-remote-in"]), "the out-of-range remote cycle must not reach `rows`")
+
+        store.deactivate()
+    }
+
+    @MainActor @Test func dateRangeChangeReFiltersAlreadyMergedRemoteCyclesWithoutRefetchingTheRemoteHost() async {
+        let store = makeStore { req in
+            guard let url = req.url else { return (200, Data("[]".utf8)) }
+            if url.path == "/api/hosts" {
+                return (200, Self.hostsJSON([("mini", "online")]))
+            }
+            guard url.path == "/api/runs/autoflows" else { return (200, Data("[]".utf8)) }
+            if Self.queryHost(req) == "mini" {
+                let inRange = Self.cycleJSON(id: "cycle-remote-in", startedAt: "2026-08-10T12:00:00Z", hostID: "mini")
+                let outOfRange = Self.cycleJSON(id: "cycle-remote-out", startedAt: "2026-08-01T12:00:00Z", hostID: "mini")
+                return (200, Data("[\(inRange),\(outOfRange)]".utf8))
+            }
+            return (200, Data("[\(Self.cycleJSON(id: "cycle-local", startedAt: "2026-08-12T12:00:00Z"))]".utf8))
+        }
+
+        await store.activate()
+        await expectEventually("both remote cycles land") { store.rows.count == 3 }
+        let remoteFetchCountBefore = CyclesStubURLProtocol.hits("/api/runs/autoflows")
+
+        await store.setDateRange(since: ISO8601Parsing.parse("2026-08-10T00:00:00Z")!, until: nil)
+
+        #expect(Set(store.rows.map(\.cycleID)) == Set(["cycle-local", "cycle-remote-in"]))
+        let remoteFetchCountAfter = CyclesStubURLProtocol.hits("/api/runs/autoflows")
+        #expect(remoteFetchCountAfter == remoteFetchCountBefore + 1, "exactly one new request (host=local's reset) — never a second remote-host fetch")
+
+        store.deactivate()
+    }
 }
