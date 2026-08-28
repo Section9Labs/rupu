@@ -64,6 +64,47 @@ private func graph(_ yaml: String) throws -> WorkflowGraph {
     #expect(obj["steps"]?.sequenceValue?[0]["approval"] == .mapping([]))
 }
 
+/// Regression for a fidelity gap review found in `nodeToStepObject`: the TS
+/// source omits `when`/`agent`/`prompt`/`for_each`/`action` when the string
+/// is FALSY (empty), not merely when it's `undefined` — `if (d.when)
+/// o.when = d.when` (workflowGraph.ts:1044 etc.), not `if (d.when !==
+/// undefined)`. A hand-authored `when: ""` (or `agent: ""`/`prompt: ""`/
+/// `for_each: ""`/`action: ""`) parses to a non-nil EMPTY Swift string, and
+/// a nil-only guard would then re-emit `when: ""` where the web drops the
+/// key entirely. Exercises all five call sites: `appendSharedTail`'s
+/// `when` (via the for_each-kind step `a`), the step/for_each arm's
+/// `agent`/`prompt`/`for_each` (also step `a`), the `action` arm's
+/// `action` (step `b`), and the `run` arm's `for_each` (step `c`).
+@Test func emptyStringFieldsAreOmittedNotEmittedAsEmptyStrings() throws {
+    let y = """
+        name: t
+        steps:
+          - id: a
+            agent: ""
+            prompt: ""
+            when: ""
+            for_each: ""
+          - id: b
+            action: ""
+          - id: c
+            for_each: ""
+            run:
+              cmd: echo
+        """
+    guard case .object(let obj) = graphToWorkflowObject(try graph(y)) else {
+        Issue.record("serialize failed")
+        return
+    }
+    let steps = obj["steps"]?.sequenceValue ?? []
+    #expect(steps.count == 3)
+    #expect(steps[0]["agent"] == nil)
+    #expect(steps[0]["prompt"] == nil)
+    #expect(steps[0]["when"] == nil)
+    #expect(steps[0]["for_each"] == nil)
+    #expect(steps[1]["action"] == nil)
+    #expect(steps[2]["for_each"] == nil)
+}
+
 @Test func loopFeedbackRefDoesNotBlockSerialize() throws {
     let y = """
         name: t

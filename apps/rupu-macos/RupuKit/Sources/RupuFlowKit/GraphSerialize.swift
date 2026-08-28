@@ -71,7 +71,7 @@ private func joinWaitValue(_ w: JoinWait) -> YAMLValue {
 /// kind EXCEPT `parallel` (a genuine TS-source asymmetry, ported verbatim:
 /// the `parallel` arm never emits these).
 private func appendSharedTail(_ o: inout [(key: String, value: YAMLValue)], _ d: StepNodeData) {
-    if let when = d.when { o.append(("when", .string(when))) }
+    if let when = d.when, !when.isEmpty { o.append(("when", .string(when))) }
     if d.continueOnError == true { o.append(("continue_on_error", .bool(true))) }
     if let actions = d.actions, !actions.isEmpty {
         o.append(("actions", .sequence(actions.map { .string($0) })))
@@ -138,13 +138,13 @@ func nodeToStepObject(_ d: StepNodeData) -> YAMLValue {
         o.append(("branch", .mapping(bo)))
 
     case .action:
-        if let action = d.action { o.append(("action", .string(action))) }
+        if let action = d.action, !action.isEmpty { o.append(("action", .string(action))) }
         if let with = d.with { o.append(("with", with)) }
         appendSharedTail(&o, d)
 
     case .run:
         if let runBlock = d.runBlock { o.append(("run", runBlock)) }
-        if let forEach = d.forEach { o.append(("for_each", .string(forEach))) }
+        if let forEach = d.forEach, !forEach.isEmpty { o.append(("for_each", .string(forEach))) }
         if let maxParallel = d.maxParallel { o.append(("max_parallel", .int(maxParallel))) }
         appendSharedTail(&o, d)
 
@@ -168,10 +168,10 @@ func nodeToStepObject(_ d: StepNodeData) -> YAMLValue {
         appendSharedTail(&o, d)
 
     case .step, .forEach:
-        if let agent = d.agent { o.append(("agent", .string(agent))) }
-        if let prompt = d.prompt { o.append(("prompt", .string(prompt))) }
+        if let agent = d.agent, !agent.isEmpty { o.append(("agent", .string(agent))) }
+        if let prompt = d.prompt, !prompt.isEmpty { o.append(("prompt", .string(prompt))) }
         appendSharedTail(&o, d)
-        if let forEach = d.forEach { o.append(("for_each", .string(forEach))) }
+        if let forEach = d.forEach, !forEach.isEmpty { o.append(("for_each", .string(forEach))) }
         if let maxParallel = d.maxParallel { o.append(("max_parallel", .int(maxParallel))) }
         if let with = d.with { o.append(("with", with)) }
     }
