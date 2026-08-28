@@ -308,6 +308,35 @@ public final class BuilderStore {
         commit(applyUpdate(graph, id: data.id, data: data))
     }
 
+    /// A single-field-safe alternative to `updateStep(_:)` for the Step
+    /// form's per-field debounced commits (macOS Workflow Builder, Task 13
+    /// review Finding 1). `updateStep(_:)` takes a WHOLE `StepNodeData` the
+    /// caller must have built ahead of time — fine for a synchronous edit,
+    /// but wrong for a debounce/blur-timer closure: a `Task` scheduled 300ms
+    /// in the future (or a SwiftUI view's `onChange`/`onSubmit` closure)
+    /// necessarily captured its `StepNodeData` snapshot back when the
+    /// keystroke fired, and by the time it actually runs, ANOTHER field's
+    /// debounce may already have committed — applying the stale snapshot
+    /// wholesale would silently revert that other field's edit. Worse, a
+    /// rename firing mid-debounce changes the node's id out from under a
+    /// frozen snapshot, so `updateStep`'s `applyUpdate(graph, id: data.id,
+    /// ...)` would look for an id that no longer exists and silently no-op.
+    ///
+    /// This method closes both gaps by resolving EVERYTHING fresh at CALL
+    /// time: `selectedID` (which `rename` keeps pointed at the renamed
+    /// node — see `rename(id:to:)`'s doc comment) and that node's CURRENT
+    /// `data`, straight off `graph.nodes` — never off any value the caller
+    /// captured earlier. `mutate` should therefore touch ONLY the one field
+    /// it owns; `nil`-selection or a since-deleted node is a silent no-op
+    /// (mirrors `deleteSelection()`'s own "no selection, nothing to do"
+    /// contract) rather than a crash.
+    public func updateSelectedStep(_ mutate: (inout StepNodeData) -> Void) {
+        guard let id = selectedID, let node = graph.nodes.first(where: { $0.id == id }) else { return }
+        var data = node.data
+        mutate(&data)
+        updateStep(data)
+    }
+
     /// Sets the workflow's top-level `name`. Split out from the description
     /// setter (Task 9 review, Finding 1) because a single combined
     /// `updateMeta(name:description:)` had asymmetric nil semantics — `name

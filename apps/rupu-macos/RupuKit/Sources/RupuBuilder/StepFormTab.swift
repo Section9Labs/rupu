@@ -199,10 +199,17 @@ private struct StepFormBody: View {
 
     // MARK: - Mutation helper (every per-kind field below routes through this)
 
+    /// Forwards straight to `store.updateSelectedStep(_:)` — NEVER reads
+    /// `self.node.data` here (review fix, Finding 1: a debounce `Task`
+    /// captures its enclosing `self` — a value-type snapshot — back when
+    /// the keystroke that scheduled it fired, so reading `node.data` at
+    /// FIRE time would silently apply a stale, possibly-already-superseded
+    /// copy of every OTHER field, or target an id a mid-debounce rename
+    /// already moved past). `store` is a class reference, so even a stale
+    /// captured `self` still calls through to the LIVE store, which
+    /// resolves the current selection and its current data itself.
     private func commit(_ mutate: (inout StepNodeData) -> Void) {
-        var data = node.data
-        mutate(&data)
-        store.updateStep(data)
+        store.updateSelectedStep(mutate)
     }
 
     // MARK: - Per-kind fields
@@ -283,10 +290,8 @@ private struct StepFormBody: View {
     }
 
     private var maxParallelField: some View {
-        DebouncedField(
-            label: "MAX PARALLEL", initial: node.data.maxParallel.map(String.init) ?? "", font: .dataMono(11)
-        ) { newValue in
-            commit { $0.maxParallel = parseOptionalInt(newValue) }
+        DebouncedNumericField(label: "MAX PARALLEL", initial: node.data.maxParallel.map(String.init) ?? "") { newValue in
+            commit { $0.maxParallel = newValue }
         }
     }
 
@@ -296,6 +301,18 @@ private struct StepFormBody: View {
         VStack(alignment: .leading, spacing: 6) {
             Eyebrow("SUB-STEPS")
             let subSteps = node.data.parallel ?? []
+            // Keyed on "<index>-<id>" (review fix, Finding 2), not the
+            // bare `.offset` this used to use — a plain offset key means
+            // removing row N leaves every row AFTER it sitting at the SAME
+            // ForEach identity it always had, so SwiftUI treats it as "the
+            // same row" and never re-seeds `SubStepRow`'s local `@State`
+            // text: the id/prompt fields kept showing the REMOVED row's
+            // stale text bound to what is now a DIFFERENT sub-step
+            // underneath. `id` is folded into the key (not just `index`)
+            // so a genuine content change (add/remove/reorder) always
+            // mints a fresh identity; two rows sharing an id — a user
+            // hasn't renamed a freshly-added one yet — still get distinct
+            // keys because `index` differs.
             ForEach(Array(subSteps.enumerated()), id: \.offset) { index, subStep in
                 SubStepRow(
                     subStep: subStep,
@@ -305,6 +322,7 @@ private struct StepFormBody: View {
                     onChangePrompt: { newPrompt in commitSubStep(at: index) { $0.prompt = newPrompt } },
                     onRemove: { removeSubStep(at: index) }
                 )
+                .id("\(index)-\(subStep.id)")
             }
             Button {
                 addSubStep()
@@ -349,6 +367,12 @@ private struct StepFormBody: View {
         VStack(alignment: .leading, spacing: 6) {
             Eyebrow("PANELISTS")
             let panelists = node.data.panel?.panelists ?? []
+            // Same composite-identity fix as `parallelField`'s sub-step
+            // rows above (review fix, Finding 2) — panelists are bare
+            // strings (duplicates entirely possible, e.g. two rows still
+            // defaulted to the same agent), so the key folds `index` in
+            // ahead of the value specifically so two same-valued rows
+            // never collide.
             ForEach(Array(panelists.enumerated()), id: \.offset) { index, panelist in
                 HStack(spacing: 6) {
                     Picker(
@@ -373,6 +397,7 @@ private struct StepFormBody: View {
                     }
                     .buttonStyle(.plain)
                 }
+                .id("\(index)-\(panelist)")
             }
             Button {
                 addPanelist()
@@ -450,10 +475,8 @@ private struct StepFormBody: View {
                 .pickerStyle(.segmented)
             }
             if joinWaitKind(node.data.joinWait) == "count" {
-                DebouncedField(
-                    label: "COUNT", initial: joinWaitCount(node.data.joinWait).map(String.init) ?? "", font: .dataMono(11)
-                ) { newValue in
-                    commit { $0.joinWait = .count(parseOptionalInt(newValue) ?? 0) }
+                DebouncedNumericField(label: "COUNT", initial: joinWaitCount(node.data.joinWait).map(String.init) ?? "") { newValue in
+                    commit { $0.joinWait = .count(newValue ?? 0) }
                 }
             }
         }
@@ -470,10 +493,10 @@ private struct StepFormBody: View {
     }
 
     private var timeoutField: some View {
-        DebouncedField(
-            label: "TIMEOUT (SECONDS)", initial: node.data.approvalTimeoutSeconds.map(String.init) ?? "", font: .dataMono(11)
+        DebouncedNumericField(
+            label: "TIMEOUT (SECONDS)", initial: node.data.approvalTimeoutSeconds.map(String.init) ?? ""
         ) { newValue in
-            commit { $0.approvalTimeoutSeconds = parseOptionalInt(newValue) }
+            commit { $0.approvalTimeoutSeconds = newValue }
         }
     }
 
@@ -568,12 +591,6 @@ private struct StepFormBody: View {
 }
 
 // MARK: - Shared local field/parsing helpers
-
-private func parseOptionalInt(_ text: String) -> Int? {
-    let trimmed = text.trimmingCharacters(in: .whitespaces)
-    guard !trimmed.isEmpty else { return nil }
-    return Int(trimmed)
-}
 
 private func joinWaitKind(_ wait: JoinWait?) -> String {
     switch wait {
@@ -691,9 +708,7 @@ private struct WithEditor: View {
                 .foregroundStyle(Color.rupuInk)
                 .scrollContentBackground(.hidden)
                 .frame(minHeight: 60)
-                .padding(6)
-                .background(Color.rupuBg)
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(focused ? Color.rupuBrand : Color.rupuBorder, lineWidth: focused ? 1.5 : 1))
+                .modifier(FieldChrome(focused: focused))
                 .focused($focused)
                 .onChange(of: text) { _, _ in scheduleParse() }
                 .onChange(of: focused) { _, isFocused in
@@ -827,6 +842,81 @@ struct DebouncedField: View {
         debounceTask?.cancel()
         debounceTask = nil
         onCommit(text)
+    }
+}
+
+/// The numeric counterpart of `DebouncedField` (review fix, Minor 2): same
+/// debounce/blur commit contract, but empty text and unparseable non-empty
+/// text are no longer conflated — `DebouncedField` used to hand a plain
+/// `String` to a caller-side `Int(trimmed)` parse that silently coerced
+/// BOTH "empty" and "not a number" to `nil`, so a typo (`"12x"`) meant to
+/// set MAX PARALLEL/TIMEOUT vanished into "unlimited/absent" with no
+/// feedback. This field keeps the WITH sub-editor's parse-or-hold contract
+/// instead: empty commits `nil`; a valid integer commits it; anything else
+/// shows an inline `.noteText` `rupuErr` error and holds — the field
+/// keeps the invalid text on screen and does NOT call `onCommit` at all,
+/// so the store's last-good value survives until the text is fixed.
+struct DebouncedNumericField: View {
+    let label: String
+    let onCommit: (Int?) -> Void
+
+    @State private var text: String
+    @State private var error: String?
+    @FocusState private var focused: Bool
+    @State private var debounceTask: Task<Void, Never>?
+
+    init(label: String, initial: String, onCommit: @escaping (Int?) -> Void) {
+        self.label = label
+        self.onCommit = onCommit
+        _text = State(initialValue: initial)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Eyebrow(label)
+            TextField("", text: $text)
+                .textFieldStyle(.plain)
+                .font(.dataMono(11))
+                .foregroundStyle(Color.rupuInk)
+                .focused($focused)
+                .modifier(FieldChrome(focused: focused))
+                .onSubmit { commitNow() }
+                .onChange(of: text) { _, _ in scheduleDebounce() }
+                .onChange(of: focused) { _, isFocused in
+                    if !isFocused { commitNow() }
+                }
+            if let error {
+                Text(error)
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuErr)
+            }
+        }
+    }
+
+    private func scheduleDebounce() {
+        debounceTask?.cancel()
+        debounceTask = Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            commitNow()
+        }
+    }
+
+    private func commitNow() {
+        debounceTask?.cancel()
+        debounceTask = nil
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else {
+            error = nil
+            onCommit(nil)
+            return
+        }
+        guard let value = Int(trimmed) else {
+            error = "Not a whole number."
+            return
+        }
+        error = nil
+        onCommit(value)
     }
 }
 

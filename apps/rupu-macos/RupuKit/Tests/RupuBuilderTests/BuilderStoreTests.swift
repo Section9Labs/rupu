@@ -305,6 +305,69 @@ struct BuilderStoreTests {
         #expect(!store.graph.nodes.contains { $0.id == "a" })
     }
 
+    // MARK: - updateSelectedStep (Task 13 review, Finding 1)
+    //
+    // `updateSelectedStep` exists specifically so the Step form's debounced
+    // field commits never read a FROZEN `StepNodeData` snapshot: each call
+    // resolves `selectedID` and that node's CURRENT `data` fresh, mutates
+    // only the one field the caller's closure touches, and applies through
+    // `updateStep`. These two tests are the store-level coverage the review
+    // asked for — `StepFormTab.swift`'s own field-commit closures have no
+    // dedicated tests (this package doesn't render-test SwiftUI bodies; see
+    // every other `RupuBuilderTests` file's own "pure seam only" convention),
+    // so the guarantee is proven once here, at the layer that actually owns
+    // it.
+
+    @Test func updateSelectedStepAppliesSequentialSingleFieldMutationsWithoutClobbering() async {
+        let client = makeClient(detailYAML: Self.twoStepYAML)
+        let store = makeStore(client: client)
+        await store.activate()
+        store.select("a")
+
+        // Two SEPARATE calls, each touching only its own field — mirrors
+        // two different debounced fields on the Step form firing one after
+        // another. If either call read a stale snapshot of the whole node
+        // (the Finding 1 bug) the first field's edit would vanish once the
+        // second one lands.
+        store.updateSelectedStep { $0.prompt = "updated prompt" }
+        store.updateSelectedStep { $0.when = "always" }
+
+        let node = store.graph.nodes.first { $0.id == "a" }
+        #expect(node?.data.prompt == "updated prompt")
+        #expect(node?.data.when == "always")
+    }
+
+    @Test func updateSelectedStepAfterARenameLandsOnTheRenamedNode() async {
+        let client = makeClient(detailYAML: Self.twoStepYAML)
+        let store = makeStore(client: client)
+        await store.activate()
+        store.select("a")
+
+        // A rename mid-edit — e.g. the STEP ID field committing on blur
+        // while a debounced PROMPT edit is still in flight for the SAME
+        // node — must not strand the follow-up mutation on the OLD id.
+        #expect(store.rename(id: "a", to: "renamed-a"))
+        #expect(store.selectedID == "renamed-a")
+
+        store.updateSelectedStep { $0.prompt = "after rename" }
+
+        let renamedNode = store.graph.nodes.first { $0.id == "renamed-a" }
+        #expect(renamedNode?.data.prompt == "after rename")
+        #expect(!store.graph.nodes.contains { $0.id == "a" })
+    }
+
+    @Test func updateSelectedStepIsANoOpWithNoSelection() async {
+        let client = makeClient(detailYAML: Self.twoStepYAML)
+        let store = makeStore(client: client)
+        await store.activate()
+        #expect(store.selectedID == nil)
+        let graphBefore = store.graph
+
+        store.updateSelectedStep { $0.prompt = "should never land" }
+
+        #expect(store.graph == graphBefore)
+    }
+
     // MARK: - Debounced revalidate (Task 9 review, Finding 2)
     //
     // Both tests use the `debounceInterval`-taking test-seam `init` with a
