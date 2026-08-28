@@ -75,6 +75,14 @@ private final class Parser {
                 pos += 1
                 continue
             }
+            // A tab immediately after the counted-spaces indent means this
+            // line's indentation used a tab: indent-by-spaces-only would
+            // silently read it as indent 0 and misfile it as a sibling of
+            // whatever's at column 0, restructuring the document without
+            // any error. Reject instead of guessing a tab width.
+            if bodyAfterIndent.hasPrefix("\t") {
+                throw YAMLError.malformed("tab characters are not supported in indentation", line: raw.number)
+            }
             if stripped == "---" {
                 if sawContent {
                     throw YAMLError.unsupported("multiple documents are not supported", line: raw.number)
@@ -112,7 +120,14 @@ private final class Parser {
         if line.content.hasPrefix("- ") || line.content == "-" {
             return try parseSequence(indent: line.indent)
         }
-        if findTopLevelColon(line.content) != nil {
+        // A line that is itself a flow collection (`[a, b]` / `{a: 1}`) is
+        // never a mapping-entry line, even though `findTopLevelColon` below
+        // is not flow-bracket-aware and would happily "find" the first `: `
+        // *inside* the braces (e.g. `{a: 1, b: 2}` → mistaking `{a` for a
+        // key). Route straight to the shared value parser, which dispatches
+        // to the flow tokenizer correctly.
+        let isBareFlow = line.content.hasPrefix("[") || line.content.hasPrefix("{")
+        if !isBareFlow, findTopLevelColon(line.content) != nil {
             return try parseMapping(indent: line.indent)
         }
         let (value, next) = try parseValue(line.content, rawIndex: pos, indent: line.indent)
@@ -145,6 +160,13 @@ private final class Parser {
     func parseSingleMappingEntry(content: String, rawIndex: Int, lineNumber: Int, indent: Int) throws -> (
         key: String, value: YAMLValue
     ) {
+        // Every call site (parseMapping's loop, parseSequence's inline-item
+        // and continuation loops) has already confirmed `content` contains
+        // a top-level colon — and, since the flow-mapping/-sequence fix
+        // above, has already ruled out a bare `[`/`{` line — before calling
+        // in, so this guard is an invariant check, not a reachable path.
+        // Kept (rather than force-unwrapped) as a defensive fallback if a
+        // future call site's guard is loosened.
         guard let colonIdx = findTopLevelColon(content) else {
             throw YAMLError.malformed("expected 'key: value'", line: lineNumber)
         }
@@ -199,7 +221,12 @@ private final class Parser {
                 } else {
                     itemValue = .null
                 }
-            } else if findTopLevelColon(remainder) != nil {
+            } else if !(remainder.hasPrefix("[") || remainder.hasPrefix("{")), findTopLevelColon(remainder) != nil {
+                // Same flow-bracket-awareness gap as parseNode's dispatch:
+                // `- {id: a, agent: x}` must not be read as an inline
+                // mapping keyed on the literal text "{id" — a bare flow
+                // collection right after the dash falls through to the
+                // scalar/flow branch below instead.
                 var entries: [(key: String, value: YAMLValue)] = []
                 let (key0, value0) = try parseSingleMappingEntry(
                     content: remainder, rawIndex: dashRawIndex, lineNumber: dashLineNumber, indent: virtualIndent)

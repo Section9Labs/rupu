@@ -80,6 +80,45 @@ import Testing
     #expect(v["branch"]?["then"] == .sequence([.string("ghost")]))
 }
 
+@Test func sequenceItemAsBareFlowMappingParsesCorrectly() throws {
+    // Regression: a block-sequence item that is *itself* a flow mapping —
+    // no "key:" on the dash line before it — must not be misparsed as an
+    // inline mapping keyed on the literal text "{id" (findTopLevelColon is
+    // not flow-bracket-aware, so without an explicit check it would "find"
+    // the ": " inside the braces). Later tasks feed the parser exactly this
+    // inline step syntax.
+    let y = "steps:\n  - {id: a, agent: x}\n"
+    let v = try YAMLParser.parse(y)
+    let steps = v["steps"]?.sequenceValue
+    #expect(steps?.count == 1)
+    #expect(steps?[0]["id"] == .string("a"))
+    #expect(steps?[0]["agent"] == .string("x"))
+}
+
+@Test func topLevelBareFlowMappingDocumentParsesCorrectly() throws {
+    // Regression: a document that is *only* a flow mapping, with no
+    // preceding "key:" at all, must not be misparsed via
+    // findTopLevelColon finding the first ": " inside the braces.
+    let v = try YAMLParser.parse("{a: 1, b: 2}\n")
+    #expect(v["a"] == .int(1))
+    #expect(v["b"] == .int(2))
+}
+
+@Test func nestedBareFlowValueOnItsOwnLineParsesCorrectly() throws {
+    // Regression: "foo:" with an empty inline value whose nested content
+    // (on the next, more-indented line) is itself a bare flow mapping.
+    let v = try YAMLParser.parse("foo:\n  {a: 1}\n")
+    #expect(v["foo"]?["a"] == .int(1))
+}
+
+@Test func tabIndentationIsRejected() {
+    // Regression: counting only literal spaces for indentation means a
+    // tab-indented line was silently read at indent 0, restructuring the
+    // document (here: "b: 1" would land as a top-level sibling of "a"
+    // instead of nested under it) rather than erroring.
+    #expect(throws: YAMLError.self) { try YAMLParser.parse("a:\n\tb: 1\n") }
+}
+
 @Test func quotedTemplateBracesStaySrings() throws {
     // Quote detection must run before flow detection: a quoted scalar
     // containing `{{ ... }}` must stay a string, not be parsed as a flow
