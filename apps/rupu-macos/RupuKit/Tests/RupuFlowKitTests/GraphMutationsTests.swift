@@ -130,3 +130,53 @@ private func graph(_ yaml: String) throws -> WorkflowGraph {
     #expect(g2.nodes.first { $0.id == "a" }?.data.agent == "y")
     #expect(g2.nodes.first { $0.id == "a" }?.data.prompt == "q")
 }
+
+@Test func deleteScrubsDependsOnReference() throws {
+    let g = try graph(
+        "name: t\nsteps:\n  - {id: a, agent: x, prompt: p}\n  - {id: b, agent: x, prompt: p, depends_on: [a]}\n"
+    )
+    let g2 = applyDelete(g, id: "a")
+    #expect(g2.nodes.first { $0.id == "b" }?.data.dependsOn == [])
+}
+
+@Test func renameRejectsUnknownFrom() throws {
+    let g = try graph("name: t\nsteps:\n  - {id: a, agent: x, prompt: p}\n")
+    guard case .rejected = applyRename(g, from: "nope", to: "whatever") else { Issue.record("expected reject"); return }
+}
+
+// ── loops survive add / connect / update (Task 8 review fix) ───────────────
+
+private let loopedGraphYAML =
+    "name: t\nloops:\n  refine: {nodes: [a, b], until: cond, max_iterations: 3, on_max: fail}\nsteps:\n  - {id: a, agent: x, prompt: p}\n  - {id: b, agent: x, prompt: p}\n"
+
+// A third, non-member node `c` gives `applyConnect` somewhere to draw a
+// FRESH edge (a->b is already an implicit chain edge, so connecting them
+// again would just read as a "duplicate" — this keeps the loop-survival
+// assertion independent of that unrelated rejection path).
+private let loopedGraphWithSpareNodeYAML =
+    "name: t\nloops:\n  refine: {nodes: [a, b], until: cond, max_iterations: 3, on_max: fail}\nsteps:\n  - {id: a, agent: x, prompt: p}\n  - {id: b, agent: x, prompt: p}\n  - {id: c, agent: x, prompt: p}\n"
+
+@Test func addPreservesLoops() throws {
+    let g = try graph(loopedGraphYAML)
+    let (g2, _) = applyAdd(g, kind: .step, at: .zero)
+    #expect(g2.loops == g.loops)
+}
+
+@Test func connectPreservesLoops() throws {
+    let g = try graph(loopedGraphWithSpareNodeYAML)
+    guard case .connected(let g2) = applyConnect(g, source: "a", target: "c", arm: nil) else {
+        Issue.record("connect refused")
+        return
+    }
+    #expect(g2.loops == g.loops)
+    #expect(g2.edges.contains { $0.source == "a" && $0.target == "c" })
+}
+
+@Test func updatePreservesLoops() throws {
+    let g = try graph(loopedGraphYAML)
+    var newData = StepNodeData(id: "a", kind: .step)
+    newData.agent = "y"
+    newData.prompt = "q"
+    let g2 = applyUpdate(g, id: "a", data: newData)
+    #expect(g2.loops == g.loops)
+}

@@ -210,14 +210,17 @@ func slugify(_ raw: String) -> String {
     return collapsed
 }
 
-/// Rename step `from` to a slugified version of `rawNew`. Rejects an
-/// empty-after-slug result or a collision with any OTHER node's id (a
-/// same-as-before "rename" is allowed — it's a no-op). Rewrites every
+/// Rename step `from` to a slugified version of `rawNew`. Rejects an unknown
+/// `from`, an empty-after-slug result, or a collision with any OTHER node's
+/// id (a same-as-before "rename" is allowed — it's a no-op). Rewrites every
 /// reference: other nodes' `next`/`split`/`dependsOn`/`thenTargets`/
 /// `elseTargets`, and loop memberships. Prompt-text `steps.<old>` template
 /// references are deliberately NOT rewritten (matches web behavior — the
 /// validate layer flags the resulting dangling reference instead).
 public func applyRename(_ g: WorkflowGraph, from: String, to rawNew: String) -> RenameOutcome {
+    guard g.nodes.contains(where: { $0.id == from }) else {
+        return .rejected("No step named \"\(from)\".")
+    }
     let newID = slugify(rawNew)
     guard !newID.isEmpty else {
         return .rejected("Step id can't be empty.")
