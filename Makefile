@@ -119,6 +119,9 @@ macos-build: macos-gen
 		-configuration Debug -derivedDataPath apps/rupu-macos/DerivedData \
 		CODE_SIGN_IDENTITY=- build
 
+# If this wedges at 0% CPU with no failure output, a test has deadlocked —
+# see docs/macos-test-hangs.md for the 3-step diagnosis recipe (serial+pty
+# run, --filter isolation) and orphaned swiftpm-testing-helper cleanup.
 macos-test:
 	swift test --package-path apps/rupu-macos/RupuKit
 

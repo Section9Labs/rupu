@@ -290,12 +290,17 @@ private actor AsyncGate {
 
     let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
         if usingOldData.value {
-            // Suspends until the test explicitly opens the gate — models a
-            // loadMore() that's still in flight when the filter changes,
-            // with NO timing dependency for correctness (only the "has it
-            // started yet" check below is timing-based, and that one is
-            // bounded — see its own comment).
-            await gate.wait()
+            // Only the loadMore() fetch (offset > 0) suspends until the test
+            // explicitly opens the gate — models a loadMore() that's still in
+            // flight when the filter changes, with NO timing dependency for
+            // correctness (only the "has it started yet" check below is
+            // timing-based, and that one is bounded — see its own comment).
+            // The setup `refresh()` above fetches page 0 of oldData and must
+            // pass through ungated: gating it too would deadlock the test
+            // against its own not-yet-reached `gate.open()`.
+            if offset > 0 {
+                await gate.wait()
+            }
             guard offset < oldData.count else { return [] }
             let end = min(offset + limit, oldData.count)
             return Array(oldData[offset..<end])
