@@ -175,7 +175,7 @@ public struct WorkflowBuilderScreen: View {
                     store.dismissCommitError()
                 } label: {
                     Text("×")
-                        .font(.system(size: 15, weight: .medium))
+                        .font(.uiText)
                         .foregroundStyle(Color.rupuDim)
                 }
                 .buttonStyle(.plain)

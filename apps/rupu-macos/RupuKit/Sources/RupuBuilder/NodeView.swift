@@ -63,8 +63,12 @@ struct NodeView: View {
         ZStack(alignment: .topLeading) {
             SilhouetteShape(name: visual.shape)
                 .fill(Color.rupuPanel)
+            // 1.4pt kind-accent stroke normally; selected swaps to a 2pt
+            // BRAND stroke (not accent) plus the outer brand shadow the
+            // `.shadow(...)` modifier on `body` adds — spec's selection
+            // treatment is a brand highlight, not a thicker accent ring.
             SilhouetteShape(name: visual.shape)
-                .stroke(accent, lineWidth: selected ? 2 : 1.4)
+                .stroke(selected ? Color.rupuBrand : accent, lineWidth: selected ? 2 : 1.4)
             SilhouetteExtras(name: visual.shape)
                 .stroke(Color.rupuBorderStrong, lineWidth: 1)
 
@@ -81,8 +85,11 @@ struct NodeView: View {
         ZStack(alignment: .top) {
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color.rupuPanel)
+            // Selection border goes brand (not the kind accent) per spec —
+            // same rule the silhouette body's own stroke follows above; the
+            // accent stays visible via the top bar fill below either way.
             RoundedRectangle(cornerRadius: 6)
-                .stroke(selected ? Color.rupuBrand : Color.rupuBorderStrong, lineWidth: selected ? 2 : 1.4)
+                .stroke(selected ? Color.rupuBrand : accent, lineWidth: selected ? 2 : 1.4)
             UnevenRoundedRectangle(topLeadingRadius: 6, topTrailingRadius: 6)
                 .fill(accent)
                 .frame(height: 3.5)
@@ -161,7 +168,20 @@ struct NodeView: View {
                     }
                 }
                 .position(point)
-                .gesture(
+                // `.highPriorityGesture`, NOT plain `.gesture` — a port dot
+                // sits INSIDE the node body, which already carries its own
+                // plain `.gesture(bodyDrag)` (see `body` below). SwiftUI's
+                // default gesture composition does not guarantee the
+                // descendant wins a same-type ambiguity (two `DragGesture`s
+                // recognizing the same touch); per Apple's own
+                // `highPriorityGesture(_:)` docs, this modifier is exactly
+                // what makes a subview's gesture take precedence over an
+                // ancestor's — without it, a drag started on the dot risks
+                // being captured by `bodyDrag` instead, silently turning
+                // every connect-drag into a node move. This can't be
+                // exercised by the pure-geometry test suite (no SwiftUI
+                // render pass here); confirm empirically in the running app.
+                .highPriorityGesture(
                     DragGesture(minimumDistance: 2, coordinateSpace: .named("canvasSpace"))
                         .onChanged { value in onPortDragChanged(source.arm, value.location) }
                         .onEnded { value in onPortDragEnded(source.arm, value.location) }
