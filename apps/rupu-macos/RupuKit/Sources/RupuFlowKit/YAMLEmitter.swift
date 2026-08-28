@@ -174,6 +174,15 @@ public enum YAMLEmitter {
         }
     }
 
+    /// Not meaningful for non-finite doubles (`.nan`/`.infinity`/
+    /// `-.infinity`) — this repo's YAML subset has no literal that parses
+    /// to one (`YAMLParser.resolveScalar` only ever produces a `.double`
+    /// via `Double.init` on a string `looksNumeric` already approved, which
+    /// excludes "nan"/"inf"-shaped text), so a `.double` carrying one can
+    /// only be constructed programmatically in Swift, never round-tripped
+    /// from parsed YAML. Produces a best-effort ("nan.0"/"inf.0"-shaped)
+    /// string rather than trapping, since callers passing one in are
+    /// already outside the format this emitter targets.
     private static func formatDouble(_ d: Double) -> String {
         let text = "\(d)"
         if text.contains(".") || text.contains("e") || text.contains("E") {
@@ -225,6 +234,29 @@ public enum YAMLEmitter {
             return nil
         }
 
+        // `parseBlockScalar` (YAMLParser.swift) derives its `baseIndent`
+        // from the FIRST non-blank raw line, then BREAKS out of the block
+        // early on any later non-blank line whose leading-space count is
+        // less than that base — it does not track a per-string minimum
+        // indent the way a real YAML reader's "detect then dedent" pass
+        // would. We always prepend the same fixed `contentIndent` pad to
+        // every line we write, so the parser's observed indent for line N
+        // is `contentIndent + line[N]'s own leading-space count`. That
+        // means the parser's base becomes `contentIndent +
+        // firstNonBlankLine's own leading-space count` — and unless that
+        // first line's own leading-space count is exactly zero, any later
+        // line with FEWER of its own leading spaces than the first line
+        // would read as under-indented and truncate the block early
+        // (dropping the remainder of the string, or worse, letting a
+        // dangling continuation line get misread as the next structural
+        // line). Refusing whenever the first non-blank line carries any
+        // leading space sidesteps the whole class: with zero there, the
+        // parser's base is exactly `contentIndent`, which every other
+        // line's own (>= 0) leading spaces can only meet or exceed.
+        if let firstNonBlank = lines.first(where: { !$0.isEmpty }), firstNonBlank.hasPrefix(" ") {
+            return nil
+        }
+
         var collected = lines
         while let last = collected.last, last.isEmpty {
             collected.removeLast()
@@ -269,8 +301,9 @@ public enum YAMLEmitter {
         // but is applied everywhere for uniformity and to stay conservative.
         if s.contains(": ") { return true }
         // `stripCommentAndTrim` starts a comment at any `#` preceded by
-        // whitespace (or at the very start, already covered above).
-        if s.contains(" #") { return true }
+        // whitespace — a space OR a tab (or at the very start, already
+        // covered above).
+        if s.contains(" #") || s.contains("\t#") { return true }
         // `resolveScalar` keyword collisions: only these exact lowercase
         // forms (plus bare `~`, covered by the leading-char set above)
         // resolve to non-string types.
