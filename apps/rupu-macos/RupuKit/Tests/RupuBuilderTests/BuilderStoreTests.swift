@@ -567,6 +567,75 @@ struct BuilderStoreTests {
         #expect(store.runOverlay == nil)
         #expect(store.followedRunStatus == nil)
     }
+
+    /// Review fix, Finding 2: two overlapping `enterRunMode` calls must
+    /// leave EXACTLY one active followed run, never an orphaned one. The
+    /// FIRST call's own `/api/runs/workflows` fetch is gated on a semaphore
+    /// (held by the test, same "deterministic mid-flight window" idiom
+    /// `ActivityStoreTests.activateRendersLocalImmediatelyThenMergesSlow
+    /// OnlineRemoteHostProgressively`'s `remoteGate` already establishes for
+    /// this codebase) so the first call is still suspended when the second
+    /// one starts.
+    ///
+    /// **Not gated on the second call's own network round-trip completing**
+    /// (an earlier draft of this test was, and it reliably paid the FULL
+    /// 10s `firstRequestGate` timeout in the process — this custom
+    /// `URLProtocol`'s loading system does not run two in-flight requests on
+    /// the same session freely concurrently, so a request created AFTER an
+    /// already-blocked one on the same stub can itself stall behind it).
+    /// What actually matters for the guard is `runFollowGeneration`, bumped
+    /// SYNCHRONOUSLY at the very top of `enterRunMode`, before its own first
+    /// `await` — so the second call only needs to have been SCHEDULED and
+    /// run its synchronous prefix, not have its network fetch resolve, for
+    /// the generation to already be current. Polling the test-only
+    /// `runFollowGeneration` counter (see that property's doc comment)
+    /// proves exactly that, fast and deterministically, without needing the
+    /// second request to race the first one through the stub at all.
+    @Test func overlappingEnterRunModeCallsLeaveExactlyOneActiveFollowedRun() async {
+        let requestIndex = Counter()
+        let firstRequestGate = DispatchSemaphore(value: 0)
+        let runADetailStub = Self.runDetailEndpoints(runID: "run-A", workflowName: "nightly")
+        let runBDetailStub = Self.runDetailEndpoints(runID: "run-B", workflowName: "nightly")
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            if req.httpMethod == "GET", req.url?.path == "/api/runs/workflows" {
+                let index = requestIndex.increment()
+                if index == 1 {
+                    // Held by the test until the second (overlapping) call
+                    // has already claimed the current generation — the 10s
+                    // cap only bounds a hung test, it is not a timing knob.
+                    _ = firstRequestGate.wait(timeout: .now() + 10)
+                    return (200, Self.runListRowsJSON([(id: "run-A", workflowName: "nightly")]))
+                }
+                return (200, Self.runListRowsJSON([(id: "run-B", workflowName: "nightly")]))
+            }
+            return runADetailStub(req) ?? runBDetailStub(req)
+        }
+        let store = makeStore(client: client)
+        await store.activate()
+
+        let backend = BackendController()
+        let taskA = Task { await store.enterRunMode(backend: backend) }
+        await expectEventually("the first (gated) workflowRuns request has been issued") {
+            BuilderStubURLProtocol.hits("GET /api/runs/workflows") == 1
+        }
+        #expect(store.runFollowGeneration == 1)
+
+        let taskB = Task { await store.enterRunMode(backend: backend) }
+        await expectEventually("the second call has claimed the current generation") {
+            store.runFollowGeneration == 2
+        }
+
+        // Release the stale first call now — it will eventually resolve to
+        // "run-A", but its captured generation (1) no longer matches
+        // (`runFollowGeneration` is 2), so it must bail out without ever
+        // touching `followedRunID`/`runFollowStore`.
+        firstRequestGate.signal()
+
+        await taskA.value
+        await taskB.value
+
+        #expect(store.followedRunID == "run-B", "the call holding the current generation must win, and a stale one resuming later must never clobber it")
+    }
 }
 
 /// Thread-safe call counter — same rationale as `ConfigStoreTests`'s own

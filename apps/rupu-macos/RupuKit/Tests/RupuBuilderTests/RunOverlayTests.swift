@@ -2,6 +2,7 @@ import Testing
 @testable import RupuBuilder
 import RupuAPI
 import RupuStore
+import RupuDesign
 
 @Suite
 struct RunOverlayTests {
@@ -172,5 +173,29 @@ struct RunOverlayTests {
         let rows = [Self.row(id: "run-other", workflowName: "unrelated")]
 
         #expect(latestRunID(rows: rows, workflowName: "nightly") == nil)
+    }
+
+    // MARK: - badgeIcon (review fix, Finding 1)
+    //
+    // A failed `.done` step previously rendered a red-recolored CHECKMARK
+    // instead of an X — the exact opposite of `RupuDesign.StatusDescriptor`/
+    // `StatusPill`'s own `.failed -> .xCircle` precedent. `badgeIcon(for:)`
+    // is `NodeView.swift`'s pure seam for this choice, testable here without
+    // a SwiftUI render pass.
+
+    @Test func badgeIconIsCheckCircleForASuccessfulDoneStep() {
+        #expect(badgeIcon(for: .done(success: true)) == .checkCircle2)
+    }
+
+    @Test func badgeIconIsXCircleForAFailedDoneStep() {
+        #expect(badgeIcon(for: .done(success: false)) == .xCircle)
+    }
+
+    @Test func badgeIconIsNilForEveryNonDoneState() {
+        #expect(badgeIcon(for: .running) == nil)
+        #expect(badgeIcon(for: .gatePending) == nil)
+        #expect(badgeIcon(for: .pending) == nil)
+        #expect(badgeIcon(for: .skipped) == nil)
+        #expect(badgeIcon(for: .paused) == nil)
     }
 }

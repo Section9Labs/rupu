@@ -89,6 +89,20 @@ public final class BuilderStore {
     private var runFollowStore: RunDetailStore?
     public private(set) var followedRunID: String?
 
+    /// Reentrancy guard (review fix, Finding 2): bumped at the START of
+    /// every `enterRunMode(backend:)` call AND by `exitRunMode()` — see
+    /// both methods' doc comments for how this closes the "two overlapping
+    /// `enterRunMode` calls orphan a `RunDetailStore`" gap a rapid
+    /// Design<->Run toggle could otherwise hit (this repo has SSE-leak
+    /// history; a `RunDetailStore` left activated with nothing referencing
+    /// it anymore is exactly that class of bug). `internal private(set)`
+    /// (not `private`), same "test-only visibility via `@testable import`"
+    /// carve-out `RunDetailStore.graphRecomputeCount` already establishes:
+    /// `BuilderStoreTests`' overlapping-calls test polls this directly to
+    /// deterministically know the second call has claimed the current
+    /// generation, rather than guessing with a fixed delay.
+    internal private(set) var runFollowGeneration = 0
+
     /// The run launched FROM this screen this session, if any — checked
     /// BEFORE the newest-run-for-this-workflow fallback in
     /// `enterRunMode(backend:)`. **Never actually set by this task's Launch
@@ -97,15 +111,20 @@ public final class BuilderStore {
     /// navigation call with no completion callback threaded back to this
     /// store) and flips `mode = .run` immediately afterward — `enterRunMode`
     /// therefore runs before the user has even filled in the sheet, let
-    /// alone before any run exists to record here. This is the documented
-    /// "Launch deviation" (see the Task 14 PR description): Launch reliably
-    /// shows the workflow's most recent PRIOR run (or the empty state) the
-    /// instant Run mode opens, not the just-launched one, until the user
-    /// manually flips back to Design and forward to Run again after the new
-    /// run has started. Kept as a real (if currently unreachable) resolution
-    /// path — not a stub — because it's the seam a future task closes this
-    /// gap through (e.g. threading a completion callback through
-    /// `presentLauncher`), and `enterRunMode`'s own precedence honestly
+    /// alone before any run exists to record here. This is the documented,
+    /// sanctioned "Launch deviation": no `presentLauncher` completion
+    /// plumbing this task. **Controller ruling, review fix**: most of the
+    /// gap is closed cheaply anyway, NOT through this property — see
+    /// `WorkflowBuilderScreen`'s `onChange(of: model.showLauncher)`, which
+    /// re-runs `enterRunMode(backend:)` when the Launcher sheet closes while
+    /// still in Run mode. By then the just-launched run (if any) IS the
+    /// newest run for this workflow, so the existing fallback path picks it
+    /// up without this property ever needing to be set. Kept as a real (if
+    /// currently unreachable) resolution path — not a stub — because it's
+    /// the seam a future task closes the REMAINING gap through (e.g.
+    /// threading an actual completion callback through `presentLauncher`,
+    /// which would resolve the followed run instantly rather than only once
+    /// the sheet closes), and `enterRunMode`'s own precedence honestly
     /// checks it first either way.
     private var launchedRunID: (id: String, host: String?)?
 
@@ -507,15 +526,50 @@ public final class BuilderStore {
     /// being followed before starting the new one, same "rebuild, don't
     /// reuse" contract `RunDetailScreen.activate()` follows for a `runID`
     /// change.
+    ///
+    /// **Reentrancy (review fix, Finding 2)**: this function has TWO
+    /// suspension points (the `workflowRuns` fetch, and `newStore.
+    /// activate()`), and a rapid Design<->Run toggle can start a second
+    /// `enterRunMode` — or call `exitRunMode()` directly — while an earlier
+    /// call is still suspended at either one. `runFollowGeneration` (bumped
+    /// here at entry, and by `exitRunMode()`) is what makes "only the most
+    /// recent call ever mutates `runFollowStore`/`followedRunID`" true by
+    /// construction rather than a timing accident: a call whose captured
+    /// generation no longer matches `runFollowGeneration` by the time either
+    /// `await` resumes discards its own results — the FIRST checkpoint bails
+    /// out before touching any shared state at all; the SECOND deactivates
+    /// the `RunDetailStore` this call itself just built and assigned, since
+    /// a newer call already overwrote `runFollowStore` out from under it
+    /// while `activate()` was in flight. Without this, a stale call
+    /// resuming last would silently leave an activated `RunDetailStore` (SSE
+    /// stream and all) running with nothing referencing it anymore — this
+    /// repo has SSE-leak history (see `project_sse_starvation_arc`).
     public func enterRunMode(backend: BackendController) async {
+        runFollowGeneration += 1
+        let generation = runFollowGeneration
+
         let workflowName = graph.meta.name
         let target: (id: String, host: String?)?
         if let launchedRunID {
             target = launchedRunID
         } else {
-            let rows = (try? await client.workflowRuns(offset: 0, limit: 50)) ?? []
+            // Review fix, Finding 3: `host: "local"` is required, not
+            // optional — `CPClient.workflowRuns(offset:limit:host:since:
+            // until:)`'s own doc comment warns an OMITTED `host` fans the
+            // call out to every registered host sequentially server-side,
+            // turning a ~60ms call into several seconds against a fleet with
+            // one offline node. The Builder only ever edits LOCAL workflow
+            // definitions, so "local" is always the right scope for this
+            // lookup — the followed RUN's own host still comes from the
+            // resolved row (`target.host` below) and threads into
+            // `RunDetailStore`'s init unchanged, so a workflow that was last
+            // run on a remote Fleet host is still followed correctly.
+            let rows = (try? await client.workflowRuns(offset: 0, limit: 50, host: "local")) ?? []
             target = RupuBuilder.latestRunID(rows: rows, workflowName: workflowName)
         }
+
+        // Checkpoint 1 — see the doc comment above.
+        guard generation == runFollowGeneration else { return }
 
         guard let target else {
             exitRunMode()
@@ -530,6 +584,14 @@ public final class BuilderStore {
         runFollowStore = newStore
         followedRunID = target.id
         await newStore.activate()
+
+        // Checkpoint 2 — see the doc comment above. `newStore` (this call's
+        // OWN local reference), not `runFollowStore` (which a newer call may
+        // have already reassigned) is what gets torn down here.
+        guard generation == runFollowGeneration else {
+            newStore.deactivate()
+            return
+        }
     }
 
     /// Deactivates and releases the followed run's store — called whenever
@@ -537,8 +599,13 @@ public final class BuilderStore {
     /// goes away entirely, mirroring `RunDetailScreen`'s own
     /// `onDisappear { store?.deactivate() }`. Idempotent (a `nil`
     /// `runFollowStore` is a harmless no-op), matching every other
-    /// activate/deactivate pair in this codebase.
+    /// activate/deactivate pair in this codebase. Also bumps
+    /// `runFollowGeneration` (review fix, Finding 2) — an `enterRunMode`
+    /// call already in flight when this runs must never resurrect a store
+    /// after the user explicitly asked to leave Run mode; see that
+    /// function's doc comment.
     public func exitRunMode() {
+        runFollowGeneration += 1
         runFollowStore?.deactivate()
         runFollowStore = nil
         followedRunID = nil

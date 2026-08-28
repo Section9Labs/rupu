@@ -115,6 +115,25 @@ public struct WorkflowBuilderScreen: View {
                 store.exitRunMode()
             }
         }
+        // Controller ruling (review fix): closes most of `launchedRunID`'s
+        // documented gap cheaply, without threading a completion callback
+        // through `presentLauncher`. `LauncherSheet` is presented at
+        // `RootView`'s level (`.sheet(isPresented: $model.showLauncher)`,
+        // not on this screen) — this screen is never removed from the view
+        // hierarchy while the sheet is up, so a plain `.onAppear` never
+        // fires again when it closes; watching `model.showLauncher`'s own
+        // `true -> false` transition IS the real "the user is back" signal
+        // in this app's architecture (the idiom `RunDetailScreen` uses,
+        // `.task(id:)`, has no equivalent here — that screen is popped/
+        // re-pushed on a navigation stack, this one sits behind a sheet).
+        // Re-running `enterRunMode` only while still in Run mode is
+        // idempotent when the followed run hasn't changed (`BuilderStore.
+        // enterRunMode`'s own doc comment) and safe under the Finding 2
+        // generation guard even if it races the `mode` observer above.
+        .onChange(of: model.showLauncher) { wasShowing, isShowing in
+            guard wasShowing, !isShowing, let store, store.mode == .run else { return }
+            Task { await store.enterRunMode(backend: backend) }
+        }
         .onDisappear {
             store?.exitRunMode()
         }
@@ -124,6 +143,10 @@ public struct WorkflowBuilderScreen: View {
     /// surfaces a failure — see `BuilderStore.save()`'s doc comment), and
     /// only open the Launcher sheet + flip to Run mode on success. A failed
     /// save must never open the sheet against stale, un-persisted YAML.
+    /// Whatever run this shows immediately after opening the sheet is
+    /// necessarily stale/empty (the launch hasn't happened yet) — see
+    /// `BuilderStore.launchedRunID`'s doc comment; the `onChange(of: model.
+    /// showLauncher)` observer above re-resolves once the sheet closes.
     private func handleLaunch(store: BuilderStore) {
         Task {
             guard await store.save() else { return }

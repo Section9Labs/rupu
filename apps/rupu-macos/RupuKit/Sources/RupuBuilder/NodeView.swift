@@ -103,27 +103,30 @@ struct NodeView: View {
         }
     }
 
-    /// The top-right corner badge: a green check for `.done`, a pulsing dot
+    /// The top-right corner badge: a green check for a SUCCESSFUL `.done`,
+    /// a red X for a FAILED one (review fix, Finding 1 — codebase precedent
+    /// is `StatusDescriptor.descriptor(for:).icon`/`StatusPill`'s own
+    /// `.failed -> .xCircle`; a recolored checkmark read as "failed but
+    /// still somehow a check", which is exactly backwards), a pulsing dot
     /// for `.running`/`.gatePending`. Nothing for `.pending`/`.skipped`
     /// (those read purely through `runContentOpacity`/`runPendingRing`
     /// above) or Design mode.
     @ViewBuilder
     private var runStateBadge: some View {
-        if runOverlayActive, let overlayState {
-            switch overlayState {
-            case .done(let success):
-                Icon(.checkCircle2, size: 14)
-                    .foregroundStyle(Color.status(success ? .done : .failed))
-                    .padding(3)
-            case .running:
-                RunPulseDot(tone: .running)
-                    .padding(5)
-            case .gatePending:
-                RunPulseDot(tone: .awaiting)
-                    .padding(5)
-            default:
-                EmptyView()
-            }
+        if runOverlayActive, let overlayState, let icon = badgeIcon(for: overlayState) {
+            // `runStrokeColor` already resolves the exact same
+            // done(success)/running/gatePending -> status-color mapping
+            // this badge needs — reused rather than re-deriving it a
+            // second time.
+            Icon(icon, size: 14)
+                .foregroundStyle(runStrokeColor ?? Color.status(.done))
+                .padding(3)
+        } else if runOverlayActive, overlayState == .running {
+            RunPulseDot(tone: .running)
+                .padding(5)
+        } else if runOverlayActive, overlayState == .gatePending {
+            RunPulseDot(tone: .awaiting)
+                .padding(5)
         }
     }
 
@@ -335,6 +338,21 @@ struct NodeView: View {
             .onEnded { value in
                 onMoveEnded(value.translation)
             }
+    }
+}
+
+/// Pure seam (review fix, Finding 1) so the badge-icon choice is testable
+/// without a SwiftUI render pass: `.checkCircle2` for a SUCCESSFUL `.done`,
+/// `.xCircle` for a FAILED one — mirrors `RupuDesign.StatusDescriptor.
+/// descriptor(for:).icon`/`StatusPill`'s own `.failed -> .xCircle` mapping,
+/// which the badge previously diverged from (a red-recolored checkmark
+/// instead of an X). `nil` for every other state — `.running`/`.gatePending`
+/// render `RunPulseDot` instead (see `runStateBadge`), `.pending`/`.skipped`
+/// render no badge at all.
+func badgeIcon(for state: NodeState) -> LucideIcon? {
+    switch state {
+    case .done(let success): success ? .checkCircle2 : .xCircle
+    default: nil
     }
 }
 
