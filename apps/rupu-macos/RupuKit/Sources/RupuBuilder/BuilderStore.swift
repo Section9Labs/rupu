@@ -78,6 +78,61 @@ public final class BuilderStore {
     /// best-effort fetch contract as `agents`.
     public private(set) var tools: [ToolSpec] = []
 
+    // MARK: - Run mode (Task 14)
+
+    /// The run `enterRunMode(backend:)` resolved and is currently following
+    /// — `nil` while Run mode has nothing to show (`WorkflowBuilderScreen`
+    /// renders the "No runs yet" empty state whenever `mode == .run` and
+    /// this is `nil`). Owns a `RunDetailStore`, mirroring
+    /// `RunDetailScreen`'s own activate/deactivate lifecycle: `enterRunMode`
+    /// activates a fresh one, `exitRunMode` deactivates and releases it.
+    private var runFollowStore: RunDetailStore?
+    public private(set) var followedRunID: String?
+
+    /// The run launched FROM this screen this session, if any — checked
+    /// BEFORE the newest-run-for-this-workflow fallback in
+    /// `enterRunMode(backend:)`. **Never actually set by this task's Launch
+    /// flow**: `WorkflowBuilderScreen`'s Launch button opens the Launcher
+    /// sheet via `AppModel.presentLauncher(...)` (a fire-and-forget
+    /// navigation call with no completion callback threaded back to this
+    /// store) and flips `mode = .run` immediately afterward — `enterRunMode`
+    /// therefore runs before the user has even filled in the sheet, let
+    /// alone before any run exists to record here. This is the documented
+    /// "Launch deviation" (see the Task 14 PR description): Launch reliably
+    /// shows the workflow's most recent PRIOR run (or the empty state) the
+    /// instant Run mode opens, not the just-launched one, until the user
+    /// manually flips back to Design and forward to Run again after the new
+    /// run has started. Kept as a real (if currently unreachable) resolution
+    /// path — not a stub — because it's the seam a future task closes this
+    /// gap through (e.g. threading a completion callback through
+    /// `presentLauncher`), and `enterRunMode`'s own precedence honestly
+    /// checks it first either way.
+    private var launchedRunID: (id: String, host: String?)?
+
+    /// The overlay `NodeView`/`EdgeLayer` render against in Run mode — a
+    /// COMPUTED property, not cached state: reads `runFollowStore.graph`/
+    /// `liveStates` fresh on every access, so SwiftUI's Observation
+    /// tracking (a view's body touching `store.runOverlay` walks straight
+    /// through into the nested `@Observable` `RunDetailStore`'s own tracked
+    /// properties) picks up every live update the same way it would if the
+    /// view read `runFollowStore` directly. `nil` whenever there's no run
+    /// being followed, or its `graph` block hasn't loaded (yet, or failed)
+    /// — `NodeView`/`EdgeLayer` render their plain design-mode look in
+    /// either case, same as "nothing to show" everywhere else in this app.
+    public var runOverlay: RunOverlay? {
+        guard let runFollowStore, case .content(let g) = runFollowStore.graph else { return nil }
+        return RupuBuilder.runOverlay(results: g.stepResults, units: g.units, liveStates: runFollowStore.liveStates)
+    }
+
+    /// The followed run's current status string (`detail.run.status`,
+    /// server-raw — `BuilderHeader` normalizes it via `ActivityStatus`), for
+    /// the header's "running" `StatusPill`. Same computed-property /
+    /// observation-passthrough rationale as `runOverlay` above.
+    public var followedRunStatus: String? {
+        guard let runFollowStore, case .content(let d) = runFollowStore.detail else { return nil }
+        return d.run.status
+    }
+
     /// The workflow name `activate()` fetches — the identity this store was
     /// constructed for, distinct from `graph.meta.name` (which `rename`/
     /// `updateName` can change mid-session; `save()` PUTs to
@@ -429,5 +484,63 @@ public final class BuilderStore {
         } catch {
             // Leave `serverValid` untouched — see doc comment above.
         }
+    }
+
+    // MARK: - Run mode (Task 14)
+
+    /// Resolves which run to follow and activates a `RunDetailStore` for it
+    /// — called whenever `mode` becomes `.run` (`WorkflowBuilderScreen`'s
+    /// `onChange(of: store.mode)`, which covers both the segmented control
+    /// and the Launch button's own `mode = .run` flip). Resolution order:
+    /// (a) `launchedRunID`, if this session recorded one (see that
+    /// property's doc comment for why that's currently always `nil`); else
+    /// (b) the newest run for `graph.meta.name` from one page of
+    /// `client.workflowRuns(offset: 0, limit: 50)` (`latestRunID(rows:
+    /// workflowName:)`); else (c) `nil` — Run mode renders the "No runs yet"
+    /// empty state.
+    ///
+    /// Idempotent for the same already-followed run (a redundant
+    /// `enterRunMode` call — e.g. the segmented control round-tripping
+    /// Design -> Run without the followed run changing — leaves the
+    /// existing `RunDetailStore` running rather than tearing it down and
+    /// losing its live stream mid-flight); otherwise tears down whatever was
+    /// being followed before starting the new one, same "rebuild, don't
+    /// reuse" contract `RunDetailScreen.activate()` follows for a `runID`
+    /// change.
+    public func enterRunMode(backend: BackendController) async {
+        let workflowName = graph.meta.name
+        let target: (id: String, host: String?)?
+        if let launchedRunID {
+            target = launchedRunID
+        } else {
+            let rows = (try? await client.workflowRuns(offset: 0, limit: 50)) ?? []
+            target = RupuBuilder.latestRunID(rows: rows, workflowName: workflowName)
+        }
+
+        guard let target else {
+            exitRunMode()
+            return
+        }
+        if followedRunID == target.id, runFollowStore != nil {
+            return
+        }
+
+        runFollowStore?.deactivate()
+        let newStore = RunDetailStore(runID: target.id, host: target.host, client: client, backend: backend)
+        runFollowStore = newStore
+        followedRunID = target.id
+        await newStore.activate()
+    }
+
+    /// Deactivates and releases the followed run's store — called whenever
+    /// `mode` leaves `.run` (back to `.design`) and whenever this screen
+    /// goes away entirely, mirroring `RunDetailScreen`'s own
+    /// `onDisappear { store?.deactivate() }`. Idempotent (a `nil`
+    /// `runFollowStore` is a harmless no-op), matching every other
+    /// activate/deactivate pair in this codebase.
+    public func exitRunMode() {
+        runFollowStore?.deactivate()
+        runFollowStore = nil
+        followedRunID = nil
     }
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import RupuDesign
+import RupuStore
 
 /// The Workflow Builder screen's fixed 46pt header row (macOS design plan,
 /// Task 10, spec §1): back chevron + breadcrumb, a "running" `StatusPill`
@@ -59,14 +60,19 @@ struct BuilderHeader: View {
     }
 
     /// Whether the "running" `StatusPill` should render — true exactly when
-    /// Run mode is actively following a live run. `BuilderStore.
-    /// enterRunMode(client:backend:)` (Task 14) is what will give this
-    /// screen a real "is a run actually live" signal; no such state exists
-    /// on `BuilderStore` yet, so this always resolves `false` today rather
-    /// than approximating with `store.mode == .run` (which would render a
-    /// "running" pill even when Run mode has nothing to follow — a mocked
-    /// state the no-mock-features rule forbids).
-    private var hasLiveRun: Bool { false }
+    /// Run mode is actively following a run whose server-reported status
+    /// reads as running/pending (`ActivityStatus.normalize`, the same
+    /// status-string bridge `RunDetailStore.availableVerbs` uses). A
+    /// followed run that's already completed/failed/awaiting/paused, or no
+    /// followed run at all (`followedRunStatus == nil` — Run mode's empty
+    /// state, or Design mode), never renders this pill.
+    private var hasLiveRun: Bool {
+        guard let status = store.followedRunStatus else { return false }
+        switch ActivityStatus.normalize(status) {
+        case .running, .pending: return true
+        default: return false
+        }
+    }
 
     private var validDot: some View {
         let tone = validDotTone(serverValid: store.serverValid, problems: store.problems)

@@ -1,6 +1,7 @@
 import SwiftUI
 import RupuDesign
 import RupuFlowKit
+import RupuStore
 
 // EdgeLayer — draws every `GraphEdge` as a cubic bezier with an arrowhead,
 // plus THEN/ELSE branch-arm labels. Pure geometry (`bezierPoints`/
@@ -78,26 +79,93 @@ private func unitDirection(from a: CGPoint, to b: CGPoint) -> CGPoint {
     return CGPoint(x: dx / length, y: dy / length)
 }
 
+/// One edge's Run-mode paint (Task 14) — resolved once per edge from its two
+/// endpoints' overlay states (missing entry -> `.pending`, same "no run
+/// overlay" contract every other run-mode consumer follows). `nil` color
+/// means "keep the plain design-mode stroke" (`Color.rupuBorderStrong`,
+/// solid).
+private struct EdgeRunPaint {
+    let color: Color
+    let dashed: Bool
+
+    /// Precedence, per the brief: both endpoints done wins outright; else a
+    /// running target; else either endpoint skipped; else the plain design
+    /// look (`nil`).
+    static func resolve(source: NodeState, target: NodeState) -> EdgeRunPaint? {
+        if case .done(let sOK) = source, sOK, case .done(let tOK) = target, tOK {
+            return EdgeRunPaint(color: Color.status(.done), dashed: false)
+        }
+        if target == .running {
+            return EdgeRunPaint(color: Color.status(.running), dashed: true)
+        }
+        if source == .skipped || target == .skipped {
+            return EdgeRunPaint(color: Color.rupuBorder.opacity(0.5), dashed: true)
+        }
+        return nil
+    }
+}
+
 struct EdgeLayer: View {
     let edges: [GraphEdge]
     let nodes: [GraphNode]
+    let mode: BuilderStore.Mode
+    let overlay: RunOverlay?
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        // The animated dash phase (running edges' marching ants) is the ONLY
+        // reason this needs a continuously-ticking `TimelineView` at all —
+        // skip it entirely under Reduce Motion (a static `draw(phase: 0)`
+        // Canvas costs nothing extra per frame) rather than running a timer
+        // whose output never changes.
+        if mode == .run, !reduceMotion {
+            TimelineView(.animation) { context in
+                draw(phase: dashPhase(for: context.date))
+            }
+        } else {
+            draw(phase: 0)
+        }
+    }
+
+    /// Marching-ants phase: a steady leftward crawl, wrapping every 10pt of
+    /// travel (the `[6, 4]` dash pattern's own 10pt period) so the pattern
+    /// never visibly "jumps" at the wrap. `date.timeIntervalSinceReferenceDate`
+    /// is monotonic for the life of the view — no accumulated `@State` phase
+    /// needed, unlike `RupuRunDetail`'s `GraphEdge.swift` (a plain SwiftUI
+    /// `Shape`, which animates via `withAnimation` instead); a `Canvas`
+    /// redraws from scratch every tick regardless, so reading time directly
+    /// is the simpler equivalent here.
+    private func dashPhase(for date: Date) -> CGFloat {
+        let speed: CGFloat = 16 // points/second
+        let traveled = CGFloat(date.timeIntervalSinceReferenceDate) * speed
+        return -traveled.truncatingRemainder(dividingBy: 10)
+    }
+
+    private func draw(phase: CGFloat) -> some View {
         Canvas { context, _ in
             for edge in edges {
                 guard let (p1, p2) = edgeAnchors(edge: edge, nodes: nodes) else { continue }
                 let (c1, c2) = bezierPoints(from: p1, to: p2)
 
+                let paint = runPaint(for: edge)
+                let color = paint?.color ?? Color.rupuBorderStrong
+                let style = StrokeStyle(
+                    lineWidth: 1.5, lineCap: .round,
+                    dash: paint?.dashed == true ? [6, 4] : [],
+                    dashPhase: paint?.dashed == true ? phase : 0
+                )
+
                 var path = Path()
                 path.move(to: p1)
                 path.addCurve(to: p2, control1: c1, control2: c2)
-                context.stroke(path, with: .color(Color.rupuBorderStrong), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                context.stroke(path, with: .color(color), style: style)
 
                 // Arrowhead: a 7pt chevron at the target, rotated to the
                 // curve's end tangent — the cubic bezier's derivative at
                 // t=1 points along `p2 - c2`.
                 let tangent = unitDirection(from: c2, to: p2)
-                drawArrowhead(context: context, at: p2, direction: tangent)
+                drawArrowhead(context: context, at: p2, direction: tangent, color: color)
 
                 if let arm = edge.branchArm {
                     let labelPoint = pointAlongTangent(from: p1, control: c1, distance: 24)
@@ -111,7 +179,17 @@ struct EdgeLayer: View {
         }
     }
 
-    private func drawArrowhead(context: GraphicsContext, at point: CGPoint, direction: CGPoint) {
+    /// `nil` outside Run mode, or when either endpoint has no run overlay
+    /// state to resolve against — same "no overlay yet" contract as
+    /// `NodeView`'s own `overlayState` param.
+    private func runPaint(for edge: GraphEdge) -> EdgeRunPaint? {
+        guard mode == .run, let overlay else { return nil }
+        let source = overlay.states[edge.source] ?? .pending
+        let target = overlay.states[edge.target] ?? .pending
+        return EdgeRunPaint.resolve(source: source, target: target)
+    }
+
+    private func drawArrowhead(context: GraphicsContext, at point: CGPoint, direction: CGPoint, color: Color) {
         let angle = atan2(direction.y, direction.x)
         let size: CGFloat = 7
         let spread: CGFloat = .pi / 7
@@ -122,6 +200,6 @@ struct EdgeLayer: View {
         path.move(to: left)
         path.addLine(to: point)
         path.addLine(to: right)
-        context.stroke(path, with: .color(Color.rupuBorderStrong), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        context.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
     }
 }

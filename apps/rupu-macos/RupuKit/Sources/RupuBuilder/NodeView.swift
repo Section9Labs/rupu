@@ -1,6 +1,7 @@
 import SwiftUI
 import RupuDesign
 import RupuFlowKit
+import RupuStore
 
 /// Which node body treatment `NodeView` paints. `.silhouette` (the shipped
 /// default) draws the kind's actual flowchart symbol (`ShapePaths.swift`'s
@@ -25,6 +26,18 @@ enum BuilderNodeStyle {
 struct NodeView: View {
     let node: GraphNode
     let selected: Bool
+    /// Run-mode overlay inputs (Task 14) — `nil`/`.design` for every
+    /// Design-mode render, which is untouched by either. `overlayState` is
+    /// this node's own resolved `NodeState` (already looked up by the
+    /// caller from `BuilderStore.runOverlay?.states[node.id]`, defaulting
+    /// to `.pending` when the run overlay has no entry for this step —
+    /// see `RunOverlayModel.swift`'s doc comment on why a missing key means
+    /// "not reached yet", not "unknown"); `unitProgress` is this node's
+    /// `(done, total)` fan-out count, `nil` for every non-`for_each` node or
+    /// a `for_each` with no unit rows yet.
+    let mode: BuilderStore.Mode
+    let overlayState: NodeState?
+    let unitProgress: (done: Int, total: Int)?
     let onSelect: () -> Void
     let onMoveEnded: (CGSize) -> Void
     let onPortDragChanged: (String?, CGPoint) -> Void
@@ -39,6 +52,8 @@ struct NodeView: View {
     // `accentColor(_:)` method — see `ShapePaths.swift`'s doc comment.
     private var accent: Color { RupuBuilder.accentColor(visual.accent) }
 
+    private var runOverlayActive: Bool { mode == .run }
+
     var body: some View {
         Group {
             switch BuilderNodeStyle.current {
@@ -50,11 +65,81 @@ struct NodeView: View {
         }
         .frame(width: NODE_W, height: NODE_H)
         .shadow(color: selected ? Color.rupuBrand.opacity(0.35) : .clear, radius: selected ? 8 : 0)
+        .opacity(runContentOpacity)
+        .overlay(runPendingRing)
+        .overlay(alignment: .topTrailing) { runStateBadge }
         .offset(dragTranslation)
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
         .gesture(bodyDrag)
         .onHover { hovering = $0 }
+    }
+
+    // MARK: - Run-mode overlay (Task 14)
+
+    /// `.pending` -> 0.6 opacity, `.skipped` -> 0.45, everything else (and
+    /// Design mode, and no overlay entry at all outside `.run`) -> 1 —
+    /// per the brief's exact glyph language.
+    private var runContentOpacity: CGFloat {
+        guard runOverlayActive, let overlayState else { return 1 }
+        switch overlayState {
+        case .pending: return 0.6
+        case .skipped: return 0.45
+        default: return 1
+        }
+    }
+
+    /// `.pending`'s dashed ring — drawn OUTSIDE the node's own shape stroke,
+    /// so it reads as an overlay rather than replacing the kind-accent
+    /// silhouette stroke underneath it.
+    @ViewBuilder
+    private var runPendingRing: some View {
+        if runOverlayActive, overlayState == .pending {
+            SilhouetteShape(name: visual.shape)
+                .stroke(Color.rupuBorder, style: StrokeStyle(lineWidth: 1.4, dash: [3, 2]))
+        } else if runOverlayActive, overlayState == .skipped {
+            SilhouetteShape(name: visual.shape)
+                .stroke(Color.rupuMute, lineWidth: 1.4)
+        }
+    }
+
+    /// The top-right corner badge: a green check for `.done`, a pulsing dot
+    /// for `.running`/`.gatePending`. Nothing for `.pending`/`.skipped`
+    /// (those read purely through `runContentOpacity`/`runPendingRing`
+    /// above) or Design mode.
+    @ViewBuilder
+    private var runStateBadge: some View {
+        if runOverlayActive, let overlayState {
+            switch overlayState {
+            case .done(let success):
+                Icon(.checkCircle2, size: 14)
+                    .foregroundStyle(Color.status(success ? .done : .failed))
+                    .padding(3)
+            case .running:
+                RunPulseDot(tone: .running)
+                    .padding(5)
+            case .gatePending:
+                RunPulseDot(tone: .awaiting)
+                    .padding(5)
+            default:
+                EmptyView()
+            }
+        }
+    }
+
+    /// The node's own accent/selection stroke — `.done`/`.running`/
+    /// `.gatePending` swap it to the state's status color per the brief;
+    /// every other state (including no overlay entry, or Design mode)
+    /// keeps the plain kind-accent/selection stroke `silhouetteBody`
+    /// already draws.
+    private var runStrokeColor: Color? {
+        guard runOverlayActive, let overlayState else { return nil }
+        switch overlayState {
+        case .done(let success): return Color.status(success ? .done : .failed)
+        case .running: return Color.status(.running)
+        case .gatePending: return Color.status(.awaiting)
+        default: return nil
+        }
     }
 
     // MARK: - Silhouette style (current)
@@ -67,8 +152,14 @@ struct NodeView: View {
             // BRAND stroke (not accent) plus the outer brand shadow the
             // `.shadow(...)` modifier on `body` adds — spec's selection
             // treatment is a brand highlight, not a thicker accent ring.
+            // Run mode's `runStrokeColor` (done/running/gatePending) wins
+            // over both when present — selection still takes the thicker
+            // 2pt line width, just recolored.
             SilhouetteShape(name: visual.shape)
-                .stroke(selected ? Color.rupuBrand : accent, lineWidth: selected ? 2 : 1.4)
+                .stroke(
+                    runStrokeColor ?? (selected ? Color.rupuBrand : accent),
+                    lineWidth: selected ? 2 : 1.4
+                )
             SilhouetteExtras(name: visual.shape)
                 .stroke(Color.rupuBorderStrong, lineWidth: 1)
 
@@ -107,7 +198,17 @@ struct NodeView: View {
     // MARK: - Content
 
     private var nodeContent: some View {
-        let sub = subLine(for: node.data)
+        // Task 14: a `for_each` node with a live fan-out count replaces its
+        // usual sub-line ("over <list>"/agent name) with "n/m items" while
+        // Run mode has progress to show — everything else (every other
+        // kind, Design mode, or a `for_each` with no `unitProgress` entry
+        // yet) keeps `subLine(for:)`'s normal design-mode text unchanged.
+        let sub: (text: String, mono: Bool)
+        if runOverlayActive, let unitProgress {
+            sub = ("\(unitProgress.done)/\(unitProgress.total) items", false)
+        } else {
+            sub = subLine(for: node.data)
+        }
         return VStack(alignment: geometry.centered ? .center : .leading, spacing: 3) {
             HStack(spacing: 4) {
                 if let icon = LucideIcon(rawValue: visual.iconName) {
@@ -234,6 +335,46 @@ struct NodeView: View {
             .onEnded { value in
                 onMoveEnded(value.translation)
             }
+    }
+}
+
+/// Run mode's top-right node badge for `.running`/`.gatePending` (Task 14):
+/// an 8pt filled dot pulsing scale 1 -> 1.3, opacity 1 -> 0.5, on a
+/// `.easeInOut(duration: 1.2)` repeat-forever — static (no animation at all)
+/// under Reduce Motion. Same start/stop-on-`onAppear`-and-`onChange`
+/// discipline as `RupuRunDetail/Graph/StepNodeCard.swift`'s `RingPulse`
+/// (this view's closest sibling): restart only at the animated <-> static
+/// boundary, never on every render, and react to a live Reduce Motion
+/// toggle exactly the way that view does.
+struct RunPulseDot: View {
+    let tone: StatusTone
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isPulsing = false
+
+    private let size: CGFloat = 8
+
+    var body: some View {
+        Circle()
+            .fill(Color.status(tone))
+            .frame(width: size, height: size)
+            .scaleEffect(active ? 1.3 : 1)
+            .opacity(active ? 0.5 : 1)
+            .onAppear { update() }
+            .onChange(of: reduceMotion) { _, _ in update() }
+    }
+
+    private var active: Bool { isPulsing && !reduceMotion }
+
+    private func update() {
+        guard !reduceMotion else {
+            isPulsing = false
+            return
+        }
+        guard !isPulsing else { return }
+        withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+            isPulsing = true
+        }
     }
 }
 

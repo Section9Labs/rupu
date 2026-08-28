@@ -1,6 +1,7 @@
 import SwiftUI
 import RupuDesign
 import RupuFlowKit
+import RupuStore
 
 // The Workflow Builder's canvas (macOS design plan, Task 11): a scrollable
 // `ZStack` — dot-grid background, `EdgeLayer`, then every node positioned
@@ -130,7 +131,7 @@ struct CanvasView: View {
                         canvasFocused = true
                     }
 
-                EdgeLayer(edges: store.graph.edges, nodes: store.graph.nodes)
+                EdgeLayer(edges: store.graph.edges, nodes: store.graph.nodes, mode: store.mode, overlay: store.runOverlay)
                     .frame(width: size.width, height: size.height)
                     .allowsHitTesting(false)
 
@@ -138,6 +139,14 @@ struct CanvasView: View {
                     NodeView(
                         node: node,
                         selected: store.selectedID == node.id,
+                        mode: store.mode,
+                        // A `.run`-mode node with no entry in `runOverlay`'s
+                        // `states` reads as `.pending` (not "unknown") —
+                        // see `RunOverlayModel.swift`'s doc comment. Design
+                        // mode passes `nil` outright so `NodeView` skips the
+                        // whole overlay treatment.
+                        overlayState: store.mode == .run ? (store.runOverlay?.states[node.id] ?? .pending) : nil,
+                        unitProgress: store.runOverlay?.unitProgress[node.id],
                         onSelect: {
                             store.select(node.id)
                             canvasFocused = true

@@ -68,9 +68,7 @@ public struct WorkflowBuilderScreen: View {
                     store: store, name: name, sourceOpen: $sourceOpen,
                     onBack: { model.navigateBack() },
                     onSave: { Task { await store.save() } },
-                    onLaunch: {
-                        model.presentLauncher(kind: .workflow, name: store.graph.meta.name, scopeKind: scopeKind, scopeID: scopeID)
-                    }
+                    onLaunch: { handleLaunch(store: store) }
                 )
                 Divider()
             }
@@ -99,6 +97,38 @@ public struct WorkflowBuilderScreen: View {
         }
         .onChange(of: store?.selectedID) { _, newValue in
             railTab = Self.railTab(afterSelecting: newValue, current: railTab)
+        }
+        // Task 14: the segmented control writes `store.mode` directly
+        // (`BuilderHeader`'s `Picker(selection: $store.mode)`) and
+        // `handleLaunch` flips it the same way on a successful save+launch
+        // — this ONE observer is what actually starts/stops the followed
+        // run for BOTH triggers, so neither has to duplicate the
+        // enter/exit call itself. Entering `.run` activates a fresh
+        // `RunDetailStore` (or reuses the already-followed one); leaving it
+        // deactivates and releases it, mirroring `RunDetailScreen`'s own
+        // activate/deactivate contract.
+        .onChange(of: store?.mode) { old, new in
+            guard let store else { return }
+            if new == .run {
+                Task { await store.enterRunMode(backend: backend) }
+            } else if old == .run {
+                store.exitRunMode()
+            }
+        }
+        .onDisappear {
+            store?.exitRunMode()
+        }
+    }
+
+    /// Launch button: save first (`store.save()`'s own `saveError` already
+    /// surfaces a failure — see `BuilderStore.save()`'s doc comment), and
+    /// only open the Launcher sheet + flip to Run mode on success. A failed
+    /// save must never open the sheet against stale, un-persisted YAML.
+    private func handleLaunch(store: BuilderStore) {
+        Task {
+            guard await store.save() else { return }
+            model.presentLauncher(kind: .workflow, name: store.graph.meta.name, scopeKind: scopeKind, scopeID: scopeID)
+            store.mode = .run
         }
     }
 
@@ -180,6 +210,15 @@ public struct WorkflowBuilderScreen: View {
                         commitErrorBanner(commitError, store: store)
                             .padding(12)
                     }
+                    // Task 14: Run mode resolved to nothing — no run
+                    // launched from here this session, and no prior run
+                    // for this workflow either (`enterRunMode`'s full
+                    // resolution chain came up empty). The canvas itself
+                    // still renders (plain, un-overlaid) underneath.
+                    if store.mode == .run, store.followedRunID == nil {
+                        noRunBanner
+                            .padding(12)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // Keeps `canvasFrame` current in the `"builder"` space —
@@ -231,6 +270,20 @@ public struct WorkflowBuilderScreen: View {
             }
         }
         .frame(maxWidth: 420)
+    }
+
+    // MARK: - No-run banner (Task 14)
+
+    /// Run mode's empty state — `enterRunMode(backend:)` found nothing to
+    /// follow (no run launched from this screen this session, and no prior
+    /// run for this workflow name either).
+    private var noRunBanner: some View {
+        TintBanner(tone: .rupuDim, toneBg: .rupuSurface) {
+            Text("No runs yet — Launch one")
+                .font(.noteText)
+                .foregroundStyle(Color.rupuInk)
+        }
+        .frame(maxWidth: 260)
     }
 
     // MARK: - YAML pane

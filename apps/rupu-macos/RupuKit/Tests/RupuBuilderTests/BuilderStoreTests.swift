@@ -422,6 +422,151 @@ struct BuilderStoreTests {
         }
         #expect(validateHits.value == 1, "the first commit's debounce must have been cancelled, not just superseded in effect")
     }
+
+    // MARK: - Run mode (Task 14)
+    //
+    // `enterRunMode(backend:)` awaits a real `RunDetailStore.activate()`
+    // internally, so these route the same `BuilderStubURLProtocol` harness
+    // through `RunDetailStore`'s own four REST endpoints in addition to
+    // `BuilderStore`'s usual ones — proving the store-level integration is
+    // cheap enough here that skipping it would have been the exception, not
+    // the rule the Task 14 brief's "only if... cheaply" carve-out expected.
+    // `BackendController()` (no live connection configured) is enough:
+    // `RunDetailStore`'s run-scoped event stream factory degrades to an
+    // already-finished, empty `AsyncStream` when there's no active
+    // connection (see that factory's own doc comment), which is exactly
+    // "no live updates" — fine for these REST-snapshot-only assertions.
+
+    nonisolated private static func usageJSON() -> String {
+        #"{"input_tokens":0,"output_tokens":0,"cached_tokens":0,"total_tokens":0,"cost_usd":null,"priced":false,"runs":0}"#
+    }
+
+    /// `rows` is passed in the exact order the stub should return it —
+    /// callers put whichever row `latestRunID` should pick FIRST, mirroring
+    /// the server's own newest-first paging that function assumes.
+    nonisolated private static func runListRowsJSON(_ rows: [(id: String, workflowName: String)]) -> Data {
+        let items = rows.map { row in
+            """
+            {"id":"\(row.id)","workflow_name":"\(row.workflowName)","status":"running","started_at":"2026-08-28T00:00:00Z","finished_at":null,"trigger":"manual","usage":\(usageJSON()),"turns":0,"duration_ms":null,"host_id":null}
+            """
+        }.joined(separator: ",")
+        return Data("[\(items)]".utf8)
+    }
+
+    nonisolated private static func runRecordJSON(id: String, workflowName: String, status: String) -> String {
+        """
+        {"id":"\(id)","workflow_name":"\(workflowName)","status":"\(status)","workspace_id":"ws-1","started_at":"2026-08-28T00:00:00Z","finished_at":null,"error_message":null,"awaiting":[],"active_step_id":null,"active_step_transcript_path":null,"parent_run_id":null,"permission_mode":"ask","final_output":null}
+        """
+    }
+
+    nonisolated private static func runDetailJSON(id: String, workflowName: String, status: String) -> Data {
+        Data("""
+        {"run":\(runRecordJSON(id: id, workflowName: workflowName, status: status)),"steps":[],"usage":\(usageJSON())}
+        """.utf8)
+    }
+
+    nonisolated private static func runGraphJSON(id: String, workflowName: String, status: String) -> Data {
+        Data("""
+        {"run":\(runRecordJSON(id: id, workflowName: workflowName, status: status)),"workflow":{"steps":[]},"step_results":[],"units":[],"usage":\(usageJSON())}
+        """.utf8)
+    }
+
+    nonisolated private static let netflowJSON = Data(#"{"flows":[],"hosts":[],"dropped_total":0,"asn_loaded":false}"#.utf8)
+    nonisolated private static let findingsJSON = Data(#"{"findings":[],"summary":{"total":0,"critical":0,"high":0,"medium":0,"low":0,"info":0}}"#.utf8)
+
+    /// Routes `RunDetailStore`'s own four REST endpoints for `runID` — every
+    /// `enterRunMode` test below layers this into `makeClient`'s `extra`
+    /// closure so the `RunDetailStore.activate()` `enterRunMode` awaits has
+    /// somewhere real to land.
+    nonisolated private static func runDetailEndpoints(runID: String, workflowName: String, status: String = "running") -> @Sendable (URLRequest) -> (status: Int, body: Data)? {
+        { req in
+            guard req.httpMethod == "GET", let path = req.url?.path else { return nil }
+            switch path {
+            case "/api/runs/\(runID)": return (200, Self.runDetailJSON(id: runID, workflowName: workflowName, status: status))
+            case "/api/runs/\(runID)/graph": return (200, Self.runGraphJSON(id: runID, workflowName: workflowName, status: status))
+            case "/api/runs/\(runID)/netflow": return (200, Self.netflowJSON)
+            case "/api/runs/\(runID)/findings": return (200, Self.findingsJSON)
+            default: return nil
+            }
+        }
+    }
+
+    @Test func enterRunModeFollowsTheNewestRunForThisWorkflowWhenNoneWasLaunchedThisSession() async {
+        let runDetailStub = Self.runDetailEndpoints(runID: "run-newest", workflowName: "nightly", status: "running")
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            if req.httpMethod == "GET", req.url?.path == "/api/runs/workflows" {
+                // Newest first, per `latestRunID`'s own "server already
+                // paginates newest-first" assumption.
+                return (200, Self.runListRowsJSON([
+                    (id: "run-newest", workflowName: "nightly"),
+                    (id: "run-older", workflowName: "nightly"),
+                ]))
+            }
+            return runDetailStub(req)
+        }
+        let store = makeStore(client: client)
+        await store.activate()
+
+        await store.enterRunMode(backend: BackendController())
+
+        #expect(store.followedRunID == "run-newest")
+        #expect(store.followedRunStatus == "running")
+    }
+
+    @Test func enterRunModeIgnoresRunsBelongingToOtherWorkflows() async {
+        let runDetailStub = Self.runDetailEndpoints(runID: "run-nightly", workflowName: "nightly")
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            if req.httpMethod == "GET", req.url?.path == "/api/runs/workflows" {
+                return (200, Self.runListRowsJSON([
+                    (id: "run-other", workflowName: "unrelated-workflow"),
+                    (id: "run-nightly", workflowName: "nightly"),
+                ]))
+            }
+            return runDetailStub(req)
+        }
+        let store = makeStore(client: client)
+        await store.activate()
+
+        await store.enterRunMode(backend: BackendController())
+
+        #expect(store.followedRunID == "run-nightly")
+    }
+
+    @Test func enterRunModeLeavesNoFollowedRunWhenTheWorkflowHasNeverRun() async {
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            if req.httpMethod == "GET", req.url?.path == "/api/runs/workflows" {
+                return (200, Data("[]".utf8))
+            }
+            return nil
+        }
+        let store = makeStore(client: client)
+        await store.activate()
+
+        await store.enterRunMode(backend: BackendController())
+
+        #expect(store.followedRunID == nil)
+        #expect(store.runOverlay == nil)
+    }
+
+    @Test func exitRunModeClearsTheFollowedRun() async {
+        let runDetailStub = Self.runDetailEndpoints(runID: "run-1", workflowName: "nightly")
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            if req.httpMethod == "GET", req.url?.path == "/api/runs/workflows" {
+                return (200, Self.runListRowsJSON([(id: "run-1", workflowName: "nightly")]))
+            }
+            return runDetailStub(req)
+        }
+        let store = makeStore(client: client)
+        await store.activate()
+        await store.enterRunMode(backend: BackendController())
+        #expect(store.followedRunID == "run-1")
+
+        store.exitRunMode()
+
+        #expect(store.followedRunID == nil)
+        #expect(store.runOverlay == nil)
+        #expect(store.followedRunStatus == nil)
+    }
 }
 
 /// Thread-safe call counter — same rationale as `ConfigStoreTests`'s own
