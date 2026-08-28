@@ -189,6 +189,15 @@ public final class BuilderStore {
         selectedID = id
     }
 
+    /// Clears a rejected edit's reason once the user has read it
+    /// (`WorkflowBuilderScreen`'s commit-error banner's dismiss control) —
+    /// see `commitError`'s own doc comment for why this is a caller-driven
+    /// clear rather than something a timer or the next render does on its
+    /// own.
+    public func dismissCommitError() {
+        commitError = nil
+    }
+
     // MARK: - Commit (WorkflowEditor.tsx `commit` port)
 
     /// Serialize-first, all-or-nothing. `graphToWorkflowObject(next)` runs

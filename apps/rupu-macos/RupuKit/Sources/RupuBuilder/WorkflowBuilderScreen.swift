@@ -133,8 +133,14 @@ public struct WorkflowBuilderScreen: View {
     private func readyBody(store: BuilderStore) -> some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                canvasPlaceholder
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ZStack(alignment: .top) {
+                    CanvasView(store: store)
+                    if let commitError = store.commitError {
+                        commitErrorBanner(commitError, store: store)
+                            .padding(12)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if sourceOpen {
                     yamlPane(store: store)
                         .frame(height: 192)
@@ -149,28 +155,33 @@ public struct WorkflowBuilderScreen: View {
         }
     }
 
-    // MARK: - Canvas placeholder (Task 11 fills interactions/node rendering)
+    // MARK: - Commit-error banner
 
-    /// A dot-grid background at a 22pt pitch — the canvas chrome without any
-    /// node/edge rendering yet (Task 11's job). One 1×1 `rupuBorder` circle
-    /// per grid intersection, drawn directly with `Canvas` rather than a
-    /// per-dot SwiftUI view — a `ForEach` over a viewport-sized dot grid
-    /// would be thousands of views for no visual benefit.
-    private var canvasPlaceholder: some View {
-        Canvas { context, size in
-            let pitch: CGFloat = 22
-            var x: CGFloat = pitch / 2
-            while x < size.width {
-                var y: CGFloat = pitch / 2
-                while y < size.height {
-                    let dot = Path(ellipseIn: CGRect(x: x - 0.5, y: y - 0.5, width: 1, height: 1))
-                    context.fill(dot, with: .color(Color.rupuBorder))
-                    y += pitch
+    /// A rejected canvas edit (`store.connect`'s self-loop/duplicate/cycle
+    /// rejections, or any other mutating verb's rejection) MUST be visible
+    /// — `store.commitError` is otherwise a purely transient, easy-to-miss
+    /// piece of state. Dismissible so a user who's read it can clear it
+    /// without waiting for the next edit to overwrite it.
+    private func commitErrorBanner(_ message: String, store: BuilderStore) -> some View {
+        TintBanner(tone: .rupuErr, toneBg: .rupuErrBg) {
+            HStack(spacing: 10) {
+                Icon(.xCircle, size: 14)
+                    .foregroundStyle(Color.rupuErr)
+                Text(message)
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuInk)
+                Spacer(minLength: 8)
+                Button {
+                    store.dismissCommitError()
+                } label: {
+                    Text("×")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(Color.rupuDim)
                 }
-                x += pitch
+                .buttonStyle(.plain)
             }
         }
-        .background(Color.rupuBg)
+        .frame(maxWidth: 420)
     }
 
     // MARK: - YAML pane
