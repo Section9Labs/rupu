@@ -301,18 +301,18 @@ private struct StepFormBody: View {
         VStack(alignment: .leading, spacing: 6) {
             Eyebrow("SUB-STEPS")
             let subSteps = node.data.parallel ?? []
-            // Keyed on "<index>-<id>" (review fix, Finding 2), not the
-            // bare `.offset` this used to use — a plain offset key means
-            // removing row N leaves every row AFTER it sitting at the SAME
-            // ForEach identity it always had, so SwiftUI treats it as "the
-            // same row" and never re-seeds `SubStepRow`'s local `@State`
-            // text: the id/prompt fields kept showing the REMOVED row's
-            // stale text bound to what is now a DIFFERENT sub-step
-            // underneath. `id` is folded into the key (not just `index`)
-            // so a genuine content change (add/remove/reorder) always
-            // mints a fresh identity; two rows sharing an id — a user
-            // hasn't renamed a freshly-added one yet — still get distinct
-            // keys because `index` differs.
+            // Plain `.offset` keying (review round 2 — a composite
+            // "<index>-<id>" key was tried first and reverted: the ID
+            // field's OWN debounced commit changes `subStep.id`, which
+            // changed the composite key, which made SwiftUI tear down and
+            // remount the row mid-edit — losing focus and the in-flight
+            // text the instant a debounce fired. Row-identity staleness
+            // after a remove is fixed downstream instead, inside
+            // `DebouncedField` itself (see its `.onChange(of: initial)`
+            // doc comment) — it re-seeds its local text from the row's
+            // CURRENT value whenever that value changes AND the field
+            // isn't focused, which covers "a row shifted into this slot"
+            // without ever fighting an in-progress edit.
             ForEach(Array(subSteps.enumerated()), id: \.offset) { index, subStep in
                 SubStepRow(
                     subStep: subStep,
@@ -322,7 +322,6 @@ private struct StepFormBody: View {
                     onChangePrompt: { newPrompt in commitSubStep(at: index) { $0.prompt = newPrompt } },
                     onRemove: { removeSubStep(at: index) }
                 )
-                .id("\(index)-\(subStep.id)")
             }
             Button {
                 addSubStep()
@@ -367,12 +366,14 @@ private struct StepFormBody: View {
         VStack(alignment: .leading, spacing: 6) {
             Eyebrow("PANELISTS")
             let panelists = node.data.panel?.panelists ?? []
-            // Same composite-identity fix as `parallelField`'s sub-step
-            // rows above (review fix, Finding 2) — panelists are bare
-            // strings (duplicates entirely possible, e.g. two rows still
-            // defaulted to the same agent), so the key folds `index` in
-            // ahead of the value specifically so two same-valued rows
-            // never collide.
+            // Plain `.offset` keying — same revert as `parallelField`'s
+            // sub-step rows above (review round 2), though a panelist row
+            // never actually carried the staleness risk to begin with: its
+            // only control is a `Picker` whose `selection` binding reads
+            // `panelist` directly every render (no local `@State` text to
+            // go stale), so there was nothing here for a composite key to
+            // protect — reverted anyway for consistency with the sub-step
+            // rows' identity contract.
             ForEach(Array(panelists.enumerated()), id: \.offset) { index, panelist in
                 HStack(spacing: 6) {
                     Picker(
@@ -397,7 +398,6 @@ private struct StepFormBody: View {
                     }
                     .buttonStyle(.plain)
                 }
-                .id("\(index)-\(panelist)")
             }
             Button {
                 addPanelist()
@@ -796,9 +796,29 @@ struct CommitOnBlurField<Label: View>: View {
 /// per-kind fields (FOR EACH, CONDITION, SUBJECT, numeric fields, ...).
 /// Owns its own local `@State` text (seeded once from `initial` at init),
 /// so a caller never needs to thread a binding down.
+///
+/// **Re-seeds from `initial` while unfocused** (review round 2, Finding 2):
+/// a ForEach-hosted row (`parallelField`'s sub-step rows) keeps the SAME
+/// view identity across an add/remove — a plain offset key, deliberately,
+/// after a composite id keyed on this very field's OWN committed value
+/// caused SwiftUI to tear the row down and remount it mid-edit (see
+/// `parallelField`'s doc comment for that reverted attempt). With a stable
+/// identity, this field's local `text` would otherwise go stale the moment
+/// a DIFFERENT row shifts into its slot (e.g. removing row 0 leaves row 1's
+/// OLD text showing under row 1's NEW data) — nothing else re-seeds it.
+/// Watching `initial` and copying it into `text` fixes that, but ONLY while
+/// `focused == false`. The guard is load-bearing, not defensive: `initial`
+/// is whatever the store currently holds for this row, which only catches
+/// up to what the user is TYPING once THIS field's own debounce/blur
+/// commits it back — so while the user is actively mid-edit, `initial` is
+/// necessarily behind their latest keystrokes. Re-seeding unconditionally
+/// would revert every keystroke typed after the 300ms debounce last fired,
+/// fighting the user's own typing. Gating on `!focused` means the reseed
+/// only ever fires when nobody could be mid-keystroke here.
 struct DebouncedField: View {
     let label: String
     var font: Font = .uiText
+    let initial: String
     let onCommit: (String) -> Void
 
     @State private var text: String
@@ -808,6 +828,7 @@ struct DebouncedField: View {
     init(label: String, initial: String, font: Font = .uiText, onCommit: @escaping (String) -> Void) {
         self.label = label
         self.font = font
+        self.initial = initial
         self.onCommit = onCommit
         _text = State(initialValue: initial)
     }
@@ -826,6 +847,9 @@ struct DebouncedField: View {
                 .onChange(of: focused) { _, isFocused in
                     if !isFocused { commitNow() }
                 }
+                .onChange(of: initial) { _, newValue in
+                    reseed(from: newValue)
+                }
         }
     }
 
@@ -842,6 +866,14 @@ struct DebouncedField: View {
         debounceTask?.cancel()
         debounceTask = nil
         onCommit(text)
+    }
+
+    /// See the type's own doc comment for why `!focused` is load-bearing.
+    private func reseed(from newValue: String) {
+        guard !focused else { return }
+        debounceTask?.cancel()
+        debounceTask = nil
+        text = newValue
     }
 }
 
