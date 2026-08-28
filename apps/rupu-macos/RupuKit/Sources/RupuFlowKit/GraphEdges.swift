@@ -254,6 +254,13 @@ func outerCycleEdges(_ nodes: [GraphNode], _ edges: [GraphEdge], _ loops: [Workf
     }
 }
 
+/// The loop `stepId` belongs to, if any. `nil` for a step in no loop —
+/// callers don't need to special-case "not in a loop" beyond an optional
+/// check. Port of `workflowGraph.ts:488-490`.
+public func loopOfStep(_ loops: [WorkflowLoop], _ stepId: String) -> WorkflowLoop? {
+    loops.first { $0.nodes.contains(stepId) }
+}
+
 // ── canConnect ────────────────────────────────────────────────────────────────
 
 /// The result of a `canConnect` check — mirrors the TS `{ ok: true } | {
