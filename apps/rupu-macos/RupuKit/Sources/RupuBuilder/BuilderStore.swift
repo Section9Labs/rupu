@@ -11,9 +11,10 @@ import RupuStore
 /// path back to `PUT /api/workflows/:name`. This is the macOS port of the
 /// web editor's `WorkflowEditor.tsx` `commit` callback — "serialize FIRST,
 /// all-or-nothing": every mutating verb below (`addNode`/`connect`/
-/// `deleteSelection`/`rename`/`updateStep`/`updateMeta`/`moveNode`) builds a
-/// candidate `WorkflowGraph` via one of `RupuFlowKit`'s pure `applyAdd`/
-/// `applyConnect`/`applyDelete`/`applyRename`/`applyUpdate` helpers and hands
+/// `moveNode`/`deleteSelection`/`rename`/`updateStep`/`updateName`/
+/// `updateDescription`) builds a candidate `WorkflowGraph` via one of
+/// `RupuFlowKit`'s pure `applyAdd`/`applyConnect`/`applyDelete`/
+/// `applyRename`/`applyUpdate` helpers and hands
 /// it to `commit(_:)`, which is the ONLY place `graph`/`canonicalYAML`/
 /// `problems`/`dirty` actually change. A commit whose `graphToWorkflowObject`
 /// closes a cycle is REJECTED wholesale — `commitError` is set, and neither
@@ -49,7 +50,12 @@ public final class BuilderStore {
     public private(set) var selectedID: String?
     public private(set) var dirty: Bool = false
     /// `nil` = not yet checked (no `revalidate()` has completed since the
-    /// last commit). Set by `revalidate()`.
+    /// last commit). Set by `revalidate()`. **Stale-while-revalidating**:
+    /// after a commit this keeps showing the PREVIOUS commit's answer for
+    /// the length of the debounce window (see `kickDebouncedRevalidate`) —
+    /// it does not reset to `nil` on every keystroke-level edit, so a caller
+    /// rendering this must treat it as "as of the last check", not "as of
+    /// right now".
     public private(set) var serverValid: Bool?
     /// The last rejected edit's reason (a cycle `commit(_:)` refused, or a
     /// rejection from `applyConnect`/`applyRename`) — transient, meant for a
@@ -70,7 +76,7 @@ public final class BuilderStore {
 
     /// The workflow name `activate()` fetches — the identity this store was
     /// constructed for, distinct from `graph.meta.name` (which `rename`/
-    /// `updateMeta` can change mid-session; `save()` PUTs to
+    /// `updateName` can change mid-session; `save()` PUTs to
     /// `graph.meta.name`, not this field, so a renamed workflow writes to
     /// its NEW name — see `save()`'s doc comment).
     private let name: String
@@ -79,17 +85,39 @@ public final class BuilderStore {
     private let client: CPClient
     private let pendingActions: PendingActions
 
-    /// The in-flight 400ms debounce timer kicked by a successful `commit(_:)`
-    /// — cancelled and replaced on every subsequent commit, per the Task 9
+    /// The in-flight debounce timer kicked by a successful `commit(_:)` —
+    /// cancelled and replaced on every subsequent commit, per the Task 9
     /// brief's "cancel the prior" instruction.
     private var revalidateTask: Task<Void, Never>?
+    /// Length of `kickDebouncedRevalidate`'s debounce window — 400ms in
+    /// production (see the public `init` below). `internal`, not `public`:
+    /// this is a test seam only. `BuilderStoreTests` shrinks it via the
+    /// designated `init(name:scopeKind:scopeID:client:pendingActions:
+    /// debounceInterval:)` below to keep its debounce coverage (Task 9
+    /// review, Finding 2) fast and non-flaky — real call sites always go
+    /// through the public convenience `init`, which hard-codes 400ms.
+    private let debounceInterval: Duration
 
-    public init(name: String, scopeKind: String?, scopeID: String?, client: CPClient, pendingActions: PendingActions) {
+    /// The production entry point — always a 400ms debounce. See the
+    /// designated `init(name:scopeKind:scopeID:client:pendingActions:
+    /// debounceInterval:)` below for the test seam.
+    public convenience init(name: String, scopeKind: String?, scopeID: String?, client: CPClient, pendingActions: PendingActions) {
+        self.init(
+            name: name, scopeKind: scopeKind, scopeID: scopeID, client: client, pendingActions: pendingActions,
+            debounceInterval: .milliseconds(400)
+        )
+    }
+
+    init(
+        name: String, scopeKind: String?, scopeID: String?, client: CPClient, pendingActions: PendingActions,
+        debounceInterval: Duration
+    ) {
         self.name = name
         self.scopeKind = scopeKind
         self.scopeID = scopeID
         self.client = client
         self.pendingActions = pendingActions
+        self.debounceInterval = debounceInterval
     }
 
     // MARK: - Activate
@@ -165,9 +193,9 @@ public final class BuilderStore {
     /// `problems`/`dirty` completely untouched — the canvas never shows a
     /// graph state the underlying YAML disagrees with. A `.object` success
     /// applies the new graph, recomputes `canonicalYAML`/`problems`, marks
-    /// `dirty`, clears any previous `commitError`, and kicks a 400ms
-    /// debounced `revalidate()` (cancelling whatever debounce was already
-    /// in flight).
+    /// `dirty`, clears any previous `commitError`, and kicks a debounced
+    /// `revalidate()` (`debounceInterval`, 400ms in production — cancelling
+    /// whatever debounce was already in flight).
     public func commit(_ next: WorkflowGraph) {
         switch graphToWorkflowObject(next) {
         case .failure(let message):
@@ -184,8 +212,9 @@ public final class BuilderStore {
 
     private func kickDebouncedRevalidate() {
         revalidateTask?.cancel()
+        let interval = debounceInterval
         revalidateTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(400))
+            try? await Task.sleep(for: interval)
             guard !Task.isCancelled else { return }
             await self?.revalidate()
         }
@@ -266,13 +295,27 @@ public final class BuilderStore {
         commit(applyUpdate(graph, id: data.id, data: data))
     }
 
-    /// Patches the workflow's top-level `name`/`description`. `name == nil`
-    /// leaves the current name unchanged (the field is required — there is
-    /// no "clear the name" gesture); `description` is a full replace,
-    /// `nil` clearing it outright.
-    public func updateMeta(name: String?, description: String?) {
+    /// Sets the workflow's top-level `name`. Split out from the description
+    /// setter (Task 9 review, Finding 1) because a single combined
+    /// `updateMeta(name:description:)` had asymmetric nil semantics — `name
+    /// == nil` meant "leave unchanged" but `description == nil` meant
+    /// "clear it" — so a caller renaming via `updateMeta(name: x,
+    /// description: nil)` intending only a rename silently wiped the
+    /// description. Two single-purpose methods have no such ambiguity: this
+    /// one always sets `name` (required — there is no "clear the name"
+    /// gesture, hence non-optional here), `updateDescription(_:)` below
+    /// always sets `description` (`nil` clearing it).
+    public func updateName(_ name: String) {
         var meta = graph.meta
-        if let name { meta.name = name }
+        meta.name = name
+        commit(WorkflowGraph(nodes: graph.nodes, edges: graph.edges, meta: meta, loops: graph.loops))
+    }
+
+    /// Sets the workflow's top-level `description`; `nil` clears it. See
+    /// `updateName(_:)`'s doc comment for why this is a separate method
+    /// rather than a combined `updateMeta`.
+    public func updateDescription(_ description: String?) {
+        var meta = graph.meta
         meta.description = description
         commit(WorkflowGraph(nodes: graph.nodes, edges: graph.edges, meta: meta, loops: graph.loops))
     }
@@ -281,7 +324,7 @@ public final class BuilderStore {
 
     /// `PUT /api/workflows/:name` where `:name` is `graph.meta.name` — NOT
     /// the `name` this store was constructed with. A workflow renamed via
-    /// `rename`/`updateMeta` mid-session therefore writes to its NEW name on
+    /// `rename`/`updateName` mid-session therefore writes to its NEW name on
     /// save (the server has no separate "rename" route; a write to a
     /// different name simply creates/overwrites that file). Synchronous
     /// server-side (200 = written to disk — see `CPClient.writeWorkflow`'s

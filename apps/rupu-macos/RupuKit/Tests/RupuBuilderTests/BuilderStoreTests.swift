@@ -144,6 +144,18 @@ struct BuilderStoreTests {
         BuilderStore(name: name, scopeKind: nil, scopeID: nil, client: client, pendingActions: PendingActions())
     }
 
+    /// Routes through the internal `debounceInterval`-taking designated
+    /// `init` (the Task 9 review Finding 2 test seam — see that
+    /// initializer's doc comment in `BuilderStore.swift`) rather than the
+    /// public 400ms convenience one, so the debounce tests below can use a
+    /// short interval and stay fast/non-flaky.
+    private func makeStore(client: CPClient, name: String = "nightly", debounceInterval: Duration) -> BuilderStore {
+        BuilderStore(
+            name: name, scopeKind: nil, scopeID: nil, client: client, pendingActions: PendingActions(),
+            debounceInterval: debounceInterval
+        )
+    }
+
     // MARK: - activate
 
     @Test func activateParsesAndIsNotDirty() async throws {
@@ -292,4 +304,99 @@ struct BuilderStoreTests {
         #expect(store.selectedID == nil)
         #expect(!store.graph.nodes.contains { $0.id == "a" })
     }
+
+    // MARK: - Debounced revalidate (Task 9 review, Finding 2)
+    //
+    // Both tests use the `debounceInterval`-taking test-seam `init` with a
+    // SHORT interval (30ms) rather than real wall-clock waits against the
+    // production 400ms — the review comment offered either a bounded
+    // wall-clock wait against 400ms or an injectable interval "if wall-clock
+    // waits prove flaky"; the injectable interval was chosen up front since
+    // it removes the flakiness risk entirely rather than discovering it
+    // later, and keeps the suite fast. Each test still bounded-waits
+    // (`pollUntil`/`expectEventually`) rather than a fixed `Task.sleep`, so
+    // there is no hardcoded "surely long enough by now" duration anywhere.
+
+    @Test func revalidateAfterCommitSetsServerValidFromExactlyOnePost() async {
+        let validateHits = Counter()
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            guard req.httpMethod == "POST", req.url?.path == "/api/workflows/validate" else { return nil }
+            validateHits.increment()
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        let store = makeStore(client: client, debounceInterval: .milliseconds(30))
+        await store.activate()
+        #expect(store.serverValid == nil, "nothing has been checked yet")
+
+        store.addNode(kind: .step, at: .zero)
+
+        await expectEventually("the debounced revalidate has landed") {
+            store.serverValid != nil
+        }
+        #expect(store.serverValid == true)
+        #expect(validateHits.value == 1)
+    }
+
+    @Test func twoRapidCommitsWithinTheDebounceWindowStillProduceExactlyOnePost() async {
+        let validateHits = Counter()
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            guard req.httpMethod == "POST", req.url?.path == "/api/workflows/validate" else { return nil }
+            validateHits.increment()
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        // A wider interval than the "after one commit" test above — wide
+        // enough that the two back-to-back commits below (synchronous,
+        // no `await` between them) are both well inside the SAME debounce
+        // window on any reasonably loaded CI box.
+        let store = makeStore(client: client, debounceInterval: .milliseconds(80))
+        await store.activate()
+
+        store.addNode(kind: .step, at: .zero) // first commit — kicks the debounce
+        store.addNode(kind: .step, at: .zero) // second commit — cancels + replaces it
+
+        await expectEventually("the debounced revalidate has landed") {
+            store.serverValid != nil
+        }
+        #expect(validateHits.value == 1, "the first commit's debounce must have been cancelled, not just superseded in effect")
+    }
+}
+
+/// Thread-safe call counter — same rationale as `ConfigStoreTests`'s own
+/// private copy of this shape (`private` to its own file): a plain captured
+/// `var` can't cross into a `@Sendable` stub-handler closure under Swift 6
+/// strict concurrency.
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = 0
+    @discardableResult
+    func increment() -> Int { lock.withLock { v += 1; return v } }
+    var value: Int { lock.withLock { v } }
+}
+
+/// De-flakes "wait for an async effect to land" — same rationale/shape as
+/// every other store-test file's own copy (e.g. `ConfigStoreTests`'s).
+@MainActor
+private func pollUntil(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ condition: () -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if condition() { return true }
+        if ContinuousClock.now >= deadline { return false }
+        try? await Task.sleep(for: interval)
+    }
+}
+
+@MainActor
+private func expectEventually(
+    timeout: Duration = .seconds(5),
+    interval: Duration = .milliseconds(10),
+    _ description: String,
+    sourceLocation: SourceLocation = #_sourceLocation,
+    _ condition: () -> Bool
+) async {
+    let succeeded = await pollUntil(timeout: timeout, interval: interval, condition)
+    #expect(succeeded, "timed out waiting for: \(description)", sourceLocation: sourceLocation)
 }
