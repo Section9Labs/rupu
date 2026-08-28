@@ -38,7 +38,11 @@ public final class BuilderStore {
         case ready
     }
 
-    public enum Mode: Equatable {
+    /// `Hashable` (not just `Equatable`) so `WorkflowBuilderScreen`'s header
+    /// can bind it straight to a SwiftUI `Picker`'s `selection:`/`.tag(_:)`
+    /// (Task 10) — a plain two-case enum, synthesis is trivial and adds no
+    /// behavior beyond what `Equatable` already gave every existing call site.
+    public enum Mode: Hashable {
         case design
         case run
     }

@@ -260,6 +260,11 @@ public enum LucideIconData {
                 "M12 2v10.3a4 4 0 0 1-1.172 2.872L4 22",
                 "m20 22-5-5",
             ]
+        case .code:
+            return [
+                "M16 18L22 12L16 6",
+                "M8 6L2 12L8 18",
+            ]
         }
     }
 }

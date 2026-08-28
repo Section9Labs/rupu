@@ -52,6 +52,7 @@ public enum LucideIcon: String, CaseIterable, Sendable {
     case terminal
     case split
     case merge
+    case code
 }
 
 /// Renders a `LucideIcon` by stroking its constituent SVG paths (`LucideIconData.paths(for:)`,

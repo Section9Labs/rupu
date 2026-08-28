@@ -107,6 +107,8 @@ const ICONS = [
   // Task 7: Workflow Builder kind visuals (split/join node icons).
   { enumCase: "split", asset: "split", source: "split" },
   { enumCase: "merge", asset: "merge", source: "merge" },
+  // Task 10: Workflow Builder header's YAML-source toggle button.
+  { enumCase: "code", asset: "code", source: "code" },
 ];
 
 // --- number formatting: deterministic, minimal-digit output -----------------------------------

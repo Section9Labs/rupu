@@ -29,7 +29,8 @@ import Testing
     // Code tab's directory-row glyph (was 35). Design-alignment Plan 3 Task 1 added
     // `bot`/`columns3`/`userCheck`/`zap`/`terminal` for the run graph's `KindBridge` (was 36).
     // Workflow Builder Task 7 added `split`/`merge` for the split/join node kind icons (was 41).
-    #expect(LucideIcon.allCases.count == 43)
+    // Workflow Builder Task 10 added `code` for the header's YAML-source toggle button (was 43).
+    #expect(LucideIcon.allCases.count == 44)
 }
 
 @Test func repeatIconRawValueIsRepeat() {
