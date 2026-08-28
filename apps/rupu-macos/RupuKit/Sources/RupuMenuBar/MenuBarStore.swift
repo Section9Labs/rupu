@@ -2,7 +2,6 @@ import Foundation
 import Observation
 import RupuAPI
 import RupuStore
-import RupuOverview
 
 /// The `MenuBarExtra`'s live-attention data source: **local-host-only**
 /// active counts (running/awaiting/paused/pending, from a `host: "local"`

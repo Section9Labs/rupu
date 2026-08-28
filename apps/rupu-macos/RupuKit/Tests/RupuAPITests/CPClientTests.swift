@@ -416,6 +416,35 @@ struct CPClientTests {
         #expect(query?.contains(URLQueryItem(name: "host", value: "mini")) == true)
     }
 
+    /// Perf & interaction arc, Plan 5 Task 5: `since`/`until` are omitted
+    /// entirely when `nil` (no query param at all — same "omit, don't send
+    /// empty" convention `host` already follows) and sent verbatim as
+    /// RFC-3339 strings when provided. One representative endpoint again
+    /// proves the wiring — `agentRuns`/`autoflowEvents`/`autoflowCycles`/
+    /// `sessions` all share the same `offsetLimitQuery(offset:limit:host:
+    /// since:until:)` helper.
+    @Test func workflowRunsSendsSinceUntilQueryParametersOnlyWhenProvided() async throws {
+        let fixture = try Fixtures.data("run_list_row.json")
+        StubURLProtocol.lastRequest = nil
+        StubURLProtocol.requestHandler = { _ in (200, ["Content-Type": "application/json"], fixture) }
+
+        let client = CPClient(
+            config: CPConfig(baseURL: URL(string: "https://cp.example.com")!),
+            session: StubURLProtocol.session()
+        )
+
+        _ = try await client.workflowRuns(offset: 0, limit: 50)
+        var query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(where: { $0.name == "since" }) == false)
+        #expect(query?.contains(where: { $0.name == "until" }) == false)
+
+        StubURLProtocol.lastRequest = nil
+        _ = try await client.workflowRuns(offset: 0, limit: 50, since: "2026-08-01T00:00:00Z", until: "2026-08-26T23:59:59Z")
+        query = StubURLProtocol.lastRequest?.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }
+        #expect(query?.contains(URLQueryItem(name: "since", value: "2026-08-01T00:00:00Z")) == true)
+        #expect(query?.contains(URLQueryItem(name: "until", value: "2026-08-26T23:59:59Z")) == true)
+    }
+
     @Test func hostsHitsExpectedPathAndDecodesInlineJSON() async throws {
         // Fixture-free per the hotfix brief — matches the live `GET
         // /api/hosts` shape observed against a real `rupu cp serve`

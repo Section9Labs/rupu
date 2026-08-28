@@ -36,6 +36,31 @@ import Foundation
     #expect(cycleFailed.turns == nil)
 }
 
+/// `autoflow_cycle_rows.json` is hand-authored (not machine-regenerated via
+/// `make macos-fixtures`'s `check_fixture` mechanism) — no Rust-side
+/// `..._fixture_is_current` test exists for `AutoflowCycleRow` yet, since
+/// this Swift-side `APIAutoflowCycleRow` is new (Task 4b: the autoflow
+/// Cycles sub-table) but the Rust struct it mirrors (`crates/rupu-cp/src/
+/// api/run_streams.rs`'s `AutoflowCycleRow`) already existed, unchanged —
+/// no RupuAPI serde type actually changed shape, so there's no drift for
+/// the cargo gate to catch. Field names/shapes here were verified directly
+/// against that struct's `#[derive(Serialize)]` output.
+@Test func decodesAutoflowCycleRowsFixture() throws {
+    let rows = try JSONDecoder().decode([APIAutoflowCycleRow].self, from: Fixtures.data("autoflow_cycle_rows.json"))
+    #expect(rows.count == 2)
+    #expect(rows[0].cycleID == "cycle-1")
+    #expect(rows[0].mode == "tick")
+    #expect(rows[0].workerName == "worker-a")
+    #expect(rows[0].runIDs == ["run-20", "run-21"])
+    #expect(rows[0].hostID == "local")
+    #expect(rows[0].usage.totalTokens == 490)
+    #expect(rows[1].workerName == nil)
+    #expect(rows[1].runIDs == [])
+    #expect(rows[1].failedCycles == 1)
+    #expect(rows[1].hostID == nil)
+    #expect(rows[1].id == "cycle-2")
+}
+
 @Test func decodesSessionRowsFixture() throws {
     let rows = try JSONDecoder().decode([APISessionRow].self, from: Fixtures.data("session_rows.json"))
     #expect(rows.count == 1)

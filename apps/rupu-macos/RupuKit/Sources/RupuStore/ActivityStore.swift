@@ -90,6 +90,40 @@ public final class ActivityStore {
 
     public var liveTail: Bool = true
 
+    /// Server-side date-range bounds on the active kind's rows (perf &
+    /// interaction arc, Plan 5 Task 5) — unlike `statusFilter`/`scopeFilter`,
+    /// this is NOT a display-time narrowing over already-fetched rows: it
+    /// changes what the server returns, so it must reset paging back to page
+    /// 0 rather than just re-filtering `rows` in place. Set together via
+    /// `setDateRange(since:until:)`, never individually — see that method's
+    /// doc comment for why. `private(set)`: the two values must only ever
+    /// change as a pair, through that method, so a caller can't set one half
+    /// without going through the paging-reset it triggers.
+    public private(set) var since: Date?
+    public private(set) var until: Date?
+
+    /// Whether the currently active kind-page source(s) have more pages to
+    /// load. Meaningful only for a kind page (`kind != .all`, exactly one
+    /// active source) — `.all` renders no table and never reads this.
+    public var hasMore: Bool {
+        let snapshots = activeSnapshots()
+        guard !snapshots.isEmpty else { return false }
+        return snapshots.contains { !$0.exhausted }
+    }
+
+    /// True while `loadMore()` is actually fetching the next page — the
+    /// sentinel's "loading more…" footer state reads this.
+    public var isLoadingMore: Bool {
+        activeSnapshots().contains { $0.isLoadingMore }
+    }
+
+    /// Raw row count loaded so far for the active kind-page source(s),
+    /// BEFORE any client-side status/scope/search narrowing — the "{m}" half
+    /// of the honesty footer's "{n} matches of {m} loaded".
+    public var loadedCount: Int {
+        activeSnapshots().reduce(0) { $0 + $1.rows.count }
+    }
+
     /// The Activity table's current sort — perf & interaction arc, Plan 5
     /// Task 3: moved here from `ActivityTable`'s own `@State` (where a
     /// `sortedRows` computed property re-sorted `rows` on every single body
@@ -106,11 +140,29 @@ public final class ActivityStore {
     public private(set) var rows: [ActivityRow] = []
 
     /// **The fleet-wide, always-unscoped projection** (perf & interaction
-    /// arc, Plan 5 Task 2 fix-round-1 — the shared-store review's Critical):
-    /// every row for the currently active `kind` sources, sorted and
-    /// status-patched exactly like `rows`, but NEVER narrowed by
-    /// `scopeFilter` or `statusFilter`. `NeedsYouCard`/`deriveNeedsYou`
+    /// arc, Plan 5 Task 2 fix-round-1 — the shared-store review's Critical;
+    /// extended Plan 5 Task 5 fix-round-2): every row for the currently
+    /// active `kind` sources, sorted and status-patched exactly like `rows`,
+    /// but NEVER narrowed by `scopeFilter`, `statusFilter`, OR the
+    /// `since`/`until` date range — the full rule is **no scope, no status,
+    /// no date narrowing, ever**, regardless of what any other property on
+    /// this shared store is currently set to. `NeedsYouCard`/`deriveNeedsYou`
     /// read this instead of `rows`.
+    ///
+    /// **The date-range exclusion specifically** (fix round 2 — an earlier
+    /// version of this task's date-range work applied the filter before this
+    /// property was assigned, reasoning a date range was a fetch-scope
+    /// decision like `kind` rather than a display toggle like
+    /// `statusFilter`/`scopeFilter`; that broke the invariant this doc
+    /// comment documents): a gate or failure parked outside whatever date
+    /// range an operator has set while browsing Activity history still
+    /// needs attention on Overview — `unscopedRows` existing at all IS the
+    /// promise that no screen-local narrowing can hide it from needs-you,
+    /// and a date range is exactly such a narrowing (screen-local state on
+    /// `ActivityStore`, set by `ActivityScreen`'s `FilterBar`/kind-page UI,
+    /// same as `statusFilter`). This holds for remote-host rows too — see
+    /// `dateFilteredForDisplay(_:)`'s own doc comment for where the date
+    /// filter actually applies instead (only on the branch feeding `rows`).
     ///
     /// **Why this exists**: `ActivityStore` is now a single instance shared
     /// by `ActivityScreen` (which legitimately narrows `rows` by
@@ -170,6 +222,31 @@ public final class ActivityStore {
     private let debounceInterval: Duration
     private var debounceTask: Task<Void, Never>?
 
+    /// Mutable holder for the operator-chosen `since`/`until` bounds, threaded
+    /// into every `Source`'s `fetch`/`remoteFetch` closures (perf & interaction
+    /// arc, Plan 5 Task 5). A plain reference type, not `self` — `sources` is
+    /// built inside `init` before `self` is a valid capture target (see
+    /// `sources`'s own doc comment for the same constraint on `client`).
+    /// `@unchecked Sendable`: every mutation (`setDateRange(since:until:)`)
+    /// and every read (inside a `PagedSnapshot`'s `fetch` closure, always
+    /// invoked via `await fetch(...)` from this `@MainActor` class) happens on
+    /// `@MainActor` — that confinement is what makes plain `var` mutation
+    /// safe here, not the type system, so this documents the invariant rather
+    /// than actually synchronizing anything.
+    private final class DateRangeBox: @unchecked Sendable {
+        var since: Date?
+        var until: Date?
+    }
+    private let dateRangeBox: DateRangeBox
+
+    /// Kind-page tables get the web-parity page size (20); `.all` (which
+    /// renders no table, just `ActivityStatsView`'s KPI cards +
+    /// `unscopedRows`-derived needs-attention list) keeps its pre-existing
+    /// merged-snapshot size. Applied to every source's `PagedSnapshot` on
+    /// every `activate(kind:)` — see that method's doc comment.
+    private static let kindPageSize = 20
+    private static let allPageSize = 50
+
     /// One entry per federated source, pairing its local `PagedSnapshot`
     /// (host=local, paged, live-patchable — the existing machinery) with a
     /// `remoteFetch` closure for the progressive per-host enrichment
@@ -219,6 +296,22 @@ public final class ActivityStore {
     /// local-only; see its doc comment), so a remote fetch is always a
     /// single page-0 call, never something that needs `PagedSnapshot`'s
     /// offset bookkeeping or live-patch integration.
+    ///
+    /// **`remoteFetch` never sends `since`/`until`** (review fix, perf &
+    /// interaction arc, Plan 5 Task 5): the server's single-remote-host proxy
+    /// branch (`GET .../:kind?host=<remote-id>`) has no date-range query
+    /// params on ANY of the 5 endpoints — only the `host=local` and
+    /// `host=all` fan-out branches filter server-side (see
+    /// `crate::pagination::DateRangeQuery`'s wiring in `run_streams.rs`/
+    /// `runs.rs`/`sessions.rs`). Sending `since`/`until` to a remote host
+    /// would silently do nothing there, which is worse than not sending them
+    /// at all — a caller reading the request might reasonably assume the
+    /// server was honoring the filter. Instead, the active range is enforced
+    /// **client-side** against every remote row at merge time — see
+    /// `dateFilteredForDisplay(_:)`, called from `recompute()` — so the
+    /// operator-visible result stays honestly date-filtered regardless of
+    /// which host a row came from, even though the server-side proxy path
+    /// doesn't support the filter yet.
     private struct Source {
         let kind: ActivityKindTag
         let snapshot: PagedSnapshot<ActivityRow>
@@ -265,12 +358,22 @@ public final class ActivityStore {
         self.signalsFactory = signalsFactory
         self.debounceInterval = debounceInterval
         self.pendingActions = pendingActions
+        let dateRangeBox = DateRangeBox()
+        self.dateRangeBox = dateRangeBox
         self.sources = [
             Source(
                 kind: .workflow,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.workflowRuns(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.workflowRuns(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
+                // No `since`/`until` here — see this doc comment on `Source.remoteFetch`
+                // for why a remote host's proxy path has no date params to
+                // receive them at all, and `recompute()`'s
+                // `dateFilteredForDisplay(_:)` for where the active range is
+                // actually enforced against these rows instead.
                 remoteFetch: { host, offset, limit in
                     try await client.workflowRuns(offset: offset, limit: limit, host: host).map(ActivityRow.init)
                 }
@@ -278,7 +381,10 @@ public final class ActivityStore {
             Source(
                 kind: .agent,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.agentRuns(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.agentRuns(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
                     try await client.agentRuns(offset: offset, limit: limit, host: host).map(ActivityRow.init)
@@ -287,7 +393,10 @@ public final class ActivityStore {
             Source(
                 kind: .autoflow,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.autoflowEvents(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.autoflowEvents(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
                     try await client.autoflowEvents(offset: offset, limit: limit, host: host).map(ActivityRow.init)
@@ -296,7 +405,10 @@ public final class ActivityStore {
             Source(
                 kind: .session,
                 snapshot: PagedSnapshot { offset, limit in
-                    try await client.sessions(offset: offset, limit: limit, host: Self.localHost).map(ActivityRow.init)
+                    try await client.sessions(
+                        offset: offset, limit: limit, host: Self.localHost,
+                        since: Self.rfc3339(dateRangeBox.since), until: Self.rfc3339(dateRangeBox.until)
+                    ).map(ActivityRow.init)
                 },
                 remoteFetch: { host, offset, limit in
                     try await client.sessions(offset: offset, limit: limit, host: host).map(ActivityRow.init)
@@ -307,6 +419,13 @@ public final class ActivityStore {
 
     private static let localHost = "local"
     private static let remotePageSize = 50
+
+    /// RFC-3339 encoding for the `since`/`until` query params — `nil` in,
+    /// `nil` out (no query item at all, matching `CPClient`'s "`nil` omits
+    /// the filter" convention).
+    private static func rfc3339(_ date: Date?) -> String? {
+        date.map { ISO8601Parsing.fractional.format($0) }
+    }
 
     /// Sets `kind`, refreshes page 0 of the *local* sources it implies
     /// (parallel across sources, never blocking on a remote host — see
@@ -327,6 +446,9 @@ public final class ActivityStore {
     /// gets that more may still arrive.
     public func activate(kind: RunKindFilter) async {
         self.kind = kind
+        for source in sources {
+            source.snapshot.setPageSize(kind == .all ? Self.allPageSize : Self.kindPageSize)
+        }
         remoteGeneration += 1
         let generation = remoteGeneration
         cancelRemoteHostTasks()
@@ -374,8 +496,45 @@ public final class ActivityStore {
     /// current `activate(kind:)` cycle; re-discovering the fleet on every
     /// pill click isn't worth the extra round trips this phase.
     public func applyPendingRefresh() async {
-        await refreshActiveSources()
+        await refreshActiveSources(preservingScrolledPages: true)
         pendingNewRuns = 0
+    }
+
+    // MARK: - Date range (perf & interaction arc, Plan 5 Task 5)
+
+    /// Sets the server-side `since`/`until` bounds and resets paging back to
+    /// page 0 for the active kind-page source(s) — a date-range change is
+    /// NOT a display-time narrowing like `statusFilter`/`scopeFilter`; it
+    /// changes what the SERVER returns, so `rows` already loaded under the
+    /// old bounds can't just be re-filtered in place.
+    ///
+    /// Both bounds are set together, in one call, rather than as two
+    /// independent `didSet`s on separate properties: setting `since` then
+    /// `until` as two separate property writes would fire two separate
+    /// resets (two round trips, the second superseding the first) for what
+    /// the operator experiences as one logical change (dragging a date
+    /// range). One call, one reset.
+    ///
+    /// Uses `PagedSnapshot.resetAndRefresh()` (not `refresh()`): a
+    /// `loadMore()` that was already in flight for the OLD bounds when this
+    /// lands must never win the race and append a stale page onto the
+    /// freshly-reset `rows` — see that method's own doc comment for the
+    /// generation-guard mechanics that guarantee this.
+    public func setDateRange(since: Date?, until: Date?) async {
+        guard since != self.since || until != self.until else { return }
+        self.since = since
+        self.until = until
+        dateRangeBox.since = since
+        dateRangeBox.until = until
+        for snapshot in activeSnapshots() {
+            await snapshot.resetAndRefresh()
+        }
+        // A stale live-patch override from before the reset must not shadow
+        // the freshly-reset page — same reasoning `refreshActiveSources()`
+        // already documents for why it clears this on every real REST
+        // refresh.
+        statusOverrides.removeAll()
+        recompute()
     }
 
     // MARK: - Sort (perf & interaction arc, Plan 5 Task 3)
@@ -521,7 +680,7 @@ public final class ActivityStore {
     /// unrefreshed with zero signal, so it retries once (see
     /// `scheduleDebouncedRefresh`).
     @discardableResult
-    private func refreshActiveSources() async -> Bool {
+    private func refreshActiveSources(preservingScrolledPages: Bool = false) async -> Bool {
         let snapshots = activeSnapshots()
         let allPerformed: Bool
         if snapshots.isEmpty {
@@ -529,7 +688,27 @@ public final class ActivityStore {
         } else {
             allPerformed = await withTaskGroup(of: Bool.self) { group in
                 for snapshot in snapshots {
-                    group.addTask { await snapshot.refresh() }
+                    group.addTask {
+                        // perf & interaction arc, Plan 5 Task 5: a plain
+                        // `refresh()` replaces `rows` wholesale with page 0
+                        // — exactly right for `activate(kind:)`'s own fresh
+                        // navigation into a kind (and it also generation-
+                        // guards away any straggler `loadMore()` from a
+                        // PRIOR visit to this same kind, via
+                        // `resetAndRefresh()`), but wrong for a refresh the
+                        // operator didn't ask for while already scrolled
+                        // several pages deep (the live-tail debounce, a
+                        // reconnect resnapshot, the "N new runs" pill) —
+                        // those use `refreshHead()` instead, which splices
+                        // the fresh head onto whatever pages `loadMore()`
+                        // already appended rather than discarding them. See
+                        // `PagedSnapshot.refreshHead()`'s doc comment.
+                        if preservingScrolledPages {
+                            await snapshot.refreshHead()
+                        } else {
+                            await snapshot.resetAndRefresh()
+                        }
+                    }
                 }
                 var performedAll = true
                 for await performed in group {
@@ -595,15 +774,37 @@ public final class ActivityStore {
             else { continue }
             merged[index] = merged[index].patchingStatus(override.status, durationMS: override.durationMS)
         }
+
         merged.sort(by: Self.isOrderedByStartedAtDescending)
 
         // Fleet-wide, unscoped projection — see `unscopedRows`'s own doc
-        // comment. Assigned BEFORE either filter narrows `merged` below, so
-        // it always carries every row for the active `kind` sources,
-        // patched and sorted, never scope/status-narrowed.
+        // comment. Assigned BEFORE any filter narrows `merged` below —
+        // `unscopedRows` always carries every row for the active `kind`
+        // sources, patched and sorted, and is NEVER narrowed by
+        // `scopeFilter`/`statusFilter`/the date range. See that property's
+        // own doc comment (updated, fix round 2) for why a date range
+        // doesn't get an exception here the way it might seem to deserve.
         unscopedRows = merged
 
-        var filtered = merged
+        // Controller fix round 2: `dateFilteredForDisplay` runs HERE — after
+        // `unscopedRows` is captured, only on the branch feeding `rows` —
+        // not on `merged` itself. An earlier version of this fix ran it
+        // before the `unscopedRows` assignment (so a date range narrowed
+        // BOTH projections), reasoning that a date range was a fetch-scope
+        // decision like `kind` rather than a display toggle like
+        // `statusFilter`/`scopeFilter`. That reasoning was wrong: it broke
+        // the Task-2 invariant `unscopedRows`/`NeedsYouCard` were built to
+        // guarantee — needs-you must surface EVERY gate/failure fleet-wide,
+        // regardless of whatever an operator has narrowed the OTHER screen
+        // to. A gate parked outside whatever date range someone set while
+        // browsing Activity history still needs attention; `unscopedRows`
+        // existing at all is precisely the promise that no screen-local
+        // narrowing (scope, status, kind's own display-time siblings, and
+        // now explicitly date) can hide it. Remote-host rows in
+        // `unscopedRows` are therefore genuinely date-UNfiltered too — not
+        // an oversight, the same "unscoped" guarantee applying uniformly
+        // regardless of a row's source.
+        var filtered = dateFilteredForDisplay(merged)
         if !statusFilter.isEmpty {
             filtered = filtered.filter { statusFilter.contains($0.status) }
         }
@@ -621,6 +822,57 @@ public final class ActivityStore {
         // every caller that never touches `sort` at all.
         rows = sortActivityRows(filtered, by: sort)
         state = Self.aggregateState(activeSnapshots().map(\.state), rowsAreEmpty: filtered.isEmpty)
+    }
+
+    /// Enforces the active `since`/`until` bounds against already-fetched
+    /// rows, client-side (review fix, perf & interaction arc Plan 5 Task 5).
+    ///
+    /// **Why this exists at all, given `since`/`until` are already sent as
+    /// server-side query params**: only for the *local* (`host=local`)
+    /// fetch — a remote host's row comes back from the single-remote-host
+    /// proxy branch (`GET .../:kind?host=<remote-id>`), which has no
+    /// date-range query params on any of the 5 endpoints server-side (see
+    /// `Source.remoteFetch`'s own doc comment). Without this, a date range
+    /// would silently narrow local rows while leaving every remote-host row
+    /// unfiltered in the SAME merged table — an honesty violation matching
+    /// the exact kind of "the UI implies a filter that isn't really applied"
+    /// bug this whole task's date-range feature exists to avoid elsewhere
+    /// (see the top-bar range's `.disabled` treatment on Activity routes).
+    /// Applying this to every row uniformly (not just remote ones) rather
+    /// than threading provenance through is deliberate: a local row is
+    /// already within `[since, until]` by construction (the server already
+    /// filtered it), so re-checking it here is a no-op, not a correctness
+    /// risk — and it keeps this function simple and provably correct rather
+    /// than trusting an unenforced "local rows are always already in range"
+    /// invariant.
+    ///
+    /// **Boundary/missing-timestamp semantics mirror the server's own**
+    /// (`crate::pagination::DateRangeQuery` — `crates/rupu-cp/src/
+    /// pagination.rs`): closed at both ends (`since <= startedAt <= until`),
+    /// and — only once a bound is actually active — a row with no
+    /// `startedAt` at all is EXCLUDED (no honest basis to claim an unknown
+    /// timestamp falls inside an operator-chosen window). An inactive range
+    /// (`since == nil && until == nil`) is a true no-op, returning `rows`
+    /// unchanged, unknown timestamps included — a range nobody asked for
+    /// must never start hiding anything.
+    ///
+    /// **Only ever applied on the branch feeding `rows`, never to
+    /// `unscopedRows`** (fix round 2): `recompute()` calls this AFTER
+    /// `unscopedRows` is already assigned from the unfiltered `merged`, on a
+    /// separate `filtered` copy — see `unscopedRows`'s own doc comment for
+    /// the invariant this preserves (needs-you must never be narrowed by any
+    /// screen-local filter, and a date range is exactly that, the same as
+    /// `statusFilter`/`scopeFilter`). A remote-host row outside the active
+    /// range is therefore excluded from `rows` (the Activity table) but
+    /// still present in `unscopedRows` (needs-you) — deliberate, not a gap.
+    private func dateFilteredForDisplay(_ rows: [ActivityRow]) -> [ActivityRow] {
+        guard since != nil || until != nil else { return rows }
+        return rows.filter { row in
+            guard let startedAt = row.startedAt else { return false }
+            if let since, startedAt < since { return false }
+            if let until, startedAt > until { return false }
+            return true
+        }
     }
 
     // MARK: - Remote hosts (progressive per-host loading)
@@ -748,7 +1000,7 @@ public final class ActivityStore {
             signals: signalsFactory(),
             resnapshot: { [weak self] in
                 guard let self else { return }
-                await self.refreshActiveSources()
+                await self.refreshActiveSources(preservingScrolledPages: true)
             },
             apply: { [weak self] event in
                 self?.apply(event)
@@ -917,7 +1169,7 @@ public final class ActivityStore {
         debounceTask = Task { [weak self, debounceInterval] in
             try? await Task.sleep(for: debounceInterval)
             guard !Task.isCancelled, let self else { return }
-            let allPerformed = await self.refreshActiveSources()
+            let allPerformed = await self.refreshActiveSources(preservingScrolledPages: true)
             if !allPerformed && !isRetry {
                 self.scheduleDebouncedRefresh(isRetry: true)
             }

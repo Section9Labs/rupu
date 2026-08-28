@@ -3,7 +3,6 @@ import RupuAPI
 import RupuBackend
 import RupuStore
 import RupuDesign
-import RupuOverview
 
 /// The `MenuBarExtra` scene's own label content. There is no dedicated
 /// app-icon/asset catalog yet (`apps/rupu-macos/App` has none — icon work is

@@ -46,4 +46,38 @@ struct ActivityScreenClaimsChromeTests {
         subTab = .runs
         #expect(ActivityScreen.isClaimsActive(kind: .autoflows, subTab: subTab) == false)
     }
+
+    // MARK: - isCyclesActive (perf & interaction arc, Plan 5 Task 4b) — same
+    // contract as `isClaimsActive` above, for the third sub-tab.
+
+    @Test func cyclesFlipsTrueOnlyForAutoflowsKindWithCyclesSubTab() {
+        #expect(ActivityScreen.isCyclesActive(kind: .autoflows, subTab: .cycles) == true)
+    }
+
+    @Test func cyclesStaysFalseForAutoflowsKindWithRunsOrClaimsSubTab() {
+        #expect(ActivityScreen.isCyclesActive(kind: .autoflows, subTab: .runs) == false)
+        #expect(ActivityScreen.isCyclesActive(kind: .autoflows, subTab: .claims) == false)
+    }
+
+    @Test func cyclesStaysFalseForEveryOtherKindRegardlessOfSubTab() {
+        for kind in RunKindFilter.allCases where kind != .autoflows {
+            for subTab in AutoflowsSubTab.allCases {
+                #expect(ActivityScreen.isCyclesActive(kind: kind, subTab: subTab) == false, "\(kind) + \(subTab)")
+            }
+        }
+    }
+
+    /// The two flags are mutually exclusive for every `(kind, subTab)`
+    /// combination — a state where both (or neither, outside `.autoflows`)
+    /// claim to be "active" would mean two different Runs-only-chrome
+    /// suppressions disagreeing about what's actually on screen.
+    @Test func claimsAndCyclesActiveAreNeverBothTrueForTheSameState() {
+        for kind in RunKindFilter.allCases {
+            for subTab in AutoflowsSubTab.allCases {
+                let claims = ActivityScreen.isClaimsActive(kind: kind, subTab: subTab)
+                let cycles = ActivityScreen.isCyclesActive(kind: kind, subTab: subTab)
+                #expect(!(claims && cycles), "\(kind) + \(subTab)")
+            }
+        }
+    }
 }

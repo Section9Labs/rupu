@@ -106,6 +106,55 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
     public let startedAt: Date?
     public let navigation: Navigation
 
+    // MARK: - Per-kind detail (perf & interaction arc, Plan 5 Task 4)
+    //
+    // The merged Activity feed (`ActivityTable`, `NeedsYou`, the command
+    // palette) only ever needed the common fields above — every list-row API
+    // type carries more than that, but nothing downstream of the merged view
+    // read it, so it was never mapped in. The Task 4 per-kind tables (per-kind
+    // columns ported verbatim from the web: token counts, model, issue ref,
+    // worker, autoflow failure detail, agent run source) DO need it — rather
+    // than inventing a second per-kind row type (and a second mapping site per
+    // API type), these are added here as plain optional fields, populated only
+    // by the one or two kind-specific inits below that have the data; every
+    // other kind's rows (and the merged view, which never reads these) simply
+    // carry `nil`. `Equatable`/`Sendable` conformance is unaffected — every
+    // added type already conforms.
+    /// Input tokens (`usage.input_tokens`) — agent/workflow/autoflow/session.
+    public let inputTokens: UInt64?
+    /// Output tokens (`usage.output_tokens`) — agent/workflow/autoflow/session.
+    public let outputTokens: UInt64?
+    /// Cached tokens (`usage.cached_tokens`) — agent/workflow/autoflow/session.
+    public let cachedTokens: UInt64?
+    /// Turn count — agent/workflow rows always carry a real `UInt64`; autoflow
+    /// events carry an optional one (some event kinds have no turn count at
+    /// all); sessions carry `total_turns`.
+    public let turns: UInt64?
+    /// Session model id (`SessionDto.model`) — sessions only.
+    public let model: String?
+    /// Raw agent-run `source` string (`"session"`/`"cli"`/`"cron"`/etc.) —
+    /// agent rows only. Backs the AgentRuns table's Source badge (web parity:
+    /// `source == "session"` gets the info tone, everything else neutral).
+    public let source: String?
+    /// Autoflow event's `issue_display_ref` — autoflow rows only.
+    public let issueRef: String?
+    /// Autoflow event's `worker_name` — autoflow rows only.
+    public let worker: String?
+    /// Autoflow event's raw `kind` (`"cycle_failed"`/`"run_started"`/etc.) —
+    /// autoflow rows only. Kept distinct from `subject` (which already falls
+    /// back to this same string when `workflow` is nil) because the
+    /// AutoflowRuns table's Event column needs the raw kind independently of
+    /// whichever workflow name `subject` resolved to.
+    public let eventKind: String?
+    /// Autoflow event's failure `detail` text — autoflow rows only, and only
+    /// non-nil for events that actually carry one (`cycle_failed` et al.).
+    /// Backs the AutoflowRuns table's expandable failure-detail row.
+    public let detail: String?
+    /// Session `updated_at` — sessions only. Backs the Sessions table's
+    /// Duration column (`created→updated`), computed from this and
+    /// `startedAt` (which carries `created_at` for session rows).
+    public let updatedAt: Date?
+
     public enum Navigation: Equatable, Sendable {
         case run(id: String, host: String?)
         case session(id: String)
@@ -161,6 +210,17 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         costUSD = r.usage.costUSD
         startedAt = Self.parseISO(r.startedAt)
         navigation = .run(id: r.id, host: r.hostID)
+        inputTokens = r.usage.inputTokens
+        outputTokens = r.usage.outputTokens
+        cachedTokens = r.usage.cachedTokens
+        turns = r.turns
+        model = nil
+        source = nil
+        issueRef = nil
+        worker = nil
+        eventKind = nil
+        detail = nil
+        updatedAt = nil
     }
 
     /// **Navigation (hotfix root cause C)**: an agent-run row is never an
@@ -190,6 +250,17 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         } else {
             navigation = .agentRun(id: r.runID, transcriptPath: r.transcriptPath, host: r.hostID)
         }
+        inputTokens = r.usage.inputTokens
+        outputTokens = r.usage.outputTokens
+        cachedTokens = r.usage.cachedTokens
+        turns = r.turns
+        model = nil
+        source = r.source
+        issueRef = nil
+        worker = nil
+        eventKind = nil
+        detail = nil
+        updatedAt = nil
     }
 
     public init(_ r: APIAutoflowEventRow) {
@@ -208,6 +279,17 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         costUSD = r.usage.costUSD
         startedAt = Self.parseISO(r.at)
         navigation = r.runID.map { .run(id: $0, host: r.hostID) } ?? .none
+        inputTokens = r.usage.inputTokens
+        outputTokens = r.usage.outputTokens
+        cachedTokens = r.usage.cachedTokens
+        turns = r.turns
+        model = nil
+        source = nil
+        issueRef = r.issueDisplayRef
+        worker = r.workerName
+        eventKind = r.kind
+        detail = r.detail
+        updatedAt = nil
     }
 
     public init(_ r: APISessionRow) {
@@ -222,6 +304,17 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         costUSD = r.usage?.costUSD
         startedAt = Self.parseISO(r.createdAt)
         navigation = .session(id: r.sessionID)
+        inputTokens = r.totalTokensIn
+        outputTokens = r.totalTokensOut
+        cachedTokens = r.totalTokensCached
+        turns = UInt64(r.totalTurns)
+        model = r.model
+        source = nil
+        issueRef = nil
+        worker = nil
+        eventKind = nil
+        detail = nil
+        updatedAt = Self.parseISO(r.updatedAt)
     }
 
     /// Full-field memberwise initializer used only by
@@ -233,7 +326,10 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
     init(
         id: String, kind: ActivityKindTag, subject: String, project: String?, host: String,
         trigger: String?, status: ActivityStatus, durationMS: UInt64?, costUSD: Double?,
-        startedAt: Date?, navigation: Navigation
+        startedAt: Date?, navigation: Navigation,
+        inputTokens: UInt64? = nil, outputTokens: UInt64? = nil, cachedTokens: UInt64? = nil,
+        turns: UInt64? = nil, model: String? = nil, source: String? = nil, issueRef: String? = nil,
+        worker: String? = nil, eventKind: String? = nil, detail: String? = nil, updatedAt: Date? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -246,6 +342,17 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
         self.costUSD = costUSD
         self.startedAt = startedAt
         self.navigation = navigation
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cachedTokens = cachedTokens
+        self.turns = turns
+        self.model = model
+        self.source = source
+        self.issueRef = issueRef
+        self.worker = worker
+        self.eventKind = eventKind
+        self.detail = detail
+        self.updatedAt = updatedAt
     }
 
     /// Returns a copy with `status` (and, when provided, `durationMS`)
@@ -255,12 +362,16 @@ public struct ActivityRow: Identifiable, Equatable, Sendable {
     /// `ActivityDelta.reduce`'s produced status patches currently carry a
     /// duration (see `LiveReducer.swift`'s doc comment), so a `nil` here
     /// keeps whatever REST-sourced duration the row already had rather than
-    /// clobbering it.
+    /// clobbering it. Every per-kind detail field is carried through
+    /// unchanged — a live status patch never touches them.
     func patchingStatus(_ newStatus: ActivityStatus, durationMS newDurationMS: UInt64?) -> ActivityRow {
         ActivityRow(
             id: id, kind: kind, subject: subject, project: project, host: host,
             trigger: trigger, status: newStatus, durationMS: newDurationMS ?? durationMS,
-            costUSD: costUSD, startedAt: startedAt, navigation: navigation
+            costUSD: costUSD, startedAt: startedAt, navigation: navigation,
+            inputTokens: inputTokens, outputTokens: outputTokens, cachedTokens: cachedTokens,
+            turns: turns, model: model, source: source, issueRef: issueRef,
+            worker: worker, eventKind: eventKind, detail: detail, updatedAt: updatedAt
         )
     }
 

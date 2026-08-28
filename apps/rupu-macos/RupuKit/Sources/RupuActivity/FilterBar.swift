@@ -2,25 +2,31 @@ import SwiftUI
 import RupuStore
 import RupuDesign
 
-/// Kind segmented control (bound *through* `model.route` — the sidebar and
-/// this control share one piece of state, never two that can drift apart),
-/// additive status chips (`store.statusFilter` narrows synchronously, no
+/// Additive status chips (`store.statusFilter` narrows synchronously, no
 /// refetch), a live-tail switch, and — when `pendingNewRuns > 0` — a "N new
 /// runs" pill that calls `applyPendingRefresh()`.
 ///
-/// **`showRunsChrome` (review fix, round 1)** — `false` while the Activity
-/// screen's autoflows-kind Claims sub-tab is showing: the status chips,
-/// live-tail toggle, and "+N new runs" pill all act on `ActivityStore`'s
-/// `ActivityTable`, which isn't even on screen at that point (`ClaimsTable`
-/// is) — leaving them visible-and-live-but-inert violates the no-dead-
-/// controls rule (toggling live-tail would keep ticking a table nobody can
-/// see; the pill would apply a refresh to rows not shown). The kind picker
-/// stays regardless of this flag — it's the only way back OUT of the
-/// autoflows kind, never inert.
+/// **The kind segmented picker is GONE** (perf & interaction arc, Plan 5
+/// Task 4 — matt's direct restructure feedback: the Activity parent stops
+/// showing one combined table with a kind-picker; each kind gets its own
+/// dedicated table, reached via the sidebar's existing disclosure children
+/// — Task 0 — which already drive `model.route` directly). This `View` now
+/// only ever renders on a kind page (never on the `.all` parent, which shows
+/// `ActivityStatsView` instead and has no `FilterBar` at all — see
+/// `ActivityScreen.body`), so it no longer needs `model`/`Route` at all.
+///
+/// **`showRunsChrome` (review fix, round 1, predates this task)** — `false`
+/// while the Activity screen's autoflows-kind Claims sub-tab is showing: the
+/// status chips, live-tail toggle, and "+N new runs" pill all act on
+/// `ActivityStore`'s per-kind table, which isn't even on screen at that
+/// point (`ClaimsTable` is) — leaving them visible-and-live-but-inert
+/// violates the no-dead-controls rule. Getting back OUT of Claims no longer
+/// needs a control THIS view renders — the `AutoflowsSubTab` picker
+/// (`ActivityScreen.autoflowsSubTabPicker`) already does that, unaffected by
+/// this change; `ActivityScreen.body` skips this whole view when
+/// `showRunsChrome` is false rather than rendering it empty.
 struct FilterBar: View {
-    @Bindable var model: AppModel
     @Bindable var store: ActivityStore
-    let showRunsChrome: Bool
 
     private static let chipStatuses: [ActivityStatus] = [
         .pending, .running, .completed, .failed, .awaiting, .rejected, .cancelled, .paused,
@@ -29,46 +35,27 @@ struct FilterBar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
-                kindPicker
+                dateRangeFilter
                 Spacer(minLength: 0)
-                if showRunsChrome {
-                    if store.pendingNewRuns > 0 {
-                        newRunsPill
-                    }
-                    liveTailToggle
+                if store.pendingNewRuns > 0 {
+                    newRunsPill
                 }
+                liveTailToggle
             }
-            if showRunsChrome {
-                statusChips
-            }
+            statusChips
         }
         .padding(12)
         .panelStyle(.panel)
     }
 
-    private var kindPicker: some View {
-        Picker("Kind", selection: kindBinding) {
-            ForEach(RunKindFilter.allCases, id: \.self) { kind in
-                Text(kind.filterLabel).tag(kind)
-            }
+    /// Server-side custom date range (perf & interaction arc, Plan 5 Task 5)
+    /// — see `KindTableDateRangeFilter`'s own doc comment for the day-
+    /// boundary normalization and why this resets paging rather than just
+    /// narrowing `rows` in place like the status chips below do.
+    private var dateRangeFilter: some View {
+        KindTableDateRangeFilter(since: store.since, until: store.until) { since, until in
+            Task { await store.setDateRange(since: since, until: until) }
         }
-        .pickerStyle(.segmented)
-        .frame(width: 380)
-        .labelsHidden()
-    }
-
-    /// The one piece of state the kind filter reads/writes — `model.route`.
-    /// There is no local `@State` mirror: this binding IS the sidebar's own
-    /// selection source, so a segmented-control change and a sidebar click
-    /// can never disagree.
-    private var kindBinding: Binding<RunKindFilter> {
-        Binding(
-            get: {
-                if case .activity(let kind) = model.route { return kind }
-                return .all
-            },
-            set: { model.route = .activity($0) }
-        )
     }
 
     private var liveTailToggle: some View {
@@ -151,18 +138,6 @@ struct FilterBar: View {
             store.statusFilter.remove(status)
         } else {
             store.statusFilter.insert(status)
-        }
-    }
-}
-
-private extension RunKindFilter {
-    var filterLabel: String {
-        switch self {
-        case .all: "All"
-        case .agents: "Agents"
-        case .workflows: "Workflows"
-        case .autoflows: "Autoflows"
-        case .sessions: "Sessions"
         }
     }
 }

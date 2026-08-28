@@ -31,27 +31,76 @@ public actor CPClient {
     }
 
     /// See `runs(offset:limit:host:)`'s doc comment on the fan-out cost of
-    /// an omitted `host`.
-    public func workflowRuns(offset: Int, limit: Int, host: String? = nil) async throws -> [APIRunListRow] {
-        try await get("api/runs/workflows", query: offsetLimitQuery(offset: offset, limit: limit, host: host))
+    /// an omitted `host`. `since`/`until` (perf & interaction arc, Plan 5
+    /// Task 5) are RFC-3339 strings, narrowing the server-side date range
+    /// applied BEFORE offset/limit paging — `nil` omits the corresponding
+    /// query param entirely (no filter), matching `usage(since:until:
+    /// groupBy:host:)`'s existing convention for the same shape.
+    public func workflowRuns(
+        offset: Int, limit: Int, host: String? = nil, since: String? = nil, until: String? = nil
+    ) async throws -> [APIRunListRow] {
+        try await get(
+            "api/runs/workflows",
+            query: offsetLimitQuery(offset: offset, limit: limit, host: host, since: since, until: until)
+        )
     }
 
     /// See `runs(offset:limit:host:)`'s doc comment on the fan-out cost of
-    /// an omitted `host`.
-    public func agentRuns(offset: Int, limit: Int, host: String? = nil) async throws -> [APIAgentRunRow] {
-        try await get("api/runs/agents", query: offsetLimitQuery(offset: offset, limit: limit, host: host))
+    /// an omitted `host`, and `workflowRuns(offset:limit:host:since:until:)`'s
+    /// on `since`/`until`.
+    public func agentRuns(
+        offset: Int, limit: Int, host: String? = nil, since: String? = nil, until: String? = nil
+    ) async throws -> [APIAgentRunRow] {
+        try await get(
+            "api/runs/agents",
+            query: offsetLimitQuery(offset: offset, limit: limit, host: host, since: since, until: until)
+        )
     }
 
     /// See `runs(offset:limit:host:)`'s doc comment on the fan-out cost of
-    /// an omitted `host`.
-    public func autoflowEvents(offset: Int, limit: Int, host: String? = nil) async throws -> [APIAutoflowEventRow] {
-        try await get("api/runs/autoflows/events", query: offsetLimitQuery(offset: offset, limit: limit, host: host))
+    /// an omitted `host`, and `workflowRuns(offset:limit:host:since:until:)`'s
+    /// on `since`/`until`.
+    public func autoflowEvents(
+        offset: Int, limit: Int, host: String? = nil, since: String? = nil, until: String? = nil
+    ) async throws -> [APIAutoflowEventRow] {
+        try await get(
+            "api/runs/autoflows/events",
+            query: offsetLimitQuery(offset: offset, limit: limit, host: host, since: since, until: until)
+        )
+    }
+
+    /// `GET /api/runs/autoflows` — autoflow-worker CYCLES (one row per batch
+    /// tick), not events. Named `autoflowCycles`, not `autoflowRuns` — the
+    /// web's own `api.ts` calls this `getAutoflowRuns` (matching the Rust
+    /// route's `/api/runs/autoflows` path literally), but this app already
+    /// uses "Runs" for the EVENTS sub-tab (`AutoflowsSubTab.runs`,
+    /// `autoflowEvents` above) — reusing that name here for a different
+    /// endpoint returning a different row shape would be a footgun for the
+    /// next reader, not a fidelity requirement (the wire path/row shape is
+    /// what has to match the server, not this client's internal method
+    /// name). See `runs(offset:limit:host:)`'s doc comment on the fan-out
+    /// cost of an omitted `host`; host-aware exactly like the other list
+    /// routes above (verified against `crates/rupu-cp/src/api/
+    /// run_streams.rs`'s top-of-file fan-out note).
+    public func autoflowCycles(
+        offset: Int, limit: Int, host: String? = nil, since: String? = nil, until: String? = nil
+    ) async throws -> [APIAutoflowCycleRow] {
+        try await get(
+            "api/runs/autoflows",
+            query: offsetLimitQuery(offset: offset, limit: limit, host: host, since: since, until: until)
+        )
     }
 
     /// See `runs(offset:limit:host:)`'s doc comment on the fan-out cost of
-    /// an omitted `host`.
-    public func sessions(offset: Int, limit: Int, host: String? = nil) async throws -> [APISessionRow] {
-        try await get("api/sessions", query: offsetLimitQuery(offset: offset, limit: limit, host: host))
+    /// an omitted `host`, and `workflowRuns(offset:limit:host:since:until:)`'s
+    /// on `since`/`until`.
+    public func sessions(
+        offset: Int, limit: Int, host: String? = nil, since: String? = nil, until: String? = nil
+    ) async throws -> [APISessionRow] {
+        try await get(
+            "api/sessions",
+            query: offsetLimitQuery(offset: offset, limit: limit, host: host, since: since, until: until)
+        )
     }
 
     /// `GET /api/hosts` — the registered fleet: `local` plus every attached
@@ -602,12 +651,15 @@ public actor CPClient {
 
     // MARK: - Query helpers
 
-    private func offsetLimitQuery(offset: Int, limit: Int, host: String? = nil) -> [URLQueryItem] {
+    private func offsetLimitQuery(
+        offset: Int, limit: Int, host: String? = nil, since: String? = nil, until: String? = nil
+    ) -> [URLQueryItem] {
         var items = [
             URLQueryItem(name: "offset", value: String(offset)),
             URLQueryItem(name: "limit", value: String(limit)),
         ]
         items.append(contentsOf: hostQuery(host))
+        items.append(contentsOf: sinceUntilQuery(since: since, until: until))
         return items
     }
 

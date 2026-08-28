@@ -3,10 +3,18 @@ import RupuAPI
 import RupuStore
 import RupuDesign
 
-/// The real Activity table (replaces the Phase 1 `PlaceholderScreen` for
-/// `.activity` routes): `FilterBar` + a merged `ActivityTable` fed by
-/// `ActivityStore`, with loading/failed/empty states and a staleness
-/// banner.
+/// The real Activity screen (replaces the Phase 1 `PlaceholderScreen` for
+/// `.activity` routes). **Restructured in perf & interaction arc, Plan 5
+/// Task 4** (matt's direct feedback: stop showing one combined table with a
+/// kind-picker): the `.all` kind renders `ActivityStatsView` (KPI cards +
+/// a compact needs-attention list, no table, no kind picker); every other
+/// kind (`agents`/`workflows`/`autoflows`/`sessions`) renders its OWN
+/// dedicated table (`RupuActivity/KindTables/`) fed by the exact same
+/// `ActivityStore`, with `FilterBar` (status chips/live-tail/"+N new runs"
+/// pill) alongside it. The merged `ActivityTable` this screen used to show
+/// unconditionally, and the kind segmented picker that selected into it,
+/// are both deleted — every kind is reached via the sidebar's disclosure
+/// children (Task 0) instead.
 ///
 /// **Shared store, not owned** (perf & interaction arc, Plan 5 Task 2):
 /// `activityStore` is built once at `RootView` and injected here — this
@@ -72,6 +80,17 @@ public struct ActivityScreen: View {
     /// reusing `storeClientID`.
     @State private var claimsStoreClientID: ObjectIdentifier?
 
+    /// Cycles sub-tab (perf & interaction arc, Plan 5 Task 4b) — same
+    /// lazy-build-on-first-selection lifecycle as `claimsStore`/
+    /// `claimsStoreClientID` above, kept as its own pair rather than
+    /// generalizing the two into one mechanism: they're independent stores
+    /// with independent activate/deactivate contracts (`CyclesStore` is
+    /// generation-guarded and progressively remote-loading; `ClaimsStore` is
+    /// a plain `load()`), so sharing bookkeeping between them would only
+    /// couple two things that don't actually need to change together.
+    @State private var cyclesStore: CyclesStore?
+    @State private var cyclesStoreClientID: ObjectIdentifier?
+
     public init(model: AppModel, backend: BackendController, activityStore: ActivityStore?) {
         self.model = model
         self.backend = backend
@@ -89,10 +108,23 @@ public struct ActivityScreen: View {
 
     public var body: some View {
         let claimsActive = Self.isClaimsActive(kind: kind, subTab: autoflowsSubTab)
+        let cyclesActive = Self.isCyclesActive(kind: kind, subTab: autoflowsSubTab)
         VStack(alignment: .leading, spacing: 12) {
             if let store = activityStore {
-                FilterBar(model: model, store: store, showRunsChrome: !claimsActive)
-                if !claimsActive {
+                // `FilterBar` (status chips / live-tail / "+N new runs" pill)
+                // only ever renders on a KIND page now (perf & interaction
+                // arc, Plan 5 Task 4 — matt's restructure: the `.all` parent
+                // shows `ActivityStatsView` instead, which has no table for
+                // these controls to act on) — same no-dead-controls reasoning
+                // `showRunsChrome` already applied to the Claims sub-tab, now
+                // also applied to Cycles (Task 4b): both sub-tabs sit over
+                // their OWN store, never `ActivityStore`'s `ActivityTable`-
+                // successor, so this bar/these banners would be inert chrome
+                // for either.
+                if kind != .all, !claimsActive, !cyclesActive {
+                    FilterBar(store: store)
+                }
+                if !claimsActive, !cyclesActive {
                     if store.freshness == .stale {
                         Text("Stream stale — reconnecting")
                             .font(.noteText)
@@ -112,8 +144,17 @@ public struct ActivityScreen: View {
                 if kind == .autoflows {
                     autoflowsSubTabPicker
                 }
-                if claimsActive {
+                if kind == .all {
+                    // The Activity parent (perf & interaction arc, Plan 5 Task
+                    // 4 restructure): a stats surface, never a table or kind
+                    // picker — every kind's own table lives one level down at
+                    // the sidebar's disclosure children (already wired since
+                    // Task 0; unaffected by this change).
+                    ActivityStatsView(store: store, backend: backend, range: model.range, onNavigate: { model.navigate(to: $0) })
+                } else if claimsActive {
                     claimsBody
+                } else if cyclesActive {
+                    cyclesBody
                 } else {
                     stateBody(store: store)
                 }
@@ -130,14 +171,26 @@ public struct ActivityScreen: View {
         .task(id: ClaimsTaskID(kind: kind, subTab: autoflowsSubTab, clientID: backend.clientIdentity())) {
             await activateClaimsIfNeeded()
         }
+        .task(id: CyclesTaskID(kind: kind, subTab: autoflowsSubTab, clientID: backend.clientIdentity())) {
+            await activateCyclesIfNeeded()
+        }
         .onChange(of: model.scopeWsID) { _, newScope in
             activityStore?.scopeFilter = newScope
         }
         .onDisappear {
             activityStore?.deactivate()
+            cyclesStore?.deactivate()
         }
     }
 
+    /// **Only ever called for a KIND page** (`kind != .all` — the `.all`
+    /// parent renders `ActivityStatsView` instead, never this). Routes to
+    /// the dedicated per-kind table (perf & interaction arc, Plan 5 Task 4)
+    /// — the merged `ActivityTable` this used to show unconditionally was
+    /// deleted along with the kind picker that selected into it; `.all`
+    /// itself is unreachable here (`fatalError` would be defensive
+    /// overkill for a `switch` this method's own doc comment already rules
+    /// out — see the caller in `body`, which never reaches this for `.all`).
     @ViewBuilder
     private func stateBody(store: ActivityStore) -> some View {
         switch store.state {
@@ -148,7 +201,18 @@ public struct ActivityScreen: View {
         case .empty:
             blockView(label: "No executions in range")
         case .content:
-            ActivityTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            switch kind {
+            case .all:
+                blockView(label: "No executions in range")
+            case .agents:
+                AgentRunsTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            case .workflows:
+                WorkflowRunsTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            case .autoflows:
+                AutoflowRunsTable(rows: store.rows, store: store, backend: backend, onSelect: handleSelect)
+            case .sessions:
+                SessionsTable(rows: store.rows, store: store, onSelect: handleSelect)
+            }
         }
     }
 
@@ -166,6 +230,15 @@ public struct ActivityScreen: View {
     /// without standing up a full view render.
     static func isClaimsActive(kind: RunKindFilter, subTab: AutoflowsSubTab) -> Bool {
         kind == .autoflows && subTab == .claims
+    }
+
+    /// Same contract as `isClaimsActive` above, for the Cycles sub-tab (perf
+    /// & interaction arc, Plan 5 Task 4b) — suppresses the same Runs-only
+    /// chrome (`FilterBar`, stale/pending-hosts banners) while Cycles is
+    /// showing, since that sub-tab sits over its own `CyclesStore`, not
+    /// `ActivityStore`'s per-kind table.
+    static func isCyclesActive(kind: RunKindFilter, subTab: AutoflowsSubTab) -> Bool {
+        kind == .autoflows && subTab == .cycles
     }
 
     private var autoflowsSubTabPicker: some View {
@@ -255,6 +328,82 @@ public struct ActivityScreen: View {
             activeStore = newStore
         }
         await activeStore.load()
+    }
+
+    // MARK: - Autoflows Cycles sub-tab (perf & interaction arc, Plan 5 Task 4b)
+
+    /// Same `claimsStore == nil` reasoning as `claimsBody`'s doc comment —
+    /// by the time this is reached, the outer `if let store` has already
+    /// proven the backend is connected, so a `nil` `cyclesStore` here is
+    /// only ever the one-frame gap before `activateCyclesIfNeeded()`'s
+    /// `.task(id:)` finishes building and assigning it.
+    @ViewBuilder
+    private var cyclesBody: some View {
+        if let cyclesStore {
+            VStack(alignment: .leading, spacing: 8) {
+                if cyclesStore.pendingHosts > 0 {
+                    Text("+\(cyclesStore.pendingHosts) host\(cyclesStore.pendingHosts == 1 ? "" : "s") loading…")
+                        .font(.noteText)
+                        .foregroundStyle(Color.rupuMute)
+                }
+                switch cyclesStore.state {
+                case .loading:
+                    loadingView
+                case .failed(let message):
+                    cyclesFailedView(message: message, store: cyclesStore)
+                case .empty:
+                    blockView(label: "No autoflow cycles yet")
+                case .content:
+                    AutoflowCyclesTable(rows: cyclesStore.rows, store: cyclesStore, onSelectRun: { model.navigate(to: $0) })
+                }
+            }
+        } else {
+            loadingView
+        }
+    }
+
+    private func cyclesFailedView(message: String, store: CyclesStore) -> some View {
+        VStack(spacing: 10) {
+            Spacer(minLength: 0)
+            Text("Failed to load cycles")
+                .font(.noteText)
+                .foregroundStyle(Color.status(.failed))
+            Text(message)
+                .font(.uiText)
+                .foregroundStyle(Color.rupuDim)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
+            Button("Retry") {
+                Task { await store.refresh() }
+            }
+            .buttonStyle(RupuButtonStyle.outline)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .panelStyle(.panel)
+    }
+
+    /// Lazy-builds (and, on a backend client swap, rebuilds) `cyclesStore`
+    /// and activates it, but ONLY once the Cycles sub-tab is actually
+    /// selected — same `CyclesTaskID`-folds-in-everything contract
+    /// `activateClaimsIfNeeded()`'s doc comment documents for its sibling.
+    /// `activate()` (not a plain `load()`/`refresh()`) — `CyclesStore` needs
+    /// its generation bumped on every (re)activation so a prior selection's
+    /// still-in-flight remote-host fetches never land on top of this one.
+    private func activateCyclesIfNeeded() async {
+        guard kind == .autoflows, autoflowsSubTab == .cycles else { return }
+        guard let client = backend.client() else { return }
+        let clientID = backend.clientIdentity()
+        let activeStore: CyclesStore
+        if let existing = cyclesStore, cyclesStoreClientID == clientID {
+            activeStore = existing
+        } else {
+            let newStore = CyclesStore(client: client)
+            cyclesStore = newStore
+            cyclesStoreClientID = clientID
+            activeStore = newStore
+        }
+        await activeStore.activate()
     }
 
     private var loadingView: some View {
@@ -356,17 +505,19 @@ private struct ActivityTaskID: Equatable {
     let clientID: ObjectIdentifier?
 }
 
-/// The autoflows-kind sub-toggle (Phase 6B, Task 3) — screen-local, not a
-/// `RunKindFilter` case: every other kind (`.all`/`.agents`/`.workflows`/
-/// `.sessions`) has no equivalent second view, so this narrower toggle lives
-/// entirely inside `ActivityScreen`, only ever rendered when `kind ==
-/// .autoflows`.
+/// The autoflows-kind sub-toggle (Phase 6B, Task 3; Cycles added perf &
+/// interaction arc Plan 5 Task 4b) — screen-local, not a `RunKindFilter`
+/// case: every other kind (`.all`/`.agents`/`.workflows`/`.sessions`) has no
+/// equivalent second view, so this narrower toggle lives entirely inside
+/// `ActivityScreen`, only ever rendered when `kind == .autoflows`. Order
+/// matches the web's own Autoflows page tab order (Runs/Cycles/Claims).
 enum AutoflowsSubTab: String, CaseIterable, Sendable {
-    case runs, claims
+    case runs, cycles, claims
 
     var label: String {
         switch self {
         case .runs: "Runs"
+        case .cycles: "Cycles"
         case .claims: "Claims"
         }
     }
@@ -382,6 +533,16 @@ enum AutoflowsSubTab: String, CaseIterable, Sendable {
 /// against an abandoned connection, the exact class of bug PR #501 fixed for
 /// run-state closures).
 private struct ClaimsTaskID: Equatable {
+    let kind: RunKindFilter
+    let subTab: AutoflowsSubTab
+    let clientID: ObjectIdentifier?
+}
+
+/// `.task(id:)` identity for the Cycles sub-tab's lazy load
+/// (`ActivityScreen.activateCyclesIfNeeded()`) — same "fold in kind/subTab/
+/// clientID" contract `ClaimsTaskID` documents for its own sub-tab, applied
+/// to the third one (perf & interaction arc, Plan 5 Task 4b).
+private struct CyclesTaskID: Equatable {
     let kind: RunKindFilter
     let subTab: AutoflowsSubTab
     let clientID: ObjectIdentifier?
