@@ -2,6 +2,7 @@ import SwiftUI
 import RupuAPI
 import RupuStore
 import RupuDesign
+import RupuFlowKit
 
 /// The Workflow Builder screen (macOS design plan, Task 10) — the SHELL:
 /// fixed 46pt header (`BuilderHeader`), a left column with the canvas over
@@ -40,6 +41,18 @@ public struct WorkflowBuilderScreen: View {
     @AppStorage("rupu.builder.sourceOpen") private var sourceOpen = true
     @AppStorage("rupu.builder.railTab") private var railTab: RailTab = .blocks
 
+    /// In-flight palette drag-to-canvas state: which kind is being dragged
+    /// and the pointer's current point in the screen-wide `"builder"` named
+    /// coordinate space (see `.coordinateSpace(name: "builder")` on `body`
+    /// below). Lives here, not in `PaletteTab`, because the drop-target
+    /// decision needs `canvasFrame` — captured from the CANVAS side of the
+    /// screen — which a rail-only view has no way to see.
+    @State private var paletteDrag: (kind: RupuFlowKit.StepKind, point: CGPoint)?
+    /// The canvas `ZStack`'s own frame in `"builder"` space, kept current by
+    /// `.onGeometryChange` in `readyBody` — the drop-target test
+    /// `handlePaletteDragEnded` runs against.
+    @State private var canvasFrame: CGRect = .zero
+
     public init(model: AppModel, backend: BackendController, name: String, scopeKind: String? = nil, scopeID: String? = nil) {
         self.model = model
         self.backend = backend
@@ -65,6 +78,19 @@ public struct WorkflowBuilderScreen: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.rupuBg)
+        // Screen-wide named space: the palette card's `DragGesture` and the
+        // canvas `ZStack`'s `.onGeometryChange` (both below) both resolve
+        // their points/frame against THIS space, so the drop-target test in
+        // `handlePaletteDragEnded` compares like-for-like with no manual
+        // ancestor-chain coordinate conversion on either side.
+        .coordinateSpace(name: "builder")
+        .overlay(alignment: .topLeading) {
+            if let paletteDrag {
+                PaletteDragGhost(kind: paletteDrag.kind)
+                    .position(paletteDrag.point)
+                    .allowsHitTesting(false)
+            }
+        }
         // Same "keyed on `name` alone" rationale `WorkflowDetailScreen.body`'s
         // doc comment gave — `activateStore()` below has its own independent
         // `storeClientID` guard for the client-swap case.
@@ -74,6 +100,21 @@ public struct WorkflowBuilderScreen: View {
         .onChange(of: store?.selectedID) { _, newValue in
             railTab = Self.railTab(afterSelecting: newValue, current: railTab)
         }
+    }
+
+    /// Drag-to-canvas release: the ghost is cleared unconditionally; a drop
+    /// point inside `canvasFrame` converts to canvas content coordinates
+    /// (`canvasPoint(fromBuilderPoint:canvasFrame:scrollOffset:)` —
+    /// `scrollOffset` is always `.zero` here, see that function's doc
+    /// comment for why) and adds the node. A drop outside the canvas —
+    /// released back over the rail or anywhere else on the screen — is
+    /// silently discarded, the same "no-op on a miss" contract `CanvasView.
+    /// handlePortDragEnded` already follows for a port-drag release outside
+    /// any node.
+    private func handlePaletteDragEnded(kind: RupuFlowKit.StepKind, point: CGPoint, store: BuilderStore) {
+        paletteDrag = nil
+        guard let target = canvasPoint(fromBuilderPoint: point, canvasFrame: canvasFrame, scrollOffset: .zero) else { return }
+        store.addNode(kind: kind, at: target)
     }
 
     private func activateStore() async {
@@ -141,6 +182,14 @@ public struct WorkflowBuilderScreen: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Keeps `canvasFrame` current in the `"builder"` space —
+                // the drop-target test `handlePaletteDragEnded` runs
+                // against. This captures the visible VIEWPORT frame, not
+                // the (possibly larger, scrolled) content size — correct
+                // for the "no scroll-offset plumbing" contract documented
+                // on `canvasPoint(fromBuilderPoint:canvasFrame:
+                // scrollOffset:)`.
+                .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .named("builder")) }) { canvasFrame = $0 }
                 if sourceOpen {
                     yamlPane(store: store)
                         .frame(height: 192)
@@ -259,7 +308,11 @@ public struct WorkflowBuilderScreen: View {
     private func railContent(store: BuilderStore) -> some View {
         switch railTab {
         case .blocks:
-            placeholderTabContent("Blocks coming in Task 12")
+            PaletteTab(
+                store: store,
+                onDragChanged: { kind, point in paletteDrag = (kind, point) },
+                onDragEnded: { kind, point in handlePaletteDragEnded(kind: kind, point: point, store: store) }
+            )
         case .step:
             placeholderTabContent("Step coming in Task 13")
         case .settings:
