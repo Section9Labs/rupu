@@ -111,6 +111,24 @@ import Testing
     #expect(v["foo"]?["a"] == .int(1))
 }
 
+@Test func bareFlowLineFollowingAMappingEntryIsRejected() {
+    // Regression: the SAME flow-bracket-vs-colon confusion as the three
+    // tests above, but reachable through parseMapping's own loop-
+    // continuation condition (not just the initial dispatch): a bare flow
+    // mapping appearing where a *sibling* "key: value" line was expected
+    // must not be silently swallowed as a bogus entry keyed on "{b" — the
+    // loop must stop on it, surfacing it as unconsumed trailing content.
+    #expect(throws: YAMLError.self) { try YAMLParser.parse("a: 1\n{b: 2}\n") }
+}
+
+@Test func bareFlowLineFollowingASequenceItemKeyIsRejected() {
+    // Regression: same defect class reachable through parseSequence's
+    // inline-item continuation loop (the "further keys at virtualIndent"
+    // loop) — a bare flow mapping aligned under a dash item's first key
+    // must not be silently swallowed as a bogus entry, either.
+    #expect(throws: YAMLError.self) { try YAMLParser.parse("- id: a\n  {b: 2}\n") }
+}
+
 @Test func tabIndentationIsRejected() {
     // Regression: counting only literal spaces for indentation means a
     // tab-indented line was silently read at indent 0, restructuring the

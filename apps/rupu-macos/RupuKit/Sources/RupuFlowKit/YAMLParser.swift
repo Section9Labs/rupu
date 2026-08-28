@@ -139,7 +139,10 @@ private final class Parser {
 
     func parseMapping(indent: Int) throws -> (YAMLValue, Int) {
         var entries: [(key: String, value: YAMLValue)] = []
-        while let line = try peek(), line.indent == indent, findTopLevelColon(line.content) != nil {
+        while let line = try peek(), line.indent == indent,
+            !(line.content.hasPrefix("[") || line.content.hasPrefix("{")),
+            findTopLevelColon(line.content) != nil
+        {
             let rawIndex = pos
             let lineNumber = line.lineNumber
             let (key, value) = try parseSingleMappingEntry(
@@ -232,6 +235,7 @@ private final class Parser {
                     content: remainder, rawIndex: dashRawIndex, lineNumber: dashLineNumber, indent: virtualIndent)
                 entries.append((key0, value0))
                 while let line2 = try peek(), line2.indent == virtualIndent,
+                    !(line2.content.hasPrefix("[") || line2.content.hasPrefix("{")),
                     findTopLevelColon(line2.content) != nil
                 {
                     let rawIndex2 = pos
