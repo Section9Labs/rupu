@@ -8,18 +8,18 @@ import RupuFlowKit
 /// fixed 46pt header (`BuilderHeader`), a left column with the canvas over
 /// a collapsible YAML source pane, and a fixed 320pt right inspector rail
 /// with a Blocks/Step/Settings tab strip. Canvas node/edge rendering + drag/
-/// connect/keyboard interactions land in Task 11, the Blocks palette in
-/// Task 12, the Step form + Settings tab content in Task 13, and the
-/// Run-mode overlay + Launch auto-save in Task 14 — this task wires the
-/// round-trip `BuilderStore` (Tasks 1-9) into a real screen with every
-/// fixed-chrome piece the spec's §1 layout calls for, ahead of the pieces
-/// that fill it in.
+/// connect/keyboard interactions landed in Task 11, the Blocks palette in
+/// Task 12, the Step form + Settings tab content in Task 13 (`StepFormTab`/
+/// `SettingsTab`), and the Run-mode overlay + Launch auto-save land in
+/// Task 14 — this task wires the round-trip `BuilderStore` (Tasks 1-9) into
+/// a real screen with every fixed-chrome piece the spec's §1 layout calls
+/// for, ahead of the pieces that fill it in.
 ///
 /// Replaces `RupuLibrary.WorkflowDetailScreen` at the `.workflowDefinition`
 /// route (deleted this task): Design mode's read affordances (YAML source,
 /// Launch) are a strict superset of what the old detail screen offered; the
-/// autoflow enable/disable toggle it carried moves to this screen's own
-/// Settings tab in Task 13.
+/// autoflow enable/disable toggle it carried moved to this screen's own
+/// Settings tab (`SettingsTab.swift`, Task 13).
 public struct WorkflowBuilderScreen: View {
     @Bindable var model: AppModel
     let backend: BackendController
@@ -314,18 +314,10 @@ public struct WorkflowBuilderScreen: View {
                 onDragEnded: { kind, point in handlePaletteDragEnded(kind: kind, point: point, store: store) }
             )
         case .step:
-            placeholderTabContent("Step coming in Task 13")
+            StepFormTab(store: store)
         case .settings:
-            placeholderTabContent("Settings coming in Task 13")
+            SettingsTab(store: store, backend: backend, scopeKind: scopeKind, scopeID: scopeID)
         }
-    }
-
-    private func placeholderTabContent(_ text: String) -> some View {
-        Text(text)
-            .font(.noteText)
-            .foregroundStyle(Color.rupuMute)
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
