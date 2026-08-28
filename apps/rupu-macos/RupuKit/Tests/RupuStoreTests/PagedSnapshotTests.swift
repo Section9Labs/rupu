@@ -289,13 +289,31 @@ private actor AsyncGate {
     let gate = AsyncGate()
 
     let snapshot = PagedSnapshot<FakeRow>(pageSize: 50) { offset, limit in
-        if usingOldData.value {
+        // Regression (macos-test hang, perf & interaction arc Plan 5 Task 5):
+        // this used to gate on `usingOldData.value` alone, which ALSO held
+        // the very first `await snapshot.refresh()` call below hostage —
+        // that page-0 fetch runs while `usingOldData.value` is still `true`
+        // and `gate.open()` is only reached much later, after `refresh()`
+        // has already returned. The result was an unconditional deadlock:
+        // `refresh()` suspended on `gate.wait()` forever, so the test body
+        // could never reach its own `gate.open()` call. Only `loadMore()`'s
+        // page-1+ fetch (`offset > 0`) is meant to be the "still in flight
+        // when the filter changes" call this gate models — the initial
+        // page-0 `refresh()` must resolve immediately, same idiom
+        // `ActivityStoreTests.setDateRangeSendsBoundsResetsOffsetAndDropsAStaleInFlightLoadMore`
+        // already uses (`if offset > 0` to single out the loadMore fetch).
+        if usingOldData.value && offset > 0 {
             // Suspends until the test explicitly opens the gate — models a
             // loadMore() that's still in flight when the filter changes,
             // with NO timing dependency for correctness (only the "has it
             // started yet" check below is timing-based, and that one is
             // bounded — see its own comment).
             await gate.wait()
+            guard offset < oldData.count else { return [] }
+            let end = min(offset + limit, oldData.count)
+            return Array(oldData[offset..<end])
+        }
+        if usingOldData.value {
             guard offset < oldData.count else { return [] }
             let end = min(offset + limit, oldData.count)
             return Array(oldData[offset..<end])
