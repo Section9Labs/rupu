@@ -90,9 +90,12 @@ let package = Package(
         // `SliceState` themselves live in `RupuStore` (already a
         // dependency), only the `FreshnessStrip` View is `RupuOverview`'s.
         .target(name: "RupuUsage", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuUsageKit", "RupuOverview"]),
-        // Workflow Builder (macOS design plan) Task 1: placeholder screen
-        // module target so the umbrella product + `RupuShell` can gain the
-        // `RupuBuilder` dependency now; real content lands in Task 10.
+        // Workflow Builder (macOS design plan): originally a placeholder
+        // target (Task 1) so the umbrella product + `RupuShell` could gain
+        // the `RupuBuilder` dependency ahead of real content —
+        // `BuilderStore` (round-trip core, using the pre-wired `RupuStore`
+        // dependency for `PendingActions`/`ActionKey`) landed Task 9; the
+        // canvas UI lands in a later task.
         .target(name: "RupuBuilder", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuFlowKit"]),
         .target(
             name: "RupuShell",

@@ -236,6 +236,24 @@ public struct ValidateBody: Encodable, Equatable, Sendable {
     }
 }
 
+/// `PUT /api/workflows/:name` body — the Workflow Builder's canonical YAML
+/// (`RupuBuilder.BuilderStore.save()`, Task 9). Same one-field shape as
+/// `ValidateBody` above (both routes take the whole document as raw text,
+/// never a structured object), kept as its own type rather than reused
+/// because the two routes are semantically distinct (validate-only vs.
+/// persist) and Task 9's brief specifies this exact name.
+public struct WorkflowWriteBody: Encodable, Equatable, Sendable {
+    public let raw: String
+
+    public init(raw: String) {
+        self.raw = raw
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case raw
+    }
+}
+
 /// `POST /api/sessions/:id/send` body. `host` is a QUERY param on this
 /// route (see `CPClient.sendToSession(id:host:body:)`), not part of this
 /// body.

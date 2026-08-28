@@ -54,6 +54,18 @@ public enum ActionVerb: String, Sendable, Hashable {
     /// asynchronously by whichever autoflow worker picks it up next), so this
     /// confirms as soon as the request itself succeeds, same as `.release`.
     case requeue
+    /// Workflow Builder (macOS design plan) Task 9 addition:
+    /// `RupuBuilder.BuilderStore.save()`. Entity-scoped to the workflow name
+    /// being written (`ActionKey(graph.meta.name, .save)`) — same "never
+    /// resolved by status" bucket as every other verb above except approve/
+    /// reject/cancel/pause/resume: a workflow definition has no
+    /// `ActivityStatus` at all. `PUT /api/workflows/:name` is synchronous
+    /// server-side (200 = written to disk, same contract as
+    /// `putConfigGlobal`/`putConfigProject`/`putConfigPolicy` — see
+    /// `CPClient.writeWorkflow`'s doc comment), so `BuilderStore.save()`
+    /// confirms directly off the response, same as `.setEnabled` does for
+    /// its own immediate write.
+    case save
 }
 
 /// Identifies one in-flight mutation: which entity (a run ID today; any
@@ -255,7 +267,7 @@ public final class PendingActions {
             return status == .cancelled
         case .pause:
             return status == .paused
-        case .archive, .restore, .send, .launch, .remove, .setEnabled, .release, .requeue:
+        case .archive, .restore, .send, .launch, .remove, .setEnabled, .release, .requeue, .save:
             return false
         }
     }

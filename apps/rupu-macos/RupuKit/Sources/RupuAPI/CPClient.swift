@@ -256,6 +256,24 @@ public actor CPClient {
         try await get("api/workflows/\(name)")
     }
 
+    /// `PUT /api/workflows/:name` — persists the Workflow Builder's
+    /// canonical YAML for a workflow (`RupuBuilder.BuilderStore.save()`,
+    /// Task 9). Synchronous server-side (200 = written to disk) — unlike
+    /// the run-control routes, there is no marker/resume-worker involved,
+    /// so a caller's confirm-on-response is honest here (same as
+    /// `putConfigGlobal`/`putConfigProject`/`putConfigPolicy`'s precedent).
+    /// `scopeKind`/`scopeID` are the same optional `?scope_kind=&scope_id=`
+    /// pinning pair `DELETE /api/workflows/:name`/`setAutoflowEnabled`
+    /// accept — see `scopeQuery(scopeKind:scopeID:)`'s doc comment.
+    public func writeWorkflow(
+        name: String,
+        body: WorkflowWriteBody,
+        scopeKind: String? = nil,
+        scopeID: String? = nil
+    ) async throws {
+        try await put("api/workflows/\(name)", query: scopeQuery(scopeKind: scopeKind, scopeID: scopeID), body: body)
+    }
+
     /// `GET /api/agents/:name` — the Library screen's Agent detail view
     /// (Phase 5A, Task 7): every `AgentDefinition` field plus `systemPrompt`/
     /// `raw` (the full `.md` source, for the mono-block source view). No
@@ -838,17 +856,21 @@ public actor CPClient {
 
     /// `PUT` with a required JSON body and no decode step — used by the
     /// config write routes (`putConfigGlobal`/`putConfigProject`/
-    /// `putConfigPolicy`), whose success body is a bare acknowledgement
-    /// object no caller needs (same rationale as `delete`'s doc comment for
-    /// skipping a `T: Decodable` return). Same error mapping as `get`/
-    /// `post`/`delete` (`mapErrorStatus`) — a non-2xx still throws
-    /// `CPError.http`, so a 501 (this deployment has no `RunLauncher`
-    /// installed — see `require_writable` in `crates/rupu-cp/src/api/
-    /// config.rs`) surfaces as `CPError.http(status: 501, ...)` exactly the
-    /// way every other write route's 501 already does, distinguishable by
-    /// callers matching on `.status` (Task 4 maps it to read-only mode).
-    func put<B: Encodable>(_ path: String, body: B) async throws {
-        let url = try buildURL(path: path, query: [])
+    /// `putConfigPolicy`) and `writeWorkflow`, whose success body is a bare
+    /// acknowledgement object no caller needs (same rationale as `delete`'s
+    /// doc comment for skipping a `T: Decodable` return). `query` defaults
+    /// to empty — the config routes never pass one; `writeWorkflow` is the
+    /// first PUT caller that needs the `?scope_kind=&scope_id=` pinning
+    /// pair, same as several `post`/`delete` routes already do. Same error
+    /// mapping as `get`/`post`/`delete` (`mapErrorStatus`) — a non-2xx still
+    /// throws `CPError.http`, so a 501 (this deployment has no
+    /// `RunLauncher` installed — see `require_writable` in
+    /// `crates/rupu-cp/src/api/config.rs`) surfaces as `CPError.http(status:
+    /// 501, ...)` exactly the way every other write route's 501 already
+    /// does, distinguishable by callers matching on `.status` (Task 4 maps
+    /// it to read-only mode).
+    func put<B: Encodable>(_ path: String, query: [URLQueryItem] = [], body: B) async throws {
+        let url = try buildURL(path: path, query: query)
         var request = authorizedRequest(url: url)
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
