@@ -257,6 +257,5 @@ public func yamlToGraph(_ obj: YAMLValue) -> WorkflowGraph {
 
     let loops = parseLoops(obj["loops"])
 
-    // Task 5: deriveEdges — `edges` stays empty until then.
-    return WorkflowGraph(nodes: nodes, edges: [], meta: meta, loops: loops)
+    return WorkflowGraph(nodes: nodes, edges: deriveEdges(nodes), meta: meta, loops: loops)
 }
