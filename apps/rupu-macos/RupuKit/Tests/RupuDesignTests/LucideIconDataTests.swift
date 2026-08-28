@@ -21,14 +21,15 @@ import Testing
 }
 
 @Test func iconCaseCountMatchesExtractorTable() {
-    // 41 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
+    // 43 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
     // pinning the count here means an enum case silently dropped from that table (rather than
     // failing to parse) still fails a test. Phase 6A Task 6 added `lock` for the Config tab's
     // Policy lock glyphs (was 34); it also added an `unlock` that nothing ever rendered, removed
     // end-to-end in the final-review wave (M5). Phase 6B Task 4 added `folder` for the Project
     // Code tab's directory-row glyph (was 35). Design-alignment Plan 3 Task 1 added
     // `bot`/`columns3`/`userCheck`/`zap`/`terminal` for the run graph's `KindBridge` (was 36).
-    #expect(LucideIcon.allCases.count == 41)
+    // Workflow Builder Task 7 added `split`/`merge` for the split/join node kind icons (was 41).
+    #expect(LucideIcon.allCases.count == 43)
 }
 
 @Test func repeatIconRawValueIsRepeat() {

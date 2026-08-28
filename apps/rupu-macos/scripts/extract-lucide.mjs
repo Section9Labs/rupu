@@ -104,6 +104,9 @@ const ICONS = [
   { enumCase: "userCheck", asset: "user-check", source: "user-check" },
   { enumCase: "zap", asset: "zap", source: "zap" },
   { enumCase: "terminal", asset: "terminal", source: "terminal" },
+  // Task 7: Workflow Builder kind visuals (split/join node icons).
+  { enumCase: "split", asset: "split", source: "split" },
+  { enumCase: "merge", asset: "merge", source: "merge" },
 ];
 
 // --- number formatting: deterministic, minimal-digit output -----------------------------------

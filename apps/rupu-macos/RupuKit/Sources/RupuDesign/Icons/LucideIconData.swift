@@ -247,6 +247,19 @@ public enum LucideIconData {
                 "M4 17L10 11L4 5",
                 "M12 19L20 19",
             ]
+        case .split:
+            return [
+                "M16 3h5v5",
+                "M8 3H3v5",
+                "M12 22v-8.3a4 4 0 0 0-1.172-2.872L3 3",
+                "m15 9 6-6",
+            ]
+        case .merge:
+            return [
+                "m8 6 4-4 4 4",
+                "M12 2v10.3a4 4 0 0 1-1.172 2.872L4 22",
+                "m20 22-5-5",
+            ]
         }
     }
 }
