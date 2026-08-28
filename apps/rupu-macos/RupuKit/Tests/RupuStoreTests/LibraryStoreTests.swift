@@ -156,7 +156,9 @@ private func makeStore(
     #expect(store.agents.value?.map(\.name) == ["second"])
 }
 
-/// `loadWorkflows()` — the narrower single-block reload `WorkflowDetailScreen`
+/// `loadWorkflows()` — the narrower single-block reload `RupuBuilder.
+/// SettingsTab` (the Workflow Builder's successor to the deleted
+/// `RupuLibrary.WorkflowDetailScreen`, which called this same method)
 /// calls instead of a full `activate()` — leaves `agents`/`autoflows` alone
 /// (still `.loading`, never fetched).
 @MainActor @Test func loadWorkflowsAloneNeverTouchesAgentsOrAutoflows() async {

@@ -24,6 +24,20 @@ public extension Font {
     /// Sans, 18pt semibold — placeholder-screen titles.
     static let placeholderTitleText = Font.system(size: 18, weight: .semibold)
 
+    /// Sans, 12.5pt semibold — the Workflow Builder canvas node's own id
+    /// (`NodeView.nodeContent`'s row 2), per the approved Workflow Builder
+    /// spec's node-content sizing (final review fix, Minor b — this was
+    /// previously an ad hoc `.system(size: 12.5, weight: .semibold)` inline
+    /// at the call site).
+    static let nodeTitle = Font.system(size: 12.5, weight: .semibold)
+    /// Sans, 10.5pt — the Workflow Builder canvas node's sub-line (`NodeView.
+    /// nodeContent`'s row 3; the mono variant of this same row still goes
+    /// through `dataMono(10.5)` for `run`/`action` kinds — see `subLine(for:)`'s
+    /// doc comment), per the approved Workflow Builder spec's node-content
+    /// sizing (final review fix, Minor b — same ad hoc inline-size history
+    /// as `nodeTitle` above).
+    static let nodeSub = Font.system(size: 10.5)
+
     /// Monospaced + monospaced-digit font for DATA, sized per call site.
     static func dataMono(_ size: CGFloat) -> Font {
         Font.system(size: size, design: .monospaced).monospacedDigit()

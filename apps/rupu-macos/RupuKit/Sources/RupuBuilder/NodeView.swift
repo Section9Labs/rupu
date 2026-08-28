@@ -235,12 +235,12 @@ struct NodeView: View {
                     .foregroundStyle(accent)
             }
             Text(node.id)
-                .font(.system(size: 12.5, weight: .semibold))
+                .font(.nodeTitle)
                 .foregroundStyle(Color.rupuInk)
                 .lineLimit(1)
             if !sub.text.isEmpty {
                 Text(sub.text)
-                    .font(sub.mono ? .dataMono(10.5) : .system(size: 10.5))
+                    .font(sub.mono ? .dataMono(10.5) : .nodeSub)
                     .foregroundStyle(Color.rupuDim)
                     .lineLimit(1)
             }

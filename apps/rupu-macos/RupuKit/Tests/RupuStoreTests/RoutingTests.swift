@@ -101,9 +101,12 @@ import Testing
 
 /// Final-review fix wave: `.agentDefinition`/`.workflowDefinition` gained
 /// `scopeKind`/`scopeID` so a Library row's tap carries its own scope all
-/// the way to the pushed detail route (`WorkflowDetailScreen.definitionRow`/
-/// `AgentDetailScreen`'s Launch button both key off these, not off `name`
-/// alone — see those types' doc comments). Two routes for the SAME name at
+/// the way to the pushed detail route (`RupuBuilder.SettingsTab.
+/// definitionRow`/`AgentDetailScreen`'s Launch button both key off these,
+/// not off `name` alone — see those types' doc comments; `SettingsTab` is
+/// the Workflow Builder's successor to the deleted `RupuLibrary.
+/// WorkflowDetailScreen`, which carried this same match-on-name-and-scope
+/// rationale first). Two routes for the SAME name at
 /// DIFFERENT scopes must compare unequal — this is the exact invariant that
 /// keeps a same-named-but-differently-scoped definition from being silently
 /// conflated, the same scope-collision class `ActionKey.autoflow(...)`

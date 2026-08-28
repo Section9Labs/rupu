@@ -278,6 +278,33 @@ struct BuilderStoreTests {
         #expect(store.saveError != nil)
     }
 
+    /// Final review fix, Important 2: `save()` PUTs to this store's own
+    /// route `name`, never `graph.meta.name` — a workflow renamed via
+    /// `updateName`/`rename` mid-session (the NAME field on Settings, or
+    /// the STEP ID field for a step-node rename — only the former touches
+    /// `meta.name`) must never silently PUT the wrong thing. Instead the
+    /// save is blocked outright with an explanatory `saveError`, and no PUT
+    /// is ever issued.
+    @Test func saveBlocksWhenMetaNameDiffersFromRouteNameAndIssuesNoPUT() async {
+        let putHits = Counter()
+        let client = makeClient(detailYAML: Self.twoStepYAML) { req in
+            guard req.httpMethod == "PUT" else { return nil }
+            putHits.increment()
+            return (200, Data(#"{"ok":true}"#.utf8))
+        }
+        let store = makeStore(client: client)
+        await store.activate()
+        store.updateName("renamed-workflow")
+        #expect(store.graph.meta.name == "renamed-workflow")
+
+        let result = await store.save()
+
+        #expect(result == false)
+        #expect(store.saveError != nil)
+        #expect(store.dirty == true, "a blocked save must never clear dirty")
+        #expect(putHits.value == 0, "no PUT may ever be issued once meta.name has drifted from the route name")
+    }
+
     // MARK: - Rename / Delete
 
     @Test func renameKeepsSelectionOnNewID() async {
@@ -305,17 +332,21 @@ struct BuilderStoreTests {
         #expect(!store.graph.nodes.contains { $0.id == "a" })
     }
 
-    // MARK: - updateSelectedStep (Task 13 review, Finding 1)
+    // MARK: - updateSelectedStep (Task 13 review, Finding 1; final review, Critical 1)
     //
     // `updateSelectedStep` exists specifically so the Step form's debounced
     // field commits never read a FROZEN `StepNodeData` snapshot: each call
-    // resolves `selectedID` and that node's CURRENT `data` fresh, mutates
-    // only the one field the caller's closure touches, and applies through
-    // `updateStep`. These two tests are the store-level coverage the review
-    // asked for — `StepFormTab.swift`'s own field-commit closures have no
-    // dedicated tests (this package doesn't render-test SwiftUI bodies; see
-    // every other `RupuBuilderTests` file's own "pure seam only" convention),
-    // so the guarantee is proven once here, at the layer that actually owns
+    // resolves that node's CURRENT `data` fresh, mutates only the one field
+    // the caller's closure touches, and applies through `updateStep`. Its
+    // `ownerID` parameter (final review, Critical 1) additionally gates the
+    // whole call on `ownerID == selectedID` — closing a stale-debounce
+    // cross-node write these tests, plus
+    // `updateSelectedStepIgnoresAStaleOwnerAfterSelectionMovesOn` below,
+    // cover. These are the store-level coverage the review asked for —
+    // `StepFormTab.swift`'s own field-commit closures have no dedicated
+    // tests (this package doesn't render-test SwiftUI bodies; see every
+    // other `RupuBuilderTests` file's own "pure seam only" convention), so
+    // the guarantee is proven once here, at the layer that actually owns
     // it.
 
     @Test func updateSelectedStepAppliesSequentialSingleFieldMutationsWithoutClobbering() async {
@@ -329,8 +360,8 @@ struct BuilderStoreTests {
         // another. If either call read a stale snapshot of the whole node
         // (the Finding 1 bug) the first field's edit would vanish once the
         // second one lands.
-        store.updateSelectedStep { $0.prompt = "updated prompt" }
-        store.updateSelectedStep { $0.when = "always" }
+        store.updateSelectedStep(ownerID: "a") { $0.prompt = "updated prompt" }
+        store.updateSelectedStep(ownerID: "a") { $0.when = "always" }
 
         let node = store.graph.nodes.first { $0.id == "a" }
         #expect(node?.data.prompt == "updated prompt")
@@ -349,7 +380,7 @@ struct BuilderStoreTests {
         #expect(store.rename(id: "a", to: "renamed-a"))
         #expect(store.selectedID == "renamed-a")
 
-        store.updateSelectedStep { $0.prompt = "after rename" }
+        store.updateSelectedStep(ownerID: "renamed-a") { $0.prompt = "after rename" }
 
         let renamedNode = store.graph.nodes.first { $0.id == "renamed-a" }
         #expect(renamedNode?.data.prompt == "after rename")
@@ -363,9 +394,37 @@ struct BuilderStoreTests {
         #expect(store.selectedID == nil)
         let graphBefore = store.graph
 
-        store.updateSelectedStep { $0.prompt = "should never land" }
+        store.updateSelectedStep(ownerID: "a") { $0.prompt = "should never land" }
 
         #expect(store.graph == graphBefore)
+    }
+
+    /// Final review fix, Critical 1: the cross-node debounce-write bug. A
+    /// `StepFormBody` instance is fixed to the node it was built for
+    /// (`ownerID`) — a debounce `Task` scheduled while node "a" was
+    /// selected must never land once selection has moved to "b", even
+    /// though the `Task` itself is never cancelled on the old form's
+    /// teardown (see `StepFormTab.swift`'s file-level doc comment for why
+    /// that's a deliberate, documented tradeoff). This is the store-level
+    /// proof the owner gate — not the (absent) `.onDisappear` cancel —
+    /// is what actually prevents node A's leftover edit from silently
+    /// landing on node B.
+    @Test func updateSelectedStepIgnoresAStaleOwnerAfterSelectionMovesOn() async {
+        let client = makeClient(detailYAML: Self.twoStepYAML)
+        let store = makeStore(client: client)
+        await store.activate()
+        store.select("a")
+        let bPromptBefore = store.graph.nodes.first { $0.id == "b" }?.data.prompt
+
+        // Selection moves to "b" before the "a" form's in-flight debounce
+        // (captured `ownerID: "a"` at schedule time) ever fires.
+        store.select("b")
+        store.updateSelectedStep(ownerID: "a") { $0.prompt = "leaked from node a" }
+
+        let nodeA = store.graph.nodes.first { $0.id == "a" }
+        let nodeB = store.graph.nodes.first { $0.id == "b" }
+        #expect(nodeA?.data.prompt != "leaked from node a", "a stale owner must never land, even on its OWN node")
+        #expect(nodeB?.data.prompt == bPromptBefore, "node b must be completely untouched by a's stale debounce")
     }
 
     // MARK: - Debounced revalidate (Task 9 review, Finding 2)

@@ -21,7 +21,7 @@ import Testing
 }
 
 @Test func iconCaseCountMatchesExtractorTable() {
-    // 43 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
+    // 44 icons per the extractor's ICONS table (apps/rupu-macos/scripts/extract-lucide.mjs) —
     // pinning the count here means an enum case silently dropped from that table (rather than
     // failing to parse) still fails a test. Phase 6A Task 6 added `lock` for the Config tab's
     // Policy lock glyphs (was 34); it also added an `unlock` that nothing ever rendered, removed

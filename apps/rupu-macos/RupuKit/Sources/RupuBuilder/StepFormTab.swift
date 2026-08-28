@@ -13,6 +13,39 @@ import RupuFlowKit
 // except STEP ID (routes through `store.rename(id:to:)`, submit/blur only —
 // a rename is a structural edit, not a text edit) and Step ID's sibling
 // NAME field on the Settings tab (same rationale, see `SettingsTab.swift`).
+//
+// **Cross-node debounce writes (final review fix, Critical 1)**: none of
+// the four debounced field types below (`DebouncedField`/
+// `DebouncedNumericField`/`DebouncedTextEditor`/`WithEditor`) cancel their
+// `debounceTask` on teardown. `StepFormTab` keys `StepFormBody` on
+// `.id(node.id)`, so selecting a different node tears the old form down —
+// but a plain `Task { }` isn't tied to SwiftUI view lifecycle, so an
+// in-flight debounce from the torn-down form still fires 300ms later. The
+// REAL guarantee against a stale fire clobbering the wrong node is the
+// store-side owner gate: every field's commit closure routes through
+// `StepFormBody.commit(_:)`, which passes `ownerID: node.id` (fixed at that
+// form's own `init`) to `BuilderStore.updateSelectedStep(ownerID:_:)`,
+// which refuses to apply unless `ownerID` still names the CURRENT
+// selection — see that method's doc comment for the full mechanism, and
+// `BuilderStoreTests.updateSelectedStepIgnoresAStaleOwnerAfterSelectionMoves
+// On` for the regression test.
+//
+// A belt-and-braces `.onDisappear { debounceTask?.cancel() }` on each field
+// type was considered and deliberately left out: whether a text field's
+// focus-loss commit is guaranteed to fire BEFORE `.onDisappear` when the
+// view is torn down by an `.id()` change (rather than a plain removal) is
+// not something this codebase can verify without an interactive run of the
+// real app render pass, and getting it wrong either way has a real cost —
+// cancelling on disappear would silently drop whatever the user was mid-
+// typing the instant they switched nodes OR rail tabs, since a debounce
+// that hasn't fired yet is exactly "the user's most recent keystrokes not
+// yet on the store." The owner gate alone is what actually prevents the
+// data-corruption bug (a wrong-node write); it also has a second, wholly
+// intentional benefit the cancel would have destroyed: a legitimate
+// in-flight edit on the STILL-selected node (e.g. the user switches from
+// the Step rail tab to Settings mid-debounce, without changing selection)
+// keeps its `Task` alive and still lands once the 300ms window closes,
+// since `ownerID` still matches `selectedID` when it fires.
 
 // MARK: - Pure helpers (tested directly in StepFormModelTests, no SwiftUI render pass)
 
@@ -199,7 +232,7 @@ private struct StepFormBody: View {
 
     // MARK: - Mutation helper (every per-kind field below routes through this)
 
-    /// Forwards straight to `store.updateSelectedStep(_:)` — NEVER reads
+    /// Forwards to `store.updateSelectedStep(ownerID:_:)` — NEVER reads
     /// `self.node.data` here (review fix, Finding 1: a debounce `Task`
     /// captures its enclosing `self` — a value-type snapshot — back when
     /// the keystroke that scheduled it fired, so reading `node.data` at
@@ -208,8 +241,21 @@ private struct StepFormBody: View {
     /// already moved past). `store` is a class reference, so even a stale
     /// captured `self` still calls through to the LIVE store, which
     /// resolves the current selection and its current data itself.
+    ///
+    /// **`ownerID: node.id`** (final review fix, Critical 1): `node.id` is
+    /// THIS `StepFormBody` instance's own id, fixed at `init` — since
+    /// `StepFormTab` keys the body `.id(node.id)`, a DIFFERENT node's form
+    /// is a wholly separate `StepFormBody` instance with its own `node.id`.
+    /// A debounce `Task` still in flight when the user selects a different
+    /// node therefore fires with `node.id` still naming the node it was
+    /// scheduled for — passing it as `ownerID` lets the store-side guard in
+    /// `updateSelectedStep(ownerID:_:)` refuse to apply it unless that node
+    /// is STILL the current selection, closing the cross-node write this
+    /// review round found (a stale debounce silently landing node A's text
+    /// on node B once B became selected). See that method's own doc comment
+    /// for the full mechanism.
     private func commit(_ mutate: (inout StepNodeData) -> Void) {
-        store.updateSelectedStep(mutate)
+        store.updateSelectedStep(ownerID: node.id, mutate)
     }
 
     // MARK: - Per-kind fields

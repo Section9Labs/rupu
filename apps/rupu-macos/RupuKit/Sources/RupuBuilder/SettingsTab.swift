@@ -95,15 +95,31 @@ struct SettingsTab: View {
 
     // MARK: - Name / description
 
+    /// Editable (per spec §7 — the NAME field itself is unchanged), but a
+    /// value that no longer matches the store's own route `name` now shows
+    /// an inline warning (final review fix, Important 2): `BuilderStore.
+    /// save()` PUTs to the ROUTE name, never `graph.meta.name`, and blocks
+    /// the save outright with a `saveError` while the two disagree — see
+    /// that method's doc comment for why a rename can't just PUT to the new
+    /// name instead. This warning is the ahead-of-time version of that same
+    /// `saveError`, so the user finds out from the field itself rather than
+    /// only after clicking Save.
     private var nameField: some View {
-        CommitOnBlurField(text: $nameText, font: .uiText) { newValue in
-            let trimmed = newValue.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, trimmed != store.graph.meta.name else {
-                nameText = store.graph.meta.name
-                return
+        VStack(alignment: .leading, spacing: 4) {
+            CommitOnBlurField(text: $nameText, font: .uiText) { newValue in
+                let trimmed = newValue.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.isEmpty, trimmed != store.graph.meta.name else {
+                    nameText = store.graph.meta.name
+                    return
+                }
+                store.updateName(trimmed)
+            } label: { Eyebrow("NAME") }
+            if store.graph.meta.name != store.name {
+                Text("Differs from the saved file (\(store.name)) — rename isn't supported from the builder yet. Save is blocked until this matches again.")
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuErr)
             }
-            store.updateName(trimmed)
-        } label: { Eyebrow("NAME") }
+        }
     }
 
     private var descriptionField: some View {

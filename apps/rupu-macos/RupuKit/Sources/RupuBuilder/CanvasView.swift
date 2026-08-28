@@ -120,7 +120,19 @@ struct CanvasView: View {
     @FocusState private var canvasFocused: Bool
 
     var body: some View {
-        ScrollView([.horizontal, .vertical]) {
+        // Final review fix, Important 3: hoisted once per render pass —
+        // `store.runOverlay` is a COMPUTED property (`BuilderStore.swift`'s
+        // own doc comment on it), so the previous per-access pattern below
+        // (`EdgeLayer` once, plus twice per node inside the `ForEach`) was
+        // re-deriving it 2N+1 times for N nodes on every single render.
+        // Reading it once here still walks through into the same nested
+        // `@Observable RunDetailStore` tracked properties Observation needs
+        // to see touched for live updates to keep working — a single read
+        // establishes the exact same dependency a caller reading it
+        // multiple times would, so this changes performance only, not
+        // behavior.
+        let overlay = store.runOverlay
+        return ScrollView([.horizontal, .vertical]) {
             let size = contentSize(nodes: store.graph.nodes)
             ZStack(alignment: .topLeading) {
                 DotGrid()
@@ -131,7 +143,7 @@ struct CanvasView: View {
                         canvasFocused = true
                     }
 
-                EdgeLayer(edges: store.graph.edges, nodes: store.graph.nodes, mode: store.mode, overlay: store.runOverlay)
+                EdgeLayer(edges: store.graph.edges, nodes: store.graph.nodes, mode: store.mode, overlay: overlay)
                     .frame(width: size.width, height: size.height)
                     .allowsHitTesting(false)
 
@@ -145,8 +157,8 @@ struct CanvasView: View {
                         // see `RunOverlayModel.swift`'s doc comment. Design
                         // mode passes `nil` outright so `NodeView` skips the
                         // whole overlay treatment.
-                        overlayState: store.mode == .run ? (store.runOverlay?.states[node.id] ?? .pending) : nil,
-                        unitProgress: store.runOverlay?.unitProgress[node.id],
+                        overlayState: store.mode == .run ? (overlay?.states[node.id] ?? .pending) : nil,
+                        unitProgress: overlay?.unitProgress[node.id],
                         onSelect: {
                             store.select(node.id)
                             canvasFocused = true

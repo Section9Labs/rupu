@@ -103,31 +103,6 @@ public final class BuilderStore {
     /// generation, rather than guessing with a fixed delay.
     internal private(set) var runFollowGeneration = 0
 
-    /// The run launched FROM this screen this session, if any — checked
-    /// BEFORE the newest-run-for-this-workflow fallback in
-    /// `enterRunMode(backend:)`. **Never actually set by this task's Launch
-    /// flow**: `WorkflowBuilderScreen`'s Launch button opens the Launcher
-    /// sheet via `AppModel.presentLauncher(...)` (a fire-and-forget
-    /// navigation call with no completion callback threaded back to this
-    /// store) and flips `mode = .run` immediately afterward — `enterRunMode`
-    /// therefore runs before the user has even filled in the sheet, let
-    /// alone before any run exists to record here. This is the documented,
-    /// sanctioned "Launch deviation": no `presentLauncher` completion
-    /// plumbing this task. **Controller ruling, review fix**: most of the
-    /// gap is closed cheaply anyway, NOT through this property — see
-    /// `WorkflowBuilderScreen`'s `onChange(of: model.showLauncher)`, which
-    /// re-runs `enterRunMode(backend:)` when the Launcher sheet closes while
-    /// still in Run mode. By then the just-launched run (if any) IS the
-    /// newest run for this workflow, so the existing fallback path picks it
-    /// up without this property ever needing to be set. Kept as a real (if
-    /// currently unreachable) resolution path — not a stub — because it's
-    /// the seam a future task closes the REMAINING gap through (e.g.
-    /// threading an actual completion callback through `presentLauncher`,
-    /// which would resolve the followed run instantly rather than only once
-    /// the sheet closes), and `enterRunMode`'s own precedence honestly
-    /// checks it first either way.
-    private var launchedRunID: (id: String, host: String?)?
-
     /// The overlay `NodeView`/`EdgeLayer` render against in Run mode — a
     /// COMPUTED property, not cached state: reads `runFollowStore.graph`/
     /// `liveStates` fresh on every access, so SwiftUI's Observation
@@ -153,11 +128,18 @@ public final class BuilderStore {
     }
 
     /// The workflow name `activate()` fetches — the identity this store was
-    /// constructed for, distinct from `graph.meta.name` (which `rename`/
-    /// `updateName` can change mid-session; `save()` PUTs to
-    /// `graph.meta.name`, not this field, so a renamed workflow writes to
-    /// its NEW name — see `save()`'s doc comment).
-    private let name: String
+    /// constructed for AND the route identity `save()` always PUTs to (final
+    /// review fix, Important 2 — see `save()`'s doc comment for why this
+    /// stopped being `graph.meta.name`: the server enforces the parsed
+    /// document's own `name:` key against the `:name` route segment, so a
+    /// PUT built off a since-renamed `graph.meta.name` either 404s against
+    /// the OLD route (with an explicit scope) or silently shadow-writes a
+    /// second file (without one) — neither ever actually renames anything).
+    /// `internal`, not `private` (final review fix, Important 4): read by
+    /// `WorkflowBuilderScreen.activateStore()`'s reuse guard, so a client
+    /// swap that also changes which workflow this screen names never
+    /// silently keeps serving the OLD store.
+    let name: String
     private let scopeKind: String?
     private let scopeID: String?
     private let client: CPClient
@@ -396,16 +378,29 @@ public final class BuilderStore {
     /// frozen snapshot, so `updateStep`'s `applyUpdate(graph, id: data.id,
     /// ...)` would look for an id that no longer exists and silently no-op.
     ///
-    /// This method closes both gaps by resolving EVERYTHING fresh at CALL
-    /// time: `selectedID` (which `rename` keeps pointed at the renamed
-    /// node — see `rename(id:to:)`'s doc comment) and that node's CURRENT
-    /// `data`, straight off `graph.nodes` — never off any value the caller
-    /// captured earlier. `mutate` should therefore touch ONLY the one field
-    /// it owns; `nil`-selection or a since-deleted node is a silent no-op
-    /// (mirrors `deleteSelection()`'s own "no selection, nothing to do"
-    /// contract) rather than a crash.
-    public func updateSelectedStep(_ mutate: (inout StepNodeData) -> Void) {
-        guard let id = selectedID, let node = graph.nodes.first(where: { $0.id == id }) else { return }
+    /// This method closes both gaps by resolving `data` fresh at CALL time —
+    /// straight off `graph.nodes`, never off any value the caller captured
+    /// earlier — and by requiring the caller to name which node it OWNS.
+    ///
+    /// **`ownerID` (final review fix, Critical 1)**: `StepFormTab.swift`
+    /// keys `StepFormBody` on `.id(node.id)`, so selecting a DIFFERENT node
+    /// tears the old form down and mounts a fresh one — but a debounce
+    /// `Task` already in flight on the torn-down form is a plain `Task { }`,
+    /// not something SwiftUI cancels on teardown, so it still fires 300ms
+    /// later and still calls this method. The OLD signature resolved the
+    /// target purely from `selectedID` at that point, which by then names
+    /// the NEWLY selected node — so a stale debounce from node A's PROMPT
+    /// field would silently write node A's leftover text into node B, and
+    /// that write would then get saved. `ownerID` is the node id the FORM
+    /// was built for (captured once, at that form's `init`, via `node.id` —
+    /// see `StepFormTab.commit(_:)`), and the guard below requires it to
+    /// still match the CURRENT `selectedID` before anything is looked up or
+    /// applied — a stale debounce whose owner is no longer selected is a
+    /// silent no-op, same contract `deleteSelection()` already gives a
+    /// `nil`-selection or since-deleted-node call. `mutate` should
+    /// therefore touch ONLY the one field it owns.
+    public func updateSelectedStep(ownerID: String, _ mutate: (inout StepNodeData) -> Void) {
+        guard selectedID == ownerID, let node = graph.nodes.first(where: { $0.id == ownerID }) else { return }
         var data = node.data
         mutate(&data)
         updateStep(data)
@@ -438,23 +433,47 @@ public final class BuilderStore {
 
     // MARK: - Save
 
-    /// `PUT /api/workflows/:name` where `:name` is `graph.meta.name` — NOT
-    /// the `name` this store was constructed with. A workflow renamed via
-    /// `rename`/`updateName` mid-session therefore writes to its NEW name on
-    /// save (the server has no separate "rename" route; a write to a
-    /// different name simply creates/overwrites that file). Synchronous
-    /// server-side (200 = written to disk — see `CPClient.writeWorkflow`'s
-    /// doc comment), so confirming directly off the response is honest here,
-    /// same as `ConfigStore`'s raw-TOML saves. On success clears `dirty`; on
-    /// failure `dirty` stays `true` and `saveError` carries the unwrapped
-    /// server message (or the transport error's description).
+    /// `PUT /api/workflows/:name` where `:name` is ALWAYS this store's own
+    /// `name` — the route identity it was constructed for — never
+    /// `graph.meta.name` (final review fix, Important 2; the prior
+    /// implementation PUT to `graph.meta.name`, which sounds right for "save
+    /// under the renamed name" but isn't: the server parses the written YAML
+    /// and enforces its `name:` key equals the `:name` route segment, so a
+    /// PUT to the OLD route carrying NEW `meta.name` content either 404s
+    /// (with an explicit scope, since that route requires an exact
+    /// existing-file match) or, worse, silently creates a SECOND file at
+    /// the new name while leaving the original untouched (without a scope).
+    /// Neither ever actually renames the workflow — the write either fails
+    /// outright or succeeds at writing the wrong thing).
+    ///
+    /// Since this store has no real rename route to fall back on either, a
+    /// `graph.meta.name` that has drifted from `name` (via `rename`/
+    /// `updateName`, which only ever touch the in-memory document) BLOCKS
+    /// the save entirely with an explanatory `saveError` instead of
+    /// attempting a PUT that would misbehave one of the two ways above —
+    /// `SettingsTab`'s NAME field stays editable but shows an inline warning
+    /// once it disagrees with the route name, so the user has to revert it
+    /// (or a future task adds real rename support) before Save works again.
+    ///
+    /// Synchronous server-side (200 = written to disk — see
+    /// `CPClient.writeWorkflow`'s doc comment), so confirming directly off
+    /// the response is honest here, same as `ConfigStore`'s raw-TOML saves.
+    /// On success clears `dirty`; on failure (including the name-mismatch
+    /// guard above) `dirty` stays `true` and `saveError` carries the
+    /// unwrapped server message (or the transport error's description, or
+    /// the guard's own message).
     public func save() async -> Bool {
-        let key = ActionKey(graph.meta.name, .save)
+        guard graph.meta.name == name else {
+            saveError = "workflow name differs from the file — rename isn't supported from the builder yet; revert the NAME field to save"
+            return false
+        }
+
+        let key = ActionKey(name, .save)
         pendingActions.begin(key)
         saveError = nil
         do {
             try await client.writeWorkflow(
-                name: graph.meta.name,
+                name: name,
                 body: WorkflowWriteBody(raw: canonicalYAML),
                 scopeKind: scopeKind,
                 scopeID: scopeID
@@ -468,6 +487,16 @@ public final class BuilderStore {
             pendingActions.fail(key, message)
             return false
         }
+    }
+
+    /// Clears a rejected save's reason once the user has read it
+    /// (`WorkflowBuilderScreen`'s save-error banner's dismiss control, final
+    /// review fix Important 1) — mirrors `dismissCommitError()`'s own
+    /// caller-driven clear contract. Also cleared implicitly at the START of
+    /// every `save()` attempt (see above), so a retry that succeeds never
+    /// leaves a stale error banner up either.
+    public func dismissSaveError() {
+        saveError = nil
     }
 
     /// Unwraps a `CPError.http` body's `{"error": "..."}` envelope, same
@@ -510,13 +539,29 @@ public final class BuilderStore {
     /// Resolves which run to follow and activates a `RunDetailStore` for it
     /// — called whenever `mode` becomes `.run` (`WorkflowBuilderScreen`'s
     /// `onChange(of: store.mode)`, which covers both the segmented control
-    /// and the Launch button's own `mode = .run` flip). Resolution order:
-    /// (a) `launchedRunID`, if this session recorded one (see that
-    /// property's doc comment for why that's currently always `nil`); else
-    /// (b) the newest run for `graph.meta.name` from one page of
+    /// and the Launch button's own `mode = .run` flip). Resolution: the
+    /// newest run for `graph.meta.name` from one page of
     /// `client.workflowRuns(offset: 0, limit: 50)` (`latestRunID(rows:
-    /// workflowName:)`); else (c) `nil` — Run mode renders the "No runs yet"
-    /// empty state.
+    /// workflowName:)`), or `nil` — Run mode renders the "No runs yet" empty
+    /// state.
+    ///
+    /// **No launched-run short-circuit today** (final review fix, Minor d —
+    /// a `launchedRunID` property tracking "the run I just launched from
+    /// this screen" existed here but was dead: nothing ever assigned it,
+    /// since `WorkflowBuilderScreen`'s Launch button opens the Launcher
+    /// sheet via `AppModel.presentLauncher(...)`, a fire-and-forget
+    /// navigation call with no completion callback threaded back to this
+    /// store — see `WorkflowBuilderScreen.handleLaunch`'s own doc comment.
+    /// Most of that gap is already closed cheaply anyway, NOT through a
+    /// property here: `WorkflowBuilderScreen`'s `onChange(of: model.
+    /// showLauncher)` re-runs `enterRunMode(backend:)` when the Launcher
+    /// sheet closes while still in Run mode, and by then the just-launched
+    /// run (if any) IS the newest run for this workflow, so the fallback
+    /// below picks it up without any extra bookkeeping. The REMAINING gap —
+    /// resolving the followed run instantly, before the sheet closes,
+    /// rather than only once it does — is the seam a future task closes by
+    /// threading an actual completion callback through `presentLauncher`
+    /// and resolving directly to that run id here, ahead of the fallback.)
     ///
     /// Idempotent for the same already-followed run (a redundant
     /// `enterRunMode` call — e.g. the segmented control round-tripping
@@ -549,24 +594,19 @@ public final class BuilderStore {
         let generation = runFollowGeneration
 
         let workflowName = graph.meta.name
-        let target: (id: String, host: String?)?
-        if let launchedRunID {
-            target = launchedRunID
-        } else {
-            // Review fix, Finding 3: `host: "local"` is required, not
-            // optional — `CPClient.workflowRuns(offset:limit:host:since:
-            // until:)`'s own doc comment warns an OMITTED `host` fans the
-            // call out to every registered host sequentially server-side,
-            // turning a ~60ms call into several seconds against a fleet with
-            // one offline node. The Builder only ever edits LOCAL workflow
-            // definitions, so "local" is always the right scope for this
-            // lookup — the followed RUN's own host still comes from the
-            // resolved row (`target.host` below) and threads into
-            // `RunDetailStore`'s init unchanged, so a workflow that was last
-            // run on a remote Fleet host is still followed correctly.
-            let rows = (try? await client.workflowRuns(offset: 0, limit: 50, host: "local")) ?? []
-            target = RupuBuilder.latestRunID(rows: rows, workflowName: workflowName)
-        }
+        // Review fix, Finding 3: `host: "local"` is required, not
+        // optional — `CPClient.workflowRuns(offset:limit:host:since:
+        // until:)`'s own doc comment warns an OMITTED `host` fans the
+        // call out to every registered host sequentially server-side,
+        // turning a ~60ms call into several seconds against a fleet with
+        // one offline node. The Builder only ever edits LOCAL workflow
+        // definitions, so "local" is always the right scope for this
+        // lookup — the followed RUN's own host still comes from the
+        // resolved row (`target.host` below) and threads into
+        // `RunDetailStore`'s init unchanged, so a workflow that was last
+        // run on a remote Fleet host is still followed correctly.
+        let rows = (try? await client.workflowRuns(offset: 0, limit: 50, host: "local")) ?? []
+        let target = RupuBuilder.latestRunID(rows: rows, workflowName: workflowName)
 
         // Checkpoint 1 — see the doc comment above.
         guard generation == runFollowGeneration else { return }

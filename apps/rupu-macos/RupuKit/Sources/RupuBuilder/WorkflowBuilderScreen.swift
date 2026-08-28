@@ -135,17 +135,31 @@ public struct WorkflowBuilderScreen: View {
             Task { await store.enterRunMode(backend: backend) }
         }
         .onDisappear {
+            // Final review fix, Minor e: reset `mode` alongside tearing down
+            // the followed run — this screen can be re-entered (Library ->
+            // Builder -> back -> Builder again) via a fresh `activateStore()`
+            // that reuses the SAME `BuilderStore` when the client identity
+            // and name haven't changed (see `activateStore()` below); without
+            // resetting `mode` here, that re-entry would silently reopen
+            // straight into Run mode with `followedRunID == nil` (since
+            // `exitRunMode()` just cleared it), showing `noRunBanner` over a
+            // canvas the user never asked to leave Design mode on.
             store?.exitRunMode()
+            store?.mode = .design
         }
     }
 
-    /// Launch button: save first (`store.save()`'s own `saveError` already
-    /// surfaces a failure — see `BuilderStore.save()`'s doc comment), and
-    /// only open the Launcher sheet + flip to Run mode on success. A failed
-    /// save must never open the sheet against stale, un-persisted YAML.
-    /// Whatever run this shows immediately after opening the sheet is
+    /// Launch button: save first — a failed save now surfaces through
+    /// `readyBody`'s error-banner slot (`store.saveError`, rendered
+    /// alongside `commitError` — final review fix, Important 1; this
+    /// comment previously claimed `saveError` "already surfaces a failure,"
+    /// which was false: nothing in this screen rendered it before that fix)
+    /// — and only open the Launcher sheet + flip to Run mode on success. A
+    /// failed save must never open the sheet against stale, un-persisted
+    /// YAML. Whatever run this shows immediately after opening the sheet is
     /// necessarily stale/empty (the launch hasn't happened yet) — see
-    /// `BuilderStore.launchedRunID`'s doc comment; the `onChange(of: model.
+    /// `BuilderStore.enterRunMode(backend:)`'s own doc comment on the "no
+    /// launched-run short-circuit" gap; the `onChange(of: model.
     /// showLauncher)` observer above re-resolves once the sheet closes.
     private func handleLaunch(store: BuilderStore) {
         Task {
@@ -170,10 +184,24 @@ public struct WorkflowBuilderScreen: View {
         store.addNode(kind: kind, at: target)
     }
 
+    /// Builds (or rebuilds) `store` for the current `name`/`client`. Guarded
+    /// on BOTH `storeClientID != clientID` (a client swap — e.g. the
+    /// backend reconnected to a different `cp serve`) AND `store?.name !=
+    /// name` (final review fix, Important 4): the prior guard only checked
+    /// the client, so a `name` change alone — this view's `.task(id: name)`
+    /// firing again for a genuinely different workflow route while the
+    /// client stayed the same — silently kept serving the OLD store, wrong
+    /// workflow and all. Rebuilding also calls `store?.exitRunMode()`
+    /// FIRST (final review fix, Important 4) — the old store, if it was
+    /// ever swapped out here, is simply dropped on the floor otherwise,
+    /// which leaks its `RunDetailStore`/SSE stream exactly the class of bug
+    /// `BuilderStore.enterRunMode`'s own reentrancy-guard doc comment
+    /// already worries about for the OTHER teardown paths.
     private func activateStore() async {
         guard let client = backend.client() else { return }
         let clientID = backend.clientIdentity()
-        if store == nil || storeClientID != clientID {
+        if store == nil || storeClientID != clientID || store?.name != name {
+            store?.exitRunMode()
             store = BuilderStore(name: name, scopeKind: scopeKind, scopeID: scopeID, client: client, pendingActions: backend.pendingActions)
             storeClientID = clientID
         }
@@ -229,8 +257,19 @@ public struct WorkflowBuilderScreen: View {
             VStack(spacing: 0) {
                 ZStack(alignment: .top) {
                     CanvasView(store: store)
+                    // Final review fix, Important 1: `saveError` shares the
+                    // same top banner slot `commitError` already used —
+                    // `commitError` takes priority when both happen to be
+                    // set (a canvas-edit rejection is the more actionable,
+                    // more specific of the two), but a plain failed Save
+                    // with no live commitError is now visible too, which it
+                    // never was before this fix (`handleLaunch`'s prior
+                    // doc comment claimed otherwise).
                     if let commitError = store.commitError {
                         commitErrorBanner(commitError, store: store)
+                            .padding(12)
+                    } else if let saveError = store.saveError {
+                        saveErrorBanner(saveError, store: store)
                             .padding(12)
                     }
                     // Task 14: Run mode resolved to nothing — no run
@@ -284,6 +323,33 @@ public struct WorkflowBuilderScreen: View {
                 Spacer(minLength: 8)
                 Button {
                     store.dismissCommitError()
+                } label: {
+                    Text("×")
+                        .font(.uiText)
+                        .foregroundStyle(Color.rupuDim)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(maxWidth: 420)
+    }
+
+    // MARK: - Save-error banner (final review fix, Important 1)
+
+    /// A failed `store.save()` (including the Important 2 name-mismatch
+    /// guard) MUST be visible — same rationale as `commitErrorBanner` above,
+    /// same dismissible treatment (`store.dismissSaveError()`).
+    private func saveErrorBanner(_ message: String, store: BuilderStore) -> some View {
+        TintBanner(tone: .rupuErr, toneBg: .rupuErrBg) {
+            HStack(spacing: 10) {
+                Icon(.xCircle, size: 14)
+                    .foregroundStyle(Color.rupuErr)
+                Text(message)
+                    .font(.noteText)
+                    .foregroundStyle(Color.rupuInk)
+                Spacer(minLength: 8)
+                Button {
+                    store.dismissSaveError()
                 } label: {
                     Text("×")
                         .font(.uiText)
