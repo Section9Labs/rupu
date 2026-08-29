@@ -932,14 +932,16 @@ fn truncate_auth_backend_ansi_line(value: &str, width: usize) -> String {
 
 #[derive(Debug, Clone, Serialize)]
 struct AuthStatusRow {
-    provider: String,
+    account: String,
+    kind: String,
     api_key: bool,
     sso: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct AuthStatusCsvRow {
-    provider: String,
+    account: String,
+    kind: String,
     api_key: String,
     sso: String,
 }
@@ -974,12 +976,12 @@ impl CollectionOutput for AuthStatusOutput {
     }
 
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
-        Some(&["provider", "api_key", "sso"])
+        Some(&["account", "kind", "api_key", "sso"])
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
         let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["PROVIDER", "API-KEY", "SSO"]);
+        table.set_header(vec!["ACCOUNT", "KIND", "API KEY", "SSO"]);
         for row in &self.report.rows {
             let api_cell = if row.api_key {
                 comfy_table::Cell::new("✓").fg(crate::output::tables::status_color(
@@ -992,7 +994,8 @@ impl CollectionOutput for AuthStatusOutput {
             };
             let sso_cell = sso_status_cell(&row.sso, &self.prefs);
             table.add_row(vec![
-                comfy_table::Cell::new(&row.provider),
+                comfy_table::Cell::new(&row.account),
+                comfy_table::Cell::new(&row.kind),
                 api_cell,
                 sso_cell,
             ]);
@@ -1007,51 +1010,53 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let prefs = crate::output::diag::prefs_for_diag(false);
     let mut rows = Vec::new();
 
-    for (label, pid) in [
-        ("anthropic", ProviderId::Anthropic),
-        ("openai", ProviderId::Openai),
-        ("gemini", ProviderId::Gemini),
-        ("copilot", ProviderId::Copilot),
-        ("github", ProviderId::Github),
-        ("gitlab", ProviderId::Gitlab),
-        ("linear", ProviderId::Linear),
-        ("jira", ProviderId::Jira),
-    ] {
-        let api_present = resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await;
-        rows.push(AuthStatusRow {
-            provider: label.to_string(),
-            api_key: api_present,
-            sso: resolver.peek_sso(pid).await.unwrap_or_default(),
-        });
-    }
-    if let Ok(global) = crate::paths::global_dir() {
-        let global_cfg = global.join("config.toml");
-        if let Ok(cfg) = rupu_config::layer_files_locked(Some(&global_cfg), None) {
-            for (name, p) in &cfg.providers {
-                if p.kind.as_deref() != Some("openai-compatible") {
-                    continue;
-                }
-                if parse_provider(name).is_ok() {
-                    continue;
-                }
-                let present = resolver
-                    .peek_named(name, rupu_providers::AuthMode::ApiKey)
-                    .await
-                    || std::env::var(format!("RUPU_{}_API_KEY", name.to_ascii_uppercase()))
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false);
-                rows.push(AuthStatusRow {
-                    provider: name.clone(),
-                    api_key: present,
-                    sso: String::new(),
-                });
-            }
+    let global = crate::paths::global_dir().ok();
+    let cfg = global
+        .as_ref()
+        .and_then(|g| rupu_config::layer_files_locked(Some(&g.join("config.toml")), None).ok())
+        .unwrap_or_default();
+
+    // Built-in vendor names always listed, so a single-account user sees
+    // the same table as before.
+    let mut names: Vec<String> = [
+        "anthropic",
+        "openai",
+        "gemini",
+        "copilot",
+        "github",
+        "gitlab",
+        "linear",
+        "jira",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // Then every declared account, in config order, skipping duplicates.
+    for name in cfg.providers.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
         }
+    }
+
+    for name in names {
+        let kind = rupu_runtime::provider_factory::resolve_kind(&name, &cfg.providers)
+            .unwrap_or_else(|| "-".to_string());
+        let api_present = resolver
+            .peek_named(&name, rupu_providers::AuthMode::ApiKey)
+            .await
+            || rupu_auth::resolver::KeychainResolver::has_env_api_key(&name);
+        rows.push(AuthStatusRow {
+            account: name.clone(),
+            kind,
+            api_key: api_present,
+            sso: resolver.peek_sso_named(&name).await.unwrap_or_default(),
+        });
     }
     let csv_rows = rows
         .iter()
         .map(|row| AuthStatusCsvRow {
-            provider: row.provider.clone(),
+            account: row.account.clone(),
+            kind: row.kind.clone(),
             api_key: if row.api_key {
                 "yes".into()
             } else {

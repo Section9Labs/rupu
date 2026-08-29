@@ -8,8 +8,9 @@ fn status_renders_two_column_header() {
         .args(["auth", "status"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("PROVIDER"))
-        .stdout(predicate::str::contains("API-KEY"))
+        .stdout(predicate::str::contains("ACCOUNT"))
+        .stdout(predicate::str::contains("KIND"))
+        .stdout(predicate::str::contains("API KEY"))
         .stdout(predicate::str::contains("SSO"));
 }
 

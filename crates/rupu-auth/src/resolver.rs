@@ -306,6 +306,13 @@ impl KeychainResolver {
         Some(AuthCredentials::ApiKey { key })
     }
 
+    /// True if `RUPU_<ACCOUNT>_API_KEY` is set (and non-empty) for `account`.
+    /// Reuses [`Self::env_api_key`]'s name-mangling transform so `rupu auth
+    /// status` cannot drift from what `get_named` actually resolves.
+    pub fn has_env_api_key(account: &str) -> bool {
+        Self::env_api_key(account).is_some()
+    }
+
     /// Resolve a config-declared provider name to an api-key credential:
     /// `auth.json["<name>/api-key"]` (or legacy `["<name>"]`), then
     /// `RUPU_<UPPER_NAME>_API_KEY`.
