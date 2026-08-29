@@ -41,6 +41,31 @@ impl ProviderId {
             Self::Jira => "jira",
         }
     }
+
+    /// Parse a **vendor** name into a `ProviderId`.
+    ///
+    /// Accepts the canonical name plus every alias
+    /// `rupu_runtime::provider_factory` recognizes, so a config
+    /// `kind = "codex"` and a bare provider name `codex` resolve
+    /// identically.
+    ///
+    /// This is deliberately NOT `FromStr`: an account name (e.g.
+    /// `anthropic-work`) is a valid provider string but not a vendor,
+    /// and conflating the two is the bug this whole change removes.
+    pub fn from_vendor_str(s: &str) -> Option<Self> {
+        match s {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" | "openai_codex" | "codex" => Some(Self::Openai),
+            "gemini" | "google_gemini" => Some(Self::Gemini),
+            "copilot" | "github_copilot" => Some(Self::Copilot),
+            "local" => Some(Self::Local),
+            "github" => Some(Self::Github),
+            "gitlab" => Some(Self::Gitlab),
+            "linear" => Some(Self::Linear),
+            "jira" => Some(Self::Jira),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ProviderId {
@@ -121,5 +146,39 @@ mod scm_provider_id_tests {
     #[test]
     fn jira_string_form() {
         assert_eq!(ProviderId::Jira.as_str(), "jira");
+    }
+}
+
+#[cfg(test)]
+mod vendor_str_tests {
+    use super::*;
+
+    #[test]
+    fn from_vendor_str_accepts_canonical_names_and_aliases() {
+        assert_eq!(
+            ProviderId::from_vendor_str("anthropic"),
+            Some(ProviderId::Anthropic)
+        );
+        assert_eq!(
+            ProviderId::from_vendor_str("codex"),
+            Some(ProviderId::Openai)
+        );
+        assert_eq!(
+            ProviderId::from_vendor_str("google_gemini"),
+            Some(ProviderId::Gemini)
+        );
+        assert_eq!(
+            ProviderId::from_vendor_str("github_copilot"),
+            Some(ProviderId::Copilot)
+        );
+    }
+
+    /// An account name is NOT a vendor name. This is the distinction the
+    /// whole multi-account model rests on.
+    #[test]
+    fn from_vendor_str_rejects_account_names() {
+        assert_eq!(ProviderId::from_vendor_str("anthropic-work"), None);
+        assert_eq!(ProviderId::from_vendor_str("openai-compatible"), None);
+        assert_eq!(ProviderId::from_vendor_str(""), None);
     }
 }
