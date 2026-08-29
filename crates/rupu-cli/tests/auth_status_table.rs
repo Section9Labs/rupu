@@ -3,8 +3,12 @@ use predicates::prelude::*;
 
 #[test]
 fn status_renders_four_column_header() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    force_json_backend(&tmp);
+
     Command::cargo_bin("rupu")
         .unwrap()
+        .env("RUPU_HOME", tmp.path())
         .args(["auth", "status"])
         .assert()
         .success()
@@ -14,17 +18,39 @@ fn status_renders_four_column_header() {
         .stdout(predicate::str::contains("SSO"));
 }
 
+/// Structured on `--format json`'s `rows` array rather than loose stdout
+/// substrings: with the KIND column added, a bare `predicate::str::contains
+/// ("anthropic")` against table stdout can be satisfied by another row's
+/// KIND cell (e.g. a declared `foo-work` account of kind `anthropic`)
+/// without the actual built-in `anthropic` ACCOUNT row ever existing. This
+/// asserts each vendor's own row is present by `account`, not just that
+/// its name appears somewhere in the output.
 #[test]
 fn status_lists_all_four_providers() {
-    Command::cargo_bin("rupu")
+    let tmp = assert_fs::TempDir::new().unwrap();
+    force_json_backend(&tmp);
+
+    let output = Command::cargo_bin("rupu")
         .unwrap()
-        .args(["auth", "status"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("anthropic"))
-        .stdout(predicate::str::contains("openai"))
-        .stdout(predicate::str::contains("gemini"))
-        .stdout(predicate::str::contains("copilot"));
+        .env("RUPU_HOME", tmp.path())
+        .args(["auth", "status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "auth status --format json exited non-zero: {output:?}"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("auth status --format json should emit valid JSON");
+    let rows = report["rows"].as_array().expect("report has a rows array");
+
+    for account in ["anthropic", "openai", "gemini", "copilot"] {
+        assert!(
+            rows.iter().any(|r| r["account"] == account),
+            "expected a row for built-in account {account:?}, got: {rows:#?}"
+        );
+    }
 }
 
 /// Pre-populate the backend cache so the CLI never probes the real OS
