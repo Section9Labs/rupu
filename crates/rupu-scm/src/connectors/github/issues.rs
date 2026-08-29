@@ -115,6 +115,54 @@ impl IssueConnector for GithubIssueConnector {
         })
     }
 
+    async fn list_comments(
+        &self,
+        i: &IssueRef,
+        limit: Option<u32>,
+    ) -> Result<Vec<Comment>, ScmError> {
+        let _permit = self.client.permit().await;
+        let (owner, repo) = parse_project(&i.project)?;
+        let number = i.number;
+        let inner = self.client.inner.clone();
+        // GitHub caps per_page at 100; clamp so an absurd `limit` can't
+        // produce a 422 from the API.
+        let per_page: u8 = limit.unwrap_or(100).clamp(1, 100) as u8;
+        let page = self
+            .client
+            .with_retry_octocrab(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                async move {
+                    inner
+                        .issues(&owner, &repo)
+                        .list_comments(number)
+                        .per_page(per_page)
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+
+        let mut out: Vec<Comment> = page
+            .items
+            .into_iter()
+            .map(|m| Comment {
+                id: m.id.to_string(),
+                author: m.user.login,
+                // octocrab models an issue comment body as Option<String>
+                // (a comment can be body-less after redaction).
+                body: m.body.unwrap_or_default(),
+                created_at: m.created_at,
+            })
+            .collect();
+        if let Some(n) = limit {
+            out.truncate(n as usize);
+        }
+        Ok(out)
+    }
+
     async fn create_issue(&self, project: &str, opts: CreateIssue) -> Result<Issue, ScmError> {
         let _permit = self.client.permit().await;
         let (owner, repo) = parse_project(project)?;

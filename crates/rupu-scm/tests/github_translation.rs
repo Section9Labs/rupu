@@ -373,3 +373,70 @@ async fn create_pr_posts_payload() {
     assert_eq!(pr.head_branch, "feat/write-paths");
     assert_eq!(pr.base_branch, "main");
 }
+
+#[tokio::test]
+async fn list_comments_translates() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/issue_comments_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_issue_connector_against(&server);
+    let comments = c
+        .list_comments(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Github,
+                project: "section9labs/rupu".into(),
+                number: 42,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(comments.len(), 2);
+    // Oldest-first: GitHub's native order is preserved, which is what a
+    // "what changed since my last iteration?" reader depends on.
+    assert_eq!(comments[0].id, "1001");
+    assert_eq!(comments[0].author, "mrbrutti");
+    assert_eq!(comments[0].body, "first comment body");
+    assert_eq!(comments[1].author, "octocat");
+    assert_eq!(comments[1].body, "second comment body");
+    assert!(comments[0].created_at < comments[1].created_at);
+}
+
+#[tokio::test]
+async fn list_comments_respects_limit() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/issue_comments_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_issue_connector_against(&server);
+    let comments = c
+        .list_comments(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Github,
+                project: "section9labs/rupu".into(),
+                number: 42,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+    // The server returned two; `limit` truncates client-side so the
+    // contract holds regardless of what the API page actually contained.
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].id, "1001");
+}
