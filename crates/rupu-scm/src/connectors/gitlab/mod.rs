@@ -24,7 +24,12 @@ use crate::connectors::{IssueConnector, RepoConnector};
 /// Try to build the GitLab Repo + Issue connectors + extras handle from
 /// configured credentials. Returns `Ok(None)` if no GitLab credential
 /// is stored — that's a normal "user hasn't logged in" path.
+///
+/// `account` is the configured account name (e.g. `gl-work`, or the bare
+/// `"gitlab"` back-compat account) — both the credential-resolver lookup
+/// key and the `[scm.<account>]` config-table key.
 pub async fn try_build(
+    account: &str,
     resolver: &dyn CredentialResolver,
     cfg: &Config,
     sink: Arc<dyn rupu_netflow::FlowSink>,
@@ -35,7 +40,7 @@ pub async fn try_build(
         Arc<GitlabExtras>,
     )>,
 > {
-    let creds = match resolver.get("gitlab", None).await {
+    let creds = match resolver.get(account, None).await {
         Ok((_mode, creds)) => creds,
         Err(_) => return Ok(None),
     };
@@ -44,7 +49,7 @@ pub async fn try_build(
         rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
     };
     let opts = crate::client_options::ScmClientOptions::from_platform_config(
-        cfg.scm.platforms.get("gitlab"),
+        cfg.scm.platforms.get(account),
     );
     let client = GitlabClient::with_options(token, &opts, sink);
     let repo: Arc<dyn RepoConnector> = Arc::new(GitlabRepoConnector::new(client.clone()));

@@ -24,7 +24,7 @@ pub use account::AccountId;
 pub use client_options::{clone_url, scm_timeout, CloneProtocol, ScmClientOptions};
 pub use clone::{clone_repo_ref, CloneError};
 pub use connectors::{IssueConnector, RepoConnector};
-pub use error::{classify_scm_error, ScmError};
+pub use error::{classify_scm_error, AccountError, ScmError};
 pub use event_connector::{EventConnector, EventPollResult, PolledEvent};
 pub use platform::{IssueTracker, Platform};
 pub use registry::Registry;

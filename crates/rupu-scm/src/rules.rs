@@ -24,6 +24,23 @@ pub struct Rule {
     pub account: AccountId,
 }
 
+impl Rule {
+    /// Convert a config-parsed `[[scm.rules]]` entry (`rupu_config::ScmRule`,
+    /// wire shape: `account: String`) into the domain `Rule` this module's
+    /// `resolve_account` consumes (`account: AccountId`). Lives beside the
+    /// type it builds rather than in `rupu-config` — `rupu-config` has no
+    /// reason to know about `AccountId`. `Registry::discover` is the sole
+    /// caller: `rupu-scm` already depends on `rupu-config`, so no CLI-side
+    /// helper and no rule list threaded through call sites.
+    pub fn from_config(r: &rupu_config::ScmRule) -> Self {
+        Self {
+            owner: r.owner.clone(),
+            path: r.path.clone(),
+            account: AccountId::new(r.account.clone()),
+        }
+    }
+}
+
 /// How an account was chosen — or why it could not be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
@@ -285,6 +302,51 @@ mod tests {
             Resolution::NoMatch {
                 candidates: accounts(&["gh-work", "gh-personal"])
             }
+        );
+    }
+
+    /// The path-tier mirror of `a_rule_naming_an_unconfigured_account_does_not_match`:
+    /// the owner tier's `known()` guard already has this test; the path
+    /// tier's identical guard did not. The code is symmetric — this
+    /// closes the coverage gap rather than hunting a bug.
+    #[test]
+    fn a_path_rule_naming_an_unconfigured_account_does_not_match() {
+        let got = resolve_account(
+            &[rule_path("/home/me/work/*", "gh-typo")],
+            None,
+            Some(&PathBuf::from("/home/me/work/api")),
+            None,
+            None,
+            &accounts(&["gh-work", "gh-personal"]),
+        );
+        assert_eq!(
+            got,
+            Resolution::NoMatch {
+                candidates: accounts(&["gh-work", "gh-personal"])
+            }
+        );
+    }
+
+    #[test]
+    fn from_config_converts_wire_rule_to_domain_rule() {
+        let owner_rule = rupu_config::ScmRule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: "gh-work".into(),
+        };
+        assert_eq!(
+            Rule::from_config(&owner_rule),
+            rule_owner("acme/*", "gh-work")
+        );
+
+        let path_rule = rupu_config::ScmRule {
+            owner: None,
+            path: Some("~/Code/work/*".into()),
+            account: "gh-work".into(),
+        };
+        assert_eq!(
+            Rule::from_config(&path_rule),
+            rule_path("~/Code/work/*", "gh-work")
         );
     }
 

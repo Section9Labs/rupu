@@ -10,6 +10,7 @@ use std::time::Duration;
 use reqwest::header::HeaderMap;
 use thiserror::Error;
 
+use crate::account::AccountId;
 use crate::platform::Platform;
 
 #[derive(Debug, Error)]
@@ -64,6 +65,59 @@ impl ScmError {
                 | Self::NotFound { .. }
         )
     }
+}
+
+/// Errors from [`crate::registry::Registry`]'s account-selection
+/// accessors (`repo_for`, `issues_for`). Spec §6.4 — these are the
+/// "which of my configured accounts serves this request" failures, a
+/// different vocabulary from `ScmError`'s "the vendor API call failed".
+#[derive(Debug, Error)]
+pub enum AccountError {
+    /// Several accounts are configured for this platform/tracker and no
+    /// rule (owner or path) and no explicit `--account` selected one.
+    /// Deliberately distinct from [`Self::NoAccounts`]: this is a
+    /// "disambiguate" failure, not a "log in" failure.
+    ///
+    /// `platform` names the vendor/tracker (`"github"`, `"linear"`, …)
+    /// so the message can say which accounts are candidates; it is not
+    /// part of the brief's minimal field list but is required to render
+    /// the spec §6.4 message shape.
+    #[error(
+        "no account rule matches {repo}\n  configured {platform} accounts: {}\n  fix: rupu scm bind --owner '<owner-glob>' --account <name>\n  or:  pass --account <name>",
+        candidates.iter().map(AccountId::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    NoRuleMatched {
+        repo: String,
+        platform: String,
+        candidates: Vec<AccountId>,
+    },
+
+    /// No account at all is configured for this platform/tracker — a
+    /// distinct failure from ambiguity, and it deserves a distinct
+    /// message: log in, rather than disambiguate.
+    ///
+    /// Held as a `String` (vendor/tracker name) rather than the brief's
+    /// literal `Platform` type: `issues_for` can be asked about `Linear`
+    /// or `Jira`, neither of which is a `Platform` variant, so a strict
+    /// `Platform` field can't represent every caller of this error.
+    #[error(
+        "no {platform} account configured\n  fix: rupu auth login --account <name> --kind {platform} --mode sso"
+    )]
+    NoAccounts { platform: String },
+
+    /// `--account <name>` (or an MCP `account` argument) named something
+    /// that is not a configured account of the right kind — most often a
+    /// typo. `resolve_account` returns `Resolution::Explicit` for any
+    /// name unconditionally (correct for a pure function); this is the
+    /// existence check the caller must apply before trusting it.
+    #[error(
+        "no such account: {requested}\n  configured accounts: {}",
+        configured.iter().map(AccountId::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    UnknownAccount {
+        requested: AccountId,
+        configured: Vec<AccountId>,
+    },
 }
 
 /// Map an HTTP failure into the structured ScmError vocabulary. Pure

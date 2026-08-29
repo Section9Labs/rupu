@@ -317,12 +317,16 @@ fn urlencode(s: &str) -> String {
 }
 
 /// Discovery helper.
+///
+/// `account` is the configured account name — see `super::try_build`'s
+/// doc for the back-compat bare-`"gitlab"` case.
 pub async fn try_build(
+    account: &str,
     resolver: &dyn rupu_auth::CredentialResolver,
     cfg: &rupu_config::Config,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> anyhow::Result<Option<std::sync::Arc<dyn EventConnector>>> {
-    let creds = match resolver.get("gitlab", None).await {
+    let creds = match resolver.get(account, None).await {
         Ok((_mode, creds)) => creds,
         Err(_) => return Ok(None),
     };
@@ -333,7 +337,7 @@ pub async fn try_build(
     let base_url = cfg
         .scm
         .platforms
-        .get("gitlab")
+        .get(account)
         .and_then(|p| p.base_url.clone());
     let connector: std::sync::Arc<dyn EventConnector> =
         std::sync::Arc::new(GitlabEventConnector::new(token, base_url, sink));
