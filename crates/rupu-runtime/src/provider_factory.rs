@@ -111,10 +111,20 @@ pub fn provider_tuning(
 ) -> rupu_providers::ProviderTuning {
     use rupu_providers::tuning;
     let p = providers.get(name);
+    // The DEFAULT permit count (i.e. when `max_concurrency` isn't set in
+    // config) comes from the resolved vendor KIND, not the account name —
+    // `default_permits` only recognizes vendor strings ("openai" => 8), so
+    // a named account like `openai-work` must still get the `openai`
+    // default rather than falling through to the generic `_ => 4`. This is
+    // purely about which default to pick; the semaphore itself stays keyed
+    // by account name elsewhere (`decorate` / `ThrottledProvider::wrap`),
+    // because two accounts of one vendor kind must hold independent
+    // concurrency budgets (rate limits are per-credential).
+    let kind = resolve_kind(name, providers).unwrap_or_else(|| name.to_string());
     rupu_providers::ProviderTuning {
         timeout: tuning::client_timeout(p.and_then(|p| p.timeout_ms)),
         max_retries: tuning::retry_budget(p.and_then(|p| p.max_retries)),
-        max_concurrency: tuning::concurrency_permits(name, p.and_then(|p| p.max_concurrency)),
+        max_concurrency: tuning::concurrency_permits(&kind, p.and_then(|p| p.max_concurrency)),
         org_id: p.and_then(|p| p.org_id.clone()),
         region: p.and_then(|p| p.region.clone()),
     }
@@ -624,6 +634,57 @@ mod tests {
         assert_eq!(t.max_concurrency, 8);
         assert_eq!(provider_tuning("anthropic", &providers).max_concurrency, 4);
         assert!(t.org_id.is_none());
+    }
+
+    /// A named `openai`-kind account must get the OPENAI vendor default (8
+    /// permits), not the generic 4-permit fallback `default_permits` uses
+    /// for any name it doesn't recognize as a vendor. Before this fix,
+    /// `provider_tuning` passed the ACCOUNT NAME (not the resolved kind)
+    /// into `concurrency_permits`, so `openai-work` silently got 4 permits
+    /// where bare `openai` got 8.
+    ///
+    /// The semaphore itself must stay keyed by account name — two accounts
+    /// of the same vendor kind hold independent concurrency budgets, since
+    /// rate limits are per-API-key. This test asserts both halves: the
+    /// default permit COUNT comes from kind, and the semaphore INSTANCE
+    /// stays distinct per account.
+    #[test]
+    fn named_openai_kind_account_gets_the_vendor_default_permits() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "openai-work-t2".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai".to_string()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "openai-personal-t2".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let work = provider_tuning("openai-work-t2", &providers);
+        let personal = provider_tuning("openai-personal-t2", &providers);
+        assert_eq!(
+            work.max_concurrency, 8,
+            "named openai account must default to the vendor's 8 permits, not the generic 4"
+        );
+        assert_eq!(personal.max_concurrency, 8);
+
+        // Same default permit count, but each account's semaphore is its
+        // own instance — draining one must not affect the other.
+        let work_sem = work.semaphore("openai-work-t2");
+        let personal_sem = personal.semaphore("openai-personal-t2");
+        assert!(
+            !std::sync::Arc::ptr_eq(&work_sem, &personal_sem),
+            "two accounts of the same kind must not share a semaphore"
+        );
+        assert_eq!(work_sem.available_permits(), 8);
+        assert_eq!(personal_sem.available_permits(), 8);
     }
 
     #[test]
