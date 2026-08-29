@@ -17,7 +17,7 @@
 - Hexagonal rule 1: `rupu-auth` MUST NOT depend on `rupu-config`. Account data crosses that boundary as `AccountSpec`, a type owned by `rupu-auth`.
 - `rupu-cli` is thin: arg parsing + delegation only.
 - Errors: `thiserror` in libraries, `anyhow` in `rupu-cli`.
-- **Never run package-wide `cargo fmt`** — `main` is fmt-dirty under the pinned toolchain. Format only the files you touched: `cargo fmt -- <file>`.
+- **Never run `cargo fmt`, even with explicit paths.** `cargo fmt -- <file>` does NOT filter by path — the `--` args are rustfmt flags, and cargo still enumerates every workspace target. Task 1's implementer ran it exactly as written and it reformatted 81 unrelated files; `main` is fmt-dirty under the pinned toolchain, so this produces a huge bogus diff. Use `rustfmt --edition 2021 <file>` instead, and check `git status` before staging.
 - **`crates/rupu-auth/src/account_key.rs` must not change.** Its test `key_format_is_stable_across_providers` must pass unchanged. Changing the key format strands every user's credentials.
 - Back-compat rule (spec §3.1), load-bearing in every task: **`kind` defaults to the account name when that name is a known vendor.** A user with `anthropic/api-key` and no `[providers.*]` config must behave exactly as before.
 - Never `git stash pop` — the stash is shared across sessions and popping it can clobber another session's work.
@@ -255,7 +255,7 @@ Expected: PASS. In particular `key_format_is_stable_across_providers` must still
 
 ```bash
 cargo clippy -p rupu-auth --all-targets -- -D warnings
-cargo fmt -- crates/rupu-auth/src/account.rs crates/rupu-auth/src/backend.rs crates/rupu-auth/src/lib.rs
+rustfmt --edition 2021 crates/rupu-auth/src/account.rs crates/rupu-auth/src/backend.rs crates/rupu-auth/src/lib.rs
 git add crates/rupu-auth/src/account.rs crates/rupu-auth/src/backend.rs crates/rupu-auth/src/lib.rs
 git commit -m "feat(auth): AccountSpec + ProviderId::from_vendor_str
 
@@ -641,7 +641,7 @@ Expected: PASS. `KeychainResolver::new()` is unchanged in behavior (empty accoun
 
 ```bash
 cargo clippy -p rupu-auth --all-targets -- -D warnings
-cargo fmt -- crates/rupu-auth/src/resolver.rs
+rustfmt --edition 2021 crates/rupu-auth/src/resolver.rs
 git add crates/rupu-auth/src/resolver.rs
 git commit -m "feat(auth): resolve declared accounts, with SSO and kind-routed refresh
 
@@ -819,7 +819,7 @@ Expected: PASS, including the pre-existing `validate_rejects_openai_compatible_w
 
 ```bash
 cargo clippy -p rupu-config --all-targets -- -D warnings
-cargo fmt -- crates/rupu-config/src/config.rs
+rustfmt --edition 2021 crates/rupu-config/src/config.rs
 git add crates/rupu-config/src/config.rs
 git commit -m "feat(config): accept built-in vendor names as provider kind
 
@@ -979,7 +979,7 @@ Expected: PASS
 
 ```bash
 cargo clippy -p rupu-runtime --all-targets -- -D warnings
-cargo fmt -- crates/rupu-runtime/src/provider_factory.rs
+rustfmt --edition 2021 crates/rupu-runtime/src/provider_factory.rs
 git add -A
 git commit -m "feat(runtime): build providers by vendor kind, not account name
 
@@ -1300,7 +1300,7 @@ Expected: `auth.json` contains exactly `anthropic/api-key`, and no `config.toml`
 
 ```bash
 cargo clippy -p rupu-cli --all-targets -- -D warnings
-cargo fmt -- crates/rupu-cli/src/cmd/auth.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/auth.rs
 git add crates/rupu-cli/src/cmd/auth.rs
 git commit -m "feat(cli): auth login --account/--kind for multiple accounts per vendor
 
@@ -1415,7 +1415,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cmd/auth.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/auth.rs
 git add crates/rupu-cli/src/cmd/auth.rs
 git commit -m "feat(cli): auth status lists every account with its kind
 
