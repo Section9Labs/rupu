@@ -68,9 +68,9 @@ fn force_json_backend(tmp: &assert_fs::TempDir) {
 /// walk a hardcoded 8-item `ProviderId` list and then append only config
 /// entries whose kind was literally `"openai-compatible"`. A
 /// config-declared account with any other kind (like `anthropic`) was
-/// silently dropped. This test is hermetic — unlike the two tests above,
-/// it sets `RUPU_HOME` to a fresh tempdir via `Command::env` rather than
-/// relying on the ambient environment.
+/// silently dropped. Like every test in this file, it is hermetic: it
+/// sets `RUPU_HOME` to a fresh tempdir via `Command::env` so a
+/// developer's real `~/.rupu` can neither satisfy nor break it.
 #[test]
 fn status_json_lists_a_declared_account_with_its_resolved_kind_and_dedups_builtins() {
     let tmp = assert_fs::TempDir::new().unwrap();

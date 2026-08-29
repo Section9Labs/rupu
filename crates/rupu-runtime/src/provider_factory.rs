@@ -645,9 +645,16 @@ mod tests {
     ///
     /// The semaphore itself must stay keyed by account name — two accounts
     /// of the same vendor kind hold independent concurrency budgets, since
-    /// rate limits are per-API-key. This test asserts both halves: the
-    /// default permit COUNT comes from kind, and the semaphore INSTANCE
-    /// stays distinct per account.
+    /// rate limits are per-API-key.
+    ///
+    /// What THIS test discriminates is the permit COUNT coming from kind
+    /// — that half is the fix's real RED. Its semaphore assertion is a
+    /// sanity check only: it passes `semaphore()` the account names
+    /// itself, so `semaphore_for`'s registry keeps them distinct however
+    /// `decorate` keys things. The guard that would actually catch a
+    /// kind-collapse regression is
+    /// `two_accounts_of_the_same_kind_get_independent_semaphores`, which
+    /// drives `decorate` rather than calling `semaphore()` directly.
     #[test]
     fn named_openai_kind_account_gets_the_vendor_default_permits() {
         use std::collections::BTreeMap;
