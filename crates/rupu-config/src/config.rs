@@ -411,18 +411,23 @@ mod tests {
     /// `BUILTIN_PROVIDER_KINDS` grew from 9 to 13 entries when the four SCM
     /// kinds (`github`/`gitlab`/`linear`/`jira`) were added, but nothing
     /// pinned that they actually validate — the same shape of gap that let
-    /// an earlier regression ship green. Pin at least one of the four.
+    /// an earlier regression ship green. Pin all four: dropping any one of
+    /// `gitlab`/`linear`/`jira` from `BUILTIN_PROVIDER_KINDS` while leaving
+    /// only `github` covered would still pass a single-kind test, which is
+    /// exactly the gap this test exists to close.
     #[test]
-    fn validate_accepts_github_kind() {
-        let mut cfg = Config::default();
-        cfg.providers.insert(
-            "github-work".into(),
-            crate::provider_config::ProviderConfig {
-                kind: Some("github".into()),
-                ..Default::default()
-            },
-        );
-        assert!(cfg.validate().is_ok());
+    fn validate_accepts_scm_kinds() {
+        for kind in ["github", "gitlab", "linear", "jira"] {
+            let mut cfg = Config::default();
+            cfg.providers.insert(
+                format!("{kind}-work"),
+                crate::provider_config::ProviderConfig {
+                    kind: Some(kind.to_string()),
+                    ..Default::default()
+                },
+            );
+            assert!(cfg.validate().is_ok(), "kind \"{kind}\" should validate");
+        }
     }
 
     #[test]
