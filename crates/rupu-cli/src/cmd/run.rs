@@ -787,6 +787,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             cfg.default_model.clone(),
             provider_factory::openai_compatible_map(&cfg.providers),
             provider_factory::provider_tuning_map(&cfg.providers),
+            provider_factory::resolve_kind_map(&cfg.providers),
         );
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 

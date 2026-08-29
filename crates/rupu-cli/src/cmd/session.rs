@@ -6228,20 +6228,18 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        // `openai_compatible` stays `None` here — a separate, pre-existing
+        // limitation (session compaction doesn't support custom
+        // openai-compatible endpoints), unrelated to kind resolution.
         openai_compatible: None,
         tuning: Some(provider_factory::provider_tuning(
             &session.provider_name,
             &cfg.providers,
         )),
-        // Task 4 (provider factory kind dispatch) scoped its call-site sweep
-        // to sites already resolving `openai_compatible`; this one hardcodes
-        // that to `None` (a separate, pre-existing limitation — session
-        // compaction doesn't support custom openai-compatible endpoints), so
-        // it's left out of that sweep too. `None` here falls back to
-        // name-based dispatch, byte-identical to before — but it means a
-        // declared multi-account name (e.g. `anthropic-work`) won't resolve
-        // its kind from `rupu session compact`.
-        kind: None,
+        // `cfg.providers` is already in scope for `provider_tuning` above,
+        // so a declared multi-account name (e.g. `anthropic-work`) resolves
+        // its kind here too.
+        kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
     };
     // No run exists here: `rupu session compact` summarizes an existing
     // session's message history in place — it mints no run id, writes no
@@ -6571,17 +6569,15 @@ async fn run_compact_request(
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        // `openai_compatible` stays `None` here — a separate, pre-existing
+        // limitation (session compaction doesn't support custom
+        // openai-compatible endpoints), unrelated to kind resolution.
         openai_compatible: None,
         tuning: Some(provider_factory::provider_tuning(
             &session.provider_name,
             &cfg.providers,
         )),
-        // See the identical note on the other `rupu session compact`
-        // provider-build site above: left out of Task 4's call-site sweep
-        // because `openai_compatible` is hardcoded `None` here (a separate,
-        // pre-existing limitation), so `kind: None` falls back to
-        // name-based dispatch, byte-identical to before.
-        kind: None,
+        kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
     };
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
@@ -6895,17 +6891,16 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+            // `openai_compatible` stays `None` here — a separate,
+            // pre-existing limitation (the session worker doesn't support
+            // custom openai-compatible endpoints), unrelated to kind
+            // resolution.
             openai_compatible: None,
             tuning: Some(provider_factory::provider_tuning(
                 &session.provider_name,
                 &cfg.providers,
             )),
-            // See the identical note on the `rupu session compact`
-            // provider-build sites: left out of Task 4's call-site sweep
-            // because `openai_compatible` is hardcoded `None` here (a
-            // separate, pre-existing limitation), so `kind: None` falls
-            // back to name-based dispatch, byte-identical to before.
-            kind: None,
+            kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
         };
         let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
             &session.provider_name,
