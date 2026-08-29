@@ -1457,8 +1457,133 @@ model: claude-opus-4-6
 
 **Out of scope for Arc 1:** all SCM/GitHub multi-account work (`Registry` reshape, `[[scm.rules]]`, `rupu scm bind`, daemon account resolution). That is Arc 2, specified in §6 of the design doc.
 
-## Wiring note for whoever does Arc 2
+---
 
-`KeychainResolver::with_accounts` (Task 2) exists but **nothing calls it yet** — every CLI construction site still uses `KeychainResolver::new()`, which means declared accounts resolve through `resolve_kind`'s name-fallback only. That is correct and sufficient for Arc 1 because `rupu auth login` writes the config declaration and `provider_factory::resolve_kind` reads config directly.
+### Task 7: Wire the resolver's account list (multi-account SSO)
 
-The resolver's own account list becomes load-bearing when SSO refresh must resolve an account it was not handed — hook `with_accounts` up at the `KeychainResolver::new()` call sites in `rupu-cli` at that point, passing `cfg.providers` mapped to `AccountSpec`.
+**Added mid-execution.** This plan originally carried a "wiring note" asserting that `with_accounts` needing no callers was "correct and sufficient for Arc 1." That was wrong, and Task 4's re-review caught it: `resolve_kind` reading config covers *which client to build*; it does not cover *which credential to read*. With `with_accounts` uncalled, `get()` for a named account never takes the `resolve_provider_id` branch and always falls through to `get_named`, which is **ApiKey-only**. Arc 1 would therefore ship multi-account API keys with multi-account **SSO silently broken** — and four of the six logins in the acceptance walkthrough are `--mode sso`.
+
+**Files:**
+- Create: `crates/rupu-cli/src/accounts.rs`
+- Modify: `crates/rupu-cli/src/lib.rs` (or `main.rs`) to declare the module
+- Modify: the LLM-relevant `KeychainResolver::new()` sites (see Step 3)
+- Modify: `crates/rupu-auth/src/resolver.rs` (`get_named` SSO precedence)
+
+**Interfaces:**
+- Consumes: `rupu_auth::{KeychainResolver, AccountSpec}`, `rupu_runtime::provider_factory::resolve_kind`.
+- Produces: `rupu_cli::accounts::account_specs(cfg: &rupu_config::Config) -> Vec<AccountSpec>` and `rupu_cli::accounts::resolver_for(cfg: &rupu_config::Config) -> KeychainResolver`.
+
+- [ ] **Step 1: Write the failing test for the account-spec builder**
+
+In `crates/rupu-cli/src/accounts.rs`'s `mod tests`:
+
+```rust
+    #[test]
+    fn account_specs_covers_declared_accounts_with_their_kinds() {
+        let mut cfg = rupu_config::Config::default();
+        cfg.providers.insert(
+            "anthropic-work".into(),
+            rupu_config::ProviderConfig {
+                kind: Some("anthropic".into()),
+                ..Default::default()
+            },
+        );
+        cfg.providers.insert(
+            "oracle".into(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://h:1".into()),
+                default_model: Some("m".into()),
+                ..Default::default()
+            },
+        );
+        let specs = account_specs(&cfg);
+        let work = specs.iter().find(|s| s.name == "anthropic-work").unwrap();
+        assert_eq!(work.kind, "anthropic");
+        // openai-compatible accounts are declared too: they have no
+        // ProviderId, so `resolve_provider_id` returns None for them and
+        // `get` routes them to `get_named`, which is correct.
+        assert!(specs.iter().any(|s| s.name == "oracle"));
+    }
+
+    /// An empty config must yield an empty list, so `resolver_for` is
+    /// behaviorally identical to `KeychainResolver::new()` for users who
+    /// have declared nothing.
+    #[test]
+    fn account_specs_is_empty_for_default_config() {
+        assert!(account_specs(&rupu_config::Config::default()).is_empty());
+    }
+```
+
+- [ ] **Step 2: Implement the helper**
+
+```rust
+//! Account-aware credential resolver construction.
+//!
+//! `rupu-auth` cannot read config (hexagonal rule 1) and `rupu-config`
+//! knows nothing about credentials, so `rupu-cli` — which depends on
+//! both — is the correct seam for turning `[providers.*]` into the
+//! `AccountSpec` list the resolver needs.
+
+use rupu_auth::{AccountSpec, KeychainResolver};
+
+/// Every declared `[providers.<name>]` entry as an `AccountSpec`.
+pub fn account_specs(cfg: &rupu_config::Config) -> Vec<AccountSpec> {
+    cfg.providers
+        .keys()
+        .filter_map(|name| {
+            rupu_runtime::provider_factory::resolve_kind(name, &cfg.providers)
+                .map(|kind| AccountSpec::new(name.clone(), kind))
+        })
+        .collect()
+}
+
+/// A `KeychainResolver` that knows the config's declared accounts, so a
+/// named account resolves SSO and refreshes against its vendor rather
+/// than falling through to the api-key-only `get_named` path.
+pub fn resolver_for(cfg: &rupu_config::Config) -> KeychainResolver {
+    KeychainResolver::new().with_accounts(account_specs(cfg))
+}
+```
+
+- [ ] **Step 3: Wire the LLM-relevant construction sites**
+
+Replace `KeychainResolver::new()` with `crate::accounts::resolver_for(&cfg)` at the sites that resolve **LLM provider** credentials, where a `Config` is already in scope:
+
+`crates/rupu-cli/src/cmd/run.rs`, `crates/rupu-cli/src/cmd/session.rs`, `crates/rupu-cli/src/cmd/workflow.rs`, `crates/rupu-cli/src/cmd/agent.rs`, `crates/rupu-cli/src/cmd/dispatch.rs`, `crates/rupu-cli/src/cmd/models.rs`, `crates/rupu-cli/src/cmd/auth.rs`, `crates/rupu-cli/src/resume.rs`, `crates/rupu-cli/src/cp_definition_generator.rs`, `crates/rupu-cli/src/cmd/autoflow.rs`, `crates/rupu-cli/src/cmd/cp.rs`, and `crates/rupu-orchestrator/src/step_factory.rs`.
+
+Do **not** touch the SCM-only sites — `issues.rs`, `repos.rs`, `mcp.rs`, `webhook.rs`, `cron.rs`. Those resolve `github`/`gitlab` credentials, which are bare vendor names needing no account list, and are Arc 2's territory.
+
+Where a site has no `Config` in scope, leave it and report it rather than threading config through — report the list.
+
+- [ ] **Step 4: Give `get_named` the same mode precedence as built-ins**
+
+In `crates/rupu-auth/src/resolver.rs`, `get_named` tries only `AuthMode::ApiKey`. An `openai-compatible` account can only ever have an api-key, but this is also the fallthrough for any account not in the resolver's list, so an SSO credential stored under a name the caller didn't declare is unreadable. Make it try SSO then ApiKey, matching `get`'s precedence. Refresh still requires a kind, so a near-expiry SSO credential on this path is returned as-is rather than refreshed — document that in the function's doc comment.
+
+Add a test asserting an SSO credential stored under an undeclared name is still readable.
+
+- [ ] **Step 5: Prove multi-account SSO end to end**
+
+Write an integration test that stores two SSO credentials under `anthropic-work/sso` and `anthropic-personal/sso` in a temp `auth.json`, builds a resolver via `resolver_for` with both declared in config, and asserts each resolves to its own distinct token with `AuthMode::Sso`. This is the test that would have caught the gap this task exists to close.
+
+- [ ] **Step 6: Verify and commit**
+
+```bash
+cargo test -p rupu-cli
+cargo test -p rupu-auth
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+rustfmt --edition 2021 crates/rupu-cli/src/accounts.rs
+git diff --name-only
+```
+
+```bash
+git add -A
+git commit -m "feat(cli): wire declared accounts into the credential resolver
+
+with_accounts had no callers, so a named account always fell through to
+the api-key-only get_named path: multi-account SSO was silently broken.
+rupu-cli is the correct seam (it depends on both rupu-auth and
+rupu-config) for turning [providers.*] into the AccountSpec list."
+```
+
