@@ -222,6 +222,18 @@ impl KeychainResolver {
         }
     }
 
+    /// The Slice-A legacy bare-key fallback applies only to canonical
+    /// vendor names. A declared account name (e.g. `anthropic-work`) was
+    /// never written under a bare key, so extending the fallback to it
+    /// would mean silently reading a different account's credential.
+    fn legacy_base(provider: &str) -> Option<&str> {
+        if Self::parse_provider(provider).is_ok() {
+            Some(provider)
+        } else {
+            None
+        }
+    }
+
     /// Returns true if a credential entry exists for the given provider/mode.
     pub async fn peek(&self, p: ProviderId, mode: AuthMode) -> bool {
         self.read(p, mode).map(|o| o.is_some()).unwrap_or(false)
@@ -290,13 +302,11 @@ impl KeychainResolver {
         )
     }
 
-    /// Returns a human-readable expiry string for an SSO token, or `None`
-    /// if no SSO credential exists for the provider. When a credential
-    /// is stored but has no `expires_at` (e.g. GitHub device-code grants
-    /// that never carry an explicit expiry), returns `Some("no expiry")`
-    /// so the status row still renders ✓.
-    pub async fn peek_sso(&self, p: ProviderId) -> Option<String> {
-        let sc = self.read(p, AuthMode::Sso).ok().flatten()?;
+    /// Human-readable expiry string for a stored SSO credential. Always
+    /// `Some`: a `None` `expires_at` (e.g. GitHub device-code grants that
+    /// never carry an explicit expiry) renders as `Some("no expiry")` so
+    /// the status row still shows ✓ rather than nothing.
+    fn expiry_string(sc: &StoredCredential) -> Option<String> {
         let Some(exp) = sc.expires_at else {
             return Some("no expiry".into());
         };
@@ -309,31 +319,31 @@ impl KeychainResolver {
         } else {
             Some(format!("expires in {}h", dur.num_hours().max(1)))
         }
+    }
+
+    /// Returns a human-readable expiry string for an SSO token, or `None`
+    /// if no SSO credential exists for the provider.
+    pub async fn peek_sso(&self, p: ProviderId) -> Option<String> {
+        self.peek_sso_named(p.as_str()).await
     }
 
     /// `peek_sso` for an account name rather than a built-in vendor.
-    /// Same human-readable expiry strings.
+    /// Byte-identical lookup to `peek_sso(p)` when `name == p.as_str()`,
+    /// since `legacy_account_for(p) == p.as_str()` (see `account_key.rs`).
     pub async fn peek_sso_named(&self, name: &str) -> Option<String> {
         let sc = self.read_account(name, Some(name), AuthMode::Sso).ok()??;
-        let Some(exp) = sc.expires_at else {
-            return Some("no expiry".into());
-        };
-        let now = chrono::Utc::now();
-        let dur = exp.signed_duration_since(now);
-        if dur.num_seconds() <= 0 {
-            Some("expired — re-login".into())
-        } else if dur.num_days() >= 1 {
-            Some(format!("expires in {}d", dur.num_days()))
-        } else {
-            Some(format!("expires in {}h", dur.num_hours().max(1)))
-        }
+        Self::expiry_string(&sc)
     }
 
-    /// Refresh against a **vendor**, not an account name. Two accounts of
-    /// the same kind refresh against the same OAuth config but store
-    /// under their own keys — that is what makes multi-account SSO work.
+    /// The OAuth request itself is keyed on **vendor** (`kind`): two
+    /// accounts of the same kind refresh against the same OAuth config.
+    /// `account` is carried separately, only to name the right identity
+    /// in user-facing error text — `kind` alone would tell a user with
+    /// `anthropic-work` and `anthropic-personal` to re-authenticate the
+    /// wrong one.
     async fn refresh_inner(
         &self,
+        account: &str,
         kind: ProviderId,
         sc: &StoredCredential,
     ) -> Result<StoredCredential> {
@@ -341,8 +351,8 @@ impl KeychainResolver {
             .ok_or_else(|| anyhow::anyhow!("no oauth config for {kind}"))?;
         let refresh_token = sc.refresh_token.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{kind} SSO token expired and no refresh token stored. \
-                 Run: rupu auth login --provider {kind} --mode sso"
+                "SSO token for '{account}' expired and no refresh token stored. \
+                 Re-authenticate this account (mode: sso) to continue."
             )
         })?;
         // Provider-agnostic refresh: standard OAuth refresh-token grant.
@@ -376,7 +386,7 @@ impl KeychainResolver {
             .map_err(|e| anyhow::anyhow!("refresh request: {e}"))?;
         if !resp.status().is_success() {
             anyhow::bail!(
-                "refresh failed for {kind}: HTTP {}. Run: rupu auth login --provider {kind} --mode sso",
+                "refresh failed for '{account}': HTTP {}. Re-authenticate this account (mode: sso) to continue.",
                 resp.status()
             );
         }
@@ -476,16 +486,12 @@ impl CredentialResolver for KeychainResolver {
         // legacy bare-vendor path is a special case of this one — it just
         // additionally tolerates the Slice-A legacy key.
         if let Some(kind) = crate::account::resolve_provider_id(provider, &self.accounts) {
-            let legacy = if Self::parse_provider(provider).is_ok() {
-                Some(provider)
-            } else {
-                None
-            };
+            let legacy = Self::legacy_base(provider);
             for mode in modes {
                 if let Some(mut sc) = self.read_account(provider, legacy, mode)? {
                     let now = chrono::Utc::now();
                     if mode == AuthMode::Sso && sc.is_near_expiry(now, EXPIRY_REFRESH_BUFFER_SECS) {
-                        let new = self.refresh_inner(kind, &sc).await?;
+                        let new = self.refresh_inner(provider, kind, &sc).await?;
                         self.store_named(provider, mode, &new).await?;
                         sc = new;
                     }
@@ -509,15 +515,11 @@ impl CredentialResolver for KeychainResolver {
     async fn refresh(&self, provider: &str, mode: AuthMode) -> Result<AuthCredentials> {
         let kind = crate::account::resolve_provider_id(provider, &self.accounts)
             .ok_or_else(|| anyhow::anyhow!("unknown provider or account: {provider}"))?;
-        let legacy = if Self::parse_provider(provider).is_ok() {
-            Some(provider)
-        } else {
-            None
-        };
+        let legacy = Self::legacy_base(provider);
         let sc = self
             .read_account(provider, legacy, mode)?
             .ok_or_else(|| anyhow::anyhow!("no stored credential for {provider}/{mode:?}"))?;
-        let new = self.refresh_inner(kind, &sc).await?;
+        let new = self.refresh_inner(provider, kind, &sc).await?;
         self.store_named(provider, mode, &new).await?;
         Ok(new.credentials)
     }
@@ -828,10 +830,15 @@ mod tests {
         assert!(matches!(creds, AuthCredentials::OAuth { access, .. } if access == "the-token"));
     }
 
-    /// Spec §3.1 regression guard: a user with only the legacy bare key
-    /// and NO declared accounts must resolve exactly as before.
+    /// Spec §3.1 regression guard: a user with a modern `anthropic/api-key`
+    /// entry and NO declared accounts must resolve exactly as before. This
+    /// does NOT exercise the Slice-A bare-key fallback (`read_account`'s
+    /// `legacy_base` branch) -- `store()` always writes the modern
+    /// `<provider>/<mode>` key. See
+    /// `bare_legacy_key_resolves_with_no_declared_accounts` below for the
+    /// actual legacy-key path.
     #[tokio::test]
-    async fn bare_builtin_still_resolves_with_no_declared_accounts() {
+    async fn modern_key_still_resolves_with_no_declared_accounts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let resolver = KeychainResolver {
@@ -850,6 +857,26 @@ mod tests {
         let (mode, creds) = resolver.get("anthropic", None).await.unwrap();
         assert_eq!(mode, AuthMode::ApiKey);
         assert!(matches!(creds, AuthCredentials::ApiKey { key } if key == "legacy"));
+    }
+
+    /// Spec §3.1's actual regression guard: a user with ONLY the Slice-A
+    /// bare `"anthropic"` key (no mode suffix, the on-disk shape every
+    /// pre-mode-suffix install has) and NO declared accounts must still
+    /// resolve. This is what exercises `read_account`'s `legacy_base`
+    /// fallback branch, which the test above does not reach.
+    #[tokio::test]
+    async fn bare_legacy_key_resolves_with_no_declared_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"anthropic":"legacy-bare-key"}"#).unwrap();
+        let resolver = KeychainResolver {
+            path: path.clone(),
+            accounts: Vec::new(),
+        };
+
+        let (mode, creds) = resolver.get("anthropic", None).await.unwrap();
+        assert_eq!(mode, AuthMode::ApiKey);
+        assert!(matches!(creds, AuthCredentials::ApiKey { key } if key == "legacy-bare-key"));
     }
 
     /// An undeclared, non-vendor name is a typo, not an account.

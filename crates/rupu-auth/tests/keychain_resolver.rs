@@ -11,12 +11,42 @@ use rupu_auth::stored::StoredCredential;
 use rupu_providers::AuthMode;
 use serial_test::serial;
 
+/// RAII guard: removes an env var for the test's duration and restores
+/// whatever value (if any) was already there on drop, even on panic.
+/// `get()` now falls through to the matching `RUPU_<PROVIDER>_API_KEY`
+/// for any built-in vendor (spec §5.6), so a "missing after forget"
+/// assertion is only reliable if that var is guaranteed unset for the
+/// duration -- ambient environment (a developer's shell, CI secrets)
+/// must not be able to flake it.
+struct EnvVarGuard {
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn unset(key: &'static str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prior }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 /// Full round-trip through the file backend: store, read back, forget.
 /// Also asserts the file is created chmod 600 — a credential file that is
 /// group- or world-readable is a leak.
 #[tokio::test]
 #[serial]
 async fn file_backend_round_trip() {
+    let _env_guard = EnvVarGuard::unset("RUPU_ANTHROPIC_API_KEY");
     let tmp = assert_fs::TempDir::new().unwrap();
     let auth_path = tmp.path().join("auth.json");
     std::env::set_var("RUPU_AUTH_FILE", auth_path.as_os_str());
