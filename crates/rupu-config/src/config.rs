@@ -157,6 +157,22 @@ const RESERVED_PROVIDER_NAMES: &[&str] = &[
     "jira",
 ];
 
+/// Vendor kinds a `[providers.<name>]` entry may declare, in addition to
+/// `"openai-compatible"`. Kept in lockstep with
+/// `rupu_runtime::provider_factory::is_builtin_provider` and
+/// `rupu_auth::backend::ProviderId::from_vendor_str`.
+const BUILTIN_PROVIDER_KINDS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "openai_codex",
+    "codex",
+    "gemini",
+    "google_gemini",
+    "copilot",
+    "github_copilot",
+    "local",
+];
+
 impl Config {
     /// Warn about keys that still parse but no longer do anything.
     ///
@@ -234,21 +250,34 @@ impl Config {
     pub fn validate(&self) -> Result<(), crate::layer::LayerError> {
         self.warn_deprecated_keys();
         for (name, p) in &self.providers {
-            if p.kind.as_deref() == Some("openai-compatible") {
-                if RESERVED_PROVIDER_NAMES.contains(&name.as_str()) {
-                    return Err(crate::layer::LayerError::Invalid(format!(
-                        "provider '{name}': \"openai-compatible\" cannot reuse the reserved \
-                         built-in provider name '{name}'; choose a distinct name"
-                    )));
+            match p.kind.as_deref() {
+                // No kind: the account name itself is the vendor
+                // (design spec §3.1). Nothing to validate here.
+                None => {}
+                Some("openai-compatible") => {
+                    if RESERVED_PROVIDER_NAMES.contains(&name.as_str()) {
+                        return Err(crate::layer::LayerError::Invalid(format!(
+                            "provider '{name}': \"openai-compatible\" cannot reuse the reserved \
+                             built-in provider name '{name}'; choose a distinct name"
+                        )));
+                    }
+                    if p.base_url.is_none() {
+                        return Err(crate::layer::LayerError::Invalid(format!(
+                            "provider '{name}': kind=\"openai-compatible\" requires base_url"
+                        )));
+                    }
+                    if p.default_model.as_deref().is_none_or(|m| m.is_empty()) {
+                        return Err(crate::layer::LayerError::Invalid(format!(
+                            "provider '{name}': kind=\"openai-compatible\" requires default_model"
+                        )));
+                    }
                 }
-                if p.base_url.is_none() {
+                Some(k) if BUILTIN_PROVIDER_KINDS.contains(&k) => {}
+                Some(k) => {
                     return Err(crate::layer::LayerError::Invalid(format!(
-                        "provider '{name}': kind=\"openai-compatible\" requires base_url"
-                    )));
-                }
-                if p.default_model.as_deref().is_none_or(|m| m.is_empty()) {
-                    return Err(crate::layer::LayerError::Invalid(format!(
-                        "provider '{name}': kind=\"openai-compatible\" requires default_model"
+                        "provider '{name}': unknown kind \"{k}\"; expected \
+                         \"openai-compatible\" or one of: {}",
+                        BUILTIN_PROVIDER_KINDS.join(", ")
                     )));
                 }
             }
@@ -336,5 +365,82 @@ mod tests {
     #[test]
     fn ui_cp_rejects_unknown_keys() {
         assert!(toml::from_str::<Config>("[ui.cp]\nshel = \"v2\"\n").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_builtin_kind() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "anthropic-work".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("anthropic".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// A built-in kind needs no base_url / default_model — those are
+    /// openai-compatible requirements only.
+    #[test]
+    fn validate_builtin_kind_does_not_require_base_url() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "openai-personal".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("openai".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_kind() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "weird".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("not-a-vendor".into()),
+                ..Default::default()
+            },
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("not-a-vendor"), "got: {err}");
+        assert!(
+            err.contains("openai-compatible"),
+            "should list valid kinds, got: {err}"
+        );
+    }
+
+    /// The reserved-name rule stays scoped to openai-compatible: you may
+    /// not name a custom endpoint "anthropic", but an account named
+    /// "anthropic" with kind "anthropic" is the legacy default and fine.
+    #[test]
+    fn validate_still_rejects_reserved_name_for_openai_compatible() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "anthropic".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://host:8080".into()),
+                default_model: Some("m".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_account_named_after_its_own_vendor() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "anthropic".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("anthropic".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_ok());
     }
 }
