@@ -328,9 +328,26 @@ impl KeychainResolver {
     /// `kind`), which by definition doesn't exist for a name that isn't
     /// in `self.accounts` and isn't a vendor name — so a near-expiry
     /// token here is returned as-is, not refreshed.
-    async fn get_named(&self, provider: &str) -> Result<(AuthMode, AuthCredentials)> {
+    ///
+    /// `hint` applies the same guard `get` applies on the declared/vendor
+    /// path: an explicit `Some(Sso)` must never be silently satisfied by
+    /// an API key, stored or env. `None` and `Some(ApiKey)` are
+    /// unaffected — both still try stored SSO first, exactly as before
+    /// this parameter existed, since callers passing `Some(ApiKey)` today
+    /// rely on that same SSO-then-api-key-then-env precedence.
+    async fn get_named(
+        &self,
+        provider: &str,
+        hint: Option<AuthMode>,
+    ) -> Result<(AuthMode, AuthCredentials)> {
         if let Some(sc) = self.read_account(provider, Some(provider), AuthMode::Sso)? {
             return Ok((AuthMode::Sso, sc.credentials));
+        }
+        if hint == Some(AuthMode::Sso) {
+            anyhow::bail!(
+                "no SSO credentials for '{provider}'. Run: rupu auth login --account {provider} \
+                 --mode sso"
+            )
         }
         if let Some(sc) = self.read_account(provider, Some(provider), AuthMode::ApiKey)? {
             return Ok((AuthMode::ApiKey, sc.credentials));
@@ -561,7 +578,7 @@ impl CredentialResolver for KeychainResolver {
 
         // Not a vendor and not declared: an openai-compatible entry, or a
         // typo. `get_named` produces the actionable error either way.
-        self.get_named(provider).await
+        self.get_named(provider, hint).await
     }
 
     async fn refresh(&self, provider: &str, mode: AuthMode) -> Result<AuthCredentials> {

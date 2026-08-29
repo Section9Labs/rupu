@@ -204,3 +204,54 @@ async fn explicit_sso_hint_is_not_satisfied_by_env_api_key() {
 
     std::env::remove_var("RUPU_AUTH_FILE");
 }
+
+/// The same `hint = Some(Sso)` guard applies on the `get_named` path
+/// (an undeclared account name, or an `openai-compatible` entry) as on
+/// the declared/vendor path above. Before this fix, `get`'s fallback
+/// call to `get_named` dropped `hint` entirely, so `get_named` always
+/// tried stored SSO then stored API key then env API key regardless of
+/// what the caller asked for -- an agent pinned to an undeclared
+/// account name with `auth: sso` frontmatter and a matching
+/// `RUPU_<ACCOUNT>_API_KEY` env var would silently receive an API key.
+#[tokio::test]
+#[serial]
+async fn explicit_sso_hint_is_not_satisfied_by_env_api_key_for_undeclared_account() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    std::env::set_var("RUPU_AUTH_FILE", auth_path.as_os_str());
+    let _env_guard = EnvVarGuard::set("RUPU_ORACLE_PERSONAL_API_KEY", "sk-should-not-be-used");
+
+    let r = KeychainResolver::new();
+
+    // "oracle-personal" is not a built-in vendor and not declared in
+    // any config, so `get` routes it through `get_named`. No stored
+    // credential of any kind exists, but the env fallback key IS set.
+    // An explicit SSO hint must still error rather than silently
+    // returning that API key.
+    let err = r
+        .get("oracle-personal", Some(AuthMode::Sso))
+        .await
+        .expect_err("an explicit SSO hint must not be satisfied by an env API key");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("sk-should-not-be-used"),
+        "error must not leak the env api key: {msg}"
+    );
+
+    // With no hint at all, the same env key IS still a valid fallback
+    // (unconstrained precedence: SSO then API key then env) -- this
+    // path is unchanged.
+    let (mode, creds) = r
+        .get("oracle-personal", None)
+        .await
+        .expect("unhinted get should still fall back to the env api key");
+    assert_eq!(mode, AuthMode::ApiKey);
+    match creds {
+        rupu_providers::auth::AuthCredentials::ApiKey { key } => {
+            assert_eq!(key, "sk-should-not-be-used")
+        }
+        other => panic!("expected api-key creds, got {other:?}"),
+    }
+
+    std::env::remove_var("RUPU_AUTH_FILE");
+}
