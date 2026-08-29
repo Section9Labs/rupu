@@ -9,6 +9,19 @@ use crate::types::{Comment, CreateIssue, Issue, IssueFilter, IssueRef, IssueStat
 
 use super::client::GithubClient;
 
+/// Render octocrab's `AuthorAssociation` as the same string GitHub's API
+/// wire format uses (e.g. `"OWNER"`, `"CONTRIBUTOR"`). The enum's variants
+/// are `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` and its catch-all
+/// `Other(String)` case is `#[serde(untagged)]`, so round-tripping through
+/// `serde_json` reproduces GitHub's raw value for every variant —
+/// including any association github adds in the future — without a
+/// hand-maintained match arm per variant.
+fn author_association_str(assoc: &octocrab::models::AuthorAssociation) -> Option<String> {
+    serde_json::to_value(assoc)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+}
+
 pub struct GithubIssueConnector {
     client: GithubClient,
 }
@@ -112,6 +125,9 @@ impl IssueConnector for GithubIssueConnector {
             author: model.user.login,
             body,
             created_at: model.created_at,
+            // Comes free on the create-comment response model — no
+            // extra API call, so there's no reason to withhold it.
+            author_association: author_association_str(&model.author_association),
         })
     }
 
@@ -173,6 +189,7 @@ impl IssueConnector for GithubIssueConnector {
                 // (a comment can be body-less after redaction).
                 body: m.body.unwrap_or_default(),
                 created_at: m.created_at,
+                author_association: author_association_str(&m.author_association),
             }));
 
             let short_page = fetched < per_page as usize;

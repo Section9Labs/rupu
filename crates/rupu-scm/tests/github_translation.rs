@@ -408,6 +408,14 @@ async fn list_comments_translates() {
     assert_eq!(comments[1].author, "octocat");
     assert_eq!(comments[1].body, "second comment body");
     assert!(comments[0].created_at < comments[1].created_at);
+    // The fixture carries GitHub's real `author_association` values —
+    // this is the field a downstream operator-control consumer needs to
+    // tell an authorized collaborator's comment apart from anyone else's.
+    assert_eq!(comments[0].author_association, Some("OWNER".to_string()));
+    assert_eq!(
+        comments[1].author_association,
+        Some("CONTRIBUTOR".to_string())
+    );
 }
 
 #[tokio::test]

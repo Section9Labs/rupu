@@ -251,6 +251,7 @@ impl RepoConnector for RecordingConnector {
             author: "rupu-bot".into(),
             body: body.to_string(),
             created_at: chrono::Utc::now(),
+            author_association: None,
         })
     }
     async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {

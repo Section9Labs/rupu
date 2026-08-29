@@ -152,6 +152,8 @@ fn translate_note_to_comment(v: &serde_json::Value) -> Result<Comment, ScmError>
         author,
         body,
         created_at,
+        // GitLab's notes API has no author_association equivalent.
+        author_association: None,
     })
 }
 

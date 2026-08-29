@@ -76,7 +76,7 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "issues.comments",
-            description: "Read an issue's comment thread. Returns id, author, body, created_at per comment, oldest-first. A `limit` truncates the NEWEST comments off the end, not the oldest — omitting `limit` returns only the oldest 100; hard ceiling 5000.",
+            description: "Read an issue's comment thread. Returns id, author, body, created_at, author_association per comment, oldest-first. author_association is GitHub's role for the commenter on this repo (e.g. OWNER, COLLABORATOR, CONTRIBUTOR, NONE) — use it to tell an authorized operator's comment apart from an arbitrary commenter's; it is null on trackers that don't expose an equivalent (GitLab, Linear, Jira). A `limit` truncates the NEWEST comments off the end, not the oldest — omitting `limit` returns only the oldest 100; hard ceiling 5000.",
             input_schema: serde_json::to_value(schemars::schema_for!(ListCommentsArgs)).unwrap(),
             kind: ToolKind::Read,
         },
