@@ -262,16 +262,46 @@ rupu scm bind --owner 'MrBrutti/*'    --account gh-personal
 rupu scm bind --path  '~/Code/work/*' --account gh-work
 ```
 
+Real output, captured from the built binary against a scratch `RUPU_HOME`
+with exactly the six accounts above declared and stored (`rupu auth
+status`, table renderer, unedited). Note two things this shorthand
+sample got wrong: **the eight built-in vendor names are always listed
+first, unconditionally** — this is a back-compat requirement, so a
+single-account user with no `[providers.*]` config still sees the same
+table they see today — with declared accounts appended after them in
+account-name order; and a present SSO credential renders with a leading
+`✓`, not bare `expires in Nd`. (The day counts below are one day lower
+than the login commands' "27d / 30d / 8d" because the sub-second gap
+between storing and reading truncates the last partial day — an
+artifact of capture timing, not a real precision guarantee.)
+
 ```
 $ rupu auth status
-ACCOUNT             KIND        API KEY   SSO
-anthropic-work      anthropic   -         expires in 27d
-anthropic-personal  anthropic   -         expires in 30d
-openai-work         openai      -         expires in 8d
-openai-personal     openai      ✓         -
-gh-work             github      -         no expiry
-gh-personal         github      -         no expiry
+ ACCOUNT              KIND        API KEY   SSO
+──────────────────── ─────────── ───────── ──────────────────
+ anthropic            anthropic   —         —
+ openai               openai      —         —
+ gemini               gemini      —         —
+ copilot              copilot     —         —
+ github               -           —         —
+ gitlab               -           —         —
+ linear               -           —         —
+ jira                 -           —         —
+ anthropic-personal   anthropic   —         ✓ expires in 29d
+ anthropic-work       anthropic   —         ✓ expires in 26d
+ gh-personal          github      —         ✓ no expiry
+ gh-work              github      —         ✓ no expiry
+ openai-personal      openai      ✓         —
+ openai-work          openai      —         ✓ expires in 7d
 ```
+
+(The four built-in SCM/issue-tracker vendors — `github`, `gitlab`,
+`linear`, `jira` — show `KIND -` in their built-in row: they have no
+`[providers.<name>]` declaration of their own, and unlike the four LLM
+vendors, `rupu-runtime`'s kind resolver deliberately doesn't fall back
+to the bare name for them — see `rupu_runtime::provider_factory::
+is_builtin_provider`'s doc comment. This is existing, correct behavior,
+not something this arc changed.)
 
 ```yaml
 ---

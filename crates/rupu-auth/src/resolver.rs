@@ -540,8 +540,18 @@ impl CredentialResolver for KeychainResolver {
                     return Ok((mode, sc.credentials));
                 }
             }
-            if let Some(creds) = Self::env_api_key(provider) {
-                return Ok((AuthMode::ApiKey, creds));
+            // Only fall back to the env API key when the caller didn't
+            // explicitly ask for SSO. An explicit `hint = Some(Sso)` (e.g.
+            // an agent's `auth: sso` frontmatter) means the user chose SSO
+            // on purpose; silently handing back an API key just because
+            // `RUPU_<VENDOR>_API_KEY` happens to be set would violate that
+            // choice (docs/providers.md's "no automatic fall-back to
+            // API-key" invariant) and mask the real problem — no SSO
+            // credential is stored.
+            if hint != Some(AuthMode::Sso) {
+                if let Some(creds) = Self::env_api_key(provider) {
+                    return Ok((AuthMode::ApiKey, creds));
+                }
             }
             anyhow::bail!(
                 "no credentials configured for {provider}. \

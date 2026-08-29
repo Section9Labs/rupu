@@ -31,7 +31,11 @@ PR backends — no `scm.*` repo, branch, PR/MR, or clone support.
 
 `rupu auth login --provider <github|gitlab|linear|jira> --mode <api-key|sso>` stores tokens
 in the OS keychain. Same flow as Slice B-1's LLM-provider auth; `rupu auth status`
-picks up SCM rows automatically.
+picks up SCM rows automatically. `--provider` is an alias for `--account` — a
+work identity and a personal identity on the same platform can coexist as two
+named accounts (`--account gh-work --kind github`, `--account gh-personal
+--kind github`); see `docs/providers.md`'s "Accounts vs. vendor kind" for the
+full mechanism.
 
 GitHub uses a device-code SSO flow; GitLab uses browser-callback PKCE. Required
 scopes:

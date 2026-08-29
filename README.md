@@ -315,7 +315,11 @@ matches `gh`, `aws`, `gcloud`). To use the OS keychain instead:
 `rupu auth backend --use keychain`. SSO entries auto-refresh near expiry;
 failure surfaces an actionable error pointing at `rupu auth login --mode sso`.
 
-See `docs/providers.md` for the full reference and `docs/providers/<name>.md`
+`--provider` above is an alias for `--account` — one credential per
+vendor is the default, but `--account <name> --kind <vendor>` (e.g.
+`--account anthropic-work --kind anthropic`) declares a second,
+independently-credentialed account of the same vendor. See
+`docs/providers.md` for the full reference and `docs/providers/<name>.md`
 for per-provider walkthroughs.
 
 ## SCM & issue trackers
@@ -323,7 +327,8 @@ for per-provider walkthroughs.
 rupu integrates with GitHub and GitLab through a single embedded MCP
 server. Agents call typed tools (`scm.prs.diff`, `issues.get`, ...) and
 the right per-platform connector dispatches the call. See `docs/scm.md`
-for the full reference.
+for the full reference — including `--account`/`--kind` for a second
+account of the same platform (e.g. work vs. personal GitHub).
 
 ```bash
 # 1. Authenticate

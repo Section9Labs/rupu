@@ -14,14 +14,38 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 
 Anthropic remains the most exercised provider; Copilot's API-key path is most reliable for users who already have `gh auth login` configured.
 
+## Accounts vs. vendor kind
+
+A provider *name* used to mean two things at once: which credential to use, and which vendor client to build. They're now split:
+
+- **Account** — the identity. Whatever you pass to `--account` (below) is a credential slot: `anthropic`, `anthropic-work`, `gh-personal`, ... Freeform, and it's what an agent's `provider:` frontmatter field names.
+- **`kind`** — the vendor. Selects which client authenticates the account: `anthropic`, `openai`, `gemini`, `copilot`, `github`, `gitlab`, `linear`, `jira`, or `openai-compatible` (see below).
+
+A bare vendor name used as the account (`--account anthropic`) needs no `--kind` — the account name *is* the vendor, exactly like before this existed, and every example below that uses a plain provider name still works unchanged. To hold a second account of the same vendor — a work identity and a personal identity, each with an independent credential including an independent SSO token — give it a distinct name and its vendor via `--kind`:
+
+```sh
+rupu auth login --account anthropic-work     --kind anthropic --mode sso
+rupu auth login --account anthropic-personal --kind anthropic --mode sso
+```
+
+The first time a new account name is used with `--kind`, rupu writes `[providers.<account>] kind = "<kind>"` into `~/.rupu/config.toml` so every later resolution (agent frontmatter, `rupu auth status`, credential refresh) knows that account's vendor. `--kind` is only required the first time an account is created — after that it's inferred from the config entry. Point an agent at a specific account the same way you'd point it at any provider: `provider: anthropic-work` in the frontmatter.
+
+`--account` accepts `--provider` as an alias throughout this document's examples, for scripts and muscle memory from before this feature existed.
+
+### Per-account API key env var
+
+`RUPU_<UPPER_ACCOUNT>_API_KEY` is read as a fallback when no stored credential exists for that account (unless the caller explicitly asked for SSO — see "Refresh" below; SSO never silently falls back to an API key). Non-alphanumeric characters in the account name map to `_`, so `anthropic-work`, `anthropic_work`, and `anthropic.work` all read the *same* variable, `RUPU_ANTHROPIC_WORK_API_KEY` — distinct accounts whose names only differ by punctuation collide on this fallback. Pick account names that stay distinct once mangled if you rely on it for more than one of them.
+
 ## Auth flows
 
 ### API key
 
 ```sh
-rupu auth login --provider <name> --mode api-key --key <secret>
+rupu auth login --account <name> --mode api-key --key <secret>
 # or omit --key to read from stdin
-echo -n "$KEY" | rupu auth login --provider <name> --mode api-key
+echo -n "$KEY" | rupu auth login --account <name> --mode api-key
+# a second account of the same vendor needs --kind the first time:
+rupu auth login --account <name> --kind <vendor> --mode api-key --key <secret>
 ```
 
 Stored in the OS keychain at `rupu/<provider>/api-key`.
@@ -29,7 +53,7 @@ Stored in the OS keychain at `rupu/<provider>/api-key`.
 ### SSO browser callback (Anthropic, OpenAI, Gemini)
 
 ```sh
-rupu auth login --provider <name> --mode sso
+rupu auth login --account <name> --mode sso
 ```
 
 Steps:
@@ -44,7 +68,7 @@ Steps:
 ### SSO device code (Copilot)
 
 ```sh
-rupu auth login --provider copilot --mode sso
+rupu auth login --account copilot --mode sso
 ```
 
 Steps:
@@ -59,19 +83,19 @@ Steps:
 When an agent file declares `provider: anthropic` without an explicit `auth:` field, the credential resolver applies this order:
 1. SSO entry if present and not expired beyond refresh.
 2. API-key entry if present.
-3. Error: `no credentials configured for <provider>. Run: rupu auth login --provider <name> --mode <api-key|sso>`.
+3. Error: `no credentials configured for <account>. Run: rupu auth login --account <account> --mode <api-key|sso>`.
 
 To force a specific mode, set `auth: api-key` or `auth: sso` in the agent's YAML frontmatter.
 
 ### Refresh
 
-SSO access tokens expire (typically 1 hour). The resolver pre-emptively refreshes when `expires_at - now < 60s` on a `get()` call, using the stored refresh token. On refresh failure: `<provider> SSO token expired and refresh failed: <reason>. Run: rupu auth login --provider <name> --mode sso`. There is no automatic fall-back to API-key — the user explicitly chose SSO.
+SSO access tokens expire (typically 1 hour). The resolver pre-emptively refreshes when `expires_at - now < 60s` on a `get()` call, using the stored refresh token. On refresh failure: an actionable error naming the account and pointing at `rupu auth login --account <name> --mode sso`. There is no automatic fall-back to API-key — the user explicitly chose SSO.
 
 ### Logout
 
 ```sh
-rupu auth logout --provider <name>             # both api-key and sso
-rupu auth logout --provider <name> --mode sso  # just one
+rupu auth logout --account <name>             # both api-key and sso
+rupu auth logout --account <name> --mode sso  # just one
 rupu auth logout --all                         # all credentials (with confirmation)
 rupu auth logout --all --yes                   # skip confirmation
 ```
@@ -116,9 +140,17 @@ max_output = 16000
 
 ## OpenAI-compatible providers (Oracle GenAI, vLLM, …)
 
-The `openai-compatible` kind connects rupu to any server that speaks the
-`/v1/chat/completions` API with a static Bearer key — self-hosted vLLM,
-Oracle GenAI, Together, Fireworks, OpenRouter, and similar endpoints.
+`kind` is not exclusive to this section — it accepts any built-in vendor
+name (`anthropic`, `openai`, `gemini`, `copilot`, `github`, `gitlab`,
+`linear`, `jira`) and is the mechanism for declaring a second account of
+a vendor you already use under its bare name; see "Accounts vs. vendor
+kind" above. `kind = "openai-compatible"` is the one value that selects
+a different, generic client instead of a specific vendor: it connects
+rupu to any server that speaks the `/v1/chat/completions` API with a
+static Bearer key — self-hosted vLLM, Oracle GenAI, Together, Fireworks,
+OpenRouter, and similar endpoints. It's also the only kind that
+*requires* `base_url` and `default_model` (enforced at config load —
+every other kind infers its endpoint from the vendor).
 
 ### Config (`~/.rupu/config.toml`)
 
@@ -148,10 +180,12 @@ Only API-key auth is supported for openai-compatible providers — there is
 no SSO flow.
 
 ```sh
-# Store the Bearer key (written to auth.json, mode 0600):
-rupu auth login --provider oracle --mode api-key   # prompts for the key
+# Store the Bearer key (written to auth.json, mode 0600). The account
+# already has `kind = "openai-compatible"` declared in config above, so
+# --kind isn't needed here:
+rupu auth login --account oracle --mode api-key   # prompts for the key
 # …or pipe from stdin / paste inline:
-echo -n "$KEY" | rupu auth login --provider oracle --mode api-key
+echo -n "$KEY" | rupu auth login --account oracle --mode api-key
 ```
 
 For CI / ephemeral environments, set the env var instead (rupu reads it
@@ -161,7 +195,9 @@ automatically and does not require a prior `rupu auth login`):
 export RUPU_ORACLE_API_KEY=sk-...
 ```
 
-The env var name is always `RUPU_<UPPERCASED_PROVIDER_NAME>_API_KEY`.
+The env var name is always `RUPU_<UPPERCASED_ACCOUNT_NAME>_API_KEY`, with
+non-alphanumeric characters in the account name mapped to `_` — see the
+collision caveat under "Per-account API key env var" above.
 
 ### Running an agent
 
@@ -213,7 +249,7 @@ If the agent's `model:` value isn't found in any source, rupu errors with:
 ## Troubleshooting
 
 **`rupu auth status` shows `✓` but `rupu run` errors with Unauthorized.**
-The token may have expired faster than the refresh window expected. Re-login with `rupu auth login --provider <name> --mode sso`. If api-key, the key was rotated server-side — generate a new one and re-login.
+The token may have expired faster than the refresh window expected. Re-login with `rupu auth login --account <name> --mode sso`. If api-key, the key was rotated server-side — generate a new one and re-login.
 
 **SSO login fails on a server / over SSH.**
 The browser-callback flow can't reach a desktop. Use `--mode api-key`. Copilot's device-code SSO is the only flow that works headless — visit the URL from any browser anywhere and the polling completes.
@@ -228,7 +264,7 @@ Plan 1 didn't wire the AI Studio API-key endpoint (the lifted client only suppor
 macOS treats each freshly-built binary as a different code identity. Track the deferred signing/notarization work in `TODO.md`. Quick fix: click "Always Allow" once on the first prompt — the trust persists per binary path until the next rebuild.
 
 **`rupu auth logout --all` removes credentials I didn't expect.**
-By design — `--all` iterates every provider × mode. Use `--provider <name>` (with optional `--mode <m>`) for surgical removals.
+By design — `--all` iterates every stored account × mode. Use `--account <name>` (with optional `--mode <m>`) for surgical removals.
 
 ## Deferred / future
 

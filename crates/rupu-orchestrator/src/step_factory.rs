@@ -1674,7 +1674,9 @@ mod kind_resolution_end_to_end_tests {
     use super::DefaultStepFactory;
     use crate::runner::StepFactory;
     use crate::workflow::Workflow;
+    use serial_test::serial;
     use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     const WF: &str = r#"
 name: w
@@ -1683,6 +1685,42 @@ steps:
     agent: ag_acct_x
     prompt: p
 "#;
+
+    /// This test mutates the process-global `RUPU_AUTH_FILE` env var,
+    /// which `KeychainResolver::new()` reads unconditionally — including
+    /// the five other tests in this binary that construct one. Bare
+    /// `set_var`/`remove_var` (the prior implementation) also left the
+    /// var set for the rest of the process if the test panicked between
+    /// the two calls. Neither window could currently produce a false
+    /// pass (the other constructions don't depend on the path), but both
+    /// are real non-hermetic gaps — closed with the same
+    /// `ENV_LOCK` + `EnvVarGuard` pattern `accounts_sso_e2e.rs` and
+    /// `cli_auth.rs` already use.
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// RAII guard: sets an env var for the test's duration and restores
+    /// whatever value (if any) was already there on drop, even on panic.
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn write_agent_pinned_to_named_account(global: &std::path::Path) {
         let agents_dir = global.join("agents");
@@ -1695,7 +1733,9 @@ steps:
     }
 
     #[tokio::test]
+    #[serial]
     async fn a_step_naming_a_declared_multi_account_resolves_its_kind() {
+        let _guard = ENV_LOCK.lock().await;
         let tmp = assert_fs::TempDir::new().unwrap();
         write_agent_pinned_to_named_account(tmp.path());
 
@@ -1703,20 +1743,24 @@ steps:
         // at a temp file via `RUPU_AUTH_FILE` so this never touches the
         // developer's real `~/.rupu/auth.json`.
         let auth_path = tmp.path().join("auth.json");
-        std::env::set_var("RUPU_AUTH_FILE", &auth_path);
-        let resolver = rupu_auth::KeychainResolver::new();
-        // `store_named` writes `<name>/<mode>` unconditionally — no
-        // `AccountSpec` declaration needed for this to be readable back via
-        // the resolver's `get_named` fallback path.
-        resolver
-            .store_named(
-                "acct-x",
-                rupu_providers::AuthMode::ApiKey,
-                &rupu_auth::StoredCredential::api_key("dummy-key-for-kind-resolution-test"),
-            )
-            .await
-            .unwrap();
-        std::env::remove_var("RUPU_AUTH_FILE");
+        let resolver = {
+            let _env = EnvVarGuard::set("RUPU_AUTH_FILE", &auth_path);
+            let resolver = rupu_auth::KeychainResolver::new();
+            // `store_named` writes `<name>/<mode>` unconditionally — no
+            // `AccountSpec` declaration needed for this to be readable back
+            // via the resolver's `get_named` fallback path.
+            resolver
+                .store_named(
+                    "acct-x",
+                    rupu_providers::AuthMode::ApiKey,
+                    &rupu_auth::StoredCredential::api_key("dummy-key-for-kind-resolution-test"),
+                )
+                .await
+                .unwrap();
+            resolver
+            // `_env` drops here, restoring `RUPU_AUTH_FILE` before any
+            // other test in this binary can observe our temp path.
+        };
 
         let mut f = DefaultStepFactory {
             workflow: Workflow::parse(WF).expect("workflow must parse"),

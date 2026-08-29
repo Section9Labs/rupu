@@ -29,6 +29,12 @@ impl EnvVarGuard {
         std::env::remove_var(key);
         Self { key, prior }
     }
+
+    fn set(key: &'static str, value: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prior }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -143,6 +149,56 @@ async fn the_service_argument_no_longer_selects_a_store() {
         .expect("a differently-named resolver must see the same file");
     match creds {
         rupu_providers::auth::AuthCredentials::ApiKey { key } => assert_eq!(key, "sk-shared"),
+        other => panic!("expected api-key creds, got {other:?}"),
+    }
+
+    std::env::remove_var("RUPU_AUTH_FILE");
+}
+
+/// An explicit `hint = Some(Sso)` must never be silently satisfied by
+/// the `RUPU_<VENDOR>_API_KEY` env fallback. Before this fix, `get`'s
+/// vendor branch fell through to `env_api_key` unconditionally once no
+/// stored credential matched any mode in `modes` — which for an SSO
+/// hint is a one-element `[Sso]` list, so a missing stored SSO
+/// credential plus a present env API key silently returned an API key
+/// instead of erroring. That violates docs/providers.md's invariant
+/// that SSO never automatically falls back to API-key: the user chose
+/// SSO on purpose (e.g. an agent's `auth: sso` frontmatter), and a
+/// silent substitution masks the real problem (no SSO credential
+/// stored) instead of surfacing it.
+#[tokio::test]
+#[serial]
+async fn explicit_sso_hint_is_not_satisfied_by_env_api_key() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    std::env::set_var("RUPU_AUTH_FILE", auth_path.as_os_str());
+    let _env_guard = EnvVarGuard::set("RUPU_ANTHROPIC_API_KEY", "sk-should-not-be-used");
+
+    let r = KeychainResolver::new();
+
+    // No stored credential of any kind for anthropic, but the env
+    // fallback key IS set. An explicit SSO hint must still error.
+    let err = r
+        .get("anthropic", Some(AuthMode::Sso))
+        .await
+        .expect_err("an explicit SSO hint must not be satisfied by an env API key");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("sk-should-not-be-used"),
+        "error must not leak the env api key: {msg}"
+    );
+
+    // With no hint at all, the same env key IS still a valid fallback
+    // (unconstrained precedence: SSO then API key then env).
+    let (mode, creds) = r
+        .get("anthropic", None)
+        .await
+        .expect("unhinted get should still fall back to the env api key");
+    assert_eq!(mode, AuthMode::ApiKey);
+    match creds {
+        rupu_providers::auth::AuthCredentials::ApiKey { key } => {
+            assert_eq!(key, "sk-should-not-be-used")
+        }
         other => panic!("expected api-key creds, got {other:?}"),
     }
 

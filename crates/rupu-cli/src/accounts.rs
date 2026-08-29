@@ -53,8 +53,13 @@ mod tests {
         assert_eq!(work.kind, "anthropic");
         // openai-compatible accounts are declared too: they have no
         // ProviderId, so `resolve_provider_id` returns None for them and
-        // `get` routes them to `get_named`, which is correct.
-        assert!(specs.iter().any(|s| s.name == "oracle"));
+        // `get` routes them to `get_named`, which is correct. Pin the
+        // kind itself, not just presence — `AccountSpec.kind` is exactly
+        // what `resolve_provider_id` inspects to decide "no ProviderId,
+        // route to get_named", so an unpinned kind here would let that
+        // routing decision silently drift.
+        let oracle = specs.iter().find(|s| s.name == "oracle").unwrap();
+        assert_eq!(oracle.kind, "openai-compatible");
     }
 
     /// An empty config must yield an empty list, so `resolver_for` is

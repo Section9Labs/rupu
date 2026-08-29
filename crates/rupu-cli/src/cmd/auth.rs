@@ -502,8 +502,12 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
         // `anthropic-work` is a key `forget`'s built-in-only sweep can
         // never see, which would let `--all` report success while
         // leaving named accounts' credentials behind.
-        resolver.forget_all().await?;
-        println!("rupu: cleared all credentials");
+        let n = resolver.forget_all().await?;
+        if n == 0 {
+            println!("rupu: no stored credentials to clear");
+        } else {
+            println!("rupu: cleared {n} credential(s)");
+        }
         return Ok(());
     }
     let account = opts
@@ -1069,7 +1073,11 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         prefs,
         report: AuthStatusReport {
             kind: "auth_status",
-            version: 1,
+            // v1 rows were `{provider, api_key, sso}`. v2 renamed
+            // `provider` to `account` and added `kind` (multi-account
+            // providers arc) — an external `jq '.rows[].provider'`
+            // consumer must see the schema change, not a silent null.
+            version: 2,
             rows,
         },
         csv_rows,
@@ -1155,6 +1163,13 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "this is not = = toml").unwrap();
         assert!(declare_account_in_config(&path, "x", "openai").is_err());
+        // Erroring is not enough on its own — the error message promises
+        // "writing would discard its contents", so pin that the file is
+        // untouched rather than truncated-then-errored.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is not = = toml"
+        );
     }
 
     /// A comment in the existing config must survive an unrelated
