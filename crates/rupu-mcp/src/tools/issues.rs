@@ -1,4 +1,4 @@
-//! issues.{list, get, comment, create, update_state} tools.
+//! issues.{list, get, comments, comment, create, update_state} tools.
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -34,6 +34,15 @@ pub struct CommentIssueArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct ListCommentsArgs {
+    pub tracker: Option<String>,
+    pub project: String,
+    pub number: u64,
+    /// Maximum comments to return, oldest-first. Defaults to 100.
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct CreateIssueArgs {
     pub tracker: Option<String>,
     pub project: String,
@@ -63,6 +72,12 @@ pub fn specs() -> Vec<ToolSpec> {
             name: "issues.get",
             description: "Fetch a single issue by number. Returns title, body, state, labels, author, timestamps.",
             input_schema: serde_json::to_value(schemars::schema_for!(GetIssueArgs)).unwrap(),
+            kind: ToolKind::Read,
+        },
+        ToolSpec {
+            name: "issues.comments",
+            description: "Read an issue's comment thread, oldest-first. Returns id, author, body, created_at per comment.",
+            input_schema: serde_json::to_value(schemars::schema_for!(ListCommentsArgs)).unwrap(),
             kind: ToolKind::Read,
         },
         ToolSpec {
@@ -123,6 +138,21 @@ pub async fn dispatch_get(args: Value, reg: &Registry) -> Result<String, McpErro
     Ok(serde_json::to_string(&conn.get_issue(&r).await?).unwrap())
 }
 
+pub async fn dispatch_comments(args: Value, reg: &Registry) -> Result<String, McpError> {
+    let parsed: ListCommentsArgs =
+        serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
+    let tracker = resolve_tracker(parsed.tracker.as_deref(), reg)?;
+    let r = IssueRef {
+        tracker,
+        project: parsed.project,
+        number: parsed.number,
+    };
+    let conn = reg
+        .issues(tracker)
+        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {tracker}")))?;
+    Ok(serde_json::to_string(&conn.list_comments(&r, parsed.limit).await?).unwrap())
+}
+
 pub async fn dispatch_comment(args: Value, reg: &Registry) -> Result<String, McpError> {
     let parsed: CommentIssueArgs =
         serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
@@ -180,5 +210,28 @@ fn resolve_tracker(arg: Option<&str>, reg: &Registry) -> Result<IssueTracker, Mc
         None => reg.default_tracker().ok_or_else(|| {
             McpError::InvalidArgs("no tracker arg and no [issues.default] configured".into())
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comments_tool_is_in_catalog_and_is_read_kind() {
+        let s = specs();
+        let spec = s
+            .iter()
+            .find(|s| s.name == "issues.comments")
+            .expect("issues.comments must be in the issues tool catalog");
+        // Read-kind matters: a readonly permission mode must still be
+        // able to read a comment thread, which is the whole point of the
+        // operator control channel.
+        assert_eq!(spec.kind, ToolKind::Read);
+        let schema = &spec.input_schema;
+        let props = &schema["properties"];
+        assert!(props.get("project").is_some(), "project is required input");
+        assert!(props.get("number").is_some(), "number is required input");
+        assert!(props.get("limit").is_some(), "limit is an accepted input");
     }
 }

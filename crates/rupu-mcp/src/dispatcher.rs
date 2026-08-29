@@ -54,6 +54,7 @@ impl ToolDispatcher {
             "scm.prs.create" => tools::scm_prs::dispatch_create(args, &self.registry).await,
             "issues.list" => tools::issues::dispatch_list(args, &self.registry).await,
             "issues.get" => tools::issues::dispatch_get(args, &self.registry).await,
+            "issues.comments" => tools::issues::dispatch_comments(args, &self.registry).await,
             "issues.comment" => tools::issues::dispatch_comment(args, &self.registry).await,
             "issues.create" => tools::issues::dispatch_create(args, &self.registry).await,
             "issues.update_state" => {
