@@ -410,30 +410,43 @@ impl Registry {
         })
     }
 
-    /// Resolve which account's `IssueConnector` serves `tracker`. Unlike
-    /// `repo_for`, there is no `RepoRef`/`cwd` here — `issues_for`'s
-    /// callers key off a tracker + project string, not a repo — so only
-    /// the explicit and sole-account tiers of the rule engine can ever
-    /// fire; owner/path rules need a `RepoRef`/`cwd` this signature
-    /// doesn't carry. `project` is not currently consumed by resolution;
-    /// it is threaded through purely so ambiguity errors can name what
-    /// was being looked up.
+    /// Resolve which account's `IssueConnector` serves `tracker`, running
+    /// the same rule engine `repo_for` runs whenever a `RepoRef` is known
+    /// — owner and path rules need the caller's `RepoRef`/`cwd`/`home`
+    /// exactly the way `repo_for` does, and dropping them here would
+    /// reproduce the very defect this arc exists to fix (spec §1: "the
+    /// owner is already in scope at these call sites and is currently
+    /// discarded"). `rupu issues list --repo acme/api` builds a full
+    /// `RepoRef` before calling in — passing it through is what lets an
+    /// `acme/* -> gh-work` rule actually select an account for it.
+    ///
+    /// **Linear and Jira genuinely have no `RepoRef`** — a tracker
+    /// project string like `"ENG"` is not an owner/repo pair. Their
+    /// callers pass `repo: None`, and only the explicit and sole-account
+    /// tiers can ever resolve for them. That is correct, not a gap to
+    /// close: it's the same reason `EventSourceRef::TrackerProject`
+    /// needs an explicit `account` field on the trigger config (Task 6) —
+    /// there is no owner/path to infer one from.
     pub fn issues_for(
         &self,
         tracker: IssueTracker,
-        project: Option<&str>,
+        repo: Option<&RepoRef>,
+        cwd: Option<&Path>,
+        home: Option<&Path>,
         explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<dyn IssueConnector>), AccountError> {
         let candidates = self.accounts_for_tracker(tracker);
         let resolution =
-            rules::resolve_account(&self.rules, None, None, None, explicit, &candidates);
+            rules::resolve_account(&self.rules, repo, cwd, home, explicit, &candidates);
         match resolution {
             Resolution::Explicit(id)
             | Resolution::Owner(id)
             | Resolution::Path(id)
             | Resolution::SoleAccount(id) => self.lookup_issues(id, tracker, &candidates),
             Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
-                repo: project.unwrap_or("(no project given)").to_string(),
+                repo: repo
+                    .map(|r| format!("{}/{}", r.owner, r.repo))
+                    .unwrap_or_else(|| format!("({tracker} lookup)")),
                 platform: tracker.to_string(),
                 candidates,
             }),
@@ -604,6 +617,22 @@ impl Registry {
             .entry(id)
             .or_insert_with(|| ScmAccount::empty(kind))
             .repo = Some(c);
+    }
+
+    /// Test/internal: register an `IssueConnector` under an explicit
+    /// account name and kind — the `issues_for` counterpart to
+    /// `insert_repo_account`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn insert_issue_account(
+        &mut self,
+        id: AccountId,
+        kind: Platform,
+        c: Arc<dyn IssueConnector>,
+    ) {
+        self.accounts
+            .entry(id)
+            .or_insert_with(|| ScmAccount::empty(kind))
+            .issues = Some(c);
     }
 
     /// Test/internal: register an `IssueConnector` directly without going
@@ -859,6 +888,12 @@ mod tests {
         Arc::new(FakeRepoConnector(Platform::Github))
     }
 
+    /// `issues_for` counterpart to `fake_repo_connector` — same reasoning:
+    /// the `IssueTracker` baked into the fake is irrelevant to resolution.
+    fn fake_issue_connector() -> Arc<dyn IssueConnector> {
+        Arc::new(FakeIssueConnector(IssueTracker::Github))
+    }
+
     #[test]
     fn resolve_configured_default_distinguishes_unset_available_and_unavailable() {
         // I-15 follow-up: `default_platform`/`default_tracker` warn when a
@@ -1053,6 +1088,42 @@ mod tests {
             repo: "api".into(),
         };
         let (id, _) = reg.repo_for(&r, None, None).unwrap();
+        assert_eq!(id, AccountId::new("gh-work"));
+    }
+
+    /// Companion assertion to `an_owner_rule_selects_between_two_accounts`:
+    /// the same rule must resolve through `issues_for`, not just
+    /// `repo_for` — `rupu issues list --repo acme/api` builds a full
+    /// `RepoRef` and must not discard the owner the way the pre-Arc-2
+    /// call sites did (spec §1's original defect). Fails against a
+    /// version of `issues_for` that calls `resolve_account` with
+    /// `None, None, None` regardless of what `repo`/`cwd` it was handed.
+    #[tokio::test]
+    async fn an_owner_rule_selects_between_two_accounts_through_issues_for() {
+        let mut reg = Registry::default();
+        reg.insert_issue_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_issue_connector(),
+        );
+        reg.insert_issue_account(
+            AccountId::new("gh-personal"),
+            Platform::Github,
+            fake_issue_connector(),
+        );
+        reg.set_rules(vec![Rule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: AccountId::new("gh-work"),
+        }]);
+        let r = RepoRef {
+            platform: Platform::Github,
+            owner: "acme".into(),
+            repo: "api".into(),
+        };
+        let (id, _) = reg
+            .issues_for(IssueTracker::Github, Some(&r), None, None, None)
+            .expect("owner rule must resolve through issues_for");
         assert_eq!(id, AccountId::new("gh-work"));
     }
 
