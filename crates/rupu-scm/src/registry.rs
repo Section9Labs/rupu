@@ -118,6 +118,44 @@ fn platform_for_tracker(t: IssueTracker) -> Option<Platform> {
     }
 }
 
+/// Whether `discover` should warn about a declared `[scm.<name>]` table
+/// whose `kind` never resolved to a `Platform` (see the call site in
+/// `discover`'s account loop).
+///
+/// Pure and unit-tested directly — the crate has no tracing-capture
+/// harness, so this is the coverage seam for the decision instead of the
+/// `warn!` call itself.
+///
+/// `declared` is `platform_cfg.is_some()`: only a real `[scm.<name>]`
+/// table can be a mistake worth flagging. The two implicit bare-name
+/// probes (`"github"`, `"gitlab"` with no config table) are the normal
+/// "no config for this built-in vendor" case, not a mistake — never warn
+/// for those.
+///
+/// Among declared tables, `"linear"`/`"jira"` are excluded on purpose,
+/// not by omission: they are legitimate declared `[scm.<name>]` tables
+/// (carrying e.g. a self-hosted `base_url` — see `docs/using-rupu.md`'s
+/// `[scm.jira]` example and `registry_discover.rs`'s
+/// `jira_event_connector_built_when_credential_present`), and for them
+/// `kind` can *never* resolve to a `Platform` — `Platform` only has
+/// `Github`/`Gitlab`, so neither a declared `kind` nor the name-is-the-
+/// vendor fallback can ever succeed. That is correct, not a config
+/// mistake: Linear/Jira are handled by `discover`'s separate tracker
+/// segment. Warning here on every `discover()` call for a documented,
+/// working Jira/Linear config would be worse than the silent drop this
+/// warn exists to replace — noise on a correct setup erodes trust in the
+/// warning faster than it helps anyone. The principled test is "does
+/// this name parse as an `IssueTracker` with no matching `Platform`" —
+/// i.e. exactly Linear/Jira — rather than hardcoding the two strings, so
+/// a future tracker-only vendor added to `IssueTracker` is excluded for
+/// free instead of silently starting to warn.
+fn should_warn_unresolvable_kind(name: &str, declared: bool) -> bool {
+    if !declared {
+        return false;
+    }
+    !matches!(name.parse::<IssueTracker>(), Ok(t) if platform_for_tracker(t).is_none())
+}
+
 impl Registry {
     /// Discover connectors from configured credentials. Every configured
     /// account (`[scm.<name>]`) is probed independently, plus the two
@@ -195,11 +233,12 @@ impl Registry {
                 // or misspelled `kind` (spec §3.1 requires it for any
                 // non-vendor account name), since `Config::validate`
                 // never inspects `cfg.scm.platforms`. Warn so the account
-                // doesn't just vanish with no trace. Stay silent for the
-                // implicit bare-name probes (`platform_cfg.is_none()`) —
-                // that's the normal "no config for this built-in vendor"
-                // case, not a mistake.
-                if platform_cfg.is_some() {
+                // doesn't just vanish with no trace. But see
+                // `should_warn_unresolvable_kind`'s doc: stay silent for
+                // the implicit bare-name probes AND for legitimate
+                // declared Linear/Jira tables, neither of which is a
+                // mistake.
+                if should_warn_unresolvable_kind(&name, platform_cfg.is_some()) {
                     warn!(
                         account = %name,
                         "scm: account declares no resolvable kind; skipping"
@@ -1484,5 +1523,38 @@ mod tests {
             msg.contains("--owner 'other/*'"),
             "fix line must be copy-pasteable from the failed repo's owner, not a placeholder: {msg}"
         );
+    }
+
+    // ── should_warn_unresolvable_kind (review round 3, finding 1) ──────
+
+    /// A declared `[scm.gh-work]` (or any name that is neither a known
+    /// `Platform` nor a known `IssueTracker`) with a missing/misspelled
+    /// `kind` is the mistake this warn exists to catch.
+    #[test]
+    fn warns_on_a_declared_account_with_an_unresolvable_kind() {
+        assert!(should_warn_unresolvable_kind("gh-work", true));
+        assert!(should_warn_unresolvable_kind("gihub", true));
+    }
+
+    /// `[scm.jira]`/`[scm.linear]` are legitimate declared tables (e.g.
+    /// carrying a self-hosted `base_url` — see `docs/using-rupu.md`'s
+    /// `[scm.jira]` example) whose `kind` can never resolve to a
+    /// `Platform`, because `Platform` only has `Github`/`Gitlab`. Must
+    /// stay silent — this is the exact regression the coordinator caught
+    /// in round 2's fix.
+    #[test]
+    fn does_not_warn_on_a_declared_tracker_only_account() {
+        assert!(!should_warn_unresolvable_kind("jira", true));
+        assert!(!should_warn_unresolvable_kind("linear", true));
+    }
+
+    /// The two implicit bare-name probes (`platform_cfg.is_none()`, i.e.
+    /// `declared: false`) are the normal "no config for this built-in
+    /// vendor" case — never a mistake, regardless of name.
+    #[test]
+    fn does_not_warn_when_the_account_was_not_declared() {
+        assert!(!should_warn_unresolvable_kind("github", false));
+        assert!(!should_warn_unresolvable_kind("gh-work", false));
+        assert!(!should_warn_unresolvable_kind("anything", false));
     }
 }
