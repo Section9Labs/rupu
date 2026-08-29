@@ -591,7 +591,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // same resolver instance can also be handed to `CliAgentDispatcher`
         // below without a second construction; existing call sites that need
         // `&dyn CredentialResolver` now go through `resolver.as_ref()`.
-        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
         // Build the SCM/issue registry from the same resolver + config the
         // LLM provider factory uses. Cheap when no platforms are configured;

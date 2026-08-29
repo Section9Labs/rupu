@@ -224,10 +224,10 @@ async fn rebuild_opts_from_disk(
     // Standard wiring (mirrors `run` above; refactor candidate but
     // keeping inline for now to avoid spreading the resume path
     // across the CLI surface).
-    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     // Netflow capture for this resumed run. This run's own linear steps
     // write to the SAME `<transcripts>/<run_id>.jsonl` file (mirrors

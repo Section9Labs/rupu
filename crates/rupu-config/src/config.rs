@@ -408,6 +408,23 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
+    /// `BUILTIN_PROVIDER_KINDS` grew from 9 to 13 entries when the four SCM
+    /// kinds (`github`/`gitlab`/`linear`/`jira`) were added, but nothing
+    /// pinned that they actually validate — the same shape of gap that let
+    /// an earlier regression ship green. Pin at least one of the four.
+    #[test]
+    fn validate_accepts_github_kind() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "github-work".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("github".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
     #[test]
     fn validate_rejects_unknown_kind() {
         let mut cfg = Config::default();

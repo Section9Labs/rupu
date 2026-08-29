@@ -222,6 +222,16 @@ pub fn resolve_kind_map(
 }
 
 /// True for provider names the factory builds directly (not openai-compatible).
+///
+/// Deliberately narrower than `rupu_config::config::BUILTIN_PROVIDER_KINDS`
+/// (9 names here vs. 13 there): this list is LLM-dispatchable kinds only —
+/// the ones this factory's `match kind { .. }` in
+/// [`build_for_provider_with_config`] actually knows how to build a client
+/// for. `BUILTIN_PROVIDER_KINDS` is broader because `rupu-config` validates
+/// what's *declarable* in `[providers.<name>]`, which also covers the four
+/// SCM kinds (`github`/`gitlab`/`linear`/`jira`) this factory never
+/// dispatches on. The two lists diverging is correct, not a bug — do not
+/// "fix" one to match the other.
 pub fn is_builtin_provider(name: &str) -> bool {
     matches!(
         name,

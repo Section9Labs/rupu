@@ -357,7 +357,7 @@ async fn login(
             anyhow::bail!("openai-compatible providers only support --mode api-key");
         };
         let secret = read_secret(key)?;
-        let resolver = rupu_auth::resolver::KeychainResolver::new();
+        let resolver = crate::accounts::resolver_for(&cfg);
         let sc = rupu_auth::stored::StoredCredential::api_key(secret);
         resolver
             .store_named(account, rupu_providers::AuthMode::ApiKey, &sc)
@@ -368,7 +368,7 @@ async fn login(
 
     let pid = rupu_auth::ProviderId::from_vendor_str(&kind)
         .ok_or_else(|| anyhow::anyhow!("unknown vendor kind: {kind}"))?;
-    let resolver = rupu_auth::resolver::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
     let mode_neutral: rupu_providers::AuthMode = mode.clone().into();
 
     match mode {
@@ -1006,7 +1006,6 @@ impl CollectionOutput for AuthStatusOutput {
 }
 
 async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let resolver = rupu_auth::resolver::KeychainResolver::new();
     let prefs = crate::output::diag::prefs_for_diag(false);
     let mut rows = Vec::new();
 
@@ -1015,6 +1014,7 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         .as_ref()
         .and_then(|g| rupu_config::layer_files_locked(Some(&g.join("config.toml")), None).ok())
         .unwrap_or_default();
+    let resolver = crate::accounts::resolver_for(&cfg);
 
     // Built-in vendor names always listed, so a single-account user sees
     // the same table as before.

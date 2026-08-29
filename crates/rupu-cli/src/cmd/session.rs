@@ -1327,7 +1327,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         );
     }
 
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
     // No run exists yet at this point, so this SCM traffic is not attributed
     // to a ledger. A run-routing FlowSink would close this; see the netflow
     // per-run plan.
@@ -6224,7 +6224,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
@@ -6550,7 +6550,7 @@ async fn run_compact_request(
             .as_deref(),
     )
     .unwrap_or_default();
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
 
     paths::ensure_dir(&session.transcripts_dir)?;
 
@@ -6856,7 +6856,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session

@@ -72,11 +72,16 @@ pub async fn handle(action: Action) -> ExitCode {
             // `[netflow]` rides along in the same load: the gate-sweep tick
             // (below) also drives the automatic ASN-table refresh, so it
             // needs `NetflowConfig` alongside `CpConfig`.
-            let (cp_runtime_cfg, netflow_cfg) = {
+            // `autoflow_resolver_accounts` rides along in the same load so
+            // the background autoflow tick below (an LLM-driving path) can
+            // build a resolver that knows this daemon's declared accounts,
+            // rather than one built from a config-less `KeychainResolver::new()`.
+            let (cp_runtime_cfg, netflow_cfg, autoflow_resolver_accounts) = {
                 let global_cfg_path = global_dir.join("config.toml");
                 let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None)
                     .unwrap_or_default();
-                (cfg.cp, cfg.netflow)
+                let accounts = crate::accounts::account_specs(&cfg);
+                (cfg.cp, cfg.netflow, accounts)
             };
             // Spawn the background resume worker. It builds the SAME
             // RunStore the CP's AppState does (`<global_dir>/runs`), so it
@@ -113,8 +118,9 @@ pub async fn handle(action: Action) -> ExitCode {
             // scheduler. Gated by `[cp].autoflow_reconcile_enabled`
             // (default: on); cadence from `[cp].autoflow_reconcile_interval_secs`
             // (default: 60s).
-            let autoflow_resolver: Arc<dyn rupu_auth::CredentialResolver> =
-                Arc::new(rupu_auth::KeychainResolver::new());
+            let autoflow_resolver: Arc<dyn rupu_auth::CredentialResolver> = Arc::new(
+                rupu_auth::KeychainResolver::new().with_accounts(autoflow_resolver_accounts),
+            );
             let autoflow_reconcile_handle = tokio::spawn(run_periodic_tick(
                 "autoflow-reconcile",
                 cp_runtime_cfg.autoflow_reconcile_enabled,

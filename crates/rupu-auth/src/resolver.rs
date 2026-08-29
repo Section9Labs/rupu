@@ -313,10 +313,25 @@ impl KeychainResolver {
         Self::env_api_key(account).is_some()
     }
 
-    /// Resolve a config-declared provider name to an api-key credential:
-    /// `auth.json["<name>/api-key"]` (or legacy `["<name>"]`), then
-    /// `RUPU_<UPPER_NAME>_API_KEY`.
+    /// Resolve a provider name that isn't in `self.accounts` and isn't a
+    /// bare vendor name either: `get`'s fallthrough for an
+    /// `openai-compatible` account (which can only ever have an api-key)
+    /// AND for any name the caller genuinely forgot to declare.
+    ///
+    /// Tries `auth.json["<name>/sso"]`, then `auth.json["<name>/api-key"]`
+    /// (or legacy `["<name>"]`), then `RUPU_<UPPER_NAME>_API_KEY` —
+    /// matching `get`'s SSO > API-key precedence, so an SSO credential
+    /// stored under an undeclared name is still readable rather than
+    /// silently shadowed by this being the api-key-only path it used to
+    /// be. Unlike `get`, this path never refreshes a near-expiry SSO
+    /// credential: refresh needs a `ProviderId` (`refresh_inner` takes a
+    /// `kind`), which by definition doesn't exist for a name that isn't
+    /// in `self.accounts` and isn't a vendor name — so a near-expiry
+    /// token here is returned as-is, not refreshed.
     async fn get_named(&self, provider: &str) -> Result<(AuthMode, AuthCredentials)> {
+        if let Some(sc) = self.read_account(provider, Some(provider), AuthMode::Sso)? {
+            return Ok((AuthMode::Sso, sc.credentials));
+        }
         if let Some(sc) = self.read_account(provider, Some(provider), AuthMode::ApiKey)? {
             return Ok((AuthMode::ApiKey, sc.credentials));
         }
@@ -918,6 +933,43 @@ mod tests {
         assert!(
             err.to_string().contains("anthropic-typo"),
             "error should name the offending string, got: {err}"
+        );
+    }
+
+    /// `get_named` is the fallthrough for any name not in `self.accounts`
+    /// (a typo, or a name the caller genuinely forgot to declare). Before
+    /// Task 7 it tried only `AuthMode::ApiKey`, so an SSO credential
+    /// stored under an undeclared name was silently unreadable even
+    /// though it was sitting right there in `auth.json`.
+    #[tokio::test]
+    async fn get_named_reads_sso_credential_under_an_undeclared_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let resolver = KeychainResolver {
+            path: path.clone(),
+            // Deliberately NOT declared, so `get` routes into `get_named`.
+            accounts: Vec::new(),
+        };
+
+        let sso = StoredCredential {
+            credentials: AuthCredentials::OAuth {
+                access: "undeclared-token".into(),
+                refresh: "undeclared-refresh".into(),
+                expires: 0,
+                extra: Default::default(),
+            },
+            refresh_token: Some("undeclared-refresh".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::days(30)),
+        };
+        resolver
+            .store_named("oracle-personal", AuthMode::Sso, &sso)
+            .await
+            .unwrap();
+
+        let (mode, creds) = resolver.get("oracle-personal", None).await.unwrap();
+        assert_eq!(mode, AuthMode::Sso);
+        assert!(
+            matches!(creds, AuthCredentials::OAuth { access, .. } if access == "undeclared-token")
         );
     }
 }
