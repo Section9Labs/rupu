@@ -89,7 +89,7 @@ To force a specific mode, set `auth: api-key` or `auth: sso` in the agent's YAML
 
 ### Refresh
 
-SSO access tokens expire (typically 1 hour). The resolver pre-emptively refreshes when `expires_at - now < 60s` on a `get()` call, using the stored refresh token. On refresh failure: an actionable error naming the account and pointing at `rupu auth login --account <name> --mode sso`. There is no automatic fall-back to API-key — the user explicitly chose SSO.
+SSO access tokens expire (typically 1 hour). The resolver pre-emptively refreshes when `expires_at - now < 60s` on a `get()` call, using the stored refresh token. On refresh failure: an actionable error naming the account and the mode that needs re-authenticating (`refresh failed for '<account>': HTTP <code>. Re-authenticate this account (mode: sso) to continue.`). There is no automatic fall-back to API-key — the user explicitly chose SSO.
 
 ### Logout
 
@@ -141,8 +141,9 @@ max_output = 16000
 ## OpenAI-compatible providers (Oracle GenAI, vLLM, …)
 
 `kind` is not exclusive to this section — it accepts any built-in vendor
-name (`anthropic`, `openai`, `gemini`, `copilot`, `github`, `gitlab`,
-`linear`, `jira`) and is the mechanism for declaring a second account of
+name (`anthropic`, `openai`, `gemini`, `copilot`, `local`, `github`,
+`gitlab`, `linear`, `jira`, plus the aliases `openai_codex`, `codex`,
+`google_gemini`, `github_copilot`) and is the mechanism for declaring a second account of
 a vendor you already use under its bare name; see "Accounts vs. vendor
 kind" above. `kind = "openai-compatible"` is the one value that selects
 a different, generic client instead of a specific vendor: it connects
