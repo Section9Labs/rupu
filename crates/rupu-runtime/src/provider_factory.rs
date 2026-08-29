@@ -38,6 +38,11 @@ pub struct ProviderConfig {
     /// factory then applies `ProviderTuning::for_provider(name)`, i.e. the
     /// documented defaults. Build it with [`provider_tuning`].
     pub tuning: Option<rupu_providers::ProviderTuning>,
+    /// Resolved vendor kind for this account, from
+    /// [`resolve_kind`]. `None` means "dispatch on the provider name",
+    /// which is the pre-multi-account behavior and is what every
+    /// existing `Default::default()` call site gets.
+    pub kind: Option<String>,
 }
 
 /// Everything the factory needs to build an `OpenAiCompatibleClient`,
@@ -177,6 +182,25 @@ pub fn resolve_model(
         .to_string()
 }
 
+/// Resolve an account name to its vendor kind string.
+///
+/// `[providers.<name>].kind` wins; otherwise the name itself, when it is
+/// a built-in vendor name (design spec §3.1 — this is what keeps a
+/// config-less `anthropic` working). `None` means the name is neither
+/// declared nor a vendor.
+pub fn resolve_kind(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> Option<String> {
+    if let Some(k) = providers.get(name).and_then(|p| p.kind.clone()) {
+        return Some(k);
+    }
+    if is_builtin_provider(name) {
+        return Some(name.to_string());
+    }
+    None
+}
+
 /// True for provider names the factory builds directly (not openai-compatible).
 pub fn is_builtin_provider(name: &str) -> bool {
     matches!(
@@ -275,11 +299,15 @@ pub async fn build_for_provider_with_config(
                 provider: name.to_string(),
                 source,
             })?;
+    // The account name identifies *who*; the kind identifies *what
+    // vendor*. Falling back to the name preserves the single-account
+    // behavior exactly.
+    let kind = config.kind.as_deref().unwrap_or(name);
     let tuning = config
         .tuning
         .clone()
-        .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(name));
-    let client = match name {
+        .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(kind));
+    let client = match kind {
         "anthropic" => build_anthropic(creds, model, config, &tuning, sink.clone()).await?,
         "openai" | "openai_codex" | "codex" => {
             build_openai(creds, model, &tuning, sink.clone()).await?
@@ -607,6 +635,55 @@ mod tests {
         assert!(!map.contains_key("anthropic"));
         assert_eq!(map["oracle"].base_url, "http://host:8080");
     }
+
+    use std::collections::BTreeMap;
+
+    fn providers_with(name: &str, kind: &str) -> BTreeMap<String, rupu_config::ProviderConfig> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            name.to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some(kind.to_string()),
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn resolve_kind_prefers_declared_kind() {
+        let p = providers_with("anthropic-work", "anthropic");
+        assert_eq!(
+            resolve_kind("anthropic-work", &p).as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    /// Spec §3.1: with no config at all, a built-in name is its own kind.
+    #[test]
+    fn resolve_kind_falls_back_to_the_name_for_builtins() {
+        let empty = BTreeMap::new();
+        assert_eq!(
+            resolve_kind("anthropic", &empty).as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(resolve_kind("codex", &empty).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn resolve_kind_is_none_for_undeclared_non_builtin() {
+        let empty = BTreeMap::new();
+        assert_eq!(resolve_kind("anthropic-work", &empty), None);
+    }
+
+    #[test]
+    fn resolve_kind_reports_openai_compatible() {
+        let p = providers_with("oracle", "openai-compatible");
+        assert_eq!(
+            resolve_kind("oracle", &p).as_deref(),
+            Some("openai-compatible")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -752,5 +829,54 @@ mod build_gemini_tests {
             result,
             Err(FactoryError::MissingCredential { .. })
         ));
+    }
+}
+
+/// Directly exercises the Step-6 dispatch change: `build_for_provider_with_config`
+/// must pick the client type from `config.kind`, not from the account name.
+/// None of `resolve_kind`'s own unit tests (pure string resolution) or the
+/// sibling `build_*_tests` modules (which all pass `ProviderConfig::default()`,
+/// i.e. `kind: None`) exercise the `match kind { .. }` line itself.
+#[cfg(test)]
+mod dispatch_by_kind_tests {
+    use super::*;
+    use rupu_auth::backend::ProviderId as AuthProviderId;
+    use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[tokio::test]
+    async fn dispatch_follows_config_kind_not_the_account_name() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let resolver = InMemoryResolver::new();
+        // Credentials live under the account name "openai" ...
+        resolver
+            .put(
+                AuthProviderId::Openai,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("sk-test-openai"),
+            )
+            .await;
+        let config = ProviderConfig {
+            // ... but the declared kind says "anthropic". If dispatch still
+            // matched on the name, this would build an OpenAI client.
+            kind: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+        let (_mode, p) = build_for_provider_with_config(
+            "openai",
+            "claude-sonnet-4-6",
+            None,
+            &resolver,
+            &config,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await
+        .expect("build");
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::Anthropic);
     }
 }

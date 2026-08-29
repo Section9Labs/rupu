@@ -482,6 +482,10 @@ async fn create(
                     &req.provider,
                     &gen_cfg.providers,
                 )),
+                kind: rupu_runtime::provider_factory::resolve_kind(
+                    &req.provider,
+                    &gen_cfg.providers,
+                ),
             };
             let outcome =
                 rupu_orchestrator::generate_definition(&req, &resolver, &gen_provider_config)

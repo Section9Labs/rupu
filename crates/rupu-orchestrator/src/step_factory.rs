@@ -307,6 +307,14 @@ impl StepFactory for DefaultStepFactory {
                     anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
                     openai_compatible: oai_params,
                     tuning: self.provider_tuning.get(&provider_name).cloned(),
+                    // `DefaultStepFactory` only carries pre-resolved
+                    // `openai_compatible`/`provider_tuning` maps, not the raw
+                    // `[providers.<name>]` config, so it cannot call
+                    // `resolve_kind` here. `None` falls back to name-based
+                    // dispatch — byte-identical to pre-Task-4 behavior, but
+                    // it means a workflow step naming a declared multi-account
+                    // (e.g. `anthropic-work`) won't yet resolve its kind.
+                    kind: None,
                 };
                 // This step's netflow sink — built fresh per step call,
                 // scoped to THIS call's `run_id`/`transcript_path`. See

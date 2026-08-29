@@ -6233,6 +6233,15 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             &session.provider_name,
             &cfg.providers,
         )),
+        // Task 4 (provider factory kind dispatch) scoped its call-site sweep
+        // to sites already resolving `openai_compatible`; this one hardcodes
+        // that to `None` (a separate, pre-existing limitation — session
+        // compaction doesn't support custom openai-compatible endpoints), so
+        // it's left out of that sweep too. `None` here falls back to
+        // name-based dispatch, byte-identical to before — but it means a
+        // declared multi-account name (e.g. `anthropic-work`) won't resolve
+        // its kind from `rupu session compact`.
+        kind: None,
     };
     // No run exists here: `rupu session compact` summarizes an existing
     // session's message history in place — it mints no run id, writes no
@@ -6567,6 +6576,12 @@ async fn run_compact_request(
             &session.provider_name,
             &cfg.providers,
         )),
+        // See the identical note on the other `rupu session compact`
+        // provider-build site above: left out of Task 4's call-site sweep
+        // because `openai_compatible` is hardcoded `None` here (a separate,
+        // pre-existing limitation), so `kind: None` falls back to
+        // name-based dispatch, byte-identical to before.
+        kind: None,
     };
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
@@ -6885,6 +6900,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 &session.provider_name,
                 &cfg.providers,
             )),
+            // See the identical note on the `rupu session compact`
+            // provider-build sites: left out of Task 4's call-site sweep
+            // because `openai_compatible` is hardcoded `None` here (a
+            // separate, pre-existing limitation), so `kind: None` falls
+            // back to name-based dispatch, byte-identical to before.
+            kind: None,
         };
         let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
             &session.provider_name,

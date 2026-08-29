@@ -249,6 +249,14 @@ impl AgentDispatcher for CliAgentDispatcher {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             openai_compatible: oai_params,
             tuning: self.provider_tuning.get(&provider_name).cloned(),
+            // `CliAgentDispatcher` only carries pre-resolved
+            // `openai_compatible`/`provider_tuning` maps, not the raw
+            // `[providers.<name>]` config, so it cannot call `resolve_kind`
+            // here. `None` falls back to name-based dispatch —
+            // byte-identical to pre-Task-4 behavior, but it means a
+            // dispatched sub-agent naming a declared multi-account (e.g.
+            // `anthropic-work`) won't yet resolve its kind.
+            kind: None,
         };
         let provider = match provider_factory::build_for_provider_with_config(
             &provider_name,

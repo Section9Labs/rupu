@@ -628,6 +628,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 &provider_name,
                 &cfg.providers,
             )),
+            kind: provider_factory::resolve_kind(&provider_name, &cfg.providers),
         };
         let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
             &provider_name,
