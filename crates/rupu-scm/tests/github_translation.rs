@@ -541,3 +541,60 @@ async fn list_comments_paginates_across_pages() {
     // not instead of it.
     assert_eq!(comments[104].id, "3005");
 }
+
+/// Pins the `limit: None` contract: `None` means "one page and stop",
+/// even when that page happens to be a *full* 100-item page that would,
+/// on its own, look exactly like an in-progress pagination walk. A page-2
+/// mock is registered so a regression that started walking to
+/// exhaustion on `None` (e.g. by dropping `single_default_page` from the
+/// loop's break condition) would still leave `list_comments` returning
+/// correct data — the `assert_hits(0)` below is the only thing that
+/// would catch it.
+#[tokio::test]
+async fn list_comments_none_limit_stops_after_one_full_page() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start();
+
+    let page1: Vec<serde_json::Value> = (1..=100)
+        .map(|n| synth_comment(4000 + n, "page1-user", "2026-08-01T00:00:00Z"))
+        .collect();
+    let page2: Vec<serde_json::Value> = (1..=10)
+        .map(|n| synth_comment(5000 + n, "page2-user", "2026-08-02T00:00:00Z"))
+        .collect();
+
+    let page1_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments")
+            .query_param("page", "1");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!(page1));
+    });
+    let page2_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments")
+            .query_param("page", "2");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!(page2));
+    });
+
+    let c = common::github_issue_connector_against(&server);
+    let comments = c
+        .list_comments(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Github,
+                project: "section9labs/rupu".into(),
+                number: 42,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(comments.len(), 100);
+    page1_mock.assert_hits(1);
+    // The point of this test: `None` must never walk past the first
+    // page, full or not.
+    page2_mock.assert_hits(0);
+}

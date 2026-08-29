@@ -38,7 +38,7 @@ pub struct ListCommentsArgs {
     pub tracker: Option<String>,
     pub project: String,
     pub number: u64,
-    /// Maximum comments to return, oldest-first. Defaults to 100.
+    /// Maximum comments to return. The thread is walked and returned oldest-first, so a `limit` below the thread's true length drops the NEWEST comments, not the oldest. Omitting `limit` returns at most the oldest 100 comments. Hard ceiling: 5000 comments, regardless of `limit`.
     pub limit: Option<u32>,
 }
 
@@ -76,7 +76,7 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "issues.comments",
-            description: "Read an issue's comment thread, oldest-first. Returns id, author, body, created_at per comment.",
+            description: "Read an issue's comment thread. Returns id, author, body, created_at per comment, oldest-first. A `limit` truncates the NEWEST comments off the end, not the oldest — omitting `limit` returns only the oldest 100; hard ceiling 5000.",
             input_schema: serde_json::to_value(schemars::schema_for!(ListCommentsArgs)).unwrap(),
             kind: ToolKind::Read,
         },

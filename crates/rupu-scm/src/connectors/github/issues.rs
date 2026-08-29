@@ -120,7 +120,9 @@ impl IssueConnector for GithubIssueConnector {
         i: &IssueRef,
         limit: Option<u32>,
     ) -> Result<Vec<Comment>, ScmError> {
-        let _permit = self.client.permit().await;
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let (owner, repo) = parse_project(&i.project)?;
         let number = i.number;
         let inner = self.client.inner.clone();
@@ -138,6 +140,12 @@ impl IssueConnector for GithubIssueConnector {
         let mut out: Vec<Comment> = Vec::new();
         let mut page_num: u32 = 1;
         loop {
+            // Acquired per page, not once for the whole walk: the GitHub
+            // semaphore has only 4 permits process-wide, and a single
+            // `list_comments` call can otherwise occupy one for up to
+            // `MAX_PAGES` requests (each independently retriable with an
+            // uncapped `Retry-After`), starving every other GitHub call.
+            let _permit = self.client.permit().await;
             let page_items = self
                 .client
                 .with_retry_octocrab(|| {
@@ -170,8 +178,19 @@ impl IssueConnector for GithubIssueConnector {
             let short_page = fetched < per_page as usize;
             let limit_satisfied = limit.is_some_and(|n| out.len() >= n as usize);
             let single_default_page = limit.is_none();
+            let cap_reached = page_num >= MAX_PAGES;
 
-            if short_page || limit_satisfied || single_default_page || page_num >= MAX_PAGES {
+            if cap_reached && !short_page {
+                tracing::warn!(
+                    issue = i.number,
+                    project = %i.project,
+                    max_pages = MAX_PAGES,
+                    per_page,
+                    "github: list_comments hit MAX_PAGES with a full last page; result is truncated and may be missing comments"
+                );
+            }
+
+            if short_page || limit_satisfied || single_default_page || cap_reached {
                 break;
             }
             page_num += 1;

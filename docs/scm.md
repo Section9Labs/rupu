@@ -13,17 +13,21 @@ PR, nested namespaces, rate-limit headers).
 | Repos (list, get, branches)         |   ✅   |   ✅   |   —    |   —  |
 | PRs / MRs (read, comment, create)   |   ✅   |   ✅   |   —    |   —  |
 | Issues (read, comment, create, transition) | ✅ |   ✅   |   ✅   |   ✅  |
+| Issue comment-thread read (`issues.comments`) | ✅ |   —    |   —    |   —  |
 | Workflow / pipeline trigger         |   ✅   |   ✅   |   —    |   —  |
 | `clone_to` (local checkout)         |   ✅   |   ✅   |   —    |   —  |
 | File read by ref                    |   ✅   |   ✅   |   —    |   —  |
 | API surface                         |  REST  |  REST  | GraphQL| REST |
 
-Linear and Jira implement the full `IssueConnector` trait (`list_issues`,
-`get_issue`, `comment_issue`, `create_issue`, `update_issue_state`), so the
-`issues.*` MCP tools (`issues.list`, `issues.get`, `issues.comment`,
-`issues.create`, `issues.update_state`) work against them today, in addition
-to their native trigger sources (webhook + polling). They are not full repo /
-PR backends — no `scm.*` repo, branch, PR/MR, or clone support.
+Linear and Jira implement every `IssueConnector` method except
+`list_comments` (`list_issues`, `get_issue`, `comment_issue`, `create_issue`,
+`update_issue_state`), so the `issues.*` MCP tools (`issues.list`,
+`issues.get`, `issues.comment`, `issues.create`, `issues.update_state`) work
+against them today, in addition to their native trigger sources (webhook +
+polling). `issues.comments` (comment-thread read) is GitHub-only; the default
+`IssueConnector::list_comments` impl returns "not supported" for Linear and
+Jira. They are not full repo / PR backends — no `scm.*` repo, branch, PR/MR,
+or clone support.
 
 ## Auth
 
@@ -69,7 +73,7 @@ agent's read tools work without a checkout.
 
 ## MCP tool catalog
 
-All 17 tools in the unified surface. Each accepts an optional `platform?` (or
+All 18 tools in the unified surface. Each accepts an optional `platform?` (or
 `tracker?`) that falls back to `[scm.default]` / `[issues.default]` from config
 when omitted.
 
@@ -87,6 +91,7 @@ when omitted.
 | `scm.prs.create`              | Write | Open a PR/MR; supports draft=true |
 | `issues.list`                 | Read  | List issues with state + labels + author filters |
 | `issues.get`                  | Read  | Fetch a single issue (title, body, state, labels, author) |
+| `issues.comments`             | Read  | Read an issue's comment thread, oldest-first (GitHub only) |
 | `issues.comment`              | Write | Comment on an issue |
 | `issues.create`               | Write | Open a new issue with title + body + labels |
 | `issues.update_state`         | Write | Transition an issue to `open` or `closed` |
