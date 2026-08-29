@@ -189,7 +189,24 @@ impl Registry {
                 .and_then(|p| p.kind.as_deref())
                 .and_then(|k| k.parse::<Platform>().ok())
                 .or_else(|| name.parse::<Platform>().ok());
-            let Some(kind) = kind else { continue };
+            let Some(kind) = kind else {
+                // A declared `[scm.<name>]` table that never resolves to
+                // a repo `kind` is almost always a mistake — a missing
+                // or misspelled `kind` (spec §3.1 requires it for any
+                // non-vendor account name), since `Config::validate`
+                // never inspects `cfg.scm.platforms`. Warn so the account
+                // doesn't just vanish with no trace. Stay silent for the
+                // implicit bare-name probes (`platform_cfg.is_none()`) —
+                // that's the normal "no config for this built-in vendor"
+                // case, not a mistake.
+                if platform_cfg.is_some() {
+                    warn!(
+                        account = %name,
+                        "scm: account declares no resolvable kind; skipping"
+                    );
+                }
+                continue;
+            };
 
             let mut acct = ScmAccount::empty(kind);
             match kind {
@@ -378,6 +395,7 @@ impl Registry {
             | Resolution::SoleAccount(id) => self.lookup_repo(id, repo.platform, &candidates),
             Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
                 repo: format!("{}/{}", repo.owner, repo.repo),
+                owner: repo.owner.clone(),
                 platform: repo.platform.to_string(),
                 candidates,
             }),
@@ -391,12 +409,25 @@ impl Registry {
     /// is a pure function; a `Resolution::Explicit(a)` names whatever the
     /// caller typed, unconditionally). This is that check, shared by
     /// every `Resolution` variant that names an account.
+    ///
+    /// `resolve_account` returns `Explicit` before it ever looks at
+    /// `candidates.is_empty()` — a pure function has no "log in" concept
+    /// to distinguish from ambiguity. So `--account gh-work` with zero
+    /// accounts configured at all must not fall through to
+    /// `UnknownAccount` with a dangling empty candidate list (which reads
+    /// as a typo); it is the same "log in" failure as the no-explicit
+    /// case, and gets the same `NoAccounts` error.
     fn lookup_repo(
         &self,
         id: AccountId,
         platform: Platform,
         candidates: &[AccountId],
     ) -> Result<(AccountId, Arc<dyn RepoConnector>), AccountError> {
+        if candidates.is_empty() {
+            return Err(AccountError::NoAccounts {
+                platform: platform.to_string(),
+            });
+        }
         if let Some(acct) = self.accounts.get(&id) {
             if acct.kind == platform {
                 if let Some(conn) = &acct.repo {
@@ -412,13 +443,20 @@ impl Registry {
 
     /// Resolve which account's `IssueConnector` serves `tracker`, running
     /// the same rule engine `repo_for` runs whenever a `RepoRef` is known
-    /// — owner and path rules need the caller's `RepoRef`/`cwd`/`home`
-    /// exactly the way `repo_for` does, and dropping them here would
-    /// reproduce the very defect this arc exists to fix (spec §1: "the
-    /// owner is already in scope at these call sites and is currently
+    /// — owner and path rules need the caller's `RepoRef`/`cwd` exactly
+    /// the way `repo_for` does, and dropping them here would reproduce
+    /// the very defect this arc exists to fix (spec §1: "the owner is
+    /// already in scope at these call sites and is currently
     /// discarded"). `rupu issues list --repo acme/api` builds a full
     /// `RepoRef` before calling in — passing it through is what lets an
-    /// `acme/* -> gh-work` rule actually select an account for it.
+    /// `acme/* -> gh-work` rule actually select an account for it. `home`
+    /// is not a parameter, matching `repo_for`: it resolves the same way
+    /// `repo_for` does (`dirs::home_dir()`), internally — unlike `cwd`,
+    /// which genuinely differs per caller (an agent's working directory
+    /// is not the process's cwd), the user's home directory is one
+    /// process-global value with nothing for a caller to meaningfully
+    /// supply, so making every future call site resolve and thread it
+    /// through would be boilerplate with no corresponding benefit.
     ///
     /// **Linear and Jira genuinely have no `RepoRef`** — a tracker
     /// project string like `"ENG"` is not an owner/repo pair. Their
@@ -432,12 +470,18 @@ impl Registry {
         tracker: IssueTracker,
         repo: Option<&RepoRef>,
         cwd: Option<&Path>,
-        home: Option<&Path>,
         explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<dyn IssueConnector>), AccountError> {
         let candidates = self.accounts_for_tracker(tracker);
-        let resolution =
-            rules::resolve_account(&self.rules, repo, cwd, home, explicit, &candidates);
+        let home = dirs::home_dir();
+        let resolution = rules::resolve_account(
+            &self.rules,
+            repo,
+            cwd,
+            home.as_deref(),
+            explicit,
+            &candidates,
+        );
         match resolution {
             Resolution::Explicit(id)
             | Resolution::Owner(id)
@@ -447,6 +491,7 @@ impl Registry {
                 repo: repo
                     .map(|r| format!("{}/{}", r.owner, r.repo))
                     .unwrap_or_else(|| format!("({tracker} lookup)")),
+                owner: repo.map(|r| r.owner.clone()).unwrap_or_default(),
                 platform: tracker.to_string(),
                 candidates,
             }),
@@ -462,6 +507,11 @@ impl Registry {
         tracker: IssueTracker,
         candidates: &[AccountId],
     ) -> Result<(AccountId, Arc<dyn IssueConnector>), AccountError> {
+        if candidates.is_empty() {
+            return Err(AccountError::NoAccounts {
+                platform: tracker.to_string(),
+            });
+        }
         match platform_for_tracker(tracker) {
             Some(kind) => {
                 if let Some(acct) = self.accounts.get(&id) {
@@ -518,10 +568,17 @@ impl Registry {
             .get(&AccountId::new(p.as_str()))
             .and_then(|a| a.repo.clone())
             .or_else(|| {
+                // `find_map`, not `find(..).and_then(..)`: repo and
+                // events are independent probes on the same credential
+                // (see `discover`), so the lexicographically-first
+                // account of this kind can register only an events
+                // connector while a later one has the repo connector.
+                // `find` would stop at the first kind match and return
+                // `None` from its empty `repo` field even though a
+                // usable connector exists further along.
                 self.accounts
                     .values()
-                    .find(|a| a.kind == p)
-                    .and_then(|a| a.repo.clone())
+                    .find_map(|a| if a.kind == p { a.repo.clone() } else { None })
             })
     }
 
@@ -534,10 +591,16 @@ impl Registry {
                 .get(&AccountId::new(t.as_str()))
                 .and_then(|a| a.issues.clone())
                 .or_else(|| {
-                    self.accounts
-                        .values()
-                        .find(|a| a.kind == kind)
-                        .and_then(|a| a.issues.clone())
+                    // See `repo`'s doc: `find_map`, not
+                    // `find(..).and_then(..)` — the same independent-probe
+                    // reasoning applies to `issues` vs `repo`/`events`.
+                    self.accounts.values().find_map(|a| {
+                        if a.kind == kind {
+                            a.issues.clone()
+                        } else {
+                            None
+                        }
+                    })
                 }),
             None => self
                 .tracker_accounts
@@ -555,10 +618,10 @@ impl Registry {
             .get(&AccountId::new(p.as_str()))
             .and_then(|a| a.events.clone())
             .or_else(|| {
+                // See `repo`'s doc: `find_map`, not `find(..).and_then(..)`.
                 self.accounts
                     .values()
-                    .find(|a| a.kind == p)
-                    .and_then(|a| a.events.clone())
+                    .find_map(|a| if a.kind == p { a.events.clone() } else { None })
             })
     }
 
@@ -633,6 +696,22 @@ impl Registry {
             .entry(id)
             .or_insert_with(|| ScmAccount::empty(kind))
             .issues = Some(c);
+    }
+
+    /// Test/internal: register an `EventConnector` under an explicit
+    /// account name and kind — the `events()` counterpart to
+    /// `insert_repo_account`/`insert_issue_account`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn insert_event_account(
+        &mut self,
+        id: AccountId,
+        kind: Platform,
+        c: Arc<dyn EventConnector>,
+    ) {
+        self.accounts
+            .entry(id)
+            .or_insert_with(|| ScmAccount::empty(kind))
+            .events = Some(c);
     }
 
     /// Test/internal: register an `IssueConnector` directly without going
@@ -878,6 +957,20 @@ mod tests {
         }
     }
 
+    struct FakeEventConnector;
+
+    #[async_trait]
+    impl EventConnector for FakeEventConnector {
+        async fn poll_events(
+            &self,
+            _source: &EventSourceRef,
+            _cursor: Option<&str>,
+            _limit: u32,
+        ) -> Result<crate::event_connector::EventPollResult, ScmError> {
+            unimplemented!()
+        }
+    }
+
     /// Shared fake connector for the account-keying tests below — reuses
     /// the `FakeRepoConnector` already defined in this module rather than
     /// inventing a second fake type. The `Platform` baked into the fake
@@ -892,6 +985,11 @@ mod tests {
     /// the `IssueTracker` baked into the fake is irrelevant to resolution.
     fn fake_issue_connector() -> Arc<dyn IssueConnector> {
         Arc::new(FakeIssueConnector(IssueTracker::Github))
+    }
+
+    /// `events()` counterpart to `fake_repo_connector`/`fake_issue_connector`.
+    fn fake_event_connector() -> Arc<dyn EventConnector> {
+        Arc::new(FakeEventConnector)
     }
 
     #[test]
@@ -1122,7 +1220,7 @@ mod tests {
             repo: "api".into(),
         };
         let (id, _) = reg
-            .issues_for(IssueTracker::Github, Some(&r), None, None, None)
+            .issues_for(IssueTracker::Github, Some(&r), None, None)
             .expect("owner rule must resolve through issues_for");
         assert_eq!(id, AccountId::new("gh-work"));
     }
@@ -1239,5 +1337,152 @@ mod tests {
     fn accounts_for_is_empty_and_sorted_with_nothing_registered() {
         let reg = Registry::default();
         assert!(reg.accounts_for(Platform::Github).is_empty());
+    }
+
+    /// Review item 5: `--account gh-work` with *zero* accounts configured
+    /// at all must not fall through to `UnknownAccount` with a dangling
+    /// empty candidate list — `resolve_account` returns `Explicit`
+    /// before it ever looks at `candidates.is_empty()` (it's a pure
+    /// function with no "log in" concept), so the existence check in
+    /// `lookup_repo`/`lookup_issues` has to catch this itself. This is
+    /// the "log in" failure, not the "typo" failure, and must get
+    /// `NoAccounts`'s message, not `UnknownAccount`'s.
+    #[tokio::test]
+    async fn explicit_account_with_no_accounts_configured_is_no_accounts_not_unknown_account() {
+        let reg = Registry::default();
+        let r = RepoRef {
+            platform: Platform::Github,
+            owner: "acme".into(),
+            repo: "api".into(),
+        };
+        let err = reg
+            .repo_for(&r, None, Some(&AccountId::new("gh-work")))
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auth login"),
+            "must be the log-in error, not a dangling-list typo error: {msg}"
+        );
+        assert!(
+            !msg.contains("no such account"),
+            "must not present a log-in gap as an unknown-account typo: {msg}"
+        );
+    }
+
+    /// Review item 3: `repo()`/`issues()`/`events()`'s fallback used to
+    /// be `.find(|a| a.kind == p).and_then(|a| a.FIELD.clone())` — which
+    /// stops at the *first* account of a kind (BTreeMap key order) and
+    /// returns `None` from its `FIELD` even when a *later* account of
+    /// the same kind actually has one. Reachable because repo/issues/
+    /// events are independent probes on the same credential (`discover`
+    /// builds each with its own `try_build` call) — one can fail while
+    /// another succeeds on the very same account.
+    ///
+    /// `acme-ghe` sorts before `gh-work` and registers *only* an issues
+    /// connector; `gh-work` has the repo connector. `find(..).and_then`
+    /// stops at `acme-ghe`, sees no `repo`, and returns `None` even
+    /// though `gh-work` has a real one — this test fails against that
+    /// form and passes against `find_map`.
+    #[test]
+    fn repo_falls_through_to_a_later_account_of_the_same_kind() {
+        let mut reg = Registry::default();
+        reg.insert_issue_account(
+            AccountId::new("acme-ghe"),
+            Platform::Github,
+            fake_issue_connector(),
+        );
+        let work_repo = fake_repo_connector();
+        reg.insert_repo_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            work_repo.clone(),
+        );
+
+        let got = reg
+            .repo(Platform::Github)
+            .expect("gh-work's repo connector must be found past acme-ghe's missing one");
+        assert!(
+            Arc::ptr_eq(&got, &work_repo),
+            "must be gh-work's connector specifically, not None or the wrong one"
+        );
+    }
+
+    /// `issues()` counterpart to `repo_falls_through_to_a_later_account_of_the_same_kind`.
+    #[test]
+    fn issues_falls_through_to_a_later_account_of_the_same_kind() {
+        let mut reg = Registry::default();
+        reg.insert_repo_account(
+            AccountId::new("acme-ghe"),
+            Platform::Github,
+            fake_repo_connector(),
+        );
+        let work_issues = fake_issue_connector();
+        reg.insert_issue_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            work_issues.clone(),
+        );
+
+        let got = reg
+            .issues(IssueTracker::Github)
+            .expect("gh-work's issue connector must be found past acme-ghe's missing one");
+        assert!(
+            Arc::ptr_eq(&got, &work_issues),
+            "must be gh-work's connector specifically, not None or the wrong one"
+        );
+    }
+
+    /// `events()` counterpart to `repo_falls_through_to_a_later_account_of_the_same_kind`.
+    #[test]
+    fn events_falls_through_to_a_later_account_of_the_same_kind() {
+        let mut reg = Registry::default();
+        reg.insert_repo_account(
+            AccountId::new("acme-ghe"),
+            Platform::Github,
+            fake_repo_connector(),
+        );
+        let work_events = fake_event_connector();
+        reg.insert_event_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            work_events.clone(),
+        );
+
+        let got = reg
+            .events(Platform::Github)
+            .expect("gh-work's event connector must be found past acme-ghe's missing one");
+        assert!(
+            Arc::ptr_eq(&got, &work_events),
+            "must be gh-work's connector specifically, not None or the wrong one"
+        );
+    }
+
+    /// Review item 4: the §6.4 fix line must be copy-pasteable — the
+    /// suggested `--owner` glob is derived from the repo that failed to
+    /// resolve, not a literal placeholder.
+    #[tokio::test]
+    async fn no_rule_matched_error_suggests_a_copy_pasteable_owner_glob() {
+        let mut reg = Registry::default();
+        reg.insert_repo_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_repo_connector(),
+        );
+        reg.insert_repo_account(
+            AccountId::new("gh-personal"),
+            Platform::Github,
+            fake_repo_connector(),
+        );
+        let r = RepoRef {
+            platform: Platform::Github,
+            owner: "other".into(),
+            repo: "thing".into(),
+        };
+        let msg = reg.repo_for(&r, None, None).err().unwrap().to_string();
+        assert!(
+            msg.contains("--owner 'other/*'"),
+            "fix line must be copy-pasteable from the failed repo's owner, not a placeholder: {msg}"
+        );
     }
 }

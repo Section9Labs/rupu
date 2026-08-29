@@ -81,13 +81,18 @@ pub enum AccountError {
     /// `platform` names the vendor/tracker (`"github"`, `"linear"`, …)
     /// so the message can say which accounts are candidates; it is not
     /// part of the brief's minimal field list but is required to render
-    /// the spec §6.4 message shape.
+    /// the spec §6.4 message shape. `owner` is likewise an addition: the
+    /// spec §6.4 example fix line is copy-pasteable (`--owner 'other/*'`,
+    /// derived from the repo that failed to resolve), not a literal
+    /// placeholder — carrying `owner` separately from the already-joined
+    /// `repo` string avoids re-parsing `"owner/repo"` to get it back.
     #[error(
-        "no account rule matches {repo}\n  configured {platform} accounts: {}\n  fix: rupu scm bind --owner '<owner-glob>' --account <name>\n  or:  pass --account <name>",
+        "no account rule matches {repo}\n  configured {platform} accounts: {}\n  fix: rupu scm bind --owner '{owner}/*' --account <name>\n  or:  pass --account <name>",
         candidates.iter().map(AccountId::as_str).collect::<Vec<_>>().join(", ")
     )]
     NoRuleMatched {
         repo: String,
+        owner: String,
         platform: String,
         candidates: Vec<AccountId>,
     },
@@ -100,9 +105,13 @@ pub enum AccountError {
     /// literal `Platform` type: `issues_for` can be asked about `Linear`
     /// or `Jira`, neither of which is a `Platform` variant, so a strict
     /// `Platform` field can't represent every caller of this error.
-    #[error(
-        "no {platform} account configured\n  fix: rupu auth login --account <name> --kind {platform} --mode sso"
-    )]
+    /// `--mode sso` is deliberately absent from the fix line: Linear and
+    /// Jira have no SSO flow (`rupu auth login`'s SSO arm bails with
+    /// "has no SSO flow" for them), and even for GitHub/GitLab a PAT is
+    /// the common path — `--mode api-key` is already clap's default, so
+    /// the bare command is correct for all four vendors this error can
+    /// name.
+    #[error("no {platform} account configured\n  fix: rupu auth login --account <name> --kind {platform}")]
     NoAccounts { platform: String },
 
     /// `--account <name>` (or an MCP `account` argument) named something
