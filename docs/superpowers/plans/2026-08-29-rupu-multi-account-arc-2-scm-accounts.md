@@ -16,7 +16,7 @@
 
 - `#![deny(clippy::all)]` workspace-wide; `unsafe_code` forbidden.
 - Workspace deps only — versions pinned in root `Cargo.toml`, never in a crate `Cargo.toml`.
-- Hexagonal rule 1: `rupu-scm` defines ports; it must not learn about `rupu-cli`. Config→account translation lives in the CLI, exactly as Arc 1 put it there for credentials.
+- Hexagonal rule 1 applies to `rupu-auth`, which must not depend on `rupu-config`. **It does NOT apply to `rupu-scm`**, which has always depended on `rupu-config` — `Registry::discover` takes `&Config` today. An earlier draft of this plan asserted otherwise and was wrong; see Ruling 3 in the ledger. The invariant that does hold and must be preserved: `rupu-config` does not depend on `rupu-scm` (verified), so `AccountId` stays out of `rupu-config` and `ScmRule.account` stays a `String`.
 - `rupu-cli` is thin: arg parsing + delegation.
 - Errors: `thiserror` in libraries, `anyhow` in `rupu-cli`.
 - **Never run `cargo fmt`, even with explicit paths.** `cargo fmt -- <file>` does NOT filter by path — the `--` args are rustfmt flags and cargo still enumerates every workspace target; `main` is fmt-dirty under the pinned toolchain, so this produces a huge bogus diff (it reformatted 81 unrelated files during Arc 1). Use `rustfmt --edition 2021 <file>`, and **never on a crate root** (`lib.rs`/`main.rs`) — rustfmt follows `mod` declarations and recurses the whole tree. `git diff --name-only` before staging.
@@ -318,7 +318,9 @@ pub fn resolve_account(
 ) -> Resolution
 ```
 
-**Two `Rule` types exist, deliberately.** `rupu_config::ScmRule` is the wire/TOML shape (`account: String`); `rupu_scm::rules::Rule` is the domain shape (`account: AccountId`). They are separate because `rupu-scm` must not depend on `rupu-config`. Task 4 adds the single conversion point (`rules_from_config`) in `rupu-cli`, mirroring how Arc 1 put `accounts::account_specs` there. Do not try to unify them or make one crate depend on the other.
+**Two `Rule` types exist, deliberately — but not for the reason an earlier draft gave.** `rupu_config::ScmRule` is the wire/TOML shape (`account: String`); `rupu_scm::rules::Rule` is the domain shape (`account: AccountId`). The real reasons are (a) `AccountId` must not leak into `rupu-config`, since `rupu-config` is the upstream crate and does not depend on `rupu-scm`, and (b) the rule engine stays pure and constructible in tests without building a whole `Config`.
+
+`rupu-scm` **does** depend on `rupu-config` (it always has — `Registry::discover` takes `&Config`), so the conversion belongs in `rupu-scm`, not the CLI: add `rules::Rule::from_config(&[rupu_config::ScmRule]) -> Vec<Rule>` and have `Registry::discover` read `cfg.scm.rules` itself. No CLI-side helper is needed, and no rule list has to be threaded through call sites.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -880,7 +882,7 @@ let (_account, conn) = registry.repo_for(&repo, cwd.as_deref(), args.account.as_
 - [ ] **Step 1:** Add `--account <name>` to `rupu issues` and `rupu repos` subcommands that target a specific repo. Do not add it to `list` subcommands that fan out.
 - [ ] **Step 2:** Migrate the targeted sites. For each, the `RepoRef` is already constructed nearby — pass it rather than re-deriving it.
 - [ ] **Step 3:** Migrate `cp_repos.rs` and `rupu repos list` to `all_repo_connectors`, and add an `ACCOUNT` column to the output so the union is legible. This is a UX improvement, not just a port: a user with two accounts sees both sets of repos in one table, tagged.
-- [ ] **Step 4:** Wire the rule list: build `Vec<Rule>` from `cfg.scm.rules` at each `Registry::discover` call site. Add a `rupu_cli::scm_rules::rules_from_config(&cfg) -> Vec<Rule>` helper so the conversion exists once, mirroring how `accounts::account_specs` centralizes the Arc 1 conversion.
+- [ ] **Step 4:** Nothing to wire here — `Registry::discover` already receives `&Config` and reads `cfg.scm.rules` itself via `Rule::from_config` (Task 3). Confirm no call site needs a rule list threaded through it, and say so in your report. If you find one that does, stop and report rather than adding a CLI-side helper.
 - [ ] **Step 5:** Add an integration test: two GitHub accounts configured, an owner rule, and `rupu issues list --repo acme/api` reaching the right one. Assert on which account's credential was used, not merely that the command exited 0.
 - [ ] **Step 6:** `cargo test -p rupu-cli`, clippy, `rustfmt` each touched leaf file, `git diff --name-only`, commit.
 
