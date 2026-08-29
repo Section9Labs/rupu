@@ -124,39 +124,59 @@ impl IssueConnector for GithubIssueConnector {
         let (owner, repo) = parse_project(&i.project)?;
         let number = i.number;
         let inner = self.client.inner.clone();
-        // GitHub caps per_page at 100; clamp so an absurd `limit` can't
-        // produce a 422 from the API.
-        let per_page: u8 = limit.unwrap_or(100).clamp(1, 100) as u8;
-        let page = self
-            .client
-            .with_retry_octocrab(|| {
-                let inner = inner.clone();
-                let owner = owner.clone();
-                let repo = repo.clone();
-                async move {
-                    inner
-                        .issues(&owner, &repo)
-                        .list_comments(number)
-                        .per_page(per_page)
-                        .send()
-                        .await
-                        .map_err(super::client::classify_octocrab_error)
-                }
-            })
-            .await?;
+        // GitHub caps per_page at 100.
+        let per_page: u8 = 100;
+        // `None` keeps its documented meaning: a single default page,
+        // never paginated further. A `limit` above one page walks
+        // successive pages (oldest-first, matching GitHub's native order)
+        // until `limit` is satisfied or a short page signals the last
+        // page. `MAX_PAGES` bounds how far an absurd `limit` can walk so a
+        // caller can't make this spin forever; 50 pages * 100/page = 5000
+        // comments, comfortably above any real operator-control thread.
+        const MAX_PAGES: u32 = 50;
 
-        let mut out: Vec<Comment> = page
-            .items
-            .into_iter()
-            .map(|m| Comment {
+        let mut out: Vec<Comment> = Vec::new();
+        let mut page_num: u32 = 1;
+        loop {
+            let page_items = self
+                .client
+                .with_retry_octocrab(|| {
+                    let inner = inner.clone();
+                    let owner = owner.clone();
+                    let repo = repo.clone();
+                    async move {
+                        inner
+                            .issues(&owner, &repo)
+                            .list_comments(number)
+                            .per_page(per_page)
+                            .page(page_num)
+                            .send()
+                            .await
+                            .map_err(super::client::classify_octocrab_error)
+                    }
+                })
+                .await?;
+
+            let fetched = page_items.items.len();
+            out.extend(page_items.items.into_iter().map(|m| Comment {
                 id: m.id.to_string(),
                 author: m.user.login,
                 // octocrab models an issue comment body as Option<String>
                 // (a comment can be body-less after redaction).
                 body: m.body.unwrap_or_default(),
                 created_at: m.created_at,
-            })
-            .collect();
+            }));
+
+            let short_page = fetched < per_page as usize;
+            let limit_satisfied = limit.is_some_and(|n| out.len() >= n as usize);
+            let single_default_page = limit.is_none();
+
+            if short_page || limit_satisfied || single_default_page || page_num >= MAX_PAGES {
+                break;
+            }
+            page_num += 1;
+        }
+
         if let Some(n) = limit {
             out.truncate(n as usize);
         }
