@@ -200,52 +200,123 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
 }
 
 /// Write `[providers.<account>] kind = "<kind>"` into a config file,
-/// preserving everything already there.
+/// preserving everything already there — comments and formatting
+/// included.
 ///
-/// Inserts into the parsed table tree directly rather than building a
-/// dotted key. A dotted key would have to be quoted to survive an
-/// account name containing a `.`, and that quoting contract has four
-/// lockstep implementations across this repo — sidestepping it here
-/// keeps this off that list.
+/// Uses `toml_edit::DocumentMut` rather than the plain `toml::Value`
+/// round-trip the first version of this function used: `toml::Value`
+/// has no concept of comments, so re-serializing it silently stripped
+/// every comment out of whatever config file it touched. `toml_edit`
+/// preserves both comments and key order.
+///
+/// Inserts into the parsed document tree directly (`get_mut` / `insert`
+/// on each `Table`) rather than building a dotted key. A dotted key
+/// would have to be quoted to survive an account name containing a
+/// `.`, and that quoting contract has four lockstep implementations
+/// across this repo — sidestepping it here keeps this off that list.
+///
+/// Writes atomically via `rupu_cp::config_write::write_atomic` — the
+/// same backup + advisory-lock + temp-file-then-rename mechanism the
+/// CP web config editor uses — so an interruption mid-write can never
+/// leave a truncated global config, and the new content is re-validated
+/// against the config schema before it lands.
 fn declare_account_in_config(path: &Path, account: &str, kind: &str) -> anyhow::Result<()> {
-    use toml::Value;
-
-    let mut root: Value = if path.exists() {
-        let text = std::fs::read_to_string(path)?;
-        toml::from_str(&text).map_err(|e| {
-            anyhow::anyhow!(
-                "refusing to write: {} is not valid TOML ({e}). \
-                 Fix or move the file first — writing would discard its contents.",
-                path.display()
-            )
-        })?
+    let text = if path.exists() {
+        std::fs::read_to_string(path)?
     } else {
-        Value::Table(Default::default())
+        String::new()
     };
 
-    let root_table = root
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        anyhow::anyhow!(
+            "refusing to write: {} is not valid TOML ({e}). \
+             Fix or move the file first — writing would discard its contents.",
+            path.display()
+        )
+    })?;
 
-    let providers = root_table
-        .entry("providers".to_string())
-        .or_insert_with(|| Value::Table(Default::default()))
-        .as_table_mut()
+    let root = doc.as_table_mut();
+    if root.get("providers").is_none() {
+        root.insert("providers", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let providers = root
+        .get_mut("providers")
+        .and_then(|item| item.as_table_mut())
         .ok_or_else(|| anyhow::anyhow!("`providers` is already a value, not a table"))?;
 
+    if providers.get(account).is_none() {
+        providers.insert(account, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
     let entry = providers
-        .entry(account.to_string())
-        .or_insert_with(|| Value::Table(Default::default()))
-        .as_table_mut()
+        .get_mut(account)
+        .and_then(|item| item.as_table_mut())
         .ok_or_else(|| anyhow::anyhow!("`providers.{account}` is already a value, not a table"))?;
 
-    entry.insert("kind".to_string(), Value::String(kind.to_string()));
+    entry["kind"] = toml_edit::value(kind);
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    rupu_cp::config_write::write_atomic(path, &doc.to_string()).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Resolve the vendor `kind` for an `auth login --account <account>`
+/// invocation. Pure (no I/O) so the precedence rules can be unit
+/// tested directly rather than only through a full CLI round-trip —
+/// see this file's `tests` module.
+///
+/// `config_kind` is `providers.<account>.kind` as genuinely declared
+/// in config (`None` if the account has no `[providers.<account>]`
+/// section, or the section has no `kind` key) — **not** a name-derived
+/// guess. Keeping those two sources apart matters for the error
+/// messages below: a real config declaration can be told "edit this
+/// file to change it"; a name that merely happens to match a vendor
+/// has no file to point at.
+///
+/// Precedence:
+/// 1. `--kind` given and it conflicts with a genuine config
+///    declaration → error (the config is the source of truth once an
+///    account is declared; tell the user where to edit it).
+/// 2. `--kind` given and it conflicts with the account name itself
+///    being a recognized vendor (e.g. `--account github --kind
+///    gitlab`) → error (a different, name-collision error — there is
+///    no config section to edit here, so telling the user to edit one
+///    would be unfollowable).
+/// 3. `--kind` given, no conflict → use it.
+/// 4. No `--kind`, but config declares one → use it.
+/// 5. No `--kind`, but the account name is itself a recognized vendor
+///    (checked via [`rupu_auth::ProviderId::from_vendor_str`], which
+///    covers every vendor `auth login` can authenticate against —
+///    LLM providers *and* SCM/issue-tracker connectors, unlike
+///    `rupu_runtime::provider_factory::resolve_kind`'s builtin-name
+///    fallback, which is deliberately LLM-only for its own callers) →
+///    use the name.
+/// 6. Neither → error asking for `--kind`.
+fn resolve_login_kind(
+    account: &str,
+    kind_arg: Option<&str>,
+    config_kind: Option<&str>,
+    cfg_path: &Path,
+) -> anyhow::Result<String> {
+    let name_is_vendor = rupu_auth::ProviderId::from_vendor_str(account).is_some();
+
+    match (kind_arg, config_kind) {
+        (Some(k), Some(d)) if k != d => anyhow::bail!(
+            "account '{account}' is already declared with kind \"{d}\"; \
+             remove [providers.{account}] from {} to change it",
+            cfg_path.display()
+        ),
+        (Some(k), Some(_)) => Ok(k.to_string()),
+        (Some(k), None) if name_is_vendor && k != account => anyhow::bail!(
+            "'{account}' is itself a recognized vendor name; --kind \"{k}\" would \
+             collide with it. Choose a different account name (e.g. \"{k}-{account}\")."
+        ),
+        (Some(k), None) => Ok(k.to_string()),
+        (None, Some(d)) => Ok(d.to_string()),
+        (None, None) if name_is_vendor => Ok(account.to_string()),
+        (None, None) => anyhow::bail!(
+            "'{account}' is not a known vendor and is not declared in config. \
+             Pass --kind <vendor> to declare it (anthropic | openai | gemini | \
+             copilot | github | gitlab | linear | jira | local)."
+        ),
     }
-    std::fs::write(path, toml::to_string_pretty(&root)?)?;
-    Ok(())
 }
 
 async fn login(
@@ -260,40 +331,28 @@ async fn login(
     let cfg_path = global.join("config.toml");
     let cfg = rupu_config::layer_files_locked(Some(&cfg_path), None).unwrap_or_default();
 
-    // Kind precedence: explicit flag, then config, then the account name
-    // itself when it is a vendor (design spec §3.1).
-    let declared = rupu_runtime::provider_factory::resolve_kind(account, &cfg.providers);
-    let kind = match (kind_arg, declared.as_deref()) {
-        (Some(k), Some(d)) if k != d => anyhow::bail!(
-            "account '{account}' is already declared with kind \"{d}\"; \
-             remove [providers.{account}] from {} to change it",
-            cfg_path.display()
-        ),
-        (Some(k), _) => k.to_string(),
-        (None, Some(d)) => d.to_string(),
-        (None, None) => anyhow::bail!(
-            "'{account}' is not a known vendor and is not declared in config. \
-             Pass --kind <vendor> to declare it (anthropic | openai | gemini | \
-             copilot | github | gitlab | linear | jira | local)."
-        ),
-    };
+    // The genuine config declaration, if any — kept apart from any
+    // name-derived vendor guess. See `resolve_login_kind`'s doc comment
+    // for why the two sources can't be conflated.
+    let config_kind = cfg.providers.get(account).and_then(|p| p.kind.as_deref());
+    let kind = resolve_login_kind(account, kind_arg, config_kind, &cfg_path)?;
 
     // Persist the declaration so every later resolver call knows this
     // account exists. Skipped when the account name IS the vendor —
     // that needs no config to resolve.
-    if kind != account
-        && cfg
-            .providers
-            .get(account)
-            .and_then(|p| p.kind.as_deref())
-            .is_none()
-    {
+    if kind != account && config_kind.is_none() {
         crate::paths::ensure_dir(&global)?;
         declare_account_in_config(&cfg_path, account, &kind)?;
         println!("rupu: declared [providers.{account}] kind = \"{kind}\"");
     }
 
     if kind == "openai-compatible" {
+        if parse_provider(account).is_ok() {
+            anyhow::bail!(
+                "'{account}' is a reserved built-in provider name; \
+                 choose a distinct name for an openai-compatible provider in config"
+            );
+        }
         let AuthModeArg::ApiKey = mode else {
             anyhow::bail!("openai-compatible providers only support --mode api-key");
         };
@@ -438,24 +497,12 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        for p in [
-            ProviderId::Anthropic,
-            ProviderId::Openai,
-            ProviderId::Gemini,
-            ProviderId::Copilot,
-            ProviderId::Github,
-            ProviderId::Gitlab,
-            ProviderId::Linear,
-            ProviderId::Jira,
-            ProviderId::Local,
-        ] {
-            for m in [
-                rupu_providers::AuthMode::ApiKey,
-                rupu_providers::AuthMode::Sso,
-            ] {
-                let _ = resolver.forget(p, m).await;
-            }
-        }
+        // Clear whatever keys are actually on disk rather than sweeping a
+        // fixed built-in `ProviderId` list: a declared account like
+        // `anthropic-work` is a key `forget`'s built-in-only sweep can
+        // never see, which would let `--all` report success while
+        // leaving named accounts' credentials behind.
+        resolver.forget_all().await?;
         println!("rupu: cleared all credentials");
         return Ok(());
     }
@@ -1103,6 +1150,107 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "this is not = = toml").unwrap();
         assert!(declare_account_in_config(&path, "x", "openai").is_err());
+    }
+
+    /// A comment in the existing config must survive an unrelated
+    /// account declaration. `toml::Value` (the pre-fix implementation)
+    /// has no concept of comments and silently drops them on
+    /// re-serialization — this pins the `toml_edit`-based replacement.
+    #[test]
+    fn declare_account_preserves_a_comment_in_the_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# do not remove this note\ndefault_provider = \"anthropic\"\n",
+        )
+        .unwrap();
+
+        declare_account_in_config(&path, "anthropic-work", "anthropic").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# do not remove this note"),
+            "comment was dropped by the config write:\n{text}"
+        );
+        // The declaration still landed correctly alongside it.
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            v["providers"]["anthropic-work"]["kind"].as_str(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn resolve_login_kind_uses_explicit_flag_when_nothing_else_is_known() {
+        let path = Path::new("/tmp/unused-config.toml");
+        assert_eq!(
+            resolve_login_kind("oracle", Some("openai-compatible"), None, path).unwrap(),
+            "openai-compatible"
+        );
+    }
+
+    #[test]
+    fn resolve_login_kind_uses_config_declaration_when_no_flag_given() {
+        let path = Path::new("/tmp/unused-config.toml");
+        assert_eq!(
+            resolve_login_kind("anthropic-work", None, Some("anthropic"), path).unwrap(),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn resolve_login_kind_falls_back_to_the_account_name_as_vendor() {
+        let path = Path::new("/tmp/unused-config.toml");
+        assert_eq!(
+            resolve_login_kind("anthropic", None, None, path).unwrap(),
+            "anthropic"
+        );
+    }
+
+    /// Regression pin for the shipped defect: `auth login --provider
+    /// github` (and gitlab/linear/jira) must resolve via the account
+    /// name being a recognized SCM/issue-tracker vendor, not just the
+    /// narrower LLM-only builtin list.
+    #[test]
+    fn resolve_login_kind_recognizes_scm_vendor_names_not_just_llm_ones() {
+        let path = Path::new("/tmp/unused-config.toml");
+        for vendor in ["github", "gitlab", "linear", "jira"] {
+            assert_eq!(
+                resolve_login_kind(vendor, None, None, path).unwrap(),
+                vendor,
+                "vendor {vendor} should resolve via the account name"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_login_kind_bails_when_neither_flag_nor_config_nor_name_resolve() {
+        let path = Path::new("/tmp/unused-config.toml");
+        let err = resolve_login_kind("mystery-account", None, None, path).unwrap_err();
+        assert!(err.to_string().contains("--kind"));
+    }
+
+    #[test]
+    fn resolve_login_kind_errors_on_genuine_config_conflict_naming_the_config_file() {
+        let path = Path::new("/tmp/some-config.toml");
+        let err = resolve_login_kind("anthropic-work", Some("openai"), Some("anthropic"), path)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already declared"));
+        assert!(msg.contains("some-config.toml"));
+    }
+
+    /// A name-derived conflict (the account name IS a vendor, and
+    /// --kind disagrees) has no config section to point at — the error
+    /// must not claim one exists.
+    #[test]
+    fn resolve_login_kind_errors_on_name_collision_without_naming_a_config_file() {
+        let path = Path::new("/tmp/some-config.toml");
+        let err = resolve_login_kind("github", Some("gitlab"), None, path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("collide"));
+        assert!(!msg.contains("some-config.toml"));
     }
 }
 

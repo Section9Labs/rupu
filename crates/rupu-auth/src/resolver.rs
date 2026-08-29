@@ -258,6 +258,26 @@ impl KeychainResolver {
         self.delete_account(&account)
     }
 
+    /// Delete every stored credential, returning how many entries were
+    /// removed.
+    ///
+    /// Used by `rupu auth logout --all`. A fixed sweep over the builtin
+    /// `ProviderId` list (the pre-multi-account implementation) can only
+    /// ever see built-in vendor names — it has no way to know about a
+    /// declared account like `anthropic-work`, so `--all` would report
+    /// success while leaving named accounts' credentials behind. This
+    /// clears whatever keys are actually on disk instead. A no-op
+    /// (returns `0`, writes nothing) when the store is empty or absent,
+    /// so `--all` on a fresh install doesn't create an empty auth.json.
+    pub async fn forget_all(&self) -> Result<usize> {
+        let map = Self::read_file_map(&self.path)?;
+        let count = map.len();
+        if count > 0 {
+            Self::write_file_map(&self.path, &Default::default())?;
+        }
+        Ok(count)
+    }
+
     /// True if a named credential exists for `name`/`mode`.
     pub async fn peek_named(&self, name: &str, mode: AuthMode) -> bool {
         self.read_account(name, Some(name), mode)

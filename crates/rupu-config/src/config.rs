@@ -159,8 +159,17 @@ const RESERVED_PROVIDER_NAMES: &[&str] = &[
 
 /// Vendor kinds a `[providers.<name>]` entry may declare, in addition to
 /// `"openai-compatible"`. Kept in lockstep with
-/// `rupu_runtime::provider_factory::is_builtin_provider` and
-/// `rupu_auth::backend::ProviderId::from_vendor_str`.
+/// `rupu_auth::backend::ProviderId::from_vendor_str` — the full vendor
+/// list `rupu auth login --kind` accepts, LLM providers and SCM/issue
+/// connectors alike (`declare_account_in_config` in `rupu-cli` writes a
+/// `[providers.<account>]` entry for any of them, and that write is
+/// schema-validated through this list, so a gap here would reject a
+/// legitimately declared second account for an SCM connector).
+///
+/// Deliberately broader than
+/// `rupu_runtime::provider_factory::is_builtin_provider`, which is
+/// LLM-only by design for its own (narrower) callers — see that
+/// function's doc comment.
 const BUILTIN_PROVIDER_KINDS: &[&str] = &[
     "anthropic",
     "openai",
@@ -171,6 +180,10 @@ const BUILTIN_PROVIDER_KINDS: &[&str] = &[
     "copilot",
     "github_copilot",
     "local",
+    "github",
+    "gitlab",
+    "linear",
+    "jira",
 ];
 
 impl Config {
