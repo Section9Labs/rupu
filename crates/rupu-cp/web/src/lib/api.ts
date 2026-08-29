@@ -1565,8 +1565,14 @@ export interface BrowseResult { path: string; parent: string | null; dirs: FsEnt
 /** One repository entry from `GET /api/repos`. */
 export interface RepoEntry {
   platform: string;
-  /** Which configured account this repo came from (multi-account fan-out tag). */
-  account: string;
+  /**
+   * Which configured account this repo came from (multi-account fan-out tag).
+   *
+   * Optional because TypeScript types are not runtime-checked: an older
+   * server binary serving a newer web bundle sends no `account`, and a
+   * required field would be a type that lies. The server always sends it.
+   */
+  account?: string;
   repo: string; // "owner/name"
   default_branch: string;
   private: boolean;
