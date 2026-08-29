@@ -13,7 +13,7 @@ describe('targetItems', () => {
     expect(it0).toMatchObject({ kind: 'project', label: 'rupu', sublabel: '/Code/rupu', resolved: { working_dir: '/Code/rupu' } });
   });
   it('repo → target = platform:repo', () => {
-    const [it0] = repoItems([{ platform: 'github', repo: 'o/r', default_branch: 'main', private: false }]);
+    const [it0] = repoItems([{ platform: 'github', account: 'github', repo: 'o/r', default_branch: 'main', private: false }]);
     expect(it0).toMatchObject({ kind: 'repo', label: 'github:o/r', resolved: { target: 'github:o/r' } });
   });
   it('dir → working_dir = path', () => {

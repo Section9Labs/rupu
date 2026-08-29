@@ -6,6 +6,12 @@ use serde::Serialize;
 pub struct RepoEntry {
     /// Platform id, e.g. "github" | "gitlab".
     pub platform: String,
+    /// Which configured account this repo came from — the multi-account
+    /// arc's fan-out tag (spec §6.2's "Account-scoped, no repo" row: a
+    /// union across every account of a kind, tagged so it's legible).
+    /// Pre-Arc-2 configs have exactly one account per kind, named after
+    /// the platform itself (e.g. `"github"`), so this is never blank.
+    pub account: String,
     /// "owner/name".
     pub repo: String,
     pub default_branch: String,

@@ -94,6 +94,10 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
 #[derive(Debug, Clone, Serialize)]
 struct RepoListRow {
     platform: String,
+    /// Which configured account this row came from — the union column
+    /// that makes a multi-account fan-out legible (spec §6.2: "a user
+    /// with two accounts sees both sets of repos in one table, tagged").
+    account: String,
     repo: String,
     default_branch: String,
     visibility: String,
@@ -128,13 +132,20 @@ impl CollectionOutput for RepoListOutput {
     }
 
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
-        Some(&["platform", "repo", "default_branch", "visibility"])
+        Some(&[
+            "platform",
+            "account",
+            "repo",
+            "default_branch",
+            "visibility",
+        ])
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
         let mut table = crate::output::tables::new_table();
         table.set_header(vec![
             "Platform",
+            "Account",
             "Owner/Repo",
             "Default branch",
             "Visibility",
@@ -150,6 +161,7 @@ impl CollectionOutput for RepoListOutput {
             };
             table.add_row(vec![
                 Cell::new(&row.platform),
+                Cell::new(&row.account),
                 Cell::new(&row.repo),
                 Cell::new(&row.default_branch),
                 visibility_cell,
@@ -169,7 +181,11 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
 
-    let resolver = rupu_auth::KeychainResolver::new();
+    // `resolver_for`, not a bare `KeychainResolver::new()` — see
+    // `issues.rs`'s `build_registry()` for why (arc progress ledger,
+    // Ruling 7: a declared `[scm.<name>]` account's SSO token needs the
+    // resolver to know the account to ever refresh).
+    let resolver = crate::accounts::resolver_for(&cfg);
     // Bare read-only CLI command (`rupu repos list`), same shape as
     // `issues.rs`'s `build_registry()` — run-less, per the approved spec.
     let registry =
@@ -188,7 +204,12 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
     let mut any_skipped = false;
     let mut any_private = false;
     for p in platforms {
-        let Some(conn) = registry.repo(p) else {
+        // Account-scoped, no repo to key on (spec §6.2): fan out across
+        // every configured account of this platform rather than the old
+        // `registry.repo(p)` shim's lexicographically-first pick, and
+        // tag each row by account so a two-account union is legible.
+        let accounts = registry.all_repo_connectors(p);
+        if accounts.is_empty() {
             if format == OutputFormat::Table {
                 crate::output::diag::skip(
                     &prefs,
@@ -199,19 +220,22 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
             }
             any_skipped = true;
             continue;
-        };
-        let repos = conn.list_repos().await?;
-        for r in repos {
-            if r.private {
-                any_private = true;
+        }
+        for (account, conn) in accounts {
+            let repos = conn.list_repos().await?;
+            for r in repos {
+                if r.private {
+                    any_private = true;
+                }
+                rows.push(RepoListRow {
+                    platform: p.to_string(),
+                    account: account.to_string(),
+                    repo: format!("{}/{}", r.r.owner, r.r.repo),
+                    default_branch: r.default_branch,
+                    visibility: if r.private { "private" } else { "public" }.into(),
+                });
+                any_listed = true;
             }
-            rows.push(RepoListRow {
-                platform: p.to_string(),
-                repo: format!("{}/{}", r.r.owner, r.r.repo),
-                default_branch: r.default_branch,
-                visibility: if r.private { "private" } else { "public" }.into(),
-            });
-            any_listed = true;
         }
     }
     if !any_listed && format == OutputFormat::Table {

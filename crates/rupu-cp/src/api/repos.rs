@@ -44,6 +44,7 @@ mod tests {
     async fn lists_from_port() {
         let entry = RepoEntry {
             platform: "github".into(),
+            account: "github".into(),
             repo: "o/r".into(),
             default_branch: "main".into(),
             private: false,

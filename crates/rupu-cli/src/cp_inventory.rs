@@ -279,14 +279,27 @@ async fn count_open_issues(
     platform: &str,
     project: &str,
 ) -> Result<u64, String> {
-    let tracker = match platform {
-        "github" => rupu_scm::IssueTracker::Github,
-        "gitlab" => rupu_scm::IssueTracker::Gitlab,
+    let (platform_kind, tracker) = match platform {
+        "github" => (rupu_scm::Platform::Github, rupu_scm::IssueTracker::Github),
+        "gitlab" => (rupu_scm::Platform::Gitlab, rupu_scm::IssueTracker::Gitlab),
         other => return Err(format!("no issue tracker for platform {other}")),
     };
-    let conn = registry
-        .issues(tracker)
-        .ok_or_else(|| format!("no issue connector configured for {platform}"))?;
+    // `project` is `entry.repo` from `deps.repos.list()` (`cp_repos.rs`'s
+    // `to_entry`), which is always `"owner/name"` for GitHub/GitLab — the
+    // targeted shape (spec §6.2): the owner is right here, so run the
+    // owner/path rule engine instead of the old `registry.issues(tracker)`
+    // shim's lexicographically-first pick. This is a fleet-wide background
+    // sweep with no cwd and no `--account`, same as a daemon.
+    let repo = project
+        .split_once('/')
+        .map(|(owner, repo)| rupu_scm::RepoRef {
+            platform: platform_kind,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        });
+    let (_account, conn) = registry
+        .issues_for(tracker, repo.as_ref(), None, None)
+        .map_err(|e| e.to_string())?;
     let filter = rupu_scm::IssueFilter {
         state: Some(rupu_scm::IssueState::Open),
         labels: Vec::new(),

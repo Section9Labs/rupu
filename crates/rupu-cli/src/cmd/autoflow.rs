@@ -9674,9 +9674,22 @@ pub(crate) async fn collect_issue_matches(
             rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
                 .await,
         );
-        let Some(connector) = registry.issues(tracker) else {
-            warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, "skipping autoflow because no issue connector is configured");
-            continue;
+        // The owner is already in scope for `EventSourceRef::Repo`
+        // sources — computed here, before the connector lookup, so
+        // `issues_for` can run the owner/path rule engine instead of the
+        // old `registry.issues(tracker)` shim's lexicographically-first
+        // pick. `TrackerProject` sources genuinely have no owner (spec
+        // §6.2's issues_for doc); `None` is correct there, not a gap.
+        let repo_ref = match &source_ref {
+            EventSourceRef::Repo { repo } => Some(repo.clone()),
+            EventSourceRef::TrackerProject { .. } => None,
+        };
+        let connector = match registry.issues_for(tracker, repo_ref.as_ref(), None, None) {
+            Ok((_account, conn)) => conn,
+            Err(err) => {
+                warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping autoflow because no issue account resolved");
+                continue;
+            }
         };
 
         let filter = build_issue_filter(autoflow);
@@ -9693,12 +9706,11 @@ pub(crate) async fn collect_issue_matches(
         // connector for this source's repo (only `EventSourceRef::Repo`
         // sources have one; `TrackerProject` sources fail closed below).
         // Mirrors `select_eligible_prs`'s author gate exactly.
-        let repo_ref = match &source_ref {
-            EventSourceRef::Repo { repo } => Some(repo.clone()),
-            EventSourceRef::TrackerProject { .. } => None,
-        };
         let repo_connector = match &repo_ref {
-            Some(repo) => registry.repo(repo.platform),
+            Some(repo) => registry
+                .repo_for(repo, None, None)
+                .ok()
+                .map(|(_account, conn)| conn),
             None => None,
         };
         issues = filter_issues_by_author_allowlist(
@@ -10245,13 +10257,7 @@ pub(crate) async fn fetch_pr(
     let registry = Arc::new(
         rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink)).await,
     );
-    let connector = registry.repo(pr_ref.repo.platform).ok_or_else(|| {
-        anyhow!(
-            "no {} credential — run `rupu auth login --provider {}`",
-            pr_ref.repo.platform.as_str(),
-            pr_ref.repo.platform.as_str()
-        )
-    })?;
+    let (_account, connector) = registry.repo_for(&pr_ref.repo, None, None)?;
     let pr = connector
         .get_pr(pr_ref)
         .await
@@ -10353,9 +10359,12 @@ pub(crate) async fn collect_pr_matches(
             rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
                 .await,
         );
-        let Some(connector) = registry.repo(repo.platform) else {
-            warn!(source = %resolved.repo_ref, workflow = %resolved.name, "skipping PR autoflow because no repo connector is configured");
-            continue;
+        let connector = match registry.repo_for(&repo, None, None) {
+            Ok((_account, conn)) => conn,
+            Err(err) => {
+                warn!(source = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping PR autoflow because no repo account resolved");
+                continue;
+            }
         };
         let eligible = match select_eligible_prs(connector.as_ref(), claim_store, autoflow, &repo)
             .await
@@ -11953,13 +11962,25 @@ pub(crate) async fn fetch_issue(
     let registry = Arc::new(
         rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink)).await,
     );
-    let connector = registry.issues(issue_ref.tracker).ok_or_else(|| {
-        anyhow!(
-            "no {} credential — run `rupu auth login --provider {}`",
-            issue_ref.tracker,
-            issue_ref.tracker
-        )
-    })?;
+    // The owner is already in scope for GitHub/GitLab (`project` is
+    // `"owner/repo"`) — run the owner/path rule engine via `issues_for`
+    // instead of the old `registry.issues(tracker)` shim's
+    // lexicographically-first pick. Linear/Jira `project` is a
+    // workspace/board id, not `"owner/repo"`; `None` there is correct
+    // (see `Registry::issues_for`'s doc).
+    let issue_repo = match issue_ref.tracker {
+        rupu_scm::IssueTracker::Github => Some(rupu_scm::Platform::Github),
+        rupu_scm::IssueTracker::Gitlab => Some(rupu_scm::Platform::Gitlab),
+        rupu_scm::IssueTracker::Linear | rupu_scm::IssueTracker::Jira => None,
+    }
+    .zip(issue_ref.project.split_once('/'))
+    .map(|(platform, (owner, repo))| rupu_scm::RepoRef {
+        platform,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    });
+    let (_account, connector) =
+        registry.issues_for(issue_ref.tracker, issue_repo.as_ref(), None, None)?;
     connector
         .get_issue(issue_ref)
         .await
