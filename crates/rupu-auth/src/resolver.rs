@@ -49,6 +49,9 @@ pub struct KeychainResolver {
     /// Where credentials live: a chmod-600 JSON file. There is no
     /// second backend — see the type docs.
     path: PathBuf,
+    /// Accounts declared in config. Empty means "built-in vendor names
+    /// only", which is exactly the pre-multi-account behavior.
+    accounts: Vec<crate::account::AccountSpec>,
 }
 
 /// Resolve the global rupu directory, honoring `$RUPU_HOME` (set by
@@ -89,7 +92,21 @@ impl KeychainResolver {
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_auth_json_path());
         tracing::debug!(path = %path.display(), "credential store");
-        Self { path }
+        Self {
+            path,
+            accounts: Vec::new(),
+        }
+    }
+
+    /// Declare the config's accounts so `get` / `refresh` can resolve a
+    /// named account to its vendor kind.
+    ///
+    /// `rupu-auth` cannot read config itself (hexagonal rule 1), so the
+    /// CLI resolves the list and passes it here. Leaving this unset
+    /// keeps the pre-multi-account behavior exactly.
+    pub fn with_accounts(mut self, accounts: Vec<crate::account::AccountSpec>) -> Self {
+        self.accounts = accounts;
+        self
     }
 
     /// Read the chmod-600 JSON file as a flat key→value map. Missing
@@ -236,6 +253,27 @@ impl KeychainResolver {
             .unwrap_or(false)
     }
 
+    /// `RUPU_<UPPER_ACCOUNT>_API_KEY`. Non-alphanumeric characters in an
+    /// account name map to `_` so `anthropic-work` reads
+    /// `RUPU_ANTHROPIC_WORK_API_KEY`.
+    fn env_api_key(account: &str) -> Option<AuthCredentials> {
+        let upper: String = account
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let key = std::env::var(format!("RUPU_{upper}_API_KEY")).ok()?;
+        if key.is_empty() {
+            return None;
+        }
+        Some(AuthCredentials::ApiKey { key })
+    }
+
     /// Resolve a config-declared provider name to an api-key credential:
     /// `auth.json["<name>/api-key"]` (or legacy `["<name>"]`), then
     /// `RUPU_<UPPER_NAME>_API_KEY`.
@@ -243,15 +281,12 @@ impl KeychainResolver {
         if let Some(sc) = self.read_account(provider, Some(provider), AuthMode::ApiKey)? {
             return Ok((AuthMode::ApiKey, sc.credentials));
         }
-        let env_name = format!("RUPU_{}_API_KEY", provider.to_ascii_uppercase());
-        if let Ok(key) = std::env::var(&env_name) {
-            if !key.is_empty() {
-                return Ok((AuthMode::ApiKey, AuthCredentials::ApiKey { key }));
-            }
+        if let Some(creds) = Self::env_api_key(provider) {
+            return Ok((AuthMode::ApiKey, creds));
         }
         anyhow::bail!(
-            "no credentials for '{provider}'. Run: rupu auth login --provider {provider} \
-             --mode api-key, or set {env_name}"
+            "no credentials for '{provider}'. Run: rupu auth login --account {provider} \
+             --mode api-key, or set the matching RUPU_*_API_KEY env var"
         )
     }
 
@@ -276,18 +311,38 @@ impl KeychainResolver {
         }
     }
 
+    /// `peek_sso` for an account name rather than a built-in vendor.
+    /// Same human-readable expiry strings.
+    pub async fn peek_sso_named(&self, name: &str) -> Option<String> {
+        let sc = self.read_account(name, Some(name), AuthMode::Sso).ok()??;
+        let Some(exp) = sc.expires_at else {
+            return Some("no expiry".into());
+        };
+        let now = chrono::Utc::now();
+        let dur = exp.signed_duration_since(now);
+        if dur.num_seconds() <= 0 {
+            Some("expired — re-login".into())
+        } else if dur.num_days() >= 1 {
+            Some(format!("expires in {}d", dur.num_days()))
+        } else {
+            Some(format!("expires in {}h", dur.num_hours().max(1)))
+        }
+    }
+
+    /// Refresh against a **vendor**, not an account name. Two accounts of
+    /// the same kind refresh against the same OAuth config but store
+    /// under their own keys — that is what makes multi-account SSO work.
     async fn refresh_inner(
         &self,
-        p: ProviderId,
-        _mode: AuthMode,
+        kind: ProviderId,
         sc: &StoredCredential,
     ) -> Result<StoredCredential> {
-        let oauth = crate::oauth::providers::provider_oauth(p)
-            .ok_or_else(|| anyhow::anyhow!("no oauth config for {p}"))?;
+        let oauth = crate::oauth::providers::provider_oauth(kind)
+            .ok_or_else(|| anyhow::anyhow!("no oauth config for {kind}"))?;
         let refresh_token = sc.refresh_token.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
-                "{p} SSO token expired and no refresh token stored. \
-                 Run: rupu auth login --provider {p} --mode sso"
+                "{kind} SSO token expired and no refresh token stored. \
+                 Run: rupu auth login --provider {kind} --mode sso"
             )
         })?;
         // Provider-agnostic refresh: standard OAuth refresh-token grant.
@@ -321,7 +376,7 @@ impl KeychainResolver {
             .map_err(|e| anyhow::anyhow!("refresh request: {e}"))?;
         if !resp.status().is_success() {
             anyhow::bail!(
-                "refresh failed for {p}: HTTP {}. Run: rupu auth login --provider {p} --mode sso",
+                "refresh failed for {kind}: HTTP {}. Run: rupu auth login --provider {kind} --mode sso",
                 resp.status()
             );
         }
@@ -410,38 +465,60 @@ impl CredentialResolver for KeychainResolver {
         provider: &str,
         hint: Option<AuthMode>,
     ) -> Result<(AuthMode, AuthCredentials)> {
-        let p = match Self::parse_provider(provider) {
-            Ok(p) => p,
-            Err(_) => return self.get_named(provider).await,
-        };
         let modes: Vec<AuthMode> = match hint {
             Some(m) => vec![m],
             None => vec![AuthMode::Sso, AuthMode::ApiKey],
         };
-        for mode in modes {
-            if let Some(mut sc) = self.read(p, mode)? {
-                let now = chrono::Utc::now();
-                if mode == AuthMode::Sso && sc.is_near_expiry(now, EXPIRY_REFRESH_BUFFER_SECS) {
-                    let new = self.refresh_inner(p, mode, &sc).await?;
-                    self.store(p, mode, &new).await?;
-                    sc = new;
+
+        // A declared account, or a bare vendor name. Both read
+        // `<name>/<mode>`; `account_for(pid, mode)` and
+        // `format!("{name}/{mode}")` produce byte-identical keys, so the
+        // legacy bare-vendor path is a special case of this one — it just
+        // additionally tolerates the Slice-A legacy key.
+        if let Some(kind) = crate::account::resolve_provider_id(provider, &self.accounts) {
+            let legacy = if Self::parse_provider(provider).is_ok() {
+                Some(provider)
+            } else {
+                None
+            };
+            for mode in modes {
+                if let Some(mut sc) = self.read_account(provider, legacy, mode)? {
+                    let now = chrono::Utc::now();
+                    if mode == AuthMode::Sso && sc.is_near_expiry(now, EXPIRY_REFRESH_BUFFER_SECS) {
+                        let new = self.refresh_inner(kind, &sc).await?;
+                        self.store_named(provider, mode, &new).await?;
+                        sc = new;
+                    }
+                    return Ok((mode, sc.credentials));
                 }
-                return Ok((mode, sc.credentials));
             }
+            if let Some(creds) = Self::env_api_key(provider) {
+                return Ok((AuthMode::ApiKey, creds));
+            }
+            anyhow::bail!(
+                "no credentials configured for {provider}. \
+                 Run: rupu auth login --account {provider} --mode <api-key|sso>"
+            )
         }
-        anyhow::bail!(
-            "no credentials configured for {provider}. \
-             Run: rupu auth login --provider {provider} --mode <api-key|sso>"
-        )
+
+        // Not a vendor and not declared: an openai-compatible entry, or a
+        // typo. `get_named` produces the actionable error either way.
+        self.get_named(provider).await
     }
 
     async fn refresh(&self, provider: &str, mode: AuthMode) -> Result<AuthCredentials> {
-        let p = Self::parse_provider(provider)?;
+        let kind = crate::account::resolve_provider_id(provider, &self.accounts)
+            .ok_or_else(|| anyhow::anyhow!("unknown provider or account: {provider}"))?;
+        let legacy = if Self::parse_provider(provider).is_ok() {
+            Some(provider)
+        } else {
+            None
+        };
         let sc = self
-            .read(p, mode)?
+            .read_account(provider, legacy, mode)?
             .ok_or_else(|| anyhow::anyhow!("no stored credential for {provider}/{mode:?}"))?;
-        let new = self.refresh_inner(p, mode, &sc).await?;
-        self.store(p, mode, &new).await?;
+        let new = self.refresh_inner(kind, &sc).await?;
+        self.store_named(provider, mode, &new).await?;
         Ok(new.credentials)
     }
 }
@@ -660,6 +737,133 @@ mod parse_stored_credential_tests {
         assert_eq!(
             KeychainResolver::parse_provider("jira").unwrap(),
             ProviderId::Jira,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rupu_providers::auth::AuthCredentials;
+
+    /// Two accounts of the same vendor store and read back independently.
+    /// This is the core capability the whole arc exists to deliver.
+    #[tokio::test]
+    async fn two_accounts_of_same_kind_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let resolver = KeychainResolver {
+            path: path.clone(),
+            accounts: vec![
+                crate::account::AccountSpec::new("anthropic-work", "anthropic"),
+                crate::account::AccountSpec::new("anthropic-personal", "anthropic"),
+            ],
+        };
+
+        resolver
+            .store_named(
+                "anthropic-work",
+                AuthMode::ApiKey,
+                &StoredCredential::api_key("work-key"),
+            )
+            .await
+            .unwrap();
+        resolver
+            .store_named(
+                "anthropic-personal",
+                AuthMode::ApiKey,
+                &StoredCredential::api_key("personal-key"),
+            )
+            .await
+            .unwrap();
+
+        let (mode, creds) = resolver.get("anthropic-work", None).await.unwrap();
+        assert_eq!(mode, AuthMode::ApiKey);
+        assert!(matches!(creds, AuthCredentials::ApiKey { key } if key == "work-key"));
+
+        let (_, creds) = resolver.get("anthropic-personal", None).await.unwrap();
+        assert!(matches!(creds, AuthCredentials::ApiKey { key } if key == "personal-key"));
+    }
+
+    /// Named accounts must support SSO, not just api-key. Before this
+    /// task `get_named` only ever tried api-key.
+    #[tokio::test]
+    async fn named_account_resolves_sso_and_prefers_it_over_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let resolver = KeychainResolver {
+            path: path.clone(),
+            accounts: vec![crate::account::AccountSpec::new(
+                "anthropic-work",
+                "anthropic",
+            )],
+        };
+
+        resolver
+            .store_named(
+                "anthropic-work",
+                AuthMode::ApiKey,
+                &StoredCredential::api_key("the-key"),
+            )
+            .await
+            .unwrap();
+
+        let sso = StoredCredential {
+            credentials: AuthCredentials::OAuth {
+                access: "the-token".into(),
+                refresh: "the-refresh".into(),
+                expires: 0,
+                extra: Default::default(),
+            },
+            refresh_token: Some("the-refresh".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::days(30)),
+        };
+        resolver
+            .store_named("anthropic-work", AuthMode::Sso, &sso)
+            .await
+            .unwrap();
+
+        let (mode, creds) = resolver.get("anthropic-work", None).await.unwrap();
+        assert_eq!(mode, AuthMode::Sso, "SSO must win over api-key");
+        assert!(matches!(creds, AuthCredentials::OAuth { access, .. } if access == "the-token"));
+    }
+
+    /// Spec §3.1 regression guard: a user with only the legacy bare key
+    /// and NO declared accounts must resolve exactly as before.
+    #[tokio::test]
+    async fn bare_builtin_still_resolves_with_no_declared_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let resolver = KeychainResolver {
+            path: path.clone(),
+            accounts: Vec::new(),
+        };
+        resolver
+            .store(
+                ProviderId::Anthropic,
+                AuthMode::ApiKey,
+                &StoredCredential::api_key("legacy"),
+            )
+            .await
+            .unwrap();
+
+        let (mode, creds) = resolver.get("anthropic", None).await.unwrap();
+        assert_eq!(mode, AuthMode::ApiKey);
+        assert!(matches!(creds, AuthCredentials::ApiKey { key } if key == "legacy"));
+    }
+
+    /// An undeclared, non-vendor name is a typo, not an account.
+    #[tokio::test]
+    async fn undeclared_account_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = KeychainResolver {
+            path: dir.path().join("auth.json"),
+            accounts: Vec::new(),
+        };
+        let err = resolver.get("anthropic-typo", None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("anthropic-typo"),
+            "error should name the offending string, got: {err}"
         );
     }
 }
