@@ -120,17 +120,18 @@ owner   = "acme/*"
 account = "gh-work"
 ```
 
-The inline-table form also accepts an explicit `account` override, which beats any owner rule and works on **every** source kind — repo-backed or tracker-native alike:
+The inline-table form also accepts an explicit `account` override, which beats any owner rule, for a repo-backed source:
 
 ```toml
 [triggers]
 poll_sources = [
   { source = "github:acme/api", account = "gh-work" },
-  { source = "linear:team-123", account = "linear-work" },
 ]
 ```
 
-For a repo-backed source this is rarely needed (the owner rule above already covers it) — reach for it when a specific poll source should route somewhere an owner rule wouldn't, without adding a rule just for one entry. For a tracker-native source (`linear:<team-id>`, `jira:<project>`) it's the *only* lever: that source has no owner or path for the rule engine to key on at all. With a single account configured (today's default for Linear/Jira), even that is never required — the sole-account tier resolves unambiguously and `account` can stay unset.
+This is rarely needed (the owner rule above already covers it) — reach for it when a specific poll source should route somewhere an owner rule wouldn't, without adding a rule just for one entry.
+
+For a tracker-native source (`linear:<team-id>`, `jira:<project>`), `account` is forward-looking only. `Registry::discover` doesn't yet register multiple accounts per tracker — Linear/Jira are always registered under the bare vendor name (`"linear"`/`"jira"`), so naming anything else resolves to `UnknownAccount` and `rupu cron tick` warns and **skips the source entirely**. Leave `account` unset for Linear/Jira sources: the sole-account tier already resolves them unambiguously, and today there is nothing else to name.
 
 The source model is now generic enough for both repo and tracker-native polling:
 
