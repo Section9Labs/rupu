@@ -54,17 +54,27 @@ pub enum Resolution {
     /// Nothing matched, but only one account is configured for this
     /// platform, so there is nothing to be ambiguous about.
     SoleAccount(AccountId),
-    /// An owner or path rule's pattern matched, but the account it
-    /// names is not among the candidates — no live connector, because
-    /// its credential is missing, revoked, or expired with a failed
-    /// refresh (`discover` only registers an account that actually
-    /// built). Distinct from [`Self::NoMatch`]: a rule DID fire here,
+    /// An owner or path rule's pattern matched, and the account it
+    /// names is not registered ANYWHERE — not merely absent from this
+    /// call's platform/capability-narrowed `candidates`, but unknown to
+    /// every `all_accounts` entry too. This is the "dead identity"
+    /// case: the credential is missing, revoked, or expired with a
+    /// failed refresh, so `discover` never registered it under any
+    /// platform. Distinct from [`Self::NoMatch`]: a rule DID fire here,
     /// so falling through to a different candidate (e.g. the
     /// sole-account tier, if exactly one other account happens to be
     /// configured) would silently target the wrong identity — the one
-    /// thing this precedence table promises never happens. `pattern` is
-    /// the rule's own owner/path text, carried through so the caller
-    /// can build a message pointing at the specific rule to fix.
+    /// thing this precedence table promises never happens.
+    ///
+    /// Deliberately NOT returned when the named account merely isn't a
+    /// candidate for *this* call but IS registered under a different
+    /// platform or capability (a GitHub-named path rule evaluated for a
+    /// GitLab repo, say) — that case still skips the rule and falls
+    /// through, exactly as it always has, because there is nothing
+    /// wrong with that account; it just isn't the one this particular
+    /// operation needs. `pattern` is the rule's own owner/path text,
+    /// carried through so the caller can build a message pointing at
+    /// the specific rule to fix.
     RuleTargetUnavailable { account: AccountId, pattern: String },
     /// Several accounts are configured and nothing selected one.
     NoMatch { candidates: Vec<AccountId> },
@@ -104,8 +114,20 @@ pub fn expand_tilde(pattern: &str, home: Option<&Path>) -> String {
 /// the accounts that actually exist.
 ///
 /// `candidates` must already be narrowed to accounts of the right
-/// platform — this function does not know about `Platform`, which keeps
-/// it pure and keeps platform filtering in one place (the Registry).
+/// platform AND capability for this call — this function does not know
+/// about `Platform`, which keeps it pure and keeps that filtering in
+/// one place (the Registry). `all_accounts` is the wider set: every
+/// account registered anywhere, of any platform/capability. `Rule`
+/// carries no platform of its own (a rule's `account` can name an
+/// identity of any kind), so the two sets matter for different
+/// questions: "is this rule's account usable for *this* call" is
+/// `candidates`; "does this rule's account exist at all, under some
+/// other platform or capability" is `all_accounts`. A rule whose
+/// pattern matches but whose account fails the first check and passes
+/// the second is not an error — it just isn't this call's rule, and the
+/// engine falls through to the next tier exactly as if the rule had
+/// never matched. A rule whose account fails BOTH is the real defect
+/// this engine guards against: see [`Resolution::RuleTargetUnavailable`].
 pub fn resolve_account(
     rules: &[Rule],
     repo: Option<&RepoRef>,
@@ -113,6 +135,7 @@ pub fn resolve_account(
     home: Option<&Path>,
     explicit: Option<&AccountId>,
     candidates: &[AccountId],
+    all_accounts: &[AccountId],
 ) -> Resolution {
     if let Some(a) = explicit {
         return Resolution::Explicit(a.clone());
@@ -122,6 +145,7 @@ pub fn resolve_account(
     }
 
     let known = |a: &AccountId| candidates.contains(a);
+    let known_anywhere = |a: &AccountId| all_accounts.contains(a);
 
     if let Some(r) = repo {
         for rule in rules {
@@ -130,16 +154,26 @@ pub fn resolve_account(
                     if known(&rule.account) {
                         return Resolution::Owner(rule.account.clone());
                     }
-                    // The pattern matched; the account it names just
-                    // isn't live. Stop here rather than continuing to
-                    // the next rule (or the sole-account tier below) —
-                    // continuing is exactly the fall-through that lets
-                    // a matched rule silently route to a different
-                    // identity.
-                    return Resolution::RuleTargetUnavailable {
-                        account: rule.account.clone(),
-                        pattern: pat.clone(),
-                    };
+                    if !known_anywhere(&rule.account) {
+                        // The pattern matched, and the account it names
+                        // doesn't exist under ANY platform/capability —
+                        // a dead identity, not merely the wrong domain
+                        // for this call. Stop here rather than
+                        // continuing to the next rule (or the
+                        // sole-account tier below) — continuing is
+                        // exactly the fall-through that lets a matched
+                        // rule silently route to a different identity.
+                        return Resolution::RuleTargetUnavailable {
+                            account: rule.account.clone(),
+                            pattern: pat.clone(),
+                        };
+                    }
+                    // Live account, just of a different
+                    // platform/capability than this call needs (e.g. a
+                    // GitHub-named rule evaluated for a GitLab repo).
+                    // Nothing wrong with it — skip this rule and let
+                    // the next rule, or a later tier, have a chance,
+                    // same as always.
                 }
             }
         }
@@ -154,10 +188,12 @@ pub fn resolve_account(
                     if known(&rule.account) {
                         return Resolution::Path(rule.account.clone());
                     }
-                    return Resolution::RuleTargetUnavailable {
-                        account: rule.account.clone(),
-                        pattern: pat.clone(),
-                    };
+                    if !known_anywhere(&rule.account) {
+                        return Resolution::RuleTargetUnavailable {
+                            account: rule.account.clone(),
+                            pattern: pat.clone(),
+                        };
+                    }
                 }
             }
         }
@@ -217,6 +253,7 @@ mod tests {
             None,
             Some(&AccountId::new("gh-personal")),
             &accounts(&["gh-work", "gh-personal"]),
+            &accounts(&["gh-work", "gh-personal"]),
         );
         assert_eq!(got, Resolution::Explicit(AccountId::new("gh-personal")));
     }
@@ -233,6 +270,7 @@ mod tests {
             Some(&PathBuf::from("/home/me/work/api")),
             None,
             None,
+            &accounts(&["gh-path", "gh-owner"]),
             &accounts(&["gh-path", "gh-owner"]),
         );
         assert_eq!(got, Resolution::Owner(AccountId::new("gh-owner")));
@@ -251,6 +289,7 @@ mod tests {
             None,
             None,
             &accounts(&["gh-other", "gh-work"]),
+            &accounts(&["gh-other", "gh-work"]),
         );
         assert_eq!(got, Resolution::Path(AccountId::new("gh-work")));
     }
@@ -267,6 +306,7 @@ mod tests {
             None,
             None,
             &accounts(&["gh-only"]),
+            &accounts(&["gh-only"]),
         );
         assert_eq!(got, Resolution::SoleAccount(AccountId::new("gh-only")));
     }
@@ -280,6 +320,7 @@ mod tests {
             None,
             None,
             &accounts(&["gh-work", "gh-personal"]),
+            &accounts(&["gh-work", "gh-personal"]),
         );
         assert_eq!(
             got,
@@ -291,7 +332,7 @@ mod tests {
 
     #[test]
     fn no_configured_accounts_is_its_own_outcome() {
-        let got = resolve_account(&[], Some(&repo("a", "b")), None, None, None, &[]);
+        let got = resolve_account(&[], Some(&repo("a", "b")), None, None, None, &[], &[]);
         assert_eq!(got, Resolution::NoAccounts);
     }
 
@@ -305,6 +346,7 @@ mod tests {
             None,
             None,
             None,
+            &accounts(&["gh-work", "gh-personal"]),
             &accounts(&["gh-work", "gh-personal"]),
         );
         assert_eq!(
@@ -333,6 +375,7 @@ mod tests {
             None,
             None,
             None,
+            &accounts(&["gh-work", "gh-personal"]),
             &accounts(&["gh-work", "gh-personal"]),
         );
         assert_eq!(
@@ -363,6 +406,7 @@ mod tests {
             None,
             None,
             &accounts(&["gh-personal"]),
+            &accounts(&["gh-personal"]),
         );
         assert_eq!(
             got,
@@ -388,6 +432,7 @@ mod tests {
             None,
             None,
             &accounts(&["gh-work", "gh-personal"]),
+            &accounts(&["gh-work", "gh-personal"]),
         );
         assert_eq!(
             got,
@@ -412,6 +457,7 @@ mod tests {
             None,
             None,
             &accounts(&["gh-personal"]),
+            &accounts(&["gh-personal"]),
         );
         assert_eq!(
             got,
@@ -420,6 +466,51 @@ mod tests {
                 pattern: "/home/me/work/*".into(),
             }
         );
+    }
+
+    /// Final Arc 2 review, fix wave 2, finding 1: `Rule` carries no
+    /// platform of its own, so a path rule naming a GitHub account
+    /// matches on `cwd` alone regardless of what platform the current
+    /// call is resolving for. Before this fix, `known(&rule.account)`
+    /// being false for `gh-work` here (it isn't a GitLab candidate,
+    /// it's a live GitHub account) was indistinguishable from `gh-work`
+    /// not existing anywhere, so the fix in the previous review round
+    /// over-corrected: it would have hard-errored a perfectly working
+    /// GitLab resolution just because a same-directory GitHub rule
+    /// happened to match first. `gh-work` here IS registered,
+    /// `all_accounts` says so, just not as a GitLab candidate, so the
+    /// rule is skipped (not treated as unavailable) and resolution
+    /// falls through to the sole remaining GitLab candidate, exactly
+    /// as it did before Arc 2's rule engine work existed at all.
+    #[test]
+    fn a_path_rule_naming_a_live_account_of_a_different_platform_is_skipped_not_unavailable() {
+        let got = resolve_account(
+            &[rule_path("/home/me/work/*", "gh-work")],
+            None,
+            Some(&PathBuf::from("/home/me/work/api")),
+            None,
+            None,
+            &accounts(&["gl-work"]),
+            &accounts(&["gh-work", "gl-work"]),
+        );
+        assert_eq!(got, Resolution::SoleAccount(AccountId::new("gl-work")));
+    }
+
+    /// Owner-tier twin of the path-tier test above: a `gh-work`-naming
+    /// owner rule matched against a GitLab repo op, with `gh-work` live
+    /// under GitHub but absent from the GitLab-narrowed `candidates`.
+    #[test]
+    fn an_owner_rule_naming_a_live_account_of_a_different_platform_is_skipped_not_unavailable() {
+        let got = resolve_account(
+            &[rule_owner("acme/*", "gh-work")],
+            Some(&repo("acme", "api")),
+            None,
+            None,
+            None,
+            &accounts(&["gl-work"]),
+            &accounts(&["gh-work", "gl-work"]),
+        );
+        assert_eq!(got, Resolution::SoleAccount(AccountId::new("gl-work")));
     }
 
     #[test]
@@ -458,6 +549,7 @@ mod tests {
             None,
             None,
             &accounts(&["gh-first", "gh-second"]),
+            &accounts(&["gh-first", "gh-second"]),
         );
         assert_eq!(got, Resolution::Owner(AccountId::new("gh-first")));
     }
@@ -493,6 +585,7 @@ mod tests {
             Some(&PathBuf::from("/home/me")),
             None,
             &accounts(&["gh-work", "gh-personal"]),
+            &accounts(&["gh-work", "gh-personal"]),
         );
         assert_eq!(got, Resolution::Path(AccountId::new("gh-work")));
     }
@@ -509,6 +602,7 @@ mod tests {
             Some(&PathBuf::from("/home/me/Code/work/api")),
             None,
             None,
+            &accounts(&["gh-work", "gh-personal"]),
             &accounts(&["gh-work", "gh-personal"]),
         );
         assert_eq!(

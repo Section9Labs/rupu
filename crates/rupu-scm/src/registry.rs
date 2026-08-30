@@ -389,6 +389,32 @@ impl Registry {
             .collect()
     }
 
+    /// Every account registered ANYWHERE — any platform, any capability,
+    /// any tracker — in deterministic order. Final Arc 2 review (fix
+    /// wave 2, finding 1): `resolve_account`'s `candidates` parameter is
+    /// always narrowed to one platform/capability (`accounts_for`,
+    /// `accounts_for_tracker`, `accounts_for_events`, ...), but a
+    /// `Rule` carries no platform of its own — its `account` can name an
+    /// identity of any kind. Without this wider set, `resolve_account`
+    /// couldn't tell "this rule's account doesn't exist at all" (the
+    /// dead-identity case `RuleTargetUnavailable` exists for) apart from
+    /// "this rule's account exists, just not for this platform or
+    /// capability" (e.g. a GitHub-named path rule evaluated while
+    /// resolving a GitLab repo) — collapsing the two meant a live
+    /// cross-platform account hard-errored instead of being skipped the
+    /// way it always was pre-Arc-2. Deliberately a superset of every
+    /// `accounts_for*` result, not a union built ad hoc per call: one
+    /// list, computed the same way every time, so "does this identity
+    /// exist anywhere" never drifts from what `discover` actually
+    /// registered.
+    fn all_registered_accounts(&self) -> Vec<AccountId> {
+        let mut ids: std::collections::BTreeSet<AccountId> =
+            self.accounts.keys().cloned().collect();
+        ids.extend(self.tracker_accounts.keys().cloned());
+        ids.extend(self.tracker_event_connectors.keys().cloned());
+        ids.into_iter().collect()
+    }
+
     fn accounts_for_tracker(&self, tracker: IssueTracker) -> Vec<AccountId> {
         match platform_for_tracker(tracker) {
             Some(kind) => self
@@ -418,6 +444,7 @@ impl Registry {
         explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<dyn RepoConnector>), AccountError> {
         let candidates = self.accounts_for(repo.platform);
+        let all_accounts = self.all_registered_accounts();
         let home = dirs::home_dir();
         let resolution = rules::resolve_account(
             &self.rules,
@@ -426,6 +453,7 @@ impl Registry {
             home.as_deref(),
             explicit,
             &candidates,
+            &all_accounts,
         );
         match resolution {
             Resolution::Explicit(id)
@@ -519,6 +547,7 @@ impl Registry {
         explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<dyn IssueConnector>), AccountError> {
         let candidates = self.accounts_for_tracker(tracker);
+        let all_accounts = self.all_registered_accounts();
         let home = dirs::home_dir();
         let resolution = rules::resolve_account(
             &self.rules,
@@ -527,6 +556,7 @@ impl Registry {
             home.as_deref(),
             explicit,
             &candidates,
+            &all_accounts,
         );
         match resolution {
             Resolution::Explicit(id)
@@ -685,6 +715,7 @@ impl Registry {
         explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<dyn EventConnector>), AccountError> {
         let home = dirs::home_dir();
+        let all_accounts = self.all_registered_accounts();
         match source {
             EventSourceRef::Repo { repo } => {
                 let candidates = self.accounts_for_events(repo.platform);
@@ -695,6 +726,7 @@ impl Registry {
                     home.as_deref(),
                     explicit,
                     &candidates,
+                    &all_accounts,
                 );
                 let id = Self::resolution_to_id(resolution, || {
                     (
@@ -720,6 +752,7 @@ impl Registry {
                         home.as_deref(),
                         explicit,
                         &candidates,
+                        &all_accounts,
                     );
                     let id = Self::resolution_to_id(resolution, || {
                         (project.clone(), repo.owner.clone(), tracker.to_string())
@@ -734,6 +767,7 @@ impl Registry {
                         home.as_deref(),
                         explicit,
                         &candidates,
+                        &all_accounts,
                     );
                     let id = Self::resolution_to_id(resolution, || {
                         (project.clone(), String::new(), tracker.to_string())
@@ -1038,6 +1072,7 @@ impl Registry {
         explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<GithubExtras>), AccountError> {
         let candidates = self.accounts_for_github_extras();
+        let all_accounts = self.all_registered_accounts();
         let home = dirs::home_dir();
         let resolution = rules::resolve_account(
             &self.rules,
@@ -1046,6 +1081,7 @@ impl Registry {
             home.as_deref(),
             explicit,
             &candidates,
+            &all_accounts,
         );
         match resolution {
             Resolution::Explicit(id)
@@ -1128,6 +1164,7 @@ impl Registry {
         explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<GitlabExtras>), AccountError> {
         let candidates = self.accounts_for_gitlab_extras();
+        let all_accounts = self.all_registered_accounts();
         let home = dirs::home_dir();
         let resolution = rules::resolve_account(
             &self.rules,
@@ -1136,6 +1173,7 @@ impl Registry {
             home.as_deref(),
             explicit,
             &candidates,
+            &all_accounts,
         );
         match resolution {
             Resolution::Explicit(id)
@@ -1713,6 +1751,62 @@ mod tests {
             !msg.contains("gh-personal"),
             "must not suggest the account it did NOT route to: {msg}"
         );
+        // Fix wave 2, finding 2: the message must not assert a
+        // credential state the resolver cannot observe, and the fix
+        // line must not carry a `--kind` that could silently rewrite an
+        // already-declared account's kind (`declare_account_in_config`
+        // writes `kind` unconditionally).
+        assert!(
+            !msg.contains("usable credential"),
+            "must not assert a cause the resolver cannot observe: {msg}"
+        );
+        assert!(
+            msg.contains("no live connector for github"),
+            "must name what's actually true -- no live connector -- not why: {msg}"
+        );
+        assert!(
+            !msg.contains("--kind"),
+            "fix line must not risk rewriting an existing account's declared kind: {msg}"
+        );
+    }
+
+    /// Final Arc 2 review, fix wave 2, finding 1, end to end through
+    /// `Registry` (not just the pure `resolve_account` unit tests in
+    /// `rules.rs`): a GitHub PATH rule matches this GitLab repo op's
+    /// `cwd`, and `gh-work` is a live, fully-registered GitHub account
+    /// -- just not a candidate for a GitLab resolution. The fix-wave-1
+    /// version of this fix could not tell that apart from `gh-work`
+    /// being unregistered entirely, and would have hard-errored this
+    /// call with `RuleTargetUnavailable` even though nothing is wrong:
+    /// the rule simply doesn't apply here. It must be skipped, and
+    /// resolution must fall through to the sole GitLab candidate.
+    #[tokio::test]
+    async fn a_path_rule_naming_a_live_github_account_does_not_break_a_gitlab_resolution() {
+        let mut reg = Registry::default();
+        reg.insert_repo_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_repo_connector(),
+        );
+        reg.insert_repo_account(
+            AccountId::new("gl-work"),
+            Platform::Gitlab,
+            fake_repo_connector(),
+        );
+        reg.set_rules(vec![Rule {
+            owner: None,
+            path: Some("/home/me/work/*".into()),
+            account: AccountId::new("gh-work"),
+        }]);
+        let r = RepoRef {
+            platform: Platform::Gitlab,
+            owner: "group".into(),
+            repo: "proj".into(),
+        };
+        let (id, _) = reg
+            .repo_for(&r, Some(Path::new("/home/me/work/api")), None)
+            .expect("a live cross-platform account must be skipped, not treated as unavailable");
+        assert_eq!(id, AccountId::new("gl-work"));
     }
 
     /// Companion assertion to `an_owner_rule_selects_between_two_accounts`:
