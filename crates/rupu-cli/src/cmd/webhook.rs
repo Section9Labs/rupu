@@ -18,10 +18,10 @@ use super::autoflow_wake::wake_requests_from_webhook;
 use crate::paths;
 use async_trait::async_trait;
 use clap::Subcommand;
-use rupu_auth::{CredentialResolver, KeychainResolver};
+use rupu_auth::KeychainResolver;
 use rupu_orchestrator::Workflow;
 use rupu_runtime::{WakeStore, WakeStoreError};
-use rupu_scm::connectors::github::GithubClient;
+use rupu_scm::connectors::github::GithubExtras;
 use rupu_webhook::{
     serve, DispatchOutcome, GithubProjectsHydrator, WebhookConfig, WebhookEvent, WebhookObserver,
     WorkflowDispatcher,
@@ -35,7 +35,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
@@ -88,13 +88,26 @@ async fn serve_cmd(addr: SocketAddr) -> anyhow::Result<()> {
         );
     }
 
+    // Built once at daemon startup, not per payload (Task 6):
+    // `Registry::discover` builds and caches every configured account's
+    // connectors — including per-account `GithubExtras` handles — in
+    // its own account-keyed maps. The GitHub Projects hydrator below
+    // resolves an `AccountId` fresh for every inbound payload (the
+    // payload carries the org/owner — see `github_projects_payload_owner`),
+    // but that resolution is a pure map lookup through the rule engine;
+    // it never rebuilds an HTTP client. A daemon receiving many events
+    // reuses the same per-account clients this one `discover` call built.
+    let registry = Arc::new(
+        rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
+    );
+
     let config = WebhookConfig {
         addr,
         github_secret,
         gitlab_token,
         linear_secret,
         jira_secret,
-        github_projects_hydrator: maybe_build_github_projects_hydrator(&resolver, &cfg).await,
+        github_projects_hydrator: Some(Arc::new(CliGithubProjectsHydrator { registry })),
         workflow_loader: Arc::new(load_workflows),
         dispatcher: Arc::new(CliDispatcher),
         observer: Some(Arc::new(CliWebhookObserver { global })),
@@ -143,30 +156,6 @@ fn load_cli_config() -> rupu_config::Config {
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
         .unwrap_or_default()
-}
-
-async fn maybe_build_github_projects_hydrator(
-    resolver: &dyn CredentialResolver,
-    cfg: &rupu_config::Config,
-) -> Option<Arc<dyn GithubProjectsHydrator>> {
-    let creds = resolver.get("github", None).await.ok()?.1;
-    let token = match creds {
-        rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
-        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
-    };
-    let base_url = cfg
-        .scm
-        .platforms
-        .get("github")
-        .and_then(|platform| platform.base_url.clone());
-    // Built once at `rupu webhook serve` daemon startup and reused for
-    // every future incoming webhook, each of which may independently
-    // dispatch a workflow run with its own fresh run id. No run exists yet
-    // at this point, so this SCM traffic is not attributed to a ledger. A
-    // run-routing FlowSink would close this; see the netflow per-run plan.
-    Some(Arc::new(CliGithubProjectsHydrator {
-        client: GithubClient::new(token, base_url, Some(2), Arc::new(rupu_netflow::NullSink)),
-    }))
 }
 
 struct CliWebhookObserver {
@@ -328,7 +317,7 @@ fn decode_dispatch_key(value: &str) -> anyhow::Result<DispatchKey> {
 }
 
 struct CliGithubProjectsHydrator {
-    client: GithubClient,
+    registry: Arc<rupu_scm::Registry>,
 }
 
 #[async_trait]
@@ -337,8 +326,63 @@ impl GithubProjectsHydrator for CliGithubProjectsHydrator {
         if !github_projects_payload_needs_hydration(payload) {
             return Ok(payload.clone());
         }
-        hydrate_github_projects_payload(&self.client, payload).await
+        let Some(owner) = github_projects_payload_owner(payload) else {
+            warn!(
+                "github projects webhook payload has no organization.login; \
+                 cannot resolve an account, skipping hydration"
+            );
+            return Ok(payload.clone());
+        };
+        let repo_ref = rupu_scm::RepoRef {
+            platform: rupu_scm::Platform::Github,
+            owner,
+            // Only `repo.owner` feeds the rule engine's owner-rule tier
+            // (`rules::glob_matches` never inspects `repo.repo`) — and
+            // the payload may not yet know which repo this project item
+            // belongs to; recovering that IS part of what hydration
+            // does. A placeholder here is deliberate, not a shortcut.
+            repo: String::new(),
+        };
+        let (account, extras) = match self.registry.github_extras_for(&repo_ref, None, None) {
+            Ok(pair) => pair,
+            // No GitHub account configured at all — nothing to hydrate
+            // with. Not a misconfiguration worth a warning: this route
+            // only receives traffic once `RUPU_GITHUB_WEBHOOK_SECRET` is
+            // set, independent of whether any GitHub account actually
+            // has credentials.
+            Err(rupu_scm::AccountError::NoAccounts { .. }) => return Ok(payload.clone()),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    owner = %repo_ref.owner,
+                    "github projects hydration: account resolution failed; skipping enrichment"
+                );
+                return Ok(payload.clone());
+            }
+        };
+        debug!(
+            account = %account.as_str(),
+            owner = %repo_ref.owner,
+            "github projects hydration: resolved account"
+        );
+        hydrate_github_projects_payload(&extras, payload).await
     }
+}
+
+/// Extract the org/owner login a `projects_v2_item` webhook payload
+/// belongs to. Read from the payload's own top-level `organization`
+/// object — present on every organization-scoped GitHub webhook
+/// delivery, independent of hydration (GitHub Projects V2 are an
+/// org-scoped resource, so this event only ever arrives as an
+/// org-level delivery) — rather than from `content.repository`, which
+/// IS one of the sparse fields hydration exists to restore and so
+/// cannot be relied on to resolve the account in the first place.
+fn github_projects_payload_owner(payload: &Value) -> Option<String> {
+    payload
+        .get("organization")
+        .and_then(|org| org.get("login"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 const GITHUB_PROJECTS_ITEM_QUERY: &str = r#"
@@ -426,7 +470,7 @@ query RupuProjectHydration($projectId: ID!) {
 "#;
 
 async fn hydrate_github_projects_payload(
-    client: &GithubClient,
+    extras: &GithubExtras,
     payload: &Value,
 ) -> anyhow::Result<Value> {
     let item_id = github_projects_item_id(payload);
@@ -436,7 +480,7 @@ async fn hydrate_github_projects_payload(
     }
 
     let item_data = if let Some(item_id) = item_id.as_deref() {
-        client
+        extras
             .graphql_json(GITHUB_PROJECTS_ITEM_QUERY, json!({ "itemId": item_id }))
             .await
             .ok()
@@ -444,7 +488,7 @@ async fn hydrate_github_projects_payload(
         None
     };
     let project_data = if let Some(project_id) = project_id.as_deref() {
-        client
+        extras
             .graphql_json(GITHUB_PROJECTS_QUERY, json!({ "projectId": project_id }))
             .await
             .ok()
@@ -849,8 +893,30 @@ mod tests {
     use super::*;
     use crate::test_support::ENV_LOCK;
     use httpmock::prelude::*;
+    use rupu_scm::connectors::github::GithubClient;
+    use rupu_scm::AccountId;
     use rupu_webhook::{WebhookEvent, WebhookSource};
     use serde_json::json;
+
+    /// Build a `Registry` with a single GitHub account (`account`)
+    /// whose `GithubExtras` handle talks to `base_url` — the account
+    /// the multi-account webhook tests below tag by which mock server
+    /// actually receives the GraphQL call, not merely by which call
+    /// returns 200 (see this arc's established "assert on which
+    /// account served, not that both succeeded" pattern).
+    fn registry_with_github_account(account: &str, base_url: &str) -> rupu_scm::Registry {
+        let mut registry = rupu_scm::Registry::default();
+        let extras = Arc::new(rupu_scm::connectors::github::GithubExtras::new(
+            GithubClient::new(
+                "ghp_test".into(),
+                Some(base_url.to_string()),
+                Some(2),
+                Arc::new(rupu_netflow::NullSink),
+            ),
+        ));
+        registry.insert_github_extras_account(AccountId::new(account), extras);
+        registry
+    }
 
     #[tokio::test]
     async fn observer_queues_only_tracked_repo_events() {
@@ -1157,16 +1223,13 @@ steps:
             }));
         });
 
+        let registry = registry_with_github_account("github", &server.base_url());
         let hydrator = CliGithubProjectsHydrator {
-            client: GithubClient::new(
-                "ghp_test".into(),
-                Some(server.base_url()),
-                Some(2),
-                Arc::new(rupu_netflow::NullSink),
-            ),
+            registry: Arc::new(registry),
         };
         let payload = json!({
             "action": "edited",
+            "organization": { "login": "Section9Labs" },
             "projects_v2_item": {
                 "id": "PVTI_1",
                 "project_node_id": "PVT_1",
@@ -1184,5 +1247,119 @@ steps:
         project_mock.assert();
         assert_eq!(hydrated["projects_v2"]["title"], "Delivery");
         assert_eq!(hydrated["changes"]["field_value"]["name"], "In Progress");
+    }
+
+    /// Arc 2 Task 6's headline daemon case: two webhook payloads for
+    /// DIFFERENT owners must reach DIFFERENT accounts. Before this task,
+    /// `maybe_build_github_projects_hydrator` built one hydrator at
+    /// `rupu webhook serve` startup from a single hardcoded credential —
+    /// every payload, regardless of which org it named, hit that one
+    /// account. Two independent mock servers (not one server plus header
+    /// inspection) make "the right account's client made this call"
+    /// provable by which server actually received the HTTP request —
+    /// `assert_hits(0)` on the OTHER server is the real proof, matching
+    /// this arc's established pattern (see `cli_issues_multi_account.rs`):
+    /// a success-only assertion would pass identically whether the right
+    /// account answered, the wrong one did, or (with the pre-Task-6
+    /// single hardcoded hydrator) it was always the same one.
+    #[tokio::test]
+    async fn hydrator_routes_different_owners_to_different_accounts() {
+        let work_server = MockServer::start();
+        let personal_server = MockServer::start();
+
+        let work_mock = work_server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/graphql")
+                .body_contains("\"itemId\":\"PVTI_WORK\"");
+            then.status(200)
+                .json_body(json!({ "data": { "item": null } }));
+        });
+        let personal_mock = personal_server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/graphql")
+                .body_contains("\"itemId\":\"PVTI_PERSONAL\"");
+            then.status(200)
+                .json_body(json!({ "data": { "item": null } }));
+        });
+
+        let mut registry = registry_with_github_account("gh-work", &work_server.base_url());
+        let personal_extras = Arc::new(rupu_scm::connectors::github::GithubExtras::new(
+            GithubClient::new(
+                "ghp_test".into(),
+                Some(personal_server.base_url()),
+                Some(2),
+                Arc::new(rupu_netflow::NullSink),
+            ),
+        ));
+        registry.insert_github_extras_account(AccountId::new("gh-personal"), personal_extras);
+        // Two accounts and nothing else disambiguates them (spec §6.3)
+        // — an owner rule per account is exactly what a real operator
+        // configures for this: "a webhook payload ... knows the owner
+        // but has no cwd", so the owner tier is the only lever a daemon
+        // has.
+        registry.set_rules(vec![
+            rupu_scm::rules::Rule {
+                owner: Some("acme-work".into()),
+                path: None,
+                account: AccountId::new("gh-work"),
+            },
+            rupu_scm::rules::Rule {
+                owner: Some("acme-personal".into()),
+                path: None,
+                account: AccountId::new("gh-personal"),
+            },
+        ]);
+
+        let hydrator = CliGithubProjectsHydrator {
+            registry: Arc::new(registry),
+        };
+
+        // Deliberately sparse (no `content`/`fieldValues`) so
+        // `github_projects_payload_needs_hydration` fires and only the
+        // item query runs (no `project_node_id`, so `project_id` stays
+        // `None` — one graphql call per payload keeps this test's
+        // assertions unambiguous).
+        let work_payload = json!({
+            "action": "edited",
+            "organization": { "login": "acme-work" },
+            "projects_v2_item": {
+                "id": "PVTI_WORK",
+                "content_type": "Issue",
+                "field_value": { "optionId": "opt-ready" }
+            },
+        });
+        let personal_payload = json!({
+            "action": "edited",
+            "organization": { "login": "acme-personal" },
+            "projects_v2_item": {
+                "id": "PVTI_PERSONAL",
+                "content_type": "Issue",
+                "field_value": { "optionId": "opt-ready" }
+            },
+        });
+
+        hydrator.hydrate(&work_payload).await.unwrap();
+        work_mock.assert_hits(1);
+        personal_mock.assert_hits(0);
+
+        hydrator.hydrate(&personal_payload).await.unwrap();
+        personal_mock.assert_hits(1);
+        // Still exactly the one hit from the work payload above — the
+        // personal payload must not have also reached the work server.
+        work_mock.assert_hits(1);
+    }
+
+    /// `github_projects_payload_owner`'s unit-level coverage: reads
+    /// `organization.login`, and returns `None` — not a panic, not an
+    /// empty-string owner that would silently match a `"*"` rule —
+    /// when that key is entirely absent.
+    #[test]
+    fn payload_owner_reads_organization_login() {
+        let payload = json!({ "organization": { "login": "Section9Labs" } });
+        assert_eq!(
+            github_projects_payload_owner(&payload),
+            Some("Section9Labs".to_string())
+        );
+        assert_eq!(github_projects_payload_owner(&json!({})), None);
     }
 }
