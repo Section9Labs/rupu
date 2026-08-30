@@ -186,6 +186,27 @@ const BUILTIN_PROVIDER_KINDS: &[&str] = &[
     "jira",
 ];
 
+/// `true` for the two account names that resolve as an SCM account
+/// with NO `[scm.<name>]` table at all — the account name IS the
+/// vendor (design spec §3.1's back-compat fallback, mirrored by
+/// `rupu_scm::Registry::discover`'s own account-name-set construction:
+/// `{"github", "gitlab"}` are always implicit candidates).
+///
+/// Deliberately a local, hardcoded two-string check rather than
+/// `rupu_scm::Platform::from_str` — `rupu-config` does not depend on
+/// `rupu-scm` (the corrected invariant from this arc's Ruling 3: only
+/// `rupu-scm` depends on `rupu-config`, never the reverse), so this
+/// crate cannot parse a `Platform` at all. Kept narrower than
+/// `BUILTIN_PROVIDER_KINDS` above on purpose: `linear`/`jira` also
+/// resolve as bare vendor names, but never as the account a `[[scm.rules]]`
+/// entry can legitimately name (`Registry::discover` never treats them
+/// as multi-account, and `[[scm.rules]]` only ever routes
+/// github/gitlab `RepoRef`s) — including them here would silence a
+/// warning for a rule that can genuinely never do anything.
+fn is_bare_repo_vendor_name(account: &str) -> bool {
+    matches!(account, "github" | "gitlab")
+}
+
 impl Config {
     /// Warn about keys that still parse but no longer do anything.
     ///
@@ -314,6 +335,18 @@ impl Config {
     /// anything, which is already surfaced structurally (as
     /// `AccountError::NoRuleMatched`'s candidate list omitting the
     /// account) rather than needing a load-time hard stop.
+    ///
+    /// That warning is itself suppressed for a bare vendor name
+    /// (`is_bare_repo_vendor_name`) — the exact case the warning's own
+    /// text calls fine. Without this, `[scm.gh-work]` plus a rule
+    /// naming the bare credential-only account `"github"` would print a
+    /// 4-line WARN on every single invocation, including `rupu repos
+    /// list` and `rupu scm accounts` (the command this warning tells
+    /// people to run to check their setup). Task 3's
+    /// `should_warn_unresolvable_kind` (`rupu-scm`) hit the identical
+    /// shape of mistake for a sibling warning and documented why noise
+    /// on a correct, common config erodes trust in the warning faster
+    /// than it helps anyone — the same reasoning applies here.
     fn validate_scm_rules(&self) -> Result<(), crate::layer::LayerError> {
         for (idx, rule) in self.scm.rules.iter().enumerate() {
             match (&rule.owner, &rule.path) {
@@ -333,15 +366,16 @@ impl Config {
                 }
                 (Some(_), None) | (None, Some(_)) => {}
             }
-            if !self.scm.platforms.contains_key(&rule.account) {
+            if !self.scm.platforms.contains_key(&rule.account)
+                && !is_bare_repo_vendor_name(&rule.account)
+            {
                 tracing::warn!(
                     key = "scm.rules",
                     index = idx,
                     account = %rule.account,
                     "config.toml declares a `[[scm.rules]]` entry pointing at an account with \
                      no matching `[scm.<name>]` table. This is fine if the account is \
-                     credential-only (e.g. the bare vendor name \"github\"/\"gitlab\", which \
-                     needs no config table); if it's a typo the rule will simply never match and \
+                     credential-only; if it's a typo the rule will simply never match and \
                      requests will fall through to the next tier (or to the ambiguity error). \
                      Run `rupu scm accounts` to see configured accounts."
                 );
@@ -595,5 +629,24 @@ mod tests {
         );
         cfg.scm.rules.push(owner_rule("acme/*", "gh-work"));
         assert!(cfg.validate().is_ok());
+    }
+
+    /// Pure-predicate coverage for `is_bare_repo_vendor_name` — this
+    /// crate has no tracing-capture harness (see `rupu_scm`'s
+    /// `should_warn_unresolvable_kind` for the sibling precedent), so
+    /// the decision itself, not the `warn!` call site, is the seam
+    /// these tests exercise directly. Three cases: the two bare names
+    /// the warning must NOT fire for, an undeclared non-vendor name it
+    /// MUST fire for (a genuine typo), and the two tracker-only vendor
+    /// names that must NOT be silenced (see the function's doc comment
+    /// on why `linear`/`jira` are deliberately excluded).
+    #[test]
+    fn is_bare_repo_vendor_name_covers_exactly_github_and_gitlab() {
+        assert!(is_bare_repo_vendor_name("github"));
+        assert!(is_bare_repo_vendor_name("gitlab"));
+        assert!(!is_bare_repo_vendor_name("gh-work"));
+        assert!(!is_bare_repo_vendor_name("linear"));
+        assert!(!is_bare_repo_vendor_name("jira"));
+        assert!(!is_bare_repo_vendor_name(""));
     }
 }
