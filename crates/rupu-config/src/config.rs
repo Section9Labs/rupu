@@ -295,6 +295,58 @@ impl Config {
                 }
             }
         }
+        self.validate_scm_rules()?;
+        Ok(())
+    }
+
+    /// Validate `[[scm.rules]]` (design spec §6.3). Makes true the claim
+    /// `ScmRule`'s doc comment already made — "a rule with both, or
+    /// neither, is a config error" — which this function is the first
+    /// code to actually enforce.
+    ///
+    /// A rule naming an account with no matching `[scm.<name>]` table is
+    /// deliberately a WARNING, not an error: the account may be
+    /// credential-only (a bare vendor name like `"github"`/`"gitlab"`
+    /// that resolves via the account-name-is-the-vendor fallback and so
+    /// never needs a config table at all — see `Registry::discover`).
+    /// Erroring there would reject a rule that resolves and works fine
+    /// at runtime; a rule with an outright typo just never matches
+    /// anything, which is already surfaced structurally (as
+    /// `AccountError::NoRuleMatched`'s candidate list omitting the
+    /// account) rather than needing a load-time hard stop.
+    fn validate_scm_rules(&self) -> Result<(), crate::layer::LayerError> {
+        for (idx, rule) in self.scm.rules.iter().enumerate() {
+            match (&rule.owner, &rule.path) {
+                (Some(_), Some(_)) => {
+                    return Err(crate::layer::LayerError::Invalid(format!(
+                        "[[scm.rules]] entry {idx} (account \"{}\"): both `owner` and `path` \
+                         are set; exactly one is required",
+                        rule.account
+                    )));
+                }
+                (None, None) => {
+                    return Err(crate::layer::LayerError::Invalid(format!(
+                        "[[scm.rules]] entry {idx} (account \"{}\"): neither `owner` nor `path` \
+                         is set; exactly one is required",
+                        rule.account
+                    )));
+                }
+                (Some(_), None) | (None, Some(_)) => {}
+            }
+            if !self.scm.platforms.contains_key(&rule.account) {
+                tracing::warn!(
+                    key = "scm.rules",
+                    index = idx,
+                    account = %rule.account,
+                    "config.toml declares a `[[scm.rules]]` entry pointing at an account with \
+                     no matching `[scm.<name>]` table. This is fine if the account is \
+                     credential-only (e.g. the bare vendor name \"github\"/\"gitlab\", which \
+                     needs no config table); if it's a typo the rule will simply never match and \
+                     requests will fall through to the next tier (or to the ambiguity error). \
+                     Run `rupu scm accounts` to see configured accounts."
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -476,6 +528,72 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert!(cfg.validate().is_ok());
+    }
+
+    fn owner_rule(owner: &str, account: &str) -> crate::scm_config::ScmRule {
+        crate::scm_config::ScmRule {
+            owner: Some(owner.into()),
+            path: None,
+            account: account.into(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_scm_rule_with_both_owner_and_path() {
+        let mut cfg = Config::default();
+        cfg.scm.rules.push(crate::scm_config::ScmRule {
+            owner: Some("acme/*".into()),
+            path: Some("~/Code/work/*".into()),
+            account: "gh-work".into(),
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("both `owner` and `path`"), "got: {err}");
+        assert!(err.contains("gh-work"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_scm_rule_with_neither_owner_nor_path() {
+        let mut cfg = Config::default();
+        cfg.scm.rules.push(crate::scm_config::ScmRule {
+            owner: None,
+            path: None,
+            account: "gh-work".into(),
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("neither `owner` nor `path`"), "got: {err}");
+    }
+
+    /// The happy path: exactly-one-of-owner-or-path rules validate fine,
+    /// even when the named account has no `[scm.<name>]` table — that's
+    /// a warning (unit-tested separately via `should_warn`-style pure
+    /// helpers elsewhere in the crate; this crate has no tracing-capture
+    /// harness, so the assertion here is simply "does not error").
+    #[test]
+    fn validate_accepts_owner_only_and_path_only_rules_even_for_undeclared_accounts() {
+        let mut cfg = Config::default();
+        cfg.scm.rules.push(owner_rule("acme/*", "gh-work"));
+        cfg.scm.rules.push(crate::scm_config::ScmRule {
+            owner: None,
+            path: Some("~/Code/work/*".into()),
+            account: "gh-work".into(),
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// A rule naming a declared `[scm.<name>]` account validates with no
+    /// warning-worthy condition at all — the common, fully-declared case.
+    #[test]
+    fn validate_accepts_scm_rule_naming_a_declared_account() {
+        let mut cfg = Config::default();
+        cfg.scm.platforms.insert(
+            "gh-work".into(),
+            crate::scm_config::ScmPlatformConfig {
+                kind: Some("github".into()),
+                ..Default::default()
+            },
+        );
+        cfg.scm.rules.push(owner_rule("acme/*", "gh-work"));
         assert!(cfg.validate().is_ok());
     }
 }
