@@ -753,6 +753,35 @@ impl Registry {
             .events = Some(c);
     }
 
+    /// Test/internal: register a `GithubExtras` handle under an explicit
+    /// account name — the `github_extras_for()` counterpart to
+    /// `insert_repo_account`. Lets a test prove account routing for
+    /// `github.workflows_dispatch` without a real octocrab HTTP round
+    /// trip: `github_extras_for` returning the same `Arc` this test
+    /// inserted is a strong enough signal (Arc identity), since
+    /// `lookup_github_extras`'s own logic is otherwise a straight
+    /// `Option` read with no further branching to miss.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn insert_github_extras_account(&mut self, id: AccountId, extras: Arc<GithubExtras>) {
+        self.accounts
+            .entry(id)
+            .or_insert_with(|| ScmAccount::empty(Platform::Github))
+            .github_extras = Some(extras);
+    }
+
+    /// Test/internal: register a `GitlabExtras` handle under an explicit
+    /// account name — see
+    /// [`insert_github_extras_account`](Self::insert_github_extras_account)'s
+    /// doc for why this is enough to exercise `gitlab_extras_for`'s
+    /// routing without a real HTTP call.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn insert_gitlab_extras_account(&mut self, id: AccountId, extras: Arc<GitlabExtras>) {
+        self.accounts
+            .entry(id)
+            .or_insert_with(|| ScmAccount::empty(Platform::Gitlab))
+            .gitlab_extras = Some(extras);
+    }
+
     /// Test/internal: register an `IssueConnector` directly without going
     /// through `discover`. Used by tests that need a fake connector.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -778,10 +807,169 @@ impl Registry {
         self.rules = rules;
     }
 
+    /// Resolve which account's `GithubExtras` handle serves `repo`,
+    /// running the same rule engine `repo_for` runs (spec §6.2/§6.3):
+    /// explicit `account` → owner rule → path rule → sole account of
+    /// GitHub → error. This is the account-aware counterpart to
+    /// [`github_extras`](Self::github_extras): that method is a
+    /// back-compat shim that picks an account arbitrarily (bare-name
+    /// first, else lexicographically-first), which is exactly the
+    /// "invisible until a second account exists" defect this arc
+    /// closes — a `workflows_dispatch` call actually mutates state on
+    /// whichever GitHub account it resolves to, so guessing wrong here
+    /// is worse than for a read-only diagnostic.
+    ///
+    /// `discover` always sets `github_extras` in the same branch as
+    /// `repo`/`issues` (see the `Platform::Github` arm above), so an
+    /// account can only be a candidate here if it also has extras —
+    /// [`lookup_github_extras`](Self::lookup_github_extras) still
+    /// checks, rather than assuming, in case a test seam registers the
+    /// two independently.
+    pub fn github_extras_for(
+        &self,
+        repo: &RepoRef,
+        cwd: Option<&Path>,
+        explicit: Option<&AccountId>,
+    ) -> Result<(AccountId, Arc<GithubExtras>), AccountError> {
+        let candidates = self.accounts_for_github_extras();
+        let home = dirs::home_dir();
+        let resolution = rules::resolve_account(
+            &self.rules,
+            Some(repo),
+            cwd,
+            home.as_deref(),
+            explicit,
+            &candidates,
+        );
+        match resolution {
+            Resolution::Explicit(id)
+            | Resolution::Owner(id)
+            | Resolution::Path(id)
+            | Resolution::SoleAccount(id) => self.lookup_github_extras(id, &candidates),
+            Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
+                repo: format!("{}/{}", repo.owner, repo.repo),
+                owner: repo.owner.clone(),
+                platform: repo.platform.to_string(),
+                candidates,
+            }),
+            Resolution::NoAccounts => Err(AccountError::NoAccounts {
+                platform: repo.platform.to_string(),
+            }),
+        }
+    }
+
+    fn accounts_for_github_extras(&self) -> Vec<AccountId> {
+        self.accounts
+            .iter()
+            .filter(|(_, a)| a.kind == Platform::Github && a.github_extras.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn lookup_github_extras(
+        &self,
+        id: AccountId,
+        candidates: &[AccountId],
+    ) -> Result<(AccountId, Arc<GithubExtras>), AccountError> {
+        if candidates.is_empty() {
+            return Err(AccountError::NoAccounts {
+                platform: Platform::Github.to_string(),
+            });
+        }
+        if let Some(acct) = self.accounts.get(&id) {
+            if acct.kind == Platform::Github {
+                if let Some(extras) = &acct.github_extras {
+                    return Ok((id, extras.clone()));
+                }
+            }
+        }
+        Err(AccountError::UnknownAccount {
+            requested: id,
+            configured: candidates.to_vec(),
+        })
+    }
+
+    /// Resolve which account's `GitlabExtras` handle serves `repo`. The
+    /// `gitlab.pipeline_trigger` counterpart to
+    /// [`github_extras_for`](Self::github_extras_for) — same rule
+    /// engine, same reasoning for why the account-arbitrary
+    /// [`gitlab_extras`](Self::gitlab_extras) shim isn't good enough for
+    /// a mutating call.
+    pub fn gitlab_extras_for(
+        &self,
+        repo: &RepoRef,
+        cwd: Option<&Path>,
+        explicit: Option<&AccountId>,
+    ) -> Result<(AccountId, Arc<GitlabExtras>), AccountError> {
+        let candidates = self.accounts_for_gitlab_extras();
+        let home = dirs::home_dir();
+        let resolution = rules::resolve_account(
+            &self.rules,
+            Some(repo),
+            cwd,
+            home.as_deref(),
+            explicit,
+            &candidates,
+        );
+        match resolution {
+            Resolution::Explicit(id)
+            | Resolution::Owner(id)
+            | Resolution::Path(id)
+            | Resolution::SoleAccount(id) => self.lookup_gitlab_extras(id, &candidates),
+            Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
+                repo: format!("{}/{}", repo.owner, repo.repo),
+                owner: repo.owner.clone(),
+                platform: repo.platform.to_string(),
+                candidates,
+            }),
+            Resolution::NoAccounts => Err(AccountError::NoAccounts {
+                platform: repo.platform.to_string(),
+            }),
+        }
+    }
+
+    fn accounts_for_gitlab_extras(&self) -> Vec<AccountId> {
+        self.accounts
+            .iter()
+            .filter(|(_, a)| a.kind == Platform::Gitlab && a.gitlab_extras.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn lookup_gitlab_extras(
+        &self,
+        id: AccountId,
+        candidates: &[AccountId],
+    ) -> Result<(AccountId, Arc<GitlabExtras>), AccountError> {
+        if candidates.is_empty() {
+            return Err(AccountError::NoAccounts {
+                platform: Platform::Gitlab.to_string(),
+            });
+        }
+        if let Some(acct) = self.accounts.get(&id) {
+            if acct.kind == Platform::Gitlab {
+                if let Some(extras) = &acct.gitlab_extras {
+                    return Ok((id, extras.clone()));
+                }
+            }
+        }
+        Err(AccountError::UnknownAccount {
+            requested: id,
+            configured: candidates.to_vec(),
+        })
+    }
+
     /// Returns the per-platform extras handle for GitHub actions, if
     /// GitHub credentials were present during discovery. Prefers the
     /// bare-vendor-named account, then the first (lowest `AccountId`)
     /// GitHub-kind account with extras — see [`repo`](Self::repo)'s doc.
+    /// Back-compat shim: `rupu-mcp`'s `github.workflows_dispatch` (a
+    /// mutating call with a `RepoRef` in hand) migrated to
+    /// [`github_extras_for`](Self::github_extras_for) in Arc 2 Task 5.
+    /// `rupu-cli`'s `repos list` private-repo scope hint still calls
+    /// this shim directly, deliberately gated to the single-GitHub-
+    /// account case where "arbitrary" and "correct" are the same
+    /// account (Arc 2 Task 4) — a read-only diagnostic, not a mutation.
     pub fn github_extras(&self) -> Option<Arc<GithubExtras>> {
         self.accounts
             .get(&AccountId::new("github"))
@@ -1262,6 +1450,93 @@ mod tests {
             .issues_for(IssueTracker::Github, Some(&r), None, None)
             .expect("owner rule must resolve through issues_for");
         assert_eq!(id, AccountId::new("gh-work"));
+    }
+
+    /// A dummy client never makes a network call in these tests — only
+    /// construction and Registry lookup are exercised, matching
+    /// `insert_github_extras_account`'s doc on why Arc/AccountId
+    /// identity is a sufficient signal here.
+    fn dummy_github_extras() -> Arc<GithubExtras> {
+        use crate::connectors::github::GithubClient;
+        Arc::new(GithubExtras::new(GithubClient::new(
+            "unused-token".into(),
+            None,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )))
+    }
+
+    fn dummy_gitlab_extras() -> Arc<GitlabExtras> {
+        use crate::connectors::gitlab::GitlabClient;
+        Arc::new(GitlabExtras::new(GitlabClient::new(
+            "unused-token".into(),
+            None,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )))
+    }
+
+    /// `github.workflows_dispatch`'s account-routing counterpart to
+    /// `an_owner_rule_selects_between_two_accounts` — proves
+    /// `github_extras_for` runs the same rule engine `repo_for` does,
+    /// rather than falling back to `github_extras()`'s account-arbitrary
+    /// bare-name-or-first-found shim (the defect `rupu-mcp`'s
+    /// `github.workflows_dispatch` had before Arc 2 Task 5: a mutating
+    /// call that could silently fire on the wrong GitHub account).
+    #[tokio::test]
+    async fn an_owner_rule_selects_between_two_accounts_through_github_extras_for() {
+        crate::install_default_crypto_provider();
+        let mut reg = Registry::default();
+        reg.insert_github_extras_account(AccountId::new("gh-work"), dummy_github_extras());
+        reg.insert_github_extras_account(AccountId::new("gh-personal"), dummy_github_extras());
+        reg.set_rules(vec![Rule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: AccountId::new("gh-work"),
+        }]);
+        let r = RepoRef {
+            platform: Platform::Github,
+            owner: "acme".into(),
+            repo: "api".into(),
+        };
+        let (id, _) = reg
+            .github_extras_for(&r, None, None)
+            .expect("owner rule must resolve through github_extras_for");
+        assert_eq!(id, AccountId::new("gh-work"));
+
+        // Explicit beats the rule, same precedence as repo_for/issues_for.
+        let (id, _) = reg
+            .github_extras_for(&r, None, Some(&AccountId::new("gh-personal")))
+            .expect("explicit account must resolve through github_extras_for");
+        assert_eq!(id, AccountId::new("gh-personal"));
+    }
+
+    /// `gitlab.pipeline_trigger`'s counterpart to the GitHub extras test
+    /// above.
+    #[tokio::test]
+    async fn an_owner_rule_selects_between_two_accounts_through_gitlab_extras_for() {
+        let mut reg = Registry::default();
+        reg.insert_gitlab_extras_account(AccountId::new("gl-work"), dummy_gitlab_extras());
+        reg.insert_gitlab_extras_account(AccountId::new("gl-personal"), dummy_gitlab_extras());
+        reg.set_rules(vec![Rule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: AccountId::new("gl-personal"),
+        }]);
+        let r = RepoRef {
+            platform: Platform::Gitlab,
+            owner: "acme".into(),
+            repo: "api".into(),
+        };
+        let (id, _) = reg
+            .gitlab_extras_for(&r, None, None)
+            .expect("owner rule must resolve through gitlab_extras_for");
+        assert_eq!(id, AccountId::new("gl-personal"));
+
+        let (id, _) = reg
+            .gitlab_extras_for(&r, None, Some(&AccountId::new("gl-work")))
+            .expect("explicit account must resolve through gitlab_extras_for");
+        assert_eq!(id, AccountId::new("gl-work"));
     }
 
     #[tokio::test]
