@@ -88,6 +88,32 @@ pub trait IssueConnector: Send + Sync {
         -> Result<Vec<Issue>, ScmError>;
     async fn get_issue(&self, i: &IssueRef) -> Result<Issue, ScmError>;
     async fn comment_issue(&self, i: &IssueRef, body: &str) -> Result<Comment, ScmError>;
+
+    /// Read an issue's comment thread, oldest-first.
+    ///
+    /// `limit` caps the number of comments returned. `None` means the
+    /// connector's default page size (a single page — never paginated
+    /// further). A `limit` larger than one page causes the connector to
+    /// walk successive pages until `limit` is satisfied or the thread is
+    /// exhausted, up to an internal page cap the connector enforces so an
+    /// absurd `limit` can't spin forever — this matters because comment
+    /// threads are read oldest-first, so silently capping at one page
+    /// would drop the newest comments, which is exactly the case an
+    /// operator-control channel driven by comments cares about most.
+    /// Default implementation is unsupported (mirroring `add_pr_labels`)
+    /// so trackers that have no comment-read surface — or test mocks —
+    /// need no change. Only platforms that override it can read comments.
+    async fn list_comments(
+        &self,
+        i: &IssueRef,
+        limit: Option<u32>,
+    ) -> Result<Vec<Comment>, ScmError> {
+        let _ = (i, limit);
+        Err(ScmError::BadRequest {
+            message: format!("list_comments is not supported by {}", self.tracker()),
+        })
+    }
+
     async fn create_issue(&self, project: &str, opts: CreateIssue) -> Result<Issue, ScmError>;
     async fn update_issue_state(&self, i: &IssueRef, state: IssueState) -> Result<(), ScmError>;
 }

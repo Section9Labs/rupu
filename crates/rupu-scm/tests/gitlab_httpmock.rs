@@ -409,6 +409,9 @@ async fn comment_issue_posts_note() {
         .unwrap();
     m.assert();
     assert_eq!(c.body, "looks great");
+    // GitLab has no author_association equivalent; the field must come
+    // back honestly absent rather than a connector inventing a value.
+    assert_eq!(c.author_association, None);
 }
 
 #[tokio::test]

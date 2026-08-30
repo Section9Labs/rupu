@@ -251,6 +251,8 @@ impl IssueConnector for JiraIssueConnector {
                 .unwrap_or_default(),
             body: render_adf_text(comment.body.as_ref()),
             created_at: comment.created,
+            // Jira has no author_association equivalent.
+            author_association: None,
         })
     }
 

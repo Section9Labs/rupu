@@ -373,3 +373,236 @@ async fn create_pr_posts_payload() {
     assert_eq!(pr.head_branch, "feat/write-paths");
     assert_eq!(pr.base_branch, "main");
 }
+
+#[tokio::test]
+async fn list_comments_translates() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/issue_comments_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_issue_connector_against(&server);
+    let comments = c
+        .list_comments(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Github,
+                project: "section9labs/rupu".into(),
+                number: 42,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(comments.len(), 2);
+    // Oldest-first: GitHub's native order is preserved, which is what a
+    // "what changed since my last iteration?" reader depends on.
+    assert_eq!(comments[0].id, "1001");
+    assert_eq!(comments[0].author, "mrbrutti");
+    assert_eq!(comments[0].body, "first comment body");
+    assert_eq!(comments[1].author, "octocat");
+    assert_eq!(comments[1].body, "second comment body");
+    assert!(comments[0].created_at < comments[1].created_at);
+    // The fixture carries GitHub's real `author_association` values —
+    // this is the field a downstream operator-control consumer needs to
+    // tell an authorized collaborator's comment apart from anyone else's.
+    assert_eq!(comments[0].author_association, Some("OWNER".to_string()));
+    assert_eq!(
+        comments[1].author_association,
+        Some("CONTRIBUTOR".to_string())
+    );
+}
+
+#[tokio::test]
+async fn list_comments_respects_limit() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/issue_comments_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_issue_connector_against(&server);
+    let comments = c
+        .list_comments(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Github,
+                project: "section9labs/rupu".into(),
+                number: 42,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+    // The server returned two; `limit` truncates client-side so the
+    // contract holds regardless of what the API page actually contained.
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].id, "1001");
+}
+
+/// Build a synthetic GitHub issue-comment JSON object with just the
+/// fields the octocrab model requires (plus `body`, which the assertions
+/// use to identify which page an item came from).
+fn synth_comment(id: u64, login: &str, created_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "node_id": format!("IC_synth_{id}"),
+        "url": format!("https://api.github.com/repos/section9labs/rupu/issues/42/comments/{id}"),
+        "html_url": format!("https://github.com/section9labs/rupu/issues/42#issuecomment-{id}"),
+        "issue_url": "https://api.github.com/repos/section9labs/rupu/issues/42",
+        "body": format!("comment {id}"),
+        "created_at": created_at,
+        "updated_at": created_at,
+        "user": {
+            "login": login,
+            "id": id + 900_000,
+            "node_id": format!("U_synth_{id}"),
+            "avatar_url": "https://avatars.githubusercontent.com/u/1?v=4",
+            "gravatar_id": "",
+            "url": format!("https://api.github.com/users/{login}"),
+            "html_url": format!("https://github.com/{login}"),
+            "followers_url": format!("https://api.github.com/users/{login}/followers"),
+            "following_url": format!("https://api.github.com/users/{login}/following{{/other_user}}"),
+            "gists_url": format!("https://api.github.com/users/{login}/gists{{/gist_id}}"),
+            "starred_url": format!("https://api.github.com/users/{login}/starred{{/owner}}{{/repo}}"),
+            "subscriptions_url": format!("https://api.github.com/users/{login}/subscriptions"),
+            "organizations_url": format!("https://api.github.com/users/{login}/orgs"),
+            "repos_url": format!("https://api.github.com/users/{login}/repos"),
+            "events_url": format!("https://api.github.com/users/{login}/events{{/privacy}}"),
+            "received_events_url": format!("https://api.github.com/users/{login}/received_events"),
+            "type": "User",
+            "site_admin": false
+        },
+        "author_association": "NONE"
+    })
+}
+
+#[tokio::test]
+async fn list_comments_paginates_across_pages() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start();
+
+    // Page 1: a full page (100 items) — per_page is fixed at 100, so a
+    // full page never signals "last page" on its own and the connector
+    // must fetch page 2 to find out.
+    let page1: Vec<serde_json::Value> = (1..=100)
+        .map(|n| synth_comment(2000 + n, "page1-user", "2026-08-01T00:00:00Z"))
+        .collect();
+    // Page 2: a short page (10 items, < per_page) — this is the signal
+    // that tells the connector to stop walking pages.
+    let page2: Vec<serde_json::Value> = (1..=10)
+        .map(|n| synth_comment(3000 + n, "page2-user", "2026-08-02T00:00:00Z"))
+        .collect();
+
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments")
+            .query_param("page", "1");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!(page1));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments")
+            .query_param("page", "2");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!(page2));
+    });
+
+    let c = common::github_issue_connector_against(&server);
+    let comments = c
+        .list_comments(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Github,
+                project: "section9labs/rupu".into(),
+                number: 42,
+            },
+            // Spans the page boundary: page 1 alone (100) can't satisfy
+            // this, so the real multi-page path must run. Also spans
+            // into page 2 far enough that the post-pagination truncate
+            // still has work to do (110 fetched -> 105 kept).
+            Some(105),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(comments.len(), 105);
+    // Last item of page 1, in place just before the boundary.
+    assert_eq!(comments[99].id, "2100");
+    assert_eq!(comments[99].author, "page1-user");
+    // First item of page 2, proving the walk actually crossed pages
+    // rather than stopping at page 1's (full) 100 items.
+    assert_eq!(comments[100].id, "3001");
+    assert_eq!(comments[100].author, "page2-user");
+    // Last kept item: truncation to `limit` applies after pagination,
+    // not instead of it.
+    assert_eq!(comments[104].id, "3005");
+}
+
+/// Pins the `limit: None` contract: `None` means "one page and stop",
+/// even when that page happens to be a *full* 100-item page that would,
+/// on its own, look exactly like an in-progress pagination walk. A page-2
+/// mock is registered so a regression that started walking to
+/// exhaustion on `None` (e.g. by dropping `single_default_page` from the
+/// loop's break condition) would still leave `list_comments` returning
+/// correct data — the `assert_hits(0)` below is the only thing that
+/// would catch it.
+#[tokio::test]
+async fn list_comments_none_limit_stops_after_one_full_page() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start();
+
+    let page1: Vec<serde_json::Value> = (1..=100)
+        .map(|n| synth_comment(4000 + n, "page1-user", "2026-08-01T00:00:00Z"))
+        .collect();
+    let page2: Vec<serde_json::Value> = (1..=10)
+        .map(|n| synth_comment(5000 + n, "page2-user", "2026-08-02T00:00:00Z"))
+        .collect();
+
+    let page1_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments")
+            .query_param("page", "1");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!(page1));
+    });
+    let page2_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/issues/42/comments")
+            .query_param("page", "2");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!(page2));
+    });
+
+    let c = common::github_issue_connector_against(&server);
+    let comments = c
+        .list_comments(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Github,
+                project: "section9labs/rupu".into(),
+                number: 42,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(comments.len(), 100);
+    page1_mock.assert_hits(1);
+    // The point of this test: `None` must never walk past the first
+    // page, full or not.
+    page2_mock.assert_hits(0);
+}

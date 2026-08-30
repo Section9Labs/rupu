@@ -426,6 +426,44 @@
     }
   },
   {
+    "name": "issues.comments",
+    "description": "Read an issue's comment thread. Returns id, author, body, created_at, author_association per comment, oldest-first. author_association is GitHub's role for the commenter on this repo (e.g. OWNER, COLLABORATOR, CONTRIBUTOR, NONE) — use it to tell an authorized operator's comment apart from an arbitrary commenter's; it is null on trackers that don't expose an equivalent (GitLab, Linear, Jira). A `limit` truncates the NEWEST comments off the end, not the oldest — omitting `limit` returns only the oldest 100; hard ceiling 5000.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ListCommentsArgs",
+      "type": "object",
+      "required": [
+        "number",
+        "project"
+      ],
+      "properties": {
+        "limit": {
+          "description": "Maximum comments to return. The thread is walked and returned oldest-first, so a `limit` below the thread's true length drops the NEWEST comments, not the oldest. Omitting `limit` returns at most the oldest 100 comments. Hard ceiling: 5000 comments, regardless of `limit`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "number": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "project": {
+          "type": "string"
+        },
+        "tracker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  {
     "name": "issues.comment",
     "description": "Post a comment on an issue.",
     "inputSchema": {

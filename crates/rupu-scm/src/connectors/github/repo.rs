@@ -342,6 +342,10 @@ impl RepoConnector for GithubRepoConnector {
             author: model.user.login,
             body,
             created_at: model.created_at,
+            // Out of scope for this feature (PR comments, not issue
+            // comments — a different MCP tool surface); left None rather
+            // than populated ad hoc.
+            author_association: None,
         })
     }
 

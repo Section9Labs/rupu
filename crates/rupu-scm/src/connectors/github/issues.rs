@@ -9,6 +9,19 @@ use crate::types::{Comment, CreateIssue, Issue, IssueFilter, IssueRef, IssueStat
 
 use super::client::GithubClient;
 
+/// Render octocrab's `AuthorAssociation` as the same string GitHub's API
+/// wire format uses (e.g. `"OWNER"`, `"CONTRIBUTOR"`). The enum's variants
+/// are `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` and its catch-all
+/// `Other(String)` case is `#[serde(untagged)]`, so round-tripping through
+/// `serde_json` reproduces GitHub's raw value for every variant —
+/// including any association github adds in the future — without a
+/// hand-maintained match arm per variant.
+fn author_association_str(assoc: &octocrab::models::AuthorAssociation) -> Option<String> {
+    serde_json::to_value(assoc)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+}
+
 pub struct GithubIssueConnector {
     client: GithubClient,
 }
@@ -112,7 +125,98 @@ impl IssueConnector for GithubIssueConnector {
             author: model.user.login,
             body,
             created_at: model.created_at,
+            // Comes free on the create-comment response model — no
+            // extra API call, so there's no reason to withhold it.
+            author_association: author_association_str(&model.author_association),
         })
+    }
+
+    async fn list_comments(
+        &self,
+        i: &IssueRef,
+        limit: Option<u32>,
+    ) -> Result<Vec<Comment>, ScmError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let (owner, repo) = parse_project(&i.project)?;
+        let number = i.number;
+        let inner = self.client.inner.clone();
+        // GitHub caps per_page at 100.
+        let per_page: u8 = 100;
+        // `None` keeps its documented meaning: a single default page,
+        // never paginated further. A `limit` above one page walks
+        // successive pages (oldest-first, matching GitHub's native order)
+        // until `limit` is satisfied or a short page signals the last
+        // page. `MAX_PAGES` bounds how far an absurd `limit` can walk so a
+        // caller can't make this spin forever; 50 pages * 100/page = 5000
+        // comments, comfortably above any real operator-control thread.
+        const MAX_PAGES: u32 = 50;
+
+        let mut out: Vec<Comment> = Vec::new();
+        let mut page_num: u32 = 1;
+        loop {
+            // Acquired per page, not once for the whole walk: the GitHub
+            // semaphore has only 4 permits process-wide, and a single
+            // `list_comments` call can otherwise occupy one for up to
+            // `MAX_PAGES` requests (each independently retriable with an
+            // uncapped `Retry-After`), starving every other GitHub call.
+            let _permit = self.client.permit().await;
+            let page_items = self
+                .client
+                .with_retry_octocrab(|| {
+                    let inner = inner.clone();
+                    let owner = owner.clone();
+                    let repo = repo.clone();
+                    async move {
+                        inner
+                            .issues(&owner, &repo)
+                            .list_comments(number)
+                            .per_page(per_page)
+                            .page(page_num)
+                            .send()
+                            .await
+                            .map_err(super::client::classify_octocrab_error)
+                    }
+                })
+                .await?;
+
+            let fetched = page_items.items.len();
+            out.extend(page_items.items.into_iter().map(|m| Comment {
+                id: m.id.to_string(),
+                author: m.user.login,
+                // octocrab models an issue comment body as Option<String>
+                // (a comment can be body-less after redaction).
+                body: m.body.unwrap_or_default(),
+                created_at: m.created_at,
+                author_association: author_association_str(&m.author_association),
+            }));
+
+            let short_page = fetched < per_page as usize;
+            let limit_satisfied = limit.is_some_and(|n| out.len() >= n as usize);
+            let single_default_page = limit.is_none();
+            let cap_reached = page_num >= MAX_PAGES;
+
+            if cap_reached && !short_page {
+                tracing::warn!(
+                    issue = i.number,
+                    project = %i.project,
+                    max_pages = MAX_PAGES,
+                    per_page,
+                    "github: list_comments hit MAX_PAGES with a full last page; result is truncated and may be missing comments"
+                );
+            }
+
+            if short_page || limit_satisfied || single_default_page || cap_reached {
+                break;
+            }
+            page_num += 1;
+        }
+
+        if let Some(n) = limit {
+            out.truncate(n as usize);
+        }
+        Ok(out)
     }
 
     async fn create_issue(&self, project: &str, opts: CreateIssue) -> Result<Issue, ScmError> {

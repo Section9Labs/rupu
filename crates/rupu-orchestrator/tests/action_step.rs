@@ -98,6 +98,7 @@ impl RepoConnector for RecordingConnector {
             author: "rupu-bot".into(),
             body: body.to_string(),
             created_at: chrono::Utc::now(),
+            author_association: None,
         })
     }
     async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
@@ -165,6 +166,7 @@ impl IssueConnector for RecordingIssueConnector {
             author: "rupu-bot".into(),
             body: body.to_string(),
             created_at: chrono::Utc::now(),
+            author_association: None,
         })
     }
     async fn create_issue(&self, _project: &str, _opts: CreateIssue) -> Result<Issue, ScmError> {

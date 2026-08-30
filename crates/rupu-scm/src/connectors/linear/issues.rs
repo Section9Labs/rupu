@@ -334,6 +334,8 @@ impl IssueConnector for LinearIssueConnector {
             author: comment.user.map(|user| user.name).unwrap_or_default(),
             body: comment.body,
             created_at: comment.created_at,
+            // Linear has no author_association equivalent.
+            author_association: None,
         })
     }
 

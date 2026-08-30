@@ -254,6 +254,14 @@ pub struct Comment {
     pub author: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
+    /// GitHub's `author_association` for this comment (e.g. `"OWNER"`,
+    /// `"COLLABORATOR"`, `"CONTRIBUTOR"`, `"NONE"`) — the signal a
+    /// consumer needs to tell an authorized operator's directive apart
+    /// from an arbitrary commenter's message. `None` when the connector
+    /// cannot supply it (GitLab, Linear, Jira) rather than inventing a
+    /// value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_association: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
