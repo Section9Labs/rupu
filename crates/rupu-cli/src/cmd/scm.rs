@@ -26,17 +26,26 @@ pub enum Action {
     Accounts,
 }
 
+/// `owner`/`path` as an explicit `ArgGroup(required = true)` rather than
+/// the equivalent `conflicts_with`/`required_unless_present` pairing
+/// the first version of this struct used: that pairing enforces the
+/// same "exactly one" rule at parse time, but clap's auto-generated
+/// usage synopsis only reflects a real `ArgGroup` — with the pairing it
+/// rendered as `rupu scm bind [OPTIONS] --account <ACCOUNT>`, which
+/// reads as if `--owner`/`--path` were both optional. The `ArgGroup`
+/// form renders `<--owner <OWNER>|--path <PATH>> --account <ACCOUNT>`.
 #[derive(ClapArgs, Debug)]
+#[command(group(clap::ArgGroup::new("selector").required(true).args(["owner", "path"])))]
 pub struct BindArgs {
     /// Owner glob this rule matches (e.g. `acme/*` or `acme`). Matched
     /// against `RepoRef.owner` — the tier that works for daemons, which
     /// know the owner but have no cwd. Mutually exclusive with `--path`;
     /// exactly one is required.
-    #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+    #[arg(long)]
     pub owner: Option<String>,
     /// Filesystem-path glob this rule matches against the caller's cwd
     /// (e.g. `~/Code/work/*`). Mutually exclusive with `--owner`.
-    #[arg(long, conflicts_with = "owner", required_unless_present = "owner")]
+    #[arg(long)]
     pub path: Option<String>,
     /// The account this rule selects.
     #[arg(long)]
@@ -227,8 +236,17 @@ impl CollectionOutput for ScmAccountsOutput {
 /// answered, and it works with no live credentials and no network call.
 /// Mirrors `Registry::discover`'s own account-name/kind resolution
 /// (declared `kind`, else the account name itself parsed as the vendor)
-/// so this listing and what `Registry::discover` actually builds never
-/// drift apart.
+/// for WHICH NAMES QUALIFY as a repo account — that part cannot drift.
+///
+/// It is **not** the same set as `NoRuleMatched`'s `candidates`, though,
+/// and does not claim to be: `candidates` comes from
+/// `Registry::accounts_for`, filtered to accounts with an actually-built
+/// `RepoConnector` (i.e. valid, currently-working credentials) —
+/// `github`/`gitlab` and any declared `[scm.<name>]` table can appear
+/// here with no credential at all (or a broken one), listed because the
+/// config names them, not because a connector exists. A row here is a
+/// "what my config declares" answer; a row in the ambiguity error's
+/// candidate list is a stronger "and it's live right now" answer.
 async fn accounts_inner(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
