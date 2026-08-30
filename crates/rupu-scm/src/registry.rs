@@ -432,6 +432,13 @@ impl Registry {
             | Resolution::Owner(id)
             | Resolution::Path(id)
             | Resolution::SoleAccount(id) => self.lookup_repo(id, repo.platform, &candidates),
+            Resolution::RuleTargetUnavailable { account, pattern } => {
+                Err(AccountError::RuleTargetUnavailable {
+                    account,
+                    pattern,
+                    platform: repo.platform.to_string(),
+                })
+            }
             Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
                 repo: format!("{}/{}", repo.owner, repo.repo),
                 owner: repo.owner.clone(),
@@ -526,6 +533,13 @@ impl Registry {
             | Resolution::Owner(id)
             | Resolution::Path(id)
             | Resolution::SoleAccount(id) => self.lookup_issues(id, tracker, &candidates),
+            Resolution::RuleTargetUnavailable { account, pattern } => {
+                Err(AccountError::RuleTargetUnavailable {
+                    account,
+                    pattern,
+                    platform: tracker.to_string(),
+                })
+            }
             Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
                 repo: repo
                     .map(|r| format!("{}/{}", r.owner, r.repo))
@@ -724,9 +738,9 @@ impl Registry {
     /// Shared `Resolution` → `Result<AccountId, AccountError>` step for
     /// `events_for_source`'s three branches — same mapping `repo_for`
     /// inlines once, factored out here because `events_for_source` has
-    /// three call sites for it. `describe` is called only on the two
-    /// error paths (`NoMatch`/`NoAccounts`), so it's a closure rather
-    /// than three eagerly-computed strings.
+    /// three call sites for it. `describe` is called only on the three
+    /// error paths (`RuleTargetUnavailable`/`NoMatch`/`NoAccounts`), so
+    /// it's a closure rather than three eagerly-computed strings.
     fn resolution_to_id(
         resolution: Resolution,
         describe: impl FnOnce() -> (String, String, String),
@@ -736,6 +750,14 @@ impl Registry {
             | Resolution::Owner(id)
             | Resolution::Path(id)
             | Resolution::SoleAccount(id) => Ok(id),
+            Resolution::RuleTargetUnavailable { account, pattern } => {
+                let (_, _, platform) = describe();
+                Err(AccountError::RuleTargetUnavailable {
+                    account,
+                    pattern,
+                    platform,
+                })
+            }
             Resolution::NoMatch { candidates } => {
                 let (repo, owner, platform) = describe();
                 Err(AccountError::NoRuleMatched {
@@ -1021,6 +1043,13 @@ impl Registry {
             | Resolution::Owner(id)
             | Resolution::Path(id)
             | Resolution::SoleAccount(id) => self.lookup_github_extras(id, &candidates),
+            Resolution::RuleTargetUnavailable { account, pattern } => {
+                Err(AccountError::RuleTargetUnavailable {
+                    account,
+                    pattern,
+                    platform: repo.platform.to_string(),
+                })
+            }
             Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
                 repo: format!("{}/{}", repo.owner, repo.repo),
                 owner: repo.owner.clone(),
@@ -1104,6 +1133,13 @@ impl Registry {
             | Resolution::Owner(id)
             | Resolution::Path(id)
             | Resolution::SoleAccount(id) => self.lookup_gitlab_extras(id, &candidates),
+            Resolution::RuleTargetUnavailable { account, pattern } => {
+                Err(AccountError::RuleTargetUnavailable {
+                    account,
+                    pattern,
+                    platform: repo.platform.to_string(),
+                })
+            }
             Resolution::NoMatch { candidates } => Err(AccountError::NoRuleMatched {
                 repo: format!("{}/{}", repo.owner, repo.repo),
                 owner: repo.owner.clone(),
@@ -1609,6 +1645,60 @@ mod tests {
         };
         let (id, _) = reg.repo_for(&r, None, None).unwrap();
         assert_eq!(id, AccountId::new("gh-work"));
+    }
+
+    /// Final Arc 2 review item 1, exercised end-to-end through
+    /// `Registry` rather than the pure `resolve_account` unit tests in
+    /// `rules.rs`: `gh-work`'s credential never built (missing,
+    /// revoked, or an expired refresh that failed), so it was never
+    /// registered — `accounts_for(Github)` sees only `gh-personal`. The
+    /// owner rule still names `gh-work`. Pre-fix, `repo_for` returned
+    /// `Ok((gh-personal, ..))` here — a silent cross-identity misroute
+    /// (this scenario, applied to `scm.prs.create`/`issues.comment`,
+    /// is a write into the wrong org with no error at all). Post-fix it
+    /// must error, and the error must name both the pattern and the
+    /// unavailable account so the fix is actionable.
+    #[tokio::test]
+    async fn an_owner_rule_naming_an_account_with_no_live_connector_errors_instead_of_silently_switching(
+    ) {
+        let mut reg = Registry::default();
+        // Only `gh-personal` actually built a connector — `gh-work` is
+        // named by the rule but was never registered, exactly what
+        // `discover` produces when `github::try_build` swallows a
+        // credential-read failure for one of two configured accounts.
+        reg.insert_repo_account(
+            AccountId::new("gh-personal"),
+            Platform::Github,
+            fake_repo_connector(),
+        );
+        reg.set_rules(vec![Rule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: AccountId::new("gh-work"),
+        }]);
+        let r = RepoRef {
+            platform: Platform::Github,
+            owner: "acme".into(),
+            repo: "api".into(),
+        };
+        let err = reg
+            .repo_for(&r, None, None)
+            .err()
+            .expect("must error rather than silently resolve to gh-personal");
+        assert!(
+            matches!(err, AccountError::RuleTargetUnavailable { .. }),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("acme/*"), "must name the rule: {msg}");
+        assert!(
+            msg.contains("gh-work"),
+            "must name the target account: {msg}"
+        );
+        assert!(
+            !msg.contains("gh-personal"),
+            "must not suggest the account it did NOT route to: {msg}"
+        );
     }
 
     /// Companion assertion to `an_owner_rule_selects_between_two_accounts`:

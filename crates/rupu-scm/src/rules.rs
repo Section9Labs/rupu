@@ -54,6 +54,18 @@ pub enum Resolution {
     /// Nothing matched, but only one account is configured for this
     /// platform, so there is nothing to be ambiguous about.
     SoleAccount(AccountId),
+    /// An owner or path rule's pattern matched, but the account it
+    /// names is not among the candidates — no live connector, because
+    /// its credential is missing, revoked, or expired with a failed
+    /// refresh (`discover` only registers an account that actually
+    /// built). Distinct from [`Self::NoMatch`]: a rule DID fire here,
+    /// so falling through to a different candidate (e.g. the
+    /// sole-account tier, if exactly one other account happens to be
+    /// configured) would silently target the wrong identity — the one
+    /// thing this precedence table promises never happens. `pattern` is
+    /// the rule's own owner/path text, carried through so the caller
+    /// can build a message pointing at the specific rule to fix.
+    RuleTargetUnavailable { account: AccountId, pattern: String },
     /// Several accounts are configured and nothing selected one.
     NoMatch { candidates: Vec<AccountId> },
     /// No accounts at all — a different failure from ambiguity, and it
@@ -114,8 +126,20 @@ pub fn resolve_account(
     if let Some(r) = repo {
         for rule in rules {
             if let Some(pat) = &rule.owner {
-                if glob_matches(pat, &r.owner) && known(&rule.account) {
-                    return Resolution::Owner(rule.account.clone());
+                if glob_matches(pat, &r.owner) {
+                    if known(&rule.account) {
+                        return Resolution::Owner(rule.account.clone());
+                    }
+                    // The pattern matched; the account it names just
+                    // isn't live. Stop here rather than continuing to
+                    // the next rule (or the sole-account tier below) —
+                    // continuing is exactly the fall-through that lets
+                    // a matched rule silently route to a different
+                    // identity.
+                    return Resolution::RuleTargetUnavailable {
+                        account: rule.account.clone(),
+                        pattern: pat.clone(),
+                    };
                 }
             }
         }
@@ -126,8 +150,14 @@ pub fn resolve_account(
         for rule in rules {
             if let Some(pat) = &rule.path {
                 let expanded = expand_tilde(pat, home);
-                if glob_matches(&expanded, &dir_s) && known(&rule.account) {
-                    return Resolution::Path(rule.account.clone());
+                if glob_matches(&expanded, &dir_s) {
+                    if known(&rule.account) {
+                        return Resolution::Path(rule.account.clone());
+                    }
+                    return Resolution::RuleTargetUnavailable {
+                        account: rule.account.clone(),
+                        pattern: pat.clone(),
+                    };
                 }
             }
         }
@@ -287,6 +317,14 @@ mod tests {
 
     /// An owner rule naming an account that is not configured must not
     /// select it — otherwise a typo in config silently routes to nothing.
+    /// With two OTHER live candidates still around, the old behavior
+    /// (fall through to the next rule, then to ambiguity) landed in
+    /// `NoMatch`. The fix makes a matched-but-unavailable rule stop
+    /// unconditionally rather than continue, so this now reports
+    /// `RuleTargetUnavailable` instead — an error that names the actual
+    /// problem (the rule's target has no credential) rather than a
+    /// generic "several accounts, none selected" message that doesn't
+    /// mention the rule at all.
     #[test]
     fn a_rule_naming_an_unconfigured_account_does_not_match() {
         let got = resolve_account(
@@ -299,8 +337,38 @@ mod tests {
         );
         assert_eq!(
             got,
-            Resolution::NoMatch {
-                candidates: accounts(&["gh-work", "gh-personal"])
+            Resolution::RuleTargetUnavailable {
+                account: AccountId::new("gh-typo"),
+                pattern: "acme/*".into(),
+            }
+        );
+    }
+
+    /// The dangerous case item 1 of the Arc 2 final review flagged: only
+    /// ONE other candidate remains once the rule's named account is
+    /// excluded. Pre-fix, `known(&rule.account)` being false made the
+    /// loop fall through past the rule entirely, straight to
+    /// `candidates.len() == 1` — which silently returned
+    /// `SoleAccount(gh-personal)`, routing a request that an owner rule
+    /// explicitly earmarked for `gh-work` onto a completely different
+    /// account with no error at all. This is the genuine RED this arc's
+    /// fix closes: the two-candidate sibling above never exercised this
+    /// branch because `NoMatch` was also its pre-fix outcome.
+    #[test]
+    fn a_rule_naming_an_unconfigured_account_does_not_fall_through_to_sole_account() {
+        let got = resolve_account(
+            &[rule_owner("acme/*", "gh-work")],
+            Some(&repo("acme", "api")),
+            None,
+            None,
+            None,
+            &accounts(&["gh-personal"]),
+        );
+        assert_eq!(
+            got,
+            Resolution::RuleTargetUnavailable {
+                account: AccountId::new("gh-work"),
+                pattern: "acme/*".into(),
             }
         );
     }
@@ -308,7 +376,9 @@ mod tests {
     /// The path-tier mirror of `a_rule_naming_an_unconfigured_account_does_not_match`:
     /// the owner tier's `known()` guard already has this test; the path
     /// tier's identical guard did not. The code is symmetric — this
-    /// closes the coverage gap rather than hunting a bug.
+    /// closes the coverage gap rather than hunting a bug. See that
+    /// test's doc for why the expected `Resolution` changed from
+    /// `NoMatch` to `RuleTargetUnavailable`.
     #[test]
     fn a_path_rule_naming_an_unconfigured_account_does_not_match() {
         let got = resolve_account(
@@ -321,8 +391,33 @@ mod tests {
         );
         assert_eq!(
             got,
-            Resolution::NoMatch {
-                candidates: accounts(&["gh-work", "gh-personal"])
+            Resolution::RuleTargetUnavailable {
+                account: AccountId::new("gh-typo"),
+                pattern: "/home/me/work/*".into(),
+            }
+        );
+    }
+
+    /// The path-tier twin of
+    /// `a_rule_naming_an_unconfigured_account_does_not_fall_through_to_sole_account`:
+    /// one other candidate remains, so the pre-fix code silently landed
+    /// on `SoleAccount(gh-personal)` for a path rule that named
+    /// `gh-work`. Same defect, same fix, same genuine RED.
+    #[test]
+    fn a_path_rule_naming_an_unconfigured_account_does_not_fall_through_to_sole_account() {
+        let got = resolve_account(
+            &[rule_path("/home/me/work/*", "gh-work")],
+            None,
+            Some(&PathBuf::from("/home/me/work/api")),
+            None,
+            None,
+            &accounts(&["gh-personal"]),
+        );
+        assert_eq!(
+            got,
+            Resolution::RuleTargetUnavailable {
+                account: AccountId::new("gh-work"),
+                pattern: "/home/me/work/*".into(),
             }
         );
     }

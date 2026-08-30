@@ -97,6 +97,27 @@ pub enum AccountError {
         candidates: Vec<AccountId>,
     },
 
+    /// An owner or path rule's pattern matched, but the account it
+    /// names has no live connector — its credential is missing,
+    /// revoked, or expired with a failed refresh, so `discover` never
+    /// registered it. Distinct from both [`Self::NoMatch`] (no rule
+    /// fired at all) and [`Self::UnknownAccount`] (an explicit
+    /// `--account` typo): here a rule DID fire and pick a specific
+    /// account, so silently falling through to a different one (e.g.
+    /// the sole remaining candidate) would be exactly the cross-identity
+    /// misroute Arc 2's goal statement promises never happens. The fix
+    /// line names the rule's own account, not a generic "log in"
+    /// pointer, so the user re-authenticates the identity the rule
+    /// already chose for them.
+    #[error(
+        "the rule for `{pattern}` names `{account}`, which has no usable credential\n  fix: rupu auth login --account {account} --kind {platform}"
+    )]
+    RuleTargetUnavailable {
+        account: AccountId,
+        pattern: String,
+        platform: String,
+    },
+
     /// No account at all is configured for this platform/tracker — a
     /// distinct failure from ambiguity, and it deserves a distinct
     /// message: log in, rather than disambiguate.
