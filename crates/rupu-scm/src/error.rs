@@ -97,20 +97,34 @@ pub enum AccountError {
         candidates: Vec<AccountId>,
     },
 
-    /// An owner or path rule's pattern matched, but the account it
-    /// names has no live connector — its credential is missing,
-    /// revoked, or expired with a failed refresh, so `discover` never
-    /// registered it. Distinct from both [`Self::NoMatch`] (no rule
-    /// fired at all) and [`Self::UnknownAccount`] (an explicit
-    /// `--account` typo): here a rule DID fire and pick a specific
-    /// account, so silently falling through to a different one (e.g.
-    /// the sole remaining candidate) would be exactly the cross-identity
-    /// misroute Arc 2's goal statement promises never happens. The fix
-    /// line names the rule's own account, not a generic "log in"
-    /// pointer, so the user re-authenticates the identity the rule
-    /// already chose for them.
+    /// An owner or path rule's pattern matched, and the account it
+    /// names is not registered under ANY platform/capability — not
+    /// merely absent from the candidates narrowed to the current call,
+    /// which would mean it's simply a live account of a different
+    /// platform (that case is not an error at all: the rule is skipped
+    /// and resolution falls through, same as always). Distinct from
+    /// both [`Self::NoMatch`] (no rule fired at all) and
+    /// [`Self::UnknownAccount`] (an explicit `--account` typo): here a
+    /// rule DID fire and pick a specific, wholly-unregistered account,
+    /// so silently falling through to a different one (e.g. the sole
+    /// remaining candidate) would be exactly the cross-identity misroute
+    /// Arc 2's goal statement promises never happens.
+    ///
+    /// Deliberately does not assert *why* the account has no connector
+    /// (final review, fix wave 2, finding 2): "has no usable credential"
+    /// overclaimed a cause the resolver cannot observe — `discover` skips
+    /// an account for several reasons, not just a bad credential — and
+    /// worded as a `--kind {platform}` fix line it risked being
+    /// literally harmful: `auth login`'s `declare_account_in_config`
+    /// writes `kind` unconditionally, so following that advice for an
+    /// account already declared under a *different* kind would silently
+    /// rewrite it and break whatever was working under the old kind.
+    /// The fix line omits `--kind` entirely and relies on `auth login`'s
+    /// own fallback (no `--kind` + an existing declared kind in config
+    /// -> reuse it; genuinely undeclared -> `auth login` itself asks for
+    /// `--kind`, an honest failure rather than a guess).
     #[error(
-        "the rule for `{pattern}` names `{account}`, which has no usable credential\n  fix: rupu auth login --account {account} --kind {platform}"
+        "the rule for `{pattern}` names `{account}`, which has no live connector for {platform}\n  fix: rupu auth login --account {account}"
     )]
     RuleTargetUnavailable {
         account: AccountId,
