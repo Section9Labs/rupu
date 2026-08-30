@@ -19,12 +19,55 @@
 //! so the child's cwd is an isolated tempdir — `issues list` walks up
 //! from cwd looking for a project `.rupu/` directory, and this test
 //! binary's own process cwd sits inside the real rupu checkout.
+//!
+//! **Seeding credentials mutates the process-global `RUPU_HOME`, so every
+//! test here locks `ENV_LOCK` for its whole body.** This is not tidiness:
+//! `KeychainResolver::with_service` captures its auth-file path at
+//! CONSTRUCTION from `RUPU_HOME` (`crates/rupu-auth/src/resolver.rs`), and
+//! these are `#[tokio::test]`s sharing one binary's thread pool. Without
+//! the lock, one test's restore landing between another's set and its
+//! `KeychainResolver::new()` would seed `gh-work-token` into the
+//! DEVELOPER'S REAL `~/.rupu/auth.json`. All three tests do their
+//! `MockServer` setup first, so they converge on that window together.
+//! `EnvVarGuard` restores the prior value rather than blindly unsetting,
+//! and does so on panic too. Mirrors the convention `accounts_sso_e2e.rs`
+//! already established. The child process's `RUPU_HOME` (passed via
+//! `.env()`) was never at risk — only the parent's seeding step.
 
 use assert_cmd::Command;
 use httpmock::prelude::*;
+use tokio::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// RAII guard: sets an env var for the test's duration and restores
+/// whatever value (if any) was already there on drop, even on panic.
+/// The `set` counterpart to `accounts_sso_e2e.rs`'s `unset` guard.
+struct EnvVarGuard {
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prior }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 #[tokio::test]
 async fn issues_list_with_owner_rule_reaches_the_matching_account() {
+    let _env_guard = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -74,7 +117,7 @@ account = "gh-work"
     // Store a distinct API-key credential under each account name,
     // matching exactly what `rupu auth login --account <name> --kind
     // github --mode api-key --key <token>` writes.
-    std::env::set_var("RUPU_HOME", &home);
+    let _home_env = EnvVarGuard::set("RUPU_HOME", &home);
     let resolver = rupu_auth::KeychainResolver::new();
     resolver
         .store_named(
@@ -92,7 +135,6 @@ account = "gh-work"
         )
         .await
         .unwrap();
-    std::env::remove_var("RUPU_HOME");
 
     // Isolated cwd with no ancestor `.rupu/` — see module doc.
     let workdir = tmp.path().join("work");
@@ -116,6 +158,7 @@ account = "gh-work"
 /// must win.
 #[tokio::test]
 async fn issues_list_explicit_account_overrides_the_owner_rule() {
+    let _env_guard = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -159,7 +202,7 @@ account = "gh-personal"
     );
     std::fs::write(home.join("config.toml"), config).unwrap();
 
-    std::env::set_var("RUPU_HOME", &home);
+    let _home_env = EnvVarGuard::set("RUPU_HOME", &home);
     let resolver = rupu_auth::KeychainResolver::new();
     resolver
         .store_named(
@@ -177,7 +220,6 @@ account = "gh-personal"
         )
         .await
         .unwrap();
-    std::env::remove_var("RUPU_HOME");
 
     let workdir = tmp.path().join("work");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -214,6 +256,7 @@ account = "gh-personal"
 /// back to some other account (spec §6.4's `UnknownAccount`).
 #[tokio::test]
 async fn issues_list_unknown_explicit_account_errors_clearly() {
+    let _env_guard = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -238,7 +281,7 @@ base_url = "{work_url}"
     );
     std::fs::write(home.join("config.toml"), config).unwrap();
 
-    std::env::set_var("RUPU_HOME", &home);
+    let _home_env = EnvVarGuard::set("RUPU_HOME", &home);
     let resolver = rupu_auth::KeychainResolver::new();
     resolver
         .store_named(
@@ -248,7 +291,6 @@ base_url = "{work_url}"
         )
         .await
         .unwrap();
-    std::env::remove_var("RUPU_HOME");
 
     let workdir = tmp.path().join("work");
     std::fs::create_dir_all(&workdir).unwrap();

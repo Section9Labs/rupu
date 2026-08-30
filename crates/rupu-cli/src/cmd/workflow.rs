@@ -4691,6 +4691,16 @@ async fn execute_workflow_invocation(
     let workflow_name_for_notify = workflow.name.clone();
     let issue_ref_text_for_notify = ctx.issue_ref.clone();
     let issue_payload_for_notify = ctx.issue.clone();
+    // Path context for the notify hook's account resolution. Deliberately
+    // the run's PROJECT ROOT rather than `std::env::current_dir()`: this
+    // notify fires wherever the run executes, which for a cron tick or a
+    // `cp serve` resume worker is a daemon whose process cwd says nothing
+    // about the repo. `project_root` is the path that actually identifies
+    // this run, so it is the one a `[[scm.rules]]` `path = ...` rule
+    // should be matched against. Without it, a config that routes by path
+    // and not by owner resolves no account and the summary comment is
+    // silently dropped.
+    let notify_cwd_for_notify = ctx.project_root.clone();
 
     // Run-store first so the dispatcher can be constructed alongside the
     // factory and threaded onto every step's `ToolContext`.
@@ -5045,6 +5055,7 @@ async fn execute_workflow_invocation(
                 payload,
                 &workflow_name_for_notify,
                 &workflow_result,
+                notify_cwd_for_notify.as_deref(),
             )
             .await;
         }
@@ -5069,6 +5080,7 @@ async fn post_run_summary_to_issue(
     payload: &serde_json::Value,
     workflow_name: &str,
     result: &rupu_orchestrator::OrchestratorRunResult,
+    cwd: Option<&std::path::Path>,
 ) {
     // Reconstruct an `IssueRef` from the persisted text + payload.
     // The text carries the canonical
@@ -5106,8 +5118,10 @@ async fn post_run_summary_to_issue(
     // match above already restricted this to GitHub/GitLab — so the
     // owner is in scope; run the owner/path rule engine via `issues_for`
     // instead of the old `registry.issues(tracker)` shim's
-    // lexicographically-first pick. This fires post-run, with no cwd and
-    // no `--account` to pass through.
+    // lexicographically-first pick. `cwd` is the run's project root (see
+    // the caller), so path rules resolve here exactly as they do on the
+    // run-start prefetch path; there is no `--account` on a post-run
+    // notify to pass through.
     let issue_repo = project
         .split_once('/')
         .map(|(owner, repo)| rupu_scm::RepoRef {
@@ -5121,7 +5135,7 @@ async fn post_run_summary_to_issue(
         number,
     };
 
-    let conn = match registry.issues_for(tracker, issue_repo.as_ref(), None, None) {
+    let conn = match registry.issues_for(tracker, issue_repo.as_ref(), cwd, None) {
         Ok((_account, conn)) => conn,
         Err(e) => {
             tracing::warn!(

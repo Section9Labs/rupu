@@ -222,7 +222,29 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
             continue;
         }
         for (account, conn) in accounts {
-            let repos = conn.list_repos().await?;
+            // Warn-and-continue, not `?`: the fan-out must not be
+            // all-or-nothing. One account with an expired token would
+            // otherwise abort the whole command and lose every OTHER
+            // account's rows — a strictly worse outcome than a partial
+            // listing with a named failure, and the opposite of what
+            // `cp_repos.rs`'s sibling fan-out already does.
+            let repos = match conn.list_repos().await {
+                Ok(repos) => repos,
+                Err(e) => {
+                    if format == OutputFormat::Table {
+                        crate::output::diag::skip(
+                            &prefs,
+                            format!("{p}/{account}"),
+                            format!("list failed: {e}"),
+                            format!("rupu auth login --account {account} --kind {p}"),
+                        );
+                    } else {
+                        tracing::warn!(platform = %p, account = %account, error = %e, "list_repos failed; skipping account");
+                    }
+                    any_skipped = true;
+                    continue;
+                }
+            };
             for r in repos {
                 if r.private {
                     any_private = true;
@@ -248,13 +270,36 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
         prefs: prefs.clone(),
         report: RepoListReport {
             kind: "repo_list",
-            version: 1,
+            // Bumped 1 -> 2: the `account` column was inserted mid-row
+            // (after `platform`), so a positional CSV consumer reading
+            // column 2 as the repo silently gets the account instead.
+            // A schema change that shifts existing columns has to be
+            // announced, not just made (precedent: `cmd/auth.rs`).
+            version: 2,
             rows,
         },
     };
     report::emit_collection(Some(format), &output)?;
 
-    if format == OutputFormat::Table && !any_private {
+    // The private-repo scope hint asks ONE token "do you have `repo`
+    // scope?" — but `Registry::github_extras()` is knowingly
+    // account-arbitrary (it prefers an account literally named
+    // `"github"`, else the first GitHub-kind one), and `any_private` is
+    // now computed over a multi-account union. With two GitHub accounts
+    // those two facts combine badly: the hint can tell a user their
+    // token lacks scope while naming the scopes of an account that was
+    // never the one missing private repos.
+    //
+    // There is no per-account extras accessor in `rupu-scm` today, and
+    // adding one reaches into a crate this task does not own. So rather
+    // than emit a diagnostic that may describe the wrong account, fire
+    // it only when exactly one GitHub account is configured — the case
+    // where "arbitrary" and "correct" are the same account. Every
+    // pre-Arc-2 config is that case, so single-account users see
+    // byte-identical behavior. Making this hint per-account is recorded
+    // as a follow-up rather than silently half-done.
+    let one_github_account = registry.accounts_for(Platform::Github).len() == 1;
+    if format == OutputFormat::Table && !any_private && one_github_account {
         if let Some(extras) = registry.github_extras() {
             if let Some(scopes) = extras.fetch_token_scopes().await {
                 emit_private_repo_diag(&prefs, &scopes);

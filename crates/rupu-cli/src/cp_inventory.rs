@@ -193,7 +193,9 @@ impl CpFleetInventory {
         let mut any_repo_unread = false;
         if let Some(entries) = &repo_entries {
             for entry in entries {
-                match count_open_issues(&deps.scm, &entry.platform, &entry.repo).await {
+                match count_open_issues(&deps.scm, &entry.platform, &entry.account, &entry.repo)
+                    .await
+                {
                     Ok(n) => per_repo.push((n, n >= u64::from(ISSUE_FETCH_CAP))),
                     Err(e) => {
                         any_repo_unread = true;
@@ -274,9 +276,23 @@ fn tally_open_issues(counts: &[(u64, bool)]) -> (Option<u64>, bool) {
 }
 
 /// Count open issues for one repo, bounded by [`ISSUE_FETCH_CAP`].
+///
+/// `account` is the account that actually *listed* this repo — it comes
+/// straight off the `RepoEntry` row (`cp_repos.rs`'s `to_entry` tags every
+/// row with the account whose connector produced it). It is passed as the
+/// rule engine's `explicit` argument, which is not an optimization but the
+/// only correct answer: re-deriving an account here would run the rules
+/// against a repo whose owning account is already known, and get it wrong
+/// in both directions. With two GitHub accounts and no `[[scm.rules]]`,
+/// re-derivation yields `NoRuleMatched` for every row, collapsing
+/// `issues_open` to `None` ("unknown") for a user whose setup is perfectly
+/// valid; with a rule present, a repo that `gh-personal` listed could be
+/// queried with `gh-work`'s token — the wrong-account bug this arc exists
+/// to remove, reintroduced one layer down.
 async fn count_open_issues(
     registry: &rupu_scm::Registry,
     platform: &str,
+    account: &str,
     project: &str,
 ) -> Result<u64, String> {
     let (platform_kind, tracker) = match platform {
@@ -285,11 +301,9 @@ async fn count_open_issues(
         other => return Err(format!("no issue tracker for platform {other}")),
     };
     // `project` is `entry.repo` from `deps.repos.list()` (`cp_repos.rs`'s
-    // `to_entry`), which is always `"owner/name"` for GitHub/GitLab — the
-    // targeted shape (spec §6.2): the owner is right here, so run the
-    // owner/path rule engine instead of the old `registry.issues(tracker)`
-    // shim's lexicographically-first pick. This is a fleet-wide background
-    // sweep with no cwd and no `--account`, same as a daemon.
+    // `to_entry`), always `"owner/name"` for GitHub/GitLab. The `RepoRef` is
+    // still built and passed so the error text names the repo, and so the
+    // rules remain the fallback shape if `explicit` is ever dropped again.
     let repo = project
         .split_once('/')
         .map(|(owner, repo)| rupu_scm::RepoRef {
@@ -297,8 +311,9 @@ async fn count_open_issues(
             owner: owner.to_string(),
             repo: repo.to_string(),
         });
+    let explicit = rupu_scm::AccountId::new(account);
     let (_account, conn) = registry
-        .issues_for(tracker, repo.as_ref(), None, None)
+        .issues_for(tracker, repo.as_ref(), None, Some(&explicit))
         .map_err(|e| e.to_string())?;
     let filter = rupu_scm::IssueFilter {
         state: Some(rupu_scm::IssueState::Open),
@@ -439,6 +454,155 @@ impl FleetInventory for CpFleetInventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Account routing for the SCM sweep ────────────────────────────
+
+    /// An `IssueConnector` that reports which account it belongs to by
+    /// returning a distinguishable issue count, so a test can prove
+    /// WHICH account's connector served a call rather than merely that
+    /// some call succeeded.
+    struct CountingIssueConnector {
+        issues: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl rupu_scm::IssueConnector for CountingIssueConnector {
+        fn tracker(&self) -> rupu_scm::IssueTracker {
+            rupu_scm::IssueTracker::Github
+        }
+        async fn list_issues(
+            &self,
+            _project: &str,
+            _filter: rupu_scm::IssueFilter,
+        ) -> Result<Vec<rupu_scm::types::Issue>, rupu_scm::ScmError> {
+            Ok((0..self.issues)
+                .map(|n| rupu_scm::types::Issue {
+                    r: rupu_scm::IssueRef {
+                        tracker: rupu_scm::IssueTracker::Github,
+                        project: "acme/api".into(),
+                        number: n as u64,
+                    },
+                    title: String::new(),
+                    body: String::new(),
+                    state: rupu_scm::IssueState::Open,
+                    labels: Vec::new(),
+                    label_colors: Default::default(),
+                    author: String::new(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                })
+                .collect())
+        }
+        async fn get_issue(
+            &self,
+            _i: &rupu_scm::IssueRef,
+        ) -> Result<rupu_scm::types::Issue, rupu_scm::ScmError> {
+            unimplemented!("not exercised by count_open_issues")
+        }
+        async fn comment_issue(
+            &self,
+            _i: &rupu_scm::IssueRef,
+            _body: &str,
+        ) -> Result<rupu_scm::types::Comment, rupu_scm::ScmError> {
+            unimplemented!("not exercised by count_open_issues")
+        }
+        async fn create_issue(
+            &self,
+            _project: &str,
+            _opts: rupu_scm::types::CreateIssue,
+        ) -> Result<rupu_scm::types::Issue, rupu_scm::ScmError> {
+            unimplemented!("not exercised by count_open_issues")
+        }
+        async fn update_issue_state(
+            &self,
+            _i: &rupu_scm::IssueRef,
+            _state: rupu_scm::IssueState,
+        ) -> Result<(), rupu_scm::ScmError> {
+            unimplemented!("not exercised by count_open_issues")
+        }
+    }
+
+    /// Two GitHub accounts, distinguishable by issue count, NO
+    /// `[[scm.rules]]` at all.
+    fn two_account_registry() -> rupu_scm::Registry {
+        let mut reg = rupu_scm::Registry::empty();
+        reg.insert_issue_account(
+            rupu_scm::AccountId::new("gh-personal"),
+            rupu_scm::Platform::Github,
+            Arc::new(CountingIssueConnector { issues: 3 }),
+        );
+        reg.insert_issue_account(
+            rupu_scm::AccountId::new("gh-work"),
+            rupu_scm::Platform::Github,
+            Arc::new(CountingIssueConnector { issues: 7 }),
+        );
+        reg
+    }
+
+    /// The binding test for the fleet sweep's account routing: the
+    /// account that LISTED a repo is the account queried for its issues.
+    ///
+    /// `RepoEntry.account` is authoritative — re-deriving an account here
+    /// would run the rule engine against a repo whose owner is already
+    /// known to belong to a specific account, and get it wrong. Asserting
+    /// on the returned COUNT (3 vs 7), not merely on `is_ok()`, is what
+    /// makes this discriminating: an implementation that dropped the tag
+    /// and re-derived would either error or return the other account's
+    /// number, and both are caught here.
+    #[tokio::test]
+    async fn count_open_issues_queries_the_account_that_listed_the_repo() {
+        let reg = two_account_registry();
+
+        let personal = count_open_issues(&reg, "github", "gh-personal", "acme/api")
+            .await
+            .expect("gh-personal must resolve from its own row tag");
+        assert_eq!(
+            personal, 3,
+            "expected gh-personal's connector (3 issues), got a different account's"
+        );
+
+        let work = count_open_issues(&reg, "github", "gh-work", "acme/api")
+            .await
+            .expect("gh-work must resolve from its own row tag");
+        assert_eq!(
+            work, 7,
+            "expected gh-work's connector (7 issues), got a different account's"
+        );
+    }
+
+    /// The regression this fix exists for: with two accounts and NO
+    /// rules, re-deriving the account yields `NoRuleMatched` for every
+    /// row, which the caller turns into `any_repo_unread = true` and the
+    /// fleet strip reports `issues_open: None` ("unknown") for a
+    /// perfectly valid setup. Honoring the row's tag must never reach the
+    /// rule engine's ambiguity path at all.
+    #[tokio::test]
+    async fn two_accounts_without_rules_still_resolve_rather_than_reporting_unknown() {
+        let reg = two_account_registry();
+        for account in ["gh-work", "gh-personal"] {
+            assert!(
+                count_open_issues(&reg, "github", account, "acme/api")
+                    .await
+                    .is_ok(),
+                "{account} must resolve with two accounts and no [[scm.rules]]"
+            );
+        }
+    }
+
+    /// A row tagged with an account that is not configured must surface
+    /// the error rather than silently falling back to some other
+    /// account's token.
+    #[tokio::test]
+    async fn an_unknown_row_account_errors_rather_than_falling_back() {
+        let reg = two_account_registry();
+        let err = count_open_issues(&reg, "github", "gh-wrok", "acme/api")
+            .await
+            .expect_err("an unconfigured account must not silently fall back");
+        assert!(
+            err.contains("gh-wrok"),
+            "error should name the unresolved account, got: {err}"
+        );
+    }
 
     #[test]
     fn auth_shaped_errors_classify_as_auth_failed() {
