@@ -438,7 +438,12 @@ async fn create(
 
     let contents = match describe {
         Some(desc) => {
-            let resolver = rupu_auth::KeychainResolver::new();
+            // Loaded here (rather than at its previous spot, right before
+            // `gen_provider_config` below) so the SAME config also builds
+            // the resolver: a declared account's SSO credential must be
+            // reachable when generating an agent via `--gen-provider`.
+            let gen_cfg = layered_config(&global, project_root.as_deref());
+            let resolver = crate::accounts::resolver_for(&gen_cfg);
             let (provider, model) = match (gen_provider, gen_model) {
                 (Some(p), Some(m)) => (p, m),
                 (Some(p), None) => {
@@ -471,7 +476,7 @@ async fn create(
             };
             // ISSUES.md I-74: pass the operator's `[providers.<name>]`
             // settings through instead of silently generating with none.
-            let gen_cfg = layered_config(&global, project_root.as_deref());
+            // (`gen_cfg` was loaded above, alongside the resolver.)
             let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
                 anthropic_oauth_system_prefix: None,
                 openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
@@ -482,6 +487,10 @@ async fn create(
                     &req.provider,
                     &gen_cfg.providers,
                 )),
+                kind: rupu_runtime::provider_factory::resolve_kind(
+                    &req.provider,
+                    &gen_cfg.providers,
+                ),
             };
             let outcome =
                 rupu_orchestrator::generate_definition(&req, &resolver, &gen_provider_config)

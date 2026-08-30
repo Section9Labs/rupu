@@ -1327,7 +1327,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         );
     }
 
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
     // No run exists yet at this point, so this SCM traffic is not attributed
     // to a ledger. A run-routing FlowSink would close this; see the netflow
     // per-run plan.
@@ -6224,15 +6224,22 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        // `openai_compatible` stays `None` here — a separate, pre-existing
+        // limitation (session compaction doesn't support custom
+        // openai-compatible endpoints), unrelated to kind resolution.
         openai_compatible: None,
         tuning: Some(provider_factory::provider_tuning(
             &session.provider_name,
             &cfg.providers,
         )),
+        // `cfg.providers` is already in scope for `provider_tuning` above,
+        // so a declared multi-account name (e.g. `anthropic-work`) resolves
+        // its kind here too.
+        kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
     };
     // No run exists here: `rupu session compact` summarizes an existing
     // session's message history in place — it mints no run id, writes no
@@ -6543,7 +6550,7 @@ async fn run_compact_request(
             .as_deref(),
     )
     .unwrap_or_default();
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
 
     paths::ensure_dir(&session.transcripts_dir)?;
 
@@ -6562,11 +6569,15 @@ async fn run_compact_request(
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        // `openai_compatible` stays `None` here — a separate, pre-existing
+        // limitation (session compaction doesn't support custom
+        // openai-compatible endpoints), unrelated to kind resolution.
         openai_compatible: None,
         tuning: Some(provider_factory::provider_tuning(
             &session.provider_name,
             &cfg.providers,
         )),
+        kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
     };
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
@@ -6845,7 +6856,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let resolver = rupu_auth::KeychainResolver::new();
+    let resolver = crate::accounts::resolver_for(&cfg);
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -6880,11 +6891,16 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+            // `openai_compatible` stays `None` here — a separate,
+            // pre-existing limitation (the session worker doesn't support
+            // custom openai-compatible endpoints), unrelated to kind
+            // resolution.
             openai_compatible: None,
             tuning: Some(provider_factory::provider_tuning(
                 &session.provider_name,
                 &cfg.providers,
             )),
+            kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
         };
         let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
             &session.provider_name,

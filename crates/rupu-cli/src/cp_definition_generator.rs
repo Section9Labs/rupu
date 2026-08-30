@@ -16,7 +16,14 @@ pub struct RuntimeDefinitionGenerator {
 #[async_trait::async_trait]
 impl DefinitionGenerator for RuntimeDefinitionGenerator {
     async fn generate(&self, req: GenerateDefRequest) -> Result<GeneratedDef, GenDefError> {
-        let resolver = rupu_auth::KeychainResolver::new();
+        // Loaded here (rather than at its previous spot, right before
+        // `gen_provider_config` below) so the SAME config also builds the
+        // resolver: a declared account's SSO credential must be reachable
+        // from the CP's "generate a definition" button too.
+        let gen_cfg =
+            rupu_config::layer_files_locked(Some(&self.global_dir.join("config.toml")), None)
+                .unwrap_or_default();
+        let resolver = crate::accounts::resolver_for(&gen_cfg);
         let (provider, model) = match (req.provider, req.model) {
             (Some(p), Some(m)) => (p, m),
             (Some(p), None) => {
@@ -55,11 +62,7 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         // ISSUES.md I-74: honor `[providers.<name>]` here too. This path is
         // the CP's "generate a definition" button, so it previously ran with
         // none of the operator's timeout/retry/concurrency/base_url settings.
-        let gen_cfg = rupu_config::layer_files_locked(
-            Some(&self.global_dir.join("config.toml")),
-            None,
-        )
-        .unwrap_or_default();
+        // (`gen_cfg` was loaded above, alongside the resolver.)
         let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: None,
             openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
@@ -70,6 +73,10 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
                 &gen_req.provider,
                 &gen_cfg.providers,
             )),
+            kind: rupu_runtime::provider_factory::resolve_kind(
+                &gen_req.provider,
+                &gen_cfg.providers,
+            ),
         };
         let out = rupu_orchestrator::generate_definition(&gen_req, &resolver, &gen_provider_config)
             .await
@@ -86,7 +93,13 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
     }
 
     async fn available_models(&self) -> Vec<ProviderModels> {
-        let resolver = rupu_auth::KeychainResolver::new();
+        // Mirrors `generate` above: build the resolver from this same
+        // config so a declared account's SSO credential (not just the
+        // bare `DEFAULT_GEN_MODELS` vendor names) is reflected here too.
+        let gen_cfg =
+            rupu_config::layer_files_locked(Some(&self.global_dir.join("config.toml")), None)
+                .unwrap_or_default();
+        let resolver = crate::accounts::resolver_for(&gen_cfg);
         let default = rupu_orchestrator::pick_default_gen_model(&resolver).await;
         let mut out = Vec::new();
         for &(provider, model) in rupu_orchestrator::generate::DEFAULT_GEN_MODELS {

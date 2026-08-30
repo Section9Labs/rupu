@@ -224,10 +224,10 @@ async fn rebuild_opts_from_disk(
     // Standard wiring (mirrors `run` above; refactor candidate but
     // keeping inline for now to avoid spreading the resume path
     // across the CLI surface).
-    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     // Netflow capture for this resumed run. This run's own linear steps
     // write to the SAME `<transcripts>/<run_id>.jsonl` file (mirrors
@@ -286,6 +286,7 @@ async fn rebuild_opts_from_disk(
     // factory below uses (ISSUES.md I-8).
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
+    let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -300,6 +301,7 @@ async fn rebuild_opts_from_disk(
         cfg.default_model.clone(),
         openai_compatible.clone(),
         provider_tuning.clone(),
+        kinds.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(&mcp_registry, &mode_str);
@@ -314,6 +316,7 @@ async fn rebuild_opts_from_disk(
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
         provider_tuning,
+        kinds,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),

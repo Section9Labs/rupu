@@ -8,15 +8,24 @@ use clap::Subcommand;
 use comfy_table::Cell;
 use rupu_auth::ProviderId;
 use serde::Serialize;
+use std::path::Path;
 use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Store credentials for a provider.
     Login {
-        /// Provider name (anthropic | openai | gemini | copilot | github | gitlab | linear | jira | local).
+        /// Account name — the identity. Use a distinct name per identity
+        /// (e.g. `anthropic-work`, `anthropic-personal`). A bare vendor
+        /// name (`anthropic`) is the single-account default.
+        #[arg(long, alias = "provider")]
+        account: String,
+        /// Vendor this account authenticates against (anthropic | openai |
+        /// gemini | copilot | github | gitlab | linear | jira | local).
+        /// Required the first time an account name is used; inferred from
+        /// config or from the account name afterwards.
         #[arg(long)]
-        provider: String,
+        kind: Option<String>,
         /// Authentication mode.
         #[arg(long, value_enum, default_value = "api-key")]
         mode: AuthModeArg,
@@ -26,15 +35,15 @@ pub enum Action {
     },
     /// Remove a stored credential.
     Logout {
-        /// Provider name (omit with --all to clear everything).
-        #[arg(long, conflicts_with = "all")]
-        provider: Option<String>,
+        /// Account name (omit with --all to clear everything).
+        #[arg(long, alias = "provider", conflicts_with = "all")]
+        account: Option<String>,
         /// Specific auth mode to remove. If omitted, both api-key and sso
         /// for that provider are removed.
         #[arg(long, value_enum)]
         mode: Option<AuthModeArg>,
         /// Remove every stored credential across all providers and modes.
-        #[arg(long, conflicts_with = "provider")]
+        #[arg(long, conflicts_with = "account")]
         all: bool,
         /// Skip the confirmation prompt for --all.
         #[arg(long, requires = "all")]
@@ -87,18 +96,19 @@ impl From<AuthModeArg> for rupu_providers::AuthMode {
 pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
         Action::Login {
-            provider,
+            account,
+            kind,
             mode,
             key,
-        } => login(&provider, mode, key.as_deref()).await,
+        } => login(&account, kind.as_deref(), mode, key.as_deref()).await,
         Action::Logout {
-            provider,
+            account,
             mode,
             all,
             yes,
         } => {
             logout(LogoutOpts {
-                provider,
+                account,
                 mode,
                 all,
                 yes,
@@ -189,58 +199,196 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
     }
 }
 
-async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::Result<()> {
+/// Write `[providers.<account>] kind = "<kind>"` into a config file,
+/// preserving everything already there — comments and formatting
+/// included.
+///
+/// Uses `toml_edit::DocumentMut` rather than the plain `toml::Value`
+/// round-trip the first version of this function used: `toml::Value`
+/// has no concept of comments, so re-serializing it silently stripped
+/// every comment out of whatever config file it touched. `toml_edit`
+/// preserves both comments and key order.
+///
+/// Inserts into the parsed document tree directly (`get_mut` / `insert`
+/// on each `Table`) rather than building a dotted key. A dotted key
+/// would have to be quoted to survive an account name containing a
+/// `.`, and that quoting contract has four lockstep implementations
+/// across this repo — sidestepping it here keeps this off that list.
+///
+/// Writes atomically via `rupu_cp::config_write::write_atomic` — the
+/// same backup + advisory-lock + temp-file-then-rename mechanism the
+/// CP web config editor uses — so an interruption mid-write can never
+/// leave a truncated global config, and the new content is re-validated
+/// against the config schema before it lands.
+fn declare_account_in_config(path: &Path, account: &str, kind: &str) -> anyhow::Result<()> {
+    let text = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        anyhow::anyhow!(
+            "refusing to write: {} is not valid TOML ({e}). \
+             Fix or move the file first — writing would discard its contents.",
+            path.display()
+        )
+    })?;
+
+    let root = doc.as_table_mut();
+    if root.get("providers").is_none() {
+        root.insert("providers", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let providers = root
+        .get_mut("providers")
+        .and_then(|item| item.as_table_mut())
+        .ok_or_else(|| anyhow::anyhow!("`providers` is already a value, not a table"))?;
+
+    if providers.get(account).is_none() {
+        providers.insert(account, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let entry = providers
+        .get_mut(account)
+        .and_then(|item| item.as_table_mut())
+        .ok_or_else(|| anyhow::anyhow!("`providers.{account}` is already a value, not a table"))?;
+
+    entry["kind"] = toml_edit::value(kind);
+
+    rupu_cp::config_write::write_atomic(path, &doc.to_string()).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Resolve the vendor `kind` for an `auth login --account <account>`
+/// invocation. Pure (no I/O) so the precedence rules can be unit
+/// tested directly rather than only through a full CLI round-trip —
+/// see this file's `tests` module.
+///
+/// `config_kind` is `providers.<account>.kind` as genuinely declared
+/// in config (`None` if the account has no `[providers.<account>]`
+/// section, or the section has no `kind` key) — **not** a name-derived
+/// guess. Keeping those two sources apart matters for the error
+/// messages below: a real config declaration can be told "edit this
+/// file to change it"; a name that merely happens to match a vendor
+/// has no file to point at.
+///
+/// Precedence:
+/// 1. `--kind` given and it conflicts with a genuine config
+///    declaration → error (the config is the source of truth once an
+///    account is declared; tell the user where to edit it).
+/// 2. `--kind` given and it conflicts with the account name itself
+///    being a recognized vendor (e.g. `--account github --kind
+///    gitlab`) → error (a different, name-collision error — there is
+///    no config section to edit here, so telling the user to edit one
+///    would be unfollowable).
+/// 3. `--kind` given, no conflict → use it.
+/// 4. No `--kind`, but config declares one → use it.
+/// 5. No `--kind`, but the account name is itself a recognized vendor
+///    (checked via [`rupu_auth::ProviderId::from_vendor_str`], which
+///    covers every vendor `auth login` can authenticate against —
+///    LLM providers *and* SCM/issue-tracker connectors, unlike
+///    `rupu_runtime::provider_factory::resolve_kind`'s builtin-name
+///    fallback, which is deliberately LLM-only for its own callers) →
+///    use the name.
+/// 6. Neither → error asking for `--kind`.
+fn resolve_login_kind(
+    account: &str,
+    kind_arg: Option<&str>,
+    config_kind: Option<&str>,
+    cfg_path: &Path,
+) -> anyhow::Result<String> {
+    let name_is_vendor = rupu_auth::ProviderId::from_vendor_str(account).is_some();
+
+    match (kind_arg, config_kind) {
+        (Some(k), Some(d)) if k != d => anyhow::bail!(
+            "account '{account}' is already declared with kind \"{d}\"; \
+             remove [providers.{account}] from {} to change it",
+            cfg_path.display()
+        ),
+        (Some(k), Some(_)) => Ok(k.to_string()),
+        (Some(k), None) if name_is_vendor && k != account => anyhow::bail!(
+            "'{account}' is itself a recognized vendor name; --kind \"{k}\" would \
+             collide with it. Choose a different account name (e.g. \"{k}-{account}\")."
+        ),
+        (Some(k), None) => Ok(k.to_string()),
+        (None, Some(d)) => Ok(d.to_string()),
+        (None, None) if name_is_vendor => Ok(account.to_string()),
+        (None, None) => anyhow::bail!(
+            "'{account}' is not a known vendor and is not declared in config. \
+             Pass --kind <vendor> to declare it (anthropic | openai | gemini | \
+             copilot | github | gitlab | linear | jira | local)."
+        ),
+    }
+}
+
+async fn login(
+    account: &str,
+    kind_arg: Option<&str>,
+    mode: AuthModeArg,
+    key: Option<&str>,
+) -> anyhow::Result<()> {
     warn_about_stranded_keychain_credentials();
 
-    if is_openai_compatible_name(provider) {
-        if parse_provider(provider).is_ok() {
+    let global = crate::paths::global_dir()?;
+    let cfg_path = global.join("config.toml");
+    let cfg = rupu_config::layer_files_locked(Some(&cfg_path), None).unwrap_or_default();
+
+    // The genuine config declaration, if any — kept apart from any
+    // name-derived vendor guess. See `resolve_login_kind`'s doc comment
+    // for why the two sources can't be conflated.
+    let config_kind = cfg.providers.get(account).and_then(|p| p.kind.as_deref());
+    let kind = resolve_login_kind(account, kind_arg, config_kind, &cfg_path)?;
+
+    // Persist the declaration so every later resolver call knows this
+    // account exists. Skipped when the account name IS the vendor —
+    // that needs no config to resolve.
+    if kind != account && config_kind.is_none() {
+        crate::paths::ensure_dir(&global)?;
+        declare_account_in_config(&cfg_path, account, &kind)?;
+        println!("rupu: declared [providers.{account}] kind = \"{kind}\"");
+    }
+
+    if kind == "openai-compatible" {
+        if parse_provider(account).is_ok() {
             anyhow::bail!(
-                "'{provider}' is a reserved built-in provider name; \
+                "'{account}' is a reserved built-in provider name; \
                  choose a distinct name for an openai-compatible provider in config"
             );
         }
         let AuthModeArg::ApiKey = mode else {
             anyhow::bail!("openai-compatible providers only support --mode api-key");
         };
-        let secret = match key {
-            Some(k) => k.to_string(),
-            None => {
-                use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin().read_to_string(&mut buf)?;
-                buf.trim().to_string()
-            }
-        };
-        if secret.is_empty() {
-            anyhow::bail!("empty API key");
-        }
-        let resolver = rupu_auth::resolver::KeychainResolver::new();
+        let secret = read_secret(key)?;
+        let resolver = crate::accounts::resolver_for(&cfg);
         let sc = rupu_auth::stored::StoredCredential::api_key(secret);
         resolver
-            .store_named(provider, rupu_providers::AuthMode::ApiKey, &sc)
+            .store_named(account, rupu_providers::AuthMode::ApiKey, &sc)
             .await?;
-        println!("rupu: stored {provider} api-key credential");
+        println!("rupu: stored {account} api-key credential");
         return Ok(());
     }
-    let pid = parse_provider(provider)?;
-    let resolver = rupu_auth::resolver::KeychainResolver::new();
+
+    let pid = rupu_auth::ProviderId::from_vendor_str(&kind)
+        .ok_or_else(|| anyhow::anyhow!("unknown vendor kind: {kind}"))?;
+    let resolver = crate::accounts::resolver_for(&cfg);
     let mode_neutral: rupu_providers::AuthMode = mode.clone().into();
+
     match mode {
         AuthModeArg::ApiKey => {
             let secret = match key {
                 Some(k) => k.to_string(),
-                None => read_api_key_from_stdin(provider, pid)?,
+                None => read_api_key_from_stdin(account, pid)?,
             };
             if secret.is_empty() {
                 anyhow::bail!("empty API key");
             }
             let sc = rupu_auth::stored::StoredCredential::api_key(secret);
-            resolver.store(pid, mode_neutral, &sc).await?;
-            println!("rupu: stored {provider} api-key credential");
+            // store_named, not store: the ACCOUNT is the key. For a bare
+            // vendor name these produce the identical string.
+            resolver.store_named(account, mode_neutral, &sc).await?;
+            println!("rupu: stored {account} api-key credential");
         }
         AuthModeArg::Sso => {
             let oauth = rupu_auth::oauth::providers::provider_oauth(pid)
-                .ok_or_else(|| anyhow::anyhow!("provider {provider} has no SSO flow"))?;
+                .ok_or_else(|| anyhow::anyhow!("vendor {kind} has no SSO flow"))?;
             let stored = match oauth.flow {
                 rupu_auth::oauth::providers::OAuthFlow::Callback => {
                     rupu_auth::oauth::callback::run(pid).await?
@@ -249,11 +397,28 @@ async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::
                     rupu_auth::oauth::device::run(pid).await?
                 }
             };
-            resolver.store(pid, mode_neutral, &stored).await?;
-            println!("rupu: stored {provider} sso credential");
+            resolver.store_named(account, mode_neutral, &stored).await?;
+            println!("rupu: stored {account} sso credential");
         }
     }
     Ok(())
+}
+
+/// Read a secret from `--key` or stdin, rejecting empty input.
+fn read_secret(key: Option<&str>) -> anyhow::Result<String> {
+    let secret = match key {
+        Some(k) => k.to_string(),
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf.trim().to_string()
+        }
+    };
+    if secret.is_empty() {
+        anyhow::bail!("empty API key");
+    }
+    Ok(secret)
 }
 
 /// Read an API key from stdin with proper UI feedback. Two paths:
@@ -302,7 +467,7 @@ fn read_api_key_from_stdin(provider: &str, pid: ProviderId) -> anyhow::Result<St
 }
 
 struct LogoutOpts {
-    provider: Option<String>,
+    account: Option<String>,
     mode: Option<AuthModeArg>,
     all: bool,
     yes: bool,
@@ -332,35 +497,27 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        for p in [
-            ProviderId::Anthropic,
-            ProviderId::Openai,
-            ProviderId::Gemini,
-            ProviderId::Copilot,
-            ProviderId::Github,
-            ProviderId::Gitlab,
-            ProviderId::Linear,
-            ProviderId::Jira,
-            ProviderId::Local,
-        ] {
-            for m in [
-                rupu_providers::AuthMode::ApiKey,
-                rupu_providers::AuthMode::Sso,
-            ] {
-                let _ = resolver.forget(p, m).await;
-            }
+        // Clear whatever keys are actually on disk rather than sweeping a
+        // fixed built-in `ProviderId` list: a declared account like
+        // `anthropic-work` is a key `forget`'s built-in-only sweep can
+        // never see, which would let `--all` report success while
+        // leaving named accounts' credentials behind.
+        let n = resolver.forget_all().await?;
+        if n == 0 {
+            println!("rupu: no stored credentials to clear");
+        } else {
+            println!("rupu: cleared {n} credential(s)");
         }
-        println!("rupu: cleared all credentials");
         return Ok(());
     }
-    let provider = opts
-        .provider
+    let account = opts
+        .account
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("--provider required (or use --all)"))?;
-    if is_openai_compatible_name(provider) {
-        if parse_provider(provider).is_ok() {
+        .ok_or_else(|| anyhow::anyhow!("--account required (or use --all)"))?;
+    if is_openai_compatible_name(account) {
+        if parse_provider(account).is_ok() {
             anyhow::bail!(
-                "'{provider}' is a reserved built-in provider name; \
+                "'{account}' is a reserved built-in provider name; \
                  choose a distinct name for an openai-compatible provider in config"
             );
         }
@@ -372,12 +529,11 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
         }
         let resolver = rupu_auth::resolver::KeychainResolver::new();
         resolver
-            .forget_named(provider, rupu_providers::AuthMode::ApiKey)
+            .forget_named(account, rupu_providers::AuthMode::ApiKey)
             .await?;
-        println!("rupu: forgot credential(s) for {provider}");
+        println!("rupu: forgot credential(s) for {account}");
         return Ok(());
     }
-    let pid = parse_provider(provider)?;
     let modes = match opts.mode {
         Some(m) => vec![m.into()],
         None => vec![
@@ -386,9 +542,11 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
         ],
     };
     for m in modes {
-        resolver.forget(pid, m).await?;
+        // forget_named, not forget: the ACCOUNT is the key. For a bare
+        // vendor name these produce the identical string.
+        resolver.forget_named(account, m).await?;
     }
-    println!("rupu: forgot credential(s) for {provider}");
+    println!("rupu: forgot credential(s) for {account}");
     Ok(())
 }
 
@@ -778,14 +936,16 @@ fn truncate_auth_backend_ansi_line(value: &str, width: usize) -> String {
 
 #[derive(Debug, Clone, Serialize)]
 struct AuthStatusRow {
-    provider: String,
+    account: String,
+    kind: String,
     api_key: bool,
     sso: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct AuthStatusCsvRow {
-    provider: String,
+    account: String,
+    kind: String,
     api_key: String,
     sso: String,
 }
@@ -820,12 +980,12 @@ impl CollectionOutput for AuthStatusOutput {
     }
 
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
-        Some(&["provider", "api_key", "sso"])
+        Some(&["account", "kind", "api_key", "sso"])
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
         let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["PROVIDER", "API-KEY", "SSO"]);
+        table.set_header(vec!["ACCOUNT", "KIND", "API KEY", "SSO"]);
         for row in &self.report.rows {
             let api_cell = if row.api_key {
                 comfy_table::Cell::new("✓").fg(crate::output::tables::status_color(
@@ -838,7 +998,8 @@ impl CollectionOutput for AuthStatusOutput {
             };
             let sso_cell = sso_status_cell(&row.sso, &self.prefs);
             table.add_row(vec![
-                comfy_table::Cell::new(&row.provider),
+                comfy_table::Cell::new(&row.account),
+                comfy_table::Cell::new(&row.kind),
                 api_cell,
                 sso_cell,
             ]);
@@ -849,55 +1010,57 @@ impl CollectionOutput for AuthStatusOutput {
 }
 
 async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let resolver = rupu_auth::resolver::KeychainResolver::new();
     let prefs = crate::output::diag::prefs_for_diag(false);
     let mut rows = Vec::new();
 
-    for (label, pid) in [
-        ("anthropic", ProviderId::Anthropic),
-        ("openai", ProviderId::Openai),
-        ("gemini", ProviderId::Gemini),
-        ("copilot", ProviderId::Copilot),
-        ("github", ProviderId::Github),
-        ("gitlab", ProviderId::Gitlab),
-        ("linear", ProviderId::Linear),
-        ("jira", ProviderId::Jira),
-    ] {
-        let api_present = resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await;
-        rows.push(AuthStatusRow {
-            provider: label.to_string(),
-            api_key: api_present,
-            sso: resolver.peek_sso(pid).await.unwrap_or_default(),
-        });
-    }
-    if let Ok(global) = crate::paths::global_dir() {
-        let global_cfg = global.join("config.toml");
-        if let Ok(cfg) = rupu_config::layer_files_locked(Some(&global_cfg), None) {
-            for (name, p) in &cfg.providers {
-                if p.kind.as_deref() != Some("openai-compatible") {
-                    continue;
-                }
-                if parse_provider(name).is_ok() {
-                    continue;
-                }
-                let present = resolver
-                    .peek_named(name, rupu_providers::AuthMode::ApiKey)
-                    .await
-                    || std::env::var(format!("RUPU_{}_API_KEY", name.to_ascii_uppercase()))
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false);
-                rows.push(AuthStatusRow {
-                    provider: name.clone(),
-                    api_key: present,
-                    sso: String::new(),
-                });
-            }
+    let global = crate::paths::global_dir().ok();
+    let cfg = global
+        .as_ref()
+        .and_then(|g| rupu_config::layer_files_locked(Some(&g.join("config.toml")), None).ok())
+        .unwrap_or_default();
+    let resolver = crate::accounts::resolver_for(&cfg);
+
+    // Built-in vendor names always listed, so a single-account user sees
+    // the same table as before.
+    let mut names: Vec<String> = [
+        "anthropic",
+        "openai",
+        "gemini",
+        "copilot",
+        "github",
+        "gitlab",
+        "linear",
+        "jira",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // Then every declared account, in config order, skipping duplicates.
+    for name in cfg.providers.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
         }
+    }
+
+    for name in names {
+        let kind = rupu_runtime::provider_factory::resolve_kind(&name, &cfg.providers)
+            .unwrap_or_else(|| "-".to_string());
+        let api_present = resolver
+            .peek_named(&name, rupu_providers::AuthMode::ApiKey)
+            .await
+            || rupu_auth::resolver::KeychainResolver::has_env_api_key(&name);
+        rows.push(AuthStatusRow {
+            account: name.clone(),
+            kind,
+            api_key: api_present,
+            sso: resolver.peek_sso_named(&name).await.unwrap_or_default(),
+        });
     }
     let csv_rows = rows
         .iter()
         .map(|row| AuthStatusCsvRow {
-            provider: row.provider.clone(),
+            account: row.account.clone(),
+            kind: row.kind.clone(),
             api_key: if row.api_key {
                 "yes".into()
             } else {
@@ -910,7 +1073,11 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         prefs,
         report: AuthStatusReport {
             kind: "auth_status",
-            version: 1,
+            // v1 rows were `{provider, api_key, sso}`. v2 renamed
+            // `provider` to `account` and added `kind` (multi-account
+            // providers arc) — an external `jq '.rows[].provider'`
+            // consumer must see the schema change, not a silent null.
+            version: 2,
             rows,
         },
         csv_rows,
@@ -951,6 +1118,160 @@ fn is_soon(repr: &str) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declare_account_writes_kind_without_dotted_key_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_provider = \"anthropic\"\n").unwrap();
+
+        declare_account_in_config(&path, "anthropic-work", "anthropic").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            v["providers"]["anthropic-work"]["kind"].as_str(),
+            Some("anthropic")
+        );
+        // Pre-existing keys survive.
+        assert_eq!(v["default_provider"].as_str(), Some("anthropic"));
+    }
+
+    /// An account name containing a dot must land as ONE table key, not
+    /// two nested tables. This is why we insert into the table tree
+    /// directly instead of building a dotted key string.
+    #[test]
+    fn declare_account_treats_a_dotted_name_as_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        declare_account_in_config(&path, "gpt-4.1-box", "openai").unwrap();
+        let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["providers"]["gpt-4.1-box"]["kind"].as_str(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn declare_account_refuses_to_clobber_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is not = = toml").unwrap();
+        assert!(declare_account_in_config(&path, "x", "openai").is_err());
+        // Erroring is not enough on its own — the error message promises
+        // "writing would discard its contents", so pin that the file is
+        // untouched rather than truncated-then-errored.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is not = = toml"
+        );
+    }
+
+    /// A comment in the existing config must survive an unrelated
+    /// account declaration. `toml::Value` (the pre-fix implementation)
+    /// has no concept of comments and silently drops them on
+    /// re-serialization — this pins the `toml_edit`-based replacement.
+    #[test]
+    fn declare_account_preserves_a_comment_in_the_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# do not remove this note\ndefault_provider = \"anthropic\"\n",
+        )
+        .unwrap();
+
+        declare_account_in_config(&path, "anthropic-work", "anthropic").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# do not remove this note"),
+            "comment was dropped by the config write:\n{text}"
+        );
+        // The declaration still landed correctly alongside it.
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            v["providers"]["anthropic-work"]["kind"].as_str(),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn resolve_login_kind_uses_explicit_flag_when_nothing_else_is_known() {
+        let path = Path::new("/tmp/unused-config.toml");
+        assert_eq!(
+            resolve_login_kind("oracle", Some("openai-compatible"), None, path).unwrap(),
+            "openai-compatible"
+        );
+    }
+
+    #[test]
+    fn resolve_login_kind_uses_config_declaration_when_no_flag_given() {
+        let path = Path::new("/tmp/unused-config.toml");
+        assert_eq!(
+            resolve_login_kind("anthropic-work", None, Some("anthropic"), path).unwrap(),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn resolve_login_kind_falls_back_to_the_account_name_as_vendor() {
+        let path = Path::new("/tmp/unused-config.toml");
+        assert_eq!(
+            resolve_login_kind("anthropic", None, None, path).unwrap(),
+            "anthropic"
+        );
+    }
+
+    /// Regression pin for the shipped defect: `auth login --provider
+    /// github` (and gitlab/linear/jira) must resolve via the account
+    /// name being a recognized SCM/issue-tracker vendor, not just the
+    /// narrower LLM-only builtin list.
+    #[test]
+    fn resolve_login_kind_recognizes_scm_vendor_names_not_just_llm_ones() {
+        let path = Path::new("/tmp/unused-config.toml");
+        for vendor in ["github", "gitlab", "linear", "jira"] {
+            assert_eq!(
+                resolve_login_kind(vendor, None, None, path).unwrap(),
+                vendor,
+                "vendor {vendor} should resolve via the account name"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_login_kind_bails_when_neither_flag_nor_config_nor_name_resolve() {
+        let path = Path::new("/tmp/unused-config.toml");
+        let err = resolve_login_kind("mystery-account", None, None, path).unwrap_err();
+        assert!(err.to_string().contains("--kind"));
+    }
+
+    #[test]
+    fn resolve_login_kind_errors_on_genuine_config_conflict_naming_the_config_file() {
+        let path = Path::new("/tmp/some-config.toml");
+        let err = resolve_login_kind("anthropic-work", Some("openai"), Some("anthropic"), path)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already declared"));
+        assert!(msg.contains("some-config.toml"));
+    }
+
+    /// A name-derived conflict (the account name IS a vendor, and
+    /// --kind disagrees) has no config section to point at — the error
+    /// must not claim one exists.
+    #[test]
+    fn resolve_login_kind_errors_on_name_collision_without_naming_a_config_file() {
+        let path = Path::new("/tmp/some-config.toml");
+        let err = resolve_login_kind("github", Some("gitlab"), None, path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("collide"));
+        assert!(!msg.contains("some-config.toml"));
+    }
 }
 
 #[cfg(test)]

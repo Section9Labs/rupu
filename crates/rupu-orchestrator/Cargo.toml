@@ -42,4 +42,5 @@ rupu-transcript = { path = "../rupu-transcript" }
 tempfile.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true
+serial_test.workspace = true
 rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }

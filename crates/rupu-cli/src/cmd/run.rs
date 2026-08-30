@@ -591,7 +591,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // same resolver instance can also be handed to `CliAgentDispatcher`
         // below without a second construction; existing call sites that need
         // `&dyn CredentialResolver` now go through `resolver.as_ref()`.
-        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
         // Build the SCM/issue registry from the same resolver + config the
         // LLM provider factory uses. Cheap when no platforms are configured;
@@ -628,6 +628,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 &provider_name,
                 &cfg.providers,
             )),
+            kind: provider_factory::resolve_kind(&provider_name, &cfg.providers),
         };
         let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
             &provider_name,
@@ -786,6 +787,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             cfg.default_model.clone(),
             provider_factory::openai_compatible_map(&cfg.providers),
             provider_factory::provider_tuning_map(&cfg.providers),
+            provider_factory::resolve_kind_map(&cfg.providers),
         );
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 

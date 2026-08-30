@@ -17,6 +17,9 @@
 pub mod backend;
 pub mod json_file;
 
+pub mod account;
+pub use account::AccountSpec;
+
 pub mod account_key;
 pub use account_key::{account_for, legacy_account_for};
 

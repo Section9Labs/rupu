@@ -22,7 +22,9 @@ can spawn it as a subprocess and call the same tools rupu's own agents call.
 After restart, Claude Desktop's tool catalog includes every `scm.*` and
 `issues.*` tool from `docs/scm.md`. Authentication is shared with rupu's CLI
 via the OS keychain — running `rupu auth login --provider github --mode sso`
-once unlocks the catalog for both.
+once unlocks the catalog for both. `--provider` is an alias for `--account`;
+see `docs/providers.md` if you need two accounts of the same platform (e.g.
+`--account gh-work --kind github`).
 
 ## Wiring into Cursor
 

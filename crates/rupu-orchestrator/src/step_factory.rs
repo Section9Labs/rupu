@@ -149,6 +149,15 @@ pub struct DefaultStepFactory {
     /// `timeout_ms` / `max_retries` / `max_concurrency` / `org_id` exactly as
     /// `rupu run` does (ISSUES.md I-9…I-12). Empty ⇒ documented defaults.
     pub provider_tuning: std::collections::HashMap<String, rupu_providers::ProviderTuning>,
+    /// Resolved vendor kind per declared account name
+    /// (`provider_factory::resolve_kind_map`). Lets a workflow step's
+    /// `agent:` resolve to a named multi-account (e.g. `anthropic-work`) the
+    /// same way `rupu run` does — without this, a step naming such an
+    /// account falls into `build_for_provider_with_config`'s `_` arm and
+    /// fails with "unknown provider" (Task 4 review, concern #2). Empty ⇒
+    /// every step's provider dispatches by name only, same as before this
+    /// field existed.
+    pub kinds: std::collections::HashMap<String, String>,
     /// `default_provider` from `config.toml`. Used when a step's agent pins no
     /// `provider:`. `None` falls back to `provider_factory::FALLBACK_PROVIDER`.
     pub default_provider: Option<String>,
@@ -307,6 +316,7 @@ impl StepFactory for DefaultStepFactory {
                     anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
                     openai_compatible: oai_params,
                     tuning: self.provider_tuning.get(&provider_name).cloned(),
+                    kind: self.kinds.get(&provider_name).cloned(),
                 };
                 // This step's netflow sink — built fresh per step call,
                 // scoped to THIS call's `run_id`/`transcript_path`. See
@@ -1188,6 +1198,7 @@ steps:
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
             provider_tuning: std::collections::HashMap::new(),
+            kinds: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,
@@ -1431,6 +1442,7 @@ steps:
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
             provider_tuning: std::collections::HashMap::new(),
+            kinds: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,
@@ -1484,6 +1496,7 @@ steps:
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
             provider_tuning: std::collections::HashMap::new(),
+            kinds: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,
@@ -1561,6 +1574,7 @@ steps:
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
             provider_tuning: std::collections::HashMap::new(),
+            kinds: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,
@@ -1629,5 +1643,170 @@ mod missing_agent_tests {
             "missing agent must not carry a provider"
         );
         assert!(out.model.is_none(), "missing agent must not carry a model");
+    }
+}
+
+/// Task 4 review, concern #2: a workflow step naming a declared multi-account
+/// (e.g. `openai-work`) must resolve its vendor kind through
+/// `DefaultStepFactory.kinds`, not fall into `build_for_provider_with_config`'s
+/// `_` arm and fail with "unknown provider". Drives the real
+/// `build_opts_for_step` — the exact code path `rupu workflow run` uses —
+/// against a real (temp-file-backed) `KeychainResolver` with a stored
+/// credential, so the assertion is on the REAL built provider's identity, not
+/// a mock seam (`RUPU_MOCK_PROVIDER_SCRIPT` short-circuits before kind
+/// dispatch is ever reached, so it can't prove this). No network call is
+/// made: `OpenAiCodexClient` construction is synchronous, and `provider_id()`
+/// is a pure accessor — the test never calls `.send()`.
+///
+/// Deliberately uses kind `openai`, NOT `anthropic`: `ProviderBuildErrorStub`
+/// (the stand-in substituted on a build failure, see its doc comment above)
+/// hardcodes `provider_id() -> ProviderId::Anthropic` as a stable log-only
+/// placeholder. Asserting `== Anthropic` here would therefore pass whether
+/// or not `kinds` actually resolved — a real anthropic-kind build and a
+/// FAILED build both report the identical `provider_id()`. `OpenaiCodex` has
+/// no such collision, so this genuinely distinguishes "the real client was
+/// built" from "the build failed and got stubbed" (verified: this test was
+/// run against kind `anthropic` first and false-passed with `kinds` left
+/// empty, exactly because of that collision — that off-by-one motivated
+/// switching to `openai`).
+#[cfg(test)]
+mod kind_resolution_end_to_end_tests {
+    use super::DefaultStepFactory;
+    use crate::runner::StepFactory;
+    use crate::workflow::Workflow;
+    use serial_test::serial;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    const WF: &str = r#"
+name: w
+steps:
+  - id: named_account_step
+    agent: ag_acct_x
+    prompt: p
+"#;
+
+    /// This test mutates the process-global `RUPU_AUTH_FILE` env var,
+    /// which `KeychainResolver::new()` reads unconditionally — including
+    /// the five other tests in this binary that construct one. Bare
+    /// `set_var`/`remove_var` (the prior implementation) also left the
+    /// var set for the rest of the process if the test panicked between
+    /// the two calls. Neither window could currently produce a false
+    /// pass (the other constructions don't depend on the path), but both
+    /// are real non-hermetic gaps — closed with the same
+    /// `ENV_LOCK` + `EnvVarGuard` pattern `accounts_sso_e2e.rs` and
+    /// `cli_auth.rs` already use.
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// RAII guard: sets an env var for the test's duration and restores
+    /// whatever value (if any) was already there on drop, even on panic.
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn write_agent_pinned_to_named_account(global: &std::path::Path) {
+        let agents_dir = global.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("ag_acct_x.md"),
+            "---\nname: ag_acct_x\nprovider: acct-x\n---\nDo the thing.\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_step_naming_a_declared_multi_account_resolves_its_kind() {
+        let _guard = ENV_LOCK.lock().await;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent_pinned_to_named_account(tmp.path());
+
+        // Hermetic credential store: a real `KeychainResolver`, but pointed
+        // at a temp file via `RUPU_AUTH_FILE` so this never touches the
+        // developer's real `~/.rupu/auth.json`.
+        let auth_path = tmp.path().join("auth.json");
+        let resolver = {
+            let _env = EnvVarGuard::set("RUPU_AUTH_FILE", &auth_path);
+            let resolver = rupu_auth::KeychainResolver::new();
+            // `store_named` writes `<name>/<mode>` unconditionally — no
+            // `AccountSpec` declaration needed for this to be readable back
+            // via the resolver's `get_named` fallback path.
+            resolver
+                .store_named(
+                    "acct-x",
+                    rupu_providers::AuthMode::ApiKey,
+                    &rupu_auth::StoredCredential::api_key("dummy-key-for-kind-resolution-test"),
+                )
+                .await
+                .unwrap();
+            resolver
+            // `_env` drops here, restoring `RUPU_AUTH_FILE` before any
+            // other test in this binary can observe our temp path.
+        };
+
+        let mut f = DefaultStepFactory {
+            workflow: Workflow::parse(WF).expect("workflow must parse"),
+            global: tmp.path().to_path_buf(),
+            project_root: None,
+            resolver: Arc::new(resolver),
+            mode_str: "bypass".to_string(),
+            mcp_registry: Arc::new(rupu_scm::Registry::empty()),
+            system_prompt_suffix: None,
+            dispatcher: None,
+            openai_compatible: std::collections::HashMap::new(),
+            provider_tuning: std::collections::HashMap::new(),
+            kinds: std::collections::HashMap::new(),
+            default_provider: None,
+            default_model: None,
+            bash_timeout_secs: 120,
+            bash_env_allowlist: Vec::new(),
+        };
+        // The account `acct-x` is declared as kind `openai` — a builtin
+        // vendor, but a name the factory's dispatch `match` would never
+        // recognize on its own.
+        f.kinds.insert("acct-x".to_string(), "openai".to_string());
+
+        let opts = f
+            .build_opts_for_step(
+                "named_account_step",
+                "ag_acct_x",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+
+        assert_eq!(opts.provider_name, "acct-x");
+        // If `kinds` were ignored (the pre-fix bug), `acct-x` falls into the
+        // `_` arm with no `openai_compatible` declared, producing a
+        // `ProviderBuildErrorStub` whose `provider_id()` is the hardcoded
+        // `Anthropic` placeholder — NOT `OpenaiCodex`. Getting a real
+        // `OpenAiCodexClient` here proves the kind resolved.
+        assert_eq!(
+            opts.provider.provider_id(),
+            rupu_providers::ProviderId::OpenaiCodex,
+            "a declared multi-account's kind did not reach the provider build"
+        );
     }
 }

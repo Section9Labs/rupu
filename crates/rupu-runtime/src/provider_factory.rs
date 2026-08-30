@@ -38,6 +38,11 @@ pub struct ProviderConfig {
     /// factory then applies `ProviderTuning::for_provider(name)`, i.e. the
     /// documented defaults. Build it with [`provider_tuning`].
     pub tuning: Option<rupu_providers::ProviderTuning>,
+    /// Resolved vendor kind for this account, from
+    /// [`resolve_kind`]. `None` means "dispatch on the provider name",
+    /// which is the pre-multi-account behavior and is what every
+    /// existing `Default::default()` call site gets.
+    pub kind: Option<String>,
 }
 
 /// Everything the factory needs to build an `OpenAiCompatibleClient`,
@@ -106,10 +111,20 @@ pub fn provider_tuning(
 ) -> rupu_providers::ProviderTuning {
     use rupu_providers::tuning;
     let p = providers.get(name);
+    // The DEFAULT permit count (i.e. when `max_concurrency` isn't set in
+    // config) comes from the resolved vendor KIND, not the account name —
+    // `default_permits` only recognizes vendor strings ("openai" => 8), so
+    // a named account like `openai-work` must still get the `openai`
+    // default rather than falling through to the generic `_ => 4`. This is
+    // purely about which default to pick; the semaphore itself stays keyed
+    // by account name elsewhere (`decorate` / `ThrottledProvider::wrap`),
+    // because two accounts of one vendor kind must hold independent
+    // concurrency budgets (rate limits are per-credential).
+    let kind = resolve_kind(name, providers).unwrap_or_else(|| name.to_string());
     rupu_providers::ProviderTuning {
         timeout: tuning::client_timeout(p.and_then(|p| p.timeout_ms)),
         max_retries: tuning::retry_budget(p.and_then(|p| p.max_retries)),
-        max_concurrency: tuning::concurrency_permits(name, p.and_then(|p| p.max_concurrency)),
+        max_concurrency: tuning::concurrency_permits(&kind, p.and_then(|p| p.max_concurrency)),
         org_id: p.and_then(|p| p.org_id.clone()),
         region: p.and_then(|p| p.region.clone()),
     }
@@ -177,7 +192,56 @@ pub fn resolve_model(
         .to_string()
 }
 
+/// Resolve an account name to its vendor kind string.
+///
+/// `[providers.<name>].kind` wins; otherwise the name itself, when it is
+/// a built-in vendor name (design spec §3.1 — this is what keeps a
+/// config-less `anthropic` working). `None` means the name is neither
+/// declared nor a vendor.
+pub fn resolve_kind(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> Option<String> {
+    if let Some(k) = providers.get(name).and_then(|p| p.kind.clone()) {
+        return Some(k);
+    }
+    if is_builtin_provider(name) {
+        return Some(name.to_string());
+    }
+    None
+}
+
+/// [`resolve_kind`] for every declared `[providers.<name>]`, keyed by name.
+/// Mirrors [`openai_compatible_map`] / [`provider_tuning_map`] — for callers
+/// (`CliAgentDispatcher`, `DefaultStepFactory`) that resolve their whole
+/// config once up front into pre-resolved maps rather than holding the raw
+/// `rupu_config::Config` and calling [`resolve_kind`] per dispatch.
+///
+/// A bare built-in name with no `[providers.<name>]` section at all (e.g.
+/// plain `anthropic`, never declared) has no entry here — that's fine: a
+/// missing map entry becomes `kind: None` at the call site, and
+/// `build_for_provider_with_config` already falls back from `None` to the
+/// account name, which for an undeclared builtin IS its own kind.
+pub fn resolve_kind_map(
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> std::collections::HashMap<String, String> {
+    providers
+        .keys()
+        .filter_map(|name| resolve_kind(name, providers).map(|k| (name.clone(), k)))
+        .collect()
+}
+
 /// True for provider names the factory builds directly (not openai-compatible).
+///
+/// Deliberately narrower than `rupu_config::config::BUILTIN_PROVIDER_KINDS`
+/// (9 names here vs. 13 there): this list is LLM-dispatchable kinds only —
+/// the ones this factory's `match kind { .. }` in
+/// [`build_for_provider_with_config`] actually knows how to build a client
+/// for. `BUILTIN_PROVIDER_KINDS` is broader because `rupu-config` validates
+/// what's *declarable* in `[providers.<name>]`, which also covers the four
+/// SCM kinds (`github`/`gitlab`/`linear`/`jira`) this factory never
+/// dispatches on. The two lists diverging is correct, not a bug — do not
+/// "fix" one to match the other.
 pub fn is_builtin_provider(name: &str) -> bool {
     matches!(
         name,
@@ -275,11 +339,15 @@ pub async fn build_for_provider_with_config(
                 provider: name.to_string(),
                 source,
             })?;
+    // The account name identifies *who*; the kind identifies *what
+    // vendor*. Falling back to the name preserves the single-account
+    // behavior exactly.
+    let kind = config.kind.as_deref().unwrap_or(name);
     let tuning = config
         .tuning
         .clone()
-        .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(name));
-    let client = match name {
+        .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(kind));
+    let client = match kind {
         "anthropic" => build_anthropic(creds, model, config, &tuning, sink.clone()).await?,
         "openai" | "openai_codex" | "codex" => {
             build_openai(creds, model, &tuning, sink.clone()).await?
@@ -309,11 +377,22 @@ pub async fn build_for_provider_with_config(
             }
         }
     };
-    Ok((mode, decorate(client, name, &tuning)))
+    Ok((mode, decorate(client, name, kind, &tuning)))
 }
 
 /// Apply the tuning decorators that make `max_retries` and `max_concurrency`
 /// observable on every call (ISSUES.md I-10 / I-11).
+///
+/// Takes BOTH the account `name` and the resolved `kind`, and they are NOT
+/// interchangeable: `name` keys the concurrency semaphore (rate limits are
+/// per-credential, so two accounts of the same vendor — e.g. `anthropic-work`
+/// and `anthropic-personal` — must hold independent concurrency budgets),
+/// while `kind` decides WHICH decorator shape applies (native-retry vendors
+/// are exempted regardless of which account name they're parked under).
+/// Passing `name` to [`provider_has_native_retry`] here was Task 4's original
+/// bug: a named `anthropic`-kind account (`kind == "anthropic"`, `name ==
+/// "anthropic-work"`) would fail the name-keyed check and get double-wrapped
+/// — see the deadlock/squared-retry-budget hazard described below.
 ///
 /// **Ordering matters.** Throttle wraps the raw client, retry wraps throttle —
 /// `RetryingProvider(ThrottledProvider(client))`. Each retry attempt therefore
@@ -324,33 +403,48 @@ pub async fn build_for_provider_with_config(
 /// same provider — `tuned::tests::a_backoff_sleep_does_not_hold_a_concurrency_permit`
 /// and its `..._inverted_order_...` counterpart pin both halves of that claim.
 ///
-/// Anthropic is the one provider given NEITHER decorator here — `client` is
-/// returned as-is. It has its own in-client 429 loop, already driven by
-/// `tuning.max_retries` via `AnthropicClient::with_tuning` (stacking
-/// `RetryingProvider` on top would silently square the retry budget), AND —
-/// since ISSUES.md I-75 — its own per-attempt semaphore acquisition, also
-/// wired up by `with_tuning`. That internal acquisition mirrors this same
-/// `RetryingProvider(ThrottledProvider(..))` shape *inside* the client: a
-/// fresh permit per HTTP attempt, dropped before that attempt's own backoff
-/// sleep, so the sleep no longer starves other concurrent Anthropic calls the
-/// way it used to when `ThrottledProvider` held one permit for the client's
-/// *entire* call (request + every internal retry). Wrapping Anthropic in
-/// `ThrottledProvider` here too would have both layers drawing from the same
-/// name-keyed semaphore (`ThrottledProvider::wrap` and
-/// `AnthropicClient::with_tuning` both resolve `tuning.semaphore("anthropic")`
-/// to the identical process-wide instance) — at best double-counting a permit
-/// per call, at worst deadlocking outright when `max_concurrency == 1` (the
-/// outer wrapper holds the only permit for the whole call while the client
-/// tries to acquire a second one from the same exhausted semaphore before its
-/// first attempt).
+/// Anthropic is the one *kind* given NEITHER decorator here — `client` is
+/// returned as-is, for every account of that kind. It has its own in-client
+/// 429 loop, already driven by `tuning.max_retries` via
+/// `AnthropicClient::with_tuning` (stacking `RetryingProvider` on top would
+/// silently square the retry budget), AND — since ISSUES.md I-75 — its own
+/// per-attempt semaphore acquisition, also wired up by `with_tuning`. That
+/// internal acquisition mirrors this same `RetryingProvider(ThrottledProvider(..))`
+/// shape *inside* the client: a fresh permit per HTTP attempt, dropped before
+/// that attempt's own backoff sleep, so the sleep no longer starves other
+/// concurrent Anthropic calls the way it used to when `ThrottledProvider` held
+/// one permit for the client's *entire* call (request + every internal retry).
+/// Wrapping Anthropic in `ThrottledProvider` here too would have both layers
+/// drawing from the same semaphore — at best double-counting a permit per
+/// call, at worst deadlocking outright when `max_concurrency == 1` (the outer
+/// wrapper holds the only permit for the whole call while the client tries to
+/// acquire a second one from the same exhausted semaphore before its first
+/// attempt).
+///
+/// KNOWN GAP (not fixed here, flagged for follow-up): `AnthropicClient::with_tuning`
+/// resolves its *internal* semaphore via the string literal `"anthropic"`
+/// (`crates/rupu-providers/src/anthropic.rs`), not the account name passed in
+/// here. So while this function correctly skips the OUTER `ThrottledProvider`
+/// for every `anthropic`-kind account (avoiding the double-wrap hazard above),
+/// the INNER per-attempt semaphore `AnthropicClient` acquires for itself is
+/// still shared process-wide across every named `anthropic`-kind account —
+/// `anthropic-work` and `anthropic-personal` do NOT get independent
+/// concurrency budgets the way two named `openai`-kind accounts do (those go
+/// through this function's account-name-keyed `ThrottledProvider::wrap`
+/// below). Fixing that requires threading the account name into
+/// `AnthropicClient::with_tuning`'s own semaphore key, a change to a
+/// different crate/file that is out of this function's scope.
 fn decorate(
     client: Box<dyn LlmProvider>,
     name: &str,
+    kind: &str,
     tuning: &rupu_providers::ProviderTuning,
 ) -> Box<dyn LlmProvider> {
-    if provider_has_native_retry(name) {
+    if provider_has_native_retry(kind) {
         return client;
     }
+    // Account-name-keyed, deliberately NOT kind-keyed: two accounts of the
+    // same vendor kind must not share a concurrency budget.
     let throttled = rupu_providers::ThrottledProvider::wrap(client, name, tuning);
     Box::new(rupu_providers::RetryingProvider::new(
         Box::new(throttled),
@@ -358,10 +452,13 @@ fn decorate(
     ))
 }
 
-/// True for providers whose client already spends `tuning.max_retries` (and,
-/// as of I-75, `tuning.max_concurrency`) itself — see `decorate` above.
-fn provider_has_native_retry(name: &str) -> bool {
-    name == "anthropic"
+/// True for VENDOR KINDS whose client already spends `tuning.max_retries`
+/// (and, as of I-75, `tuning.max_concurrency`) itself — see `decorate` above.
+/// Takes the resolved `kind`, never the account name: a named account
+/// (`anthropic-work`) of a native-retry kind (`anthropic`) must still skip
+/// the outer decorator, or it gets double-wrapped.
+fn provider_has_native_retry(kind: &str) -> bool {
+    kind == "anthropic"
 }
 
 fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryError> {
@@ -539,6 +636,64 @@ mod tests {
         assert!(t.org_id.is_none());
     }
 
+    /// A named `openai`-kind account must get the OPENAI vendor default (8
+    /// permits), not the generic 4-permit fallback `default_permits` uses
+    /// for any name it doesn't recognize as a vendor. Before this fix,
+    /// `provider_tuning` passed the ACCOUNT NAME (not the resolved kind)
+    /// into `concurrency_permits`, so `openai-work` silently got 4 permits
+    /// where bare `openai` got 8.
+    ///
+    /// The semaphore itself must stay keyed by account name — two accounts
+    /// of the same vendor kind hold independent concurrency budgets, since
+    /// rate limits are per-API-key.
+    ///
+    /// What THIS test discriminates is the permit COUNT coming from kind
+    /// — that half is the fix's real RED. Its semaphore assertion is a
+    /// sanity check only: it passes `semaphore()` the account names
+    /// itself, so `semaphore_for`'s registry keeps them distinct however
+    /// `decorate` keys things. The guard that would actually catch a
+    /// kind-collapse regression is
+    /// `two_accounts_of_the_same_kind_get_independent_semaphores`, which
+    /// drives `decorate` rather than calling `semaphore()` directly.
+    #[test]
+    fn named_openai_kind_account_gets_the_vendor_default_permits() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "openai-work-t2".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai".to_string()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "openai-personal-t2".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let work = provider_tuning("openai-work-t2", &providers);
+        let personal = provider_tuning("openai-personal-t2", &providers);
+        assert_eq!(
+            work.max_concurrency, 8,
+            "named openai account must default to the vendor's 8 permits, not the generic 4"
+        );
+        assert_eq!(personal.max_concurrency, 8);
+
+        // Same default permit count, but each account's semaphore is its
+        // own instance — draining one must not affect the other.
+        let work_sem = work.semaphore("openai-work-t2");
+        let personal_sem = personal.semaphore("openai-personal-t2");
+        assert!(
+            !std::sync::Arc::ptr_eq(&work_sem, &personal_sem),
+            "two accounts of the same kind must not share a semaphore"
+        );
+        assert_eq!(work_sem.available_permits(), 8);
+        assert_eq!(personal_sem.available_permits(), 8);
+    }
+
     #[test]
     fn provider_tuning_map_covers_every_declared_provider() {
         use std::collections::BTreeMap;
@@ -565,6 +720,11 @@ mod tests {
         // acquisition (wrapping it in ThrottledProvider too would double-count
         // a permit per call, or deadlock at max_concurrency == 1) — see
         // `decorate`'s doc comment for the full reasoning.
+        //
+        // `provider_has_native_retry` takes a KIND string, not an account
+        // name — these plain vendor strings double as both here, but
+        // `decorate_kind_tests` below proves the distinction matters for a
+        // named account whose name differs from its kind.
         assert!(provider_has_native_retry("anthropic"));
         assert!(!provider_has_native_retry("openai"));
         assert!(!provider_has_native_retry("gemini"));
@@ -606,6 +766,83 @@ mod tests {
         assert!(map.contains_key("oracle"));
         assert!(!map.contains_key("anthropic"));
         assert_eq!(map["oracle"].base_url, "http://host:8080");
+    }
+
+    #[test]
+    fn resolve_kind_map_covers_every_declared_account() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "anthropic-work".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("anthropic".into()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "oracle".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://host:8080".into()),
+                ..Default::default()
+            },
+        );
+        let map = resolve_kind_map(&providers);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["anthropic-work"], "anthropic");
+        assert_eq!(map["oracle"], "openai-compatible");
+        // A bare builtin with no declared section is absent — the call
+        // site's fallback (`kind: None` → dispatch by name) covers it.
+        assert!(!map.contains_key("anthropic"));
+    }
+
+    use std::collections::BTreeMap;
+
+    fn providers_with(name: &str, kind: &str) -> BTreeMap<String, rupu_config::ProviderConfig> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            name.to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some(kind.to_string()),
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn resolve_kind_prefers_declared_kind() {
+        let p = providers_with("anthropic-work", "anthropic");
+        assert_eq!(
+            resolve_kind("anthropic-work", &p).as_deref(),
+            Some("anthropic")
+        );
+    }
+
+    /// Spec §3.1: with no config at all, a built-in name is its own kind.
+    #[test]
+    fn resolve_kind_falls_back_to_the_name_for_builtins() {
+        let empty = BTreeMap::new();
+        assert_eq!(
+            resolve_kind("anthropic", &empty).as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(resolve_kind("codex", &empty).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn resolve_kind_is_none_for_undeclared_non_builtin() {
+        let empty = BTreeMap::new();
+        assert_eq!(resolve_kind("anthropic-work", &empty), None);
+    }
+
+    #[test]
+    fn resolve_kind_reports_openai_compatible() {
+        let p = providers_with("oracle", "openai-compatible");
+        assert_eq!(
+            resolve_kind("oracle", &p).as_deref(),
+            Some("openai-compatible")
+        );
     }
 }
 
@@ -752,5 +989,300 @@ mod build_gemini_tests {
             result,
             Err(FactoryError::MissingCredential { .. })
         ));
+    }
+}
+
+/// Directly exercises the Step-6 dispatch change: `build_for_provider_with_config`
+/// must pick the client type from `config.kind`, not from the account name.
+/// None of `resolve_kind`'s own unit tests (pure string resolution) or the
+/// sibling `build_*_tests` modules (which all pass `ProviderConfig::default()`,
+/// i.e. `kind: None`) exercise the `match kind { .. }` line itself.
+#[cfg(test)]
+mod dispatch_by_kind_tests {
+    use super::*;
+    use rupu_auth::backend::ProviderId as AuthProviderId;
+    use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[tokio::test]
+    async fn dispatch_follows_config_kind_not_the_account_name() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let resolver = InMemoryResolver::new();
+        // Credentials live under the account name "openai" ...
+        resolver
+            .put(
+                AuthProviderId::Openai,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("sk-test-openai"),
+            )
+            .await;
+        let config = ProviderConfig {
+            // ... but the declared kind says "anthropic". If dispatch still
+            // matched on the name, this would build an OpenAI client.
+            kind: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+        let (_mode, p) = build_for_provider_with_config(
+            "openai",
+            "claude-sonnet-4-6",
+            None,
+            &resolver,
+            &config,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await
+        .expect("build");
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::Anthropic);
+    }
+}
+
+/// Covers `decorate`'s kind-vs-name split (the coordinator-ruled fix for
+/// concern #1 in the Task 4 review): the native-retry SKIP must follow
+/// `kind`, while the concurrency semaphore must stay keyed by the account
+/// `name`. Uses hand-rolled `LlmProvider` probes (mirroring
+/// `rupu_providers::tuned`'s own test fixtures) since `decorate` returns an
+/// opaque `Box<dyn LlmProvider>` that can't be downcast to inspect which
+/// decorators were applied — attempt counts and permit-contention timing are
+/// the only externally observable signals.
+#[cfg(test)]
+mod decorate_kind_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rupu_providers::{
+        ContentBlock, LlmRequest, LlmResponse, Message, ProviderError, ProviderId as PId,
+        StopReason, StreamEvent, Usage,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn req() -> LlmRequest {
+        LlmRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 16,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        }
+    }
+
+    fn ok_response() -> LlmResponse {
+        LlmResponse {
+            id: "msg".into(),
+            model: "m".into(),
+            content: vec![ContentBlock::Text { text: "ok".into() }],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage::default(),
+        }
+    }
+
+    /// Always fails with a retryable error, counting every `send()` call —
+    /// lets a test tell "wrapped in `RetryingProvider`" (multiple calls per
+    /// one external `.send()`) from "not wrapped" (exactly one).
+    struct RetryableProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RetryableProbe {
+        async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::RateLimited { retry_after: None })
+        }
+        async fn stream(
+            &mut self,
+            _r: &LlmRequest,
+            _e: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            unreachable!("test only exercises send()")
+        }
+        fn default_model(&self) -> &str {
+            "mock"
+        }
+        fn provider_id(&self) -> PId {
+            PId::Anthropic
+        }
+    }
+
+    /// Always succeeds immediately.
+    struct OkProbe;
+
+    #[async_trait]
+    impl LlmProvider for OkProbe {
+        async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            Ok(ok_response())
+        }
+        async fn stream(
+            &mut self,
+            _r: &LlmRequest,
+            _e: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            unreachable!("test only exercises send()")
+        }
+        fn default_model(&self) -> &str {
+            "mock"
+        }
+        fn provider_id(&self) -> PId {
+            PId::Anthropic
+        }
+    }
+
+    /// Signals `ready` the instant `send()` is entered (i.e. the instant its
+    /// `ThrottledProvider` permit is held), then blocks until `release` fires
+    /// — lets a test hold one decorated provider's permit for a controlled
+    /// window while probing whether a DIFFERENT decorated provider is
+    /// blocked by it.
+    struct BlockingProbe {
+        ready: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for BlockingProbe {
+        async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            self.ready.notify_one();
+            self.release.notified().await;
+            Ok(ok_response())
+        }
+        async fn stream(
+            &mut self,
+            _r: &LlmRequest,
+            _e: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            unreachable!("test only exercises send()")
+        }
+        fn default_model(&self) -> &str {
+            "mock"
+        }
+        fn provider_id(&self) -> PId {
+            PId::Anthropic
+        }
+    }
+
+    /// The Task 4 review's concern #1: a NAMED anthropic-kind account
+    /// (`name != kind`) must still skip the outer decorator. Before the fix,
+    /// `decorate` checked `provider_has_native_retry(name)`, which is false
+    /// for `"anthropic-work"` — silently double-wrapping the client on top
+    /// of its own internal retry loop.
+    #[tokio::test]
+    async fn anthropic_kind_is_not_double_decorated_even_for_a_named_account() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = RetryableProbe {
+            calls: calls.clone(),
+        };
+        let tuning = rupu_providers::ProviderTuning {
+            max_retries: 1,
+            ..rupu_providers::ProviderTuning::for_provider("anthropic")
+        };
+        // Account name deliberately differs from the kind.
+        let mut decorated = decorate(Box::new(probe), "anthropic-work", "anthropic", &tuning);
+        let _ = decorated.send(&req()).await;
+        // Exactly one call: if `RetryingProvider` were wrapping this (the
+        // pre-fix bug), a retryable error would trigger a second attempt
+        // after the backoff sleep, inside this single external `.send()`.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an anthropic-kind account was double-decorated"
+        );
+    }
+
+    /// The symmetric regression guard: a non-anthropic kind must still get
+    /// the retry decorator, named account or not. Uses paused tokio time so
+    /// the real 2s backoff doesn't slow the suite down (same idiom as
+    /// `rupu_providers::tuned`'s own retry tests).
+    #[tokio::test(start_paused = true)]
+    async fn a_non_anthropic_kind_still_gets_the_retry_decorator() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = RetryableProbe {
+            calls: calls.clone(),
+        };
+        let tuning = rupu_providers::ProviderTuning {
+            max_retries: 1,
+            ..rupu_providers::ProviderTuning::for_provider("openai")
+        };
+        let mut decorated = decorate(Box::new(probe), "openai-work", "openai", &tuning);
+        let handle = tokio::spawn(async move {
+            let _ = decorated.send(&req()).await;
+        });
+        // Let the spawned task run up to its backoff sleep before advancing
+        // the clock, or `advance` below could find no timer registered yet.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        handle.await.unwrap();
+        // Two calls: the RetryingProvider retried once after the backoff.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a non-anthropic-kind account was not retry-decorated"
+        );
+    }
+
+    /// The Task 4 review's concern #1's other half, and the explicit
+    /// "do NOT change `ThrottledProvider::wrap`" constraint: two DIFFERENT
+    /// account names of the SAME kind must not share a concurrency permit.
+    ///
+    /// Deliberately does NOT acquire `"acct-a"`'s semaphore directly (that
+    /// would only prove the correct, name-keyed implementation is
+    /// self-consistent — a kind-keyed regression would leave `"acct-a"`
+    /// untouched and this test would pass vacuously either way). Instead it
+    /// holds `acct_a`'s permit BY ACTUALLY CALLING THROUGH `decorate`, via
+    /// `BlockingProbe`, so the held permit is whichever key `decorate`
+    /// genuinely used — then checks whether that contends with `acct_b`.
+    #[tokio::test]
+    async fn two_accounts_of_the_same_kind_get_independent_semaphores() {
+        let tuning = rupu_providers::ProviderTuning {
+            max_concurrency: 1,
+            ..rupu_providers::ProviderTuning::for_provider("openai")
+        };
+
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut decorated_a = decorate(
+            Box::new(BlockingProbe {
+                ready: ready.clone(),
+                release: release.clone(),
+            }),
+            "acct-a",
+            "openai",
+            &tuning,
+        );
+        let handle_a = tokio::spawn(async move {
+            let request = req();
+            decorated_a.send(&request).await.unwrap();
+        });
+        // Wait until acct-a's send() has actually entered — i.e. it holds
+        // whichever permit `decorate` acquired for it.
+        ready.notified().await;
+
+        let mut decorated_b = decorate(Box::new(OkProbe), "acct-b", "openai", &tuning);
+        let request_b = req();
+        let call_b = decorated_b.send(&request_b);
+        tokio::pin!(call_b);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut call_b)
+                .await
+                .is_ok(),
+            "acct-b was blocked while acct-a held its permit — semaphores \
+             are not independent per account"
+        );
+
+        release.notify_one();
+        handle_a.await.unwrap();
     }
 }

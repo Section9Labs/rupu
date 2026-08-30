@@ -2019,7 +2019,12 @@ async fn create(
 
     let contents = match describe {
         Some(desc) => {
-            let resolver = rupu_auth::KeychainResolver::new();
+            // Loaded here (rather than at its previous spot, right before
+            // `gen_provider_config` below) so the SAME config also builds
+            // the resolver: a declared account's SSO credential must be
+            // reachable when generating a workflow via `--gen-provider`.
+            let gen_cfg = layered_config_workflow(&global, project_root.as_deref());
+            let resolver = crate::accounts::resolver_for(&gen_cfg);
             let (provider, model) = match (gen_provider, gen_model) {
                 (Some(p), Some(m)) => (p, m),
                 (Some(p), None) => {
@@ -2057,7 +2062,7 @@ async fn create(
             };
             // ISSUES.md I-74: pass the operator's `[providers.<name>]`
             // settings through instead of silently generating with none.
-            let gen_cfg = layered_config_workflow(&global, project_root.as_deref());
+            // (`gen_cfg` was loaded above, alongside the resolver.)
             let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
                 anthropic_oauth_system_prefix: None,
                 openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
@@ -2068,6 +2073,10 @@ async fn create(
                     &req.provider,
                     &gen_cfg.providers,
                 )),
+                kind: rupu_runtime::provider_factory::resolve_kind(
+                    &req.provider,
+                    &gen_cfg.providers,
+                ),
             };
             let outcome =
                 rupu_orchestrator::generate_definition(&req, &resolver, &gen_provider_config)
@@ -3158,10 +3167,10 @@ pub(crate) async fn resume_run(
     let project_root = paths::project_root_for(&workspace_path)?;
 
     // Standard wiring (mirrors `approve` above).
-    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     // Netflow capture for this resumed run — same reasoning as
     // `resume.rs::rebuild_opts_from_disk`: this run's linear steps share
@@ -3201,6 +3210,7 @@ pub(crate) async fn resume_run(
     // factory below uses (ISSUES.md I-8).
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
+    let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -3215,6 +3225,7 @@ pub(crate) async fn resume_run(
         cfg.default_model.clone(),
         openai_compatible.clone(),
         provider_tuning.clone(),
+        kinds.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &mode_str);
@@ -3230,6 +3241,7 @@ pub(crate) async fn resume_run(
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
         provider_tuning,
+        kinds,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
@@ -4000,14 +4012,15 @@ async fn run_with_outcome(
         warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
     }
 
-    // Credential resolver (shared across all steps in this workflow run).
-    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
-
     // Resolve config (global + project) so Registry::discover can read
-    // [scm] platform settings.
+    // [scm] platform settings, and so the credential resolver below knows
+    // this run's declared accounts.
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+
+    // Credential resolver (shared across all steps in this workflow run).
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
     let live_view = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view;
 
     // Mint this run's id NOW (rather than letting `execute_workflow_
@@ -4630,13 +4643,13 @@ async fn execute_workflow_invocation(
             .and_then(|repo| repo.repo_ref.as_deref()),
     )?;
     let prepared_run = prepare_local_run(&run_envelope, &worker_record.worker_id)?;
-    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = ctx
         .project_root
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
     let transcripts = paths::transcripts_dir(&global, ctx.project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
@@ -4694,6 +4707,7 @@ async fn execute_workflow_invocation(
     // factory below uses (ISSUES.md I-8).
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
+    let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         ctx.project_root.clone(),
@@ -4708,6 +4722,7 @@ async fn execute_workflow_invocation(
         cfg.default_model.clone(),
         openai_compatible.clone(),
         provider_tuning.clone(),
+        kinds.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
@@ -4728,6 +4743,7 @@ async fn execute_workflow_invocation(
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
         provider_tuning,
+        kinds,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),

@@ -235,3 +235,108 @@ async fn auth_backend_use_file_renders_requested_backend_snapshot() {
             "rupu auth login --provider <name>",
         ));
 }
+
+/// Regression pin for a shipped defect: kind resolution for `auth login`
+/// used to route solely through `rupu_runtime::provider_factory::resolve_kind`,
+/// whose name-is-vendor fallback is LLM-only and does not include
+/// github/gitlab/linear/jira. `rupu auth login --provider github` is a
+/// documented, first-class flow (README.md, docs/mcp.md, docs/scm.md, and
+/// several in-product error messages tell users to run exactly this) — it
+/// must keep working.
+#[tokio::test]
+async fn login_with_provider_github_succeeds() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    force_json_backend(&tmp);
+    std::env::set_var("RUPU_HOME", tmp.path());
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "auth".into(),
+        "login".into(),
+        "--provider".into(),
+        "github".into(),
+        "--mode".into(),
+        "api-key".into(),
+        "--key".into(),
+        "ghp-test".into(),
+    ])
+    .await;
+
+    let auth_json = std::fs::read_to_string(tmp.path().join("auth.json")).unwrap_or_default();
+    let config_written = tmp.path().join("config.toml").exists();
+    std::env::remove_var("RUPU_HOME");
+
+    assert_eq!(
+        format!("{exit:?}"),
+        format!("{:?}", std::process::ExitCode::from(0)),
+        "auth login --provider github should exit 0, auth.json was: {auth_json}"
+    );
+    assert!(
+        auth_json.contains("\"github/api-key\""),
+        "expected github/api-key in auth.json, got: {auth_json}"
+    );
+    assert!(
+        !config_written,
+        "a bare vendor name should not write a config.toml"
+    );
+}
+
+/// Regression pin: `logout --all` must clear every stored credential,
+/// including a declared account name (e.g. `anthropic-work`) that a
+/// fixed sweep over the builtin `ProviderId` list can never see. The
+/// prior implementation printed "cleared all credentials" while leaving
+/// such accounts behind.
+#[tokio::test]
+async fn logout_all_clears_a_named_account() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    force_json_backend(&tmp);
+    std::env::set_var("RUPU_HOME", tmp.path());
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "auth".into(),
+        "login".into(),
+        "--account".into(),
+        "anthropic-work".into(),
+        "--kind".into(),
+        "anthropic".into(),
+        "--key".into(),
+        "sk-test-work".into(),
+    ])
+    .await;
+    assert_eq!(
+        format!("{exit:?}"),
+        format!("{:?}", std::process::ExitCode::from(0)),
+        "login should exit 0"
+    );
+    let before = std::fs::read_to_string(tmp.path().join("auth.json")).unwrap();
+    assert!(
+        before.contains("anthropic-work/api-key"),
+        "precondition: expected anthropic-work/api-key present, got: {before}"
+    );
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "auth".into(),
+        "logout".into(),
+        "--all".into(),
+        "--yes".into(),
+    ])
+    .await;
+    let after = std::fs::read_to_string(tmp.path().join("auth.json")).unwrap_or_default();
+    std::env::remove_var("RUPU_HOME");
+
+    assert_eq!(
+        format!("{exit:?}"),
+        format!("{:?}", std::process::ExitCode::from(0)),
+        "logout --all should exit 0"
+    );
+    assert!(
+        !after.contains("anthropic-work/api-key"),
+        "named account should be gone after --all, got: {after}"
+    );
+}
