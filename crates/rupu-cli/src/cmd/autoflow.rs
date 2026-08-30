@@ -9027,7 +9027,9 @@ fn source_matches_issue_ref(source: &str, issue_ref: &IssueRef) -> bool {
             }
             IssueTracker::Linear | IssueTracker::Jira => false,
         },
-        EventSourceRef::TrackerProject { tracker, project } => {
+        EventSourceRef::TrackerProject {
+            tracker, project, ..
+        } => {
             tracker == issue_ref.tracker
                 && match tracker {
                     IssueTracker::Jira => {
@@ -9090,7 +9092,9 @@ fn issue_ref_for_autoflow(
     if issue_ref.tracker != IssueTracker::Jira || !source_matches_issue_ref(source, issue_ref) {
         return Ok(issue_ref.clone());
     }
-    let Ok(EventSourceRef::TrackerProject { tracker, project }) = source.parse::<EventSourceRef>()
+    let Ok(EventSourceRef::TrackerProject {
+        tracker, project, ..
+    }) = source.parse::<EventSourceRef>()
     else {
         return Ok(issue_ref.clone());
     };
@@ -9569,6 +9573,10 @@ async fn enqueue_polled_wakes(
             warn!(source_ref, "invalid autoflow source for wake polling");
             continue;
         };
+        // Shared with `cmd/cron.rs`'s `tick_polled_events`: the compact
+        // source string has nowhere to encode an account, so splice the
+        // sibling `account = "..."` config field in before resolving.
+        let event_source = super::cron::apply_account_override(event_source, source);
         let last_polled_file = autoflow_last_polled_at_path(&cursors_root, &event_source);
         match autoflow_poll_source_due(source, &last_polled_file, chrono::Utc::now()) {
             Ok(true) => {}
@@ -9581,12 +9589,22 @@ async fn enqueue_polled_wakes(
             rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
                 .await,
         );
-        let Some(connector) = registry.events_for_source(&event_source) else {
-            warn!(
-                source_ref,
-                "no event connector configured for autoflow wake polling"
-            );
-            continue;
+        // `cwd: None` — an autoflow wake poll is a daemon caller exactly
+        // like `cron.rs`'s tick: no filesystem context to key a path
+        // rule on (spec §6.3/§6.5).
+        let (_account, connector) = match registry.events_for_source(&event_source, None) {
+            Ok(pair) => pair,
+            Err(rupu_scm::AccountError::NoAccounts { .. }) => {
+                warn!(
+                    source_ref,
+                    "no event connector configured for autoflow wake polling"
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!(source_ref, error = %err, "account resolution failed for autoflow wake polling; skipping");
+                continue;
+            }
         };
         let cursor_file = autoflow_cursor_path(&cursors_root, &event_source);
         let cursor = read_cursor(&cursor_file).ok();
@@ -12041,7 +12059,9 @@ fn issue_discovery_target(source: &EventSourceRef) -> (IssueTracker, String) {
             },
             format!("{}/{}", repo.owner, repo.repo),
         ),
-        EventSourceRef::TrackerProject { tracker, project } => (*tracker, project.clone()),
+        EventSourceRef::TrackerProject {
+            tracker, project, ..
+        } => (*tracker, project.clone()),
     }
 }
 

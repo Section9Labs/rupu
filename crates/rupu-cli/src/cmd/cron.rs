@@ -510,6 +510,7 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
             warn!(source = %source_ref, "invalid poll_sources entry");
             continue;
         };
+        let event_source = apply_account_override(event_source, source);
         let last_polled_file = last_polled_at_path(&cursors_root, &event_source);
         match poll_source_due(source, &last_polled_file, Utc::now()) {
             Ok(true) => {}
@@ -521,13 +522,25 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                 warn!(source = %source_ref, error = %e, "invalid poll interval; polling anyway");
             }
         }
-        let Some(connector) = registry.events_for_source(&event_source) else {
-            info!(
-                source = %source_ref,
-                "no event connector configured for trigger source"
-            );
-            continue;
+        // `cwd: None` — a cron poll has no filesystem context to key a
+        // path rule on any more than a webhook payload does (spec §6.3:
+        // "a webhook payload or cron poll knows the owner but has no
+        // cwd"); only the explicit/owner/sole-account tiers can fire.
+        let (account, connector) = match registry.events_for_source(&event_source, None) {
+            Ok(pair) => pair,
+            Err(rupu_scm::AccountError::NoAccounts { .. }) => {
+                info!(
+                    source = %source_ref,
+                    "no event connector configured for trigger source"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(source = %source_ref, error = %e, "account resolution failed for trigger source; skipping");
+                continue;
+            }
         };
+        debug!(source = %source_ref, account = %account.as_str(), "resolved account for trigger source");
 
         let cursor_file = cursor_path(&cursors_root, &event_source);
         let cursor = read_cursor(&cursor_file).ok();
@@ -801,6 +814,30 @@ fn push_event(dir: &Path, into: &mut BTreeMap<String, EventWorkflow>) {
     }
 }
 
+/// Splice a `PollSourceEntry`'s explicit `account = "..."` override
+/// (Task 6, spec §6.5) into a freshly-parsed `EventSourceRef`. The
+/// compact `source` string (`"linear:team-123"`) has nowhere to encode
+/// an account, so this is the only way one reaches
+/// `Registry::events_for_source`'s `explicit` tier — a `Repo`-sourced
+/// trigger has no such field and passes through unchanged (it infers
+/// its account from `repo.owner` via an owner rule instead).
+///
+/// Extracted as a pure, dependency-free step — mirrors
+/// `rupu-scm/src/registry.rs`'s `resolve_configured_default` reasoning
+/// — so it's unit-testable without a `Registry`/`rupu cron tick`
+/// integration harness. Shared with `cmd/autoflow.rs`'s
+/// `enqueue_polled_wakes`, which polls the same `poll_sources` config
+/// through the same account-resolution surface for autoflow wake-ups.
+pub(crate) fn apply_account_override(
+    mut event_source: EventSourceRef,
+    entry: &PollSourceEntry,
+) -> EventSourceRef {
+    if let EventSourceRef::TrackerProject { account, .. } = &mut event_source {
+        *account = entry.account().map(rupu_scm::AccountId::new);
+    }
+    event_source
+}
+
 fn format_poll_source_entry(source: &PollSourceEntry) -> String {
     match source.poll_interval() {
         Some(interval) => format!("{}@{interval}", source.source()),
@@ -912,7 +949,9 @@ fn build_event_payload(ev: &rupu_scm::PolledEvent, matched_event_id: &str) -> se
                 "ref": format!("{}:{}/{}", repo.platform.as_str(), repo.owner, repo.repo),
             }),
         ),
-        EventSourceRef::TrackerProject { tracker, project } => (
+        EventSourceRef::TrackerProject {
+            tracker, project, ..
+        } => (
             tracker.as_str(),
             serde_json::json!({}),
             serde_json::json!({
@@ -1125,11 +1164,54 @@ mod tests {
     }
 
     #[test]
+    fn apply_account_override_splices_tracker_project_account() {
+        let entry = PollSourceEntry::Detailed(PollSourceSpec {
+            source: "linear:team-123".into(),
+            poll_interval: None,
+            account: Some("linear-work".into()),
+        });
+        let parsed: EventSourceRef = entry.source().parse().unwrap();
+        let spliced = apply_account_override(parsed, &entry);
+        match spliced {
+            EventSourceRef::TrackerProject { account, .. } => {
+                assert_eq!(account, Some(rupu_scm::AccountId::new("linear-work")));
+            }
+            EventSourceRef::Repo { .. } => panic!("expected TrackerProject"),
+        }
+    }
+
+    #[test]
+    fn apply_account_override_is_noop_for_repo_sources() {
+        // `Repo` has no `account` field to splice into — it infers its
+        // account from `repo.owner` via an owner rule instead.
+        let entry = PollSourceEntry::Source("github:acme/api".into());
+        let parsed: EventSourceRef = entry.source().parse().unwrap();
+        let spliced = apply_account_override(parsed, &entry);
+        assert!(matches!(spliced, EventSourceRef::Repo { .. }));
+    }
+
+    #[test]
+    fn apply_account_override_clears_to_none_when_entry_has_no_account() {
+        let entry = PollSourceEntry::Detailed(PollSourceSpec {
+            source: "linear:team-123".into(),
+            poll_interval: None,
+            account: None,
+        });
+        let parsed: EventSourceRef = entry.source().parse().unwrap();
+        let spliced = apply_account_override(parsed, &entry);
+        match spliced {
+            EventSourceRef::TrackerProject { account, .. } => assert_eq!(account, None),
+            EventSourceRef::Repo { .. } => panic!("expected TrackerProject"),
+        }
+    }
+
+    #[test]
     fn poll_source_due_without_interval_is_always_true() {
         let tmp = TempDir::new().unwrap();
         let entry = PollSourceEntry::Detailed(PollSourceSpec {
             source: "github:Section9Labs/rupu".into(),
             poll_interval: None,
+            account: None,
         });
         assert!(poll_source_due(&entry, &tmp.path().join("missing"), Utc::now()).unwrap());
     }
@@ -1147,6 +1229,7 @@ mod tests {
         let entry = PollSourceEntry::Detailed(PollSourceSpec {
             source: "github:Section9Labs/rupu".into(),
             poll_interval: Some("5m".into()),
+            account: None,
         });
         assert!(!poll_source_due(&entry, &path, Utc::now()).unwrap());
         write_last_polled_at(&path, Utc::now() - chrono::Duration::minutes(6)).unwrap();
@@ -1187,6 +1270,7 @@ mod tests {
             source: rupu_scm::EventSourceRef::TrackerProject {
                 tracker: rupu_scm::IssueTracker::Linear,
                 project: "workspace-123".into(),
+                account: None,
             },
             subject: None,
             payload: json!({

@@ -233,7 +233,9 @@ fn normalized_polled_payload(event: &PolledEvent) -> serde_json::Value {
                 "ref": format!("{}:{}/{}", repo.platform.as_str(), repo.owner, repo.repo),
             }),
         ),
-        EventSourceRef::TrackerProject { tracker, project } => (
+        EventSourceRef::TrackerProject {
+            tracker, project, ..
+        } => (
             tracker.as_str(),
             serde_json::json!({}),
             serde_json::json!({
@@ -475,6 +477,7 @@ mod tests {
             source: EventSourceRef::TrackerProject {
                 tracker: IssueTracker::Linear,
                 project: "workspace-123".into(),
+                account: None,
             },
             subject: None,
             payload: json!({
@@ -495,6 +498,7 @@ mod tests {
             source: EventSourceRef::TrackerProject {
                 tracker: IssueTracker::Jira,
                 project: "127.0.0.1/ENG".into(),
+                account: None,
             },
             subject: Some(EventSubjectRef::Issue {
                 issue: IssueRef {
