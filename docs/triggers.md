@@ -108,6 +108,29 @@ poll_sources = [
 
 This is an operational control only. It does not change workflow matching semantics; it only decides whether a source is due to be polled on a given `rupu cron tick --only-events`.
 
+#### Multiple SCM accounts (`account`)
+
+If you hold more than one account of a kind — two GitHub accounts, or github.com alongside a GitHub Enterprise host — `rupu cron tick` has to decide which account's connector serves each poll source. It has no cwd to key a path rule on (it's a scheduled poll, not run from inside a checkout), so it resolves the same way `rupu webhook serve` does: explicit → owner rule → sole account → error.
+
+A repo-backed source (`github:owner/repo`, `gitlab:group/project`) already carries an owner, so an owner rule is usually all you need — nothing to configure here:
+
+```toml
+[[scm.rules]]
+owner   = "acme/*"
+account = "gh-work"
+```
+
+A tracker-native source (`linear:<team-id>`, `jira:<project>`) has no owner to infer from at all. The inline-table form accepts an explicit `account` override for exactly this case:
+
+```toml
+[triggers]
+poll_sources = [
+  { source = "linear:team-123", account = "linear-work" },
+]
+```
+
+With a single account configured (today's default for Linear/Jira), this is never required — the sole-account tier resolves unambiguously and `account` can stay unset.
+
 The source model is now generic enough for both repo and tracker-native polling:
 
 - `github:owner/repo`
