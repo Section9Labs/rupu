@@ -218,13 +218,15 @@ rupu scm bind --path  '~/Code/work/*' --account gh-work
 
 ### The `--account` flag
 
-Every targeted SCM/issues command and the `scm.*`/`issues.*` MCP tools accept `--account <name>` (CLI) / `account` (MCP tool argument) to bypass the rule engine entirely for that one call — precedence tier 1 above. Useful for a one-off against an account the rules don't cover yet, without editing config first:
+`rupu issues list` / `rupu issues show`, and the `scm.*`/`issues.*` MCP tools, accept `--account <name>` (CLI) / `account` (MCP tool argument) to bypass the rule engine entirely for that one call — precedence tier 1 above. Useful for a one-off against an account the rules don't cover yet, without editing config first:
 
 ```bash
 rupu issues list --repo github:other/thing --account gh-work
 ```
 
 An unconfigured `--account` name errors immediately (`no such account: ...`, listing what *is* configured) rather than silently falling back to some other account.
+
+Run-target commands (`rupu run <target>`, `rupu workflow run <target>`, `rupu issues run` — equivalent to `rupu workflow run <name> <issue-ref>`) have **no** `--account` flag; they resolve strictly by rule (owner → path → sole account). Against an ambiguous repo, the `NoRuleMatched` error's `or: pass --account <name>` line does not apply to them — add a `[[scm.rules]]` entry (`rupu scm bind`) instead.
 
 ## Concurrency, caching, retry
 
