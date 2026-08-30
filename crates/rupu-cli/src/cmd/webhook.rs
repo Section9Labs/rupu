@@ -327,11 +327,43 @@ impl GithubProjectsHydrator for CliGithubProjectsHydrator {
             return Ok(payload.clone());
         }
         let Some(owner) = github_projects_payload_owner(payload) else {
-            warn!(
-                "github projects webhook payload has no organization.login; \
-                 cannot resolve an account, skipping hydration"
-            );
-            return Ok(payload.clone());
+            // No owner to run the rule engine against at all (review
+            // item 1: not every `projects_v2_item` payload carries a
+            // top-level `organization` — `rupu-webhook`'s own normalizer
+            // already treats it as optional, `event_vocab.rs`'s
+            // `unwrap_or(Value::Null)`). Falling straight to warn-and-skip
+            // here would silently stop hydrating for every single-account
+            // user the moment a payload happened to omit the field —
+            // exactly the back-compat break Task 6 exists to avoid, not
+            // create. Fall back to the sole-account tier by hand (no
+            // `RepoRef`/owner means `github_extras_for`'s rule engine has
+            // nothing to run — this is the same "no owner, no path" case
+            // `issues_for` handles via its `repo: Option<&RepoRef>`
+            // parameter for Linear/Jira): only resolve when exactly one
+            // GitHub account is configured, so two-account users still
+            // get an explicit warning instead of a guess.
+            match self.registry.accounts_for_github_extras().as_slice() {
+                [] => return Ok(payload.clone()),
+                [only] => {
+                    let Some(extras) = self.registry.github_extras_by_account(only) else {
+                        return Ok(payload.clone());
+                    };
+                    debug!(
+                        account = %only.as_str(),
+                        "github projects hydration: resolved sole account \
+                         (payload had no organization.login)"
+                    );
+                    return hydrate_github_projects_payload(&extras, payload).await;
+                }
+                _ => {
+                    warn!(
+                        "github projects webhook payload has no organization.login and \
+                         multiple GitHub accounts are configured; cannot disambiguate, \
+                         skipping hydration"
+                    );
+                    return Ok(payload.clone());
+                }
+            }
         };
         let repo_ref = rupu_scm::RepoRef {
             platform: rupu_scm::Platform::Github,
@@ -1227,9 +1259,13 @@ steps:
         let hydrator = CliGithubProjectsHydrator {
             registry: Arc::new(registry),
         };
+        // Deliberately NO top-level `organization` field — review item
+        // 1's regression guard: not every `projects_v2_item` payload
+        // carries one (`rupu-webhook`'s own normalizer treats it as
+        // optional), and a single-account user must still get hydration
+        // via the sole-account fallback, not a silent skip.
         let payload = json!({
             "action": "edited",
-            "organization": { "login": "Section9Labs" },
             "projects_v2_item": {
                 "id": "PVTI_1",
                 "project_node_id": "PVT_1",
@@ -1256,7 +1292,16 @@ steps:
     /// every payload, regardless of which org it named, hit that one
     /// account. Two independent mock servers (not one server plus header
     /// inspection) make "the right account's client made this call"
-    /// provable by which server actually received the HTTP request —
+    /// provable by which server's TCP endpoint actually received the
+    /// HTTP request — `work_server`/`personal_server` are genuinely
+    /// separate `MockServer` instances on separate ports, so a request
+    /// physically cannot land on the wrong one. Deliberately no
+    /// `body_contains` matcher on either mock (review item 4: an
+    /// item-id-scoped matcher would make `assert_hits(0)` prove "no
+    /// request with THIS body landed here", which is weaker than what
+    /// server separation already proves for free — "no request AT ALL
+    /// landed here" — and would risk *understating* a routing bug
+    /// whose misrouted request still happened to carry a matching body).
     /// `assert_hits(0)` on the OTHER server is the real proof, matching
     /// this arc's established pattern (see `cli_issues_multi_account.rs`):
     /// a success-only assertion would pass identically whether the right
@@ -1268,16 +1313,12 @@ steps:
         let personal_server = MockServer::start();
 
         let work_mock = work_server.mock(|when, then| {
-            when.method(POST)
-                .path("/api/graphql")
-                .body_contains("\"itemId\":\"PVTI_WORK\"");
+            when.method(POST).path("/api/graphql");
             then.status(200)
                 .json_body(json!({ "data": { "item": null } }));
         });
         let personal_mock = personal_server.mock(|when, then| {
-            when.method(POST)
-                .path("/api/graphql")
-                .body_contains("\"itemId\":\"PVTI_PERSONAL\"");
+            when.method(POST).path("/api/graphql");
             then.status(200)
                 .json_body(json!({ "data": { "item": null } }));
         });
@@ -1347,6 +1388,87 @@ steps:
         // Still exactly the one hit from the work payload above — the
         // personal payload must not have also reached the work server.
         work_mock.assert_hits(1);
+    }
+
+    /// Review item 1's regression guard, at the sole-account granularity
+    /// (the round-trip test above already exercises this same fallback
+    /// end-to-end): a payload with no top-level `organization` and
+    /// exactly one configured GitHub account must still hydrate through
+    /// it, not skip.
+    #[tokio::test]
+    async fn hydrator_falls_back_to_sole_account_when_payload_has_no_organization() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/api/graphql");
+            then.status(200)
+                .json_body(json!({ "data": { "item": null } }));
+        });
+        let registry = registry_with_github_account("github", &server.base_url());
+        let hydrator = CliGithubProjectsHydrator {
+            registry: Arc::new(registry),
+        };
+        let payload = json!({
+            "action": "edited",
+            "projects_v2_item": {
+                "id": "PVTI_1",
+                "content_type": "Issue",
+                "field_value": { "optionId": "opt-ready" }
+            },
+        });
+
+        hydrator.hydrate(&payload).await.unwrap();
+
+        mock.assert_hits(1);
+    }
+
+    /// Review item 1's other half: a payload with no top-level
+    /// `organization` and TWO configured GitHub accounts is genuinely
+    /// ambiguous (there is no owner to run an owner rule against, and
+    /// more than one account exists) — must warn-and-skip, not guess.
+    /// Neither server may be touched.
+    #[tokio::test]
+    async fn hydrator_skips_ambiguous_multi_account_payload_with_no_organization() {
+        let work_server = MockServer::start();
+        let personal_server = MockServer::start();
+        let work_mock = work_server.mock(|when, then| {
+            when.method(POST).path("/api/graphql");
+            then.status(200)
+                .json_body(json!({ "data": { "item": null } }));
+        });
+        let personal_mock = personal_server.mock(|when, then| {
+            when.method(POST).path("/api/graphql");
+            then.status(200)
+                .json_body(json!({ "data": { "item": null } }));
+        });
+
+        let mut registry = registry_with_github_account("gh-work", &work_server.base_url());
+        let personal_extras = Arc::new(rupu_scm::connectors::github::GithubExtras::new(
+            GithubClient::new(
+                "ghp_test".into(),
+                Some(personal_server.base_url()),
+                Some(2),
+                Arc::new(rupu_netflow::NullSink),
+            ),
+        ));
+        registry.insert_github_extras_account(AccountId::new("gh-personal"), personal_extras);
+        let hydrator = CliGithubProjectsHydrator {
+            registry: Arc::new(registry),
+        };
+        let payload = json!({
+            "action": "edited",
+            "projects_v2_item": {
+                "id": "PVTI_1",
+                "content_type": "Issue",
+                "field_value": { "optionId": "opt-ready" }
+            },
+        });
+
+        let hydrated = hydrator.hydrate(&payload).await.unwrap();
+
+        // Unhydrated passthrough, and neither account's client touched.
+        assert_eq!(hydrated, payload);
+        work_mock.assert_hits(0);
+        personal_mock.assert_hits(0);
     }
 
     /// `github_projects_payload_owner`'s unit-level coverage: reads
