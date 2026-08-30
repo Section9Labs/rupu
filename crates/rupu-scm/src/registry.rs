@@ -592,7 +592,16 @@ impl Registry {
     /// Direct lookup by account name, with no rule engine involved. Used
     /// by account-scoped operations that already know exactly which
     /// account they want (e.g. resolving `--account` for a non-repo
-    /// operation, or `rupu scm bind`'s validation).
+    /// operation).
+    ///
+    /// NOT what powers `rupu scm bind`'s validation (Arc 2 final review
+    /// item 4) — that check is a lighter-weight, synchronous read of
+    /// layered `[scm.*]` config (`cmd/scm.rs`'s `warn_if_account_unknown`,
+    /// the same shape `scm accounts` already reads config with),
+    /// deliberately not a full `Registry::discover` + `repo_by_account`
+    /// round trip: `bind` is a fast local-only "did I type this right"
+    /// check, and building a live registry would mean network calls and
+    /// credential resolution just to validate a string.
     pub fn repo_by_account(&self, id: &AccountId) -> Option<Arc<dyn RepoConnector>> {
         self.accounts.get(id).and_then(|a| a.repo.clone())
     }

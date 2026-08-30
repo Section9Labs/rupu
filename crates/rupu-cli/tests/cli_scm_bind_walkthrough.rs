@@ -381,3 +381,68 @@ async fn auth_login_self_heals_an_account_stranded_under_providers() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains("gh-work"), "got: {stdout}");
 }
+
+/// Arc 2 final review item 4: `scm bind` used to write a rule for a
+/// typo'd `--account` with zero signal — the only feedback was a WARN
+/// at the *next* config load, deep in an unrelated command's log
+/// output. `warn_if_account_unknown` (`cmd/scm.rs`) now surfaces this
+/// immediately on stderr. Non-blocking by design (see that function's
+/// doc): the command still succeeds and the rule still lands, because
+/// `scm bind` before `auth login` is a legitimate forward-declaration
+/// order.
+#[tokio::test]
+async fn bind_warns_on_stderr_for_an_unknown_account_but_still_writes_the_rule() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg_path = home.join("config.toml");
+
+    let assert = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args([
+            "scm",
+            "bind",
+            "--owner",
+            "acme/*",
+            "--account",
+            "gh-typo-account",
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("gh-typo-account") && stderr.contains("not a declared"),
+        "expected an unknown-account warning on stderr, got:\n{stderr}"
+    );
+
+    // Non-blocking: the rule is still written despite the warning.
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        text.contains("gh-typo-account"),
+        "rule must still be written:\n{text}"
+    );
+}
+
+/// The bare-vendor-name and already-declared cases must NOT warn — a
+/// single-account user binding `--account github` (today's back-compat
+/// default) or a user re-binding a second rule at an already-declared
+/// `[scm.gh-work]` account should see clean stderr.
+#[tokio::test]
+async fn bind_does_not_warn_for_a_bare_vendor_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let assert = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["scm", "bind", "--owner", "acme/*", "--account", "github"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        !stderr.contains("not a declared"),
+        "bare vendor name must not warn, got:\n{stderr}"
+    );
+}

@@ -76,6 +76,8 @@ async fn bind_inner(args: BindArgs) -> anyhow::Result<()> {
     paths::ensure_dir(&global)?;
     let cfg_path = global.join("config.toml");
 
+    warn_if_account_unknown(&args.account);
+
     append_scm_rule(
         &cfg_path,
         args.owner.as_deref(),
@@ -95,6 +97,43 @@ async fn bind_inner(args: BindArgs) -> anyhow::Result<()> {
         (None, None) => unreachable!("clap requires exactly one of --owner/--path"),
     }
     Ok(())
+}
+
+/// `rupu scm bind`'s validation (Arc 2 final review item 4:
+/// `registry.rs`'s `repo_by_account` doc comment claims this exists —
+/// it didn't; this makes the claim true). Reads the same layered
+/// global+project config `scm accounts` reads, and warns — does not
+/// refuse to write — when `account` is neither a declared `[scm.*]`
+/// table nor a bare vendor name (`github`/`gitlab`). Non-blocking on
+/// purpose: `scm bind` then `auth login --account <name>` is a
+/// legitimate forward-declaration order (spec doesn't require the
+/// account to exist before a rule names it), and this reads a
+/// best-effort snapshot of config that may not exactly match what
+/// `Registry::discover` sees at rule-match time. What it closes is the
+/// silent gap: today a typo here produces no signal until the next
+/// config load's WARN, deep in an unrelated command's log output — see
+/// item 1's compounding note: a typo'd bind under one live account
+/// silently routes everything to that account.
+fn warn_if_account_unknown(account: &str) {
+    let Ok(pwd) = std::env::current_dir() else {
+        return;
+    };
+    let project_root = paths::project_root_for(&pwd).ok().flatten();
+    let Ok(global) = paths::global_dir() else {
+        return;
+    };
+    let global_cfg = global.join("config.toml");
+    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())
+        .unwrap_or_default();
+
+    let declared = cfg.scm.platforms.contains_key(account);
+    let bare_vendor = account.parse::<rupu_scm::Platform>().is_ok();
+    if !declared && !bare_vendor {
+        eprintln!(
+            "rupu: warning: --account '{account}' is not a declared [scm.*] account or a bare vendor name (github/gitlab) — this rule may never match until one exists.\n  run `rupu scm accounts` to see what's configured, or `rupu auth login --account {account} --kind <github|gitlab>` to declare it."
+        );
+    }
 }
 
 /// Append one `[[scm.rules]]` entry to the config file at `cfg_path`,
