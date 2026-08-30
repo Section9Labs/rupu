@@ -1,4 +1,4 @@
-use rupu_scm::{IssueTracker, Platform, Registry};
+use rupu_scm::{IssueTracker, Platform, Registry, RepoRef};
 
 #[tokio::test]
 async fn empty_resolver_yields_no_connectors() {
@@ -7,10 +7,37 @@ async fn empty_resolver_yields_no_connectors() {
     let resolver = InMemoryResolver::new();
     let cfg = rupu_config::Config::default();
     let r = Registry::discover(&resolver, &cfg, std::sync::Arc::new(rupu_netflow::NullSink)).await;
-    assert!(r.repo(Platform::Github).is_none());
-    assert!(r.repo(Platform::Gitlab).is_none());
-    assert!(r.issues(IssueTracker::Github).is_none());
-    assert!(r.issues(IssueTracker::Gitlab).is_none());
+    // `repo()`/`issues()` (the account-arbitrary shims) were deleted in
+    // Arc 2 Task 6 review — asserting through the real call paths
+    // (`repo_for`/`issues_for`) instead of the internals they used to
+    // wrap.
+    assert!(r.repo_for(&github_repo_ref(), None, None).is_err());
+    assert!(r.repo_for(&gitlab_repo_ref(), None, None).is_err());
+    assert!(r
+        .issues_for(IssueTracker::Github, None, None, None)
+        .is_err());
+    assert!(r
+        .issues_for(IssueTracker::Gitlab, None, None, None)
+        .is_err());
+}
+
+/// Placeholder `RepoRef`s for the existence-only assertions below —
+/// no `[[scm.rules]]` are configured in these tests, so the sole-account
+/// tier (or `NoAccounts`) resolves regardless of `owner`/`repo`.
+fn github_repo_ref() -> RepoRef {
+    RepoRef {
+        platform: Platform::Github,
+        owner: "any".into(),
+        repo: "any".into(),
+    }
+}
+
+fn gitlab_repo_ref() -> RepoRef {
+    RepoRef {
+        platform: Platform::Gitlab,
+        owner: "any".into(),
+        repo: "any".into(),
+    }
 }
 
 #[tokio::test]
@@ -31,8 +58,8 @@ async fn github_connector_built_when_credential_present() {
         .await;
     let cfg = rupu_config::Config::default();
     let r = Registry::discover(&resolver, &cfg, std::sync::Arc::new(rupu_netflow::NullSink)).await;
-    assert!(r.repo(Platform::Github).is_some());
-    assert!(r.issues(IssueTracker::Github).is_some());
+    assert!(r.repo_for(&github_repo_ref(), None, None).is_ok());
+    assert!(r.issues_for(IssueTracker::Github, None, None, None).is_ok());
     assert!(r.github_extras().is_some());
     // Without GitLab credential, gitlab extras should be None.
     assert!(r.gitlab_extras().is_none());
@@ -56,8 +83,8 @@ async fn gitlab_connector_built_when_credential_present() {
         .await;
     let cfg = rupu_config::Config::default();
     let r = Registry::discover(&resolver, &cfg, std::sync::Arc::new(rupu_netflow::NullSink)).await;
-    assert!(r.repo(Platform::Gitlab).is_some());
-    assert!(r.issues(IssueTracker::Gitlab).is_some());
+    assert!(r.repo_for(&gitlab_repo_ref(), None, None).is_ok());
+    assert!(r.issues_for(IssueTracker::Gitlab, None, None, None).is_ok());
     assert!(r.gitlab_extras().is_some());
     // Without GitHub credential, github extras should be None.
     assert!(r.github_extras().is_none());
@@ -82,7 +109,7 @@ async fn linear_event_connector_built_when_credential_present() {
         .await;
     let cfg = rupu_config::Config::default();
     let r = Registry::discover(&resolver, &cfg, std::sync::Arc::new(rupu_netflow::NullSink)).await;
-    assert!(r.issues(IssueTracker::Linear).is_some());
+    assert!(r.issues_for(IssueTracker::Linear, None, None, None).is_ok());
     assert!(r
         .events_for_source(
             &EventSourceRef::TrackerProject {
@@ -90,6 +117,7 @@ async fn linear_event_connector_built_when_credential_present() {
                 project: "team-123".into(),
                 account: None,
             },
+            None,
             None,
         )
         .is_ok());
@@ -121,7 +149,7 @@ async fn jira_event_connector_built_when_credential_present() {
         },
     );
     let r = Registry::discover(&resolver, &cfg, std::sync::Arc::new(rupu_netflow::NullSink)).await;
-    assert!(r.issues(IssueTracker::Jira).is_some());
+    assert!(r.issues_for(IssueTracker::Jira, None, None, None).is_ok());
     assert!(r
         .events_for_source(
             &EventSourceRef::TrackerProject {
@@ -129,6 +157,7 @@ async fn jira_event_connector_built_when_credential_present() {
                 project: "ENG".into(),
                 account: None,
             },
+            None,
             None,
         )
         .is_ok());

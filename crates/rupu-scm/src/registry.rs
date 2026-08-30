@@ -583,6 +583,18 @@ impl Registry {
         self.accounts.get(id).and_then(|a| a.repo.clone())
     }
 
+    /// `github_extras_by_account`'s counterpart for when there is
+    /// nothing to run the rule engine against at all — no `RepoRef`,
+    /// not even an owner (Arc 2 Task 6 review item 1: a `projects_v2_item`
+    /// webhook payload with no top-level `organization` object). The
+    /// caller is expected to have already narrowed to a single candidate
+    /// via `accounts_for(Platform::Github)` (sole-account tier) before
+    /// calling this — this method itself does no disambiguation, same
+    /// as `repo_by_account`.
+    pub fn github_extras_by_account(&self, id: &AccountId) -> Option<Arc<GithubExtras>> {
+        self.accounts.get(id).and_then(|a| a.github_extras.clone())
+    }
+
     /// Every registered account's `RepoConnector` for `kind`, in
     /// deterministic order — the fan-out accessor for account-scoped
     /// operations that have no repo to key on (`rupu repos list`, spec
@@ -595,97 +607,45 @@ impl Registry {
             .collect()
     }
 
-    /// Retrieve the RepoConnector for a given platform. Back-compat shim
-    /// over the account-keyed map: prefers the bare-vendor-named account
-    /// (`"github"`/`"gitlab"`) — the account a pre-Arc-2 config always
-    /// produces — falling back to the first (lowest `AccountId`)
-    /// registered account of that kind so a multi-account setup with no
-    /// bare-named account doesn't silently look empty to old call sites.
-    /// Clones the Arc so the caller owns a reference.
-    pub fn repo(&self, p: Platform) -> Option<Arc<dyn RepoConnector>> {
-        self.accounts
-            .get(&AccountId::new(p.as_str()))
-            .and_then(|a| a.repo.clone())
-            .or_else(|| {
-                // `find_map`, not `find(..).and_then(..)`: repo and
-                // events are independent probes on the same credential
-                // (see `discover`), so the lexicographically-first
-                // account of this kind can register only an events
-                // connector while a later one has the repo connector.
-                // `find` would stop at the first kind match and return
-                // `None` from its empty `repo` field even though a
-                // usable connector exists further along.
-                self.accounts
-                    .values()
-                    .find_map(|a| if a.kind == p { a.repo.clone() } else { None })
-            })
-    }
-
-    /// Retrieve the IssueConnector for a given tracker. Back-compat shim;
-    /// see [`repo`](Self::repo)'s doc for the bare-name-first preference.
-    pub fn issues(&self, t: IssueTracker) -> Option<Arc<dyn IssueConnector>> {
-        match platform_for_tracker(t) {
-            Some(kind) => self
-                .accounts
-                .get(&AccountId::new(t.as_str()))
-                .and_then(|a| a.issues.clone())
-                .or_else(|| {
-                    // See `repo`'s doc: `find_map`, not
-                    // `find(..).and_then(..)` — the same independent-probe
-                    // reasoning applies to `issues` vs `repo`/`events`.
-                    self.accounts.values().find_map(|a| {
-                        if a.kind == kind {
-                            a.issues.clone()
-                        } else {
-                            None
-                        }
-                    })
-                }),
-            None => self
-                .tracker_accounts
-                .get(&AccountId::new(t.as_str()))
-                .map(|(_, c)| c.clone()),
-        }
-    }
-
-    /// Retrieve the EventConnector for a given platform, if one is
-    /// registered. Used by `rupu cron tick`'s polled-events tier.
-    /// Back-compat shim; see [`repo`](Self::repo)'s doc for the
-    /// bare-name-first preference.
-    pub fn events(&self, p: Platform) -> Option<Arc<dyn EventConnector>> {
-        self.accounts
-            .get(&AccountId::new(p.as_str()))
-            .and_then(|a| a.events.clone())
-            .or_else(|| {
-                // See `repo`'s doc: `find_map`, not `find(..).and_then(..)`.
-                self.accounts
-                    .values()
-                    .find_map(|a| if a.kind == p { a.events.clone() } else { None })
-            })
-    }
-
     /// Resolve which account's `EventConnector` serves a polled trigger
     /// source, running the same rule engine `repo_for`/`issues_for` run
     /// (spec §6.2/§6.3, Task 6): explicit → owner rule → path rule →
-    /// sole account → error. `cwd` powers path rules exactly like
-    /// `repo_for`; `rupu cron tick` has no meaningful cwd of its own —
-    /// it polls a remote source on a schedule, not from inside a
-    /// checkout — so its caller passes `None`, same as the webhook
-    /// receiver (spec §6.5's daemon note: "a webhook payload or cron
-    /// poll knows the owner but has no cwd"). Only the
-    /// explicit/owner/sole-account tiers can ever fire for a daemon
-    /// caller as a result — that is by design, not a gap.
+    /// sole account → error. Same three-argument shape as
+    /// `repo_for`/`issues_for`/`github_extras_for` (Arc 2 Task 6 review
+    /// item 2) — `explicit` is a real caller-supplied parameter, not
+    /// something only `EventSourceRef::TrackerProject`'s embedded
+    /// `account` field can carry. Before this fix, `Repo` sources always
+    /// passed `None` as their explicit tier: an `account = "..."` on a
+    /// repo-backed `poll_sources` entry (`github:owner/repo`,
+    /// `gitlab:group/project`) parsed cleanly (a known field, so
+    /// `deny_unknown_fields` never caught it) and then did nothing —
+    /// exactly the silent-config-no-op this project rejects everywhere
+    /// else. `cwd` powers path rules exactly like `repo_for`; `rupu cron
+    /// tick` has no meaningful cwd of its own — it polls a remote
+    /// source on a schedule, not from inside a checkout — so its caller
+    /// passes `None`, same as the webhook receiver (spec §6.5's daemon
+    /// note: "a webhook payload or cron poll knows the owner but has no
+    /// cwd"). Only the explicit/owner/sole-account tiers can ever fire
+    /// for a daemon caller as a result — that is by design, not a gap.
     ///
     /// `EventSourceRef::Repo` has an owner to key on and resolves
-    /// exactly like `repo_for`. `EventSourceRef::TrackerProject` splits
-    /// its `project` string into a `RepoRef` via
+    /// exactly like `repo_for`, with `explicit` as its explicit tier.
+    /// `EventSourceRef::TrackerProject` splits its `project` string into
+    /// a `RepoRef` via
     /// [`tracker_project_repo`](crate::types::tracker_project_repo) for
     /// the repo-backed trackers (`github`/`gitlab` issues, where
     /// `project` IS `owner/repo`) so the same owner-rule tier applies
-    /// there too — Linear/Jira have no such split, so their only lever
-    /// is the variant's own `account` field, threaded in here as the
-    /// `explicit` tier (spec §6.5: "the one place multi-account cannot
-    /// be inferred").
+    /// there too. Its explicit tier is `explicit.or(account)` — the
+    /// caller-supplied parameter wins when given (so a caller that
+    /// threads a trigger-config `account` through the parameter, same
+    /// as it would for a `Repo` source, behaves identically for either
+    /// variant); the variant's own embedded `account` field is the
+    /// fallback, so a value constructed directly with that field set
+    /// (no separate parameter available at the call site) still
+    /// resolves — this is the field's real purpose for Linear/Jira,
+    /// whose `project` has no owner/path to infer an account from at
+    /// all (spec §6.5: "the one place multi-account cannot be
+    /// inferred").
     ///
     /// Was `events_for_source`'s pre-Task-6 shape: `Option<Arc<dyn
     /// EventConnector>>`, `Repo` routed through the account-arbitrary
@@ -699,6 +659,7 @@ impl Registry {
         &self,
         source: &EventSourceRef,
         cwd: Option<&Path>,
+        explicit: Option<&AccountId>,
     ) -> Result<(AccountId, Arc<dyn EventConnector>), AccountError> {
         let home = dirs::home_dir();
         match source {
@@ -709,7 +670,7 @@ impl Registry {
                     Some(repo),
                     cwd,
                     home.as_deref(),
-                    None,
+                    explicit,
                     &candidates,
                 );
                 let id = Self::resolution_to_id(resolution, || {
@@ -726,6 +687,7 @@ impl Registry {
                 project,
                 account,
             } => {
+                let explicit = explicit.or(account.as_ref());
                 if let Some(repo) = crate::types::tracker_project_repo(*tracker, project) {
                     let candidates = self.accounts_for_events(repo.platform);
                     let resolution = rules::resolve_account(
@@ -733,7 +695,7 @@ impl Registry {
                         Some(&repo),
                         cwd,
                         home.as_deref(),
-                        account.as_ref(),
+                        explicit,
                         &candidates,
                     );
                     let id = Self::resolution_to_id(resolution, || {
@@ -747,7 +709,7 @@ impl Registry {
                         None,
                         cwd,
                         home.as_deref(),
-                        account.as_ref(),
+                        explicit,
                         &candidates,
                     );
                     let id = Self::resolution_to_id(resolution, || {
@@ -1071,7 +1033,20 @@ impl Registry {
         }
     }
 
-    fn accounts_for_github_extras(&self) -> Vec<AccountId> {
+    /// Every registered account with a built `GithubExtras` handle, in
+    /// deterministic order. `github_extras_for`'s own candidate list —
+    /// made `pub` (Arc 2 Task 6 review item 1) so a caller with no
+    /// `RepoRef` at all (no owner, so no rule engine to run) can still
+    /// implement the sole-account tier by hand: check this list has
+    /// exactly one entry, then `github_extras_by_account` it directly.
+    /// Deliberately NOT `accounts_for(Platform::Github)` (filtered on
+    /// `a.repo.is_some()`) — `discover()`'s Github arm always builds
+    /// `repo`/`issues`/`github_extras` together, so the two lists agree
+    /// for every account `discover()` itself produces, but a test
+    /// double built via `insert_github_extras_account` alone (no
+    /// matching `insert_repo_account`) makes them diverge, and this is
+    /// the field this candidate list is actually about.
+    pub fn accounts_for_github_extras(&self) -> Vec<AccountId> {
         self.accounts
             .iter()
             .filter(|(_, a)| a.kind == Platform::Github && a.github_extras.is_some())
@@ -1175,7 +1150,14 @@ impl Registry {
     /// Returns the per-platform extras handle for GitHub actions, if
     /// GitHub credentials were present during discovery. Prefers the
     /// bare-vendor-named account, then the first (lowest `AccountId`)
-    /// GitHub-kind account with extras — see [`repo`](Self::repo)'s doc.
+    /// GitHub-kind account with extras (`find_map`, not
+    /// `find(..).and_then(..)`: independent accounts can each have a
+    /// distinct subset of a kind's fields populated, so stopping at the
+    /// first *matching-kind* account rather than the first
+    /// *matching-kind-with-this-field* account could return `None` past
+    /// a real one — the same reasoning the deleted `repo`/`issues`/
+    /// `events` shims documented before Arc 2 Task 6 removed them as
+    /// dead code).
     /// Back-compat shim: `rupu-mcp`'s `github.workflows_dispatch` (a
     /// mutating call with a `RepoRef` in hand) migrated to
     /// [`github_extras_for`](Self::github_extras_for) in Arc 2 Task 5.
@@ -1781,9 +1763,50 @@ mod tests {
             },
         };
         let (id, _) = reg
-            .events_for_source(&source, None)
+            .events_for_source(&source, None, None)
             .expect("owner rule must resolve through events_for_source");
         assert_eq!(id, AccountId::new("gh-personal"));
+    }
+
+    /// Arc 2 Task 6 review item 2's regression: an explicit `account`
+    /// override must work for a `Repo` source too, not just
+    /// `TrackerProject`. Before the fix, `events_for_source` always
+    /// passed `None` as the explicit tier for `Repo` sources — an
+    /// `account = "..."` on a `github:owner/repo` poll_sources entry
+    /// parsed cleanly (a known `PollSourceSpec` field) and then did
+    /// nothing. Here the configured owner rule points at `gh-personal`;
+    /// the explicit override names `gh-work` instead, and must win —
+    /// explicit beats owner rule in `rules::resolve_account`'s
+    /// precedence regardless of source kind.
+    #[tokio::test]
+    async fn explicit_account_overrides_an_owner_rule_through_events_for_source() {
+        let mut reg = Registry::default();
+        reg.insert_event_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        reg.insert_event_account(
+            AccountId::new("gh-personal"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        reg.set_rules(vec![Rule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: AccountId::new("gh-personal"),
+        }]);
+        let source = EventSourceRef::Repo {
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "acme".into(),
+                repo: "api".into(),
+            },
+        };
+        let (id, _) = reg
+            .events_for_source(&source, None, Some(&AccountId::new("gh-work")))
+            .expect("explicit account must resolve through events_for_source");
+        assert_eq!(id, AccountId::new("gh-work"));
     }
 
     /// A repo-backed `TrackerProject` (`project` = `owner/repo`) gets the
@@ -1816,7 +1839,7 @@ mod tests {
             account: None,
         };
         let (id, _) = reg
-            .events_for_source(&source, None)
+            .events_for_source(&source, None, None)
             .expect("owner rule must apply to a split repo-backed tracker project");
         assert_eq!(id, AccountId::new("gh-work"));
     }
@@ -1848,7 +1871,7 @@ mod tests {
             account: Some(AccountId::new("linear")),
         };
         let (id, _) = reg
-            .events_for_source(&source, None)
+            .events_for_source(&source, None, None)
             .expect("explicit account field must resolve a tracker-native source");
         assert_eq!(id, AccountId::new("linear"));
     }
@@ -1866,7 +1889,7 @@ mod tests {
             project: "team-123".into(),
             account: Some(AccountId::new("linear-typo")),
         };
-        let err = match reg.events_for_source(&source, None) {
+        let err = match reg.events_for_source(&source, None, None) {
             Err(e) => e,
             Ok(_) => panic!("expected UnknownAccount"),
         };
@@ -1903,7 +1926,7 @@ mod tests {
             account: Some(AccountId::new("gh-work")),
         };
         let (id, _) = reg
-            .events_for_source(&source, None)
+            .events_for_source(&source, None, None)
             .expect("explicit account must resolve a repo-backed tracker with no owner/repo split");
         assert_eq!(id, AccountId::new("gh-work"));
     }
@@ -1927,7 +1950,7 @@ mod tests {
             },
         };
         let (id, _) = reg
-            .events_for_source(&source, None)
+            .events_for_source(&source, None, None)
             .expect("sole account must resolve with no rules configured");
         assert_eq!(id, AccountId::new("github"));
     }
@@ -1945,7 +1968,7 @@ mod tests {
                 repo: "rupu".into(),
             },
         };
-        let err = match reg.events_for_source(&source, None) {
+        let err = match reg.events_for_source(&source, None, None) {
             Err(e) => e,
             Ok(_) => panic!("expected NoAccounts"),
         };
@@ -1974,7 +1997,7 @@ mod tests {
                 repo: "thing".into(),
             },
         };
-        let err = match reg.events_for_source(&source, None) {
+        let err = match reg.events_for_source(&source, None, None) {
             Err(e) => e,
             Ok(_) => panic!("expected NoRuleMatched"),
         };
@@ -2123,94 +2146,6 @@ mod tests {
         assert!(
             !msg.contains("no such account"),
             "must not present a log-in gap as an unknown-account typo: {msg}"
-        );
-    }
-
-    /// Review item 3: `repo()`/`issues()`/`events()`'s fallback used to
-    /// be `.find(|a| a.kind == p).and_then(|a| a.FIELD.clone())` — which
-    /// stops at the *first* account of a kind (BTreeMap key order) and
-    /// returns `None` from its `FIELD` even when a *later* account of
-    /// the same kind actually has one. Reachable because repo/issues/
-    /// events are independent probes on the same credential (`discover`
-    /// builds each with its own `try_build` call) — one can fail while
-    /// another succeeds on the very same account.
-    ///
-    /// `acme-ghe` sorts before `gh-work` and registers *only* an issues
-    /// connector; `gh-work` has the repo connector. `find(..).and_then`
-    /// stops at `acme-ghe`, sees no `repo`, and returns `None` even
-    /// though `gh-work` has a real one — this test fails against that
-    /// form and passes against `find_map`.
-    #[test]
-    fn repo_falls_through_to_a_later_account_of_the_same_kind() {
-        let mut reg = Registry::default();
-        reg.insert_issue_account(
-            AccountId::new("acme-ghe"),
-            Platform::Github,
-            fake_issue_connector(),
-        );
-        let work_repo = fake_repo_connector();
-        reg.insert_repo_account(
-            AccountId::new("gh-work"),
-            Platform::Github,
-            work_repo.clone(),
-        );
-
-        let got = reg
-            .repo(Platform::Github)
-            .expect("gh-work's repo connector must be found past acme-ghe's missing one");
-        assert!(
-            Arc::ptr_eq(&got, &work_repo),
-            "must be gh-work's connector specifically, not None or the wrong one"
-        );
-    }
-
-    /// `issues()` counterpart to `repo_falls_through_to_a_later_account_of_the_same_kind`.
-    #[test]
-    fn issues_falls_through_to_a_later_account_of_the_same_kind() {
-        let mut reg = Registry::default();
-        reg.insert_repo_account(
-            AccountId::new("acme-ghe"),
-            Platform::Github,
-            fake_repo_connector(),
-        );
-        let work_issues = fake_issue_connector();
-        reg.insert_issue_account(
-            AccountId::new("gh-work"),
-            Platform::Github,
-            work_issues.clone(),
-        );
-
-        let got = reg
-            .issues(IssueTracker::Github)
-            .expect("gh-work's issue connector must be found past acme-ghe's missing one");
-        assert!(
-            Arc::ptr_eq(&got, &work_issues),
-            "must be gh-work's connector specifically, not None or the wrong one"
-        );
-    }
-
-    /// `events()` counterpart to `repo_falls_through_to_a_later_account_of_the_same_kind`.
-    #[test]
-    fn events_falls_through_to_a_later_account_of_the_same_kind() {
-        let mut reg = Registry::default();
-        reg.insert_repo_account(
-            AccountId::new("acme-ghe"),
-            Platform::Github,
-            fake_repo_connector(),
-        );
-        let work_events = fake_event_connector();
-        reg.insert_event_account(
-            AccountId::new("gh-work"),
-            Platform::Github,
-            work_events.clone(),
-        );
-
-        let got = reg
-            .events(Platform::Github)
-            .expect("gh-work's event connector must be found past acme-ghe's missing one");
-        assert!(
-            Arc::ptr_eq(&got, &work_events),
-            "must be gh-work's connector specifically, not None or the wrong one"
         );
     }
 

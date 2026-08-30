@@ -4094,9 +4094,22 @@ async fn run_with_outcome(
                             repo: repo.clone(),
                         };
                         let tmp = tempfile::tempdir()?;
-                        rupu_scm::clone_repo_ref(&mcp_registry, &r, tmp.path())
-                            .await
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        // The owner is already in scope (`r` is a full
+                        // `RepoRef`) — run the owner/path rule engine
+                        // via `repo_for` instead of the old
+                        // `mcp_registry.repo(platform)` shim's
+                        // lexicographically-first pick, mirroring the
+                        // sibling `RunTarget::Issue` arm's `issues_for`
+                        // call below.
+                        rupu_scm::clone_repo_ref(
+                            &mcp_registry,
+                            &r,
+                            tmp.path(),
+                            Some(pwd.as_path()),
+                            None,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let p = tmp.path().to_path_buf();
                         (Some(tmp), p)
                     }
