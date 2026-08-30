@@ -112,11 +112,9 @@ impl JiraEventConnector {
 
     fn resolve_target(&self, source: &EventSourceRef) -> Result<JiraProjectTarget, ScmError> {
         let project = match source {
-            EventSourceRef::TrackerProject { tracker, project }
-                if *tracker == IssueTracker::Jira =>
-            {
-                project.as_str()
-            }
+            EventSourceRef::TrackerProject {
+                tracker, project, ..
+            } if *tracker == IssueTracker::Jira => project.as_str(),
             _ => {
                 return Err(ScmError::BadRequest {
                     message: "jira events polling only supports jira tracker_project sources"
@@ -958,6 +956,7 @@ mod tests {
         EventSourceRef::TrackerProject {
             tracker: IssueTracker::Jira,
             project: project.to_string(),
+            account: None,
         }
     }
 

@@ -664,20 +664,233 @@ impl Registry {
             })
     }
 
-    /// Retrieve the EventConnector suitable for a trigger source.
-    pub fn events_for_source(&self, source: &EventSourceRef) -> Option<Arc<dyn EventConnector>> {
+    /// Resolve which account's `EventConnector` serves a polled trigger
+    /// source, running the same rule engine `repo_for`/`issues_for` run
+    /// (spec §6.2/§6.3, Task 6): explicit → owner rule → path rule →
+    /// sole account → error. `cwd` powers path rules exactly like
+    /// `repo_for`; `rupu cron tick` has no meaningful cwd of its own —
+    /// it polls a remote source on a schedule, not from inside a
+    /// checkout — so its caller passes `None`, same as the webhook
+    /// receiver (spec §6.5's daemon note: "a webhook payload or cron
+    /// poll knows the owner but has no cwd"). Only the
+    /// explicit/owner/sole-account tiers can ever fire for a daemon
+    /// caller as a result — that is by design, not a gap.
+    ///
+    /// `EventSourceRef::Repo` has an owner to key on and resolves
+    /// exactly like `repo_for`. `EventSourceRef::TrackerProject` splits
+    /// its `project` string into a `RepoRef` via
+    /// [`tracker_project_repo`](crate::types::tracker_project_repo) for
+    /// the repo-backed trackers (`github`/`gitlab` issues, where
+    /// `project` IS `owner/repo`) so the same owner-rule tier applies
+    /// there too — Linear/Jira have no such split, so their only lever
+    /// is the variant's own `account` field, threaded in here as the
+    /// `explicit` tier (spec §6.5: "the one place multi-account cannot
+    /// be inferred").
+    ///
+    /// Was `events_for_source`'s pre-Task-6 shape: `Option<Arc<dyn
+    /// EventConnector>>`, `Repo` routed through the account-arbitrary
+    /// `events(Platform)` shim, and `TrackerProject` had no lever at
+    /// all besides that same shim. The `Result<(AccountId, ...)>`
+    /// return shape matches `repo_for`/`issues_for` so callers can
+    /// distinguish "no account configured for this vendor" (skip,
+    /// unremarkable) from "several accounts and nothing selected one"
+    /// (a real misconfiguration worth a warning).
+    pub fn events_for_source(
+        &self,
+        source: &EventSourceRef,
+        cwd: Option<&Path>,
+    ) -> Result<(AccountId, Arc<dyn EventConnector>), AccountError> {
+        let home = dirs::home_dir();
         match source {
-            EventSourceRef::Repo { repo } => self.events(repo.platform),
-            EventSourceRef::TrackerProject { tracker, .. } => self
-                .tracker_event_connectors
-                .get(&AccountId::new(tracker.as_str()))
-                .cloned()
-                .or_else(|| match tracker {
-                    IssueTracker::Github => self.events(Platform::Github),
-                    IssueTracker::Gitlab => self.events(Platform::Gitlab),
-                    IssueTracker::Linear | IssueTracker::Jira => None,
-                }),
+            EventSourceRef::Repo { repo } => {
+                let candidates = self.accounts_for_events(repo.platform);
+                let resolution = rules::resolve_account(
+                    &self.rules,
+                    Some(repo),
+                    cwd,
+                    home.as_deref(),
+                    None,
+                    &candidates,
+                );
+                let id = Self::resolution_to_id(resolution, || {
+                    (
+                        format!("{}/{}", repo.owner, repo.repo),
+                        repo.owner.clone(),
+                        repo.platform.to_string(),
+                    )
+                })?;
+                self.lookup_events_platform(id, repo.platform, &candidates)
+            }
+            EventSourceRef::TrackerProject {
+                tracker,
+                project,
+                account,
+            } => {
+                if let Some(repo) = crate::types::tracker_project_repo(*tracker, project) {
+                    let candidates = self.accounts_for_events(repo.platform);
+                    let resolution = rules::resolve_account(
+                        &self.rules,
+                        Some(&repo),
+                        cwd,
+                        home.as_deref(),
+                        account.as_ref(),
+                        &candidates,
+                    );
+                    let id = Self::resolution_to_id(resolution, || {
+                        (project.clone(), repo.owner.clone(), tracker.to_string())
+                    })?;
+                    self.lookup_events_platform(id, repo.platform, &candidates)
+                } else {
+                    let candidates = self.accounts_for_tracker_events(*tracker);
+                    let resolution = rules::resolve_account(
+                        &self.rules,
+                        None,
+                        cwd,
+                        home.as_deref(),
+                        account.as_ref(),
+                        &candidates,
+                    );
+                    let id = Self::resolution_to_id(resolution, || {
+                        (project.clone(), String::new(), tracker.to_string())
+                    })?;
+                    self.lookup_events_tracker(id, *tracker, &candidates)
+                }
+            }
         }
+    }
+
+    /// Shared `Resolution` → `Result<AccountId, AccountError>` step for
+    /// `events_for_source`'s three branches — same mapping `repo_for`
+    /// inlines once, factored out here because `events_for_source` has
+    /// three call sites for it. `describe` is called only on the two
+    /// error paths (`NoMatch`/`NoAccounts`), so it's a closure rather
+    /// than three eagerly-computed strings.
+    fn resolution_to_id(
+        resolution: Resolution,
+        describe: impl FnOnce() -> (String, String, String),
+    ) -> Result<AccountId, AccountError> {
+        match resolution {
+            Resolution::Explicit(id)
+            | Resolution::Owner(id)
+            | Resolution::Path(id)
+            | Resolution::SoleAccount(id) => Ok(id),
+            Resolution::NoMatch { candidates } => {
+                let (repo, owner, platform) = describe();
+                Err(AccountError::NoRuleMatched {
+                    repo,
+                    owner,
+                    platform,
+                    candidates,
+                })
+            }
+            Resolution::NoAccounts => {
+                let (_, _, platform) = describe();
+                Err(AccountError::NoAccounts { platform })
+            }
+        }
+    }
+
+    /// Candidate accounts for `events_for_source`'s `Repo` tier and its
+    /// repo-backed-tracker branch: every account of `kind` that actually
+    /// has an `EventConnector` built (mirrors `accounts_for`'s
+    /// `a.repo.is_some()` filter, but for `a.events`).
+    fn accounts_for_events(&self, kind: Platform) -> Vec<AccountId> {
+        self.accounts
+            .iter()
+            .filter(|(_, a)| a.kind == kind && a.events.is_some())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Candidate accounts for `events_for_source`'s tracker-native
+    /// branch (Linear/Jira, or a repo-backed tracker whose `project`
+    /// didn't split). Repo-backed trackers still live in `self.accounts`
+    /// (there is no separate "github issues" account map), so this
+    /// delegates to `accounts_for_events`; Linear/Jira live in
+    /// `tracker_event_connectors`, which — per that field's doc — holds
+    /// at most one entry per tracker today (not yet multi-account), so
+    /// this returns a 0- or 1-element list.
+    fn accounts_for_tracker_events(&self, tracker: IssueTracker) -> Vec<AccountId> {
+        match platform_for_tracker(tracker) {
+            Some(kind) => self.accounts_for_events(kind),
+            None => {
+                let id = AccountId::new(tracker.as_str());
+                if self.tracker_event_connectors.contains_key(&id) {
+                    vec![id]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    fn lookup_events_platform(
+        &self,
+        id: AccountId,
+        platform: Platform,
+        candidates: &[AccountId],
+    ) -> Result<(AccountId, Arc<dyn EventConnector>), AccountError> {
+        if candidates.is_empty() {
+            return Err(AccountError::NoAccounts {
+                platform: platform.to_string(),
+            });
+        }
+        if let Some(acct) = self.accounts.get(&id) {
+            if acct.kind == platform {
+                if let Some(c) = &acct.events {
+                    return Ok((id, c.clone()));
+                }
+            }
+        }
+        Err(AccountError::UnknownAccount {
+            requested: id,
+            configured: candidates.to_vec(),
+        })
+    }
+
+    /// Mirrors `lookup_issues`'s dual-branch dispatch: a repo-backed
+    /// tracker's accounts live in `self.accounts` (keyed by `Platform`,
+    /// same map `lookup_events_platform` reads), Linear/Jira's live in
+    /// `tracker_event_connectors`. Needed because
+    /// `accounts_for_tracker_events` — this function's candidate-list
+    /// counterpart — returns candidates from `self.accounts` for a
+    /// repo-backed tracker (`events_for_source`'s call site reaches
+    /// this branch when a `TrackerProject { tracker: Github/Gitlab,
+    /// .. }`'s `project` doesn't split into `owner/repo`, e.g. no `/`)
+    /// — looking only in `tracker_event_connectors` for those ids would
+    /// always report `UnknownAccount`, even for an account that is
+    /// genuinely configured and has an events connector.
+    fn lookup_events_tracker(
+        &self,
+        id: AccountId,
+        tracker: IssueTracker,
+        candidates: &[AccountId],
+    ) -> Result<(AccountId, Arc<dyn EventConnector>), AccountError> {
+        if candidates.is_empty() {
+            return Err(AccountError::NoAccounts {
+                platform: tracker.to_string(),
+            });
+        }
+        match platform_for_tracker(tracker) {
+            Some(kind) => {
+                if let Some(acct) = self.accounts.get(&id) {
+                    if acct.kind == kind {
+                        if let Some(c) = &acct.events {
+                            return Ok((id, c.clone()));
+                        }
+                    }
+                }
+            }
+            None => {
+                if let Some(c) = self.tracker_event_connectors.get(&id) {
+                    return Ok((id, c.clone()));
+                }
+            }
+        }
+        Err(AccountError::UnknownAccount {
+            requested: id,
+            configured: candidates.to_vec(),
+        })
     }
 
     /// Test/internal: register an `EventConnector` directly under the
@@ -1537,6 +1750,235 @@ mod tests {
             .gitlab_extras_for(&r, None, Some(&AccountId::new("gl-work")))
             .expect("explicit account must resolve through gitlab_extras_for");
         assert_eq!(id, AccountId::new("gl-work"));
+    }
+
+    /// `events_for_source`'s `Repo` tier: same owner-rule resolution as
+    /// `repo_for` (Task 6 migrated it off the account-arbitrary
+    /// `events(Platform)` shim).
+    #[tokio::test]
+    async fn an_owner_rule_selects_between_two_accounts_through_events_for_source() {
+        let mut reg = Registry::default();
+        reg.insert_event_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        reg.insert_event_account(
+            AccountId::new("gh-personal"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        reg.set_rules(vec![Rule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: AccountId::new("gh-personal"),
+        }]);
+        let source = EventSourceRef::Repo {
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "acme".into(),
+                repo: "api".into(),
+            },
+        };
+        let (id, _) = reg
+            .events_for_source(&source, None)
+            .expect("owner rule must resolve through events_for_source");
+        assert_eq!(id, AccountId::new("gh-personal"));
+    }
+
+    /// A repo-backed `TrackerProject` (`project` = `owner/repo`) gets the
+    /// owner split back out via `tracker_project_repo` and resolves
+    /// through the SAME owner-rule tier as `Repo` — proving Task 6's
+    /// investigation answer for item 3: splitting genuinely does make
+    /// the explicit `account` field unnecessary for a repo-backed
+    /// tracker, so this passes with `account: None`.
+    #[tokio::test]
+    async fn tracker_project_owner_rule_applies_when_project_splits() {
+        let mut reg = Registry::default();
+        reg.insert_event_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        reg.insert_event_account(
+            AccountId::new("gh-personal"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        reg.set_rules(vec![Rule {
+            owner: Some("acme/*".into()),
+            path: None,
+            account: AccountId::new("gh-work"),
+        }]);
+        let source = EventSourceRef::TrackerProject {
+            tracker: IssueTracker::Github,
+            project: "acme/api".into(),
+            account: None,
+        };
+        let (id, _) = reg
+            .events_for_source(&source, None)
+            .expect("owner rule must apply to a split repo-backed tracker project");
+        assert_eq!(id, AccountId::new("gh-work"));
+    }
+
+    /// Linear/Jira have no owner to split out of `project` (`"team-123"`
+    /// isn't `owner/repo`) — the variant's own `account` field is the
+    /// only lever (spec §6.5). Inserts directly into the private
+    /// `tracker_event_connectors` map (this test lives inside the
+    /// `registry` module via `use super::*`, so it has the same access
+    /// discovery's own Linear/Jira segment does) since there is no
+    /// public multi-account test seam for it. Genuinely single-account
+    /// (`tracker_event_connectors` has no per-entry `IssueTracker` tag —
+    /// unlike `tracker_accounts`, which pairs one in — so its candidate
+    /// list, `accounts_for_tracker_events`, can only recognize the one
+    /// bare-name key `discover` ever writes; that's `tracker_accounts`'s
+    /// "not yet multi-account" constraint, not a new one introduced
+    /// here). The claim this proves is narrower than the two-account
+    /// owner-rule tests above: the `account` field is read and actually
+    /// gates resolution (a wrong name is `UnknownAccount`, not a silent
+    /// pass-through) — see the next test.
+    #[tokio::test]
+    async fn tracker_project_explicit_account_resolves_a_tracker_native_source() {
+        let mut reg = Registry::default();
+        reg.tracker_event_connectors
+            .insert(AccountId::new("linear"), fake_event_connector());
+        let source = EventSourceRef::TrackerProject {
+            tracker: IssueTracker::Linear,
+            project: "team-123".into(),
+            account: Some(AccountId::new("linear")),
+        };
+        let (id, _) = reg
+            .events_for_source(&source, None)
+            .expect("explicit account field must resolve a tracker-native source");
+        assert_eq!(id, AccountId::new("linear"));
+    }
+
+    /// Companion to the test above: a typo'd `account` field must be
+    /// `UnknownAccount`, not silently ignored or silently matched to
+    /// the one real entry — the `account` field has teeth.
+    #[tokio::test]
+    async fn tracker_project_explicit_account_typo_is_unknown_account() {
+        let mut reg = Registry::default();
+        reg.tracker_event_connectors
+            .insert(AccountId::new("linear"), fake_event_connector());
+        let source = EventSourceRef::TrackerProject {
+            tracker: IssueTracker::Linear,
+            project: "team-123".into(),
+            account: Some(AccountId::new("linear-typo")),
+        };
+        let err = match reg.events_for_source(&source, None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected UnknownAccount"),
+        };
+        assert!(
+            matches!(err, AccountError::UnknownAccount { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// Regression coverage for a bug caught in self-review: a
+    /// `TrackerProject { tracker: Github, .. }` whose `project` does
+    /// NOT split (no `/`) falls to the tracker-native branch of
+    /// `events_for_source`, whose candidate list
+    /// (`accounts_for_tracker_events`) correctly draws from
+    /// `self.accounts` for a repo-backed tracker — but an earlier
+    /// version of `lookup_events_tracker` looked ONLY in
+    /// `tracker_event_connectors` regardless of tracker kind, so it
+    /// always reported `UnknownAccount` for a github/gitlab id even
+    /// though the account genuinely exists and has an events connector.
+    /// This must resolve via the explicit `account` field exactly like
+    /// the split-project case above.
+    #[tokio::test]
+    async fn tracker_project_explicit_account_resolves_repo_backed_tracker_with_unsplittable_project(
+    ) {
+        let mut reg = Registry::default();
+        reg.insert_event_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        let source = EventSourceRef::TrackerProject {
+            tracker: IssueTracker::Github,
+            project: "no-slash-here".into(),
+            account: Some(AccountId::new("gh-work")),
+        };
+        let (id, _) = reg
+            .events_for_source(&source, None)
+            .expect("explicit account must resolve a repo-backed tracker with no owner/repo split");
+        assert_eq!(id, AccountId::new("gh-work"));
+    }
+
+    /// Back-compat clause (spec §6.3's fourth tier): one GitHub account
+    /// and no `[[scm.rules]]` resolves via `SoleAccount`, matching
+    /// today's single-account behavior with zero config changes.
+    #[tokio::test]
+    async fn sole_account_resolves_events_for_source_with_no_rules() {
+        let mut reg = Registry::default();
+        reg.insert_event_account(
+            AccountId::new("github"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        let source = EventSourceRef::Repo {
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "Section9Labs".into(),
+                repo: "rupu".into(),
+            },
+        };
+        let (id, _) = reg
+            .events_for_source(&source, None)
+            .expect("sole account must resolve with no rules configured");
+        assert_eq!(id, AccountId::new("github"));
+    }
+
+    /// No GitHub account configured at all is a distinct failure
+    /// (`NoAccounts`) from ambiguity (`NoRuleMatched`) — `cron.rs`'s
+    /// caller treats these differently (silent skip vs. a warning).
+    #[tokio::test]
+    async fn events_for_source_reports_no_accounts_when_none_configured() {
+        let reg = Registry::default();
+        let source = EventSourceRef::Repo {
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "Section9Labs".into(),
+                repo: "rupu".into(),
+            },
+        };
+        let err = match reg.events_for_source(&source, None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected NoAccounts"),
+        };
+        assert!(matches!(err, AccountError::NoAccounts { .. }), "{err:?}");
+    }
+
+    /// Two accounts and no rule that matches is `NoRuleMatched`, not a
+    /// silent pick — the whole reason spec §6.4 exists.
+    #[tokio::test]
+    async fn events_for_source_reports_no_rule_matched_when_ambiguous() {
+        let mut reg = Registry::default();
+        reg.insert_event_account(
+            AccountId::new("gh-work"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        reg.insert_event_account(
+            AccountId::new("gh-personal"),
+            Platform::Github,
+            fake_event_connector(),
+        );
+        let source = EventSourceRef::Repo {
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "other".into(),
+                repo: "thing".into(),
+            },
+        };
+        let err = match reg.events_for_source(&source, None) {
+            Err(e) => e,
+            Ok(_) => panic!("expected NoRuleMatched"),
+        };
+        assert!(matches!(err, AccountError::NoRuleMatched { .. }), "{err:?}");
     }
 
     #[tokio::test]

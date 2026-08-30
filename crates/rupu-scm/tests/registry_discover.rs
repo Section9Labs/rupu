@@ -84,11 +84,15 @@ async fn linear_event_connector_built_when_credential_present() {
     let r = Registry::discover(&resolver, &cfg, std::sync::Arc::new(rupu_netflow::NullSink)).await;
     assert!(r.issues(IssueTracker::Linear).is_some());
     assert!(r
-        .events_for_source(&EventSourceRef::TrackerProject {
-            tracker: IssueTracker::Linear,
-            project: "team-123".into(),
-        })
-        .is_some());
+        .events_for_source(
+            &EventSourceRef::TrackerProject {
+                tracker: IssueTracker::Linear,
+                project: "team-123".into(),
+                account: None,
+            },
+            None,
+        )
+        .is_ok());
 }
 
 #[tokio::test]
@@ -119,9 +123,13 @@ async fn jira_event_connector_built_when_credential_present() {
     let r = Registry::discover(&resolver, &cfg, std::sync::Arc::new(rupu_netflow::NullSink)).await;
     assert!(r.issues(IssueTracker::Jira).is_some());
     assert!(r
-        .events_for_source(&EventSourceRef::TrackerProject {
-            tracker: IssueTracker::Jira,
-            project: "ENG".into(),
-        })
-        .is_some());
+        .events_for_source(
+            &EventSourceRef::TrackerProject {
+                tracker: IssueTracker::Jira,
+                project: "ENG".into(),
+                account: None,
+            },
+            None,
+        )
+        .is_ok());
 }

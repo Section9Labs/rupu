@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+use crate::account::AccountId;
 use crate::platform::{IssueTracker, Platform};
 
 /// Reference to a repository on a specific platform.
@@ -27,6 +28,23 @@ pub enum EventSourceRef {
     TrackerProject {
         tracker: IssueTracker,
         project: String,
+        /// Explicit account override (Arc 2 Task 6, spec §6.5). A
+        /// `Repo`-sourced trigger infers its account from `repo.owner`
+        /// via an owner rule; a `TrackerProject` source has no owner or
+        /// path baked into `project` for Linear/Jira (`"ENG"`,
+        /// `"team-123"` — not an `owner/repo` shape), so multi-account
+        /// genuinely cannot be inferred there and this field is the only
+        /// lever. For a repo-backed tracker (`github`/`gitlab`, where
+        /// `project` IS `owner/repo`) [`tracker_project_repo`] splits the
+        /// owner back out so the normal owner-rule tier still applies —
+        /// this field is an override there, not the only lever.
+        ///
+        /// `#[serde(default)]` so a `TrackerProject` value serialized
+        /// before this field existed still deserializes: unset becomes
+        /// `None`, i.e. "resolve without an explicit account", which is
+        /// exactly today's (pre-field) behavior.
+        #[serde(default)]
+        account: Option<AccountId>,
     },
 }
 
@@ -60,11 +78,38 @@ impl EventSourceRef {
             Self::Repo { repo } => {
                 format!("{}:{}/{}", repo.platform.as_str(), repo.owner, repo.repo)
             }
-            Self::TrackerProject { tracker, project } => {
+            Self::TrackerProject {
+                tracker, project, ..
+            } => {
                 format!("{}:{project}", tracker.as_str())
             }
         }
     }
+}
+
+/// Split a tracker `project` string into a `RepoRef` for a repo-backed
+/// tracker (`github`/`gitlab`, where `project` is `owner/repo`).
+/// Returns `None` for `Linear`/`Jira` (no `owner/repo` shape to split)
+/// or a `project` with no `/`.
+///
+/// Shared by every call site that needs to route a `tracker` + `project`
+/// pair through the account rule engine's owner-rule tier —
+/// `rupu-mcp`'s `tools/issues.rs::project_repo` and `rupu-cli`'s
+/// `cmd/issues.rs::issue_ref_repo` had already written this split
+/// independently before `Registry::events_for_source` (Task 6) needed a
+/// third copy; this is the shared version they both now delegate to.
+pub fn tracker_project_repo(tracker: IssueTracker, project: &str) -> Option<RepoRef> {
+    let platform = match tracker {
+        IssueTracker::Github => Platform::Github,
+        IssueTracker::Gitlab => Platform::Gitlab,
+        IssueTracker::Linear | IssueTracker::Jira => return None,
+    };
+    let (owner, repo) = project.split_once('/')?;
+    Some(RepoRef {
+        platform,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
 }
 
 impl fmt::Display for EventSourceRef {
@@ -109,6 +154,11 @@ impl FromStr for EventSourceRef {
             "linear" | "jira" => Ok(Self::TrackerProject {
                 tracker: IssueTracker::from_str(kind)?,
                 project: rest.to_string(),
+                // The compact `kind:project` string form has nowhere to
+                // encode an account; callers that need one (cron's
+                // `PollSourceSpec.account`) set it on the parsed value
+                // afterward. See the field's doc.
+                account: None,
             }),
             other => Err(format!("unknown trigger source kind: {other}")),
         }
@@ -350,6 +400,72 @@ mod tests {
         assert_eq!(jira.source_ref_text(), "jira:acme.atlassian.net/ENG");
         assert!(jira.repo().is_none());
         assert_eq!(jira.tracker(), Some(IssueTracker::Jira));
+    }
+
+    #[test]
+    fn tracker_project_from_str_has_no_explicit_account() {
+        // The compact `kind:project` string form has nowhere to encode
+        // an account (Task 6) — every parsed value starts `None`, and
+        // callers (cron's `PollSourceSpec.account`) set it afterward.
+        let linear = EventSourceRef::from_str("linear:workspace-123").unwrap();
+        match linear {
+            EventSourceRef::TrackerProject { account, .. } => assert_eq!(account, None),
+            EventSourceRef::Repo { .. } => panic!("expected TrackerProject"),
+        }
+    }
+
+    #[test]
+    fn tracker_project_account_field_round_trips_through_serde() {
+        let with_account = EventSourceRef::TrackerProject {
+            tracker: IssueTracker::Linear,
+            project: "team-123".into(),
+            account: Some(AccountId::new("linear-work")),
+        };
+        let json = serde_json::to_string(&with_account).unwrap();
+        let back: EventSourceRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_account, back);
+    }
+
+    #[test]
+    fn tracker_project_deserializes_pre_account_field_json() {
+        // Back-compat (Task 6 constraint): a `TrackerProject` value
+        // serialized before the `account` field existed — i.e. missing
+        // the key entirely — must still deserialize, as `None`.
+        let legacy_json = r#"{"kind":"tracker_project","tracker":"jira","project":"ENG"}"#;
+        let parsed: EventSourceRef = serde_json::from_str(legacy_json).unwrap();
+        match parsed {
+            EventSourceRef::TrackerProject {
+                tracker,
+                project,
+                account,
+            } => {
+                assert_eq!(tracker, IssueTracker::Jira);
+                assert_eq!(project, "ENG");
+                assert_eq!(account, None);
+            }
+            EventSourceRef::Repo { .. } => panic!("expected TrackerProject"),
+        }
+    }
+
+    #[test]
+    fn tracker_project_repo_splits_repo_backed_trackers() {
+        let repo = tracker_project_repo(IssueTracker::Github, "acme/api").unwrap();
+        assert_eq!(repo.platform, Platform::Github);
+        assert_eq!(repo.owner, "acme");
+        assert_eq!(repo.repo, "api");
+
+        let repo = tracker_project_repo(IssueTracker::Gitlab, "group/subgroup/proj").unwrap();
+        assert_eq!(repo.platform, Platform::Gitlab);
+        assert_eq!(repo.owner, "group");
+        assert_eq!(repo.repo, "subgroup/proj");
+    }
+
+    #[test]
+    fn tracker_project_repo_returns_none_for_non_repo_backed_or_unsplittable() {
+        assert!(tracker_project_repo(IssueTracker::Linear, "team-123").is_none());
+        assert!(tracker_project_repo(IssueTracker::Jira, "ENG").is_none());
+        // No `/` to split on, even for a repo-backed tracker.
+        assert!(tracker_project_repo(IssueTracker::Github, "no-slash").is_none());
     }
 
     #[test]

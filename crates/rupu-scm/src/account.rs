@@ -7,11 +7,18 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// The name of one configured SCM account, e.g. `gh-work`.
 ///
 /// Ordered so account listings and fan-out results are deterministic
-/// rather than hash-ordered.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// rather than hash-ordered. `Serialize`/`Deserialize` (newtype-struct
+/// derive — a single-field tuple struct serializes transparently as
+/// the inner string) so it can sit inside a serde type directly, e.g.
+/// `EventSourceRef::TrackerProject`'s `account` field (Task 6): a
+/// tracker-project trigger source has no owner/path to infer an
+/// account from, so that field carries an explicit override.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AccountId(pub String);
 
 impl AccountId {

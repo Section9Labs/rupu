@@ -191,6 +191,7 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
         let source = EventSourceRef::TrackerProject {
             tracker: IssueTracker::Linear,
             project: "team-1".into(),
+            account: None,
         };
         connector
             .poll_events(&source, None, 10)
@@ -265,6 +266,7 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
         let source = EventSourceRef::TrackerProject {
             tracker: IssueTracker::Jira,
             project: "ENG".into(),
+            account: None,
         };
         connector
             .poll_events(&source, None, 10)
