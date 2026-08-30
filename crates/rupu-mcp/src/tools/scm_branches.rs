@@ -6,13 +6,17 @@ use serde_json::Value;
 
 use super::{ToolKind, ToolSpec};
 use crate::error::McpError;
-use rupu_scm::{Registry, RepoRef};
+use rupu_scm::{AccountId, Registry, RepoRef};
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListBranchesArgs {
     pub platform: Option<String>,
     pub owner: String,
     pub repo: String,
+    /// Which configured account to use, when more than one is configured
+    /// for this platform (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -22,6 +26,10 @@ pub struct CreateBranchArgs {
     pub repo: String,
     pub name: String,
     pub from_sha: String,
+    /// Which configured account to use, when more than one is configured
+    /// for this platform (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -51,9 +59,8 @@ pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpErr
         owner: parsed.owner,
         repo: parsed.repo,
     };
-    let conn = reg
-        .repo(platform)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {platform}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.repo_for(&r, None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.list_branches(&r).await?).unwrap())
 }
 
@@ -66,9 +73,8 @@ pub async fn dispatch_create(args: Value, reg: &Registry) -> Result<String, McpE
         owner: parsed.owner,
         repo: parsed.repo,
     };
-    let conn = reg
-        .repo(platform)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {platform}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.repo_for(&r, None, account.as_ref())?;
     Ok(serde_json::to_string(
         &conn
             .create_branch(&r, &parsed.name, &parsed.from_sha)

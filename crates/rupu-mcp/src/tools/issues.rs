@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::{ToolKind, ToolSpec};
 use crate::error::McpError;
-use rupu_scm::{CreateIssue, IssueFilter, IssueRef, IssueState, IssueTracker, Registry};
+use rupu_scm::{AccountId, CreateIssue, IssueFilter, IssueRef, IssueState, IssueTracker, Registry};
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListIssuesArgs {
@@ -16,6 +16,10 @@ pub struct ListIssuesArgs {
     pub labels: Option<Vec<String>>,
     pub author: Option<String>,
     pub limit: Option<u32>,
+    /// Which configured account to use, when more than one is configured
+    /// for this tracker (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -23,6 +27,10 @@ pub struct GetIssueArgs {
     pub tracker: Option<String>,
     pub project: String,
     pub number: u64,
+    /// Which configured account to use, when more than one is configured
+    /// for this tracker (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -31,6 +39,10 @@ pub struct CommentIssueArgs {
     pub project: String,
     pub number: u64,
     pub body: String,
+    /// Which configured account to use, when more than one is configured
+    /// for this tracker (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -49,6 +61,10 @@ pub struct CreateIssueArgs {
     pub title: String,
     pub body: String,
     pub labels: Option<Vec<String>>,
+    /// Which configured account to use, when more than one is configured
+    /// for this tracker (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -58,6 +74,10 @@ pub struct UpdateIssueStateArgs {
     pub number: u64,
     /// `open` | `closed`.
     pub state: String,
+    /// Which configured account to use, when more than one is configured
+    /// for this tracker (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -117,9 +137,9 @@ pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpErr
         author: parsed.author,
         limit: parsed.limit,
     };
-    let conn = reg
-        .issues(tracker)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {tracker}")))?;
+    let repo = project_repo(tracker, &parsed.project);
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.issues_for(tracker, repo.as_ref(), None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.list_issues(&parsed.project, filter).await?).unwrap())
 }
 
@@ -127,14 +147,14 @@ pub async fn dispatch_get(args: Value, reg: &Registry) -> Result<String, McpErro
     let parsed: GetIssueArgs =
         serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
     let tracker = resolve_tracker(parsed.tracker.as_deref(), reg)?;
+    let repo = project_repo(tracker, &parsed.project);
     let r = IssueRef {
         tracker,
         project: parsed.project,
         number: parsed.number,
     };
-    let conn = reg
-        .issues(tracker)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {tracker}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.issues_for(tracker, repo.as_ref(), None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.get_issue(&r).await?).unwrap())
 }
 
@@ -157,14 +177,14 @@ pub async fn dispatch_comment(args: Value, reg: &Registry) -> Result<String, Mcp
     let parsed: CommentIssueArgs =
         serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
     let tracker = resolve_tracker(parsed.tracker.as_deref(), reg)?;
+    let repo = project_repo(tracker, &parsed.project);
     let r = IssueRef {
         tracker,
         project: parsed.project,
         number: parsed.number,
     };
-    let conn = reg
-        .issues(tracker)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {tracker}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.issues_for(tracker, repo.as_ref(), None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.comment_issue(&r, &parsed.body).await?).unwrap())
 }
 
@@ -177,9 +197,9 @@ pub async fn dispatch_create(args: Value, reg: &Registry) -> Result<String, McpE
         body: parsed.body,
         labels: parsed.labels.unwrap_or_default(),
     };
-    let conn = reg
-        .issues(tracker)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {tracker}")))?;
+    let repo = project_repo(tracker, &parsed.project);
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.issues_for(tracker, repo.as_ref(), None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.create_issue(&parsed.project, opts).await?).unwrap())
 }
 
@@ -187,6 +207,7 @@ pub async fn dispatch_update_state(args: Value, reg: &Registry) -> Result<String
     let parsed: UpdateIssueStateArgs =
         serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
     let tracker = resolve_tracker(parsed.tracker.as_deref(), reg)?;
+    let repo = project_repo(tracker, &parsed.project);
     let r = IssueRef {
         tracker,
         project: parsed.project,
@@ -197,11 +218,32 @@ pub async fn dispatch_update_state(args: Value, reg: &Registry) -> Result<String
         "closed" => IssueState::Closed,
         other => return Err(McpError::InvalidArgs(format!("unknown state: {other}"))),
     };
-    let conn = reg
-        .issues(tracker)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {tracker}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.issues_for(tracker, repo.as_ref(), None, account.as_ref())?;
     conn.update_issue_state(&r, new_state).await?;
     Ok("{}".to_string())
+}
+
+/// Recover a `RepoRef` from an issue-tracker `project` string, when the
+/// tracker is repo-backed (GitHub/GitLab use `"owner/repo"` project
+/// identifiers) and the string actually parses that way. Linear/Jira
+/// project keys (`"ENG"`) aren't owner/repo pairs — `issues_for` already
+/// documents that those trackers only ever resolve via the explicit or
+/// sole-account tiers, and this returning `None` for them is what makes
+/// that true rather than a false owner/path match on a malformed value.
+/// Mirrors `rupu-cli`'s `cmd/issues.rs::issue_ref_repo`.
+fn project_repo(tracker: IssueTracker, project: &str) -> Option<rupu_scm::RepoRef> {
+    let platform = match tracker {
+        IssueTracker::Github => rupu_scm::Platform::Github,
+        IssueTracker::Gitlab => rupu_scm::Platform::Gitlab,
+        IssueTracker::Linear | IssueTracker::Jira => return None,
+    };
+    let (owner, repo) = project.split_once('/')?;
+    Some(rupu_scm::RepoRef {
+        platform,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
 }
 
 fn resolve_tracker(arg: Option<&str>, reg: &Registry) -> Result<IssueTracker, McpError> {

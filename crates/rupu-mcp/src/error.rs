@@ -16,6 +16,16 @@ pub enum McpError {
     #[error("tool dispatch failed: {0}")]
     Dispatch(#[from] rupu_scm::ScmError),
 
+    /// `Registry::repo_for`/`issues_for`/`github_extras_for`/
+    /// `gitlab_extras_for` failed to pick an account — ambiguous
+    /// (`NoRuleMatched`), unconfigured (`NoAccounts`), or a bad
+    /// explicit `account` argument (`UnknownAccount`). Distinct from
+    /// `Dispatch`: the connector was never reached, so this is a
+    /// request-shape problem, closer to `InvalidArgs` than to an SCM
+    /// API failure.
+    #[error("account resolution failed: {0}")]
+    Account(#[from] rupu_scm::AccountError),
+
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
 
@@ -33,6 +43,7 @@ impl McpError {
             Self::PermissionDenied { .. } => -32001,
             Self::NotWiredInV0(_) => -32002,
             Self::Dispatch(_) => -32003,
+            Self::Account(_) => -32004,
             Self::Transport(_) => -32603, // internal error
         }
     }
