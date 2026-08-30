@@ -32,7 +32,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use jsonschema::JSONSchema;
-use rupu_auth::{CredentialResolver, KeychainResolver};
+use rupu_auth::CredentialResolver;
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
@@ -1441,7 +1441,25 @@ pub async fn handle(
     absolute: bool,
     all_columns: bool,
 ) -> ExitCode {
-    let resolver: Arc<dyn CredentialResolver> = Arc::new(KeychainResolver::new());
+    // `resolver_for`, not a bare `KeychainResolver::new()` — see
+    // `crate::accounts`'s doc and `cmd/issues.rs`'s identical fix
+    // (Ruling 7): a declared `[scm.gh-work]` account's SSO token needs
+    // an `AccountSpec` to reach `get`'s near-expiry refresh branch, and
+    // autoflow subcommands (`autoflow serve` chief among them) are
+    // long-lived. Best-effort global+cwd-project config, matching
+    // `resolve_config`'s own shape — this is only the resolver's
+    // account roster; which repo's config a given polling *source*
+    // discovers against deeper in the call graph is the separate,
+    // deliberately-untouched per-source `Registry::discover` question.
+    let cfg = paths::global_dir()
+        .ok()
+        .map(|global| {
+            let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let project_root = paths::project_root_for(&pwd).ok().flatten();
+            resolve_config(&global, project_root.as_deref()).unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let resolver: Arc<dyn CredentialResolver> = Arc::new(crate::accounts::resolver_for(&cfg));
     let result = handle_with_resolver(action, resolver, global_format, absolute, all_columns).await;
     match result {
         Ok(()) => ExitCode::from(0),

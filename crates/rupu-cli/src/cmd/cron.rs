@@ -494,7 +494,13 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    let resolver = rupu_auth::KeychainResolver::new();
+    // `resolver_for`, not a bare `KeychainResolver::new()` — see
+    // `crate::accounts`'s doc and `cmd/issues.rs`'s identical fix
+    // (Ruling 7): a declared `[scm.gh-work]` account's SSO token needs
+    // an `AccountSpec` to reach `get`'s near-expiry refresh branch, and
+    // this is a long-lived daemon (`cron serve`) that will outlive a
+    // token.
+    let resolver = crate::accounts::resolver_for(&cfg);
     let registry = Arc::new(
         rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
     );

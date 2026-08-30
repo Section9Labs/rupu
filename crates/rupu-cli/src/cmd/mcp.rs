@@ -48,7 +48,11 @@ async fn serve_inner(args: ServeArgs) -> anyhow::Result<()> {
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
 
-    let resolver = rupu_auth::KeychainResolver::new();
+    // `resolver_for`, not a bare `KeychainResolver::new()` — see
+    // `crate::accounts`'s doc and `cmd/issues.rs`'s identical fix
+    // (Ruling 7): a declared `[scm.gh-work]` account's SSO token needs
+    // an `AccountSpec` to reach `get`'s near-expiry refresh branch.
+    let resolver = crate::accounts::resolver_for(&cfg);
     // `rupu mcp serve` is a long-lived daemon that builds one registry at
     // startup and serves every future external MCP client request through
     // it (Claude Desktop, Cursor, ...) — there's no rupu run id to attach

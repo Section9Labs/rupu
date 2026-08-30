@@ -18,7 +18,6 @@ use super::autoflow_wake::wake_requests_from_webhook;
 use crate::paths;
 use async_trait::async_trait;
 use clap::Subcommand;
-use rupu_auth::KeychainResolver;
 use rupu_orchestrator::Workflow;
 use rupu_runtime::{WakeStore, WakeStoreError};
 use rupu_scm::connectors::github::GithubExtras;
@@ -62,8 +61,13 @@ pub async fn handle(action: Action) -> ExitCode {
 async fn serve_cmd(addr: SocketAddr) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
-    let resolver = KeychainResolver::new();
     let cfg = load_cli_config();
+    // `resolver_for`, not a bare `KeychainResolver::new()` — see
+    // `crate::accounts`'s doc and `cmd/issues.rs`'s identical fix
+    // (Ruling 7): a declared `[scm.gh-work]` account's SSO token needs
+    // an `AccountSpec` to reach `get`'s near-expiry refresh branch, and
+    // this is a long-lived daemon that will outlive a token.
+    let resolver = crate::accounts::resolver_for(&cfg);
     let github_secret = std::env::var("RUPU_GITHUB_WEBHOOK_SECRET")
         .ok()
         .map(|s| s.into_bytes());
