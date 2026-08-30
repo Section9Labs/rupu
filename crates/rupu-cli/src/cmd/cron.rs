@@ -510,7 +510,6 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
             warn!(source = %source_ref, "invalid poll_sources entry");
             continue;
         };
-        let event_source = apply_account_override(event_source, source);
         let last_polled_file = last_polled_at_path(&cursors_root, &event_source);
         match poll_source_due(source, &last_polled_file, Utc::now()) {
             Ok(true) => {}
@@ -522,11 +521,23 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                 warn!(source = %source_ref, error = %e, "invalid poll interval; polling anyway");
             }
         }
+        // The compact `source_ref` string has nowhere to encode an
+        // account, so `account = "..."` (spec §6.5, Task 6 review item
+        // 2) travels as `events_for_source`'s `explicit` parameter
+        // instead — the same three-arg shape `repo_for`/`issues_for`
+        // use, and uniform across `Repo` and `TrackerProject` sources
+        // alike (a repo-backed poll source can override its owner rule
+        // with this too, not just a tracker-native one).
+        let explicit_account = source.account().map(rupu_scm::AccountId::new);
         // `cwd: None` — a cron poll has no filesystem context to key a
         // path rule on any more than a webhook payload does (spec §6.3:
         // "a webhook payload or cron poll knows the owner but has no
         // cwd"); only the explicit/owner/sole-account tiers can fire.
-        let (account, connector) = match registry.events_for_source(&event_source, None) {
+        let (account, connector) = match registry.events_for_source(
+            &event_source,
+            None,
+            explicit_account.as_ref(),
+        ) {
             Ok(pair) => pair,
             Err(rupu_scm::AccountError::NoAccounts { .. }) => {
                 info!(
@@ -814,30 +825,6 @@ fn push_event(dir: &Path, into: &mut BTreeMap<String, EventWorkflow>) {
     }
 }
 
-/// Splice a `PollSourceEntry`'s explicit `account = "..."` override
-/// (Task 6, spec §6.5) into a freshly-parsed `EventSourceRef`. The
-/// compact `source` string (`"linear:team-123"`) has nowhere to encode
-/// an account, so this is the only way one reaches
-/// `Registry::events_for_source`'s `explicit` tier — a `Repo`-sourced
-/// trigger has no such field and passes through unchanged (it infers
-/// its account from `repo.owner` via an owner rule instead).
-///
-/// Extracted as a pure, dependency-free step — mirrors
-/// `rupu-scm/src/registry.rs`'s `resolve_configured_default` reasoning
-/// — so it's unit-testable without a `Registry`/`rupu cron tick`
-/// integration harness. Shared with `cmd/autoflow.rs`'s
-/// `enqueue_polled_wakes`, which polls the same `poll_sources` config
-/// through the same account-resolution surface for autoflow wake-ups.
-pub(crate) fn apply_account_override(
-    mut event_source: EventSourceRef,
-    entry: &PollSourceEntry,
-) -> EventSourceRef {
-    if let EventSourceRef::TrackerProject { account, .. } = &mut event_source {
-        *account = entry.account().map(rupu_scm::AccountId::new);
-    }
-    event_source
-}
-
 fn format_poll_source_entry(source: &PollSourceEntry) -> String {
     match source.poll_interval() {
         Some(interval) => format!("{}@{interval}", source.source()),
@@ -845,6 +832,16 @@ fn format_poll_source_entry(source: &PollSourceEntry) -> String {
     }
 }
 
+/// `<vendor>/<slug>.cursor` file naming. **Ignores `account`** (Task 6
+/// review item 4) — two `poll_sources` entries with the same
+/// `tracker`/`project` (or `platform`/`owner`/`repo`) but different
+/// `account` overrides collide on the same cursor file and silently
+/// share state. Not fixed here: today's data model has no per-account
+/// tracker multi-account case in production (`tracker_event_connectors`
+/// holds at most one entry per tracker — see its field doc in
+/// `rupu-scm/src/registry.rs`), so nobody can actually configure two
+/// `account`-distinguished poll sources for the same project yet. Left
+/// as a landmine for whoever adds that, not a live bug today.
 fn source_slug(source: &EventSourceRef) -> String {
     let text = match source {
         EventSourceRef::Repo { repo } => format!("repo-{}-{}", repo.owner, repo.repo),
@@ -1163,46 +1160,23 @@ mod tests {
         assert_eq!(read.timestamp(), ts.timestamp());
     }
 
+    /// `PollSourceEntry::account()` accessor coverage — `apply_account_override`
+    /// (the splice-into-the-enum helper) was deleted in Arc 2 Task 6
+    /// review item 2: `events_for_source` now takes `explicit` as a real
+    /// parameter (same three-arg shape as `repo_for`/`issues_for`), so
+    /// `tick_polled_events` just reads `source.account()` and passes it
+    /// straight through — see `Registry::events_for_source`'s own tests
+    /// in `rupu-scm/src/registry.rs` for the resolution-side coverage
+    /// (including the fixed bug: a repo-backed poll source's `account`
+    /// used to be silently dropped).
     #[test]
-    fn apply_account_override_splices_tracker_project_account() {
+    fn poll_source_entry_account_reads_the_detailed_field() {
         let entry = PollSourceEntry::Detailed(PollSourceSpec {
-            source: "linear:team-123".into(),
+            source: "github:acme/api".into(),
             poll_interval: None,
-            account: Some("linear-work".into()),
+            account: Some("gh-work".into()),
         });
-        let parsed: EventSourceRef = entry.source().parse().unwrap();
-        let spliced = apply_account_override(parsed, &entry);
-        match spliced {
-            EventSourceRef::TrackerProject { account, .. } => {
-                assert_eq!(account, Some(rupu_scm::AccountId::new("linear-work")));
-            }
-            EventSourceRef::Repo { .. } => panic!("expected TrackerProject"),
-        }
-    }
-
-    #[test]
-    fn apply_account_override_is_noop_for_repo_sources() {
-        // `Repo` has no `account` field to splice into — it infers its
-        // account from `repo.owner` via an owner rule instead.
-        let entry = PollSourceEntry::Source("github:acme/api".into());
-        let parsed: EventSourceRef = entry.source().parse().unwrap();
-        let spliced = apply_account_override(parsed, &entry);
-        assert!(matches!(spliced, EventSourceRef::Repo { .. }));
-    }
-
-    #[test]
-    fn apply_account_override_clears_to_none_when_entry_has_no_account() {
-        let entry = PollSourceEntry::Detailed(PollSourceSpec {
-            source: "linear:team-123".into(),
-            poll_interval: None,
-            account: None,
-        });
-        let parsed: EventSourceRef = entry.source().parse().unwrap();
-        let spliced = apply_account_override(parsed, &entry);
-        match spliced {
-            EventSourceRef::TrackerProject { account, .. } => assert_eq!(account, None),
-            EventSourceRef::Repo { .. } => panic!("expected TrackerProject"),
-        }
+        assert_eq!(entry.account(), Some("gh-work"));
     }
 
     #[test]

@@ -9573,10 +9573,6 @@ async fn enqueue_polled_wakes(
             warn!(source_ref, "invalid autoflow source for wake polling");
             continue;
         };
-        // Shared with `cmd/cron.rs`'s `tick_polled_events`: the compact
-        // source string has nowhere to encode an account, so splice the
-        // sibling `account = "..."` config field in before resolving.
-        let event_source = super::cron::apply_account_override(event_source, source);
         let last_polled_file = autoflow_last_polled_at_path(&cursors_root, &event_source);
         match autoflow_poll_source_due(source, &last_polled_file, chrono::Utc::now()) {
             Ok(true) => {}
@@ -9589,10 +9585,20 @@ async fn enqueue_polled_wakes(
             rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
                 .await,
         );
+        // Shared with `cmd/cron.rs`'s `tick_polled_events`: the compact
+        // source string has nowhere to encode an account, so
+        // `account = "..."` (spec §6.5) travels as `events_for_source`'s
+        // `explicit` parameter instead — uniform across `Repo` and
+        // `TrackerProject` sources (Task 6 review item 2).
+        let explicit_account = source.account().map(rupu_scm::AccountId::new);
         // `cwd: None` — an autoflow wake poll is a daemon caller exactly
         // like `cron.rs`'s tick: no filesystem context to key a path
         // rule on (spec §6.3/§6.5).
-        let (_account, connector) = match registry.events_for_source(&event_source, None) {
+        let (_account, connector) = match registry.events_for_source(
+            &event_source,
+            None,
+            explicit_account.as_ref(),
+        ) {
             Ok(pair) => pair,
             Err(rupu_scm::AccountError::NoAccounts { .. }) => {
                 warn!(
