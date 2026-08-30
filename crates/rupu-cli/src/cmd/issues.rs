@@ -536,19 +536,12 @@ fn repo_to_issue_tracker(p: Platform) -> IssueTracker {
 /// away. `None` for Linear/Jira, whose `project` is a workspace/board
 /// id, not `"owner/repo"` — `issues_for` already treats a `None` repo as
 /// "only the explicit and sole-account tiers can resolve", which is
-/// correct for them (see `Registry::issues_for`'s doc).
+/// correct for them (see `Registry::issues_for`'s doc). Delegates to
+/// the shared `rupu_scm::tracker_project_repo` — mirrors `rupu-mcp`'s
+/// `tools/issues.rs::project_repo` (Task 6 lifted the duplicated logic
+/// when `Registry::events_for_source` needed a third copy).
 fn issue_ref_repo(issue_ref: &IssueRef) -> Option<RepoRef> {
-    let platform = match issue_ref.tracker {
-        IssueTracker::Github => Platform::Github,
-        IssueTracker::Gitlab => Platform::Gitlab,
-        IssueTracker::Linear | IssueTracker::Jira => return None,
-    };
-    let (owner, repo) = issue_ref.project.split_once('/')?;
-    Some(RepoRef {
-        platform,
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-    })
+    rupu_scm::tracker_project_repo(issue_ref.tracker, &issue_ref.project)
 }
 
 /// Resolve `[issues.default]` into a concrete `RepoRef` (ISSUES.md I-73):

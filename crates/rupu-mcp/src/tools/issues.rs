@@ -231,19 +231,12 @@ pub async fn dispatch_update_state(args: Value, reg: &Registry) -> Result<String
 /// documents that those trackers only ever resolve via the explicit or
 /// sole-account tiers, and this returning `None` for them is what makes
 /// that true rather than a false owner/path match on a malformed value.
-/// Mirrors `rupu-cli`'s `cmd/issues.rs::issue_ref_repo`.
+/// Mirrors `rupu-cli`'s `cmd/issues.rs::issue_ref_repo`; both delegate
+/// to the shared `rupu_scm::tracker_project_repo` (Task 6 lifted the
+/// duplicated logic there when `Registry::events_for_source` needed a
+/// third copy).
 fn project_repo(tracker: IssueTracker, project: &str) -> Option<rupu_scm::RepoRef> {
-    let platform = match tracker {
-        IssueTracker::Github => rupu_scm::Platform::Github,
-        IssueTracker::Gitlab => rupu_scm::Platform::Gitlab,
-        IssueTracker::Linear | IssueTracker::Jira => return None,
-    };
-    let (owner, repo) = project.split_once('/')?;
-    Some(rupu_scm::RepoRef {
-        platform,
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-    })
+    rupu_scm::tracker_project_repo(tracker, project)
 }
 
 fn resolve_tracker(arg: Option<&str>, reg: &Registry) -> Result<IssueTracker, McpError> {
