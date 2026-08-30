@@ -290,14 +290,19 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
     // token lacks scope while naming the scopes of an account that was
     // never the one missing private repos.
     //
-    // There is no per-account extras accessor in `rupu-scm` today, and
-    // adding one reaches into a crate this task does not own. So rather
-    // than emit a diagnostic that may describe the wrong account, fire
-    // it only when exactly one GitHub account is configured — the case
-    // where "arbitrary" and "correct" are the same account. Every
-    // pre-Arc-2 config is that case, so single-account users see
-    // byte-identical behavior. Making this hint per-account is recorded
-    // as a follow-up rather than silently half-done.
+    // Arc 2 Task 5 (`0d4163d8`) added `Registry::github_extras_for`, an
+    // account-aware counterpart to this shim — but it resolves via a
+    // `RepoRef` (spec §6.2/§6.3's rule engine needs an owner/repo to
+    // match rules against), and this hint has no repo in scope: it fires
+    // once per `rupu repos list` invocation, not once per row, so there
+    // is no single `RepoRef` to hand it. So rather than emit a
+    // diagnostic that may describe the wrong account, fire it only when
+    // exactly one GitHub account is configured — the case where
+    // "arbitrary" and "correct" are the same account. Every pre-Arc-2
+    // config is that case, so single-account users see byte-identical
+    // behavior. Making this hint per-account (e.g. by attaching it to
+    // each account's own row instead of firing once globally) is
+    // recorded as a follow-up rather than silently half-done.
     let one_github_account = registry.accounts_for(Platform::Github).len() == 1;
     if format == OutputFormat::Table && !any_private && one_github_account {
         if let Some(extras) = registry.github_extras() {

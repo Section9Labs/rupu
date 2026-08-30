@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::{ToolKind, ToolSpec};
 use crate::error::McpError;
-use rupu_scm::{AccountId, Platform, Registry, RepoRef};
+use rupu_scm::{AccountError, AccountId, Platform, Registry, RepoRef};
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListReposArgs {
@@ -65,7 +65,16 @@ struct RepoListEntry {
 pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpError> {
     let parsed: ListReposArgs =
         serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
-    let platform = resolve_platform(parsed.platform.as_deref(), reg)?;
+
+    // `platform` is parsed (not defaulted) up front so the `account`
+    // branch below can check it against the resolved account's real
+    // kind without forcing a `[scm.default]` lookup when `account` alone
+    // already determines the connector.
+    let platform_arg = parsed
+        .platform
+        .as_deref()
+        .map(|s| s.parse::<Platform>().map_err(McpError::InvalidArgs))
+        .transpose()?;
 
     // "Account-scoped, no repo" (spec §6.2): there is no RepoRef to run
     // the rule engine against, so `account` (when given) is a direct
@@ -75,26 +84,97 @@ pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpErr
     let accounts: Vec<(AccountId, _)> = match parsed.account.as_deref() {
         Some(name) => {
             let id = AccountId::new(name);
-            let conn = reg.repo_by_account(&id).ok_or_else(|| {
-                McpError::InvalidArgs(format!("no such account: {}", id.as_str()))
-            })?;
+            let conn = match reg.repo_by_account(&id) {
+                Some(conn) => conn,
+                None => {
+                    // `repo_by_account` is a bare lookup with no kind
+                    // filtering, so the candidate list for an unknown
+                    // name is "every repo account of the requested
+                    // platform" when one was given, else the union
+                    // across both platforms — mirroring the candidate
+                    // lists `repo_for`'s own `UnknownAccount` uses.
+                    let mut configured = match platform_arg {
+                        Some(p) => reg.accounts_for(p),
+                        None => {
+                            let mut c = reg.accounts_for(Platform::Github);
+                            c.extend(reg.accounts_for(Platform::Gitlab));
+                            c
+                        }
+                    };
+                    configured.sort();
+                    return Err(AccountError::UnknownAccount {
+                        requested: id,
+                        configured,
+                    }
+                    .into());
+                }
+            };
+            // `repo_by_account` does no kind filtering (unlike
+            // `repo_for`'s `lookup_repo`), so an `account` of the wrong
+            // vendor would otherwise silently list GitLab repos under a
+            // `{"platform":"github"}` request — self-describing per row
+            // (each carries its own `r.platform`), but still a request
+            // that claimed one platform and got another.
+            if let Some(requested) = platform_arg {
+                let actual = conn.platform();
+                if actual != requested {
+                    return Err(McpError::InvalidArgs(format!(
+                        "account '{id}' is a {actual} account, not {requested}"
+                    )));
+                }
+            }
             vec![(id, conn)]
         }
-        None => reg.all_repo_connectors(platform),
+        None => {
+            let platform = match platform_arg {
+                Some(p) => p,
+                None => resolve_platform(None, reg)?,
+            };
+            let accounts = reg.all_repo_connectors(platform);
+            if accounts.is_empty() {
+                return Err(AccountError::NoAccounts {
+                    platform: platform.to_string(),
+                }
+                .into());
+            }
+            accounts
+        }
     };
-    if accounts.is_empty() {
-        return Err(McpError::NotWiredInV0(format!(
-            "no connector for {platform}"
-        )));
-    }
 
+    // Warn-and-continue per account, not `?`: the fan-out must not be
+    // all-or-nothing. One account with an expired token would otherwise
+    // abort the whole tool call and lose every OTHER account's repos —
+    // strictly worse for an agent than for a human at a terminal, since
+    // an agent has no partial result on screen to retry against.
+    // Mirrors `rupu-cli`'s sibling fan-outs (`cmd/repos.rs`,
+    // `cp_repos.rs`). Errors out only if every account failed — a total
+    // outage should still surface rather than returning a silently
+    // empty list.
+    let total = accounts.len();
+    let mut failures = Vec::new();
     let mut entries = Vec::new();
     for (account, conn) in accounts {
-        let repos = conn.list_repos().await?;
-        entries.extend(repos.into_iter().map(|repo| RepoListEntry {
-            account: account.to_string(),
-            repo,
-        }));
+        match conn.list_repos().await {
+            Ok(repos) => {
+                entries.extend(repos.into_iter().map(|repo| RepoListEntry {
+                    account: account.to_string(),
+                    repo,
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    account = %account,
+                    error = %e,
+                    "scm.repos.list: list_repos failed; skipping account"
+                );
+                failures.push(format!("{account}: {e}"));
+            }
+        }
+    }
+    if !failures.is_empty() && failures.len() == total {
+        return Err(McpError::Dispatch(rupu_scm::ScmError::Transient(
+            anyhow::anyhow!("every configured account failed: {}", failures.join("; ")),
+        )));
     }
     Ok(serde_json::to_string(&entries).unwrap())
 }
