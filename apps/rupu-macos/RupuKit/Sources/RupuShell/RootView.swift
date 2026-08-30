@@ -12,6 +12,7 @@ import RupuFleet
 import RupuLibrary
 import RupuSecurity
 import RupuUsage
+import RupuBuilder
 
 /// The app's window content: fixed sidebar + detail pane that switches on
 /// `model.route`. Phase 2+ swaps each `PlaceholderScreen` branch for a real
@@ -309,7 +310,7 @@ public struct RootView: View {
         case .agentDefinition(let name, let scopeKind, let scopeID):
             AgentDetailScreen(model: model, backend: backend, name: name, scopeKind: scopeKind, scopeID: scopeID)
         case .workflowDefinition(let name, let scopeKind, let scopeID):
-            WorkflowDetailScreen(model: model, backend: backend, name: name, scopeKind: scopeKind, scopeID: scopeID)
+            WorkflowBuilderScreen(model: model, backend: backend, name: name, scopeKind: scopeKind, scopeID: scopeID)
         case .fleet:
             FleetScreen(model: model, backend: backend)
         case .usage:

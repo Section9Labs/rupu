@@ -29,20 +29,36 @@ public struct RupuButtonStyle {
     public static var ghost: some ButtonStyle {
         ChromeButtonStyle(fill: .clear, hoverFill: .rupuSurfaceHover, textColor: .rupuDim, borderColor: nil)
     }
+
+    /// The Workflow Builder header's Launch button (macOS Workflow Builder,
+    /// Task 10) — the spec calls for a `rupuBrand600` REST fill (not
+    /// `primary`'s `rupuBrand`, which only reaches `rupuBrand600` on hover)
+    /// at a 5pt radius (not `primary`'s shared 6pt). Both differences are
+    /// real enough that restyling the shared `primary` in place would move
+    /// every OTHER primary button in the app off its own spec — hence a
+    /// dedicated variant rather than a `primary` edit.
+    public static var builderLaunch: some ButtonStyle {
+        ChromeButtonStyle(fill: .rupuBrand600, hoverFill: .rupuBrand700, textColor: .white, borderColor: nil, radius: 5)
+    }
 }
 
 /// Shared render path for every `RupuButtonStyle` variant — only the color set
-/// differs. Hover state isn't available on `ButtonStyleConfiguration`, so it's
-/// tracked locally via `.onHover` (mouse-driven; trackpad/keyboard focus never
-/// sets it, matching AppKit control conventions).
+/// (and, for `builderLaunch`, the radius) differs. Hover state isn't available
+/// on `ButtonStyleConfiguration`, so it's tracked locally via `.onHover`
+/// (mouse-driven; trackpad/keyboard focus never sets it, matching AppKit
+/// control conventions).
 private struct ChromeButtonStyle: ButtonStyle {
     let fill: Color
     let hoverFill: Color
     let textColor: Color
     let borderColor: Color?
+    var radius: CGFloat = 6
 
     func makeBody(configuration: Configuration) -> some View {
-        ChromeButtonBody(configuration: configuration, fill: fill, hoverFill: hoverFill, textColor: textColor, borderColor: borderColor)
+        ChromeButtonBody(
+            configuration: configuration, fill: fill, hoverFill: hoverFill, textColor: textColor, borderColor: borderColor,
+            radius: radius
+        )
     }
 }
 
@@ -52,11 +68,12 @@ private struct ChromeButtonBody: View {
     let hoverFill: Color
     let textColor: Color
     let borderColor: Color?
+    let radius: CGFloat
 
     @State private var isHovering = false
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 6)
+        let shape = RoundedRectangle(cornerRadius: radius)
         configuration.label
             .font(.uiText)
             .foregroundStyle(textColor)

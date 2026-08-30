@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0;min-height:100vh;background:linear-gradient(160deg,#3b3b45,#26262e);font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',sans-serif;-webkit-font-smoothing:antialiased;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}
+a{color:#7c3aed;text-decoration:none}a:hover{color:#a78bfa}
+.wf{--bg:#0a0a0a;--panel:#141416;--surface:#1b1b1f;--surface-hover:#232327;--border:#26262a;--border-strong:#3f3f46;--ink:#f5f5f5;--dim:#a1a1aa;--mute:#71717a;--brand:#7c3aed;--brand600:#7c3aed;--brand700:#a78bfa;--ok:#4ade80;--err:#f87171;--warn:#fbbf24;--info:#60a5fa;--running:#60a5fa;--done:#4ade80;--failed:#f87171;--awaiting:#fbbf24;--paused:#22d3ee;--pending:#71717a;--skipped:#52525b;--crit:#a855f7;--med:#fb923c;--sevinfo:#94a3b8}
+.wf[data-theme="light"]{--bg:#fafafa;--panel:#ffffff;--surface:#f1f5f9;--surface-hover:#e2e8f0;--border:#e5e7eb;--border-strong:#cbd5e1;--ink:#0f172a;--dim:#64748b;--mute:#94a3b8;--brand:#7c3aed;--brand600:#6d28d9;--brand700:#5b21b6;--ok:#16a34a;--err:#dc2626;--warn:#d97706;--info:#2563eb;--running:#3b82f6;--done:#22c55e;--failed:#ef4444;--awaiting:#f59e0b;--paused:#06b6d4;--pending:#94a3b8;--skipped:#cbd5e1;--crit:#9333ea;--med:#ea580c;--sevinfo:#64748b}
+@keyframes rupulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.35);opacity:.45}}
+@keyframes edgeflow{to{stroke-dashoffset:-22}}
+.wf ::-webkit-scrollbar{width:9px;height:9px}
+.wf ::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:5px;border:2px solid transparent;background-clip:padding-box}
+.wf ::-webkit-scrollbar-corner{background:transparent}
+.wf input,.wf textarea,.wf select,.wf button{font-family:inherit}
+.wf input:focus,.wf textarea:focus,.wf select:focus{outline:none;border-color:var(--brand)}
+</style>
+</helmet>
+<div class="wf" data-theme="{{themeAttr}}" data-screen-label="Workflow Builder" style="width:1512px;border-radius:11px;overflow:hidden;box-shadow:0 0 0 1px rgba(0,0,0,0.35), 0 28px 70px rgba(0,0,0,0.5);display:flex;flex-direction:column;background:var(--panel);color:var(--ink);font-size:12px;text-align:left">
+<div style="position:relative;height:38px;flex:none;display:flex;align-items:center;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--border)">
+  <div style="display:flex;gap:8px;position:relative;z-index:1"><span style="width:12px;height:12px;border-radius:50%;background:#ff5f57;border:0.5px solid rgba(0,0,0,0.15);box-sizing:border-box"></span><span style="width:12px;height:12px;border-radius:50%;background:#febc2e;border:0.5px solid rgba(0,0,0,0.15);box-sizing:border-box"></span><span style="width:12px;height:12px;border-radius:50%;background:#28c840;border:0.5px solid rgba(0,0,0,0.15);box-sizing:border-box"></span></div>
+  <div style="position:absolute;left:0;right:0;text-align:center;font-size:12px;font-weight:600;color:var(--dim);pointer-events:none">rupu &#8212; Control Plane</div>
+</div>
+<div style="display:flex;height:874px">
+  <div style="width:204px;flex:none;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;gap:8px;height:48px;padding:0 12px;border-bottom:1px solid var(--border)">
+      <div style="width:28px;height:28px;border-radius:6px;background:var(--brand600);display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;font-weight:300">&#8734;</div>
+      <div><div style="font-size:14px;font-weight:600;color:var(--ink);line-height:1.2">rupu</div><div style="font-size:11px;color:var(--mute);line-height:1.2">Control Plane</div></div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:2px;padding:8px">
+      <div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;color:var(--dim)" style-hover="background:var(--surface-hover)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h7v9H3z M14 3h7v5h-7z M14 12h7v9h-7z M3 16h7v5H3z"></path></svg><span style="font-size:13px">Overview</span></div>
+      <div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;color:var(--dim)" style-hover="background:var(--surface-hover)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg><span style="font-size:13px">Activity</span></div>
+      <div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;color:var(--dim)" style-hover="background:var(--surface-hover)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9L9.6 3.9A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"></path></svg><span style="font-size:13px">Projects</span></div>
+      <div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;color:var(--dim)" style-hover="background:var(--surface-hover)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z M9 12l2 2 4-4"></path></svg><span style="font-size:13px">Security</span></div>
+      <div style="position:relative;display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;background:var(--surface);color:var(--ink);overflow:hidden"><div style="position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--brand)"></div><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20 M6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5v-15A2.5 2.5 0 0 1 6.5 2z M10 2v8l3-3 3 3V2"></path></svg><span style="font-size:13px">Library</span></div>
+      <div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;color:var(--dim)" style-hover="background:var(--surface-hover)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 2h20v8H2z M2 14h20v8H2z M6 6h.01 M6 18h.01"></path></svg><span style="font-size:13px">Fleet</span></div>
+      <div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;color:var(--dim)" style-hover="background:var(--surface-hover)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20 M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg><span style="font-size:13px">Usage</span></div>
+    </div>
+    <div style="flex:1"></div>
+    <div style="padding:0 8px 8px"><div style="display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;border-radius:5px;color:var(--dim)" style-hover="background:var(--surface-hover)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M12 2v2 M12 20v2 M2 12h2 M20 12h2 M4.9 4.9l1.4 1.4 M17.7 17.7l1.4 1.4 M19.1 4.9l-1.4 1.4 M6.3 17.7l-1.4 1.4"></path></svg><span style="font-size:13px">Settings</span></div></div>
+    <div style="border-top:1px solid var(--border);padding:10px 12px;display:flex;flex-direction:column;gap:6px">
+      <div style="display:flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:3px;background:var(--ok)"></span><span style="font-size:10px;color:var(--dim)">Connected &#8211; v0.71.2</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:3px;background:var(--info)"></span><span style="font-size:10px;color:var(--dim)">Event stream &#183; live</span></div>
+      <div style="display:flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:3px;background:var(--border-strong)"></span><span style="font-size:10px;color:var(--dim)">3 hosts &#183; 2 online</span></div>
+    </div>
+  </div>
+  <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+    <div style="display:flex;align-items:center;gap:10px;height:46px;flex:none;padding:0 14px;border-bottom:1px solid var(--border);background:var(--panel)">
+      <button style="background:none;border:none;padding:2px;cursor:pointer;color:var(--dim);display:flex" title="Back to Library"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5 M12 19l-7-7 7-7"></path></svg></button>
+      <span style="font-size:13px;color:var(--dim)">Library <span style="color:var(--mute)">&#9656;</span> <span style="color:var(--ink);font-weight:600">{{wfName}}</span></span>
+      <sc-if value="{{runMode}}" hint-placeholder-val="{{false}}"><span style="{{runPillStyle}}">&#9679; running</span></sc-if>
+      <div style="flex:1"></div>
+      <span style="display:flex;align-items:center;gap:5px"><span style="width:6px;height:6px;border-radius:3px;background:var(--ok)"></span><span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:10px;color:var(--dim)">valid</span></span>
+      <div style="display:flex;background:var(--surface);border-radius:6px;padding:2px;gap:2px">
+        <button style="{{segDesignStyle}}" onClick="{{onDesign}}">Design</button>
+        <button style="{{segRunStyle}}" onClick="{{onRun}}">Run</button>
+      </div>
+      <button style="{{srcBtnStyle}}" onClick="{{toggleYaml}}" title="Toggle YAML source"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 18l6-6-6-6 M8 6l-6 6 6 6"></path></svg></button>
+      <button style="{{launchStyle}}" style-hover="filter:brightness(1.12)" onClick="{{onLaunch}}"><svg width="10" height="10" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z" fill="currentColor" stroke="none"></path></svg>Launch</button>
+    </div>
+    <div style="flex:1;display:flex;min-height:0">
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0;position:relative">
+        <sc-if value="{{showDock}}" hint-placeholder-val="{{false}}">
+          <div style="position:absolute;left:14px;top:14px;z-index:6;display:flex;flex-wrap:wrap;gap:5px;max-width:640px;background:color-mix(in srgb, var(--panel) 94%, transparent);border:1px solid var(--border);border-radius:8px;padding:7px;backdrop-filter:blur(8px)">
+            <sc-for list="{{dockCards}}" as="k" hint-placeholder-count="4"><div draggable="true" onDragStart="{{k.onDrag}}" onClick="{{k.onAdd}}" title="{{k.sub}}" style="{{k.style}}" style-hover="border-color:var(--brand);color:var(--ink)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="{{k.accent}}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="{{k.iconD}}"></path></svg><span>{{k.label}}</span></div></sc-for>
+          </div>
+        </sc-if>
+        <div style="position:absolute;left:14px;bottom:12px;z-index:6;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;color:var(--mute);pointer-events:none">drag blocks in &#183; click a step to edit &#183; drag a port to connect &#183; &#9003; removes</div>
+        <div style="flex:1;overflow:auto;background:var(--bg)">
+          <div ref="{{canvasRef}}" onClick="{{onCanvasClick}}" onDrop="{{onDrop}}" onDragOver="{{onDragOver}}" style="position:relative;width:1800px;height:520px;background-image:radial-gradient(var(--border) 1px, transparent 1px);background-size:22px 22px">
+            <svg width="1800" height="520" viewBox="0 0 1800 520" style="position:absolute;left:0;top:0;pointer-events:none;z-index:1">
+              <sc-for list="{{edgeVMs}}" as="e" hint-placeholder-count="3"><g><path d="{{e.d}}" fill="none" stroke="{{e.stroke}}" stroke-width="1.5" stroke-dasharray="{{e.dash}}" opacity="{{e.op}}" style="{{e.anim}}"></path><path d="{{e.arrow}}" fill="none" stroke="{{e.stroke}}" stroke-width="1.5" opacity="{{e.op}}" stroke-linecap="round" stroke-linejoin="round"></path><text x="{{e.lx}}" y="{{e.ly}}" fill="var(--dim)" style="{{e.lstyle}}">{{e.label}}</text></g></sc-for>
+              <sc-if value="{{tempD}}" hint-placeholder-val="{{false}}"><path d="{{tempD}}" fill="none" stroke="var(--brand)" stroke-width="1.5" stroke-dasharray="5 4"></path></sc-if>
+            </svg>
+            <sc-for list="{{nodeVMs}}" as="n" hint-placeholder-count="4">
+              <div style="{{n.wrapStyle}}" onPointerDown="{{n.onDown}}" onPointerUp="{{n.onUp}}" onClick="{{n.onClick}}">
+                <svg width="176" height="68" viewBox="0 0 176 68" style="position:absolute;left:0;top:0;overflow:visible">
+                  <sc-for list="{{n.behind}}" as="x"><path d="{{x.d}}" fill="{{x.fill}}" stroke="{{x.stroke}}" stroke-width="1.2" opacity="{{x.op}}"></path></sc-for>
+                  <path d="{{n.d}}" fill="var(--panel)" stroke="{{n.stroke}}" stroke-width="{{n.sw}}" stroke-dasharray="{{n.sdash}}" stroke-linejoin="round"></path>
+                  <sc-for list="{{n.above}}" as="x"><path d="{{x.d}}" fill="{{x.fill}}" stroke="{{x.stroke}}" stroke-width="1.2" opacity="{{x.op}}"></path></sc-for>
+                </svg>
+                <div style="{{n.contentStyle}}">
+                  <div style="display:flex;align-items:center;gap:5px"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="{{n.accent}}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="{{n.iconD}}"></path></svg><span style="{{n.chipStyle}}">{{n.kindLabel}}</span></div>
+                  <div style="{{n.idStyle}}">{{n.id}}</div>
+                  <div style="{{n.subStyle}}">{{n.sub}}</div>
+                </div>
+                <div style="{{n.tgtDotStyle}}"></div>
+                <sc-for list="{{n.ports}}" as="p"><div data-port="1" title="{{p.label}}" style="{{p.style}}" style-hover="background:var(--brand);border-color:var(--brand)" onPointerDown="{{p.onDown}}"></div></sc-for>
+                <sc-if value="{{n.gShow}}" hint-placeholder-val="{{false}}">
+                  <div style="{{n.gWrapStyle}}">
+                    <sc-if value="{{n.gDone}}" hint-placeholder-val="{{false}}"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--done)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"></path></svg></sc-if>
+                    <sc-if value="{{n.gRun}}" hint-placeholder-val="{{false}}"><div style="width:8px;height:8px;border-radius:4px;background:var(--running);animation:rupulse 1s ease-in-out infinite"></div></sc-if>
+                    <sc-if value="{{n.gPend}}" hint-placeholder-val="{{false}}"><div style="width:8px;height:8px;border-radius:4px;border:1.5px dashed var(--border-strong);box-sizing:border-box"></div></sc-if>
+                    <sc-if value="{{n.gSkip}}" hint-placeholder-val="{{false}}"><div style="width:8px;height:8px;border-radius:4px;border:1.5px solid var(--mute);box-sizing:border-box"></div></sc-if>
+                  </div>
+                </sc-if>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        <sc-if value="{{yamlOpen}}" hint-placeholder-val="{{true}}">
+          <div style="height:192px;flex:none;border-top:1px solid var(--border);background:var(--panel);display:flex;flex-direction:column;min-height:0">
+            <div style="display:flex;align-items:center;gap:8px;height:30px;flex:none;padding:0 12px;border-bottom:1px solid var(--border)">
+              <span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute)">WORKFLOW.YAML</span>
+              <span style="width:6px;height:6px;border-radius:3px;background:var(--ok)"></span><span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:10px;color:var(--dim)">canonical &#183; round-trips with the canvas</span>
+              <div style="flex:1"></div>
+              <button style="background:none;border:none;cursor:pointer;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:10px;color:var(--dim);padding:2px 4px" style-hover="color:var(--ink)" onClick="{{toggleYaml}}">hide</button>
+            </div>
+            <pre style="margin:0;padding:10px 14px;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:11px;line-height:1.6;color:var(--ink);overflow:auto;flex:1">{{yamlText}}</pre>
+          </div>
+        </sc-if>
+      </div>
+      <div style="width:320px;flex:none;border-left:1px solid var(--border);background:var(--panel);display:flex;flex-direction:column;min-height:0">
+        <div style="display:flex;flex:none;border-bottom:1px solid var(--border);padding:0 8px">
+          <sc-for list="{{tabsVM}}" as="t" hint-placeholder-count="3"><button style="{{t.style}}" onClick="{{t.onClick}}">{{t.label}}</button></sc-for>
+        </div>
+        <div style="flex:1;overflow:auto;padding:12px">
+          <sc-if value="{{showBlocks}}" hint-placeholder-val="{{true}}">
+            <input value="{{palQ}}" onChange="{{onPalQ}}" placeholder="Filter blocks" style="{{filterStyle}}">
+            <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin:12px 0 8px">WORK</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px">
+              <sc-for list="{{workCards}}" as="k" hint-placeholder-count="6"><div draggable="true" onDragStart="{{k.onDrag}}" onClick="{{k.onPick}}" style="{{k.style}}" style-hover="border-color:var(--border-strong)"><svg width="30" height="18" viewBox="0 0 34 20" style="flex:none"><path d="{{k.pd}}" fill="none" stroke="{{k.accent}}" stroke-width="1.3" stroke-linejoin="round"></path></svg><div style="min-width:0"><div style="{{k.labelStyle}}">{{k.label}}</div><div style="font-size:10px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{k.sub}}</div></div></div></sc-for>
+            </div>
+            <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin:14px 0 8px">ORCHESTRATION</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px">
+              <sc-for list="{{orchCards}}" as="k" hint-placeholder-count="4"><div draggable="true" onDragStart="{{k.onDrag}}" onClick="{{k.onPick}}" style="{{k.style}}" style-hover="border-color:var(--border-strong)"><svg width="30" height="18" viewBox="0 0 34 20" style="flex:none"><path d="{{k.pd}}" fill="none" stroke="{{k.accent}}" stroke-width="1.3" stroke-linejoin="round"></path></svg><div style="min-width:0"><div style="{{k.labelStyle}}">{{k.label}}</div><div style="font-size:10px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{k.sub}}</div></div></div></sc-for>
+            </div>
+            <div style="margin-top:14px;border:1px solid var(--border);border-radius:7px;padding:12px;background:var(--bg)">
+              <div style="display:flex;align-items:center;gap:7px;margin-bottom:6px">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="{{palDetail.accent}}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="{{palDetail.iconD}}"></path></svg>
+                <span style="{{palDetail.titleStyle}}">{{palDetail.label}}</span>
+                <span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9px;letter-spacing:1px;color:var(--mute);text-transform:uppercase">{{palDetail.family}}</span>
+              </div>
+              <div style="font-size:11px;line-height:1.55;color:var(--dim)">{{palDetail.what}}</div>
+              <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin:10px 0 4px">REQUIRED</div>
+              <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:10.5px;color:var(--ink)">{{palDetail.req}}</div>
+              <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin:10px 0 4px">EXAMPLE</div>
+              <pre style="margin:0;padding:8px 10px;background:var(--surface);border-radius:5px;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:10px;line-height:1.5;color:var(--ink);overflow:auto">{{palDetail.example}}</pre>
+              <button style="{{addBtnStyle}}" style-hover="background:color-mix(in srgb, var(--brand) 10%, transparent)" onClick="{{palDetail.onAdd}}">+ Add to canvas</button>
+            </div>
+          </sc-if>
+          <sc-if value="{{showStep}}" hint-placeholder-val="{{false}}">
+            <sc-if value="{{hasSel}}" hint-placeholder-val="{{false}}">
+              <div style="display:flex;align-items:center;gap:9px;margin-bottom:14px">
+                <svg width="30" height="18" viewBox="0 0 34 20" style="flex:none"><path d="{{selVM.pd}}" fill="none" stroke="{{selVM.accent}}" stroke-width="1.3" stroke-linejoin="round"></path></svg>
+                <div style="min-width:0"><div style="font-size:13px;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{selVM.id}}</div><div style="{{selVM.chipStyle}}">{{selVM.kindLabel}}</div></div>
+              </div>
+              <sc-for list="{{fields}}" as="f">
+                <div style="margin-bottom:10px">
+                  <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin-bottom:4px">{{f.label}}</div>
+                  <sc-if value="{{f.isText}}" hint-placeholder-val="{{false}}"><input value="{{f.value}}" onChange="{{f.onChange}}" style="{{f.style}}"></sc-if>
+                  <sc-if value="{{f.isArea}}" hint-placeholder-val="{{false}}"><textarea value="{{f.value}}" onChange="{{f.onChange}}" rows="3" style="{{f.style}}"></textarea></sc-if>
+                  <sc-if value="{{f.isSelect}}" hint-placeholder-val="{{false}}"><select value="{{f.value}}" onChange="{{f.onChange}}" style="{{f.style}}"><sc-for list="{{f.options}}" as="o"><option value="{{o.v}}">{{o.v}}</option></sc-for></select></sc-if>
+                </div>
+              </sc-for>
+              <sc-for list="{{derived}}" as="dr"><div style="display:flex;gap:7px;align-items:baseline;margin-bottom:6px"><span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1px;color:var(--mute)">{{dr.label}}</span><span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:10.5px;color:var(--ink)">{{dr.v}}</span></div></sc-for>
+              <button style="{{removeBtnStyle}}" style-hover="background:color-mix(in srgb, var(--err) 10%, transparent)" onClick="{{onRemove}}">Remove step</button>
+            </sc-if>
+            <sc-if value="{{noSel}}" hint-placeholder-val="{{false}}"><div style="font-size:11px;line-height:1.6;color:var(--mute);padding:24px 6px;text-align:center">Select a step on the canvas to edit it &#8212; or drag a block in from the palette.</div></sc-if>
+          </sc-if>
+          <sc-if value="{{showSettings}}" hint-placeholder-val="{{false}}">
+            <div style="margin-bottom:10px"><div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin-bottom:4px">NAME</div><input value="{{wfName}}" onChange="{{onName}}" style="{{inputStyleMono}}"></div>
+            <div style="margin-bottom:12px"><div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin-bottom:4px">DESCRIPTION</div><textarea value="{{wfDesc}}" onChange="{{onDesc}}" rows="2" style="{{inputStyle}}"></textarea></div>
+            <div style="border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px">
+              <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin-bottom:8px">TRIGGER</div>
+              <div style="display:flex;align-items:center;gap:8px"><span style="{{cronPillStyle}}">cron</span><input value="{{cron}}" onChange="{{onCron}}" style="{{inputStyleMono}}"></div>
+              <div style="font-size:10px;color:var(--mute);margin-top:6px">Runs nightly at 02:00 UTC. Manual launches always allowed.</div>
+            </div>
+            <div style="border:1px solid var(--border);border-radius:6px;padding:10px">
+              <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9.5px;letter-spacing:1.2px;color:var(--mute);margin-bottom:8px">INPUTS</div>
+              <div style="display:flex;align-items:center;gap:8px"><span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:11px;color:var(--ink)">pr</span><span style="font-size:10.5px;color:var(--dim)">string</span><div style="flex:1"></div><span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:9px;letter-spacing:.5px;color:var(--mute);border:1px solid var(--border);border-radius:4px;padding:1px 5px">required</span></div>
+            </div>
+          </sc-if>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1560,&quot;height&quot;:1000},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;default&quot;:&quot;dark&quot;,&quot;tsType&quot;:&quot;'dark' | 'light'&quot;,&quot;section&quot;:&quot;Appearance&quot;},&quot;nodeStyle&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;flowchart&quot;,&quot;cards&quot;],&quot;default&quot;:&quot;flowchart&quot;,&quot;tsType&quot;:&quot;'flowchart' | 'cards'&quot;,&quot;section&quot;:&quot;Appearance&quot;},&quot;palettePlacement&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;rail&quot;,&quot;dock&quot;],&quot;default&quot;:&quot;rail&quot;,&quot;tsType&quot;:&quot;'rail' | 'dock'&quot;,&quot;section&quot;:&quot;Layout&quot;}}">
+const MONO = "ui-monospace,'SF Mono',Menlo,monospace";
+const W = 176, H = 68, CW = 1800, CH = 520;
+const BR_THEN = 24, BR_ELSE = 44;
+
+const ICON = {
+  bot: 'M12 8V4H8 M4 8h16v12H4z M2 14h2 M20 14h2 M15 13v2 M9 13v2',
+  repeat: 'M17 2l4 4-4 4 M3 11v-1a4 4 0 0 1 4-4h14 M7 22l-4-4 4-4 M21 13v1a4 4 0 0 1-4 4H3',
+  cols: 'M3 3h18v18H3z M9 3v18 M15 3v18',
+  shield: 'M20 13c0 5-3.5 7.5-7.7 8.9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1 1 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z M9 12l2 2 4-4',
+  gitbr: 'M6 3v12 M18 3a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M6 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M18 9a9 9 0 0 1-9 9',
+  usercheck: 'M16 11l2 2 4-4 M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0z M2 21v-2a4 4 0 0 1 4-4h6',
+  zap: 'M13 2L3 14h9l-1 8 10-12h-9l1-8z',
+  term: 'M4 17l6-6-6-6 M12 19h8',
+  split: 'M16 3h5v5 M8 3H3v5 M12 22v-8.3a4 4 0 0 0-1.2-2.9L3 3 M15 9l6-6',
+  merge: 'M8 6l4-4 4 4 M12 2v10.3a4 4 0 0 1-1.2 2.9L4 22 M20 22l-5-5'
+};
+
+const KINDS = {
+  step: { label: 'step', sub: 'one agent', family: 'work', shape: 'rect', accent: '--running', icon: ICON.bot },
+  for_each: { label: 'for_each', sub: 'over a list', family: 'work', shape: 'hexagon', accent: '--brand', icon: ICON.repeat },
+  parallel: { label: 'parallel', sub: 'N at once', family: 'work', shape: 'subroutine', accent: '--crit', icon: ICON.cols },
+  panel: { label: 'panel', sub: 'review+gate', family: 'work', shape: 'stacked', accent: '--awaiting', icon: ICON.shield },
+  action: { label: 'action', sub: 'connector call', family: 'work', shape: 'parallelogram', accent: '--sevinfo', icon: ICON.zap },
+  run: { label: 'run', sub: 'command', family: 'work', shape: 'rect', accent: '--med', icon: ICON.term },
+  branch: { label: 'branch', sub: 'if / then / else', family: 'orchestration', shape: 'vhex', accent: '--done', icon: ICON.gitbr },
+  split: { label: 'split', sub: 'fan out', family: 'orchestration', shape: 'fanout', accent: '--brand600', icon: ICON.split },
+  join: { label: 'join', sub: 'barrier', family: 'orchestration', shape: 'fanin', accent: '--brand700', icon: ICON.merge },
+  approval_gate: { label: 'gate', sub: 'human approval', family: 'orchestration', shape: 'trapezoid', accent: '--paused', icon: ICON.usercheck }
+};
+const WORK_ORDER = ['step', 'for_each', 'parallel', 'panel', 'action', 'run'];
+const ORCH_ORDER = ['branch', 'split', 'join', 'approval_gate'];
+
+const CATALOG = {
+  step: { what: 'Runs one agent against a prompt and records its output for later steps to reference.', req: '*agent   *prompt', example: '- id: review\n  agent: code-reviewer\n  prompt: "Review the diff."' },
+  for_each: { what: "Runs one agent's prompt once per item in a list, up to max_parallel at a time.", req: '*agent   *for_each   *prompt', example: '- id: review_each\n  agent: code-reviewer\n  for_each: "{{ inputs.files }}"\n  max_parallel: 4\n  prompt: "Review {{ item }}."' },
+  parallel: { what: 'Runs a fixed set of named sub-steps concurrently, each with its own agent and prompt.', req: '*parallel', example: '- id: fanout\n  parallel:\n    - id: a\n      agent: writer\n      prompt: "..."' },
+  panel: { what: 'Runs several agents ("panelists") against one subject in parallel and aggregates their findings.', req: '*panelists   *subject', example: '- id: review\n  panel:\n    panelists: [security-reviewer]\n    subject: "{{ inputs.diff }}"' },
+  action: { what: 'Calls one connector tool (MCP) deterministically \u2014 no agent involved.', req: '*action', example: '- id: open_pr\n  action: scm.prs.create\n  with:\n    title: "..."' },
+  run: { what: 'Executes a deterministic shell command and records its output.', req: '*run', example: '- id: scan\n  run: semgrep scan --config auto' },
+  branch: { what: 'Evaluates a condition and routes the run to a then/else set of next steps \u2014 no agent runs on this node.', req: '*condition', example: "- id: route\n  branch:\n    condition: \"{{ steps.assess.output == 'clean' }}\"\n    then: [ship]\n    else: [fix]" },
+  split: { what: 'Fans the run out along explicit target step ids \u2014 every listed target runs.', req: '(targets come from its outgoing edges)', example: '- id: fanout\n  split: [review_a, review_b]' },
+  join: { what: 'A barrier: waits for its inbound edges per a wait policy (all / any / a count) before continuing.', req: '(all fields optional)', example: '- id: barrier\n  join:\n    wait: all' },
+  approval_gate: { what: 'Pauses the run for a human approve/reject decision before continuing; can auto-approve from an expression.', req: '(all fields optional)', example: '- id: ship_gate\n  approval:\n    prompt: "Approve to continue?"\n    timeout_seconds: 86400\n    on_timeout: reject' }
+};
+
+const AGENTS = ['triager', 'code-reviewer', 'security-reviewer', 'performance-reviewer', 'writer'];
+const TOOLS = ['scm.prs.diff', 'scm.prs.create', 'scm.prs.comment', 'issues.create', 'issues.comment', 'coverage.record'];
+
+const DEFAULT_F = {
+  step: { agent: 'code-reviewer', prompt: 'Review the diff.' },
+  for_each: { agent: 'code-reviewer', for_each: '{{ inputs.files }}', max_parallel: '4', prompt: 'Review {{ item }}.' },
+  parallel: { parallel: 'a, b' },
+  panel: { panelists: 'security-reviewer, performance-reviewer', subject: '{{ inputs.diff }}' },
+  action: { action: 'scm.prs.comment', with: 'body: "..."' },
+  run: { run: 'make test' },
+  branch: { condition: "{{ steps.prev.output == 'ok' }}" },
+  split: {},
+  join: { wait: 'all' },
+  approval_gate: { prompt: 'Approve to continue?', timeout_seconds: '86400', on_timeout: 'reject' }
+};
+
+const INIT_NODES = [
+  { id: 'fetch_diff', kind: 'action', x: 32, y: 236, f: { action: 'scm.prs.diff', with: 'pr: "{{ inputs.pr }}"' } },
+  { id: 'triage', kind: 'step', x: 252, y: 236, f: { agent: 'triager', prompt: 'Assess the risk of this diff. Output risk: high|low.' } },
+  { id: 'route', kind: 'branch', x: 472, y: 232, f: { condition: "{{ steps.triage.output.risk == 'high' }}" } },
+  { id: 'fan', kind: 'split', x: 692, y: 118, f: {} },
+  { id: 'quick_scan', kind: 'run', x: 692, y: 372, f: { run: 'semgrep scan --config auto' } },
+  { id: 'review_each', kind: 'for_each', x: 912, y: 22, f: { agent: 'code-reviewer', for_each: '{{ steps.fetch_diff.output.files }}', max_parallel: '4', prompt: 'Review {{ item }}.' } },
+  { id: 'audit', kind: 'panel', x: 912, y: 148, f: { panelists: 'security-reviewer, performance-reviewer', subject: '{{ steps.fetch_diff.output.diff }}' } },
+  { id: 'bench', kind: 'parallel', x: 912, y: 274, f: { parallel: 'bench_api, bench_ui' } },
+  { id: 'barrier', kind: 'join', x: 1132, y: 148, f: { wait: 'all' } },
+  { id: 'ship_gate', kind: 'approval_gate', x: 1352, y: 232, f: { prompt: 'Approve to open the PR?', timeout_seconds: '86400', on_timeout: 'reject' } },
+  { id: 'open_pr', kind: 'action', x: 1572, y: 232, f: { action: 'scm.prs.create', with: 'title: "Automated security review"' } }
+];
+const INIT_EDGES = [
+  { from: 'fetch_diff', to: 'triage' }, { from: 'triage', to: 'route' },
+  { from: 'route', to: 'fan', port: 'then' }, { from: 'route', to: 'quick_scan', port: 'else' },
+  { from: 'fan', to: 'review_each' }, { from: 'fan', to: 'audit' }, { from: 'fan', to: 'bench' },
+  { from: 'review_each', to: 'barrier' }, { from: 'audit', to: 'barrier' }, { from: 'bench', to: 'barrier' },
+  { from: 'barrier', to: 'ship_gate' }, { from: 'quick_scan', to: 'ship_gate' },
+  { from: 'ship_gate', to: 'open_pr' }
+];
+const RUN_STATUS = { fetch_diff: 'done', triage: 'done', route: 'done', fan: 'done', review_each: 'running', audit: 'running', bench: 'done', barrier: 'pending', ship_gate: 'pending', open_pr: 'pending', quick_scan: 'skipped' };
+const RUN_PROG = { review_each: '3/5 items \u00b7 running' };
+
+function rr(x0, y0, x1, y1, r) {
+  return 'M ' + (x0 + r) + ' ' + y0 + ' L ' + (x1 - r) + ' ' + y0 + ' Q ' + x1 + ' ' + y0 + ' ' + x1 + ' ' + (y0 + r) +
+    ' L ' + x1 + ' ' + (y1 - r) + ' Q ' + x1 + ' ' + y1 + ' ' + (x1 - r) + ' ' + y1 +
+    ' L ' + (x0 + r) + ' ' + y1 + ' Q ' + x0 + ' ' + y1 + ' ' + x0 + ' ' + (y1 - r) +
+    ' L ' + x0 + ' ' + (y0 + r) + ' Q ' + x0 + ' ' + y0 + ' ' + (x0 + r) + ' ' + y0 + ' Z';
+}
+function P(pts) { return 'M ' + pts.map(p => p[0] + ' ' + p[1]).join(' L ') + ' Z'; }
+function ci(v, dim, f) { return Math.min(v, (dim - 3) * (f || 0.3)); }
+
+function shapeGeo(shape, w, h) {
+  const I = 1.5;
+  let d, behind = [], above = [], safe = { x: 14, y: 9, w: w - 28, h: h - 18 }, align = 'start';
+  switch (shape) {
+    case 'parallelogram': { const s = ci(20, w); d = P([[I + s, I], [w - I, I], [w - I - s, h - I], [I, h - I]]); safe = { x: s + 6, y: 9, w: w - 2 * s - 12, h: h - 18 }; break; }
+    case 'trapezoid': { const t = ci(26, w); d = P([[I + t, I], [w - I - t, I], [w - I, h - I], [I, h - I]]); safe = { x: t, y: 10, w: w - 2 * t, h: h - 20 }; align = 'center'; break; }
+    case 'hexagon': { const p = ci(22, w); d = P([[I + p, I], [w - I - p, I], [w - I, h / 2], [w - I - p, h - I], [I + p, h - I], [I, h / 2]]); safe = { x: p + 4, y: 9, w: w - 2 * p - 8, h: h - 18 }; break; }
+    case 'vhex': { const q = ci(12, h, 0.35); d = P([[I, q], [w / 2, I], [w - I, q], [w - I, h - q], [w / 2, h - I], [I, h - q]]); safe = { x: 14, y: q + 1, w: w - 28, h: h - 2 * q - 2 }; align = 'center'; break; }
+    case 'subroutine': { const rl = ci(11, w); d = rr(I, I, w - I, h - I, 8); above = [{ d: 'M ' + (I + rl) + ' ' + I + ' L ' + (I + rl) + ' ' + (h - I), fill: 'none', op: 0.55 }, { d: 'M ' + (w - I - rl) + ' ' + I + ' L ' + (w - I - rl) + ' ' + (h - I), fill: 'none', op: 0.55 }]; safe = { x: rl + 8, y: 9, w: w - 2 * rl - 16, h: h - 18 }; break; }
+    case 'stacked': { const l = ci(9, h, 0.5); behind = [{ d: rr(I + l, I, w - I, h - I - l, 7), fill: 'var(--panel)', op: 0.8 }]; d = rr(I, I + l, w - I - l, h - I, 7); safe = { x: 12, y: l + 7, w: w - l - 24, h: h - l - 16 }; break; }
+    case 'fanout': { const f = ci(30, w); d = P([[I, h / 2], [I + f, I], [w - I, I], [w - I, h - I], [I + f, h - I]]); safe = { x: f + 4, y: 9, w: w - f - 14, h: h - 18 }; break; }
+    case 'fanin': { const f = ci(30, w); d = P([[I, I], [w - I - f, I], [w - I, h / 2], [w - I - f, h - I], [I, h - I]]); safe = { x: 12, y: 9, w: w - f - 20, h: h - 18 }; break; }
+    case 'cardrect': { d = rr(I, I, w - I, h - I, 8); above = [{ d: 'M 9 1.5 L ' + (w - 9) + ' 1.5 L ' + (w - 9) + ' 5 L 9 5 Z', fill: 'ACCENT', op: 1 }]; safe = { x: 14, y: 12, w: w - 28, h: h - 20 }; break; }
+    default: { const r = Math.min(10, (w - 3) / 2, (h - 3) / 2); d = rr(I, I, w - I, h - I, r); }
+  }
+  return { d, behind, above, safe, align };
+}
+function srcInset(shape) { return { parallelogram: 10, trapezoid: 13, stacked: 8 }[shape] || 0; }
+function tgtInset(shape) { return { parallelogram: 10, trapezoid: 13 }[shape] || 0; }
+function trunc(s, n) { s = s || ''; return s.length > n ? s.slice(0, n - 1) + '\u2026' : s; }
+function bez(x1, y1, x2, y2) { const dx = Math.max(36, Math.abs(x2 - x1) * 0.45); return 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ' ' + (x2 - dx) + ' ' + y2 + ' ' + x2 + ' ' + y2; }
+function arrowAt(x, y) { return 'M ' + (x - 6) + ' ' + (y - 3.5) + ' L ' + (x - 0.5) + ' ' + y + ' L ' + (x - 6) + ' ' + (y + 3.5); }
+
+class Component extends DCLogic {
+  canvasRef = React.createRef();
+  state = {
+    nodes: INIT_NODES.map(n => ({ ...n, f: { ...n.f } })),
+    edges: INIT_EDGES.slice(),
+    sel: null, tab: 'blocks', mode: 'design', yamlOpen: true,
+    palSel: 'step', palQ: '', drag: null, connect: null,
+    name: 'nightly-security-review', desc: 'Nightly diff review; opens a PR when approved.', cron: '0 2 * * *'
+  };
+
+  componentDidMount() {
+    this._kd = (e) => {
+      const t = document.activeElement && document.activeElement.tagName;
+      if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') return;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && this.state.sel) { e.preventDefault(); this.removeNode(this.state.sel); }
+      if (e.key === 'Escape') this.setState({ connect: null, sel: null, drag: null });
+    };
+    this._mm = (e) => this.winMove(e);
+    this._mu = () => this.winUp();
+    window.addEventListener('keydown', this._kd);
+    window.addEventListener('pointermove', this._mm);
+    window.addEventListener('pointerup', this._mu);
+  }
+  componentWillUnmount() {
+    window.removeEventListener('keydown', this._kd);
+    window.removeEventListener('pointermove', this._mm);
+    window.removeEventListener('pointerup', this._mu);
+  }
+
+  canvasPoint(e) {
+    const el = this.canvasRef.current;
+    if (!el) return { x: 0, y: 0 };
+    const r = el.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+  winMove(e) {
+    const { drag, connect } = this.state;
+    if (drag) {
+      const p = this.canvasPoint(e);
+      const x = Math.max(0, Math.min(Math.round(p.x - drag.dx), CW - W));
+      const y = Math.max(0, Math.min(Math.round(p.y - drag.dy), CH - H));
+      this.setState(s => ({ drag: { ...s.drag, moved: true }, nodes: s.nodes.map(n => n.id === drag.id ? { ...n, x, y } : n) }));
+    } else if (connect) {
+      const p = this.canvasPoint(e);
+      this.setState(s => ({ connect: { ...s.connect, mx: p.x, my: p.y } }));
+    }
+  }
+  winUp() {
+    const { drag, connect } = this.state;
+    if (drag) {
+      const sel = !drag.moved ? { sel: drag.id, tab: 'step' } : {};
+      this.setState({ drag: null, ...sel });
+    }
+    if (connect) this.setState({ connect: null });
+  }
+  nodeDown(e, id) {
+    if (e.target.closest && e.target.closest('[data-port]')) return;
+    e.preventDefault();
+    const n = this.state.nodes.find(n => n.id === id);
+    const p = this.canvasPoint(e);
+    this.setState({ drag: { id, dx: p.x - n.x, dy: p.y - n.y, moved: false } });
+  }
+  nodeUp(id) {
+    const c = this.state.connect;
+    if (c && c.from !== id) this.addEdge(c.from, id, c.port);
+  }
+  portDown(e, id, port, x1, y1) {
+    e.stopPropagation(); e.preventDefault();
+    const p = this.canvasPoint(e);
+    this.setState({ connect: { from: id, port, x1, y1, mx: p.x, my: p.y } });
+  }
+  addEdge(from, to, port) {
+    if (this.state.edges.some(e => e.from === from && e.to === to && e.port === port)) return;
+    this.setState(s => ({ edges: [...s.edges, { from, to, port }] }));
+  }
+  addNode(kind, x, y) {
+    this._casc = (this._casc || 0) + 1;
+    if (x === undefined) { x = 300 + (this._casc * 44) % 320; y = 50 + (this._casc * 60) % 260; }
+    x = Math.max(0, Math.min(Math.round(x), CW - W)); y = Math.max(0, Math.min(Math.round(y), CH - H));
+    const base = kind === 'approval_gate' ? 'gate' : kind;
+    const ids = new Set(this.state.nodes.map(n => n.id));
+    let id = base, i = 1;
+    while (ids.has(id)) { i++; id = base + '_' + i; }
+    this.setState(s => ({ nodes: [...s.nodes, { id, kind, x, y, f: { ...DEFAULT_F[kind] } }], sel: id, tab: 'step' }));
+  }
+  removeNode(id) {
+    this.setState(s => ({ nodes: s.nodes.filter(n => n.id !== id), edges: s.edges.filter(e => e.from !== id && e.to !== id), sel: s.sel === id ? null : s.sel }));
+  }
+  renameNode(oldId, raw) {
+    const id = raw.replace(/[^a-zA-Z0-9_]/g, '_');
+    if (!id) return;
+    this.setState(s => {
+      if (id !== oldId && s.nodes.some(n => n.id === id)) return null;
+      return {
+        nodes: s.nodes.map(n => n.id === oldId ? { ...n, id } : n),
+        edges: s.edges.map(e => ({ ...e, from: e.from === oldId ? id : e.from, to: e.to === oldId ? id : e.to })),
+        sel: id
+      };
+    });
+  }
+  updateField(id, key, val) {
+    this.setState(s => ({ nodes: s.nodes.map(n => n.id === id ? { ...n, f: { ...n.f, [key]: val } } : n) }));
+  }
+  outsOf(id, port) { return this.state.edges.filter(e => e.from === id && (port === undefined || e.port === port)).map(e => e.to); }
+  insOf(id) { return this.state.edges.filter(e => e.to === id).map(e => e.from); }
+
+  subFor(n) {
+    const f = n.f;
+    switch (n.kind) {
+      case 'step': return f.agent;
+      case 'for_each': return f.agent + ' \u00b7 per item';
+      case 'parallel': return (f.parallel || '').split(',').filter(x => x.trim()).length + ' sub-steps';
+      case 'panel': return (f.panelists || '').split(',').filter(x => x.trim()).length + ' panelists';
+      case 'branch': return 'if ' + trunc(f.condition, 22);
+      case 'split': return '\u2192 ' + this.outsOf(n.id).length + ' targets';
+      case 'join': return 'wait: ' + f.wait;
+      case 'approval_gate': return 'human approval';
+      case 'action': return f.action;
+      case 'run': return '$ ' + trunc(f.run, 20);
+    }
+    return '';
+  }
+
+  yamlFor() {
+    const { nodes, name, desc, cron } = this.state;
+    const L = ['name: ' + name, 'description: ' + desc, 'on:', '  schedule:', '    cron: "' + cron + '"', 'inputs:', '  pr:', '    type: string', 'steps:'];
+    for (const n of nodes) {
+      L.push('  - id: ' + n.id);
+      const f = n.f;
+      switch (n.kind) {
+        case 'step': L.push('    agent: ' + f.agent, '    prompt: "' + f.prompt + '"'); break;
+        case 'for_each': L.push('    agent: ' + f.agent, '    for_each: "' + f.for_each + '"', '    max_parallel: ' + f.max_parallel, '    prompt: "' + f.prompt + '"'); break;
+        case 'parallel':
+          L.push('    parallel:');
+          (f.parallel || '').split(',').map(s => s.trim()).filter(Boolean).forEach(s => L.push('      - id: ' + s, '        agent: writer', '        prompt: "..."'));
+          break;
+        case 'panel': L.push('    panel:', '      panelists: [' + f.panelists + ']', '      subject: "' + f.subject + '"'); break;
+        case 'branch': L.push('    branch:', '      condition: "' + f.condition + '"', '      then: [' + this.outsOf(n.id, 'then').join(', ') + ']', '      else: [' + this.outsOf(n.id, 'else').join(', ') + ']'); break;
+        case 'split': L.push('    split: [' + this.outsOf(n.id).join(', ') + ']'); break;
+        case 'join': L.push('    join:', '      wait: ' + f.wait); break;
+        case 'approval_gate': L.push('    approval:', '      prompt: "' + f.prompt + '"', '      timeout_seconds: ' + f.timeout_seconds, '      on_timeout: ' + f.on_timeout); break;
+        case 'action': L.push('    action: ' + f.action); if (f.with) L.push('    with:', '      ' + f.with); break;
+        case 'run': L.push('    run: ' + f.run); break;
+      }
+    }
+    return L.join('\n');
+  }
+
+  fieldsFor(n) {
+    const mk = (label, key, type, opts) => ({
+      label, isText: type === 'text', isArea: type === 'area', isSelect: type === 'select',
+      value: n.f[key] || '', options: (opts || []).map(v => ({ v })),
+      onChange: (e) => this.updateField(n.id, key, e.target.value),
+      style: this.inputStyle(type !== 'select' && key !== 'prompt' && key !== 'panelists')
+    });
+    const arr = [{
+      label: 'STEP ID', isText: true, isArea: false, isSelect: false, value: n.id, options: [],
+      onChange: (e) => this.renameNode(n.id, e.target.value), style: this.inputStyle(true)
+    }];
+    switch (n.kind) {
+      case 'step': arr.push(mk('AGENT', 'agent', 'select', AGENTS), mk('PROMPT', 'prompt', 'area')); break;
+      case 'for_each': arr.push(mk('AGENT', 'agent', 'select', AGENTS), mk('FOR EACH', 'for_each', 'text'), mk('MAX PARALLEL', 'max_parallel', 'text'), mk('PROMPT', 'prompt', 'area')); break;
+      case 'parallel': arr.push(mk('SUB-STEP IDS', 'parallel', 'text')); break;
+      case 'panel': arr.push(mk('PANELISTS', 'panelists', 'text'), mk('SUBJECT', 'subject', 'text')); break;
+      case 'branch': arr.push(mk('CONDITION', 'condition', 'area')); break;
+      case 'join': arr.push(mk('WAIT POLICY', 'wait', 'select', ['all', 'any', '2'])); break;
+      case 'approval_gate': arr.push(mk('APPROVAL PROMPT', 'prompt', 'area'), mk('TIMEOUT (SECONDS)', 'timeout_seconds', 'text'), mk('ON TIMEOUT', 'on_timeout', 'select', ['reject', 'approve'])); break;
+      case 'action': arr.push(mk('TOOL', 'action', 'select', TOOLS), mk('WITH', 'with', 'text')); break;
+      case 'run': arr.push(mk('COMMAND', 'run', 'text')); break;
+    }
+    return arr;
+  }
+  derivedFor(n) {
+    if (n.kind === 'branch') return [
+      { label: 'then \u2192', v: this.outsOf(n.id, 'then').join(', ') || '\u2014' },
+      { label: 'else \u2192', v: this.outsOf(n.id, 'else').join(', ') || '\u2014' }];
+    if (n.kind === 'split') return [{ label: 'targets \u2192', v: this.outsOf(n.id).join(', ') || '\u2014' }];
+    if (n.kind === 'join') return [{ label: 'waits on \u2190', v: this.insOf(n.id).join(', ') || '\u2014' }];
+    return [];
+  }
+  inputStyle(mono) {
+    return { width: '100%', boxSizing: 'border-box', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '5px', padding: '5px 8px', fontSize: '11.5px', color: 'var(--ink)', fontFamily: mono ? MONO : 'inherit', resize: 'vertical' };
+  }
+
+  renderVals() {
+    const st = this.state;
+    const theme = this.props.theme ?? 'dark';
+    const nodeStyle = this.props.nodeStyle ?? 'flowchart';
+    const placement = this.props.palettePlacement ?? 'rail';
+    const cards = nodeStyle === 'cards';
+    const run = st.mode === 'run';
+    const byId = {}; st.nodes.forEach(n => { byId[n.id] = n; });
+    const shapeOf = (n) => cards ? 'cardrect' : KINDS[n.kind].shape;
+    const statusOf = (id) => RUN_STATUS[id] || 'pending';
+    const strokeFor = { done: 'var(--done)', running: 'var(--running)', pending: 'var(--border-strong)', skipped: 'var(--border-strong)', awaiting: 'var(--awaiting)' };
+
+    const nodeVMs = st.nodes.map(n => {
+      const k = KINDS[n.kind];
+      const accent = 'var(' + k.accent + ')';
+      const geo = shapeGeo(shapeOf(n), W, H);
+      const sel = st.sel === n.id;
+      const status = run ? statusOf(n.id) : null;
+      const stroke = sel ? 'var(--brand)' : run ? strokeFor[status] : (cards ? 'var(--border-strong)' : accent);
+      const opacity = run && status === 'skipped' ? 0.45 : run && status === 'pending' ? 0.6 : 1;
+      const above = geo.above.map(x => ({ d: x.d, fill: x.fill === 'ACCENT' ? accent : (x.fill || 'none'), stroke: x.fill === 'ACCENT' || x.fill ? 'none' : (run ? stroke : accent), op: x.op }));
+      const behind = geo.behind.map(x => ({ d: x.d, fill: x.fill || 'none', stroke: run ? stroke : accent, op: x.op }));
+      const ports = (n.kind === 'branch'
+        ? [{ label: 'then', y: BR_THEN }, { label: 'else', y: BR_ELSE }]
+        : [{ label: 'out', y: H / 2 }]
+      ).map(p => ({
+        label: p.label,
+        style: { position: 'absolute', right: (srcInset(shapeOf(n)) - 5) + 'px', top: (p.y - 5) + 'px', width: '10px', height: '10px', borderRadius: '50%', background: 'var(--panel)', border: '1.5px solid var(--border-strong)', boxSizing: 'border-box', cursor: 'crosshair', zIndex: 4 },
+        onDown: (e) => this.portDown(e, n.id, p.label === 'out' ? undefined : p.label, n.x + W - srcInset(shapeOf(n)), n.y + p.y)
+      }));
+      return {
+        id: n.id, kindLabel: k.label, iconD: k.icon, accent,
+        d: geo.d, behind, above, stroke, sw: sel ? 2 : 1.4,
+        sdash: run && status === 'pending' ? '4 3' : '',
+        sub: run && RUN_PROG[n.id] ? RUN_PROG[n.id] : this.subFor(n),
+        wrapStyle: { position: 'absolute', left: n.x + 'px', top: n.y + 'px', width: W + 'px', height: H + 'px', cursor: 'grab', userSelect: 'none', touchAction: 'none', opacity, zIndex: sel ? 3 : 2, filter: sel ? 'drop-shadow(0 3px 8px color-mix(in srgb, var(--brand) 35%, transparent))' : undefined },
+        contentStyle: { position: 'absolute', left: geo.safe.x + 'px', top: geo.safe.y + 'px', width: geo.safe.w + 'px', height: geo.safe.h + 'px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: '1px', alignItems: geo.align === 'center' ? 'center' : 'stretch', textAlign: geo.align === 'center' ? 'center' : 'left', pointerEvents: 'none' },
+        chipStyle: { fontFamily: MONO, fontSize: '9px', letterSpacing: '1px', textTransform: 'uppercase', color: accent },
+        idStyle: { fontSize: '12.5px', fontWeight: 600, color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%' },
+        subStyle: { fontSize: '10.5px', color: 'var(--dim)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '100%', fontFamily: (n.kind === 'run' || n.kind === 'action') ? MONO : 'inherit' },
+        tgtDotStyle: { position: 'absolute', left: (tgtInset(shapeOf(n)) - 3.5) + 'px', top: (H / 2 - 3.5) + 'px', width: '7px', height: '7px', borderRadius: '50%', background: 'var(--border-strong)', zIndex: 4 },
+        ports,
+        gShow: run, gDone: status === 'done', gRun: status === 'running', gPend: status === 'pending', gSkip: status === 'skipped',
+        gWrapStyle: { position: 'absolute', right: '-6px', top: '-6px', width: '17px', height: '17px', borderRadius: '9px', background: 'var(--panel)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 5, boxSizing: 'border-box' },
+        onDown: (e) => this.nodeDown(e, n.id),
+        onUp: () => this.nodeUp(n.id),
+        onClick: (e) => e.stopPropagation()
+      };
+    });
+
+    const edgeVMs = st.edges.map(e => {
+      const a = byId[e.from], b = byId[e.to];
+      if (!a || !b) return null;
+      const sy = e.port === 'then' ? BR_THEN : e.port === 'else' ? BR_ELSE : H / 2;
+      const x1 = a.x + W - srcInset(shapeOf(a)), y1 = a.y + sy;
+      const x2 = b.x + tgtInset(shapeOf(b)), y2 = b.y + H / 2;
+      let stroke = 'var(--border-strong)', dash = '', op = 1, anim = {};
+      if (run) {
+        const sF = statusOf(e.from), sT = statusOf(e.to);
+        if (sT === 'skipped' || sF === 'skipped') { stroke = 'var(--border-strong)'; dash = '3 4'; op = 0.5; }
+        else if (sF === 'done' && sT === 'running') { stroke = 'var(--running)'; dash = '6 5'; anim = { animation: 'edgeflow .7s linear infinite' }; }
+        else if (sF === 'done' && sT === 'done') { stroke = 'var(--done)'; op = 0.55; }
+        else op = 0.45;
+      }
+      return {
+        d: bez(x1, y1, x2, y2), arrow: arrowAt(x2, y2), stroke, dash, op, anim,
+        label: e.port || '', lx: x1 + 9, ly: e.port === 'else' ? y1 + 14 : y1 - 6,
+        lstyle: { fontFamily: MONO, fontSize: '9px', textTransform: 'uppercase', letterSpacing: '1px' }
+      };
+    }).filter(Boolean);
+
+    const tempD = st.connect ? bez(st.connect.x1, st.connect.y1, st.connect.mx, st.connect.my) : null;
+
+    const q = st.palQ.trim().toLowerCase();
+    const cardVM = (kind) => {
+      const k = KINDS[kind];
+      const pg = shapeGeo(cards ? 'cardrect' : k.shape, 34, 20);
+      const selP = st.palSel === kind;
+      return {
+        label: k.label, sub: k.sub, accent: 'var(' + k.accent + ')', pd: pg.d,
+        style: { display: 'flex', gap: '8px', alignItems: 'center', padding: '8px 9px', border: '1px solid ' + (selP ? 'var(--brand)' : 'var(--border)'), borderRadius: '6px', background: selP ? 'var(--surface)' : 'var(--panel)', cursor: 'grab', width: 'calc(50% - 4px)', boxSizing: 'border-box' },
+        labelStyle: { fontFamily: MONO, fontSize: '11px', color: 'var(' + k.accent + ')', whiteSpace: 'nowrap' },
+        onDrag: (e) => { e.dataTransfer.setData('text/rupu-kind', kind); e.dataTransfer.effectAllowed = 'copy'; },
+        onPick: () => this.setState({ palSel: kind })
+      };
+    };
+    const match = (kind) => !q || (KINDS[kind].label + ' ' + KINDS[kind].sub).toLowerCase().includes(q);
+    const workCards = WORK_ORDER.filter(match).map(cardVM);
+    const orchCards = ORCH_ORDER.filter(match).map(cardVM);
+
+    const pk = KINDS[st.palSel], pc = CATALOG[st.palSel];
+    const palDetail = {
+      label: pk.label, family: pk.family, what: pc.what, req: pc.req, example: pc.example,
+      accent: 'var(' + pk.accent + ')', iconD: pk.icon,
+      titleStyle: { fontFamily: MONO, fontSize: '12px', fontWeight: 600, color: 'var(' + pk.accent + ')' },
+      onAdd: () => this.addNode(st.palSel)
+    };
+
+    const dockCards = [...WORK_ORDER, ...ORCH_ORDER].map(kind => {
+      const k = KINDS[kind];
+      return {
+        label: k.label, sub: k.sub, accent: 'var(' + k.accent + ')', iconD: k.icon,
+        style: { display: 'flex', gap: '5px', alignItems: 'center', padding: '4px 8px', border: '1px solid var(--border)', borderRadius: '5px', background: 'var(--panel)', cursor: 'grab', fontFamily: MONO, fontSize: '10.5px', color: 'var(--dim)' },
+        onDrag: (e) => { e.dataTransfer.setData('text/rupu-kind', kind); e.dataTransfer.effectAllowed = 'copy'; },
+        onAdd: () => this.addNode(kind)
+      };
+    });
+
+    const activeTab = (placement === 'dock' && st.tab === 'blocks') ? 'step' : st.tab;
+    const tabList = placement === 'rail' ? ['blocks', 'step', 'settings'] : ['step', 'settings'];
+    const tabsVM = tabList.map(t => ({
+      label: t === 'blocks' ? 'Blocks' : t === 'step' ? 'Step' : 'Settings',
+      style: { flex: 1, padding: '9px 0', fontSize: '11.5px', fontWeight: activeTab === t ? 600 : 400, color: activeTab === t ? 'var(--ink)' : 'var(--dim)', background: 'none', border: 'none', borderBottom: activeTab === t ? '2px solid var(--brand)' : '2px solid transparent', cursor: 'pointer' },
+      onClick: () => this.setState({ tab: t })
+    }));
+
+    const selNode = st.sel ? st.nodes.find(n => n.id === st.sel) : null;
+    let selVM = null, fields = [], derived = [];
+    if (selNode) {
+      const k = KINDS[selNode.kind];
+      const pg = shapeGeo(cards ? 'cardrect' : k.shape, 34, 20);
+      selVM = { id: selNode.id, kindLabel: k.label, accent: 'var(' + k.accent + ')', pd: pg.d, chipStyle: { fontFamily: MONO, fontSize: '9px', letterSpacing: '1px', textTransform: 'uppercase', color: 'var(' + k.accent + ')' } };
+      fields = this.fieldsFor(selNode);
+      derived = this.derivedFor(selNode);
+    }
+
+    const seg = (active) => ({ padding: '3px 10px', fontSize: '11px', fontWeight: active ? 600 : 400, borderRadius: '4px', border: 'none', cursor: 'pointer', background: active ? 'var(--panel)' : 'transparent', color: active ? 'var(--ink)' : 'var(--dim)', boxShadow: active ? '0 0 0 1px var(--border)' : 'none' });
+
+    return {
+      winProps: { width: 1512, height: 950, title: 'rupu \u2014 Control Plane' },
+      themeAttr: theme,
+      canvasRef: this.canvasRef,
+      wfName: st.name, wfDesc: st.desc, cron: st.cron,
+      onName: (e) => this.setState({ name: e.target.value.replace(/\s+/g, '-') }),
+      onDesc: (e) => this.setState({ desc: e.target.value }),
+      onCron: (e) => this.setState({ cron: e.target.value }),
+      runMode: run,
+      runPillStyle: { fontSize: '10px', fontFamily: MONO, color: 'var(--running)', background: 'color-mix(in srgb, var(--running) 12%, transparent)', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--running) 30%, transparent)', borderRadius: '4px', padding: '2px 7px' },
+      segDesignStyle: seg(!run), segRunStyle: seg(run),
+      onDesign: () => this.setState({ mode: 'design' }),
+      onRun: () => this.setState({ mode: 'run' }),
+      srcBtnStyle: { display: 'flex', alignItems: 'center', padding: '4px 6px', borderRadius: '5px', border: '1px solid ' + (st.yamlOpen ? 'var(--border-strong)' : 'var(--border)'), background: st.yamlOpen ? 'var(--surface)' : 'transparent', color: st.yamlOpen ? 'var(--ink)' : 'var(--dim)', cursor: 'pointer' },
+      launchStyle: { display: 'flex', alignItems: 'center', gap: '6px', background: 'var(--brand600)', color: '#fff', border: 'none', borderRadius: '5px', padding: '5px 12px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' },
+      onLaunch: () => this.setState({ mode: 'run' }),
+      yamlOpen: st.yamlOpen,
+      toggleYaml: () => this.setState(s => ({ yamlOpen: !s.yamlOpen })),
+      yamlText: this.yamlFor(),
+      nodeVMs, edgeVMs, tempD,
+      onCanvasClick: () => this.setState({ sel: null }),
+      onDragOver: (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; },
+      onDrop: (e) => {
+        e.preventDefault();
+        const kind = e.dataTransfer.getData('text/rupu-kind');
+        if (!kind || !KINDS[kind]) return;
+        const p = this.canvasPoint(e);
+        this.addNode(kind, p.x - W / 2, p.y - H / 2);
+      },
+      showDock: placement === 'dock', dockCards,
+      tabsVM,
+      showBlocks: activeTab === 'blocks' && placement === 'rail',
+      showStep: activeTab === 'step',
+      showSettings: activeTab === 'settings',
+      palQ: st.palQ,
+      onPalQ: (e) => this.setState({ palQ: e.target.value }),
+      filterStyle: this.inputStyle(false),
+      workCards, orchCards, palDetail,
+      addBtnStyle: { width: '100%', marginTop: '10px', padding: '6px 0', border: '1px solid var(--brand)', borderRadius: '5px', background: 'transparent', color: 'var(--brand700)', fontSize: '11.5px', fontWeight: 600, cursor: 'pointer' },
+      hasSel: !!selVM, noSel: !selVM, selVM, fields, derived,
+      onRemove: () => st.sel && this.removeNode(st.sel),
+      removeBtnStyle: { width: '100%', marginTop: '8px', padding: '6px 0', border: '1px solid color-mix(in srgb, var(--err) 45%, transparent)', borderRadius: '5px', background: 'transparent', color: 'var(--err)', fontSize: '11.5px', cursor: 'pointer' },
+      inputStyle: this.inputStyle(false), inputStyleMono: this.inputStyle(true),
+      cronPillStyle: { fontSize: '10px', fontFamily: MONO, color: 'var(--brand700)', background: 'color-mix(in srgb, var(--brand) 12%, transparent)', boxShadow: 'inset 0 0 0 1px color-mix(in srgb, var(--brand) 30%, transparent)', borderRadius: '4px', padding: '2px 7px', flex: 'none' }
+    };
+  }
+}
+</script>
+</body>
+</html>

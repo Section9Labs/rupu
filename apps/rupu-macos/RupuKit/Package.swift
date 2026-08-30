@@ -10,7 +10,7 @@ let package = Package(
             targets: [
                 "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
                 "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsageKit", "RupuUsage", "RupuShell", "RupuMenuBar",
-                "RupuSituation",
+                "RupuSituation", "RupuFlowKit", "RupuBuilder",
             ]
         )
     ],
@@ -26,6 +26,11 @@ let package = Package(
     targets: [
         .target(name: "RupuAPI"),
         .target(name: "RupuBackend", dependencies: ["RupuAPI"]),
+        // Workflow Builder (macOS design plan) Task 1: pure ordered
+        // YAML-value tree — no dependencies, mirrors `RupuUsageKit`'s
+        // no-deps shape. Everything else in the Builder module tree
+        // (`RupuBuilder`) depends on this for the workflow document model.
+        .target(name: "RupuFlowKit"),
         .target(name: "RupuDesign", exclude: ["Icons/svg"]),
         // Pure aggregation port (no View/Observation deps) — depends only on
         // `RupuAPI` for `APIUsageRunRow`, never on `RupuStore`, so `RupuStore`
@@ -85,11 +90,18 @@ let package = Package(
         // `SliceState` themselves live in `RupuStore` (already a
         // dependency), only the `FreshnessStrip` View is `RupuOverview`'s.
         .target(name: "RupuUsage", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuUsageKit", "RupuOverview"]),
+        // Workflow Builder (macOS design plan): originally a placeholder
+        // target (Task 1) so the umbrella product + `RupuShell` could gain
+        // the `RupuBuilder` dependency ahead of real content —
+        // `BuilderStore` (round-trip core, using the pre-wired `RupuStore`
+        // dependency for `PendingActions`/`ActionKey`) landed Task 9; the
+        // canvas UI lands in a later task.
+        .target(name: "RupuBuilder", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuFlowKit"]),
         .target(
             name: "RupuShell",
             dependencies: [
                 "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
-                "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsage",
+                "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsage", "RupuBuilder",
             ]
         ),
         // Task 8: the `MenuBarExtra` popover (`MenuBarStore` + `MenuBarView`)
@@ -151,6 +163,11 @@ let package = Package(
         .testTarget(
             name: "RupuLibraryTests",
             dependencies: ["RupuLibrary", "RupuAPI", "RupuStore", "RupuDesign"]
+        ),
+        .testTarget(name: "RupuFlowKitTests", dependencies: ["RupuFlowKit"]),
+        .testTarget(
+            name: "RupuBuilderTests",
+            dependencies: ["RupuBuilder", "RupuFlowKit", "RupuAPI", "RupuStore", "RupuDesign"]
         ),
     ]
 )
