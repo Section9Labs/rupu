@@ -298,10 +298,14 @@ fn config_section_for_kind(kind: &str) -> &'static str {
 /// `config_kind` is the account's genuinely declared `kind` — checked
 /// under both `[providers.<account>]` and `[scm.<account>]` (`None` if
 /// neither section declares the account, or declares it with no `kind`
-/// key) — **not** a name-derived guess. Keeping those two sources apart
-/// matters for the error messages below: a real config declaration can
-/// be told "edit this file to change it"; a name that merely happens to
-/// match a vendor has no file to point at.
+/// key) — **not** a name-derived guess. `config_kind_section` names
+/// which of the two sections it actually came from (`"providers"` or
+/// `"scm"`), so the conflict error below can point at the real table on
+/// disk rather than re-deriving a section from `kind` via
+/// `config_section_for_kind` — those two can disagree for an account
+/// stranded under `[providers.<account>]` by a pre-Task-7 `auth login`
+/// (see `login`'s migration comment), and pointing the user at a
+/// section their file doesn't contain would be unfollowable.
 ///
 /// Precedence:
 /// 1. `--kind` given and it conflicts with a genuine config
@@ -326,6 +330,7 @@ fn resolve_login_kind(
     account: &str,
     kind_arg: Option<&str>,
     config_kind: Option<&str>,
+    config_kind_section: Option<&str>,
     cfg_path: &Path,
 ) -> anyhow::Result<String> {
     let name_is_vendor = rupu_auth::ProviderId::from_vendor_str(account).is_some();
@@ -334,7 +339,7 @@ fn resolve_login_kind(
         (Some(k), Some(d)) if k != d => anyhow::bail!(
             "account '{account}' is already declared with kind \"{d}\"; \
              remove [{}.{account}] from {} to change it",
-            config_section_for_kind(d),
+            config_kind_section.unwrap_or_else(|| config_section_for_kind(d)),
             cfg_path.display()
         ),
         (Some(k), Some(_)) => Ok(k.to_string()),
@@ -368,20 +373,32 @@ async fn login(
     // The genuine config declaration, if any — kept apart from any
     // name-derived vendor guess. See `resolve_login_kind`'s doc comment
     // for why the two sources can't be conflated. Checked under both
-    // `[providers.<account>]` and `[scm.<account>]`: which one a given
-    // account lives under depends on its `kind` (`config_section_for_kind`),
-    // and at this point in `login` the kind isn't resolved yet.
-    let config_kind = cfg
-        .providers
+    // `[providers.<account>]` and `[scm.<account>]`, `providers` first:
+    // which one a given account lives under depends on its `kind`
+    // (`config_section_for_kind`), and at this point in `login` the
+    // kind isn't resolved yet. `config_kind_section` records which
+    // section actually answered, independent of where a fresh
+    // declaration for the resolved `kind` *should* go — see the
+    // migration branch below, which is exactly the case where those
+    // two disagree.
+    let providers_kind = cfg.providers.get(account).and_then(|p| p.kind.as_deref());
+    let scm_kind = cfg
+        .scm
+        .platforms
         .get(account)
-        .and_then(|p| p.kind.as_deref())
-        .or_else(|| {
-            cfg.scm
-                .platforms
-                .get(account)
-                .and_then(|p| p.kind.as_deref())
-        });
-    let kind = resolve_login_kind(account, kind_arg, config_kind, &cfg_path)?;
+        .and_then(|p| p.kind.as_deref());
+    let (config_kind, config_kind_section) = match (providers_kind, scm_kind) {
+        (Some(k), _) => (Some(k), Some("providers")),
+        (None, Some(k)) => (Some(k), Some("scm")),
+        (None, None) => (None, None),
+    };
+    let kind = resolve_login_kind(
+        account,
+        kind_arg,
+        config_kind,
+        config_kind_section,
+        &cfg_path,
+    )?;
 
     // Persist the declaration so every later resolver call knows this
     // account exists. Skipped when the account name IS the vendor —
@@ -396,6 +413,24 @@ async fn login(
         let section = config_section_for_kind(&kind);
         declare_account_in_config(&cfg_path, section, account, &kind)?;
         println!("rupu: declared [{section}.{account}] kind = \"{kind}\"");
+    } else if config_kind_section == Some("providers") && config_section_for_kind(&kind) == "scm" {
+        // Migration: an account declared before this fix (or by hand)
+        // sits under `[providers.<account>]` with a github/gitlab kind
+        // — invisible to `rupu_scm::Registry::discover`, which only
+        // ever reads `cfg.scm.platforms` (see `declare_account_in_config`'s
+        // doc comment). Re-running the identical `auth login` command
+        // must repair this rather than silently re-store the credential
+        // and say nothing: self-heal by also writing the `[scm.<account>]`
+        // table. The stale `[providers.<account>]` entry is left in
+        // place (harmless dead data, never consulted by anything once
+        // `[scm.<account>]` exists) rather than deleted, since this
+        // function only ever adds tables, never removes them.
+        crate::paths::ensure_dir(&global)?;
+        declare_account_in_config(&cfg_path, "scm", account, &kind)?;
+        println!(
+            "rupu: migrated stale declaration — added [scm.{account}] kind = \"{kind}\" \
+             (the old [providers.{account}] entry is unused now; safe to delete by hand)"
+        );
     }
 
     if kind == "openai-compatible" {
@@ -1337,7 +1372,7 @@ mod tests {
     fn resolve_login_kind_uses_explicit_flag_when_nothing_else_is_known() {
         let path = Path::new("/tmp/unused-config.toml");
         assert_eq!(
-            resolve_login_kind("oracle", Some("openai-compatible"), None, path).unwrap(),
+            resolve_login_kind("oracle", Some("openai-compatible"), None, None, path).unwrap(),
             "openai-compatible"
         );
     }
@@ -1346,7 +1381,14 @@ mod tests {
     fn resolve_login_kind_uses_config_declaration_when_no_flag_given() {
         let path = Path::new("/tmp/unused-config.toml");
         assert_eq!(
-            resolve_login_kind("anthropic-work", None, Some("anthropic"), path).unwrap(),
+            resolve_login_kind(
+                "anthropic-work",
+                None,
+                Some("anthropic"),
+                Some("providers"),
+                path
+            )
+            .unwrap(),
             "anthropic"
         );
     }
@@ -1355,7 +1397,7 @@ mod tests {
     fn resolve_login_kind_falls_back_to_the_account_name_as_vendor() {
         let path = Path::new("/tmp/unused-config.toml");
         assert_eq!(
-            resolve_login_kind("anthropic", None, None, path).unwrap(),
+            resolve_login_kind("anthropic", None, None, None, path).unwrap(),
             "anthropic"
         );
     }
@@ -1369,7 +1411,7 @@ mod tests {
         let path = Path::new("/tmp/unused-config.toml");
         for vendor in ["github", "gitlab", "linear", "jira"] {
             assert_eq!(
-                resolve_login_kind(vendor, None, None, path).unwrap(),
+                resolve_login_kind(vendor, None, None, None, path).unwrap(),
                 vendor,
                 "vendor {vendor} should resolve via the account name"
             );
@@ -1379,18 +1421,46 @@ mod tests {
     #[test]
     fn resolve_login_kind_bails_when_neither_flag_nor_config_nor_name_resolve() {
         let path = Path::new("/tmp/unused-config.toml");
-        let err = resolve_login_kind("mystery-account", None, None, path).unwrap_err();
+        let err = resolve_login_kind("mystery-account", None, None, None, path).unwrap_err();
         assert!(err.to_string().contains("--kind"));
     }
 
     #[test]
     fn resolve_login_kind_errors_on_genuine_config_conflict_naming_the_config_file() {
         let path = Path::new("/tmp/some-config.toml");
-        let err = resolve_login_kind("anthropic-work", Some("openai"), Some("anthropic"), path)
-            .unwrap_err();
+        let err = resolve_login_kind(
+            "anthropic-work",
+            Some("openai"),
+            Some("anthropic"),
+            Some("providers"),
+            path,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("already declared"));
         assert!(msg.contains("some-config.toml"));
+        // The bail message must name the section the config actually
+        // uses (tracked, not re-derived from `kind`) — see
+        // `resolve_login_kind_conflict_names_the_scm_section_when_declared_there`
+        // for the case where the derived and tracked sections diverge.
+        assert!(msg.contains("[providers.anthropic-work]"), "got: {msg}");
+    }
+
+    /// The regression this whole fix round exists to close: when the
+    /// genuine declaration lives under `[scm.<account>]` (a github/gitlab
+    /// account), the conflict error must name `scm`, not re-derive
+    /// `providers` from the OLD kind via `config_section_for_kind` —
+    /// those two happen to agree for every LLM example above, which is
+    /// exactly why a dedicated SCM-shaped case is needed to catch a
+    /// regression back to the un-tracked derivation.
+    #[test]
+    fn resolve_login_kind_conflict_names_the_scm_section_when_declared_there() {
+        let path = Path::new("/tmp/some-config.toml");
+        let err = resolve_login_kind("gh-work", Some("gitlab"), Some("github"), Some("scm"), path)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[scm.gh-work]"), "got: {msg}");
+        assert!(!msg.contains("[providers.gh-work]"), "got: {msg}");
     }
 
     /// A name-derived conflict (the account name IS a vendor, and
@@ -1399,7 +1469,7 @@ mod tests {
     #[test]
     fn resolve_login_kind_errors_on_name_collision_without_naming_a_config_file() {
         let path = Path::new("/tmp/some-config.toml");
-        let err = resolve_login_kind("github", Some("gitlab"), None, path).unwrap_err();
+        let err = resolve_login_kind("github", Some("gitlab"), None, None, path).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("collide"));
         assert!(!msg.contains("some-config.toml"));

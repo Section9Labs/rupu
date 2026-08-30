@@ -29,6 +29,7 @@
 
 use assert_cmd::Command;
 use httpmock::prelude::*;
+use predicates::prelude::*;
 
 const WORK_REPO_BODY: &str = r#"[
   {
@@ -315,4 +316,68 @@ async fn arc2_walkthrough_ambiguity_error_names_candidates_and_fix() {
         stderr.contains("rupu scm bind --owner 'other/*' --account <name>"),
         "got: {stderr}"
     );
+}
+
+/// Migration: an account declared before the Task 7 `auth.rs` fix (or
+/// by hand) sits under `[providers.<account>]` with a github kind --
+/// invisible to `Registry::discover`, which only reads
+/// `cfg.scm.platforms`. Re-running the identical `auth login` command
+/// against that stale config must repair it rather than silently
+/// re-store the credential and say nothing: this pins that the repair
+/// actually lands on disk under `[scm.<account>]`, and that the account
+/// is then genuinely visible to `rupu scm accounts`.
+#[tokio::test]
+async fn auth_login_self_heals_an_account_stranded_under_providers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg_path = home.join("config.toml");
+
+    // Simulate a pre-fix declaration: exactly what the OLD
+    // `declare_account_in_config` (unconditionally `[providers.*]`)
+    // would have written for `auth login --account gh-work --kind
+    // github`.
+    std::fs::write(&cfg_path, "[providers.gh-work]\nkind = \"github\"\n").unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args([
+            "auth",
+            "login",
+            "--account",
+            "gh-work",
+            "--kind",
+            "github",
+            "--mode",
+            "api-key",
+            "--key",
+            "gh-work-token",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("migrated stale declaration"))
+        .stdout(predicate::str::contains("[scm.gh-work]"));
+
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    let v: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(
+        v["scm"]["gh-work"]["kind"].as_str(),
+        Some("github"),
+        "migration did not land [scm.gh-work] in the config:\n{text}"
+    );
+    // The stale table is left in place (never deleted), so both must
+    // now agree.
+    assert_eq!(v["providers"]["gh-work"]["kind"].as_str(), Some("github"));
+
+    // The account is now genuinely visible to `scm accounts`, not just
+    // present in the config text.
+    let assert = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["scm", "accounts"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("gh-work"), "got: {stdout}");
 }
