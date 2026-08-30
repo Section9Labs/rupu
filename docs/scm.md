@@ -187,6 +187,10 @@ Exactly one of `owner` (matched against the repo owner — `acme/*` or a bare `a
 4. **Sole account** — exactly one account of the repo's platform is configured, so nothing is ambiguous and no rule is needed. This is the back-compat guarantee: a single-account setup never sees any of this.
 5. **Error** — two or more accounts, no explicit selection, nothing matched.
 
+The first matching owner or path rule wins its tier — but if the account that rule names has no live connector **anywhere** (not merely for a different platform, see below), resolution stops right there with an error rather than falling through to a later tier. Before this existed, a rule for `acme/*` naming `gh-work` whose credential was missing/revoked/unrefreshable, with exactly one other account configured, silently resolved through the sole-account tier to that *other* account — a cross-identity misroute with no error at all. See "The unavailable-account error" below.
+
+This is distinct from a rule whose account IS live, just under a different platform than the current call needs — e.g. a path rule naming a GitHub account, evaluated while resolving a GitLab repo from the same directory. `[[scm.rules]]` entries have no platform of their own, so this is a legitimate, supported shape (per-directory routing for two different vendors), and it behaves exactly as it always has: the rule is skipped and the next rule, or a later tier, gets a chance.
+
 A rule naming an account that has no `[scm.<name>]` table logs a warning at config load (not an error — the account may be credential-only, e.g. a bare vendor name that needs no table), but a rule with both `owner` and `path`, or neither, is a hard config error naming the offending entry.
 
 Two commands have no repo to key on at all — `rupu repos list` and the `scm.repos.list` MCP tool — so there is nothing to disambiguate: they fan out across every configured account of the platform and return the union in one table, tagged by account.
@@ -203,6 +207,19 @@ no account rule matches other/thing
 ```
 
 Fix it either by adding a rule (`rupu scm bind --owner 'other/*' --account gh-work`) or by passing `--account` on that one invocation. `rupu scm accounts` shows the accounts named in the error and what, if anything, already routes to them.
+
+### The unavailable-account error
+
+A rule that matches — its `owner` or `path` glob fires — but names an account with no live connector under any platform errors instead of silently falling through to a different account:
+
+```
+the rule for `acme/*` names `gh-work`, which has no live connector for github
+  fix: rupu auth login --account gh-work
+```
+
+This is a different failure from the ambiguity error above: there, no rule fired at all. Here, one did, and named a specific account — falling through to whatever else happened to be configured would silently target a different identity than the rule chose, exactly the failure mode this whole rule engine exists to prevent. The fix line deliberately omits `--kind`: if `gh-work` is already declared (a stranded `[scm.gh-work]` table from an earlier login, say), `rupu auth login --account gh-work` reuses the declared kind on its own; if it isn't declared at all, `auth login` asks for `--kind` rather than the error guessing one and risking a rewrite of an unrelated, already-working account under the same name.
+
+A rule naming a **live** account that just happens to be of a different platform (see "Precedence" above) does not trigger this error — it isn't a misconfiguration, so it isn't reported as one.
 
 ### `rupu scm bind`
 
