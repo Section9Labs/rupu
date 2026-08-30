@@ -328,7 +328,10 @@ rupu integrates with GitHub and GitLab through a single embedded MCP
 server. Agents call typed tools (`scm.prs.diff`, `issues.get`, ...) and
 the right per-platform connector dispatches the call. See `docs/scm.md`
 for the full reference — including `--account`/`--kind` for a second
-account of the same platform (e.g. work vs. personal GitHub).
+account of the same platform (e.g. work vs. personal GitHub, or
+github.com alongside a GitHub Enterprise host) and `rupu scm bind` /
+`rupu scm accounts` for routing repos to the right one via
+`[[scm.rules]]`.
 
 ```bash
 # 1. Authenticate

@@ -30,6 +30,8 @@ rupu auth login --account anthropic-personal --kind anthropic --mode sso
 
 The first time a new account name is used with `--kind`, rupu writes `[providers.<account>] kind = "<kind>"` into `~/.rupu/config.toml` so every later resolution (agent frontmatter, `rupu auth status`, credential refresh) knows that account's vendor. `--kind` is only required the first time an account is created — after that it's inferred from the config entry. Point an agent at a specific account the same way you'd point it at any provider: `provider: anthropic-work` in the frontmatter.
 
+**Exception:** a `github` or `gitlab` account (e.g. `--account gh-work --kind github`) writes `[scm.<account>] kind = "<kind>"` instead — SCM accounts route repos/issues through `rupu-scm`'s account-selection rules, which only ever look at `[scm.*]`. Every other vendor, this document's examples included, lands in `[providers.*]` as described above. See `docs/scm.md`'s "Multi-account routing" section for the SCM side: rules, precedence, the ambiguity error, `rupu scm bind`, and `rupu scm accounts`.
+
 `--account` accepts `--provider` as an alias throughout this document's examples, for scripts and muscle memory from before this feature existed.
 
 ### Per-account API key env var

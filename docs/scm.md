@@ -137,6 +137,94 @@ clone_protocol = "https"
 - **`timeout_ms`** (`Option<u64>`): total per-request deadline for this platform's HTTP calls. Default: `30000`. `0` is treated as unset.
 - **`max_concurrency`** (`Option<usize>`): per-platform semaphore size. Defaults: github 8, gitlab 6.
 - **`clone_protocol`** (`"https" | "ssh"`): how `clone_to` reaches the remote. Default `https` (token embedded in the URL). `ssh` produces `git@<host>:<owner>/<repo>.git` and drops the token entirely — authentication is your SSH agent and `~/.ssh/config`. SSH clones shell out to the system `git` so host aliases, `IdentityFile`, `ProxyJump`, and agent forwarding apply; `git` must be on `PATH`. An unrecognized value logs a warning and falls back to `https`.
+- **`kind`** (`Option<String>`, `"github"` | `"gitlab"`): the vendor a *named* account talks to — see "Multi-account routing" below. `None` means the table name itself is the vendor (`[scm.github]`, `[scm.gitlab]`), which is why every example above needs no `kind` at all.
+
+## Multi-account routing
+
+A single GitHub account (or a single GitLab account) needs none of this: `[scm.github]` / `[scm.gitlab]` — or no `[scm.*]` config at all, just a stored credential — resolves exactly as shown above, unchanged. This section is for holding **two** accounts of the same platform: a work identity and a personal identity, or github.com alongside a GitHub Enterprise host.
+
+### Accounts
+
+`[scm.<name>]` is account-keyed, not platform-keyed. The table name is the identity (freeform — whatever you pass to `--account`); `kind` selects the vendor client:
+
+```toml
+[scm.gh-work]
+kind = "github"
+
+[scm.gh-personal]
+kind = "github"
+
+[scm.acme-ghe]
+kind = "github"
+base_url = "https://git.acme.internal/api/v3"    # GitHub Enterprise
+```
+
+A bare vendor name (`[scm.github]`, no `kind`) still works with zero change — the account name *is* the vendor, exactly as in the single-account examples above. This is the same identity-vs-vendor split Slice B-1 established for LLM providers; see `docs/providers.md`'s "Accounts vs. vendor kind" for the general mechanism. `rupu auth login --account <name> --kind github|gitlab --mode <api-key|sso>` declares the account (writing `[scm.<name>] kind = "<kind>"` into `~/.rupu/config.toml` the first time that name is used) and stores its credential in the same step — there is no separate "declare, then log in" step.
+
+Run `rupu scm accounts` to see every configured account, its kind, base_url, and which rules (below) point at it — the command an ambiguity error (below) tells you to run.
+
+### Rules
+
+With two accounts of the same platform, rupu needs to know which one serves a given repo. `[[scm.rules]]` supplies that:
+
+```toml
+[[scm.rules]]
+owner = "acme/*"
+account = "gh-work"
+
+[[scm.rules]]
+path = "~/Code/work/*"
+account = "gh-work"
+```
+
+Exactly one of `owner` (matched against the repo owner — `acme/*` or a bare `acme`) or `path` (matched against the caller's cwd — `~/Code/work/*`, `~` expands to `$HOME`) is set per rule; a rule with both or neither fails config validation. `rupu scm bind` (below) is the CLI shortcut for appending one.
+
+**Precedence**, highest first:
+
+1. **Explicit** — `--account <name>` on the command line, or an MCP `account` argument.
+2. **Owner rule** — the first `[[scm.rules]]` entry whose `owner` glob matches. This is the tier daemons rely on: a webhook payload or cron poll knows the repo owner but has no cwd.
+3. **Path rule** — the first entry whose `path` glob matches the current directory.
+4. **Sole account** — exactly one account of the repo's platform is configured, so nothing is ambiguous and no rule is needed. This is the back-compat guarantee: a single-account setup never sees any of this.
+5. **Error** — two or more accounts, no explicit selection, nothing matched.
+
+A rule naming an account that has no `[scm.<name>]` table logs a warning at config load (not an error — the account may be credential-only, e.g. a bare vendor name that needs no table), but a rule with both `owner` and `path`, or neither, is a hard config error naming the offending entry.
+
+Two commands have no repo to key on at all — `rupu repos list` and the `scm.repos.list` MCP tool — so there is nothing to disambiguate: they fan out across every configured account of the platform and return the union in one table, tagged by account.
+
+### The ambiguity error
+
+A *targeted* command (one naming a specific repo — `rupu issues list --repo`, `scm.repos.get`, …) against a repo no rule matches, with two or more candidate accounts, errors rather than silently guessing:
+
+```
+no account rule matches other/thing
+  configured github accounts: gh-personal, gh-work
+  fix: rupu scm bind --owner 'other/*' --account <name>
+  or:  pass --account <name>
+```
+
+Fix it either by adding a rule (`rupu scm bind --owner 'other/*' --account gh-work`) or by passing `--account` on that one invocation. `rupu scm accounts` shows the accounts named in the error and what, if anything, already routes to them.
+
+### `rupu scm bind`
+
+Sugar for appending `[[scm.rules]]` — writes via the same `toml_edit`-based atomic config writer `rupu auth login` uses, so comments and formatting in `config.toml` survive and a config that doesn't already parse as valid TOML is left untouched:
+
+```bash
+rupu scm bind --owner 'acme/*'        --account gh-work
+rupu scm bind --owner 'MrBrutti/*'    --account gh-personal
+rupu scm bind --path  '~/Code/work/*' --account gh-work
+```
+
+`--owner` and `--path` are mutually exclusive; exactly one is required alongside `--account`. Hand-editing `[[scm.rules]]` works identically — `scm bind` is a convenience, not the only way in.
+
+### The `--account` flag
+
+Every targeted SCM/issues command and the `scm.*`/`issues.*` MCP tools accept `--account <name>` (CLI) / `account` (MCP tool argument) to bypass the rule engine entirely for that one call — precedence tier 1 above. Useful for a one-off against an account the rules don't cover yet, without editing config first:
+
+```bash
+rupu issues list --repo github:other/thing --account gh-work
+```
+
+An unconfigured `--account` name errors immediately (`no such account: ...`, listing what *is* configured) rather than silently falling back to some other account.
 
 ## Concurrency, caching, retry
 
