@@ -1214,7 +1214,12 @@ impl Registry {
         self.accounts
             .get(&AccountId::new("github"))
             .and_then(|a| a.github_extras.clone())
-            .or_else(|| self.accounts.values().find_map(|a| a.github_extras.clone()))
+            .or_else(|| {
+                self.accounts
+                    .values()
+                    .filter(|a| a.kind == Platform::Github)
+                    .find_map(|a| a.github_extras.clone())
+            })
     }
 
     /// Returns the per-platform extras handle for GitLab pipeline
