@@ -1,26 +1,6 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-// Package-level cross-module optimization is on by default for release
-// builds of a multi-target package (SwiftPM passes `-enable-default-cmo`
-// alongside `-package-name`). Under Xcode 16.4 that makes `swift-frontend`
-// crash while deserializing a protocol conformance out of a sibling module's
-// `.swiftmodule` — `ProtocolConformanceDeserializer::
-// readNormalProtocolConformanceXRef` — which took down the `v0.76.0-beta.1`
-// release build of `RupuShell` (the target that gained `RupuBuilder` in #625,
-// giving it the widest cross-module fan-in in the package).
-//
-// The crash is Release-only, so the PR gate never sees it: `make macos-test`
-// and CI's `macos-app` job build Debug, where CMO is off. Only
-// `make macos-release` hits it.
-//
-// Disabling CMO costs some cross-module inlining and nothing else — it is not
-// a semantic change. Applied to every library target rather than just
-// `RupuShell` so a later dependency edge cannot silently reintroduce the
-// crash in a different module, at the cost of another release cycle to find
-// out. Revisit when the app's Xcode pin moves past 16.4.
-let cmoOff: [SwiftSetting] = [.unsafeFlags(["-disable-cmo"], .when(configuration: .release))]
-
 let package = Package(
     name: "RupuKit",
     platforms: [.macOS(.v14)],
@@ -44,14 +24,14 @@ let package = Package(
         .package(url: "https://github.com/smittytone/HighlighterSwift", exact: "3.1.0")
     ],
     targets: [
-        .target(name: "RupuAPI", swiftSettings: cmoOff),
-        .target(name: "RupuBackend", dependencies: ["RupuAPI"], swiftSettings: cmoOff),
+        .target(name: "RupuAPI"),
+        .target(name: "RupuBackend", dependencies: ["RupuAPI"]),
         // Workflow Builder (macOS design plan) Task 1: pure ordered
         // YAML-value tree — no dependencies, mirrors `RupuUsageKit`'s
         // no-deps shape. Everything else in the Builder module tree
         // (`RupuBuilder`) depends on this for the workflow document model.
-        .target(name: "RupuFlowKit", swiftSettings: cmoOff),
-        .target(name: "RupuDesign", exclude: ["Icons/svg"], swiftSettings: cmoOff),
+        .target(name: "RupuFlowKit"),
+        .target(name: "RupuDesign", exclude: ["Icons/svg"]),
         // Pure aggregation port (no View/Observation deps) — depends only on
         // `RupuAPI` for `APIUsageRunRow`, never on `RupuStore`, so `RupuStore`
         // (which owns `UsageStore.swift`, the consumer) can depend on THIS
@@ -64,7 +44,7 @@ let package = Package(
         // depended on circularly by) the screen target — see
         // `UsageAggregation.swift`'s file-header doc comment for the full
         // rationale.
-        .target(name: "RupuUsageKit", dependencies: ["RupuAPI"], swiftSettings: cmoOff),
+        .target(name: "RupuUsageKit", dependencies: ["RupuAPI"]),
         // Phase 6B, Task 6: Situation Room's pure derivations (line-by-line
         // Swift port of `crates/rupu-cp/web/src/lib/situationRoom/{cards,
         // roster}.ts`) — a pure aggregation module in the same spirit as
@@ -82,23 +62,22 @@ let package = Package(
         // (a `RupuStore` -> `RupuSituation` edge would cycle the graph) and
         // how its own `eventsPerMin`/`spark` avoid needing this module's
         // `EventRateRing` as a result.
-        .target(name: "RupuSituation", dependencies: ["RupuAPI", "RupuDesign", "RupuStore"], swiftSettings: cmoOff),
-        .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign", "RupuUsageKit"], swiftSettings: cmoOff),
-        .target(name: "RupuActivity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
+        .target(name: "RupuSituation", dependencies: ["RupuAPI", "RupuDesign", "RupuStore"]),
+        .target(name: "RupuStore", dependencies: ["RupuAPI", "RupuBackend", "RupuDesign", "RupuUsageKit"]),
+        .target(name: "RupuActivity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         .target(
             name: "RupuRunDetail",
             dependencies: [
                 "RupuAPI", "RupuStore", "RupuDesign",
                 .product(name: "Highlighter", package: "HighlighterSwift"),
-            ],
-            swiftSettings: cmoOff
+            ]
         ),
-        .target(name: "RupuLauncher", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
-        .target(name: "RupuOverview", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
-        .target(name: "RupuProjects", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
-        .target(name: "RupuFleet", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
-        .target(name: "RupuLibrary", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
-        .target(name: "RupuSecurity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
+        .target(name: "RupuLauncher", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(name: "RupuOverview", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(name: "RupuProjects", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(name: "RupuFleet", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(name: "RupuLibrary", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
+        .target(name: "RupuSecurity", dependencies: ["RupuAPI", "RupuStore", "RupuDesign"]),
         // The Usage screen (Phase 5B, Task 6) — depends on `RupuUsageKit`
         // directly (for `UsagePivot`/`PivotRow`/`SpendBucket`/
         // `aggregateRows`/`buildSpendTimeline`, used to drive the pivot
@@ -110,21 +89,20 @@ let package = Package(
         // explicit ask) rather than forking a parallel one; `HostSlice`/
         // `SliceState` themselves live in `RupuStore` (already a
         // dependency), only the `FreshnessStrip` View is `RupuOverview`'s.
-        .target(name: "RupuUsage", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuUsageKit", "RupuOverview"], swiftSettings: cmoOff),
+        .target(name: "RupuUsage", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuUsageKit", "RupuOverview"]),
         // Workflow Builder (macOS design plan): originally a placeholder
         // target (Task 1) so the umbrella product + `RupuShell` could gain
         // the `RupuBuilder` dependency ahead of real content —
         // `BuilderStore` (round-trip core, using the pre-wired `RupuStore`
         // dependency for `PendingActions`/`ActionKey`) landed Task 9; the
         // canvas UI lands in a later task.
-        .target(name: "RupuBuilder", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuFlowKit"], swiftSettings: cmoOff),
+        .target(name: "RupuBuilder", dependencies: ["RupuAPI", "RupuStore", "RupuDesign", "RupuFlowKit"]),
         .target(
             name: "RupuShell",
             dependencies: [
                 "RupuAPI", "RupuBackend", "RupuStore", "RupuDesign", "RupuActivity", "RupuRunDetail", "RupuLauncher", "RupuOverview",
                 "RupuProjects", "RupuFleet", "RupuLibrary", "RupuSecurity", "RupuUsage", "RupuBuilder",
-            ],
-            swiftSettings: cmoOff
+            ]
         ),
         // Task 8: the `MenuBarExtra` popover (`MenuBarStore` + `MenuBarView`)
         // reuses `deriveNeedsYou`/`NeedsYouItem` (not duplicated) — those
@@ -134,7 +112,7 @@ let package = Package(
         // edge), so this target no longer needs `RupuOverview` at all — just
         // the usual `RupuAPI`/`RupuStore`/`RupuDesign` trio every other
         // screen module depends on.
-        .target(name: "RupuMenuBar", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign"], swiftSettings: cmoOff),
+        .target(name: "RupuMenuBar", dependencies: ["RupuAPI", "RupuBackend", "RupuStore", "RupuDesign"]),
         .testTarget(name: "RupuAPITests", dependencies: ["RupuAPI"]),
         .testTarget(name: "RupuBackendTests", dependencies: ["RupuBackend", "RupuAPI"]),
         .testTarget(name: "RupuDesignTests", dependencies: ["RupuDesign"]),
