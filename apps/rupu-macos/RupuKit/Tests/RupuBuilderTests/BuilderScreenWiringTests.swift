@@ -39,12 +39,21 @@ import RupuDesign
 
 // MARK: - railTab(afterSelecting:current:)
 
+// `WorkflowBuilderScreen` is a SwiftUI View and therefore `@MainActor`, so
+// its static helpers inherit that isolation. Swift Testing runs `@Test`
+// funcs in a nonisolated context by default, which makes a synchronous call
+// to one of them a hard error rather than a warning. These two tests are the
+// only ones in this file that touch the view type — the `validDotTone` ones
+// above call a free function — so the annotation goes here rather than on
+// the whole suite.
+@MainActor
 @Test func selectingANodeFlipsRailToStep() {
     #expect(WorkflowBuilderScreen.railTab(afterSelecting: "step1", current: .blocks) == .step)
     #expect(WorkflowBuilderScreen.railTab(afterSelecting: "step1", current: .settings) == .step)
     #expect(WorkflowBuilderScreen.railTab(afterSelecting: "step1", current: .step) == .step)
 }
 
+@MainActor
 @Test func clearingSelectionLeavesTheCurrentTabUntouched() {
     // Esc / deselect never forces the rail back to Blocks — mirrors the web
     // editor, which only navigates the panel on an explicit tab click.
