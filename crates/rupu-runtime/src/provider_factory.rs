@@ -257,6 +257,40 @@ pub fn is_builtin_provider(name: &str) -> bool {
     )
 }
 
+/// True when this factory can build a client for the provider `name` given
+/// the declared `[providers.*]` map — i.e. when
+/// [`build_for_provider_with_config`]'s `match kind { .. }` will land on a
+/// real arm rather than fall through to [`FactoryError::UnknownProvider`].
+///
+/// Two ways to be dispatchable, and a name only needs one:
+/// 1. its resolved *vendor kind* ([`resolve_kind`]) is a builtin the factory
+///    builds directly — which covers both a bare builtin name (`anthropic`)
+///    and a **named account** declaring that vendor
+///    (`[providers.anthropic-work] kind = "anthropic"`, exactly what
+///    `rupu auth login --account anthropic-work --kind anthropic` writes);
+/// 2. it declares a complete `kind = "openai-compatible"` endpoint
+///    ([`openai_compatible_params`]).
+///
+/// Order matters only in that both are checked: `openai-compatible` is NOT a
+/// builtin kind, so branch 1 rejects it and branch 2 must carry it — that
+/// path is unchanged from before named accounts were dispatchable. A
+/// half-declared `kind = "openai-compatible"` with no `base_url` yields no
+/// params and stays undispatchable, so its error message is preserved too.
+///
+/// Exists so callers that need to *reject early* (the `rupu run` pre-flight
+/// check, which fails before any credential lookup) ask the factory rather
+/// than re-deriving the rule — a second copy that can disagree with this one
+/// is exactly how a declared account came to be rejected in the first place.
+pub fn is_dispatchable_provider(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> bool {
+    if resolve_kind(name, providers).is_some_and(|k| is_builtin_provider(&k)) {
+        return true;
+    }
+    openai_compatible_params(name, providers).is_some()
+}
+
 #[derive(Debug, Error)]
 pub enum FactoryError {
     #[error(
@@ -267,7 +301,19 @@ pub enum FactoryError {
         provider: String,
         source: anyhow::Error,
     },
-    #[error("unknown provider: {0}")]
+    /// Names BOTH remedies deliberately: the caller cannot know which of the
+    /// two the user meant, and a name reaches this arm for either reason —
+    /// an account whose vendor `kind` was never declared, or an
+    /// openai-compatible endpoint that was never declared (or declared
+    /// without a `base_url`). Saying only one of them sends half the users
+    /// down the wrong path.
+    #[error(
+        "unknown provider '{0}': it is not a built-in vendor name, no \
+         [providers.{0}] declares its vendor kind (declare one with \
+         `rupu auth login --account {0} --kind <vendor>`), and it is not \
+         declared as an openai-compatible endpoint ([providers.{0}] with \
+         kind = \"openai-compatible\" and a base_url) in config.toml"
+    )]
     UnknownProvider(String),
     #[error("provider {0} is not wired in v0; only `anthropic` is currently supported")]
     NotWiredInV0(String),
@@ -1284,5 +1330,237 @@ mod decorate_kind_tests {
 
         release.notify_one();
         handle_a.await.unwrap();
+    }
+}
+
+/// The multi-account gate: a provider name that is not a builtin vendor name
+/// must still be dispatchable when its account declares a vendor `kind`.
+///
+/// `InMemoryResolver` deliberately only knows builtin vendor names, so these
+/// tests use a permissive local resolver — the point under test is which
+/// client the `match kind { .. }` arm builds for a genuinely *named* account,
+/// not credential lookup (which `KeychainResolver::get_named` already covers).
+#[cfg(test)]
+mod named_account_dispatch_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rupu_providers::auth::AuthCredentials;
+    use rupu_providers::AuthMode;
+    use std::collections::BTreeMap;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Hands back the same API key for any account name — including names
+    /// `rupu_auth::in_memory::InMemoryResolver` refuses to parse.
+    struct AnyAccountResolver;
+
+    #[async_trait]
+    impl rupu_auth::CredentialResolver for AnyAccountResolver {
+        async fn get(
+            &self,
+            _provider: &str,
+            _hint: Option<AuthMode>,
+        ) -> anyhow::Result<(AuthMode, AuthCredentials)> {
+            Ok((
+                AuthMode::ApiKey,
+                AuthCredentials::ApiKey {
+                    key: "sk-test-any".to_string(),
+                },
+            ))
+        }
+
+        async fn refresh(
+            &self,
+            _provider: &str,
+            _mode: AuthMode,
+        ) -> anyhow::Result<AuthCredentials> {
+            unreachable!("tests never refresh")
+        }
+    }
+
+    async fn build(
+        name: &str,
+        config: ProviderConfig,
+    ) -> Result<Box<dyn LlmProvider>, FactoryError> {
+        build_for_provider_with_config(
+            name,
+            "some-model",
+            None,
+            &AnyAccountResolver,
+            &config,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await
+        .map(|(_mode, p)| p)
+    }
+
+    fn declared(name: &str, kind: &str) -> BTreeMap<String, rupu_config::ProviderConfig> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            name.to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some(kind.to_string()),
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    #[tokio::test]
+    async fn a_named_anthropic_account_builds_an_anthropic_client() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let providers = declared("anthropic-work", "anthropic");
+        let p = build(
+            "anthropic-work",
+            ProviderConfig {
+                kind: resolve_kind("anthropic-work", &providers),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("named anthropic account should build");
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::Anthropic);
+    }
+
+    #[tokio::test]
+    async fn a_named_openai_account_builds_an_openai_client() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let providers = declared("openai-work", "openai");
+        let p = build(
+            "openai-work",
+            ProviderConfig {
+                kind: resolve_kind("openai-work", &providers),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("named openai account should build");
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::OpenaiCodex);
+    }
+
+    /// The openai-compatible path must keep winning where it applies today:
+    /// its kind is not a dispatchable builtin, so it lands on the `_` arm and
+    /// is satisfied by `config.openai_compatible`.
+    #[tokio::test]
+    async fn an_openai_compatible_account_still_builds_that_client() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "oracle".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://127.0.0.1:9".into()),
+                default_model: Some("glm".into()),
+                ..Default::default()
+            },
+        );
+        let p = build(
+            "oracle",
+            ProviderConfig {
+                kind: resolve_kind("oracle", &providers),
+                openai_compatible: openai_compatible_params("oracle", &providers),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("openai-compatible account should build");
+        assert_eq!(
+            p.provider_id(),
+            rupu_providers::ProviderId::OpenaiCompatible
+        );
+    }
+
+    /// A builtin name with no config at all is untouched by any of this.
+    #[tokio::test]
+    async fn a_builtin_name_is_unaffected() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let empty = BTreeMap::new();
+        let p = build(
+            "anthropic",
+            ProviderConfig {
+                kind: resolve_kind("anthropic", &empty),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("builtin should build");
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::Anthropic);
+    }
+
+    /// Neither a builtin, nor a declared account, nor an openai-compatible
+    /// endpoint: still an error, and the message must name BOTH remedies —
+    /// the user does not know which of the two they forgot.
+    #[tokio::test]
+    async fn an_unknown_name_errors_naming_both_remedies() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let empty = BTreeMap::new();
+        let result = build(
+            "typo-provider",
+            ProviderConfig {
+                kind: resolve_kind("typo-provider", &empty),
+                ..Default::default()
+            },
+        )
+        .await;
+        // Not `expect_err`: `Box<dyn LlmProvider>` isn't `Debug`.
+        let Err(err) = result else {
+            panic!("undeclared provider must error");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("typo-provider"), "names the provider: {msg}");
+        assert!(
+            msg.contains("rupu auth login"),
+            "remedy 1 — declare the account's vendor kind: {msg}"
+        );
+        assert!(
+            msg.contains("openai-compatible"),
+            "remedy 2 — declare an openai-compatible endpoint: {msg}"
+        );
+    }
+
+    #[test]
+    fn is_dispatchable_covers_builtins_named_accounts_and_openai_compatible() {
+        let empty = BTreeMap::new();
+        // Builtin vendor names, with no config at all.
+        assert!(is_dispatchable_provider("anthropic", &empty));
+        assert!(is_dispatchable_provider("copilot", &empty));
+        // A named account declaring a dispatchable vendor kind.
+        assert!(is_dispatchable_provider(
+            "anthropic-work",
+            &declared("anthropic-work", "anthropic")
+        ));
+        assert!(is_dispatchable_provider(
+            "openai-work",
+            &declared("openai-work", "openai")
+        ));
+        // A complete openai-compatible declaration.
+        let mut oai = BTreeMap::new();
+        oai.insert(
+            "oracle".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://127.0.0.1:9".into()),
+                ..Default::default()
+            },
+        );
+        assert!(is_dispatchable_provider("oracle", &oai));
+        // Undeclared, and a `kind = "openai-compatible"` with no `base_url`
+        // (which yields no params, so nothing can be built from it).
+        assert!(!is_dispatchable_provider("typo-provider", &empty));
+        assert!(!is_dispatchable_provider(
+            "half-declared",
+            &declared("half-declared", "openai-compatible")
+        ));
+        // A kind rupu-config accepts but this factory never dispatches on.
+        assert!(!is_dispatchable_provider(
+            "gh-work",
+            &declared("gh-work", "github")
+        ));
     }
 }
