@@ -514,6 +514,13 @@
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this tracker (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "limit": {
           "description": "Maximum comments to return. The thread is walked and returned oldest-first, so a `limit` below the thread's true length drops the NEWEST comments, not the oldest. Omitting `limit` returns at most the oldest 100 comments. Hard ceiling: 5000 comments, regardless of `limit`.",
           "format": "uint32",

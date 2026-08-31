@@ -52,6 +52,10 @@ pub struct ListCommentsArgs {
     pub number: u64,
     /// Maximum comments to return. The thread is walked and returned oldest-first, so a `limit` below the thread's true length drops the NEWEST comments, not the oldest. Omitting `limit` returns at most the oldest 100 comments. Hard ceiling: 5000 comments, regardless of `limit`.
     pub limit: Option<u32>,
+    /// Which configured account to use, when more than one is configured
+    /// for this tracker (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -162,14 +166,18 @@ pub async fn dispatch_comments(args: Value, reg: &Registry) -> Result<String, Mc
     let parsed: ListCommentsArgs =
         serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
     let tracker = resolve_tracker(parsed.tracker.as_deref(), reg)?;
+    // Derive the RepoRef before `project` is moved into the IssueRef: for
+    // a repo-backed tracker it is what lets the owner rule tier fire, and
+    // dropping it here would reproduce the account-arbitrary behaviour the
+    // deleted `issues(tracker)` shim had.
+    let repo = project_repo(tracker, &parsed.project);
     let r = IssueRef {
         tracker,
         project: parsed.project,
         number: parsed.number,
     };
-    let conn = reg
-        .issues(tracker)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {tracker}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.issues_for(tracker, repo.as_ref(), None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.list_comments(&r, parsed.limit).await?).unwrap())
 }
 
