@@ -166,6 +166,93 @@ async fn resolver_for_reads_two_distinct_sso_accounts_of_the_same_kind() {
     token_mock.assert();
 }
 
+/// The SCM counterpart of the test above (arc progress ledger, Ruling 7):
+/// `rupu_scm::Registry::discover` is the first code in the tree to call
+/// `resolver.get(<name>, ..)` for a *non-vendor* SCM account name — but
+/// `rupu_cli::accounts::account_specs` originally read `cfg.providers`
+/// only, so a declared `[scm.gh-work]` account never became an
+/// `AccountSpec` and its SSO token could never refresh. Same
+/// discriminator as above: `refresh` is the one operation that requires
+/// `resolve_provider_id("gh-work", ..)` to actually resolve.
+#[tokio::test]
+async fn resolver_for_reads_a_declared_scm_accounts_sso_credential() {
+    let _guard = ENV_LOCK.lock().await;
+    let _auth_env = EnvVarGuard::unset("RUPU_AUTH_FILE");
+    let _oauth_env = EnvVarGuard::unset("RUPU_OAUTH_TOKEN_URL_OVERRIDE");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let auth_path = tmp.path().join("auth.json");
+    std::env::set_var("RUPU_AUTH_FILE", &auth_path);
+
+    // A single named GitHub account, declared under `[scm.gh-work]` —
+    // the shape a two-GitHub-account user's config actually takes.
+    let mut cfg = rupu_config::Config::default();
+    cfg.scm.platforms.insert(
+        "gh-work".into(),
+        rupu_config::ScmPlatformConfig {
+            kind: Some("github".into()),
+            ..Default::default()
+        },
+    );
+
+    let resolver = rupu_cli::accounts::resolver_for(&cfg);
+
+    // Store the SSO credential directly under `<name>/sso`, matching
+    // exactly what `rupu auth login --account gh-work --kind github
+    // --mode sso` writes.
+    let work_sso = StoredCredential {
+        credentials: AuthCredentials::OAuth {
+            access: "gh-work-token".into(),
+            refresh: "gh-work-refresh".into(),
+            expires: 0,
+            extra: Default::default(),
+        },
+        refresh_token: Some("gh-work-refresh".into()),
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::days(30)),
+    };
+    resolver
+        .store_named("gh-work", AuthMode::Sso, &work_sso)
+        .await
+        .unwrap();
+
+    let (mode, creds) = resolver.get("gh-work", None).await.unwrap();
+    assert_eq!(mode, AuthMode::Sso, "gh-work must resolve SSO");
+    assert!(
+        matches!(creds, AuthCredentials::OAuth { ref access, .. } if access == "gh-work-token"),
+        "gh-work resolved the wrong credential: {creds:?}"
+    );
+
+    // ── The discriminator ────────────────────────────────────────────
+    // Same reasoning as the LLM-provider test above: `refresh` only
+    // reaches the network (and this mocked 500) once `resolve_provider_id`
+    // has resolved "gh-work" to a `ProviderId`, which requires the
+    // `[scm.gh-work]` account to have become an `AccountSpec`.
+    let server = MockServer::start();
+    let token_mock = server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(500);
+    });
+    std::env::set_var("RUPU_OAUTH_TOKEN_URL_OVERRIDE", server.url("/token"));
+
+    let refresh_err = resolver
+        .refresh("gh-work", AuthMode::Sso)
+        .await
+        .expect_err("refresh must fail (mocked 500), but must reach the network to do so");
+    let refresh_err_msg = refresh_err.to_string();
+    assert!(
+        !refresh_err_msg.contains("unknown provider or account"),
+        "refresh bailed on account resolution instead of reaching the network — \
+         `[scm.gh-work]` is NOT wired into `account_specs` (this is the exact \
+         gap Ruling 7 describes): {refresh_err_msg}"
+    );
+    assert!(
+        refresh_err_msg.contains("refresh failed for 'gh-work'")
+            && refresh_err_msg.contains("HTTP"),
+        "expected an HTTP-layer refresh failure naming the account, got: {refresh_err_msg}"
+    );
+    token_mock.assert();
+}
+
 /// RAII guard: removes an env var for the test's duration and restores
 /// whatever value (if any) was already there on drop, even on panic.
 /// Mirrors the identical guard in `crates/rupu-auth/tests/keychain_resolver.rs`.

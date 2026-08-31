@@ -28,6 +28,23 @@ impl PollSourceEntry {
             Self::Detailed(spec) => spec.poll_interval.as_deref(),
         }
     }
+
+    /// Explicit account override for this source (Arc 2 Task 6, spec
+    /// §6.5). Only the detailed inline-table form can carry one — the
+    /// bare-string form (`"linear:team-123"`) has nowhere to put it.
+    /// Repo-backed sources (`github:owner/repo`, `gitlab:group/project`)
+    /// infer their account from the owner via `[[scm.rules]]`, same as
+    /// any other repo-keyed operation, so this is rarely needed for
+    /// them; a tracker-native source (`linear:<team-id>`,
+    /// `jira:<project>`) has no owner to infer from at all, so this is
+    /// the only way to disambiguate one once more than one tracker
+    /// account of that kind is configured.
+    pub fn account(&self) -> Option<&str> {
+        match self {
+            Self::Source(_) => None,
+            Self::Detailed(spec) => spec.account.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +59,12 @@ pub struct PollSourceSpec {
     /// When unset, the source is eligible on every `rupu cron tick`
     /// event pass.
     pub poll_interval: Option<String>,
+    /// Explicit account override — see [`PollSourceEntry::account`]'s
+    /// doc. `#[serde(default)]` (inherited from the struct-level
+    /// attribute below) so an existing `config.toml` written before
+    /// this field existed keeps parsing unchanged: unset means "resolve
+    /// without an explicit account" exactly like today.
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -120,6 +143,33 @@ mod tests {
         assert_eq!(cfg.poll_sources[0].poll_interval(), Some("5m"));
         assert_eq!(cfg.poll_sources[1].source(), "gitlab:baz/qux");
         assert_eq!(cfg.poll_sources[1].poll_interval(), None);
+    }
+
+    #[test]
+    fn parses_inline_table_poll_source_with_account_override() {
+        let toml_str = r#"
+            poll_sources = [
+              { source = "linear:team-123", account = "linear-work" },
+              "linear:team-456",
+            ]
+        "#;
+        let cfg: TriggersConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.poll_sources[0].account(), Some("linear-work"));
+        // The bare-string form has nowhere to carry an account.
+        assert_eq!(cfg.poll_sources[1].account(), None);
+    }
+
+    #[test]
+    fn poll_source_without_account_field_still_parses() {
+        // Back-compat (Task 6 constraint): an existing config.toml
+        // written before `account` existed must keep parsing.
+        let toml_str = r#"
+            poll_sources = [
+              { source = "github:foo/bar", poll_interval = "5m" },
+            ]
+        "#;
+        let cfg: TriggersConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.poll_sources[0].account(), None);
     }
 
     #[test]

@@ -12,6 +12,29 @@ pub struct ScmSection {
     /// Keyed by lower-case platform name.
     #[serde(flatten, with = "platforms_serde")]
     pub platforms: BTreeMap<String, ScmPlatformConfig>,
+    /// Ordered account-selection rules. First match wins within a tier;
+    /// see `rupu_scm::rules::resolve_account` for the precedence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<ScmRule>,
+}
+
+/// One account-selection rule. Exactly one of `owner` / `path` is set;
+/// a rule with both, or neither, is a config error (validated in
+/// `Config::validate`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScmRule {
+    /// Owner glob, e.g. `acme/*` or `acme`. Matched against
+    /// `RepoRef.owner`. This is the form that works for daemons, which
+    /// know the owner but have no cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Filesystem path glob, e.g. `~/Code/work/*`. Matched against the
+    /// caller's cwd. Covers the interactive case before a remote is
+    /// known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The account this rule selects.
+    pub account: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +102,12 @@ pub struct IssuesDefault {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScmPlatformConfig {
+    /// The platform this account talks to (`github` / `gitlab`). `None`
+    /// means the account name IS the platform — the back-compat rule
+    /// from design spec §3.1, which is what keeps a pre-existing
+    /// `[scm.github]` table working with no edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,9 +140,80 @@ mod platforms_serde {
         d: D,
     ) -> Result<BTreeMap<String, ScmPlatformConfig>, D::Error> {
         let mut raw: BTreeMap<String, ScmPlatformConfig> = BTreeMap::deserialize(d)?;
-        // Drop the reserved key if it slipped through (it's typed
-        // separately on ScmSection.default).
+        // Drop the reserved keys if they slipped through (they're typed
+        // separately on ScmSection as `default` / `rules`). In practice
+        // serde's flatten routing already excludes any key matching a
+        // named sibling field before it reaches this map, so these are
+        // defensive no-ops — kept for symmetry and to document intent.
         raw.remove("default");
+        raw.remove("rules");
         Ok(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scm_account_declares_a_kind() {
+        let toml = r#"
+[gh-work]
+kind = "github"
+
+[acme-ghe]
+kind = "github"
+base_url = "https://git.acme.internal/api/v3"
+"#;
+        let sec: ScmSection = toml::from_str(toml).unwrap();
+        assert_eq!(
+            sec.platforms.get("gh-work").and_then(|p| p.kind.as_deref()),
+            Some("github")
+        );
+        assert_eq!(
+            sec.platforms
+                .get("acme-ghe")
+                .and_then(|p| p.base_url.as_deref()),
+            Some("https://git.acme.internal/api/v3")
+        );
+    }
+
+    /// Back-compat: `[scm.github]` with no `kind` is still valid — the
+    /// account name IS the platform, exactly as spec §3.1 does for LLM
+    /// providers.
+    #[test]
+    fn bare_platform_table_still_parses_without_kind() {
+        let sec: ScmSection = toml::from_str("[github]\ntimeout_ms = 5000\n").unwrap();
+        let gh = sec.platforms.get("github").unwrap();
+        assert_eq!(gh.kind, None);
+        assert_eq!(gh.timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn rules_parse_owner_and_path_forms() {
+        let toml = r#"
+[[rules]]
+owner = "acme/*"
+account = "gh-work"
+
+[[rules]]
+path = "~/Code/work/*"
+account = "gh-work"
+"#;
+        let sec: ScmSection = toml::from_str(toml).unwrap();
+        assert_eq!(sec.rules.len(), 2);
+        assert_eq!(sec.rules[0].owner.as_deref(), Some("acme/*"));
+        assert_eq!(sec.rules[0].account, "gh-work");
+        assert_eq!(sec.rules[1].path.as_deref(), Some("~/Code/work/*"));
+        assert!(sec.rules[1].owner.is_none());
+    }
+
+    /// `rules` is a reserved key like `default` — it must not be
+    /// swallowed by the flattened per-account map.
+    #[test]
+    fn rules_is_not_treated_as_an_account() {
+        let sec: ScmSection =
+            toml::from_str("[[rules]]\nowner = \"a/*\"\naccount = \"x\"\n").unwrap();
+        assert!(!sec.platforms.contains_key("rules"));
     }
 }

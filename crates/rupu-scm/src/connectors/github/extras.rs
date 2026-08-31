@@ -23,6 +23,22 @@ impl GithubExtras {
         self.client.fetch_token_scopes().await
     }
 
+    /// Exposes [`GithubClient::graphql_json`] without making the whole
+    /// client `pub`. Used by `rupu webhook serve`'s GitHub Projects
+    /// hydrator (Task 6): the hydrator resolves an `AccountId` via
+    /// `Registry::github_extras_for` per inbound payload (the payload
+    /// carries the org/owner), then runs its enrichment GraphQL queries
+    /// against that account's already-built client — no client gets
+    /// built per event, `Registry::discover` already built and cached
+    /// one per configured account at daemon startup.
+    pub async fn graphql_json(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<serde_json::Value, ScmError> {
+        self.client.graphql_json(query, variables).await
+    }
+
     pub async fn workflows_dispatch(
         &self,
         r: &RepoRef,

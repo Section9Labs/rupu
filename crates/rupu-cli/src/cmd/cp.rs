@@ -341,20 +341,27 @@ pub async fn handle(action: Action) -> ExitCode {
             // Repo lister for the web Run target picker. The same SCM registry
             // and repo lister feed the fleet strip's SCM half below — one
             // credential resolution, not two.
-            let scm_resolver = Arc::new(rupu_auth::resolver::KeychainResolver::new());
-            let scm_registry = {
+            // `cfg` is hoisted out of the registry block below purely so the
+            // resolver can be built from it: `resolver_for`, not a bare
+            // `KeychainResolver::new()`, so a declared `[scm.gh-work]`
+            // account becomes an `AccountSpec` and its SSO token can
+            // actually refresh (arc progress ledger, Ruling 7). This is the
+            // resolver backing BOTH `CpRepoLister` and the `cp_inventory`
+            // SCM sweep, so without it the Ruling 7 fix would be wired in
+            // `accounts.rs` yet inert everywhere `cp serve` runs.
+            let scm_cfg = {
                 let global_cfg = global_dir.join("config.toml");
-                let cfg =
-                    rupu_config::layer_files_locked(Some(&global_cfg), None).unwrap_or_default();
-                Arc::new(
-                    rupu_scm::Registry::discover(
-                        scm_resolver.as_ref(),
-                        &cfg,
-                        Arc::new(rupu_netflow::NullSink),
-                    )
-                    .await,
-                )
+                rupu_config::layer_files_locked(Some(&global_cfg), None).unwrap_or_default()
             };
+            let scm_resolver = Arc::new(crate::accounts::resolver_for(&scm_cfg));
+            let scm_registry = Arc::new(
+                rupu_scm::Registry::discover(
+                    scm_resolver.as_ref(),
+                    &scm_cfg,
+                    Arc::new(rupu_netflow::NullSink),
+                )
+                .await,
+            );
             let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> =
                 Arc::new(crate::cp_repos::CpRepoLister {
                     registry: Arc::clone(&scm_registry),

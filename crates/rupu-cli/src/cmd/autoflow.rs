@@ -32,7 +32,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use jsonschema::JSONSchema;
-use rupu_auth::{CredentialResolver, KeychainResolver};
+use rupu_auth::CredentialResolver;
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
@@ -1441,7 +1441,25 @@ pub async fn handle(
     absolute: bool,
     all_columns: bool,
 ) -> ExitCode {
-    let resolver: Arc<dyn CredentialResolver> = Arc::new(KeychainResolver::new());
+    // `resolver_for`, not a bare `KeychainResolver::new()` — see
+    // `crate::accounts`'s doc and `cmd/issues.rs`'s identical fix
+    // (Ruling 7): a declared `[scm.gh-work]` account's SSO token needs
+    // an `AccountSpec` to reach `get`'s near-expiry refresh branch, and
+    // autoflow subcommands (`autoflow serve` chief among them) are
+    // long-lived. Best-effort global+cwd-project config, matching
+    // `resolve_config`'s own shape — this is only the resolver's
+    // account roster; which repo's config a given polling *source*
+    // discovers against deeper in the call graph is the separate,
+    // deliberately-untouched per-source `Registry::discover` question.
+    let cfg = paths::global_dir()
+        .ok()
+        .map(|global| {
+            let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let project_root = paths::project_root_for(&pwd).ok().flatten();
+            resolve_config(&global, project_root.as_deref()).unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let resolver: Arc<dyn CredentialResolver> = Arc::new(crate::accounts::resolver_for(&cfg));
     let result = handle_with_resolver(action, resolver, global_format, absolute, all_columns).await;
     match result {
         Ok(()) => ExitCode::from(0),
@@ -9027,7 +9045,9 @@ fn source_matches_issue_ref(source: &str, issue_ref: &IssueRef) -> bool {
             }
             IssueTracker::Linear | IssueTracker::Jira => false,
         },
-        EventSourceRef::TrackerProject { tracker, project } => {
+        EventSourceRef::TrackerProject {
+            tracker, project, ..
+        } => {
             tracker == issue_ref.tracker
                 && match tracker {
                     IssueTracker::Jira => {
@@ -9090,7 +9110,9 @@ fn issue_ref_for_autoflow(
     if issue_ref.tracker != IssueTracker::Jira || !source_matches_issue_ref(source, issue_ref) {
         return Ok(issue_ref.clone());
     }
-    let Ok(EventSourceRef::TrackerProject { tracker, project }) = source.parse::<EventSourceRef>()
+    let Ok(EventSourceRef::TrackerProject {
+        tracker, project, ..
+    }) = source.parse::<EventSourceRef>()
     else {
         return Ok(issue_ref.clone());
     };
@@ -9581,12 +9603,32 @@ async fn enqueue_polled_wakes(
             rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
                 .await,
         );
-        let Some(connector) = registry.events_for_source(&event_source) else {
-            warn!(
-                source_ref,
-                "no event connector configured for autoflow wake polling"
-            );
-            continue;
+        // Shared with `cmd/cron.rs`'s `tick_polled_events`: the compact
+        // source string has nowhere to encode an account, so
+        // `account = "..."` (spec §6.5) travels as `events_for_source`'s
+        // `explicit` parameter instead — uniform across `Repo` and
+        // `TrackerProject` sources (Task 6 review item 2).
+        let explicit_account = source.account().map(rupu_scm::AccountId::new);
+        // `cwd: None` — an autoflow wake poll is a daemon caller exactly
+        // like `cron.rs`'s tick: no filesystem context to key a path
+        // rule on (spec §6.3/§6.5).
+        let (_account, connector) = match registry.events_for_source(
+            &event_source,
+            None,
+            explicit_account.as_ref(),
+        ) {
+            Ok(pair) => pair,
+            Err(rupu_scm::AccountError::NoAccounts { .. }) => {
+                warn!(
+                    source_ref,
+                    "no event connector configured for autoflow wake polling"
+                );
+                continue;
+            }
+            Err(err) => {
+                warn!(source_ref, error = %err, "account resolution failed for autoflow wake polling; skipping");
+                continue;
+            }
         };
         let cursor_file = autoflow_cursor_path(&cursors_root, &event_source);
         let cursor = read_cursor(&cursor_file).ok();
@@ -9674,9 +9716,22 @@ pub(crate) async fn collect_issue_matches(
             rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
                 .await,
         );
-        let Some(connector) = registry.issues(tracker) else {
-            warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, "skipping autoflow because no issue connector is configured");
-            continue;
+        // The owner is already in scope for `EventSourceRef::Repo`
+        // sources — computed here, before the connector lookup, so
+        // `issues_for` can run the owner/path rule engine instead of the
+        // old `registry.issues(tracker)` shim's lexicographically-first
+        // pick. `TrackerProject` sources genuinely have no owner (spec
+        // §6.2's issues_for doc); `None` is correct there, not a gap.
+        let repo_ref = match &source_ref {
+            EventSourceRef::Repo { repo } => Some(repo.clone()),
+            EventSourceRef::TrackerProject { .. } => None,
+        };
+        let connector = match registry.issues_for(tracker, repo_ref.as_ref(), None, None) {
+            Ok((_account, conn)) => conn,
+            Err(err) => {
+                warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping autoflow because no issue account resolved");
+                continue;
+            }
         };
 
         let filter = build_issue_filter(autoflow);
@@ -9693,12 +9748,11 @@ pub(crate) async fn collect_issue_matches(
         // connector for this source's repo (only `EventSourceRef::Repo`
         // sources have one; `TrackerProject` sources fail closed below).
         // Mirrors `select_eligible_prs`'s author gate exactly.
-        let repo_ref = match &source_ref {
-            EventSourceRef::Repo { repo } => Some(repo.clone()),
-            EventSourceRef::TrackerProject { .. } => None,
-        };
         let repo_connector = match &repo_ref {
-            Some(repo) => registry.repo(repo.platform),
+            Some(repo) => registry
+                .repo_for(repo, None, None)
+                .ok()
+                .map(|(_account, conn)| conn),
             None => None,
         };
         issues = filter_issues_by_author_allowlist(
@@ -10245,13 +10299,7 @@ pub(crate) async fn fetch_pr(
     let registry = Arc::new(
         rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink)).await,
     );
-    let connector = registry.repo(pr_ref.repo.platform).ok_or_else(|| {
-        anyhow!(
-            "no {} credential — run `rupu auth login --provider {}`",
-            pr_ref.repo.platform.as_str(),
-            pr_ref.repo.platform.as_str()
-        )
-    })?;
+    let (_account, connector) = registry.repo_for(&pr_ref.repo, None, None)?;
     let pr = connector
         .get_pr(pr_ref)
         .await
@@ -10353,9 +10401,12 @@ pub(crate) async fn collect_pr_matches(
             rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
                 .await,
         );
-        let Some(connector) = registry.repo(repo.platform) else {
-            warn!(source = %resolved.repo_ref, workflow = %resolved.name, "skipping PR autoflow because no repo connector is configured");
-            continue;
+        let connector = match registry.repo_for(&repo, None, None) {
+            Ok((_account, conn)) => conn,
+            Err(err) => {
+                warn!(source = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping PR autoflow because no repo account resolved");
+                continue;
+            }
         };
         let eligible = match select_eligible_prs(connector.as_ref(), claim_store, autoflow, &repo)
             .await
@@ -11953,13 +12004,25 @@ pub(crate) async fn fetch_issue(
     let registry = Arc::new(
         rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink)).await,
     );
-    let connector = registry.issues(issue_ref.tracker).ok_or_else(|| {
-        anyhow!(
-            "no {} credential — run `rupu auth login --provider {}`",
-            issue_ref.tracker,
-            issue_ref.tracker
-        )
-    })?;
+    // The owner is already in scope for GitHub/GitLab (`project` is
+    // `"owner/repo"`) — run the owner/path rule engine via `issues_for`
+    // instead of the old `registry.issues(tracker)` shim's
+    // lexicographically-first pick. Linear/Jira `project` is a
+    // workspace/board id, not `"owner/repo"`; `None` there is correct
+    // (see `Registry::issues_for`'s doc).
+    let issue_repo = match issue_ref.tracker {
+        rupu_scm::IssueTracker::Github => Some(rupu_scm::Platform::Github),
+        rupu_scm::IssueTracker::Gitlab => Some(rupu_scm::Platform::Gitlab),
+        rupu_scm::IssueTracker::Linear | rupu_scm::IssueTracker::Jira => None,
+    }
+    .zip(issue_ref.project.split_once('/'))
+    .map(|(platform, (owner, repo))| rupu_scm::RepoRef {
+        platform,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    });
+    let (_account, connector) =
+        registry.issues_for(issue_ref.tracker, issue_repo.as_ref(), None, None)?;
     connector
         .get_issue(issue_ref)
         .await
@@ -12020,7 +12083,9 @@ fn issue_discovery_target(source: &EventSourceRef) -> (IssueTracker, String) {
             },
             format!("{}/{}", repo.owner, repo.repo),
         ),
-        EventSourceRef::TrackerProject { tracker, project } => (*tracker, project.clone()),
+        EventSourceRef::TrackerProject {
+            tracker, project, ..
+        } => (*tracker, project.clone()),
     }
 }
 

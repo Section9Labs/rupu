@@ -6,6 +6,13 @@
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "account": {
+            "description": "Which configured account to fan out over, when more than one is configured for this platform (e.g. two GitHub accounts). Omit to list every configured account of `platform` at once — each repo in the response is tagged with the `account` that returned it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "platform": {
             "description": "Platform to query (`github` | `gitlab`). Omit to use [scm.default].",
             "type": [
@@ -25,6 +32,13 @@
       "input_schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "account": {
+            "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "from_sha": {
             "type": "string"
           },

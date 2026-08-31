@@ -494,7 +494,13 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    let resolver = rupu_auth::KeychainResolver::new();
+    // `resolver_for`, not a bare `KeychainResolver::new()` — see
+    // `crate::accounts`'s doc and `cmd/issues.rs`'s identical fix
+    // (Ruling 7): a declared `[scm.gh-work]` account's SSO token needs
+    // an `AccountSpec` to reach `get`'s near-expiry refresh branch, and
+    // this is a long-lived daemon (`cron serve`) that will outlive a
+    // token.
+    let resolver = crate::accounts::resolver_for(&cfg);
     let registry = Arc::new(
         rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
     );
@@ -521,13 +527,37 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                 warn!(source = %source_ref, error = %e, "invalid poll interval; polling anyway");
             }
         }
-        let Some(connector) = registry.events_for_source(&event_source) else {
-            info!(
-                source = %source_ref,
-                "no event connector configured for trigger source"
-            );
-            continue;
+        // The compact `source_ref` string has nowhere to encode an
+        // account, so `account = "..."` (spec §6.5, Task 6 review item
+        // 2) travels as `events_for_source`'s `explicit` parameter
+        // instead — the same three-arg shape `repo_for`/`issues_for`
+        // use, and uniform across `Repo` and `TrackerProject` sources
+        // alike (a repo-backed poll source can override its owner rule
+        // with this too, not just a tracker-native one).
+        let explicit_account = source.account().map(rupu_scm::AccountId::new);
+        // `cwd: None` — a cron poll has no filesystem context to key a
+        // path rule on any more than a webhook payload does (spec §6.3:
+        // "a webhook payload or cron poll knows the owner but has no
+        // cwd"); only the explicit/owner/sole-account tiers can fire.
+        let (account, connector) = match registry.events_for_source(
+            &event_source,
+            None,
+            explicit_account.as_ref(),
+        ) {
+            Ok(pair) => pair,
+            Err(rupu_scm::AccountError::NoAccounts { .. }) => {
+                info!(
+                    source = %source_ref,
+                    "no event connector configured for trigger source"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(source = %source_ref, error = %e, "account resolution failed for trigger source; skipping");
+                continue;
+            }
         };
+        debug!(source = %source_ref, account = %account.as_str(), "resolved account for trigger source");
 
         let cursor_file = cursor_path(&cursors_root, &event_source);
         let cursor = read_cursor(&cursor_file).ok();
@@ -808,6 +838,16 @@ fn format_poll_source_entry(source: &PollSourceEntry) -> String {
     }
 }
 
+/// `<vendor>/<slug>.cursor` file naming. **Ignores `account`** (Task 6
+/// review item 4) — two `poll_sources` entries with the same
+/// `tracker`/`project` (or `platform`/`owner`/`repo`) but different
+/// `account` overrides collide on the same cursor file and silently
+/// share state. Not fixed here: today's data model has no per-account
+/// tracker multi-account case in production (`tracker_event_connectors`
+/// holds at most one entry per tracker — see its field doc in
+/// `rupu-scm/src/registry.rs`), so nobody can actually configure two
+/// `account`-distinguished poll sources for the same project yet. Left
+/// as a landmine for whoever adds that, not a live bug today.
 fn source_slug(source: &EventSourceRef) -> String {
     let text = match source {
         EventSourceRef::Repo { repo } => format!("repo-{}-{}", repo.owner, repo.repo),
@@ -912,7 +952,9 @@ fn build_event_payload(ev: &rupu_scm::PolledEvent, matched_event_id: &str) -> se
                 "ref": format!("{}:{}/{}", repo.platform.as_str(), repo.owner, repo.repo),
             }),
         ),
-        EventSourceRef::TrackerProject { tracker, project } => (
+        EventSourceRef::TrackerProject {
+            tracker, project, ..
+        } => (
             tracker.as_str(),
             serde_json::json!({}),
             serde_json::json!({
@@ -1124,12 +1166,32 @@ mod tests {
         assert_eq!(read.timestamp(), ts.timestamp());
     }
 
+    /// `PollSourceEntry::account()` accessor coverage — `apply_account_override`
+    /// (the splice-into-the-enum helper) was deleted in Arc 2 Task 6
+    /// review item 2: `events_for_source` now takes `explicit` as a real
+    /// parameter (same three-arg shape as `repo_for`/`issues_for`), so
+    /// `tick_polled_events` just reads `source.account()` and passes it
+    /// straight through — see `Registry::events_for_source`'s own tests
+    /// in `rupu-scm/src/registry.rs` for the resolution-side coverage
+    /// (including the fixed bug: a repo-backed poll source's `account`
+    /// used to be silently dropped).
+    #[test]
+    fn poll_source_entry_account_reads_the_detailed_field() {
+        let entry = PollSourceEntry::Detailed(PollSourceSpec {
+            source: "github:acme/api".into(),
+            poll_interval: None,
+            account: Some("gh-work".into()),
+        });
+        assert_eq!(entry.account(), Some("gh-work"));
+    }
+
     #[test]
     fn poll_source_due_without_interval_is_always_true() {
         let tmp = TempDir::new().unwrap();
         let entry = PollSourceEntry::Detailed(PollSourceSpec {
             source: "github:Section9Labs/rupu".into(),
             poll_interval: None,
+            account: None,
         });
         assert!(poll_source_due(&entry, &tmp.path().join("missing"), Utc::now()).unwrap());
     }
@@ -1147,6 +1209,7 @@ mod tests {
         let entry = PollSourceEntry::Detailed(PollSourceSpec {
             source: "github:Section9Labs/rupu".into(),
             poll_interval: Some("5m".into()),
+            account: None,
         });
         assert!(!poll_source_due(&entry, &path, Utc::now()).unwrap());
         write_last_polled_at(&path, Utc::now() - chrono::Duration::minutes(6)).unwrap();
@@ -1187,6 +1250,7 @@ mod tests {
             source: rupu_scm::EventSourceRef::TrackerProject {
                 tracker: rupu_scm::IssueTracker::Linear,
                 project: "workspace-123".into(),
+                account: None,
             },
             subject: None,
             payload: json!({

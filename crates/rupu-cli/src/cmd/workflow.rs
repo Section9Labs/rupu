@@ -4094,9 +4094,22 @@ async fn run_with_outcome(
                             repo: repo.clone(),
                         };
                         let tmp = tempfile::tempdir()?;
-                        rupu_scm::clone_repo_ref(&mcp_registry, &r, tmp.path())
-                            .await
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        // The owner is already in scope (`r` is a full
+                        // `RepoRef`) — run the owner/path rule engine
+                        // via `repo_for` instead of the old
+                        // `mcp_registry.repo(platform)` shim's
+                        // lexicographically-first pick, mirroring the
+                        // sibling `RunTarget::Issue` arm's `issues_for`
+                        // call below.
+                        rupu_scm::clone_repo_ref(
+                            &mcp_registry,
+                            &r,
+                            tmp.path(),
+                            Some(pwd.as_path()),
+                            None,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let p = tmp.path().to_path_buf();
                         (Some(tmp), p)
                     }
@@ -4115,13 +4128,28 @@ async fn run_with_outcome(
                             project: project.clone(),
                             number: *number,
                         };
-                        let conn = mcp_registry.issues(*tracker).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "no {} credential — run `rupu auth login --provider {}`",
-                                tracker,
-                                tracker
-                            )
-                        })?;
+                        // The owner is already in scope (`project` is
+                        // `"owner/repo"` for GitHub/GitLab) — run the
+                        // owner/path rule engine via `issues_for` instead
+                        // of the old `mcp_registry.issues(tracker)`
+                        // shim's lexicographically-first pick.
+                        let issue_repo = match tracker {
+                            rupu_scm::IssueTracker::Github => Some(rupu_scm::Platform::Github),
+                            rupu_scm::IssueTracker::Gitlab => Some(rupu_scm::Platform::Gitlab),
+                            rupu_scm::IssueTracker::Linear | rupu_scm::IssueTracker::Jira => None,
+                        }
+                        .zip(project.split_once('/'))
+                        .map(|(platform, (owner, repo))| rupu_scm::RepoRef {
+                            platform,
+                            owner: owner.to_string(),
+                            repo: repo.to_string(),
+                        });
+                        let (_account, conn) = mcp_registry.issues_for(
+                            *tracker,
+                            issue_repo.as_ref(),
+                            Some(pwd.as_path()),
+                            None,
+                        )?;
                         match conn.get_issue(&i).await {
                             Ok(issue) => {
                                 issue_payload = serde_json::to_value(&issue).ok();
@@ -4676,6 +4704,16 @@ async fn execute_workflow_invocation(
     let workflow_name_for_notify = workflow.name.clone();
     let issue_ref_text_for_notify = ctx.issue_ref.clone();
     let issue_payload_for_notify = ctx.issue.clone();
+    // Path context for the notify hook's account resolution. Deliberately
+    // the run's PROJECT ROOT rather than `std::env::current_dir()`: this
+    // notify fires wherever the run executes, which for a cron tick or a
+    // `cp serve` resume worker is a daemon whose process cwd says nothing
+    // about the repo. `project_root` is the path that actually identifies
+    // this run, so it is the one a `[[scm.rules]]` `path = ...` rule
+    // should be matched against. Without it, a config that routes by path
+    // and not by owner resolves no account and the summary comment is
+    // silently dropped.
+    let notify_cwd_for_notify = ctx.project_root.clone();
 
     // Run-store first so the dispatcher can be constructed alongside the
     // factory and threaded onto every step's `ToolContext`.
@@ -5030,6 +5068,7 @@ async fn execute_workflow_invocation(
                 payload,
                 &workflow_name_for_notify,
                 &workflow_result,
+                notify_cwd_for_notify.as_deref(),
             )
             .await;
         }
@@ -5054,6 +5093,7 @@ async fn post_run_summary_to_issue(
     payload: &serde_json::Value,
     workflow_name: &str,
     result: &rupu_orchestrator::OrchestratorRunResult,
+    cwd: Option<&std::path::Path>,
 ) {
     // Reconstruct an `IssueRef` from the persisted text + payload.
     // The text carries the canonical
@@ -5063,9 +5103,12 @@ async fn post_run_summary_to_issue(
         .pointer("/r/tracker")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let tracker = match tracker_str {
-        "github" => rupu_scm::IssueTracker::Github,
-        "gitlab" => rupu_scm::IssueTracker::Gitlab,
+    // `tracker` and `platform` come from the same match arm so there is
+    // one source of truth for "this tracker_str is repo-backed" — no
+    // second match (and no `unreachable!`) needed below.
+    let (tracker, platform) = match tracker_str {
+        "github" => (rupu_scm::IssueTracker::Github, rupu_scm::Platform::Github),
+        "gitlab" => (rupu_scm::IssueTracker::Gitlab, rupu_scm::Platform::Gitlab),
         other => {
             tracing::warn!(tracker = %other, "notifyIssue: unknown tracker; skipping comment");
             return;
@@ -5084,18 +5127,37 @@ async fn post_run_summary_to_issue(
         tracing::warn!(ref_text, "notifyIssue: malformed payload; skipping comment");
         return;
     }
+    // `project` is always `"owner/repo"` here — `tracker`/`platform`'s
+    // match above already restricted this to GitHub/GitLab — so the
+    // owner is in scope; run the owner/path rule engine via `issues_for`
+    // instead of the old `registry.issues(tracker)` shim's
+    // lexicographically-first pick. `cwd` is the run's project root (see
+    // the caller), so path rules resolve here exactly as they do on the
+    // run-start prefetch path; there is no `--account` on a post-run
+    // notify to pass through.
+    let issue_repo = project
+        .split_once('/')
+        .map(|(owner, repo)| rupu_scm::RepoRef {
+            platform,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        });
     let r = rupu_scm::IssueRef {
         tracker,
         project,
         number,
     };
 
-    let Some(conn) = registry.issues(tracker) else {
-        tracing::warn!(
-            tracker = %tracker,
-            "notifyIssue: no credential for tracker; skipping comment"
-        );
-        return;
+    let conn = match registry.issues_for(tracker, issue_repo.as_ref(), cwd, None) {
+        Ok((_account, conn)) => conn,
+        Err(e) => {
+            tracing::warn!(
+                tracker = %tracker,
+                error = %e,
+                "notifyIssue: no account resolved for tracker; skipping comment"
+            );
+            return;
+        }
     };
 
     let outcome = match &result.awaiting {

@@ -79,7 +79,9 @@ async fn clone_repo_ref_creates_target_dir_with_content() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let target = dir.path().join("clone");
-    clone_repo_ref(&registry, &r, &target).await.expect("clone");
+    clone_repo_ref(&registry, &r, &target, None, None)
+        .await
+        .expect("clone");
     assert!(target.join("README.md").exists());
 }
 
@@ -93,7 +95,7 @@ async fn clone_repo_ref_missing_connector_returns_error() {
     };
     let dir = tempfile::tempdir().expect("tempdir");
     let target = dir.path().join("clone");
-    let err = clone_repo_ref(&registry, &r, &target)
+    let err = clone_repo_ref(&registry, &r, &target, None, None)
         .await
         .expect_err("should fail without connector");
     let msg = err.to_string();

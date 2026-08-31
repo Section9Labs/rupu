@@ -272,11 +272,9 @@ impl EventConnector for LinearEventConnector {
         limit: u32,
     ) -> Result<EventPollResult, ScmError> {
         let team_id = match source {
-            EventSourceRef::TrackerProject { tracker, project }
-                if *tracker == IssueTracker::Linear =>
-            {
-                project.as_str()
-            }
+            EventSourceRef::TrackerProject {
+                tracker, project, ..
+            } if *tracker == IssueTracker::Linear => project.as_str(),
             _ => {
                 return Err(ScmError::BadRequest {
                     message: "linear events polling only supports linear tracker_project sources"
@@ -854,6 +852,7 @@ mod tests {
         EventSourceRef::TrackerProject {
             tracker: IssueTracker::Linear,
             project: team_id.to_string(),
+            account: None,
         }
     }
 

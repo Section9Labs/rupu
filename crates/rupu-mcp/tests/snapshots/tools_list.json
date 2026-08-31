@@ -1,12 +1,16 @@
 [
   {
-    "name": "scm.repos.list",
     "description": "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "ListReposArgs",
-      "type": "object",
       "properties": {
+        "account": {
+          "description": "Which configured account to fan out over, when more than one is configured for this platform (e.g. two GitHub accounts). Omit to list every configured account of `platform` at once — each repo in the response is tagged with the `account` that returned it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "platform": {
           "description": "Platform to query (`github` | `gitlab`). Omit to use [scm.default].",
           "type": [
@@ -14,21 +18,24 @@
             "null"
           ]
         }
-      }
-    }
+      },
+      "title": "ListReposArgs",
+      "type": "object"
+    },
+    "name": "scm.repos.list"
   },
   {
-    "name": "scm.repos.get",
     "description": "Fetch a single repository (default branch, clone URLs, visibility, description).",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "GetRepoArgs",
-      "type": "object",
-      "required": [
-        "owner",
-        "repo"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "owner": {
           "type": "string"
         },
@@ -41,21 +48,28 @@
         "repo": {
           "type": "string"
         }
-      }
-    }
+      },
+      "required": [
+        "owner",
+        "repo"
+      ],
+      "title": "GetRepoArgs",
+      "type": "object"
+    },
+    "name": "scm.repos.get"
   },
   {
-    "name": "scm.branches.list",
     "description": "List branches on a repository. Returns name, sha, and protected flag for each.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "ListBranchesArgs",
-      "type": "object",
-      "required": [
-        "owner",
-        "repo"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "owner": {
           "type": "string"
         },
@@ -68,23 +82,28 @@
         "repo": {
           "type": "string"
         }
-      }
-    }
-  },
-  {
-    "name": "scm.branches.create",
-    "description": "Create a new branch from a given SHA. Returns the new branch.",
-    "inputSchema": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "CreateBranchArgs",
-      "type": "object",
+      },
       "required": [
-        "from_sha",
-        "name",
         "owner",
         "repo"
       ],
+      "title": "ListBranchesArgs",
+      "type": "object"
+    },
+    "name": "scm.branches.list"
+  },
+  {
+    "description": "Create a new branch from a given SHA. Returns the new branch.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "from_sha": {
           "type": "string"
         },
@@ -103,22 +122,30 @@
         "repo": {
           "type": "string"
         }
-      }
-    }
+      },
+      "required": [
+        "from_sha",
+        "name",
+        "owner",
+        "repo"
+      ],
+      "title": "CreateBranchArgs",
+      "type": "object"
+    },
+    "name": "scm.branches.create"
   },
   {
-    "name": "scm.files.read",
     "description": "Read a single file from a repository at an optional ref. Returns path, ref, content, and encoding.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "ReadFileArgs",
-      "type": "object",
-      "required": [
-        "owner",
-        "path",
-        "repo"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "owner": {
           "type": "string"
         },
@@ -141,21 +168,29 @@
         "repo": {
           "type": "string"
         }
-      }
-    }
+      },
+      "required": [
+        "owner",
+        "path",
+        "repo"
+      ],
+      "title": "ReadFileArgs",
+      "type": "object"
+    },
+    "name": "scm.files.read"
   },
   {
-    "name": "scm.prs.list",
     "description": "List pull/merge requests on a repository. Optional filters: state (open/closed/merged), author, limit.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "ListPrsArgs",
-      "type": "object",
-      "required": [
-        "owner",
-        "repo"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "author": {
           "type": [
             "string",
@@ -163,12 +198,12 @@
           ]
         },
         "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
+          ]
         },
         "owner": {
           "type": "string"
@@ -189,26 +224,32 @@
             "null"
           ]
         }
-      }
-    }
+      },
+      "required": [
+        "owner",
+        "repo"
+      ],
+      "title": "ListPrsArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.list"
   },
   {
-    "name": "scm.prs.get",
     "description": "Fetch a single pull/merge request by number. Returns title, body, state, head/base branches, author, timestamps.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "GetPrArgs",
-      "type": "object",
-      "required": [
-        "number",
-        "owner",
-        "repo"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "number": {
-          "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "owner": {
           "type": "string"
@@ -222,26 +263,33 @@
         "repo": {
           "type": "string"
         }
-      }
-    }
+      },
+      "required": [
+        "number",
+        "owner",
+        "repo"
+      ],
+      "title": "GetPrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.get"
   },
   {
-    "name": "scm.prs.diff",
     "description": "Fetch the unified-diff patch for a pull/merge request. Returns patch text + per-file change counts.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "DiffPrArgs",
-      "type": "object",
-      "required": [
-        "number",
-        "owner",
-        "repo"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "number": {
-          "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "owner": {
           "type": "string"
@@ -255,30 +303,36 @@
         "repo": {
           "type": "string"
         }
-      }
-    }
-  },
-  {
-    "name": "scm.prs.comment",
-    "description": "Post a top-level comment on a pull/merge request.",
-    "inputSchema": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "CommentPrArgs",
-      "type": "object",
+      },
       "required": [
-        "body",
         "number",
         "owner",
         "repo"
       ],
+      "title": "DiffPrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.diff"
+  },
+  {
+    "description": "Post a top-level comment on a pull/merge request.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "body": {
           "type": "string"
         },
         "number": {
-          "type": "integer",
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "owner": {
           "type": "string"
@@ -292,25 +346,30 @@
         "repo": {
           "type": "string"
         }
-      }
-    }
+      },
+      "required": [
+        "body",
+        "number",
+        "owner",
+        "repo"
+      ],
+      "title": "CommentPrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.comment"
   },
   {
-    "name": "scm.prs.create",
     "description": "Open a pull/merge request from `head` branch into `base`. Set draft=true to open as a draft.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "CreatePrArgs",
-      "type": "object",
-      "required": [
-        "base",
-        "body",
-        "head",
-        "owner",
-        "repo",
-        "title"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this platform (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "base": {
           "type": "string"
         },
@@ -341,20 +400,32 @@
         "title": {
           "type": "string"
         }
-      }
-    }
+      },
+      "required": [
+        "base",
+        "body",
+        "head",
+        "owner",
+        "repo",
+        "title"
+      ],
+      "title": "CreatePrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.create"
   },
   {
-    "name": "issues.list",
     "description": "List issues on a tracker. Filters: state (open/closed), labels, author, limit.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "ListIssuesArgs",
-      "type": "object",
-      "required": [
-        "project"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this tracker (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "author": {
           "type": [
             "string",
@@ -362,21 +433,21 @@
           ]
         },
         "labels": {
+          "items": {
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string"
-          }
+          ]
         },
         "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
+          ]
         },
         "project": {
           "type": "string"
@@ -393,25 +464,31 @@
             "null"
           ]
         }
-      }
-    }
+      },
+      "required": [
+        "project"
+      ],
+      "title": "ListIssuesArgs",
+      "type": "object"
+    },
+    "name": "issues.list"
   },
   {
-    "name": "issues.get",
     "description": "Fetch a single issue by number. Returns title, body, state, labels, author, timestamps.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "GetIssueArgs",
-      "type": "object",
-      "required": [
-        "number",
-        "project"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this tracker (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "number": {
-          "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "project": {
           "type": "string"
@@ -422,34 +499,41 @@
             "null"
           ]
         }
-      }
-    }
+      },
+      "required": [
+        "number",
+        "project"
+      ],
+      "title": "GetIssueArgs",
+      "type": "object"
+    },
+    "name": "issues.get"
   },
   {
-    "name": "issues.comments",
     "description": "Read an issue's comment thread. Returns id, author, body, created_at, author_association per comment, oldest-first. author_association is GitHub's role for the commenter on this repo (e.g. OWNER, COLLABORATOR, CONTRIBUTOR, NONE) — use it to tell an authorized operator's comment apart from an arbitrary commenter's; it is null on trackers that don't expose an equivalent (GitLab, Linear, Jira). A `limit` truncates the NEWEST comments off the end, not the oldest — omitting `limit` returns only the oldest 100; hard ceiling 5000.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "ListCommentsArgs",
-      "type": "object",
-      "required": [
-        "number",
-        "project"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this tracker (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "limit": {
           "description": "Maximum comments to return. The thread is walked and returned oldest-first, so a `limit` below the thread's true length drops the NEWEST comments, not the oldest. Omitting `limit` returns at most the oldest 100 comments. Hard ceiling: 5000 comments, regardless of `limit`.",
+          "format": "uint32",
+          "minimum": 0.0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
+          ]
         },
         "number": {
-          "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "project": {
           "type": "string"
@@ -460,29 +544,35 @@
             "null"
           ]
         }
-      }
-    }
-  },
-  {
-    "name": "issues.comment",
-    "description": "Post a comment on an issue.",
-    "inputSchema": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "CommentIssueArgs",
-      "type": "object",
+      },
       "required": [
-        "body",
         "number",
         "project"
       ],
+      "title": "ListCommentsArgs",
+      "type": "object"
+    },
+    "name": "issues.comments"
+  },
+  {
+    "description": "Post a comment on an issue.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this tracker (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "body": {
           "type": "string"
         },
         "number": {
-          "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "project": {
           "type": "string"
@@ -493,33 +583,40 @@
             "null"
           ]
         }
-      }
-    }
+      },
+      "required": [
+        "body",
+        "number",
+        "project"
+      ],
+      "title": "CommentIssueArgs",
+      "type": "object"
+    },
+    "name": "issues.comment"
   },
   {
-    "name": "issues.create",
     "description": "Open a new issue with title, body, and optional labels.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "CreateIssueArgs",
-      "type": "object",
-      "required": [
-        "body",
-        "project",
-        "title"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this tracker (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "body": {
           "type": "string"
         },
         "labels": {
+          "items": {
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string"
-          }
+          ]
         },
         "project": {
           "type": "string"
@@ -533,26 +630,33 @@
             "null"
           ]
         }
-      }
-    }
+      },
+      "required": [
+        "body",
+        "project",
+        "title"
+      ],
+      "title": "CreateIssueArgs",
+      "type": "object"
+    },
+    "name": "issues.create"
   },
   {
-    "name": "issues.update_state",
     "description": "Transition an issue's state to `open` or `closed`.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "UpdateIssueStateArgs",
-      "type": "object",
-      "required": [
-        "number",
-        "project",
-        "state"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured account to use, when more than one is configured for this tracker (e.g. two GitHub accounts). Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "number": {
-          "type": "integer",
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "project": {
           "type": "string"
@@ -567,23 +671,29 @@
             "null"
           ]
         }
-      }
-    }
+      },
+      "required": [
+        "number",
+        "project",
+        "state"
+      ],
+      "title": "UpdateIssueStateArgs",
+      "type": "object"
+    },
+    "name": "issues.update_state"
   },
   {
-    "name": "github.workflows_dispatch",
     "description": "Trigger a GitHub Actions workflow run via workflow_dispatch. Requires the workflow file to declare `on: workflow_dispatch:`.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "WorkflowsDispatchArgs",
-      "type": "object",
-      "required": [
-        "owner",
-        "ref",
-        "repo",
-        "workflow"
-      ],
       "properties": {
+        "account": {
+          "description": "Which configured GitHub account to use, when more than one is configured. Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "inputs": {
           "description": "Optional inputs map matching the workflow's `inputs:` schema."
         },
@@ -601,22 +711,30 @@
           "description": "Workflow filename (e.g. `ci.yml`) or numeric ID.",
           "type": "string"
         }
-      }
-    }
-  },
-  {
-    "name": "gitlab.pipeline_trigger",
-    "description": "Trigger a GitLab CI pipeline against a branch/tag with optional variables.",
-    "inputSchema": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "PipelineTriggerArgs",
-      "type": "object",
+      },
       "required": [
         "owner",
         "ref",
-        "repo"
+        "repo",
+        "workflow"
       ],
+      "title": "WorkflowsDispatchArgs",
+      "type": "object"
+    },
+    "name": "github.workflows_dispatch"
+  },
+  {
+    "description": "Trigger a GitLab CI pipeline against a branch/tag with optional variables.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "account": {
+          "description": "Which configured GitLab account to use, when more than one is configured. Only needed when `[[scm.rules]]` don't disambiguate.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "owner": {
           "type": "string"
         },
@@ -628,16 +746,24 @@
           "type": "string"
         },
         "variables": {
+          "additionalProperties": {
+            "type": "string"
+          },
           "description": "Map of pipeline variables (key → value).",
           "type": [
             "object",
             "null"
-          ],
-          "additionalProperties": {
-            "type": "string"
-          }
+          ]
         }
-      }
-    }
+      },
+      "required": [
+        "owner",
+        "ref",
+        "repo"
+      ],
+      "title": "PipelineTriggerArgs",
+      "type": "object"
+    },
+    "name": "gitlab.pipeline_trigger"
   }
 ]

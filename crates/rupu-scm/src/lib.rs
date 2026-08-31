@@ -8,6 +8,7 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-05-03-rupu-slice-b2-scm-design.md`.
 
+pub mod account;
 pub mod client_options;
 pub mod clone;
 pub mod connectors;
@@ -15,20 +16,22 @@ pub mod error;
 pub mod event_connector;
 pub mod platform;
 pub mod registry;
+pub mod rules;
 pub mod types;
 pub mod weburl;
 
+pub use account::AccountId;
 pub use client_options::{clone_url, scm_timeout, CloneProtocol, ScmClientOptions};
 pub use clone::{clone_repo_ref, CloneError};
 pub use connectors::{IssueConnector, RepoConnector};
-pub use error::{classify_scm_error, ScmError};
+pub use error::{classify_scm_error, AccountError, ScmError};
 pub use event_connector::{EventConnector, EventPollResult, PolledEvent};
 pub use platform::{IssueTracker, Platform};
 pub use registry::Registry;
 pub use types::{
-    Branch, Comment, CreateIssue, CreatePr, Diff, EventSourceRef, EventSubjectRef, FileContent,
-    Issue, IssueFilter, IssueRef, IssueState, PipelineTrigger, Pr, PrFilter, PrRef, PrState, Repo,
-    RepoRef, WorkflowDispatch,
+    tracker_project_repo, Branch, Comment, CreateIssue, CreatePr, Diff, EventSourceRef,
+    EventSubjectRef, FileContent, Issue, IssueFilter, IssueRef, IssueState, PipelineTrigger, Pr,
+    PrFilter, PrRef, PrState, Repo, RepoRef, WorkflowDispatch,
 };
 
 /// Install a process-level rustls `CryptoProvider`, once.

@@ -1383,13 +1383,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
                 owner: owner.clone(),
                 repo: repo.clone(),
             };
-            let conn = scm_registry.repo(*platform).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no {} credential — run `rupu auth login --provider {}`",
-                    platform,
-                    platform
-                )
-            })?;
+            let (_account, conn) = scm_registry.repo_for(&r, Some(pwd.as_path()), None)?;
             let (dest, _guard) = resolve_clone_dest(&pwd, repo, args.into.as_deref(), false)?;
             eprintln!("  cloning {}/{} → {}", owner, repo, dest.display());
             conn.clone_to(&r, &dest).await?;

@@ -143,6 +143,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::repos::Action,
     },
+    /// Multi-account SCM routing: rules and the account roster.
+    Scm {
+        #[command(subcommand)]
+        action: cmd::scm::Action,
+    },
     /// Persistent agent sessions.
     Session {
         #[command(subcommand)]
@@ -326,6 +331,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
             cmd::netflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
         Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
+        Cmd::Scm { action } => cmd::scm::handle(action, cli.format).await,
         Cmd::Session { action } => {
             cmd::session::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
@@ -387,6 +393,7 @@ fn ensure_output_format_supported(
         Cmd::Models { action } => cmd::models::ensure_output_format(action, format),
         Cmd::Netflow { action } => cmd::netflow::ensure_output_format(action, format),
         Cmd::Repos { action } => cmd::repos::ensure_output_format(action, format),
+        Cmd::Scm { action } => cmd::scm::ensure_output_format(action, format),
         Cmd::Session { action } => cmd::session::ensure_output_format(action, format),
         Cmd::Issues { action } => cmd::issues::ensure_output_format(action, format),
         Cmd::Init(_) => output::formats::ensure_supported(

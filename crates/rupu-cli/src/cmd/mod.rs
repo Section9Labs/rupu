@@ -27,6 +27,7 @@ pub mod node;
 pub mod repos;
 pub mod retention;
 pub mod run;
+pub mod scm;
 pub mod session;
 pub mod transcript;
 pub mod ui;

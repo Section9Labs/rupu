@@ -10,6 +10,7 @@ use std::time::Duration;
 use reqwest::header::HeaderMap;
 use thiserror::Error;
 
+use crate::account::AccountId;
 use crate::platform::Platform;
 
 #[derive(Debug, Error)]
@@ -64,6 +65,103 @@ impl ScmError {
                 | Self::NotFound { .. }
         )
     }
+}
+
+/// Errors from [`crate::registry::Registry`]'s account-selection
+/// accessors (`repo_for`, `issues_for`). Spec §6.4 — these are the
+/// "which of my configured accounts serves this request" failures, a
+/// different vocabulary from `ScmError`'s "the vendor API call failed".
+#[derive(Debug, Error)]
+pub enum AccountError {
+    /// Several accounts are configured for this platform/tracker and no
+    /// rule (owner or path) and no explicit `--account` selected one.
+    /// Deliberately distinct from [`Self::NoAccounts`]: this is a
+    /// "disambiguate" failure, not a "log in" failure.
+    ///
+    /// `platform` names the vendor/tracker (`"github"`, `"linear"`, …)
+    /// so the message can say which accounts are candidates; it is not
+    /// part of the brief's minimal field list but is required to render
+    /// the spec §6.4 message shape. `owner` is likewise an addition: the
+    /// spec §6.4 example fix line is copy-pasteable (`--owner 'other/*'`,
+    /// derived from the repo that failed to resolve), not a literal
+    /// placeholder — carrying `owner` separately from the already-joined
+    /// `repo` string avoids re-parsing `"owner/repo"` to get it back.
+    #[error(
+        "no account rule matches {repo}\n  configured {platform} accounts: {}\n  fix: rupu scm bind --owner '{owner}/*' --account <name>\n  or:  pass --account <name>",
+        candidates.iter().map(AccountId::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    NoRuleMatched {
+        repo: String,
+        owner: String,
+        platform: String,
+        candidates: Vec<AccountId>,
+    },
+
+    /// An owner or path rule's pattern matched, and the account it
+    /// names is not registered under ANY platform/capability — not
+    /// merely absent from the candidates narrowed to the current call,
+    /// which would mean it's simply a live account of a different
+    /// platform (that case is not an error at all: the rule is skipped
+    /// and resolution falls through, same as always). Distinct from
+    /// both [`Self::NoMatch`] (no rule fired at all) and
+    /// [`Self::UnknownAccount`] (an explicit `--account` typo): here a
+    /// rule DID fire and pick a specific, wholly-unregistered account,
+    /// so silently falling through to a different one (e.g. the sole
+    /// remaining candidate) would be exactly the cross-identity misroute
+    /// Arc 2's goal statement promises never happens.
+    ///
+    /// Deliberately does not assert *why* the account has no connector
+    /// (final review, fix wave 2, finding 2): "has no usable credential"
+    /// overclaimed a cause the resolver cannot observe — `discover` skips
+    /// an account for several reasons, not just a bad credential — and
+    /// worded as a `--kind {platform}` fix line it risked being
+    /// literally harmful: `auth login`'s `declare_account_in_config`
+    /// writes `kind` unconditionally, so following that advice for an
+    /// account already declared under a *different* kind would silently
+    /// rewrite it and break whatever was working under the old kind.
+    /// The fix line omits `--kind` entirely and relies on `auth login`'s
+    /// own fallback (no `--kind` + an existing declared kind in config
+    /// -> reuse it; genuinely undeclared -> `auth login` itself asks for
+    /// `--kind`, an honest failure rather than a guess).
+    #[error(
+        "the rule for `{pattern}` names `{account}`, which has no live connector for {platform}\n  fix: rupu auth login --account {account}"
+    )]
+    RuleTargetUnavailable {
+        account: AccountId,
+        pattern: String,
+        platform: String,
+    },
+
+    /// No account at all is configured for this platform/tracker — a
+    /// distinct failure from ambiguity, and it deserves a distinct
+    /// message: log in, rather than disambiguate.
+    ///
+    /// Held as a `String` (vendor/tracker name) rather than the brief's
+    /// literal `Platform` type: `issues_for` can be asked about `Linear`
+    /// or `Jira`, neither of which is a `Platform` variant, so a strict
+    /// `Platform` field can't represent every caller of this error.
+    /// `--mode sso` is deliberately absent from the fix line: Linear and
+    /// Jira have no SSO flow (`rupu auth login`'s SSO arm bails with
+    /// "has no SSO flow" for them), and even for GitHub/GitLab a PAT is
+    /// the common path — `--mode api-key` is already clap's default, so
+    /// the bare command is correct for all four vendors this error can
+    /// name.
+    #[error("no {platform} account configured\n  fix: rupu auth login --account <name> --kind {platform}")]
+    NoAccounts { platform: String },
+
+    /// `--account <name>` (or an MCP `account` argument) named something
+    /// that is not a configured account of the right kind — most often a
+    /// typo. `resolve_account` returns `Resolution::Explicit` for any
+    /// name unconditionally (correct for a pure function); this is the
+    /// existence check the caller must apply before trusting it.
+    #[error(
+        "no such account: {requested}\n  configured accounts: {}",
+        configured.iter().map(AccountId::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    UnknownAccount {
+        requested: AccountId,
+        configured: Vec<AccountId>,
+    },
 }
 
 /// Map an HTTP failure into the structured ScmError vocabulary. Pure

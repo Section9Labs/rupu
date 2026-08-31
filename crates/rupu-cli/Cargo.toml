@@ -86,3 +86,10 @@ axum = { workspace = true, features = ["ws"] }
 # test-util only (paused virtual clock) — layered on the same workspace
 # `tokio` dependency already pulled in normally; only affects test builds.
 tokio = { workspace = true, features = ["test-util"] }
+# `test-helpers` only (the `insert_*_account` Registry seams) — layered on
+# the same path dependency already pulled in normally, so this changes no
+# production build. `cp_inventory`'s account-routing test needs to register
+# two GitHub accounts with distinguishable connectors without standing up
+# real credentials; that seam is exactly what the feature exists for (see
+# rupu-scm's own Cargo.toml comment).
+rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }

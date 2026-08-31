@@ -40,7 +40,9 @@ pub use policy_config::{CpConfig, PolicyConfig};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use resolve::{resolve, KeyProvenance, KeySource, Resolved};
-pub use scm_config::{IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmSection};
+pub use scm_config::{
+    IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmRule, ScmSection,
+};
 pub use storage_config::StorageConfig;
 pub use triggers_config::{PollSourceEntry, PollSourceSpec, TriggersConfig};
 pub use update_config::UpdateConfig;

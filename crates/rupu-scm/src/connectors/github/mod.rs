@@ -24,7 +24,12 @@ pub use repo::GithubRepoConnector;
 /// Try to build the GitHub Repo + Issue connectors + extras handle from
 /// configured credentials. Returns `Ok(None)` when no GitHub credential
 /// is stored — that's a normal "user hasn't logged in" case.
+///
+/// `account` is the configured account name (e.g. `gh-work`, or the bare
+/// `"github"` back-compat account) — both the credential-resolver lookup
+/// key and the `[scm.<account>]` config-table key.
 pub async fn try_build(
+    account: &str,
     resolver: &dyn CredentialResolver,
     cfg: &Config,
     sink: Arc<dyn rupu_netflow::FlowSink>,
@@ -35,7 +40,7 @@ pub async fn try_build(
         Arc<GithubExtras>,
     )>,
 > {
-    let creds = match resolver.get("github", None).await {
+    let creds = match resolver.get(account, None).await {
         Ok((_mode, creds)) => creds,
         Err(_) => return Ok(None),
     };
@@ -44,7 +49,7 @@ pub async fn try_build(
         rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
     };
     let opts = crate::client_options::ScmClientOptions::from_platform_config(
-        cfg.scm.platforms.get("github"),
+        cfg.scm.platforms.get(account),
     );
     let client = GithubClient::with_options(token, &opts, sink);
     let repo: Arc<dyn RepoConnector> = Arc::new(repo::GithubRepoConnector::new(client.clone()));

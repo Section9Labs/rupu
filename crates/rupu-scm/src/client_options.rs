@@ -276,6 +276,7 @@ mod tests {
     #[test]
     fn options_read_every_configured_key() {
         let cfg = ScmPlatformConfig {
+            kind: None,
             base_url: Some("https://ghe.example.com/api/v3".into()),
             timeout_ms: Some(7_000),
             max_concurrency: Some(3),

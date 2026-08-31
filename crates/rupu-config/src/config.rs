@@ -186,6 +186,27 @@ const BUILTIN_PROVIDER_KINDS: &[&str] = &[
     "jira",
 ];
 
+/// `true` for the two account names that resolve as an SCM account
+/// with NO `[scm.<name>]` table at all — the account name IS the
+/// vendor (design spec §3.1's back-compat fallback, mirrored by
+/// `rupu_scm::Registry::discover`'s own account-name-set construction:
+/// `{"github", "gitlab"}` are always implicit candidates).
+///
+/// Deliberately a local, hardcoded two-string check rather than
+/// `rupu_scm::Platform::from_str` — `rupu-config` does not depend on
+/// `rupu-scm` (the corrected invariant from this arc's Ruling 3: only
+/// `rupu-scm` depends on `rupu-config`, never the reverse), so this
+/// crate cannot parse a `Platform` at all. Kept narrower than
+/// `BUILTIN_PROVIDER_KINDS` above on purpose: `linear`/`jira` also
+/// resolve as bare vendor names, but never as the account a `[[scm.rules]]`
+/// entry can legitimately name (`Registry::discover` never treats them
+/// as multi-account, and `[[scm.rules]]` only ever routes
+/// github/gitlab `RepoRef`s) — including them here would silence a
+/// warning for a rule that can genuinely never do anything.
+fn is_bare_repo_vendor_name(account: &str) -> bool {
+    matches!(account, "github" | "gitlab")
+}
+
 impl Config {
     /// Warn about keys that still parse but no longer do anything.
     ///
@@ -293,6 +314,71 @@ impl Config {
                         BUILTIN_PROVIDER_KINDS.join(", ")
                     )));
                 }
+            }
+        }
+        self.validate_scm_rules()?;
+        Ok(())
+    }
+
+    /// Validate `[[scm.rules]]` (design spec §6.3). Makes true the claim
+    /// `ScmRule`'s doc comment already made — "a rule with both, or
+    /// neither, is a config error" — which this function is the first
+    /// code to actually enforce.
+    ///
+    /// A rule naming an account with no matching `[scm.<name>]` table is
+    /// deliberately a WARNING, not an error: the account may be
+    /// credential-only (a bare vendor name like `"github"`/`"gitlab"`
+    /// that resolves via the account-name-is-the-vendor fallback and so
+    /// never needs a config table at all — see `Registry::discover`).
+    /// Erroring there would reject a rule that resolves and works fine
+    /// at runtime; a rule with an outright typo just never matches
+    /// anything, which is already surfaced structurally (as
+    /// `AccountError::NoRuleMatched`'s candidate list omitting the
+    /// account) rather than needing a load-time hard stop.
+    ///
+    /// That warning is itself suppressed for a bare vendor name
+    /// (`is_bare_repo_vendor_name`) — the exact case the warning's own
+    /// text calls fine. Without this, `[scm.gh-work]` plus a rule
+    /// naming the bare credential-only account `"github"` would print a
+    /// 4-line WARN on every single invocation, including `rupu repos
+    /// list` and `rupu scm accounts` (the command this warning tells
+    /// people to run to check their setup). Task 3's
+    /// `should_warn_unresolvable_kind` (`rupu-scm`) hit the identical
+    /// shape of mistake for a sibling warning and documented why noise
+    /// on a correct, common config erodes trust in the warning faster
+    /// than it helps anyone — the same reasoning applies here.
+    fn validate_scm_rules(&self) -> Result<(), crate::layer::LayerError> {
+        for (idx, rule) in self.scm.rules.iter().enumerate() {
+            match (&rule.owner, &rule.path) {
+                (Some(_), Some(_)) => {
+                    return Err(crate::layer::LayerError::Invalid(format!(
+                        "[[scm.rules]] entry {idx} (account \"{}\"): both `owner` and `path` \
+                         are set; exactly one is required",
+                        rule.account
+                    )));
+                }
+                (None, None) => {
+                    return Err(crate::layer::LayerError::Invalid(format!(
+                        "[[scm.rules]] entry {idx} (account \"{}\"): neither `owner` nor `path` \
+                         is set; exactly one is required",
+                        rule.account
+                    )));
+                }
+                (Some(_), None) | (None, Some(_)) => {}
+            }
+            if !self.scm.platforms.contains_key(&rule.account)
+                && !is_bare_repo_vendor_name(&rule.account)
+            {
+                tracing::warn!(
+                    key = "scm.rules",
+                    index = idx,
+                    account = %rule.account,
+                    "config.toml declares a `[[scm.rules]]` entry pointing at an account with \
+                     no matching `[scm.<name>]` table. This is fine if the account is \
+                     credential-only; if it's a typo the rule will simply never match and \
+                     requests will fall through to the next tier (or to the ambiguity error). \
+                     Run `rupu scm accounts` to see configured accounts."
+                );
             }
         }
         Ok(())
@@ -477,5 +563,90 @@ mod tests {
             },
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    fn owner_rule(owner: &str, account: &str) -> crate::scm_config::ScmRule {
+        crate::scm_config::ScmRule {
+            owner: Some(owner.into()),
+            path: None,
+            account: account.into(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_scm_rule_with_both_owner_and_path() {
+        let mut cfg = Config::default();
+        cfg.scm.rules.push(crate::scm_config::ScmRule {
+            owner: Some("acme/*".into()),
+            path: Some("~/Code/work/*".into()),
+            account: "gh-work".into(),
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("both `owner` and `path`"), "got: {err}");
+        assert!(err.contains("gh-work"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_scm_rule_with_neither_owner_nor_path() {
+        let mut cfg = Config::default();
+        cfg.scm.rules.push(crate::scm_config::ScmRule {
+            owner: None,
+            path: None,
+            account: "gh-work".into(),
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("neither `owner` nor `path`"), "got: {err}");
+    }
+
+    /// The happy path: exactly-one-of-owner-or-path rules validate fine,
+    /// even when the named account has no `[scm.<name>]` table — that's
+    /// a warning (unit-tested separately via `should_warn`-style pure
+    /// helpers elsewhere in the crate; this crate has no tracing-capture
+    /// harness, so the assertion here is simply "does not error").
+    #[test]
+    fn validate_accepts_owner_only_and_path_only_rules_even_for_undeclared_accounts() {
+        let mut cfg = Config::default();
+        cfg.scm.rules.push(owner_rule("acme/*", "gh-work"));
+        cfg.scm.rules.push(crate::scm_config::ScmRule {
+            owner: None,
+            path: Some("~/Code/work/*".into()),
+            account: "gh-work".into(),
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// A rule naming a declared `[scm.<name>]` account validates with no
+    /// warning-worthy condition at all — the common, fully-declared case.
+    #[test]
+    fn validate_accepts_scm_rule_naming_a_declared_account() {
+        let mut cfg = Config::default();
+        cfg.scm.platforms.insert(
+            "gh-work".into(),
+            crate::scm_config::ScmPlatformConfig {
+                kind: Some("github".into()),
+                ..Default::default()
+            },
+        );
+        cfg.scm.rules.push(owner_rule("acme/*", "gh-work"));
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Pure-predicate coverage for `is_bare_repo_vendor_name` — this
+    /// crate has no tracing-capture harness (see `rupu_scm`'s
+    /// `should_warn_unresolvable_kind` for the sibling precedent), so
+    /// the decision itself, not the `warn!` call site, is the seam
+    /// these tests exercise directly. Three cases: the two bare names
+    /// the warning must NOT fire for, an undeclared non-vendor name it
+    /// MUST fire for (a genuine typo), and the two tracker-only vendor
+    /// names that must NOT be silenced (see the function's doc comment
+    /// on why `linear`/`jira` are deliberately excluded).
+    #[test]
+    fn is_bare_repo_vendor_name_covers_exactly_github_and_gitlab() {
+        assert!(is_bare_repo_vendor_name("github"));
+        assert!(is_bare_repo_vendor_name("gitlab"));
+        assert!(!is_bare_repo_vendor_name("gh-work"));
+        assert!(!is_bare_repo_vendor_name("linear"));
+        assert!(!is_bare_repo_vendor_name("jira"));
+        assert!(!is_bare_repo_vendor_name(""));
     }
 }

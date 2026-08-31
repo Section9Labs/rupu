@@ -59,6 +59,11 @@ pub struct ListArgs {
     /// `[ui].color = "never"` in config).
     #[arg(long)]
     pub no_color: bool,
+    /// Which configured SCM account to use, when more than one is
+    /// configured for this platform (e.g. two GitHub accounts). Skips
+    /// the owner/path rule engine entirely. Errors on an unknown name.
+    #[arg(long)]
+    pub account: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -75,6 +80,10 @@ pub struct ShowArgs {
     pub pager: bool,
     #[arg(long, conflicts_with = "pager")]
     pub no_pager: bool,
+    /// Which configured SCM account to use, when more than one is
+    /// configured for this platform. Skips the owner/path rule engine.
+    #[arg(long)]
+    pub account: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -247,15 +256,15 @@ impl DetailOutput for IssueShowOutput {
 }
 
 async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let (registry, _global, _project_root, cfg) = build_registry().await?;
+    let (registry, _global, _project_root, cfg, pwd) = build_registry().await?;
     let repo = resolve_repo_or_autodetect(
         args.repo.as_deref(),
         configured_default_repo(cfg.issues.default.as_ref()),
     )?;
     let tracker = repo_to_issue_tracker(repo.platform);
-    let conn = registry.issues(tracker).ok_or_else(|| {
-        anyhow::anyhow!("no {tracker} credential — run `rupu auth login --provider {tracker}`")
-    })?;
+    let account = args.account.as_deref().map(rupu_scm::AccountId::new);
+    let (_account, conn) =
+        registry.issues_for(tracker, Some(&repo), Some(pwd.as_path()), account.as_ref())?;
 
     // Merge --label (repeatable) and --labels foo,bar (csv) into a
     // single label set. AND match — all listed labels must be present.
@@ -339,15 +348,15 @@ async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Re
 }
 
 async fn show(args: ShowArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let (registry, _global, _project_root, cfg) = build_registry().await?;
+    let (registry, _global, _project_root, cfg, pwd) = build_registry().await?;
     let issue_ref = resolve_issue_ref(&args.r#ref)?;
-    let conn = registry.issues(issue_ref.tracker).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no {} credential — run `rupu auth login --provider {}`",
-            issue_ref.tracker,
-            issue_ref.tracker,
-        )
-    })?;
+    let account = args.account.as_deref().map(rupu_scm::AccountId::new);
+    let (_account, conn) = registry.issues_for(
+        issue_ref.tracker,
+        issue_ref_repo(&issue_ref).as_ref(),
+        Some(pwd.as_path()),
+        account.as_ref(),
+    )?;
     let issue = conn.get_issue(&issue_ref).await?;
     let pager_flag = if args.pager {
         Some(true)
@@ -481,6 +490,7 @@ async fn build_registry() -> anyhow::Result<(
     std::path::PathBuf,
     Option<std::path::PathBuf>,
     rupu_config::Config,
+    std::path::PathBuf,
 )> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -492,10 +502,15 @@ async fn build_registry() -> anyhow::Result<(
     let global_cfg = global.join("config.toml");
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
-    let resolver = rupu_auth::KeychainResolver::new();
+    // `resolver_for`, not a bare `KeychainResolver::new()`: this is
+    // exactly the seam `accounts::account_specs`' `[scm.*]` union closes
+    // (arc progress ledger, Ruling 7) — a declared `[scm.gh-work]`
+    // account's SSO token needs `resolve_provider_id("gh-work", ..)` to
+    // resolve, and that requires the resolver to know the account.
+    let resolver = crate::accounts::resolver_for(&cfg);
     let registry =
         Arc::new(Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await);
-    Ok((registry, global, project_root, cfg))
+    Ok((registry, global, project_root, cfg, pwd))
 }
 
 fn parse_state_filter(s: &str) -> anyhow::Result<Option<IssueState>> {
@@ -512,6 +527,21 @@ fn repo_to_issue_tracker(p: Platform) -> IssueTracker {
         Platform::Github => IssueTracker::Github,
         Platform::Gitlab => IssueTracker::Gitlab,
     }
+}
+
+/// The inverse of [`repo_to_issue_tracker`] plus `IssueRef.project`'s
+/// `"owner/repo"` convention: recover the `RepoRef` an `IssueRef`
+/// carries, so `issues_for` can run the owner/path rule engine instead
+/// of the old `registry.issues(tracker)` shim, which threw the owner
+/// away. `None` for Linear/Jira, whose `project` is a workspace/board
+/// id, not `"owner/repo"` — `issues_for` already treats a `None` repo as
+/// "only the explicit and sole-account tiers can resolve", which is
+/// correct for them (see `Registry::issues_for`'s doc). Delegates to
+/// the shared `rupu_scm::tracker_project_repo` — mirrors `rupu-mcp`'s
+/// `tools/issues.rs::project_repo` (Task 6 lifted the duplicated logic
+/// when `Registry::events_for_source` needed a third copy).
+fn issue_ref_repo(issue_ref: &IssueRef) -> Option<RepoRef> {
+    rupu_scm::tracker_project_repo(issue_ref.tracker, &issue_ref.project)
 }
 
 /// Resolve `[issues.default]` into a concrete `RepoRef` (ISSUES.md I-73):

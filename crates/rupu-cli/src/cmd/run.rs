@@ -729,13 +729,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                     owner: owner.clone(),
                     repo: repo.clone(),
                 };
-                let conn = scm_registry.repo(*platform).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no {} credential — run `rupu auth login --provider {}`",
-                        platform,
-                        platform
-                    )
-                })?;
+                let (_account, conn) = scm_registry.repo_for(&r, Some(pwd.as_path()), None)?;
 
                 let (dest, guard) = resolve_clone_dest(&pwd, repo, args.into.as_deref(), args.tmp)?;
                 // Brief progress line on stderr so the user knows where the

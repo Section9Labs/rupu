@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::{ToolKind, ToolSpec};
 use crate::error::McpError;
-use rupu_scm::{CreatePr, PrFilter, PrRef, PrState, Registry, RepoRef};
+use rupu_scm::{AccountId, CreatePr, PrFilter, PrRef, PrState, Registry, RepoRef};
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListPrsArgs {
@@ -17,6 +17,10 @@ pub struct ListPrsArgs {
     pub state: Option<String>,
     pub author: Option<String>,
     pub limit: Option<u32>,
+    /// Which configured account to use, when more than one is configured
+    /// for this platform (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -25,6 +29,10 @@ pub struct GetPrArgs {
     pub owner: String,
     pub repo: String,
     pub number: u32,
+    /// Which configured account to use, when more than one is configured
+    /// for this platform (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -33,6 +41,10 @@ pub struct DiffPrArgs {
     pub owner: String,
     pub repo: String,
     pub number: u32,
+    /// Which configured account to use, when more than one is configured
+    /// for this platform (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -42,6 +54,10 @@ pub struct CommentPrArgs {
     pub repo: String,
     pub number: u32,
     pub body: String,
+    /// Which configured account to use, when more than one is configured
+    /// for this platform (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -54,6 +70,10 @@ pub struct CreatePrArgs {
     pub head: String,
     pub base: String,
     pub draft: Option<bool>,
+    /// Which configured account to use, when more than one is configured
+    /// for this platform (e.g. two GitHub accounts). Only needed when
+    /// `[[scm.rules]]` don't disambiguate.
+    pub account: Option<String>,
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -112,9 +132,8 @@ pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpErr
         author: parsed.author,
         limit: parsed.limit,
     };
-    let conn = reg
-        .repo(platform)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {platform}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.repo_for(&r, None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.list_prs(&r, filter).await?).unwrap())
 }
 
@@ -130,9 +149,8 @@ pub async fn dispatch_get(args: Value, reg: &Registry) -> Result<String, McpErro
         },
         number: parsed.number,
     };
-    let conn = reg
-        .repo(platform)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {platform}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.repo_for(&p.repo, None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.get_pr(&p).await?).unwrap())
 }
 
@@ -148,9 +166,8 @@ pub async fn dispatch_diff(args: Value, reg: &Registry) -> Result<String, McpErr
         },
         number: parsed.number,
     };
-    let conn = reg
-        .repo(platform)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {platform}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.repo_for(&p.repo, None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.diff_pr(&p).await?).unwrap())
 }
 
@@ -166,9 +183,8 @@ pub async fn dispatch_comment(args: Value, reg: &Registry) -> Result<String, Mcp
         },
         number: parsed.number,
     };
-    let conn = reg
-        .repo(platform)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {platform}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.repo_for(&p.repo, None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.comment_pr(&p, &parsed.body).await?).unwrap())
 }
 
@@ -188,8 +204,7 @@ pub async fn dispatch_create(args: Value, reg: &Registry) -> Result<String, McpE
         base: parsed.base,
         draft: parsed.draft.unwrap_or(false),
     };
-    let conn = reg
-        .repo(platform)
-        .ok_or_else(|| McpError::NotWiredInV0(format!("no connector for {platform}")))?;
+    let account = parsed.account.as_deref().map(AccountId::new);
+    let (_account, conn) = reg.repo_for(&r, None, account.as_ref())?;
     Ok(serde_json::to_string(&conn.create_pr(&r, opts).await?).unwrap())
 }
