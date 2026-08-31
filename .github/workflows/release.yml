@@ -826,7 +826,21 @@ jobs:
 
   publish:
     name: publish release
-    needs: [meta, linux, macos, macos-app, packages]
+    # Deliberately NOT depending on `macos-app`. rupu.app is an optional
+    # artifact for CLI users, but as a hard `need` it was a veto: `repo`,
+    # `community`, `publish-aur` and `publish-homebrew` all need this job, so
+    # one Swift compiler crash in the app took the CLI, the Linux binaries,
+    # the .deb/.rpm, the apt/yum repos, Homebrew and the AUR down with it --
+    # every one of those already built and green. That is what happened to
+    # `v0.76.0-beta.1`.
+    #
+    # The one-tag matched-pair property that put both products on this
+    # workflow is intact: the app still builds from this same tag and still
+    # uploads to this same release when it succeeds. Only the failure mode
+    # changes -- the app can now miss a release instead of cancelling one. A
+    # failed `macos-app` still reds the workflow run, so a missing app is
+    # loud rather than silent.
+    needs: [meta, linux, macos, packages]
     # The only conditional the `app_dry_run` input adds. A dry run builds,
     # signs, notarizes and staples everything and then stops here; `repo`,
     # `community`, `publish-aur` and `publish-homebrew` all need this job, so
@@ -864,11 +878,19 @@ jobs:
             test -f "dist/rupu-$p"        || { echo "::error::missing rupu-$p"; exit 1; }
             test -f "dist/rupu-$p.sha256" || { echo "::error::missing rupu-$p.sha256"; exit 1; }
           done
-          # rupu.app ships on this same tag — see the `macos-app` job.
+          # rupu.app ships on this same tag whenever the `macos-app` job
+          # succeeds -- see the comment on this job's `needs`. It is not
+          # required: a failed app build must not hold back the CLI release.
+          # Every CLI asset above stays mandatory, so a genuinely broken
+          # release still fails here.
+          app_present=yes
           for f in rupu-app-darwin-arm64.dmg rupu-app-darwin-arm64.zip; do
-            test -f "dist/$f"        || { echo "::error::missing $f"; exit 1; }
-            test -f "dist/$f.sha256" || { echo "::error::missing $f.sha256"; exit 1; }
+            test -f "dist/$f" && test -f "dist/$f.sha256" || app_present=no
           done
+          if [ "$app_present" = no ]; then
+            echo "::warning::rupu.app assets absent -- publishing the CLI without them"
+          fi
+          echo "app_present=$app_present" >> "$GITHUB_ENV"
           test "$(ls dist/*.deb dist/*.rpm 2>/dev/null | wc -l)" -eq 4 \
             || { echo "::error::expected 4 packages"; exit 1; }
           ( cd dist && sha256sum -c ./*.sha256 )
@@ -883,14 +905,20 @@ jobs:
           PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
+          # Only advertise the rupu.app rows when the bundle is actually in
+          # `dist` (see the sanity-check step above). The leading newline is
+          # what makes this append two rows to the darwin-arm64 row below,
+          # and collapse to nothing at all when the app did not build.
+          APP_ROWS=""
+          if [ "${app_present:-no}" = yes ]; then
+            APP_ROWS=$(printf '\n| `rupu-app-darwin-arm64.dmg` | rupu.app, the macOS desktop client — signed + notarized + stapled; open it and drag rupu to Applications |\n| `rupu-app-darwin-arm64.zip` | rupu.app as a zip — the same stapled bundle, for scripted installs |')
+          fi
           notes=$(cat <<EOF
           ${CHANNEL} release of rupu \`${VERSION}\`.
 
           | Asset | Platform |
           |---|---|
-          | \`rupu-darwin-arm64\` | macOS, Apple Silicon — signed + notarized |
-          | \`rupu-app-darwin-arm64.dmg\` | rupu.app, the macOS desktop client — signed + notarized + stapled; open it and drag rupu to Applications |
-          | \`rupu-app-darwin-arm64.zip\` | rupu.app as a zip — the same stapled bundle, for scripted installs |
+          | \`rupu-darwin-arm64\` | macOS, Apple Silicon — signed + notarized |${APP_ROWS}
           | \`rupu-linux-x64\` | Linux x86_64 — static musl |
           | \`rupu-linux-arm64\` | Linux aarch64 — static musl |
           | \`rupu_${VERSION}_amd64.deb\` / \`rupu_${VERSION}_arm64.deb\` | Debian/Ubuntu package (declares its own deps, installs completions + man page) |
