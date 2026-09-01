@@ -1942,10 +1942,14 @@ enum SessionEntry {
     },
     /// A standalone reasoning block (schema-v2 `Thinking` event) — not
     /// bundled with an `Assistant` entry's content. `text: None` means the
-    /// block was redacted by the provider.
+    /// block was redacted by the provider. `streaming` mirrors
+    /// `Assistant.streaming`: `true` while accumulating `ThinkingDelta`
+    /// chunks, flipped to `false` (and `text`/`provider` overwritten with
+    /// the authoritative values) once the committed `Thinking` event lands.
     Thinking {
         text: Option<String>,
         provider: String,
+        streaming: bool,
     },
     ToolCall {
         tool: String,
@@ -2557,15 +2561,11 @@ impl SessionInteractiveState {
             }
             TranscriptEvent::Thinking { text, provider, .. } => {
                 self.activity = SessionActivity::Thinking;
-                self.push_entry(SessionEntry::Thinking {
-                    text: text.clone(),
-                    provider: provider.clone(),
-                });
+                self.push_thinking_entry(text.clone(), provider.clone());
             }
-            // `ThinkingDelta` is dropped just like `AssistantDelta` isn't
-            // pushed as its own entry — the committed `Thinking`/`Assistant`
-            // entry carries the whole block.
-            TranscriptEvent::ThinkingDelta { .. } => {}
+            TranscriptEvent::ThinkingDelta { content } => {
+                self.push_thinking_delta(content);
+            }
             TranscriptEvent::UserMessage { content } => {
                 self.push_line(
                     crate::output::palette::Status::Active,
@@ -2740,6 +2740,96 @@ impl SessionInteractiveState {
             match self.entries.get(idx) {
                 Some(SessionEntry::Usage { .. }) => continue,
                 Some(SessionEntry::Assistant { .. }) => return Some(idx),
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// Live-typing counterpart of `push_assistant_delta`, for reasoning
+    /// text: appends to a still-open (`streaming: true`) trailing
+    /// `SessionEntry::Thinking`, or opens a new one if the tail entry isn't
+    /// already one. The provider isn't known until the committed `Thinking`
+    /// event lands, so it's left empty here and filled in by
+    /// `push_thinking_entry`.
+    fn push_thinking_delta(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.activity = SessionActivity::Thinking;
+        let last_index = self.entries.len().checked_sub(1);
+        match last_index.and_then(|index| self.entries.get_mut(index).map(|entry| (index, entry))) {
+            Some((
+                index,
+                SessionEntry::Thinking {
+                    text, streaming, ..
+                },
+            )) => {
+                text.get_or_insert_with(String::new).push_str(chunk);
+                *streaming = true;
+                self.invalidate_entry(index);
+            }
+            _ => {
+                self.push_entry(SessionEntry::Thinking {
+                    text: Some(chunk.to_string()),
+                    provider: String::new(),
+                    streaming: true,
+                });
+            }
+        }
+    }
+
+    /// Live-typing counterpart of `push_assistant_message`: finalizes the
+    /// still-open `SessionEntry::Thinking` accumulated by
+    /// `push_thinking_delta` (if any) in place — so the committed event
+    /// REPLACES the delta-accumulated approximation rather than duplicating
+    /// it — or pushes a fresh entry when there's nothing open to merge into
+    /// (mirrors `push_assistant_message`'s streaming-or-content-match merge
+    /// guard, so two back-to-back non-streaming `Thinking` blocks in the
+    /// same turn don't collapse into one).
+    fn push_thinking_entry(&mut self, text: Option<String>, provider: String) {
+        match self.last_mergeable_thinking_index() {
+            Some(index) => match self.entries.get_mut(index) {
+                Some(SessionEntry::Thinking {
+                    text: existing_text,
+                    provider: existing_provider,
+                    streaming,
+                }) => {
+                    let matches = match (existing_text.as_deref(), text.as_deref()) {
+                        (Some(existing), Some(incoming)) => existing.trim() == incoming.trim(),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if *streaming || matches {
+                        *existing_text = text;
+                        *existing_provider = provider;
+                        *streaming = false;
+                        self.invalidate_entry(index);
+                    } else {
+                        self.push_entry(SessionEntry::Thinking {
+                            text,
+                            provider,
+                            streaming: false,
+                        });
+                    }
+                }
+                _ => unreachable!("last_mergeable_thinking_index only returns Thinking entries"),
+            },
+            None => {
+                self.push_entry(SessionEntry::Thinking {
+                    text,
+                    provider,
+                    streaming: false,
+                });
+            }
+        }
+    }
+
+    fn last_mergeable_thinking_index(&self) -> Option<usize> {
+        for idx in (0..self.entries.len()).rev() {
+            match self.entries.get(idx) {
+                Some(SessionEntry::Usage { .. }) => continue,
+                Some(SessionEntry::Thinking { .. }) => return Some(idx),
                 _ => break,
             }
         }
@@ -3779,6 +3869,43 @@ fn render_synthetic_session_activity_rows(
     }
 }
 
+/// Unified visibility policy for a `thinking` block, shared by
+/// `SessionEntry::Assistant`'s bundled `thinking` field and the standalone
+/// `SessionEntry::Thinking` entry: `Focused` shows a single 96-char line;
+/// `Compact` and `Full` show the full rendered body. Returns the
+/// already-labeled first line (built via `retained_session_event_line` for
+/// the plain-truncated Focused case, `retained_session_event_line_raw` for
+/// the syntax-highlighted full-body case) plus any continuation lines,
+/// which the caller wraps with its own framing (`render_role_body` for the
+/// bundled case, `render_nested_event_rows`/`render_nested_body_lines` for
+/// the standalone case).
+fn thinking_line_and_body(
+    text: &str,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) -> (String, Vec<String>) {
+    use crate::output::palette::Status;
+    match view_mode {
+        LiveViewMode::Focused => (
+            retained_session_event_line(
+                Status::Active,
+                "thinking",
+                &truncate_single_line(text, 96),
+            ),
+            Vec::new(),
+        ),
+        LiveViewMode::Compact | LiveViewMode::Full => {
+            let payload = render_payload(text, prefs);
+            let mut lines = payload.rendered.lines();
+            let first = lines.next().unwrap_or("");
+            (
+                retained_session_event_line_raw(Status::Active, "thinking", first),
+                lines.map(str::to_string).collect(),
+            )
+        }
+    }
+}
+
 fn render_session_entry_rows(
     entry: &SessionEntry,
     next_is_nested: bool,
@@ -3836,19 +3963,10 @@ fn render_session_entry_rows(
                 width,
             );
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                if view_mode == LiveViewMode::Full {
-                    let payload = render_payload(thinking, prefs);
-                    let mut lines = payload.rendered.lines();
-                    if let Some(first) = lines.next() {
-                        let mut body = vec![retained_session_event_line_raw(
-                            Status::Active,
-                            "thinking",
-                            first,
-                        )];
-                        body.extend(lines.map(str::to_string));
-                        rows.extend(render_role_body(&body, role_color, width));
-                    }
-                }
+                let (first, rest) = thinking_line_and_body(thinking, view_mode, prefs);
+                let mut body = vec![first];
+                body.extend(rest);
+                rows.extend(render_role_body(&body, role_color, width));
             }
             if !content.trim().is_empty() {
                 let payload = render_assistant_content(content.trim(), prefs);
@@ -3864,7 +3982,7 @@ fn render_session_entry_rows(
             }
             rows
         }
-        SessionEntry::Thinking { text, provider } => {
+        SessionEntry::Thinking { text, provider, .. } => {
             match text.as_deref().filter(|t| !t.trim().is_empty()) {
                 None => render_nested_event_rows(
                     next_is_nested,
@@ -3876,37 +3994,13 @@ fn render_session_entry_rows(
                     ),
                     width,
                 ),
-                Some(t) => match view_mode {
-                    LiveViewMode::Focused | LiveViewMode::Compact => render_nested_event_rows(
-                        next_is_nested,
-                        Status::Active,
-                        retained_session_event_line(
-                            Status::Active,
-                            "thinking",
-                            &truncate_single_line(t, 96),
-                        ),
-                        width,
-                    ),
-                    LiveViewMode::Full => {
-                        let payload = render_payload(t, prefs);
-                        let mut lines = payload.rendered.lines();
-                        let mut rows = Vec::new();
-                        if let Some(first) = lines.next() {
-                            rows = render_nested_event_rows(
-                                next_is_nested,
-                                Status::Active,
-                                retained_session_event_line_raw(Status::Active, "thinking", first),
-                                width,
-                            );
-                            rows.extend(render_nested_body_lines(
-                                next_is_nested,
-                                &lines.map(str::to_string).collect::<Vec<_>>(),
-                                width,
-                            ));
-                        }
-                        rows
-                    }
-                },
+                Some(t) => {
+                    let (first, rest) = thinking_line_and_body(t, view_mode, prefs);
+                    let mut rows =
+                        render_nested_event_rows(next_is_nested, Status::Active, first, width);
+                    rows.extend(render_nested_body_lines(next_is_nested, &rest, width));
+                    rows
+                }
             }
         }
         SessionEntry::ToolCall { tool, input } => {
@@ -9050,6 +9144,188 @@ mod tests {
             state.entries.last(),
             Some(SessionEntry::Thinking { .. })
         ));
+    }
+
+    #[test]
+    fn render_session_entry_rows_assistant_bundled_thinking_follows_the_unified_policy() {
+        let long = "x".repeat(300);
+        let entry = SessionEntry::Assistant {
+            content: "the fix".into(),
+            thinking: Some(long.clone()),
+            streaming: false,
+        };
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let compact_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+
+        // Focused (the `rupu session attach` default) must show the 96-char
+        // thinking line — this is finding 1: it used to show nothing at all.
+        let focused = render_session_entry_rows(
+            &entry,
+            false,
+            LiveViewMode::Focused,
+            &focused_prefs,
+            200,
+            None,
+        );
+        assert!(
+            focused.iter().any(|row| row.contains("thinking")),
+            "focused must show a thinking line: {focused:?}"
+        );
+        assert!(
+            !focused.iter().any(|row| row.contains(&long)),
+            "focused must not show the full body"
+        );
+
+        for (view_mode, prefs) in [
+            (LiveViewMode::Compact, &compact_prefs),
+            (LiveViewMode::Full, &full_prefs),
+        ] {
+            let rows = render_session_entry_rows(&entry, false, view_mode, prefs, 400, None);
+            let joined = rows.join("\n");
+            assert!(
+                joined.contains(&long),
+                "{view_mode:?} must show the full thinking body: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_session_entry_rows_standalone_thinking_follows_the_unified_policy() {
+        let long = "x".repeat(300);
+        let entry = SessionEntry::Thinking {
+            text: Some(long.clone()),
+            provider: "anthropic".into(),
+            streaming: false,
+        };
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+
+        let focused = render_session_entry_rows(
+            &entry,
+            false,
+            LiveViewMode::Focused,
+            &focused_prefs,
+            200,
+            None,
+        );
+        assert!(focused.iter().any(|row| row.contains("thinking")));
+        assert!(!focused.iter().any(|row| row.contains(&long)));
+
+        let full =
+            render_session_entry_rows(&entry, false, LiveViewMode::Full, &full_prefs, 400, None);
+        assert!(full.join("\n").contains(&long));
+
+        let redacted_entry = SessionEntry::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            streaming: false,
+        };
+        let redacted = render_session_entry_rows(
+            &redacted_entry,
+            false,
+            LiveViewMode::Full,
+            &full_prefs,
+            200,
+            None,
+        );
+        assert!(redacted
+            .iter()
+            .any(|row| row.contains("redacted reasoning")));
+    }
+
+    #[test]
+    fn thinking_deltas_accumulate_then_the_committed_event_replaces_them_without_duplication() {
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_thinking_delta.jsonl"),
+            Some("run_thinking_delta".into()),
+            LiveViewMode::Full,
+        );
+        state.push_transcript_event(&TranscriptEvent::ThinkingDelta {
+            content: "reasoning ".into(),
+        });
+        state.push_transcript_event(&TranscriptEvent::ThinkingDelta {
+            content: "about the fix".into(),
+        });
+        let thinking_entries_after_deltas = state
+            .entries
+            .iter()
+            .filter(|e| matches!(e, SessionEntry::Thinking { .. }))
+            .count();
+        assert_eq!(
+            thinking_entries_after_deltas, 1,
+            "deltas must accumulate into one open entry, not one each"
+        );
+        match state.entries.last() {
+            Some(SessionEntry::Thinking {
+                text, streaming, ..
+            }) => {
+                assert_eq!(text.as_deref(), Some("reasoning about the fix"));
+                assert!(
+                    *streaming,
+                    "still-accumulating entry must be marked streaming"
+                );
+            }
+            other => panic!("expected an open SessionEntry::Thinking, got {other:?}"),
+        }
+
+        state.push_transcript_event(&TranscriptEvent::Thinking {
+            text: Some("reasoning about the fix, finalized".into()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        });
+        let thinking_entries_after_commit = state
+            .entries
+            .iter()
+            .filter(|e| matches!(e, SessionEntry::Thinking { .. }))
+            .count();
+        assert_eq!(
+            thinking_entries_after_commit, 1,
+            "the committed event must replace the accumulated entry, not add a second one"
+        );
+        match state.entries.last() {
+            Some(SessionEntry::Thinking {
+                text,
+                provider,
+                streaming,
+            }) => {
+                assert_eq!(text.as_deref(), Some("reasoning about the fix, finalized"));
+                assert_eq!(provider, "anthropic");
+                assert!(!*streaming, "commit must finalize streaming");
+            }
+            other => panic!("expected a finalized SessionEntry::Thinking, got {other:?}"),
+        }
     }
 
     #[test]
