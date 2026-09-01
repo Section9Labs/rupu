@@ -272,6 +272,17 @@ pub enum Event {
 // `Event::deserialize` when the tag is one we recognize; an unrecognized
 // tag short-circuits straight to `Event::Unknown` without ever trying to
 // interpret `content`.
+//
+// This fallback must stay NARROW: `Event::Unknown` is reserved for a
+// well-formed line whose `type` is a string that just isn't one we know
+// about (forward compatibility with a future writer). Anything structurally
+// malformed — no top-level JSON object at all, an object with no `type`
+// key, or a `type` that isn't a string — is genuine corruption and must
+// still fail with a real deserialize error (the `reader.rs` module doc's
+// "bad JSON lines mid-file are returned as `Err(ReadError::Parse)`"
+// contract depends on this), so those shapes are explicitly rejected up
+// front / delegated to the derived parser's own error paths rather than
+// being swallowed into `Unknown`.
 impl Serialize for Event {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -287,12 +298,24 @@ impl<'de> Deserialize<'de> for Event {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        let tag = value.get("type").and_then(|t| t.as_str());
-        match tag {
-            Some(known) if KNOWN_EVENT_TAGS.contains(&known) => {
-                Event::deserialize(value).map_err(serde::de::Error::custom)
+        // Anything other than a JSON object can't carry a `type` tag at
+        // all — that's corruption, not an unrecognized-but-valid event.
+        let Some(obj) = value.as_object() else {
+            return Err(serde::de::Error::custom(format!(
+                "invalid type: expected a JSON object with a \"type\" field, got {value}"
+            )));
+        };
+        match obj.get("type") {
+            // Well-formed (object, string tag) but not one we know:
+            // forward-compatible `Unknown`, never an error.
+            Some(Value::String(tag)) if !KNOWN_EVENT_TAGS.contains(&tag.as_str()) => {
+                Ok(Event::Unknown)
             }
-            _ => Ok(Event::Unknown),
+            // Known tag, missing tag, or a non-string tag all fall through
+            // to the derived parser: it accepts the known-tag shape, and
+            // produces a real error (missing field / wrong type) for the
+            // other two — neither should silently become `Unknown`.
+            _ => Event::deserialize(value).map_err(serde::de::Error::custom),
         }
     }
 }
@@ -533,6 +556,33 @@ mod tests {
     fn unrecognized_event_type_parses_as_unknown_not_error() {
         let line = r#"{"type":"hologram_projection","data":{"x":1}}"#;
         assert_eq!(serde_json::from_str::<Event>(line).unwrap(), Event::Unknown);
+    }
+
+    // The three malformed shapes below must all be real deserialize errors,
+    // never `Event::Unknown` — `Unknown` is reserved for a well-formed
+    // object whose string `type` just isn't one we recognize. Silently
+    // downgrading corruption to `Unknown` would break the documented
+    // `reader.rs` contract that bad JSON lines surface as
+    // `Err(ReadError::Parse)`.
+
+    #[test]
+    fn object_missing_type_key_is_a_deserialize_error() {
+        let line = r#"{"data":{"turn_idx":0}}"#;
+        assert!(serde_json::from_str::<Event>(line).is_err());
+    }
+
+    #[test]
+    fn non_string_type_is_a_deserialize_error() {
+        let line = r#"{"type":123,"data":{}}"#;
+        assert!(serde_json::from_str::<Event>(line).is_err());
+    }
+
+    #[test]
+    fn non_object_top_level_is_a_deserialize_error() {
+        assert!(serde_json::from_str::<Event>("[1,2,3]").is_err());
+        assert!(serde_json::from_str::<Event>("42").is_err());
+        assert!(serde_json::from_str::<Event>("\"just a string\"").is_err());
+        assert!(serde_json::from_str::<Event>("null").is_err());
     }
 
     #[test]
