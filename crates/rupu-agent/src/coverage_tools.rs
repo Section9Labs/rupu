@@ -256,6 +256,20 @@ pub struct ReportFindingTool {
     paths: CoveragePaths,
 }
 
+impl ReportFindingTool {
+    /// Build the tool against an explicit ledger location.
+    ///
+    /// `register` below wires this up as part of the coverage harness. This
+    /// constructor exists for the other caller: an agent that records
+    /// findings WITHOUT a `concerns:` block (see `runner`'s
+    /// findings-without-coverage registration). A campaign that assesses
+    /// hosts rather than files has no catalog and no concerns, but still
+    /// produces findings.
+    pub fn new(paths: CoveragePaths) -> Self {
+        Self { paths }
+    }
+}
+
 #[async_trait]
 impl Tool for ReportFindingTool {
     fn name(&self) -> &'static str {
