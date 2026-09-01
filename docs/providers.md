@@ -240,11 +240,23 @@ See `docs/providers/openai-compatible.md` for a step-by-step setup guide.
 3. **Baked-in** — Copilot and Gemini ship a curated v0 list since their public listing endpoints are limited.
 
 ```sh
-rupu models list              # all four providers
+rupu models list              # built-in vendors + every declared account
 rupu models list --provider openai
 rupu models refresh           # re-fetch live caches
 rupu models refresh --provider anthropic
 ```
+
+`--provider` accepts a **declared account name** as well as a built-in vendor
+name — `rupu models refresh --provider anthropic-work` refreshes that account
+against its declared vendor (`[providers.anthropic-work] kind = "anthropic"`),
+using that account's own credential, and caches the result under the account
+name so two accounts of one vendor keep separate model lists. A name that is
+neither a built-in vendor nor a declared account is an error with a non-zero
+exit, not a silent no-op.
+
+An `openai-compatible` account has no live listing endpoint — its models are
+whatever `[[providers.<name>.models]]` declares — so `models refresh` reports
+that rather than pretending to fetch.
 
 If the agent's `model:` value isn't found in any source, rupu errors with:
 > `model 'xyz' not found for provider 'openai'. Run 'rupu models list --provider openai' to see available models, or add a custom entry to ~/.rupu/config.toml.`

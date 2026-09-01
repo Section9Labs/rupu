@@ -607,10 +607,27 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             cfg.default_provider.as_deref(),
         );
         let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
-        if !provider_factory::is_builtin_provider(&provider_name) && oai_params.is_none() {
+        // Pre-flight, before any credential lookup, so a typo'd provider name
+        // fails with a config error rather than a confusing auth one.
+        //
+        // Asks the factory (`is_dispatchable_provider`) rather than
+        // re-deriving the rule: this check used to be
+        // `!is_builtin_provider(name) && oai_params.is_none()`, which tests
+        // the *account name* against the builtin vendor list and so rejected
+        // every named account — `[providers.anthropic-work] kind =
+        // "anthropic"`, exactly what `rupu auth login --account
+        // anthropic-work --kind anthropic` writes and what `rupu auth
+        // status`'s KIND column reads back. The factory has dispatched on
+        // the resolved *kind* since multi-account landed; only this gate,
+        // the one copy of the rule that lived outside it, still looked at
+        // the name.
+        if !provider_factory::is_dispatchable_provider(&provider_name, &cfg.providers) {
             anyhow::bail!(
-                "provider '{provider_name}' is not a built-in provider and is not declared as \
-             [providers.{provider_name}] with kind = \"openai-compatible\" in config.toml"
+                "provider '{provider_name}' is not a built-in provider, is not a declared \
+                 account (no [providers.{provider_name}] with a vendor `kind` — declare one \
+                 with `rupu auth login --account {provider_name} --kind <vendor>`), and is \
+                 not declared as [providers.{provider_name}] with kind = \"openai-compatible\" \
+                 and a base_url in config.toml"
             );
         }
         // For an openai-compatible provider, prefer its configured default_model
