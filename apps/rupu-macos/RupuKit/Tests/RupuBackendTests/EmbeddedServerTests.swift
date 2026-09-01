@@ -43,24 +43,29 @@ final class CallCounter: @unchecked Sendable {
 // MARK: - Fast cold-start probe race (perf & interaction arc, Plan 5 Task 2)
 
 /// The overwhelmingly common case — a `cp serve` already listening —
-/// resolves `start()` in well under the probe's own (much longer, ~3s in
-/// production) timeout: a probe that answers immediately attaches almost
-/// instantly, called exactly once.
-@Test func startAttachesQuicklyWhenTheProbeAnswersFast() async throws {
+/// resolves `start()` via the race's "probe answered" branch without ever
+/// waiting out the fast-path deadline. Proven by ordering, not wall-clock
+/// (a `< 250ms` elapsed assertion here was flaky on loaded shared CI
+/// runners — 284ms observed under scheduler noise): the injected deadline
+/// is minutes long, so `start()` returning within the 1-minute time limit
+/// at all is only possible if the answered branch won the race.
+@Test(.timeLimit(.minutes(1)))
+func startAttachesQuicklyWhenTheProbeAnswersFast() async throws {
     let probeCalls = CallCounter()
-    let server = EmbeddedServer(binaryPath: "/nonexistent/rupu", port: 65535, probe: { _ in
-        probeCalls.increment()
-        return true
-    })
+    let server = EmbeddedServer(
+        binaryPath: "/nonexistent/rupu",
+        port: 65535,
+        fastPathDeadline: .seconds(600),
+        probe: { _ in
+            probeCalls.increment()
+            return true
+        }
+    )
 
-    let clock = ContinuousClock()
-    let start = clock.now
     let origin = try await server.start()
-    let elapsed = clock.now - start
 
     #expect(origin == .attached)
     #expect(probeCalls.value == 1)
-    #expect(elapsed < .milliseconds(250), "a fast-answering probe must not pay the 300ms fast-path deadline at all")
 }
 
 /// A probe that takes LONGER than the 300ms fast-path deadline to answer
