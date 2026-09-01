@@ -25,9 +25,27 @@
  *     the audit is surfaced as a standalone entry so it's never silently
  *     dropped.
  *   • each tool is classified into a `ToolKind` from its tool name.
- *   • tools are grouped into turns, a new turn starting at each
- *     `assistant_message` (tools before the first assistant land in a leading
- *     turn with no assistant).
+ *   • events land as ordered `TurnBlock`s inside a `TurnView`, a new turn
+ *     starting at each `turn_start` (v2 transcripts). Legacy v1 transcripts
+ *     carry no `turn_start` at all — for those, `assistant_message` itself
+ *     opens a new turn (tools/thinking before the first assistant land in a
+ *     leading turn with no assistant block), matching the old per-assistant
+ *     grouping exactly.
+ *   • `thinking` (v2) becomes its own block; a legacy `assistant_message
+ *     .thinking` string becomes a `thinking` block emitted immediately
+ *     before that turn's `assistant` block, so both eras render the same
+ *     block shape.
+ *   • `gate_requested` / `seed` / `user_message` / `notice` / `compaction`
+ *     each become their own block kind. Anything else unrecognised becomes
+ *     an `unknown` block carrying the raw event `type` — nothing is ever
+ *     silently dropped, EXCEPT `net_flow`: TranscriptSink appends one into
+ *     this same JSONL on essentially every provider call, and it already has
+ *     a dedicated display (the RunDetail Netflow tab, fed from the separate
+ *     per-run ledger API) — rendering it here too would flood nearly every
+ *     turn with a redundant/misleading row, so it's a deliberate no-op.
+ *   • orphaned pairing targets (a `tool_result`/`file_edit`/`command_run`
+ *     with no preceding `tool_call` to attach to in this snapshot) render as
+ *     a standalone `tool` block instead of vanishing.
  *   • a header is surfaced from `run_start`; a footer from `run_complete`,
  *     falling back to the last `usage` event when the run hasn't completed.
  *
@@ -121,9 +139,21 @@ export interface ToolAuditView {
   restricted: boolean;
 }
 
+export type TurnBlock =
+  | { kind: 'assistant'; content: string }
+  | { kind: 'thinking'; text: string | null; provider: string } // text null = redacted
+  | { kind: 'user'; content: string }
+  | { kind: 'tool'; view: ToolView }
+  | { kind: 'gate'; gateId: string; prompt: string; decision: string | null; decidedBy: string | null }
+  | { kind: 'seed'; messageCount: number; sourceTranscript: string | null }
+  | { kind: 'notice'; noticeKind: string; message: string }
+  | { kind: 'compaction'; seq: number; summarized: number }
+  | { kind: 'unknown'; type: string };
+
 export interface TurnView {
-  assistant?: { content: string; thinking?: string };
-  tools: ToolView[];
+  blocks: TurnBlock[];
+  tokensIn: number | null;
+  tokensOut: number | null;
   summary: {
     toolCount: number;
     findingCount: number;
@@ -246,8 +276,9 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   let sawRunComplete = false;
 
   const turns: TurnView[] = [];
-  // The turn tools currently attach to. Created lazily so a leading turn only
-  // appears when there are tools before the first assistant_message.
+  // The turn new blocks currently attach to. Created lazily (via `ensureTurn`)
+  // so a leading turn only appears when something lands before the first
+  // `turn_start` / `assistant_message`.
   let current: TurnView | null = null;
   // Tool lookup by call_id, so a later `tool_result` finds its `tool_call`.
   const toolByCall = new Map<string, ToolView>();
@@ -267,12 +298,26 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   // because a step may invoke the same tool more than once.
   const pendingActionArgsByTool = new Map<string, unknown[]>();
 
+  // Legacy (v1) transcripts carry no `turn_start` at all — for those,
+  // `assistant_message` itself opens a new turn, matching the old
+  // per-assistant grouping. v2 transcripts group by `turn_start` instead;
+  // once we've seen one, `assistant_message` just lands in the current turn.
+  let sawTurnStart = false;
+
+  function newTurn(): TurnView {
+    const t: TurnView = {
+      blocks: [],
+      tokensIn: null,
+      tokensOut: null,
+      summary: { toolCount: 0, findingCount: 0, result: 'running' },
+    };
+    turns.push(t);
+    current = t;
+    return t;
+  }
+
   function ensureTurn(): TurnView {
-    if (current === null) {
-      current = { tools: [], summary: { toolCount: 0, findingCount: 0, result: 'running' } };
-      turns.push(current);
-    }
-    return current;
+    return current ?? newTurn();
   }
 
   for (const ev of events) {
@@ -290,19 +335,96 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         break;
       }
 
+      case 'turn_start': {
+        sawTurnStart = true;
+        newTurn();
+        break;
+      }
+
+      case 'turn_end': {
+        const t = ensureTurn();
+        t.tokensIn = asNumber(data.tokens_in);
+        t.tokensOut = asNumber(data.tokens_out);
+        break;
+      }
+
+      case 'thinking': {
+        ensureTurn().blocks.push({
+          kind: 'thinking',
+          text: asString(data.text),
+          provider: asString(data.provider) ?? '',
+        });
+        break;
+      }
+
+      case 'assistant_delta':
+      case 'thinking_delta':
+        // Consolidated events (`assistant_message` / `thinking`) carry the
+        // same content already — the deltas are for live-streaming UIs only.
+        break;
+
+      case 'net_flow':
+        // Deliberately unrendered here. TranscriptSink appends a `net_flow`
+        // line into this same JSONL on essentially every provider call, so
+        // treating it like an unrecognised event would flood nearly every
+        // turn with a misleading "unrecognized event" row. Netflow has its
+        // own dedicated display — the RunDetail Netflow tab, fed from the
+        // separate per-run ledger API — so it's a deliberate no-op here.
+        break;
+
       case 'assistant_message': {
-        const turn: TurnView = {
-          assistant: {
-            content: asString(data.content) ?? '',
-            ...(asString(data.thinking) !== null
-              ? { thinking: asString(data.thinking) as string }
-              : {}),
-          },
-          tools: [],
-          summary: { toolCount: 0, findingCount: 0, result: 'running' },
-        };
-        turns.push(turn);
-        current = turn;
+        // v1 files have no reliable turn framing convention here: keep the
+        // legacy "assistant opens a turn" grouping unless turn_start is
+        // doing the grouping.
+        const turn = sawTurnStart ? ensureTurn() : newTurn();
+        const legacyThinking = asString(data.thinking);
+        if (legacyThinking !== null) {
+          turn.blocks.push({ kind: 'thinking', text: legacyThinking, provider: '' });
+        }
+        turn.blocks.push({ kind: 'assistant', content: asString(data.content) ?? '' });
+        break;
+      }
+
+      case 'user_message': {
+        ensureTurn().blocks.push({ kind: 'user', content: asString(data.content) ?? '' });
+        break;
+      }
+
+      case 'seed': {
+        ensureTurn().blocks.push({
+          kind: 'seed',
+          messageCount: asNumber(data.message_count) ?? 0,
+          sourceTranscript: asString(data.source_transcript),
+        });
+        break;
+      }
+
+      case 'gate_requested': {
+        ensureTurn().blocks.push({
+          kind: 'gate',
+          gateId: asString(data.gate_id) ?? '',
+          prompt: asString(data.prompt) ?? '',
+          decision: asString(data.decision),
+          decidedBy: asString(data.decided_by),
+        });
+        break;
+      }
+
+      case 'notice': {
+        ensureTurn().blocks.push({
+          kind: 'notice',
+          noticeKind: asString(data.kind) ?? '',
+          message: asString(data.message) ?? '',
+        });
+        break;
+      }
+
+      case 'compaction': {
+        ensureTurn().blocks.push({
+          kind: 'compaction',
+          seq: asNumber(data.seq) ?? 0,
+          summarized: asNumber(data.summarized_messages) ?? 0,
+        });
         break;
       }
 
@@ -336,7 +458,7 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           pendingAuditsByTool.set(tool, [view]);
         }
 
-        ensureTurn().tools.push(view);
+        ensureTurn().blocks.push({ kind: 'tool', view });
         break;
       }
 
@@ -351,8 +473,18 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           const durationMs = asNumber(data.duration_ms);
           if (durationMs !== null) view.durationMs = durationMs;
           if (data.structured !== undefined) view.structured = data.structured;
+        } else {
+          // Orphan result (no tool_call in this snapshot): standalone card.
+          const orphan: ToolView = { tool: '(result)', input: undefined, kind: 'generic' };
+          if (callId !== '') orphan.callId = callId;
+          const output = asString(data.output);
+          if (output !== null) orphan.output = output;
+          const error = asString(data.error);
+          if (error !== null) orphan.error = error;
+          const durationMs = asNumber(data.duration_ms);
+          if (durationMs !== null) orphan.durationMs = durationMs;
+          ensureTurn().blocks.push({ kind: 'tool', view: orphan });
         }
-        // An unpaired result carries no tool_call to render against; ignore.
         break;
       }
 
@@ -381,33 +513,52 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           // the two events are merged, never surfaced separately.
           const argQueue = pendingActionArgsByTool.get(tool);
           const input = argQueue && argQueue.length > 0 ? argQueue.shift() : undefined;
-          ensureTurn().tools.push({ tool, input, kind: classify(tool), audit });
+          ensureTurn().blocks.push({
+            kind: 'tool',
+            view: { tool, input, kind: classify(tool), audit },
+          });
         }
         break;
       }
 
       case 'file_edit': {
+        const diff = {
+          path: asString(data.path) ?? '',
+          editKind: asString(data.kind) ?? '',
+          diff: asString(data.diff) ?? '',
+        };
         if (pendingDiff) {
-          pendingDiff.diff = {
-            path: asString(data.path) ?? '',
-            editKind: asString(data.kind) ?? '',
-            diff: asString(data.diff) ?? '',
-          };
+          pendingDiff.diff = diff;
           pendingDiff = null;
+        } else {
+          // Orphan edit (no preceding write_file/edit_file tool_call in this
+          // snapshot): standalone card instead of a silently dropped diff.
+          ensureTurn().blocks.push({
+            kind: 'tool',
+            view: { tool: 'file_edit', input: undefined, kind: 'diff', diff },
+          });
         }
         break;
       }
 
       case 'command_run': {
+        const argv = Array.isArray(data.argv) ? data.argv : [];
+        const command = typeof argv[2] === 'string' ? argv[2] : '';
+        const terminal = {
+          command,
+          cwd: asString(data.cwd) ?? '',
+          exitCode: asNumber(data.exit_code) ?? 0,
+        };
         if (pendingTerminal) {
-          const argv = Array.isArray(data.argv) ? data.argv : [];
-          const command = typeof argv[2] === 'string' ? argv[2] : '';
-          pendingTerminal.terminal = {
-            command,
-            cwd: asString(data.cwd) ?? '',
-            exitCode: asNumber(data.exit_code) ?? 0,
-          };
+          pendingTerminal.terminal = terminal;
           pendingTerminal = null;
+        } else {
+          // Orphan command (no preceding bash tool_call in this snapshot):
+          // standalone card instead of a silently dropped terminal block.
+          ensureTurn().blocks.push({
+            kind: 'tool',
+            view: { tool: 'command_run', input: undefined, kind: 'terminal', terminal },
+          });
         }
         break;
       }
@@ -457,25 +608,32 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         break;
       }
 
-      // user_message is a dead/legacy shape — there is no user_message in the
-      // live stream. turn_start / turn_end / assistant_delta / gate_requested
-      // carry no render payload. All ignored gracefully.
-      default:
+      default: {
+        // Anything unrecognised (including forward-compat event types the
+        // catch-all member of TranscriptEvent admits) still renders, rather
+        // than vanishing silently.
+        ensureTurn().blocks.push({ kind: 'unknown', type: ev.type });
         break;
+      }
     }
   }
 
   // Finalize per-turn summaries.
   for (const turn of turns) {
-    const toolCount = turn.tools.length;
-    const findingCount = turn.tools.filter((t) => t.kind === 'finding').length;
-    const hasError = turn.tools.some((t) => t.error !== undefined);
+    const tools = turn.blocks.filter(
+      (b): b is Extract<TurnBlock, { kind: 'tool' }> => b.kind === 'tool',
+    );
+    const hasError = tools.some((t) => t.view.error !== undefined);
     turn.summary = {
-      toolCount,
-      findingCount,
+      toolCount: tools.length,
+      findingCount: tools.filter((t) => t.view.kind === 'finding').length,
       result: hasError ? 'error' : sawRunComplete ? 'ok' : 'running',
     };
   }
 
-  return { header, turns, footer };
+  // Drop turns that ended up with no blocks (e.g. a turn_start whose turn
+  // only produced deltas) so empty shells don't render.
+  const nonEmpty = turns.filter((t) => t.blocks.length > 0);
+
+  return { header, turns: nonEmpty, footer };
 }

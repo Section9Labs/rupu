@@ -1,6 +1,26 @@
 import { describe, it, expect } from 'vitest';
 import { buildTranscriptView } from './transcriptView';
 import type { TranscriptEvent } from '../../lib/transcript';
+import type { TurnView, TurnBlock, ToolView } from './transcriptView';
+
+// ---------------------------------------------------------------------------
+// Accessors (the v2 blocks model replaced `turn.assistant` / `turn.tools`
+// with an ordered `turn.blocks` array — these mirror the old shape so the
+// existing assertions below stay pinned to the same behavior.)
+// ---------------------------------------------------------------------------
+
+function toolsOf(turns: TurnView[]): ToolView[] {
+  return turns
+    .flatMap((t) => t.blocks)
+    .filter((b): b is Extract<TurnBlock, { kind: 'tool' }> => b.kind === 'tool')
+    .map((b) => b.view);
+}
+
+function assistantContent(turn: TurnView): string | undefined {
+  return turn.blocks.find(
+    (b): b is Extract<TurnBlock, { kind: 'assistant' }> => b.kind === 'assistant',
+  )?.content;
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -109,7 +129,7 @@ describe('buildTranscriptView — findings from report_finding', () => {
 
   it('produces one finding ToolView with parsed fields', () => {
     const view = buildTranscriptView([RUN_START, ASSISTANT, FINDING_CALL, FINDING_RESULT]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     const tool = tools[0];
     expect(tool.kind).toBe('finding');
@@ -128,7 +148,7 @@ describe('buildTranscriptView — findings from report_finding', () => {
 
   it('yields a finding from the tool_call ALONE (no action_emitted, no result)', () => {
     const view = buildTranscriptView([RUN_START, ASSISTANT, FINDING_CALL]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     expect(tools[0].kind).toBe('finding');
     expect(tools[0].finding?.severity).toBe('high');
@@ -147,7 +167,7 @@ describe('buildTranscriptView — terminal / diff pairing', () => {
       data: { argv: ['/bin/sh', '-c', 'ls -la'], cwd: '/x', exit_code: 0, stdout_bytes: 10, stderr_bytes: 0 },
     };
     const view = buildTranscriptView([RUN_START, ASSISTANT, bashCall, cmdRun]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     const tool = tools[0];
     expect(tool.kind).toBe('terminal');
@@ -166,7 +186,7 @@ describe('buildTranscriptView — terminal / diff pairing', () => {
       data: { path: 'a.rs', kind: 'modify', diff: '@@ -1 +1 @@\n-old\n+new' },
     };
     const view = buildTranscriptView([RUN_START, ASSISTANT, editCall, fileEdit]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     const tool = tools[0];
     expect(tool.kind).toBe('diff');
@@ -180,7 +200,7 @@ describe('buildTranscriptView — tool kinds', () => {
   function kindOf(tool: string, input: unknown = {}): string {
     const call: TranscriptEvent = { type: 'tool_call', data: { call_id: 'k1', tool, input } };
     const view = buildTranscriptView([RUN_START, ASSISTANT, call]);
-    return view.turns.flatMap((t) => t.tools)[0].kind;
+    return toolsOf(view.turns)[0].kind;
   }
 
   it('maps tool names to kinds', () => {
@@ -204,7 +224,7 @@ describe('buildTranscriptView — ast_grep tool kind + structured payload', () =
       { type: 'tool_result', data: { call_id: 'c1', output: 'a.rs:1:1: impl X for Y', duration_ms: 3, structured: { tool: 'ast_grep', matchCount: 1, matches: [] } } },
     ];
     const view = buildTranscriptView(events as unknown as TranscriptEvent[]);
-    const tool = view.turns.flatMap((t) => t.tools).find((x) => x.tool === 'ast_grep')!;
+    const tool = toolsOf(view.turns).find((x) => x.tool === 'ast_grep')!;
     expect(tool.kind).toBe('ast_grep');
     expect((tool.structured as { matchCount: number }).matchCount).toBe(1);
   });
@@ -235,17 +255,17 @@ describe('buildTranscriptView — turn grouping', () => {
     expect(view.turns).toHaveLength(2);
 
     const t0 = view.turns[0];
-    expect(t0.assistant?.content).toContain('keyring module');
-    expect(t0.tools).toHaveLength(1);
-    expect(t0.tools[0].kind).toBe('read');
+    expect(assistantContent(t0)).toContain('keyring module');
+    expect(toolsOf([t0])).toHaveLength(1);
+    expect(toolsOf([t0])[0].kind).toBe('read');
     expect(t0.summary.toolCount).toBe(1);
     expect(t0.summary.findingCount).toBe(0);
     expect(t0.summary.result).toBe('ok');
 
     const t1 = view.turns[1];
-    expect(t1.assistant?.content).toBe('B');
-    expect(t1.tools).toHaveLength(1);
-    expect(t1.tools[0].kind).toBe('finding');
+    expect(assistantContent(t1)).toBe('B');
+    expect(toolsOf([t1])).toHaveLength(1);
+    expect(toolsOf([t1])[0].kind).toBe('finding');
     expect(t1.summary.findingCount).toBe(1);
   });
 
@@ -257,10 +277,10 @@ describe('buildTranscriptView — turn grouping', () => {
       ASSISTANT,
     ]);
     expect(view.turns).toHaveLength(2);
-    expect(view.turns[0].assistant).toBeUndefined();
-    expect(view.turns[0].tools).toHaveLength(1);
-    expect(view.turns[1].assistant?.content).toContain('keyring module');
-    expect(view.turns[1].tools).toHaveLength(0);
+    expect(assistantContent(view.turns[0])).toBeUndefined();
+    expect(toolsOf([view.turns[0]])).toHaveLength(1);
+    expect(assistantContent(view.turns[1])).toContain('keyring module');
+    expect(toolsOf([view.turns[1]])).toHaveLength(0);
   });
 
   it("summary.result is 'error' when any tool errored", () => {
@@ -271,7 +291,7 @@ describe('buildTranscriptView — turn grouping', () => {
     };
     const view = buildTranscriptView([RUN_START, ASSISTANT, call, errResult, RUN_COMPLETE]);
     expect(view.turns[0].summary.result).toBe('error');
-    expect(view.turns[0].tools[0].error).toBe('ENOENT');
+    expect(toolsOf([view.turns[0]])[0].error).toBe('ENOENT');
   });
 
   it("summary.result is 'running' when no run_complete is seen", () => {
@@ -281,7 +301,14 @@ describe('buildTranscriptView — turn grouping', () => {
 });
 
 describe('buildTranscriptView — graceful ignores', () => {
-  it('ignores phantom user_message / action_emitted events without a phantom item', () => {
+  it('renders user_message as a real block (no longer a dead/phantom shape) and still ignores the legacy action_emitted finding shape', () => {
+    // Pre-v2, `user_message` never appeared in the live stream and was
+    // treated as dead/ignorable. v2 transcripts DO emit it (seeded prompts,
+    // mid-run user turns), so it must render — see the `v2 blocks model`
+    // describe block below for the dedicated coverage. This test only pins
+    // down that it doesn't produce a phantom TOOL item, and that the legacy
+    // `action_emitted` finding shape (no `kind`/`payload`) still produces
+    // nothing on its own.
     const userMsg: TranscriptEvent = {
       type: 'user_message',
       data: { content: 'hello' },
@@ -291,11 +318,15 @@ describe('buildTranscriptView — graceful ignores', () => {
       data: { action: 'report_finding', severity: 'high', summary: 'legacy' },
     };
     const view = buildTranscriptView([RUN_START, userMsg, actionEmitted, ASSISTANT]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(0);
-    // exactly one assistant turn, no phantom finding from action_emitted
-    expect(view.turns).toHaveLength(1);
-    expect(view.turns[0].assistant?.content).toContain('keyring module');
+    // The user_message opens a leading turn (no turn_start present); the
+    // assistant_message opens its own turn after it — no phantom finding
+    // from action_emitted in either.
+    expect(view.turns).toHaveLength(2);
+    const userBlock = view.turns[0].blocks.find((b) => b.kind === 'user');
+    expect(userBlock).toEqual({ kind: 'user', content: 'hello' });
+    expect(assistantContent(view.turns[1])).toContain('keyring module');
   });
 
   it('merges action_emitted into the tool_audit entry rather than adding a second item (regression: never conflate the two)', () => {
@@ -308,7 +339,7 @@ describe('buildTranscriptView — graceful ignores', () => {
       data: { tool: 'scm.prs.comment', declared: true, granted: true, blocked: false, restricted: true },
     };
     const view = buildTranscriptView([actionEmitted, audit]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     // The standing invariant: an action call is surfaced exactly ONCE. Since
     // ISSUES.md I-40 the action_emitted payload enriches that single entry
     // rather than being discarded, but it still never produces an item of its
@@ -335,7 +366,7 @@ describe('buildTranscriptView — graceful ignores', () => {
       data: { tool: 'issues.comment', declared: true, granted: true, blocked: false, restricted: false },
     };
     const view = buildTranscriptView([actionEmitted, audit]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     expect(tools[0].input).toEqual({ project: 'acme/widget', number: 42, body: 'triaged' });
   });
@@ -352,7 +383,7 @@ describe('buildTranscriptView — graceful ignores', () => {
       data: { tool: 'issues.comment', declared: true, granted: true, blocked: false, restricted: false },
     };
     const view = buildTranscriptView([legacy, audit]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     expect(tools[0].input).toBeUndefined();
   });
@@ -383,7 +414,7 @@ describe('buildTranscriptView — tool_audit', () => {
       data: { call_id: 'c1', output: '{"id":1}', duration_ms: 5 },
     };
     const view = buildTranscriptView([RUN_START, ASSISTANT, call, auditEvent(), result]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     expect(tools[0].tool).toBe('issues.create');
     expect(tools[0].audit).toEqual({ declared: false, granted: true, blocked: false, restricted: false });
@@ -402,7 +433,7 @@ describe('buildTranscriptView — tool_audit', () => {
       call,
       auditEvent({ tool: 'scm.prs.diff', declared: true, granted: false, blocked: true, restricted: true }),
     ]);
-    const tool = view.turns.flatMap((t) => t.tools)[0];
+    const tool = toolsOf(view.turns)[0];
     expect(tool.audit?.blocked).toBe(true);
     expect(tool.audit?.granted).toBe(false);
     expect(tool.audit?.declared).toBe(true);
@@ -415,7 +446,7 @@ describe('buildTranscriptView — tool_audit', () => {
     const view = buildTranscriptView([
       auditEvent({ tool: 'scm.prs.comment', declared: true, granted: true, blocked: false, restricted: true }),
     ]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(1);
     expect(tools[0].tool).toBe('scm.prs.comment');
     expect(tools[0].audit).toEqual({ declared: true, granted: true, blocked: false, restricted: true });
@@ -452,7 +483,7 @@ describe('buildTranscriptView — tool_audit', () => {
       auditB,
       resultB,
     ]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     // Exactly 2 cards — no third, phantom standalone card.
     expect(tools).toHaveLength(2);
 
@@ -483,7 +514,7 @@ describe('buildTranscriptView — tool_audit', () => {
       audit2,
       result2,
     ]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(2);
     expect(tools[0].callId).toBe('x1');
     expect(tools[0].audit?.blocked).toBe(false);
@@ -501,7 +532,7 @@ describe('buildTranscriptView — tool_audit', () => {
       auditEvent({ tool: 'issues.list' }),
       call2,
     ]);
-    const tools = view.turns.flatMap((t) => t.tools);
+    const tools = toolsOf(view.turns);
     expect(tools).toHaveLength(2);
     expect(tools[0].tool).toBe('issues.list');
     expect(tools[0].audit).toBeDefined();
@@ -519,10 +550,93 @@ describe('buildTranscriptView — result pairing by call_id', () => {
       toolResult('c1', '80 lines · const KEY', 120),
       RUN_COMPLETE,
     ]);
-    const tool = view.turns.flatMap((t) => t.tools)[0];
+    const tool = toolsOf(view.turns)[0];
     expect(tool.callId).toBe('c1');
     expect(tool.output).toContain('const KEY');
     expect(tool.durationMs).toBe(120);
     expect(tool.error).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2 blocks model
+// ---------------------------------------------------------------------------
+
+describe('v2 blocks model', () => {
+  it('groups by turn_start and preserves in-turn block order incl. thinking', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      { type: 'thinking', data: { text: 'pick a tool', provider: 'anthropic', model: 'm' } },
+      { type: 'tool_call', data: { call_id: 'c1', tool: 'grep', input: { q: 'x' } } },
+      { type: 'tool_result', data: { call_id: 'c1', output: 'hit', duration_ms: 3 } },
+      { type: 'turn_end', data: { turn_idx: 0, tokens_in: 11, tokens_out: 7 } },
+      { type: 'turn_start', data: { turn_idx: 1 } },
+      { type: 'thinking', data: { text: null, provider: 'anthropic', model: 'm' } },
+      { type: 'assistant_message', data: { content: 'done' } },
+      { type: 'turn_end', data: { turn_idx: 1, tokens_in: 5, tokens_out: 2 } },
+    ]);
+    expect(view.turns).toHaveLength(2);
+    expect(view.turns[0].blocks.map((b) => b.kind)).toEqual(['thinking', 'tool']);
+    expect(view.turns[0].tokensIn).toBe(11);
+    const t1 = view.turns[1].blocks;
+    expect(t1[0]).toEqual({ kind: 'thinking', text: null, provider: 'anthropic' });
+    expect(t1[1]).toEqual({ kind: 'assistant', content: 'done' });
+  });
+
+  it('renders gate_requested, seed, user_message, notice, compaction and unknown — nothing dropped', () => {
+    const view = buildTranscriptView([
+      { type: 'seed', data: { message_count: 4 } },
+      { type: 'user_message', data: { content: 'do the task' } },
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      { type: 'gate_requested', data: { gate_id: 'g1', prompt: 'ship it?', decision: 'approve', decided_by: 'matt' } },
+      { type: 'notice', data: { kind: 'context_trim', message: 'trimmed' } },
+      { type: 'compaction', data: { seq: 1, summarized_messages: 9 } },
+      { type: 'hologram_projection', data: { x: 1 } },
+    ]);
+    const kinds = view.turns.flatMap((t) => t.blocks.map((b) => b.kind));
+    expect(kinds).toEqual(['seed', 'user', 'gate', 'notice', 'compaction', 'unknown']);
+    const gate = view.turns.flatMap((t) => t.blocks).find((b) => b.kind === 'gate');
+    expect(gate).toMatchObject({ gateId: 'g1', decision: 'approve', decidedBy: 'matt' });
+  });
+
+  it('legacy v1: assistant_message.thinking becomes a thinking block before the assistant block, and assistant_message still opens a turn when no turn_start groups it', () => {
+    const view = buildTranscriptView([
+      { type: 'assistant_message', data: { content: 'first', thinking: 'old-style' } },
+      { type: 'tool_call', data: { call_id: 'c1', tool: 'bash', input: {} } },
+      { type: 'assistant_message', data: { content: 'second' } },
+    ]);
+    expect(view.turns).toHaveLength(2);
+    expect(view.turns[0].blocks.map((b) => b.kind)).toEqual(['thinking', 'assistant', 'tool']);
+  });
+
+  it('an orphan tool_result renders standalone instead of vanishing', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      { type: 'tool_result', data: { call_id: 'ghost', output: 'late output', duration_ms: 1 } },
+    ]);
+    const tools = view.turns.flatMap((t) => t.blocks).filter((b) => b.kind === 'tool');
+    expect(tools).toHaveLength(1);
+    expect((tools[0] as { view: { output?: string } }).view.output).toBe('late output');
+  });
+
+  it('orphan file_edit / command_run render standalone', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      { type: 'file_edit', data: { path: 'a.rs', kind: 'modify', diff: '--- x' } },
+      { type: 'command_run', data: { argv: ['bash', '-lc', 'ls'], cwd: '/w', exit_code: 0, stdout_bytes: 1, stderr_bytes: 0 } },
+    ]);
+    const tools = view.turns.flatMap((t) => t.blocks).filter((b) => b.kind === 'tool');
+    expect(tools).toHaveLength(2);
+  });
+
+  it('net_flow is deliberately unrendered — no block at all, and specifically no unknown block (its display surface is the RunDetail Netflow tab)', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      { type: 'net_flow', data: { flow: { bytes_in: 100, bytes_out: 50 } } },
+      { type: 'assistant_message', data: { content: 'done' } },
+    ]);
+    const kinds = view.turns.flatMap((t) => t.blocks.map((b) => b.kind));
+    expect(kinds).toEqual(['assistant']);
+    expect(kinds).not.toContain('unknown');
   });
 });

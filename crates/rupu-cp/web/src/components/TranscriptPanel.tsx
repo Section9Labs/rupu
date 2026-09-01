@@ -57,6 +57,11 @@ export default function TranscriptPanel({
   const [state, setState] = useState<LoadState>('loading');
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [connected, setConnected] = useState(false);
+  // Lines the server couldn't parse in the REST snapshot (absent on older
+  // servers, or when there were none). Live-tail SSE events append to the
+  // same event list but don't affect this count — the badge covers the
+  // snapshot only; torn tails are excluded server-side.
+  const [unparsed, setUnparsed] = useState<number | undefined>(undefined);
   const navigate = useNavigate();
 
   // Open a sub-run transcript in the same transcript route (reuses the existing
@@ -72,12 +77,14 @@ export default function TranscriptPanel({
     setState('loading');
     setEvents([]);
     setConnected(false);
+    setUnparsed(undefined);
 
     api
       .getTranscript(path, { host })
       .then((res) => {
         if (cancelled) return;
         setEvents(res.events);
+        setUnparsed(res.unparsed);
         setState('ready');
       })
       .catch((err: unknown) => {
@@ -178,6 +185,11 @@ export default function TranscriptPanel({
                 )}
               />
               {connected ? 'live' : 'offline'}
+            </span>
+          )}
+          {typeof unparsed === 'number' && unparsed > 0 && (
+            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ring-1 ring-inset bg-warn-bg text-warn ring-warn/30">
+              {unparsed} unparsed {unparsed === 1 ? 'line' : 'lines'}
             </span>
           )}
           {view.footer?.totalTokens != null && (

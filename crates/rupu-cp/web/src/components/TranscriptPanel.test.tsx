@@ -77,4 +77,20 @@ describe('TranscriptPanel embedded mode', () => {
     expect(screen.queryByText('reviewer-agent')).not.toBeInTheDocument();
     expect(screen.queryByText(/completed/)).not.toBeInTheDocument();
   });
+
+  it('shows an unparsed-lines badge when the response reports unparsed > 0', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue({ ...TRANSCRIPT, unparsed: 3 });
+    renderPanel(false);
+
+    expect((await screen.findAllByText('reviewer-agent'))[0]).toBeInTheDocument();
+    expect(screen.getByText(/3 unparsed lines/)).toBeInTheDocument();
+  });
+
+  it('omits the unparsed badge when unparsed is absent or zero', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(TRANSCRIPT);
+    renderPanel(false);
+
+    expect((await screen.findAllByText('reviewer-agent'))[0]).toBeInTheDocument();
+    expect(screen.queryByText(/unparsed/)).not.toBeInTheDocument();
+  });
 });
