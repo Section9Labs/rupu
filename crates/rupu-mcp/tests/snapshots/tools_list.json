@@ -765,5 +765,82 @@
       "type": "object"
     },
     "name": "gitlab.pipeline_trigger"
+  },
+  {
+    "description": "Record a security finding in this project's findings ledger, so it appears in the control plane rather than only in an external tracker. Use the narrowest scope the evidence supports.",
+    "inputSchema": {
+      "properties": {
+        "code_excerpt": {
+          "description": "Relevant excerpt, if any.",
+          "type": "string"
+        },
+        "concern_id": {
+          "description": "Catalog concern id, when one applies.",
+          "type": "string"
+        },
+        "file_path": {
+          "description": "Workspace-relative path, for the code scopes.",
+          "type": "string"
+        },
+        "line_range": {
+          "description": "[start, end], required for scope 'line'.",
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "rationale": {
+          "description": "Why this is a weakness, and the evidence that establishes it.",
+          "type": "string"
+        },
+        "references": {
+          "description": "Supporting links — an issue URL, an advisory.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "description": "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a service URL), 'resource' (a cloud resource id such as an OCID/ARN/URN).",
+          "enum": [
+            "line",
+            "file",
+            "repo",
+            "host",
+            "endpoint",
+            "resource"
+          ],
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "summary": {
+          "description": "One sentence stating the weakness.",
+          "type": "string"
+        },
+        "target_ref": {
+          "description": "The host, endpoint URL, or resource id — required for the target scopes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "summary",
+        "severity",
+        "rationale"
+      ],
+      "type": "object"
+    },
+    "name": "findings.record"
   }
 ]

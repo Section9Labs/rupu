@@ -51,14 +51,21 @@ use std::sync::Arc;
 pub fn action_dispatcher_for(
     registry: &Arc<rupu_scm::Registry>,
     mode_str: &str,
+    findings: Option<rupu_mcp::FindingsContext>,
 ) -> Arc<ToolDispatcher> {
-    Arc::new(ToolDispatcher::new(
+    let dispatcher = ToolDispatcher::new(
         Arc::clone(registry),
         McpPermission::new(
             rupu_agent::runner::parse_mode_for_runtime(mode_str),
             vec!["*".into()],
         ),
-    ))
+    );
+    // Without this context `findings.record` is listed but refuses: an
+    // action step could observe a weakness and have nowhere to record it.
+    Arc::new(match findings {
+        Some(ctx) => dispatcher.with_findings(ctx),
+        None => dispatcher,
+    })
 }
 
 /// Result of a successful [`resume_run`], carrying everything the caller
@@ -304,7 +311,17 @@ async fn rebuild_opts_from_disk(
         kinds.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
-    let action_dispatcher = action_dispatcher_for(&mcp_registry, &mode_str);
+    let action_dispatcher = action_dispatcher_for(
+        &mcp_registry,
+        &mode_str,
+        Some(rupu_mcp::FindingsContext {
+            workspace_path: workspace_path.clone(),
+            scope_name: workflow.name.clone(),
+            run_id: run_id.to_string(),
+            model: cfg.default_model.clone().unwrap_or_default(),
+            surface: rupu_coverage::Surface::Workflow,
+        }),
+    );
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
