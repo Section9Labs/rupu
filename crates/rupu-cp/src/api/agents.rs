@@ -2716,6 +2716,8 @@ mod tests {
             model: "claude-opus-4-8".into(),
             started_at: chrono::Utc::now(),
             mode: rupu_transcript::RunMode::Ask,
+            schema: None,
+            system_prompt: None,
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');

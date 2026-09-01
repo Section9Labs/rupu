@@ -216,6 +216,8 @@ mod tests {
                 .with_ymd_and_hms(2026, 6, 16, 12, 0, 0)
                 .unwrap(),
             mode: RunMode::Ask,
+            schema: None,
+            system_prompt: None,
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');

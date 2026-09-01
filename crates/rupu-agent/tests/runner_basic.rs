@@ -17,6 +17,7 @@ async fn happy_path_one_turn_no_tools() {
     let transcript_path = tmp.path().join("run.jsonl");
 
     let opts = AgentRunOpts {
+        seed_source: None,
         agent_name: "noop".into(),
         agent_system_prompt: "You are a noop agent.".into(),
         agent_tools: None,

@@ -11,6 +11,7 @@ fn opts(
     ws: std::path::PathBuf,
 ) -> AgentRunOpts {
     AgentRunOpts {
+        seed_source: None,
         agent_name: "test".into(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

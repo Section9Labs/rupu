@@ -346,6 +346,8 @@ fn transcript_events_fixture_is_current() {
             model: "claude-sonnet-4-6".into(),
             started_at: t,
             mode: rupu_transcript::RunMode::Ask,
+            schema: None,
+            system_prompt: None,
         },
         rupu_transcript::Event::TurnStart { turn_idx: 0 },
         rupu_transcript::Event::AssistantDelta {
@@ -420,11 +422,15 @@ fn transcript_events_fixture_is_current() {
             turn_idx: 0,
             tokens_in: Some(500),
             tokens_out: Some(120),
+            stop_reason: None,
+            response_id: None,
         },
         rupu_transcript::Event::TurnEnd {
             turn_idx: 1,
             tokens_in: None,
             tokens_out: None,
+            stop_reason: None,
+            response_id: None,
         },
         rupu_transcript::Event::Usage {
             provider: "anthropic".into(),
@@ -537,6 +543,70 @@ fn transcript_events_fixture_is_current() {
                 duration_ms: Some(430),
             }),
         },
+        // Schema v2 (transcript fidelity plan 1, Task 5): real reasoning
+        // block, byte-exact `raw` (signature intact) for replay.
+        rupu_transcript::Event::Thinking {
+            text: Some("Weighing whether to run the full suite before committing.".into()),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            raw: serde_json::json!({
+                "type": "thinking",
+                "thinking": "Weighing whether to run the full suite before committing.",
+                "signature": "sig-abc123",
+            }),
+        },
+        // Redacted counterpart: `text: None` — the block existed but its
+        // content is not human-readable; `raw` still carries the opaque
+        // provider payload for replay.
+        rupu_transcript::Event::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            raw: serde_json::json!({
+                "type": "redacted_thinking",
+                "data": "opaque-base64-blob",
+            }),
+        },
+        rupu_transcript::Event::ThinkingDelta {
+            content: "Weighing whether".into(),
+        },
+        rupu_transcript::Event::UserMessage {
+            content: "Please review the auth module for security issues.".into(),
+        },
+        // Seed form 1: vouched-for by a prior transcript (chain resolves
+        // recursively) — `messages` absent.
+        rupu_transcript::Event::Seed {
+            message_count: 7,
+            sha256: "cd".repeat(32),
+            source_transcript: Some("t/run_prev.jsonl".into()),
+            messages: None,
+        },
+        // Seed form 2: inline fallback — full `Vec<Message>` embedded,
+        // `source_transcript` absent.
+        rupu_transcript::Event::Seed {
+            message_count: 3,
+            sha256: "ab".repeat(32),
+            source_transcript: None,
+            messages: Some(serde_json::json!([
+                { "role": "user", "content": [{ "type": "text", "text": "start the review" }] }
+            ])),
+        },
+        rupu_transcript::Event::Compaction {
+            seq: 1,
+            summarized_messages: 12,
+            backup_path: "t/run-01.compacted.1.json".into(),
+            messages: serde_json::json!([
+                { "role": "user", "content": [{ "type": "text", "text": "continue the review" }] }
+            ]),
+        },
+        rupu_transcript::Event::Notice {
+            kind: "context_trim".into(),
+            message: "Trimmed 3 tool results to fit the context window".into(),
+        },
+        rupu_transcript::Event::Notice {
+            kind: "provider_retry".into(),
+            message: "Retrying after a 529 overloaded response".into(),
+        },
     ];
     assert_transcript_events_cover_every_variant(&events);
     check_fixture("transcript_events.json", &events);
@@ -567,6 +637,20 @@ fn assert_transcript_events_cover_every_variant(events: &[rupu_transcript::Event
             rupu_transcript::Event::RunComplete { .. } => {}
             rupu_transcript::Event::ToolAudit { .. } => {}
             rupu_transcript::Event::NetFlow { .. } => {}
+            rupu_transcript::Event::Thinking { .. } => {}
+            rupu_transcript::Event::ThinkingDelta { .. } => {}
+            rupu_transcript::Event::UserMessage { .. } => {}
+            rupu_transcript::Event::Seed { .. } => {}
+            rupu_transcript::Event::Compaction { .. } => {}
+            rupu_transcript::Event::Notice { .. } => {}
+            // `Unknown` is the forward-compatibility catch-all for an
+            // unrecognized `type` tag (see event.rs's doc comment) — it is
+            // never constructed by a writer, so there is nothing to put in
+            // the sample vec above and no fixture row for it. Kept as an
+            // explicit arm (not folded into a wildcard) so this match stays
+            // an exhaustiveness guard: a genuinely new variant still fails
+            // to compile here until a case is added for it.
+            rupu_transcript::Event::Unknown => {}
         }
     }
 }

@@ -53,6 +53,7 @@ impl StepFactory for FakeFactory {
             output_tokens: 1,
         }]);
         AgentRunOpts {
+            seed_source: None,
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,

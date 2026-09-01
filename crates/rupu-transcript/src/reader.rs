@@ -92,6 +92,7 @@ impl JsonlReader {
             model,
             started_at,
             mode,
+            ..
         }) = start
         else {
             // Surface a real IO error if we hit one; otherwise the file genuinely

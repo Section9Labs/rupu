@@ -1426,6 +1426,8 @@ mod tests {
                 model: "claude-sonnet-4-6".into(),
                 started_at: Utc::now(),
                 mode: RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
             })
             .unwrap();
         writer

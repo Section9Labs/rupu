@@ -26,12 +26,16 @@ fn reads_complete_run_summary() {
                 model: "claude-sonnet-4-6".into(),
                 started_at: Utc.with_ymd_and_hms(2026, 5, 1, 17, 0, 0).unwrap(),
                 mode: RunMode::Ask,
+                schema: None,
+                system_prompt: None,
             },
             Event::TurnStart { turn_idx: 0 },
             Event::TurnEnd {
                 turn_idx: 0,
                 tokens_in: Some(10),
                 tokens_out: Some(20),
+                stop_reason: None,
+                response_id: None,
             },
             Event::RunComplete {
                 run_id: "run_a".into(),
@@ -62,6 +66,8 @@ fn missing_run_complete_reports_aborted() {
                 model: "claude-sonnet-4-6".into(),
                 started_at: Utc.with_ymd_and_hms(2026, 5, 1, 17, 0, 0).unwrap(),
                 mode: RunMode::Ask,
+                schema: None,
+                system_prompt: None,
             },
             Event::TurnStart { turn_idx: 0 },
             // no TurnEnd, no RunComplete
@@ -85,6 +91,8 @@ fn truncated_last_line_does_not_crash() {
             model: "claude-sonnet-4-6".into(),
             started_at: Utc.with_ymd_and_hms(2026, 5, 1, 17, 0, 0).unwrap(),
             mode: RunMode::Ask,
+            schema: None,
+            system_prompt: None,
         })
         .unwrap();
     }
@@ -112,6 +120,8 @@ fn iter_yields_all_events_in_order() {
                 turn_idx: 0,
                 tokens_in: Some(1),
                 tokens_out: Some(2),
+                stop_reason: None,
+                response_id: None,
             },
             Event::TurnStart { turn_idx: 1 },
         ],

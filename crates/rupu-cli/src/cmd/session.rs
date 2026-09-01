@@ -436,6 +436,19 @@ struct SessionRecord {
     /// Compact-at percentage. Captured from spec at session start.
     #[serde(default)]
     compact_at_percent: Option<u8>,
+    /// Path of a transcript whose replay-reconstruction equals
+    /// `message_history` byte-exact — the ONLY legitimate source for
+    /// `seed_source` when starting the next turn (spec §3 seed dedup
+    /// rule). Set ONLY at the single point where `message_history` is
+    /// replaced with a successful turn's `final_messages`; cleared to
+    /// `None` at every other mutation of `message_history` (compaction,
+    /// in both the offline CLI and worker pseudo-turn paths) so a turn
+    /// whose transcript does NOT reconstruct to the current history can
+    /// never be referenced. Distinct from `last_transcript_path`, which
+    /// is a UX pointer updated unconditionally (including on failed/
+    /// stopped/crashed turns) and must never be used to derive a seed.
+    #[serde(default)]
+    history_source_transcript: Option<PathBuf>,
 }
 
 impl SessionRecord {
@@ -1483,6 +1496,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         max_tokens: spec.max_tokens,
         context_window_tokens: spec.context_window_tokens,
         compact_at_percent: spec.compact_at_percent,
+        history_source_transcript: None,
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach, args.view).await
@@ -1938,6 +1952,17 @@ enum SessionEntry {
     Assistant {
         content: String,
         thinking: Option<String>,
+        streaming: bool,
+    },
+    /// A standalone reasoning block (schema-v2 `Thinking` event) — not
+    /// bundled with an `Assistant` entry's content. `text: None` means the
+    /// block was redacted by the provider. `streaming` mirrors
+    /// `Assistant.streaming`: `true` while accumulating `ThinkingDelta`
+    /// chunks, flipped to `false` (and `text`/`provider` overwritten with
+    /// the authoritative values) once the committed `Thinking` event lands.
+    Thinking {
+        text: Option<String>,
+        provider: String,
         streaming: bool,
     },
     ToolCall {
@@ -2523,12 +2548,106 @@ impl SessionInteractiveState {
                     error: error.clone(),
                 });
             }
-            // Netflow capture streams into the transcript for offline
-            // inspection (`rupu transcript show`), but the interactive
-            // session view has no dedicated row for it yet — silently
-            // skip rather than clutter the entry list. Out of scope for
-            // the capture-wiring task; a future task can add rendering.
-            TranscriptEvent::NetFlow { .. } => {}
+            TranscriptEvent::NetFlow { flow } => {
+                let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+                let status = if ok {
+                    crate::output::palette::Status::Complete
+                } else {
+                    crate::output::palette::Status::Failed
+                };
+                self.push_line(
+                    status,
+                    retained_session_event_line_raw(
+                        status,
+                        "net flow",
+                        &format!(
+                            "{} {}{}  ·  {}  ·  {}ms",
+                            flow.method,
+                            flow.host,
+                            flow.path,
+                            flow.status
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            flow.duration_ms.unwrap_or(0),
+                        ),
+                    ),
+                );
+            }
+            TranscriptEvent::Thinking { text, provider, .. } => {
+                self.activity = SessionActivity::Thinking;
+                self.push_thinking_entry(text.clone(), provider.clone());
+            }
+            TranscriptEvent::ThinkingDelta { content } => {
+                self.push_thinking_delta(content);
+            }
+            TranscriptEvent::UserMessage { content } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line(
+                        crate::output::palette::Status::Active,
+                        "prompt",
+                        &truncate_single_line(content, 96),
+                    ),
+                );
+            }
+            TranscriptEvent::Seed {
+                message_count,
+                source_transcript,
+                ..
+            } => {
+                let detail = match source_transcript {
+                    Some(src) => format!(
+                        "{message_count} prior messages seed this run  ·  from {}",
+                        truncate_single_line(src, 48)
+                    ),
+                    None => format!("{message_count} prior messages seed this run"),
+                };
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "seed",
+                        &detail,
+                    ),
+                );
+            }
+            TranscriptEvent::Notice { kind, message } => {
+                self.push_line(
+                    crate::output::palette::Status::Awaiting,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Awaiting,
+                        "notice",
+                        &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+                    ),
+                );
+            }
+            TranscriptEvent::Compaction {
+                seq,
+                summarized_messages,
+                backup_path,
+                ..
+            } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "compaction",
+                        &format!(
+                            "seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"
+                        ),
+                    ),
+                );
+            }
+            TranscriptEvent::Unknown => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "event",
+                        "unrecognized event type (newer rupu wrote this transcript)",
+                    ),
+                );
+            }
         }
     }
 
@@ -2635,6 +2754,96 @@ impl SessionInteractiveState {
             match self.entries.get(idx) {
                 Some(SessionEntry::Usage { .. }) => continue,
                 Some(SessionEntry::Assistant { .. }) => return Some(idx),
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// Live-typing counterpart of `push_assistant_delta`, for reasoning
+    /// text: appends to a still-open (`streaming: true`) trailing
+    /// `SessionEntry::Thinking`, or opens a new one if the tail entry isn't
+    /// already one. The provider isn't known until the committed `Thinking`
+    /// event lands, so it's left empty here and filled in by
+    /// `push_thinking_entry`.
+    fn push_thinking_delta(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.activity = SessionActivity::Thinking;
+        let last_index = self.entries.len().checked_sub(1);
+        match last_index.and_then(|index| self.entries.get_mut(index).map(|entry| (index, entry))) {
+            Some((
+                index,
+                SessionEntry::Thinking {
+                    text, streaming, ..
+                },
+            )) => {
+                text.get_or_insert_with(String::new).push_str(chunk);
+                *streaming = true;
+                self.invalidate_entry(index);
+            }
+            _ => {
+                self.push_entry(SessionEntry::Thinking {
+                    text: Some(chunk.to_string()),
+                    provider: String::new(),
+                    streaming: true,
+                });
+            }
+        }
+    }
+
+    /// Live-typing counterpart of `push_assistant_message`: finalizes the
+    /// still-open `SessionEntry::Thinking` accumulated by
+    /// `push_thinking_delta` (if any) in place — so the committed event
+    /// REPLACES the delta-accumulated approximation rather than duplicating
+    /// it — or pushes a fresh entry when there's nothing open to merge into
+    /// (mirrors `push_assistant_message`'s streaming-or-content-match merge
+    /// guard, so two back-to-back non-streaming `Thinking` blocks in the
+    /// same turn don't collapse into one).
+    fn push_thinking_entry(&mut self, text: Option<String>, provider: String) {
+        match self.last_mergeable_thinking_index() {
+            Some(index) => match self.entries.get_mut(index) {
+                Some(SessionEntry::Thinking {
+                    text: existing_text,
+                    provider: existing_provider,
+                    streaming,
+                }) => {
+                    let matches = match (existing_text.as_deref(), text.as_deref()) {
+                        (Some(existing), Some(incoming)) => existing.trim() == incoming.trim(),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if *streaming || matches {
+                        *existing_text = text;
+                        *existing_provider = provider;
+                        *streaming = false;
+                        self.invalidate_entry(index);
+                    } else {
+                        self.push_entry(SessionEntry::Thinking {
+                            text,
+                            provider,
+                            streaming: false,
+                        });
+                    }
+                }
+                _ => unreachable!("last_mergeable_thinking_index only returns Thinking entries"),
+            },
+            None => {
+                self.push_entry(SessionEntry::Thinking {
+                    text,
+                    provider,
+                    streaming: false,
+                });
+            }
+        }
+    }
+
+    fn last_mergeable_thinking_index(&self) -> Option<usize> {
+        for idx in (0..self.entries.len()).rev() {
+            match self.entries.get(idx) {
+                Some(SessionEntry::Usage { .. }) => continue,
+                Some(SessionEntry::Thinking { .. }) => return Some(idx),
                 _ => break,
             }
         }
@@ -3674,6 +3883,43 @@ fn render_synthetic_session_activity_rows(
     }
 }
 
+/// Unified visibility policy for a `thinking` block, shared by
+/// `SessionEntry::Assistant`'s bundled `thinking` field and the standalone
+/// `SessionEntry::Thinking` entry: `Focused` shows a single 96-char line;
+/// `Compact` and `Full` show the full rendered body. Returns the
+/// already-labeled first line (built via `retained_session_event_line` for
+/// the plain-truncated Focused case, `retained_session_event_line_raw` for
+/// the syntax-highlighted full-body case) plus any continuation lines,
+/// which the caller wraps with its own framing (`render_role_body` for the
+/// bundled case, `render_nested_event_rows`/`render_nested_body_lines` for
+/// the standalone case).
+fn thinking_line_and_body(
+    text: &str,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) -> (String, Vec<String>) {
+    use crate::output::palette::Status;
+    match view_mode {
+        LiveViewMode::Focused => (
+            retained_session_event_line(
+                Status::Active,
+                "thinking",
+                &truncate_single_line(text, 96),
+            ),
+            Vec::new(),
+        ),
+        LiveViewMode::Compact | LiveViewMode::Full => {
+            let payload = render_payload(text, prefs);
+            let mut lines = payload.rendered.lines();
+            let first = lines.next().unwrap_or("");
+            (
+                retained_session_event_line_raw(Status::Active, "thinking", first),
+                lines.map(str::to_string).collect(),
+            )
+        }
+    }
+}
+
 fn render_session_entry_rows(
     entry: &SessionEntry,
     next_is_nested: bool,
@@ -3731,17 +3977,10 @@ fn render_session_entry_rows(
                 width,
             );
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                if view_mode == LiveViewMode::Full {
-                    rows.extend(render_role_body(
-                        &[retained_session_event_line(
-                            Status::Active,
-                            "thinking",
-                            &truncate_single_line(thinking, 96),
-                        )],
-                        role_color,
-                        width,
-                    ));
-                }
+                let (first, rest) = thinking_line_and_body(thinking, view_mode, prefs);
+                let mut body = vec![first];
+                body.extend(rest);
+                rows.extend(render_role_body(&body, role_color, width));
             }
             if !content.trim().is_empty() {
                 let payload = render_assistant_content(content.trim(), prefs);
@@ -3756,6 +3995,27 @@ fn render_session_entry_rows(
                 rows.extend(render_role_body(&body_lines, role_color, width));
             }
             rows
+        }
+        SessionEntry::Thinking { text, provider, .. } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => render_nested_event_rows(
+                    next_is_nested,
+                    Status::Active,
+                    retained_session_event_line(
+                        Status::Active,
+                        "thinking",
+                        &format!("[redacted reasoning · {provider}]"),
+                    ),
+                    width,
+                ),
+                Some(t) => {
+                    let (first, rest) = thinking_line_and_body(t, view_mode, prefs);
+                    let mut rows =
+                        render_nested_event_rows(next_is_nested, Status::Active, first, width);
+                    rows.extend(render_nested_body_lines(next_is_nested, &rest, width));
+                    rows
+                }
+            }
         }
         SessionEntry::ToolCall { tool, input } => {
             let mut rows = render_nested_event_rows(
@@ -4153,6 +4413,7 @@ fn session_entry_is_nested(entry: Option<&SessionEntry>) -> bool {
                 | SessionEntry::ActionEmitted { .. }
                 | SessionEntry::ToolAudit { .. }
                 | SessionEntry::GateRequested { .. }
+                | SessionEntry::Thinking { .. }
         )
     )
 }
@@ -4380,15 +4641,35 @@ fn transcript_event_lines(
         TranscriptEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                out.push(SessionViewLine {
-                    status: Status::Active,
-                    text: retained_session_event_line(
-                        Status::Active,
-                        "thinking",
-                        &truncate_single_line(thinking, 96),
-                    ),
-                    continuation: false,
-                });
+                match view_mode {
+                    LiveViewMode::Focused => out.push(SessionViewLine {
+                        status: Status::Active,
+                        text: retained_session_event_line(
+                            Status::Active,
+                            "thinking",
+                            &truncate_single_line(thinking, 96),
+                        ),
+                        continuation: false,
+                    }),
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload = render_payload(thinking, prefs);
+                        let mut lines = payload.rendered.lines();
+                        if let Some(first) = lines.next() {
+                            out.push(SessionViewLine {
+                                status: Status::Active,
+                                text: retained_session_event_line_raw(Status::Active, "thinking", first),
+                                continuation: false,
+                            });
+                            for line in lines {
+                                out.push(SessionViewLine {
+                                    status: Status::Active,
+                                    text: line.to_string(),
+                                    continuation: true,
+                                });
+                            }
+                        }
+                    }
+                }
             }
             if !content.trim().is_empty() {
                 match view_mode {
@@ -4723,6 +5004,7 @@ fn transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => {
             if view_mode == LiveViewMode::Compact {
                 return Vec::new();
@@ -4797,9 +5079,124 @@ fn transcript_event_lines(
                 continuation: false,
             }]
         }
-        // No dedicated session-view row for netflow yet (see the
-        // matching no-op in `push_transcript_event` above).
-        TranscriptEvent::NetFlow { .. } => Vec::new(),
+        TranscriptEvent::Thinking { text, provider, .. } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => vec![SessionViewLine {
+                    status: Status::Active,
+                    text: retained_session_event_line(
+                        Status::Active,
+                        "thinking",
+                        &format!("[redacted reasoning · {provider}]"),
+                    ),
+                    continuation: false,
+                }],
+                Some(t) => match view_mode {
+                    LiveViewMode::Focused => vec![SessionViewLine {
+                        status: Status::Active,
+                        text: retained_session_event_line(Status::Active, "thinking", &truncate_single_line(t, 96)),
+                        continuation: false,
+                    }],
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload = render_payload(t, prefs);
+                        let mut lines = payload.rendered.lines();
+                        let mut out = Vec::new();
+                        if let Some(first) = lines.next() {
+                            out.push(SessionViewLine {
+                                status: Status::Active,
+                                text: retained_session_event_line_raw(Status::Active, "thinking", first),
+                                continuation: false,
+                            });
+                            for line in lines {
+                                out.push(SessionViewLine {
+                                    status: Status::Active,
+                                    text: line.to_string(),
+                                    continuation: true,
+                                });
+                            }
+                        }
+                        out
+                    }
+                },
+            }
+        }
+        TranscriptEvent::ThinkingDelta { .. } => Vec::new(),
+        TranscriptEvent::UserMessage { content } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line(Status::Active, "prompt", &truncate_single_line(content, 96)),
+            continuation: false,
+        }],
+        TranscriptEvent::Seed {
+            message_count,
+            source_transcript,
+            ..
+        } => {
+            let detail = match source_transcript {
+                Some(src) => format!(
+                    "{message_count} prior messages seed this run  ·  from {}",
+                    truncate_single_line(src, 48)
+                ),
+                None => format!("{message_count} prior messages seed this run"),
+            };
+            vec![SessionViewLine {
+                status: Status::Active,
+                text: retained_session_event_line_raw(Status::Active, "seed", &detail),
+                continuation: false,
+            }]
+        }
+        TranscriptEvent::Notice { kind, message } => vec![SessionViewLine {
+            status: Status::Awaiting,
+            text: retained_session_event_line_raw(
+                Status::Awaiting,
+                "notice",
+                &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::Compaction {
+            seq,
+            summarized_messages,
+            backup_path,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "compaction",
+                &format!(
+                    "seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"
+                ),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::NetFlow { flow } => {
+            let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+            let status = if ok { Status::Complete } else { Status::Failed };
+            vec![SessionViewLine {
+                status,
+                text: retained_session_event_line_raw(
+                    status,
+                    "net flow",
+                    &format!(
+                        "{} {}{}  ·  {}  ·  {}ms",
+                        flow.method,
+                        flow.host,
+                        flow.path,
+                        flow.status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                        flow.duration_ms.unwrap_or(0),
+                    ),
+                ),
+                continuation: false,
+            }]
+        }
+        TranscriptEvent::Unknown => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "event",
+                "unrecognized event type (newer rupu wrote this transcript)",
+            ),
+            continuation: false,
+        }],
     }
 }
 
@@ -6264,6 +6661,11 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             let before = session.message_history.len();
             session.message_history = outcome.messages;
             let after = session.message_history.len();
+            // Compaction rewrites history in place with no transcript of its
+            // own that reconstructs to the summarized result — the next
+            // turn must seed inline, never reference a pre-compaction
+            // transcript.
+            session.history_source_transcript = None;
             session.updated_at = Utc::now();
             write_session(&global, scope, &session)?;
             println!(
@@ -6312,6 +6714,15 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
     {
         let _ = terminate_pid(pid);
     }
+    // NOTE on `history_source_transcript`: below, `last_transcript_path` (a
+    // UX pointer only) is promoted to the killed run's transcript, which may
+    // carry only the runner prologue's `UserMessage` event with no matching
+    // turn ever committed to `message_history`. `history_source_transcript`
+    // is deliberately left untouched here — this function never mutates
+    // `message_history`, so whatever it already pointed at (the transcript
+    // of the last turn that actually completed and was folded into
+    // `message_history`) is still exactly reconstructible into the current
+    // `message_history` and remains a valid seed source for the next turn.
     session.status = SessionStatus::Stopped;
     session.updated_at = Utc::now();
     session.last_error = Some("stopped by operator".into());
@@ -6600,6 +7011,9 @@ async fn run_compact_request(
         model: session.model.clone(),
         started_at,
         mode: run_mode,
+        // TODO(Task 2, transcript fidelity plan 1): schema/system_prompt.
+        schema: None,
+        system_prompt: None,
     })?;
     writer.flush()?;
 
@@ -6711,6 +7125,11 @@ async fn run_compact_request(
         Ok(Some(outcome)) => {
             let summarized = outcome.summarized_messages;
             session.message_history = outcome.messages;
+            // Same reasoning as the offline `rupu session compact` path: the
+            // compaction pseudo-transcript this function writes does NOT
+            // reconstruct to the summarized history (it replays to an empty
+            // conversation), so the next turn must never reference it.
+            session.history_source_transcript = None;
             let after = session.message_history.len();
             let content = format!(
                 "[context compacted: summarized {} messages; {} → {} kept]\n",
@@ -6813,6 +7232,12 @@ fn finalize_compact_run(
     s.last_transcript_path = Some(request.transcript_path.clone());
     // Persist compacted message history.
     s.message_history = session.message_history.clone();
+    // Mirror `session.history_source_transcript` (cleared above on the
+    // compacting branch, unchanged otherwise) onto the freshly re-read `s`
+    // — otherwise `s`'s on-disk value would survive this write untouched
+    // and could keep referencing a transcript that no longer matches the
+    // history just persisted above.
+    s.history_source_transcript = session.history_source_transcript.clone();
     s.status = if status == RunStatus::Ok {
         SessionStatus::Idle
     } else {
@@ -6986,6 +7411,20 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             }
         });
 
+        // Reference the previous turn's transcript instead of re-embedding
+        // `message_history` inline — the O(n²) dedup this field exists for
+        // (see `AgentRunOpts::seed_source`). Read `history_source_transcript`
+        // (NOT `last_transcript_path`, which is a UX pointer updated
+        // unconditionally — including on failed/stopped/crashed turns whose
+        // transcript does not reconstruct to `message_history`). Only valid
+        // when a prior turn actually left history in this exact state and
+        // its transcript file is still on disk; otherwise fall back to an
+        // inline seed (first turn, a pruned transcript, or any divergence).
+        let seed_source = session
+            .history_source_transcript
+            .clone()
+            .filter(|p| p.exists());
+
         let opts = AgentRunOpts {
             agent_name: session.agent_name.clone(),
             agent_system_prompt: session.agent_system_prompt.clone(),
@@ -7032,6 +7471,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             scope_name: Some(session.session_id.clone()),
             surface_tag: Some("session".to_string()),
             pause: None,
+            seed_source,
         };
 
         let outcome = rupu_agent::run_agent(opts).await;
@@ -7093,6 +7533,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 session.total_tokens_out += result.total_tokens_out;
                 session.total_tokens_cached += cached_tokens;
                 session.message_history = result.final_messages;
+                // This turn's own transcript always reconstructs to exactly
+                // `final_messages`: `run_agent` writes a `RunComplete` event
+                // at every `Ok(RunResult)` exit (success, max-turns, or a
+                // cooperative pause) immediately before returning, so the
+                // transcript on disk at `transcript_path` and the message
+                // list assigned above are the same snapshot. Safe to record
+                // as the seed source regardless of `result.status`.
+                session.history_source_transcript = Some(transcript_path.clone());
                 session.last_error = if result.status == RunStatus::Ok {
                     None
                 } else {
@@ -7201,6 +7649,10 @@ fn reconcile_stale_session(session: &mut SessionRecord) -> bool {
         .active_run_id
         .clone()
         .or_else(|| session.last_run_id.clone());
+    // As in `stop_session_in_place`: `last_transcript_path` (UX only) is
+    // promoted to the crashed run's possibly-incomplete transcript, but
+    // `message_history` — and therefore `history_source_transcript` — is
+    // never touched here, so it stays a valid seed reference.
     session.last_transcript_path = session
         .active_transcript_path
         .clone()
@@ -7695,6 +8147,8 @@ mod tests {
                 model: "gpt-5".into(),
                 started_at: Utc::now(),
                 mode: RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
             })
             .unwrap(),
         );
@@ -8644,6 +9098,295 @@ mod tests {
     }
 
     #[test]
+    fn transcript_event_lines_thinking_full_body_and_redacted_marker() {
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let long = "x".repeat(300);
+        let ev = TranscriptEvent::Thinking {
+            text: Some(long.clone()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let full = transcript_event_lines(&ev, LiveViewMode::Full, &full_prefs);
+        let joined: String = full.iter().map(|l| l.text.as_str()).collect();
+        assert!(joined.contains(&long));
+
+        let focused = transcript_event_lines(&ev, LiveViewMode::Focused, &focused_prefs);
+        assert_eq!(focused.len(), 1);
+        assert!(focused[0].text.len() < 300);
+
+        let redacted = TranscriptEvent::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let lines = transcript_event_lines(&redacted, LiveViewMode::Full, &full_prefs);
+        assert!(lines[0].text.contains("redacted reasoning"));
+    }
+
+    #[test]
+    fn transcript_event_lines_v2_rows_exist_for_every_new_variant() {
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let cases: Vec<TranscriptEvent> = vec![
+            TranscriptEvent::UserMessage {
+                content: "do it".into(),
+            },
+            TranscriptEvent::Seed {
+                message_count: 4,
+                sha256: "abc".into(),
+                source_transcript: None,
+                messages: Some(serde_json::json!([])),
+            },
+            TranscriptEvent::Notice {
+                kind: "context_trim".into(),
+                message: "trimmed".into(),
+            },
+            TranscriptEvent::Compaction {
+                seq: 1,
+                summarized_messages: 8,
+                backup_path: "/b".into(),
+                messages: serde_json::json!([]),
+            },
+            TranscriptEvent::Unknown,
+        ];
+        for ev in &cases {
+            assert!(
+                !transcript_event_lines(ev, LiveViewMode::Compact, &prefs).is_empty(),
+                "no row for {ev:?} — silent drop"
+            );
+        }
+        assert!(transcript_event_lines(
+            &TranscriptEvent::ThinkingDelta {
+                content: "c".into()
+            },
+            LiveViewMode::Full,
+            &prefs,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn push_transcript_event_thinking_renders_a_real_row_not_a_silent_drop() {
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_thinking.jsonl"),
+            Some("run_thinking".into()),
+            LiveViewMode::Full,
+        );
+        state.push_transcript_event(&TranscriptEvent::Thinking {
+            text: Some("reasoning about the fix".into()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        });
+        assert!(matches!(
+            state.entries.last(),
+            Some(SessionEntry::Thinking { .. })
+        ));
+    }
+
+    #[test]
+    fn render_session_entry_rows_assistant_bundled_thinking_follows_the_unified_policy() {
+        let long = "x".repeat(300);
+        let entry = SessionEntry::Assistant {
+            content: "the fix".into(),
+            thinking: Some(long.clone()),
+            streaming: false,
+        };
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let compact_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+
+        // Focused (the `rupu session attach` default) must show the 96-char
+        // thinking line — this is finding 1: it used to show nothing at all.
+        let focused = render_session_entry_rows(
+            &entry,
+            false,
+            LiveViewMode::Focused,
+            &focused_prefs,
+            200,
+            None,
+        );
+        assert!(
+            focused.iter().any(|row| row.contains("thinking")),
+            "focused must show a thinking line: {focused:?}"
+        );
+        assert!(
+            !focused.iter().any(|row| row.contains(&long)),
+            "focused must not show the full body"
+        );
+
+        for (view_mode, prefs) in [
+            (LiveViewMode::Compact, &compact_prefs),
+            (LiveViewMode::Full, &full_prefs),
+        ] {
+            let rows = render_session_entry_rows(&entry, false, view_mode, prefs, 400, None);
+            let joined = rows.join("\n");
+            assert!(
+                joined.contains(&long),
+                "{view_mode:?} must show the full thinking body: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_session_entry_rows_standalone_thinking_follows_the_unified_policy() {
+        let long = "x".repeat(300);
+        let entry = SessionEntry::Thinking {
+            text: Some(long.clone()),
+            provider: "anthropic".into(),
+            streaming: false,
+        };
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+
+        let focused = render_session_entry_rows(
+            &entry,
+            false,
+            LiveViewMode::Focused,
+            &focused_prefs,
+            200,
+            None,
+        );
+        assert!(focused.iter().any(|row| row.contains("thinking")));
+        assert!(!focused.iter().any(|row| row.contains(&long)));
+
+        let full =
+            render_session_entry_rows(&entry, false, LiveViewMode::Full, &full_prefs, 400, None);
+        assert!(full.join("\n").contains(&long));
+
+        let redacted_entry = SessionEntry::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            streaming: false,
+        };
+        let redacted = render_session_entry_rows(
+            &redacted_entry,
+            false,
+            LiveViewMode::Full,
+            &full_prefs,
+            200,
+            None,
+        );
+        assert!(redacted
+            .iter()
+            .any(|row| row.contains("redacted reasoning")));
+    }
+
+    #[test]
+    fn thinking_deltas_accumulate_then_the_committed_event_replaces_them_without_duplication() {
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_thinking_delta.jsonl"),
+            Some("run_thinking_delta".into()),
+            LiveViewMode::Full,
+        );
+        state.push_transcript_event(&TranscriptEvent::ThinkingDelta {
+            content: "reasoning ".into(),
+        });
+        state.push_transcript_event(&TranscriptEvent::ThinkingDelta {
+            content: "about the fix".into(),
+        });
+        let thinking_entries_after_deltas = state
+            .entries
+            .iter()
+            .filter(|e| matches!(e, SessionEntry::Thinking { .. }))
+            .count();
+        assert_eq!(
+            thinking_entries_after_deltas, 1,
+            "deltas must accumulate into one open entry, not one each"
+        );
+        match state.entries.last() {
+            Some(SessionEntry::Thinking {
+                text, streaming, ..
+            }) => {
+                assert_eq!(text.as_deref(), Some("reasoning about the fix"));
+                assert!(
+                    *streaming,
+                    "still-accumulating entry must be marked streaming"
+                );
+            }
+            other => panic!("expected an open SessionEntry::Thinking, got {other:?}"),
+        }
+
+        state.push_transcript_event(&TranscriptEvent::Thinking {
+            text: Some("reasoning about the fix, finalized".into()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        });
+        let thinking_entries_after_commit = state
+            .entries
+            .iter()
+            .filter(|e| matches!(e, SessionEntry::Thinking { .. }))
+            .count();
+        assert_eq!(
+            thinking_entries_after_commit, 1,
+            "the committed event must replace the accumulated entry, not add a second one"
+        );
+        match state.entries.last() {
+            Some(SessionEntry::Thinking {
+                text,
+                provider,
+                streaming,
+            }) => {
+                assert_eq!(text.as_deref(), Some("reasoning about the fix, finalized"));
+                assert_eq!(provider, "anthropic");
+                assert!(!*streaming, "commit must finalize streaming");
+            }
+            other => panic!("expected a finalized SessionEntry::Thinking, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn transcript_event_lines_full_expands_json_tool_results() {
         let event = TranscriptEvent::ToolResult {
             output: "{\"status\":\"ok\",\"items\":[1,2]}".into(),
@@ -8887,7 +9630,469 @@ mod tests {
             max_tokens: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            history_source_transcript: None,
         }
+    }
+
+    /// 3j (transcript fidelity plan 1): the session worker's send path
+    /// must thread the PREVIOUS turn's transcript path into the new
+    /// `AgentRunOpts::seed_source` field instead of re-embedding
+    /// `message_history` inline on every turn — the O(n²) growth that
+    /// field exists to break. Drives two real turns through `run_turn`
+    /// (the exact function the detached worker invokes per turn) against
+    /// the `RUPU_MOCK_PROVIDER_SCRIPT` test-only provider seam, so the
+    /// assertion covers the real wiring rather than a reimplementation
+    /// of it. Task 3 extends this same test with the end-to-end
+    /// assertion that `rupu_agent::replay::reconstruct_transcript` on
+    /// turn 2's transcript returns the full two-turn conversation — that
+    /// function doesn't exist yet at this step.
+    #[tokio::test]
+    async fn second_turn_seeds_from_first_turns_transcript_by_reference() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_seed_wiring01".into();
+        record.workspace_path = workspace;
+        // Keep this run entirely local — no project-level config.toml, no
+        // real repo/issue metadata to resolve.
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_turns = 0;
+        record.total_tokens_in = 0;
+        record.total_tokens_out = 0;
+        record.total_tokens_cached = 0;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let transcript_1 = record.transcripts_dir.join("run_seed_wiring_1.jsonl");
+        let transcript_2 = record.transcripts_dir.join("run_seed_wiring_2.jsonl");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#,
+        );
+
+        let turn1 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_wiring_1".into(),
+            prompt: "first prompt".into(),
+        })
+        .await;
+        let turn2 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_wiring_2".into(),
+            prompt: "second prompt".into(),
+        })
+        .await;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        turn1.expect("turn 1 completes");
+        turn2.expect("turn 2 completes");
+
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(
+            after.status,
+            SessionStatus::Idle,
+            "both turns must succeed against the mock provider: {after:?}"
+        );
+        assert!(
+            transcript_1.is_file(),
+            "turn 1 must have written a transcript"
+        );
+
+        let events: Vec<TranscriptEvent> = JsonlReader::iter(&transcript_2)
+            .expect("open turn 2 transcript")
+            .filter_map(Result::ok)
+            .collect();
+        let (source_transcript, messages) = events
+            .iter()
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript,
+                    messages,
+                    ..
+                } => Some((source_transcript.clone(), messages.clone())),
+                _ => None,
+            })
+            .expect("turn 2 transcript must contain a Seed event");
+        assert_eq!(
+            source_transcript,
+            Some(transcript_1.display().to_string()),
+            "turn 2's seed must reference turn 1's transcript path, not re-embed it"
+        );
+        assert!(
+            messages.is_none(),
+            "a referenced seed must not also carry an inline copy of the messages"
+        );
+
+        // End-to-end: replay resolves the reference chain (turn 2's Seed ->
+        // turn 1's transcript) and rebuilds the full two-turn conversation,
+        // not just turn 2's own slice of it.
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_2)
+            .expect("turn 2 transcript reconstructs via the seed chain");
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("first prompt"),
+                Message::assistant("ack"),
+                Message::user("second prompt"),
+                Message::assistant("ack"),
+            ])
+            .unwrap(),
+            "replay must reconstruct the full two-turn conversation across the seed reference"
+        );
+    }
+
+    /// I-1 (transcript fidelity plan 1, whole-branch review): a turn's
+    /// transcript may only ever be referenced as a seed source when
+    /// `message_history` was actually advanced to match it — i.e. only at
+    /// the single successful-turn assignment site. `last_transcript_path`
+    /// is a UX pointer set unconditionally, including on a failed turn
+    /// (whose transcript already recorded a `UserMessage` from the runner
+    /// prologue with no matching assistant reply): deriving `seed_source`
+    /// from it would let a later turn reference that broken, incomplete
+    /// transcript and blow up at replay with a `SeedHashMismatch`.
+    ///
+    /// Drives three real turns through `run_turn`: turn 1 succeeds
+    /// (establishing a genuinely valid, still-replayable transcript), turn
+    /// 2 fails outright (`ProviderError`, scripted via the same
+    /// `RUPU_MOCK_PROVIDER_SCRIPT` seam used for the happy-path test above),
+    /// and turn 3 succeeds again. Because `history_source_transcript` is
+    /// only ever mutated at the one successful-assignment site, turn 2's
+    /// failure leaves it exactly as turn 1 left it — so turn 3 correctly
+    /// keeps referencing turn 1's transcript (the reference is still
+    /// perfectly valid; there is no reason to fall back to an inline
+    /// embed). What the fix actually prevents is turn 3 referencing turn
+    /// 2's transcript instead — which is exactly what `last_transcript_path`
+    /// would point to, and exactly what reproduces the corruption.
+    #[tokio::test]
+    async fn failed_turn_does_not_poison_next_turns_seed_chain() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_seed_fail01".into();
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.history_source_transcript = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_turns = 0;
+        record.total_tokens_in = 0;
+        record.total_tokens_out = 0;
+        record.total_tokens_cached = 0;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let transcript_1 = record.transcripts_dir.join("run_seed_fail_1.jsonl");
+        let transcript_2 = record.transcripts_dir.join("run_seed_fail_2.jsonl");
+        let transcript_3 = record.transcripts_dir.join("run_seed_fail_3.jsonl");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#,
+        );
+        let turn1 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fail_1".into(),
+            prompt: "first prompt".into(),
+        })
+        .await;
+
+        turn1.expect("turn 1 completes");
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "ProviderError": "boom" }]"#,
+        );
+        let turn2 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fail_2".into(),
+            prompt: "second prompt".into(),
+        })
+        .await;
+        // `run_turn` records a failed agent run in the session's own
+        // bookkeeping rather than propagating a Rust-level error — the
+        // worker process keeps running so later turns can still be sent.
+        turn2.expect("turn 2 (failing) completes without propagating a Rust-level error");
+
+        let (after_turn2, _) =
+            read_session(&global, &record.session_id).expect("read session after turn 2");
+        assert_eq!(
+            after_turn2.status,
+            SessionStatus::Failed,
+            "turn 2 must be recorded as failed: {after_turn2:?}"
+        );
+        assert_eq!(
+            after_turn2.message_history.len(),
+            2,
+            "a failed turn must never advance message_history"
+        );
+        assert_eq!(
+            after_turn2.history_source_transcript,
+            Some(transcript_1.clone()),
+            "a failed turn must never touch history_source_transcript"
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack3", "stop": "end_turn" } }]"#,
+        );
+        let turn3 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fail_3".into(),
+            prompt: "third prompt".into(),
+        })
+        .await;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        turn3.expect("turn 3 completes");
+
+        let (after_turn3, _) =
+            read_session(&global, &record.session_id).expect("read session after turn 3");
+        assert_eq!(
+            after_turn3.status,
+            SessionStatus::Idle,
+            "turn 3 must succeed against the mock provider: {after_turn3:?}"
+        );
+
+        let events: Vec<TranscriptEvent> = JsonlReader::iter(&transcript_3)
+            .expect("open turn 3 transcript")
+            .filter_map(Result::ok)
+            .collect();
+        let (source_transcript, messages) = events
+            .iter()
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript,
+                    messages,
+                    ..
+                } => Some((source_transcript.clone(), messages.clone())),
+                _ => None,
+            })
+            .expect("turn 3 transcript must contain a Seed event");
+        assert_eq!(
+            source_transcript,
+            Some(transcript_1.display().to_string()),
+            "turn 3 must reference turn 1's still-valid transcript — NEVER turn 2's, which is \
+             what `last_transcript_path` (unconditionally promoted on every turn, including \
+             failures) would incorrectly point to"
+        );
+        assert_ne!(
+            source_transcript,
+            Some(transcript_2.display().to_string()),
+            "turn 3 must never reference the failed turn's own transcript"
+        );
+        assert!(
+            messages.is_none(),
+            "a referenced seed must not also carry an inline copy of the messages"
+        );
+
+        // End-to-end: replay must succeed (no SeedHashMismatch) and must
+        // reproduce exactly turn 1 + turn 3's conversation — turn 2's
+        // orphaned "second prompt" (recorded in transcript_2 but never
+        // folded into message_history) must not leak in.
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_3)
+            .expect("turn 3 transcript reconstructs cleanly via the seed chain");
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("first prompt"),
+                Message::assistant("ack"),
+                Message::user("third prompt"),
+                Message::assistant("ack3"),
+            ])
+            .unwrap(),
+            "replay must skip turn 2 entirely — it never joined message_history"
+        );
+    }
+
+    /// I-1 (transcript fidelity plan 1, whole-branch review): compaction
+    /// rewrites `message_history` in place with no transcript of its own
+    /// that reconstructs to the summarized result (the CLI `compact`
+    /// command writes no transcript at all), so `history_source_transcript`
+    /// must be cleared whenever compaction actually fires — regardless of
+    /// what it pointed at beforehand — and the next turn must seed inline.
+    #[tokio::test]
+    async fn compact_clears_history_source_transcript_and_next_turn_seeds_inline() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_compact_seed01".into();
+        record.status = SessionStatus::Idle;
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        std::fs::create_dir_all(&record.transcripts_dir).expect("create transcripts dir");
+
+        // Dense history that reliably exceeds a tiny compaction window —
+        // same recipe as
+        // `rupu_agent::runner::tests::compact_messages_returns_outcome_with_mock_provider`.
+        let dense_chunk = "x".repeat(1000);
+        let mut history = vec![Message::user(&format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            history.push(Message::assistant(&format!("assistant {i}: {dense_chunk}")));
+            history.push(Message::user(&format!("user {i}: {dense_chunk}")));
+        }
+        record.message_history = history;
+        record.compact_at_percent = Some(80);
+        record.context_window_tokens = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        // Seed a fake prior reference to prove compaction clears it
+        // unconditionally, regardless of what it held beforehand.
+        let fake_prior_transcript = record.transcripts_dir.join("run_prior.jsonl");
+        std::fs::write(&fake_prior_transcript, b"").expect("touch fake transcript");
+        record.history_source_transcript = Some(fake_prior_transcript);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#,
+        );
+
+        let compact_result = compact(&record.session_id, Some(1000)).await;
+        compact_result.expect("compact completes");
+
+        let (after_compact, _) =
+            read_session(&global, &record.session_id).expect("read session after compact");
+        assert!(
+            after_compact.history_source_transcript.is_none(),
+            "compaction must clear history_source_transcript, got {:?}",
+            after_compact.history_source_transcript
+        );
+        assert!(
+            after_compact.message_history.len() < record.message_history.len(),
+            "compaction must actually have fired (summarized some messages away): {} -> {}",
+            record.message_history.len(),
+            after_compact.message_history.len()
+        );
+
+        let transcript_next = record.transcripts_dir.join("run_after_compact.jsonl");
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#,
+        );
+        let turn = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_after_compact".into(),
+            prompt: "post-compact prompt".into(),
+        })
+        .await;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        turn.expect("post-compact turn completes");
+
+        let events: Vec<TranscriptEvent> = JsonlReader::iter(&transcript_next)
+            .expect("open post-compact transcript")
+            .filter_map(Result::ok)
+            .collect();
+        let (source_transcript, messages) = events
+            .iter()
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript,
+                    messages,
+                    ..
+                } => Some((source_transcript.clone(), messages.clone())),
+                _ => None,
+            })
+            .expect("post-compact transcript must contain a Seed event");
+        assert_eq!(
+            source_transcript, None,
+            "the turn right after compaction must seed inline — there is no transcript that \
+             reconstructs to the summarized history"
+        );
+        assert!(
+            messages.is_some(),
+            "an inline seed must carry the actual messages"
+        );
+
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_next)
+            .expect("post-compact transcript reconstructs cleanly");
+        let mut expected = after_compact.message_history.clone();
+        expected.push(Message::user("post-compact prompt"));
+        expected.push(Message::assistant("ack"));
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "replay must reproduce exactly the post-compaction history plus the new turn"
+        );
     }
 
     #[test]

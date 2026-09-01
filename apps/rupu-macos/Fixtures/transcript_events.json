@@ -283,5 +283,100 @@
         "duration_ms": 430
       }
     }
+  },
+  {
+    "type": "thinking",
+    "data": {
+      "text": "Weighing whether to run the full suite before committing.",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "raw": {
+        "signature": "sig-abc123",
+        "thinking": "Weighing whether to run the full suite before committing.",
+        "type": "thinking"
+      }
+    }
+  },
+  {
+    "type": "thinking",
+    "data": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "raw": {
+        "data": "opaque-base64-blob",
+        "type": "redacted_thinking"
+      }
+    }
+  },
+  {
+    "type": "thinking_delta",
+    "data": {
+      "content": "Weighing whether"
+    }
+  },
+  {
+    "type": "user_message",
+    "data": {
+      "content": "Please review the auth module for security issues."
+    }
+  },
+  {
+    "type": "seed",
+    "data": {
+      "message_count": 7,
+      "sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "source_transcript": "t/run_prev.jsonl"
+    }
+  },
+  {
+    "type": "seed",
+    "data": {
+      "message_count": 3,
+      "sha256": "abababababababababababababababababababababababababababababababab",
+      "messages": [
+        {
+          "content": [
+            {
+              "text": "start the review",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ]
+    }
+  },
+  {
+    "type": "compaction",
+    "data": {
+      "seq": 1,
+      "summarized_messages": 12,
+      "backup_path": "t/run-01.compacted.1.json",
+      "messages": [
+        {
+          "content": [
+            {
+              "text": "continue the review",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ]
+    }
+  },
+  {
+    "type": "notice",
+    "data": {
+      "kind": "context_trim",
+      "message": "Trimmed 3 tool results to fit the context window"
+    }
+  },
+  {
+    "type": "notice",
+    "data": {
+      "kind": "provider_retry",
+      "message": "Retrying after a 529 overloaded response"
+    }
   }
 ]

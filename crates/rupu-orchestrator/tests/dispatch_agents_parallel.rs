@@ -96,6 +96,8 @@ impl AgentDispatcher for FakeDispatcher {
                 model: "mock-1".into(),
                 started_at: chrono::Utc::now(),
                 mode: rupu_transcript::RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
             })
             .unwrap();
         writer
@@ -165,6 +167,7 @@ impl StepFactory for ParallelFactory {
         ]);
         let parent_run_id_for_ctx = Some(run_id.clone());
         AgentRunOpts {
+            seed_source: None,
             agent_name: "writer".into(),
             agent_system_prompt: "you are the writer".into(),
             agent_tools: Some(vec!["dispatch_agents_parallel".into()]),

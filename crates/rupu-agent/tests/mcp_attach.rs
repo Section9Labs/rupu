@@ -24,6 +24,7 @@ async fn mcp_registry_attaches_tools_to_run() {
     let tmp = assert_fs::TempDir::new().unwrap();
 
     let opts = AgentRunOpts {
+        seed_source: None,
         agent_name: "mcp-test".into(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

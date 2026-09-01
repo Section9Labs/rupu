@@ -48,6 +48,7 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
     let captured = provider.captured.clone();
 
     let opts = AgentRunOpts {
+        seed_source: None,
         agent_name: "test-agent".into(),
         agent_system_prompt: "You are a coverage agent.".into(),
         agent_tools: None,
@@ -158,6 +159,7 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
     let captured = provider.captured.clone();
 
     let opts = AgentRunOpts {
+        seed_source: None,
         agent_name: "plain-agent".into(),
         agent_system_prompt: "You are a plain agent.".into(),
         agent_tools: None,
@@ -229,6 +231,7 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
     let captured = provider.captured.clone();
 
     let opts = AgentRunOpts {
+        seed_source: None,
         agent_name: "prompt-check-agent".into(),
         agent_system_prompt: "Base prompt.".into(),
         agent_tools: None,
@@ -309,6 +312,7 @@ async fn surface_tag_override_is_respected() {
     }]);
 
     let opts = AgentRunOpts {
+        seed_source: None,
         agent_name: "workflow-step-agent".into(),
         agent_system_prompt: "You are a workflow step agent.".into(),
         agent_tools: None,
@@ -385,6 +389,7 @@ async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
     let captured = provider.captured.clone();
 
     let opts = AgentRunOpts {
+        seed_source: None,
         agent_name: "index-mode-agent".into(),
         agent_system_prompt: "You are a coverage index agent.".into(),
         agent_tools: None,

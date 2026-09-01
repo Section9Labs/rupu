@@ -179,6 +179,8 @@ fn write_transcript_file(path: &std::path::Path, run_id: &str, assistant_content
             model: "claude-sonnet-4-6".into(),
             started_at: Utc::now(),
             mode: RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
         })
         .unwrap();
     writer.write(&Event::TurnStart { turn_idx: 0 }).unwrap();

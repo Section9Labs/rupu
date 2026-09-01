@@ -218,6 +218,7 @@ impl StepFactory for EchoFactory {
             output_tokens: 1,
         }]);
         AgentRunOpts {
+            seed_source: None,
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
             agent_tools: None,

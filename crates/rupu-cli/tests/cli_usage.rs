@@ -51,6 +51,8 @@ fn write_usage_transcript(
             model: model.into(),
             started_at,
             mode: RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
         })
         .unwrap();
     writer
@@ -612,6 +614,8 @@ fn usage_backfill_creates_sidecars_for_old_standalone_transcripts() {
             model: "claude-sonnet-4-6".into(),
             started_at,
             mode: RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
         })
         .unwrap();
     for event in events.into_iter().skip(1) {

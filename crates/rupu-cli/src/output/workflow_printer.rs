@@ -1300,18 +1300,41 @@ fn workflow_transcript_event_lines(
             if view_mode.shows_full_payloads() {
                 if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty())
                 {
-                    out.push(WorkflowViewLine {
-                        status: UiStatus::Active,
-                        text: retained_workflow_event_line(
-                            UiStatus::Active,
-                            "thinking",
-                            &truncate_single_line(thinking, 96),
-                        ),
-                        continuation: false,
-                        indent: 0,
-                        kind: WorkflowViewLineKind::Event,
-                    });
+                    let payload = render_payload(thinking, prefs);
+                    let mut lines = payload.rendered.lines();
+                    if let Some(first) = lines.next() {
+                        out.push(WorkflowViewLine {
+                            status: UiStatus::Active,
+                            text: retained_workflow_event_line_raw(UiStatus::Active, "thinking", first),
+                            continuation: false,
+                            indent: 0,
+                            kind: WorkflowViewLineKind::Event,
+                        });
+                        for line in lines {
+                            out.push(WorkflowViewLine {
+                                status: UiStatus::Active,
+                                text: line.to_string(),
+                                continuation: true,
+                                indent: 0,
+                                kind: WorkflowViewLineKind::Event,
+                            });
+                        }
+                    }
                 }
+            } else if let Some(thinking) =
+                thinking.as_deref().filter(|value| !value.trim().is_empty())
+            {
+                out.push(WorkflowViewLine {
+                    status: UiStatus::Active,
+                    text: retained_workflow_event_line(
+                        UiStatus::Active,
+                        "thinking",
+                        &truncate_single_line(thinking, 96),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                });
             }
             if !content.trim().is_empty() {
                 match view_mode {
@@ -1636,6 +1659,7 @@ fn workflow_transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => {
             if !view_mode.shows_full_payloads() {
                 return Vec::new();
@@ -1712,9 +1736,181 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
-        // No dedicated workflow-view row for netflow yet — it streams
-        // into the JSONL for offline inspection, not this pretty view.
-        TxEvent::NetFlow { .. } => Vec::new(),
+        TxEvent::Thinking { text, provider, .. } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => vec![WorkflowViewLine {
+                    status: UiStatus::Active,
+                    text: retained_workflow_event_line(
+                        UiStatus::Active,
+                        "thinking",
+                        &format!("[redacted reasoning · {provider}]"),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                }],
+                Some(t) if view_mode.shows_full_payloads() => {
+                    let payload = render_payload(t, prefs);
+                    let mut lines = payload.rendered.lines();
+                    let mut out = Vec::new();
+                    if let Some(first) = lines.next() {
+                        out.push(WorkflowViewLine {
+                            status: UiStatus::Active,
+                            text: retained_workflow_event_line_raw(UiStatus::Active, "thinking", first),
+                            continuation: false,
+                            indent: 0,
+                            kind: WorkflowViewLineKind::Event,
+                        });
+                        for line in lines {
+                            out.push(WorkflowViewLine {
+                                status: UiStatus::Active,
+                                text: line.to_string(),
+                                continuation: true,
+                                indent: 0,
+                                kind: WorkflowViewLineKind::Event,
+                            });
+                        }
+                    }
+                    out
+                }
+                Some(t) => vec![WorkflowViewLine {
+                    status: UiStatus::Active,
+                    text: retained_workflow_event_line(
+                        UiStatus::Active,
+                        "thinking",
+                        &truncate_single_line(t, 96),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                }],
+            }
+        }
+        TxEvent::ThinkingDelta { .. } => Vec::new(),
+        TxEvent::UserMessage { content } => {
+            if !view_mode.shows_full_payloads() {
+                vec![WorkflowViewLine {
+                    status: UiStatus::Active,
+                    text: retained_workflow_event_line(
+                        UiStatus::Active,
+                        "prompt",
+                        &truncate_single_line(content, 96),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                }]
+            } else {
+                let payload = render_payload(content, prefs);
+                let mut lines = payload.rendered.lines();
+                let mut out = Vec::new();
+                if let Some(first) = lines.next() {
+                    out.push(WorkflowViewLine {
+                        status: UiStatus::Active,
+                        text: retained_workflow_event_line_raw(UiStatus::Active, "prompt", first),
+                        continuation: false,
+                        indent: 0,
+                        kind: WorkflowViewLineKind::Event,
+                    });
+                    for line in lines {
+                        out.push(WorkflowViewLine {
+                            status: UiStatus::Active,
+                            text: line.to_string(),
+                            continuation: true,
+                            indent: 0,
+                            kind: WorkflowViewLineKind::Event,
+                        });
+                    }
+                }
+                out
+            }
+        }
+        TxEvent::Seed {
+            message_count,
+            source_transcript,
+            ..
+        } => {
+            let detail = match source_transcript {
+                Some(src) => format!(
+                    "{message_count} prior messages seed this run  ·  from {}",
+                    truncate_single_line(src, 48)
+                ),
+                None => format!("{message_count} prior messages seed this run"),
+            };
+            vec![WorkflowViewLine {
+                status: UiStatus::Active,
+                text: retained_workflow_event_line(UiStatus::Active, "seed", &detail),
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
+        TxEvent::Notice { kind, message } => vec![WorkflowViewLine {
+            status: UiStatus::Awaiting,
+            text: retained_workflow_event_line(
+                UiStatus::Awaiting,
+                "notice",
+                &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+            ),
+            continuation: false,
+            indent: 0,
+            kind: WorkflowViewLineKind::Event,
+        }],
+        TxEvent::Compaction {
+            seq,
+            summarized_messages,
+            backup_path,
+            ..
+        } => vec![WorkflowViewLine {
+            status: UiStatus::Active,
+            text: retained_workflow_event_line(
+                UiStatus::Active,
+                "compaction",
+                &format!(
+                    "seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"
+                ),
+            ),
+            continuation: false,
+            indent: 0,
+            kind: WorkflowViewLineKind::Event,
+        }],
+        TxEvent::NetFlow { flow } => {
+            let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+            let status = if ok {
+                UiStatus::Complete
+            } else {
+                UiStatus::Failed
+            };
+            vec![WorkflowViewLine {
+                status,
+                text: retained_workflow_event_line_raw(
+                    status,
+                    "net flow",
+                    &format!(
+                        "{} {}{}  ·  {}  ·  {}ms",
+                        flow.method,
+                        flow.host,
+                        flow.path,
+                        flow.status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                        flow.duration_ms.unwrap_or(0),
+                    ),
+                ),
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
+        TxEvent::Unknown => vec![WorkflowViewLine {
+            status: UiStatus::Active,
+            text: retained_workflow_event_line_raw(
+                UiStatus::Active,
+                "event",
+                "unrecognized event type (newer rupu wrote this transcript)",
+            ),
+            continuation: false,
+            indent: 0,
+            kind: WorkflowViewLineKind::Event,
+        }],
     }
 }
 
@@ -4139,6 +4335,8 @@ mod tests {
                     model: "claude-sonnet-4-6".into(),
                     started_at: run_started,
                     mode: rupu_transcript::RunMode::Readonly,
+                    schema: None,
+                    system_prompt: None,
                 },
                 TxEvent::AssistantMessage {
                     content: "Summarized the implementation plan.".into(),
@@ -4278,6 +4476,94 @@ mod tests {
     }
 
     #[test]
+    fn workflow_transcript_event_lines_thinking_full_body_and_redacted_marker() {
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let long = "x".repeat(300);
+        let ev = TxEvent::Thinking {
+            text: Some(long.clone()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let full = workflow_transcript_event_lines(&ev, LiveViewMode::Full, &full_prefs);
+        let joined: String = full.iter().map(|l| l.text.as_str()).collect();
+        assert!(joined.contains(&long));
+
+        let focused = workflow_transcript_event_lines(&ev, LiveViewMode::Focused, &focused_prefs);
+        assert_eq!(focused.len(), 1);
+        assert!(focused[0].text.len() < 300);
+
+        let redacted = TxEvent::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let lines = workflow_transcript_event_lines(&redacted, LiveViewMode::Full, &full_prefs);
+        assert!(lines[0].text.contains("redacted reasoning"));
+    }
+
+    #[test]
+    fn workflow_transcript_event_lines_v2_rows_exist_for_every_new_variant() {
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let cases: Vec<TxEvent> = vec![
+            TxEvent::UserMessage {
+                content: "do it".into(),
+            },
+            TxEvent::Seed {
+                message_count: 4,
+                sha256: "abc".into(),
+                source_transcript: None,
+                messages: Some(serde_json::json!([])),
+            },
+            TxEvent::Notice {
+                kind: "context_trim".into(),
+                message: "trimmed".into(),
+            },
+            TxEvent::Compaction {
+                seq: 1,
+                summarized_messages: 8,
+                backup_path: "/b".into(),
+                messages: serde_json::json!([]),
+            },
+            TxEvent::Unknown,
+        ];
+        for ev in &cases {
+            assert!(
+                !workflow_transcript_event_lines(ev, LiveViewMode::Compact, &prefs).is_empty(),
+                "no row for {ev:?} — silent drop"
+            );
+        }
+        assert!(workflow_transcript_event_lines(
+            &TxEvent::ThinkingDelta {
+                content: "c".into()
+            },
+            LiveViewMode::Full,
+            &prefs,
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn workflow_transcript_event_lines_compact_keeps_assistant_body() {
         let event = TxEvent::AssistantMessage {
             content: "## Findings\n\n- one\n- two".into(),
@@ -4406,6 +4692,8 @@ mod tests {
                 model: "claude-sonnet-4-6".into(),
                 started_at: Utc::now(),
                 mode: rupu_transcript::RunMode::Readonly,
+                schema: None,
+                system_prompt: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Child output\n\n- item one\n- item two".into(),
@@ -4533,6 +4821,8 @@ mod tests {
                 model: "claude-sonnet-4-6".into(),
                 started_at: Utc::now(),
                 mode: rupu_transcript::RunMode::Readonly,
+                schema: None,
+                system_prompt: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Reviewer output\n\n- looks good".into(),

@@ -151,6 +151,8 @@ fn write_archived_standalone_transcript(
         model: "claude-sonnet-4-6".to_string(),
         started_at: Utc::now(),
         mode: RunMode::Readonly,
+        schema: None,
+        system_prompt: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {

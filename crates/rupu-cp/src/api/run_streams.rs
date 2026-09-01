@@ -1658,6 +1658,8 @@ mod tests {
             model: "claude".into(),
             started_at: started_at.parse().unwrap(),
             mode: rupu_transcript::RunMode::Ask,
+            schema: None,
+            system_prompt: None,
         };
         let line = serde_json::to_string(&ev).unwrap();
         fs::write(dir.join(format!("{run_id}.jsonl")), format!("{line}\n")).unwrap();
@@ -2161,6 +2163,8 @@ mod tests {
                 model: "claude-opus-4-8".into(),
                 started_at: Utc::now(),
                 mode: rupu_transcript::RunMode::Ask,
+                schema: None,
+                system_prompt: None,
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),

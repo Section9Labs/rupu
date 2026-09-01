@@ -149,6 +149,7 @@ impl StepFactory for ReadingFactory {
             output_tokens: 1,
         }]);
         AgentRunOpts {
+            seed_source: None,
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "reader".into(),
             agent_tools: None,

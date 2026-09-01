@@ -242,6 +242,8 @@ mod tests {
             model: model.into(),
             started_at: Utc::now(),
             mode: RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
         }
     }
 

@@ -4351,29 +4351,50 @@ fn live_run_event_lines(
             )]
         }
         TranscriptEvent::AssistantDelta { .. } => Vec::new(),
-        TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-            match view_mode {
-                LiveViewMode::Focused => vec![serve_event_line(
-                    UiStatus::Active,
-                    format!("assistant  ·  {}", truncate_single_line(content, 96)),
-                )],
-                LiveViewMode::Compact | LiveViewMode::Full => {
-                    let prefs = retained_serve_ui_prefs();
-                    let highlighted = render_assistant_content(content.trim(), &prefs).rendered;
-                    let mut out = Vec::new();
-                    for (index, line) in highlighted.lines().enumerate() {
-                        out.push(if index == 0 {
-                            serve_event_line(
-                                UiStatus::Active,
-                                format!("assistant output  ·  {line}"),
-                            )
-                        } else {
-                            serve_note_line(UiStatus::Active, line.to_string())
-                        });
+        TranscriptEvent::AssistantMessage { content, thinking } => {
+            let mut out = Vec::new();
+            if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
+                match view_mode {
+                    LiveViewMode::Focused => out.push(serve_event_line(
+                        UiStatus::Active,
+                        format!("thinking  ·  {}", truncate_single_line(thinking, 96)),
+                    )),
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let prefs = retained_serve_ui_prefs();
+                        let payload = render_payload(thinking, &prefs);
+                        for (index, line) in payload.rendered.lines().enumerate() {
+                            out.push(if index == 0 {
+                                serve_event_line(UiStatus::Active, format!("thinking  ·  {line}"))
+                            } else {
+                                serve_note_line(UiStatus::Active, line.to_string())
+                            });
+                        }
                     }
-                    out
                 }
             }
+            if !content.trim().is_empty() {
+                match view_mode {
+                    LiveViewMode::Focused => out.push(serve_event_line(
+                        UiStatus::Active,
+                        format!("assistant  ·  {}", truncate_single_line(content, 96)),
+                    )),
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let prefs = retained_serve_ui_prefs();
+                        let highlighted = render_assistant_content(content.trim(), &prefs).rendered;
+                        for (index, line) in highlighted.lines().enumerate() {
+                            out.push(if index == 0 {
+                                serve_event_line(
+                                    UiStatus::Active,
+                                    format!("assistant output  ·  {line}"),
+                                )
+                            } else {
+                                serve_note_line(UiStatus::Active, line.to_string())
+                            });
+                        }
+                    }
+                }
+            }
+            out
         }
         TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
             LiveViewMode::Focused => vec![serve_event_line(
@@ -4588,6 +4609,7 @@ fn live_run_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => {
             if !view_mode.shows_full_payloads() {
                 return Vec::new();
@@ -4627,6 +4649,86 @@ fn live_run_event_lines(
                 }
                 text
             },
+        )],
+        TranscriptEvent::Thinking { text, provider, .. } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => vec![serve_event_line(
+                    UiStatus::Active,
+                    format!("thinking  ·  [redacted reasoning · {provider}]"),
+                )],
+                Some(t) => match view_mode {
+                    LiveViewMode::Focused => vec![serve_event_line(
+                        UiStatus::Active,
+                        format!("thinking  ·  {}", truncate_single_line(t, 96)),
+                    )],
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let prefs = retained_serve_ui_prefs();
+                        let payload = render_payload(t, &prefs);
+                        let mut out = Vec::new();
+                        for (index, line) in payload.rendered.lines().enumerate() {
+                            out.push(if index == 0 {
+                                serve_event_line(UiStatus::Active, format!("thinking  ·  {line}"))
+                            } else {
+                                serve_note_line(UiStatus::Active, line.to_string())
+                            });
+                        }
+                        out
+                    }
+                },
+            }
+        }
+        TranscriptEvent::ThinkingDelta { .. } => Vec::new(),
+        TranscriptEvent::UserMessage { content } => vec![serve_event_line(
+            UiStatus::Active,
+            format!("prompt  ·  {}", truncate_single_line(content, 96)),
+        )],
+        TranscriptEvent::Seed {
+            message_count,
+            source_transcript,
+            ..
+        } => {
+            let detail = match source_transcript {
+                Some(src) => format!(
+                    "{message_count} prior messages seed this run  ·  from {}",
+                    truncate_single_line(src, 48)
+                ),
+                None => format!("{message_count} prior messages seed this run"),
+            };
+            vec![serve_event_line(UiStatus::Active, format!("seed  ·  {detail}"))]
+        }
+        TranscriptEvent::Notice { kind, message } => vec![serve_event_line(
+            UiStatus::Awaiting,
+            format!("notice  ·  {kind}  ·  {}", truncate_single_line(message, 96)),
+        )],
+        TranscriptEvent::Compaction {
+            seq,
+            summarized_messages,
+            backup_path,
+            ..
+        } => vec![serve_event_line(
+            UiStatus::Active,
+            format!(
+                "compaction  ·  seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"
+            ),
+        )],
+        TranscriptEvent::NetFlow { flow } => {
+            let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+            let status = if ok { UiStatus::Complete } else { UiStatus::Failed };
+            vec![serve_event_line(
+                status,
+                format!(
+                    "net flow  ·  {} {}{}  ·  {}  ·  {}ms",
+                    flow.method,
+                    flow.host,
+                    flow.path,
+                    flow.status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                    flow.duration_ms.unwrap_or(0),
+                ),
+            )]
+        }
+        TranscriptEvent::Unknown => vec![serve_event_line(
+            UiStatus::Active,
+            "event  ·  unrecognized event type (newer rupu wrote this transcript)".to_string(),
         )],
         _ => Vec::new(),
     }
@@ -6021,6 +6123,72 @@ mod serve_heartbeat_tests {
         assert!(lines.len() > 1);
         assert!(lines[0].text.contains("tool result"));
         assert!(lines.iter().any(|line| line.text.contains("line1")));
+    }
+
+    #[test]
+    fn live_run_event_lines_thinking_full_body_and_redacted_marker() {
+        let long = "x".repeat(300);
+        let ev = TranscriptEvent::Thinking {
+            text: Some(long.clone()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let full = live_run_event_lines(&ev, LiveViewMode::Full);
+        let joined: String = full.iter().map(|l| l.text.as_str()).collect();
+        assert!(joined.contains(&long));
+
+        let focused = live_run_event_lines(&ev, LiveViewMode::Focused);
+        assert_eq!(focused.len(), 1);
+        assert!(focused[0].text.len() < 300);
+
+        let redacted = TranscriptEvent::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let lines = live_run_event_lines(&redacted, LiveViewMode::Full);
+        assert!(lines[0].text.contains("redacted reasoning"));
+    }
+
+    #[test]
+    fn live_run_event_lines_v2_rows_exist_for_every_new_variant() {
+        let cases: Vec<TranscriptEvent> = vec![
+            TranscriptEvent::UserMessage {
+                content: "do it".into(),
+            },
+            TranscriptEvent::Seed {
+                message_count: 4,
+                sha256: "abc".into(),
+                source_transcript: None,
+                messages: Some(serde_json::json!([])),
+            },
+            TranscriptEvent::Notice {
+                kind: "context_trim".into(),
+                message: "trimmed".into(),
+            },
+            TranscriptEvent::Compaction {
+                seq: 1,
+                summarized_messages: 8,
+                backup_path: "/b".into(),
+                messages: serde_json::json!([]),
+            },
+            TranscriptEvent::Unknown,
+        ];
+        for ev in &cases {
+            assert!(
+                !live_run_event_lines(ev, LiveViewMode::Compact).is_empty(),
+                "no row for {ev:?} — silent drop"
+            );
+        }
+        assert!(live_run_event_lines(
+            &TranscriptEvent::ThinkingDelta {
+                content: "c".into()
+            },
+            LiveViewMode::Full,
+        )
+        .is_empty());
     }
 
     #[test]
