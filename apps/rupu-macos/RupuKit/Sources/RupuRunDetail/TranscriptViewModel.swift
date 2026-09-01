@@ -390,12 +390,12 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
             }
             pendingTerminal = nil
 
-        case .actionEmitted(let data):
-            guard case .object(let obj) = data,
-                  case .string(let kind)? = obj["kind"],
-                  let payload = obj["payload"]
-            else { continue }
+        case .actionEmitted(let kind, let payload, _, _, _):
             pendingActionArgsByTool[kind, default: []].append(payload)
+
+        // upgraded in Task 2
+        case .thinking, .thinkingDelta, .userMessage, .seed, .notice, .compaction:
+            continue
         }
     }
 

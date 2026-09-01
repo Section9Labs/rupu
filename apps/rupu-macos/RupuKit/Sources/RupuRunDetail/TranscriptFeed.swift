@@ -299,6 +299,10 @@ func buildFeedRows(events: [TranscriptEvent]) -> [FeedRow] {
 
         case .fileEdit, .commandRun, .actionEmitted, .runStart, .usage, .netFlow, .assistantDelta, .unknown:
             continue
+
+        // upgraded in Task 2
+        case .thinking, .thinkingDelta, .userMessage, .seed, .notice, .compaction:
+            continue
         }
     }
 

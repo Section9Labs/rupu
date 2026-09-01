@@ -155,7 +155,7 @@ struct TranscriptViewModelTests {
         let payload = JSONValue.object(["channel": .string("#eng")])
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "action node ran", thinking: nil),
-            .actionEmitted(data: .object(["kind": .string("notify_slack"), "payload": payload, "allowed": .bool(true), "applied": .bool(true)])),
+            .actionEmitted(kind: "notify_slack", payload: payload, allowed: true, applied: true, reason: nil),
             .toolAudit(tool: "notify_slack", declared: true, granted: true, blocked: false, restricted: true),
         ]
 
@@ -173,9 +173,9 @@ struct TranscriptViewModelTests {
         let payloadB = JSONValue.object(["channel": .string("#b")])
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "two action calls", thinking: nil),
-            .actionEmitted(data: .object(["kind": .string("notify_slack"), "payload": payloadA])),
+            .actionEmitted(kind: "notify_slack", payload: payloadA, allowed: true, applied: true, reason: nil),
             .toolAudit(tool: "notify_slack", declared: true, granted: true, blocked: false, restricted: true),
-            .actionEmitted(data: .object(["kind": .string("notify_slack"), "payload": payloadB])),
+            .actionEmitted(kind: "notify_slack", payload: payloadB, allowed: true, applied: true, reason: nil),
             .toolAudit(tool: "notify_slack", declared: true, granted: true, blocked: false, restricted: true),
         ]
 
