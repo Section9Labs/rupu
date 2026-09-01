@@ -43,38 +43,53 @@ final class CallCounter: @unchecked Sendable {
 // MARK: - Fast cold-start probe race (perf & interaction arc, Plan 5 Task 2)
 
 /// The overwhelmingly common case — a `cp serve` already listening —
-/// resolves `start()` in well under the probe's own (much longer, ~3s in
-/// production) timeout: a probe that answers immediately attaches almost
-/// instantly, called exactly once.
-@Test func startAttachesQuicklyWhenTheProbeAnswersFast() async throws {
+/// resolves `start()` off the probe's own answer, never by waiting out
+/// the fast-path deadline. Asserted mechanically, not by wall clock (an
+/// earlier `elapsed < 250ms` bound flaked at 0.284s on a loaded macos-15
+/// runner): the injected deadline is pushed far past the test's time
+/// limit, so `start()` can only finish before the limit if the answered
+/// probe alone resolved the race — a regression that waits for the
+/// deadline hangs here and trips `.timeLimit` instead.
+@Test(.timeLimit(.minutes(1)))
+func startAttachesQuicklyWhenTheProbeAnswersFast() async throws {
     let probeCalls = CallCounter()
-    let server = EmbeddedServer(binaryPath: "/nonexistent/rupu", port: 65535, probe: { _ in
-        probeCalls.increment()
-        return true
-    })
+    let server = EmbeddedServer(
+        binaryPath: "/nonexistent/rupu",
+        port: 65535,
+        fastPathDeadline: .seconds(600),
+        probe: { _ in
+            probeCalls.increment()
+            return true
+        }
+    )
 
-    let clock = ContinuousClock()
-    let start = clock.now
     let origin = try await server.start()
-    let elapsed = clock.now - start
 
     #expect(origin == .attached)
     #expect(probeCalls.value == 1)
-    #expect(elapsed < .milliseconds(250), "a fast-answering probe must not pay the 300ms fast-path deadline at all")
 }
 
-/// A probe that takes LONGER than the 300ms fast-path deadline to answer
+/// A probe that takes LONGER than the fast-path deadline to answer
 /// (but still well within its own real timeout) must still resolve
 /// correctly — via the SAME in-flight call, never a second, redundant
 /// probe invocation — rather than being misclassified as "not running"
-/// just because it didn't answer within the first 300ms.
+/// just because it didn't answer within the deadline. The injected 10ms
+/// deadline against a 300ms probe keeps the intended ordering (deadline
+/// first) robust under runner load while running faster than the old
+/// 300ms-vs-600ms pairing; note the assertions hold either way the race
+/// lands, so this has no wall-clock failure mode.
 @Test func startStillAttachesCorrectlyWhenTheProbeAnswersSlowerThanTheFastDeadline() async throws {
     let probeCalls = CallCounter()
-    let server = EmbeddedServer(binaryPath: "/nonexistent/rupu", port: 65535, probe: { _ in
-        probeCalls.increment()
-        try? await Task.sleep(for: .milliseconds(600))
-        return true
-    })
+    let server = EmbeddedServer(
+        binaryPath: "/nonexistent/rupu",
+        port: 65535,
+        fastPathDeadline: .milliseconds(10),
+        probe: { _ in
+            probeCalls.increment()
+            try? await Task.sleep(for: .milliseconds(300))
+            return true
+        }
+    )
 
     let origin = try await server.start()
 

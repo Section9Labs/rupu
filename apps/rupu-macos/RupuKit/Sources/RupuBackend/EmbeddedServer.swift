@@ -19,13 +19,25 @@ public actor EmbeddedServer {
 
     private let binaryPath: String
     private let port: Int
+    private let fastPathDeadline: Duration
     private let probe: @Sendable (URL) async -> Bool
 
     private var origin: Origin?
 
-    public init(binaryPath: String, port: Int, probe: @escaping @Sendable (URL) async -> Bool) {
+    /// `fastPathDeadline` is the race deadline in `isAlreadyRunning()` —
+    /// injectable so tests can pin the fast path mechanically (a deadline
+    /// far beyond the test's time limit proves the probe's answer alone
+    /// resolved the race) instead of asserting wall-clock latency, which
+    /// flakes on loaded CI runners.
+    public init(
+        binaryPath: String,
+        port: Int,
+        fastPathDeadline: Duration = .milliseconds(300),
+        probe: @escaping @Sendable (URL) async -> Bool
+    ) {
         self.binaryPath = binaryPath
         self.port = port
+        self.fastPathDeadline = fastPathDeadline
         self.probe = probe
     }
 
@@ -54,7 +66,8 @@ public actor EmbeddedServer {
     }
 
     /// Fast cold start (perf & interaction arc, Plan 5 Task 2): races the
-    /// injected `probe` against a short 300ms deadline before falling back
+    /// injected `probe` against a short deadline (`fastPathDeadline`,
+    /// 300ms in production) before falling back
     /// to just awaiting it out for as long as its own (much longer — 3s in
     /// production, `BackendController.defaultEmbeddedProbe`) timeout
     /// allows. The overwhelmingly common case — a `cp serve` already
@@ -86,8 +99,8 @@ public actor EmbeddedServer {
         enum RaceOutcome { case answered(Bool), deadlineElapsed }
         let outcome = await withTaskGroup(of: RaceOutcome.self) { group -> RaceOutcome in
             group.addTask { .answered(await probeTask.value) }
-            group.addTask {
-                try? await Task.sleep(for: .milliseconds(300))
+            group.addTask { [fastPathDeadline] in
+                try? await Task.sleep(for: fastPathDeadline)
                 return .deadlineElapsed
             }
             let first = await group.next() ?? .deadlineElapsed
