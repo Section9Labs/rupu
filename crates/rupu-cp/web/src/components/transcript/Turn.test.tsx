@@ -8,6 +8,7 @@
  *   - result pill reflects summary.result.
  */
 
+import '@testing-library/jest-dom/vitest';
 import { it, expect, describe, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import Turn from './Turn';
@@ -114,5 +115,57 @@ describe('Turn', () => {
   it('defaultOpen=true renders the body immediately', () => {
     render(<Turn turn={makeTurn()} defaultOpen={true} />);
     expect(screen.getByText('UNIQUE_TOOL_OUTPUT_MARKER')).toBeTruthy();
+  });
+
+  it('renders blocks in order: thinking (collapsible, full text), assistant, gate', () => {
+    render(
+      <Turn
+        defaultOpen
+        turn={{
+          blocks: [
+            { kind: 'thinking', text: 'long reasoning body', provider: 'anthropic' },
+            { kind: 'assistant', content: 'the answer' },
+            { kind: 'gate', gateId: 'g1', prompt: 'ship it?', decision: null, decidedBy: null },
+          ],
+          tokensIn: 11,
+          tokensOut: 7,
+          summary: { toolCount: 0, findingCount: 0, result: 'ok' },
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByText('thinking'));
+    expect(screen.getByText('long reasoning body')).toBeInTheDocument();
+    // "the answer" legitimately appears twice with defaultOpen: once in the
+    // header snippet, once in the body's rendered assistant block.
+    expect(screen.getAllByText('the answer').length).toBeGreaterThan(0);
+    expect(screen.getByText('ship it?')).toBeInTheDocument();
+    expect(screen.getByText(/11.*→.*7|11 in.*7 out/)).toBeInTheDocument();
+  });
+
+  it('renders a redacted thinking block as a marker, and notice/seed/compaction/unknown rows', () => {
+    render(
+      <Turn
+        defaultOpen
+        turn={{
+          blocks: [
+            { kind: 'seed', messageCount: 4, sourceTranscript: null },
+            { kind: 'user', content: 'do the task' },
+            { kind: 'thinking', text: null, provider: 'anthropic' },
+            { kind: 'notice', noticeKind: 'context_trim', message: 'trimmed to fit' },
+            { kind: 'compaction', seq: 1, summarized: 9 },
+            { kind: 'unknown', type: 'hologram_projection' },
+          ],
+          tokensIn: null,
+          tokensOut: null,
+          summary: { toolCount: 0, findingCount: 0, result: 'running' },
+        }}
+      />,
+    );
+    expect(screen.getByText(/redacted reasoning/)).toBeInTheDocument();
+    expect(screen.getByText(/4 prior messages/)).toBeInTheDocument();
+    expect(screen.getByText('do the task')).toBeInTheDocument();
+    expect(screen.getByText(/trimmed to fit/)).toBeInTheDocument();
+    expect(screen.getByText(/summarized 9/)).toBeInTheDocument();
+    expect(screen.getByText(/hologram_projection/)).toBeInTheDocument();
   });
 });
