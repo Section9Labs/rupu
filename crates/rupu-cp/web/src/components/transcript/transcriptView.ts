@@ -38,7 +38,11 @@
  *   • `gate_requested` / `seed` / `user_message` / `notice` / `compaction`
  *     each become their own block kind. Anything else unrecognised becomes
  *     an `unknown` block carrying the raw event `type` — nothing is ever
- *     silently dropped.
+ *     silently dropped, EXCEPT `net_flow`: TranscriptSink appends one into
+ *     this same JSONL on essentially every provider call, and it already has
+ *     a dedicated display (the RunDetail Netflow tab, fed from the separate
+ *     per-run ledger API) — rendering it here too would flood nearly every
+ *     turn with a redundant/misleading row, so it's a deliberate no-op.
  *   • orphaned pairing targets (a `tool_result`/`file_edit`/`command_run`
  *     with no preceding `tool_call` to attach to in this snapshot) render as
  *     a standalone `tool` block instead of vanishing.
@@ -357,6 +361,15 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
       case 'thinking_delta':
         // Consolidated events (`assistant_message` / `thinking`) carry the
         // same content already — the deltas are for live-streaming UIs only.
+        break;
+
+      case 'net_flow':
+        // Deliberately unrendered here. TranscriptSink appends a `net_flow`
+        // line into this same JSONL on essentially every provider call, so
+        // treating it like an unrecognised event would flood nearly every
+        // turn with a misleading "unrecognized event" row. Netflow has its
+        // own dedicated display — the RunDetail Netflow tab, fed from the
+        // separate per-run ledger API — so it's a deliberate no-op here.
         break;
 
       case 'assistant_message': {

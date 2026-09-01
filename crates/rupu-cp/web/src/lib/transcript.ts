@@ -30,6 +30,7 @@ export type TranscriptEvent =
   | { type: 'seed'; data: { message_count: number; sha256?: string; source_transcript?: string | null; messages?: unknown } }
   | { type: 'notice'; data: { kind: string; message: string } }
   | { type: 'compaction'; data: { seq: number; summarized_messages: number; backup_path?: string; messages?: unknown } }
+  | { type: 'net_flow'; data: { flow: unknown } }
   | { type: string; data: Record<string, unknown> }; // catch-all for forward-compat
 
 // ---------------------------------------------------------------------------

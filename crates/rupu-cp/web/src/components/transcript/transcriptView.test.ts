@@ -628,4 +628,15 @@ describe('v2 blocks model', () => {
     const tools = view.turns.flatMap((t) => t.blocks).filter((b) => b.kind === 'tool');
     expect(tools).toHaveLength(2);
   });
+
+  it('net_flow is deliberately unrendered — no block at all, and specifically no unknown block (its display surface is the RunDetail Netflow tab)', () => {
+    const view = buildTranscriptView([
+      { type: 'turn_start', data: { turn_idx: 0 } },
+      { type: 'net_flow', data: { flow: { bytes_in: 100, bytes_out: 50 } } },
+      { type: 'assistant_message', data: { content: 'done' } },
+    ]);
+    const kinds = view.turns.flatMap((t) => t.blocks.map((b) => b.kind));
+    expect(kinds).toEqual(['assistant']);
+    expect(kinds).not.toContain('unknown');
+  });
 });
