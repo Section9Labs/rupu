@@ -52,9 +52,9 @@ struct TranscriptViewModelTests {
         #expect(entry.output == "late output")
     }
 
-    // MARK: - file_edit adjacency
+    // MARK: - file_edit FIFO pairing
 
-    @Test func fileEditPairsByAdjacencyOntoThePrecedingUnpairedDiffCall() {
+    @Test func fileEditPairsOntoThePrecedingUnpairedDiffCallViaFIFO() {
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "editing", thinking: nil),
             .toolCall(callID: "c1", tool: "write_file", input: .object(["path": .string("a.rs")])),
@@ -71,9 +71,11 @@ struct TranscriptViewModelTests {
         #expect(entry.fileEdit?.diff == "-old\n+new")
     }
 
-    @Test func fileEditWithNoPendingDiffCallIsDroppedRatherThanMisattached() {
+    @Test func fileEditWithNoPendingDiffCallBecomesAStandaloneEntryRatherThanBeingDropped() {
         // No preceding diff-kind call armed — the file_edit has nothing to
-        // pair onto and must not create a phantom entry or crash.
+        // pair onto. It must still surface as a standalone row rather than
+        // being silently dropped (the Plan 3 review's must-fix: the old
+        // no-else `if let` swallowed this case entirely).
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "nothing to edit yet", thinking: nil),
             .fileEdit(path: "a.rs", kind: "modified", diff: "-old\n+new"),
@@ -81,12 +83,18 @@ struct TranscriptViewModelTests {
 
         let turns = buildTranscriptViewModel(events: events)
 
-        #expect(turns[0].tools.isEmpty)
+        #expect(turns[0].tools.count == 1, "an unpaired file_edit must still surface as a row, not vanish")
+        let entry = turns[0].tools[0]
+        #expect(entry.tool == "")
+        #expect(entry.kind == .diff)
+        #expect(entry.fileEdit?.path == "a.rs")
+        #expect(entry.fileEdit?.kind == "modified")
+        #expect(entry.fileEdit?.diff == "-old\n+new")
     }
 
-    // MARK: - command_run adjacency
+    // MARK: - command_run FIFO pairing
 
-    @Test func commandRunPairsByAdjacencyOntoThePrecedingUnpairedBashCall() {
+    @Test func commandRunPairsOntoThePrecedingUnpairedBashCallViaFIFO() {
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "running", thinking: nil),
             .toolCall(callID: "c1", tool: "bash", input: .object(["command": .string("ls")])),
@@ -101,6 +109,59 @@ struct TranscriptViewModelTests {
         #expect(entry.command?.argv == ["/bin/sh", "-c", "ls"])
         #expect(entry.command?.cwd == "/tmp")
         #expect(entry.command?.exitCode == 0)
+    }
+
+    @Test func commandRunWithNoPendingTerminalCallBecomesAStandaloneEntryRatherThanBeingDropped() {
+        let events: [TranscriptEvent] = [
+            .assistantMessage(content: "nothing running yet", thinking: nil),
+            .commandRun(argv: ["/bin/sh", "-c", "ls"], cwd: "/tmp", exitCode: 0, stdoutBytes: 10, stderrBytes: 0),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns[0].tools.count == 1, "an unpaired command_run must still surface as a row, not vanish")
+        let entry = turns[0].tools[0]
+        #expect(entry.tool == "")
+        #expect(entry.kind == .terminal)
+        #expect(entry.command?.argv == ["/bin/sh", "-c", "ls"])
+        #expect(entry.command?.cwd == "/tmp")
+        #expect(entry.command?.exitCode == 0)
+    }
+
+    // MARK: - file_edit/command_run FIFO across a multi-tool-call turn (Plan 3 review must-fix)
+
+    /// The runner emits ALL of a turn's `tool_call`s in block order before
+    /// dispatching any of them, so a turn with [edit A, bash B, edit C] can
+    /// see `file_edit(a)`, `command_run(b)`, `file_edit(c)` arrive in call
+    /// order too. A single adjacency slot (armed by the LAST tool_call seen)
+    /// would attach diff `a` to call C instead of A, and drop `c` outright
+    /// since nothing would still be "pending" for it. FIFO queues, one for
+    /// diff-capable calls and one for terminal-capable calls, must attribute
+    /// each exactly onto the call that actually produced it.
+    @Test func multiCallTurnAttributesEachFileEditAndCommandRunToTheCorrectCallInOrder() {
+        let events: [TranscriptEvent] = [
+            .assistantMessage(content: "three tool calls", thinking: nil),
+            .toolCall(callID: "A", tool: "write_file", input: .object(["path": .string("a.rs")])),
+            .toolCall(callID: "B", tool: "bash", input: .object(["command": .string("b")])),
+            .toolCall(callID: "C", tool: "edit_file", input: .object(["path": .string("c.rs")])),
+            .fileEdit(path: "a.rs", kind: "created", diff: "diff-a"),
+            .commandRun(argv: ["/bin/sh", "-c", "b"], cwd: "/tmp", exitCode: 0, stdoutBytes: 1, stderrBytes: 0),
+            .fileEdit(path: "c.rs", kind: "modified", diff: "diff-c"),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns[0].tools.count == 3)
+        let entryA = turns[0].tools.first { $0.id == "A" }!
+        let entryB = turns[0].tools.first { $0.id == "B" }!
+        let entryC = turns[0].tools.first { $0.id == "C" }!
+        #expect(entryA.fileEdit?.path == "a.rs")
+        #expect(entryA.fileEdit?.diff == "diff-a")
+        #expect(entryB.command?.argv == ["/bin/sh", "-c", "b"])
+        #expect(entryC.fileEdit?.path == "c.rs")
+        #expect(entryC.fileEdit?.diff == "diff-c")
+        // Cross-check: A must NOT have picked up c's diff, nor C a's.
+        #expect(entryA.fileEdit?.diff != entryC.fileEdit?.diff)
     }
 
     // MARK: - tool_audit FIFO-per-name, NOT adjacency (out-of-order two-same-name-calls)
@@ -273,6 +334,28 @@ struct TranscriptViewModelTests {
         #expect(turns[1].id == 1)
         #expect(turns[1].tokensIn == 10)
         #expect(turns[1].tokensOut == 5)
+    }
+
+    /// v2 emits one `assistant_message` PER Text block, so a turn with
+    /// interleaved [text, tool_use, text] (or a multi-part Gemini response)
+    /// carries more than one of these between its `turn_start`/`turn_end`.
+    /// The old code overwrote (`t.assistantText = content`, last-wins),
+    /// silently dropping every text block but the final one — a must-fix
+    /// from the Plan 3 review. Both texts must survive, in order.
+    @Test func twoAssistantMessageEventsInOneTurnAccumulateInOrderRatherThanOverwriting() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "first part", thinking: nil),
+            .toolCall(callID: "c1", tool: "read_file", input: .null),
+            .toolResult(callID: "c1", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .assistantMessage(content: "second part", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: 10, tokensOut: 5),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns.count == 1)
+        #expect(turns[0].assistantText == "first part\n\nsecond part")
     }
 
     /// Review fix (Critical): two non-adjacent gaps — content arriving

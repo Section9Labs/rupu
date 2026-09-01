@@ -17,10 +17,24 @@ import RupuAPI
 ///   standalone entry (empty `tool` name, `.generic` kind) so a truncated
 ///   snapshot's tail result is never silently lost — the controller's
 ///   explicit instruction for this task.
-/// - `file_edit` pairs by ADJACENCY onto the nearest preceding unpaired
-///   `write_file`/`edit_file` (`.diff`-kind) call (L326-328, L389-399).
-/// - `command_run` pairs by ADJACENCY onto the nearest preceding unpaired
-///   `bash` (`.terminal`-kind) call (L328, L401-413).
+/// - `file_edit` pairs onto a `write_file`/`edit_file` (`.diff`-kind) call
+///   via a FIFO queue of pending diff-capable calls (**deviation from the
+///   web**, `transcriptView.ts` L326-328/L389-399: the web arms a single
+///   adjacency slot per `tool_call`, reset on every new call, and a
+///   `file_edit` while no slot is armed is silently ignored, L390 "An
+///   unpaired result carries no tool_call to render against; ignore." —
+///   copy-pasted comment aside, that's the file_edit case). Because
+///   `run_agent` emits every `tool_call` for a turn before dispatching any
+///   of them, a multi-tool-call turn (e.g. two `write_file` calls in one
+///   turn) needs FIFO, not last-call-wins adjacency, or the diff/exit-call
+///   attribution scrambles and a non-final call's diff is silently
+///   dropped. A `file_edit` arriving with an empty queue surfaces as a
+///   standalone entry (mirrors the orphan `tool_result` handling above)
+///   rather than being dropped.
+/// - `command_run` pairs onto a `bash` (`.terminal`-kind) call the same
+///   way, via its own FIFO queue of pending terminal-capable calls; same
+///   deviation from the web (L328/L401-413), same standalone-on-empty-queue
+///   fallback.
 /// - `tool_audit` is matched by a FIFO queue keyed on the tool NAME
 ///   (L258-268, L329-337, L359-387) — deliberately NOT adjacency: a single
 ///   turn can carry more than one `tool_use` block, and `run_agent` writes
@@ -267,6 +281,16 @@ private final class TurnBuilder {
     }
 }
 
+/// Appends `new` onto `existing` with a blank-line separator, skipping the
+/// separator when either side is empty/nil. Used to fold multiple
+/// `assistant_message` events in one turn into one `assistantText` without
+/// dropping any of them (see the call site's doc comment).
+private func accumulateText(_ existing: String?, _ new: String) -> String {
+    guard let existing, !existing.isEmpty else { return new }
+    guard !new.isEmpty else { return existing }
+    return existing + "\n\n" + new
+}
+
 public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
     let hasTurnEvents = events.contains {
         switch $0 {
@@ -301,10 +325,17 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
     }
 
     var toolByCallID: [String: ToolBuilder] = [:]
-    var pendingDiff: ToolBuilder?
-    var pendingTerminal: ToolBuilder?
+    // FIFO queues of pending diff-/terminal-capable calls, oldest first —
+    // see the "file_edit"/"command_run" bullets in the file-header doc
+    // comment for why this must be FIFO rather than a single adjacency
+    // slot. Emptied on a hit; never reset wholesale by an unrelated
+    // tool_call, unlike the old single-slot scheme.
+    var pendingDiffQueue: [ToolBuilder] = []
+    var pendingTerminalQueue: [ToolBuilder] = []
     var pendingAuditsByTool: [String: [ToolBuilder]] = [:]
     var pendingActionArgsByTool: [String: [JSONValue]] = [:]
+    var standaloneFileEditCounter = 0
+    var standaloneCommandCounter = 0
 
     for event in events {
         switch event {
@@ -333,7 +364,14 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
         case .assistantMessage(let content, let thinking):
             if hasTurnEvents {
                 let t = ensureTurn()
-                t.assistantText = content
+                // v2 emits one assistant_message PER Text block, so a turn
+                // with interleaved [text, tool_use, text] (or a multi-part
+                // Gemini turn) carries more than one of these. Accumulate
+                // rather than overwrite (last-wins previously dropped every
+                // text but the final block) — a minimal fix that preserves
+                // all content without restructuring the turn card into
+                // multiple views.
+                t.assistantText = accumulateText(t.assistantText, content)
                 t.thinking = thinking
             } else {
                 // Fallback mode: each assistant_message opens its own
@@ -351,8 +389,8 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
             let kind = classify(tool)
             let tb = ToolBuilder(id: callID, tool: tool, kind: kind, input: input)
             toolByCallID[callID] = tb
-            pendingDiff = kind == .diff ? tb : nil
-            pendingTerminal = kind == .terminal ? tb : nil
+            if kind == .diff { pendingDiffQueue.append(tb) }
+            if kind == .terminal { pendingTerminalQueue.append(tb) }
             pendingAuditsByTool[tool, default: []].append(tb)
             ensureTurn().tools.append(tb)
 
@@ -392,16 +430,33 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
             }
 
         case .fileEdit(let path, let kind, let diff):
-            if let pendingDiff {
-                pendingDiff.fileEdit = ToolEntry.FileEdit(path: path, kind: kind, diff: diff)
+            if !pendingDiffQueue.isEmpty {
+                let target = pendingDiffQueue.removeFirst()
+                target.fileEdit = ToolEntry.FileEdit(path: path, kind: kind, diff: diff)
+            } else {
+                // Orphan file_edit — no diff-capable call waiting for it
+                // (a truncated snapshot, or a shape the runner never paired
+                // with a tool_call). Surfaced as a standalone entry rather
+                // than dropped; see the type doc comment's "Deviation from
+                // the web" note.
+                standaloneFileEditCounter += 1
+                let tb = ToolBuilder(id: "file_edit-\(standaloneFileEditCounter)", tool: "", kind: .diff, input: .null)
+                tb.fileEdit = ToolEntry.FileEdit(path: path, kind: kind, diff: diff)
+                ensureTurn().tools.append(tb)
             }
-            pendingDiff = nil
 
         case .commandRun(let argv, let cwd, let exitCode, _, _):
-            if let pendingTerminal {
-                pendingTerminal.command = ToolEntry.Command(argv: argv, cwd: cwd, exitCode: exitCode)
+            if !pendingTerminalQueue.isEmpty {
+                let target = pendingTerminalQueue.removeFirst()
+                target.command = ToolEntry.Command(argv: argv, cwd: cwd, exitCode: exitCode)
+            } else {
+                // Orphan command_run — same rationale as the orphan
+                // file_edit case above.
+                standaloneCommandCounter += 1
+                let tb = ToolBuilder(id: "command_run-\(standaloneCommandCounter)", tool: "", kind: .terminal, input: .null)
+                tb.command = ToolEntry.Command(argv: argv, cwd: cwd, exitCode: exitCode)
+                ensureTurn().tools.append(tb)
             }
-            pendingTerminal = nil
 
         case .actionEmitted(let kind, let payload, _, _, _):
             pendingActionArgsByTool[kind, default: []].append(payload)
