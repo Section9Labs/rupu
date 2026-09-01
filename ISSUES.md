@@ -154,6 +154,65 @@ P0/P1/P2, and a fix closes an issue only when it is observed at the consumer.
 
 ## Open
 
+### I-91 — `make macos-release` crashes Xcode 16.4's Swift frontend; rupu.app ships from no release
+
+**Where.** `apps/rupu-macos/` built through `make macos-release` (Release configuration,
+`-O -whole-module-optimization`), on the Xcode 16.4 / `macos-15` image that
+`.github/workflows/release.yml`'s `macos-app` job pins deliberately. `swift-frontend`
+takes a signal while compiling the `RupuShell` batch (`CommandPaletteView.swift`,
+`ConfigTab.swift`, `NotificationsTab.swift`, `OnboardingView.swift`,
+`PlaceholderScreen.swift`, `RootView.swift`, `RouteDisplay.swift`, `SettingsView.swift`,
+`ShellToolbar.swift`, `Sidebar.swift`).
+
+**Symptom.** `Command SwiftCompile failed with a nonzero exit code` / `** BUILD FAILED **`
+/ `make: *** [macos-release] Error 65`, with a crash backtrace whose frame 2 is
+`SignalHandler(int)` and whose next ~250 frames are a recursion of
+
+```
+ModuleFile::getTypeChecked
+  -> decls_block::detail::TypeRecordDispatch<...>
+  -> ModuleFile::getSubstitutionMapChecked
+  -> ModuleFile::getConformanceChecked
+  -> ProtocolConformanceDeserializer::readNormalProtocolConformanceXRef
+```
+
+i.e. a **stack overflow** in the deserializer while unpacking deeply nested generic types
+across module boundaries — the shape SwiftUI view composition produces in bulk.
+`RupuShell` is the target that hits it because #625 gave it a `RupuBuilder` dependency,
+widening its cross-module fan-in more than any other module in the package.
+
+**Effect.** rupu.app has not shipped since `v0.75.0`. `v0.76.0-beta.1` failed outright
+(nothing published at all, because `publish` then still had `macos-app` in its `needs`);
+`v0.76.0-beta.2` published every CLI artifact but no `.app`. It reproduces on every
+attempt — three consecutive release runs, byte-identical stack each time.
+
+**Why no PR catches it.** The crash is Release-only. `make macos-test` and CI's
+`macos-app` gate both build Debug. Only `make macos-release` reaches it, and that runs
+solely on a `v*` tag — so the first signal is always a failed release.
+
+**A ruled-out hypothesis, recorded so it is not retried.** SwiftPM enables package-level
+cross-module optimization for release builds (`-enable-default-cmo`, alongside
+`-package-name`), and that flag's presence in the crashing command made CMO look like the
+cause. #630 put `-disable-cmo` on every library target via `unsafeFlags`. The flag applied
+correctly — `-enable-default-cmo` disappeared from the build and `-disable-cmo` appeared
+56 times — **and the crash was unchanged**. CMO is not the cause; the change was reverted
+as a pure optimization loss with no benefit. Plain `-O -whole-module-optimization` is
+enough to trigger it.
+
+**Most promising lead: the Xcode pin, not the app code.** Xcode 26.6 compiles this package
+clean — `swift build -c release` builds all 310 units including the crashing file, with
+`-enable-default-cmo` confirmed present, on the exact same sources. The bug appears fixed
+in a later Swift. Bumping the pin is likely a far smaller change than refactoring
+`RupuShell`'s view hierarchies to shrink cross-module generic nesting, but per the
+`macos-app` job's own comment the release image and the PR gate image must move together,
+so both `ci.yml` and `release.yml` need the bump in one change — and it wants a real GUI
+run afterwards (macOS rule 7), since a toolchain bump can move rendering behaviour.
+
+**Not reproducible on a developer machine running a newer Xcode**, which is what makes
+this expensive: each attempt costs a tag plus a full release cycle.
+
+---
+
 ### I-90 — a sub-agent's ledger has no transcript fallback if its ledger degrades
 
 **Where.** `crates/rupu-cp/src/api/netflow.rs`'s `merge_with_transcript` — the recovery
