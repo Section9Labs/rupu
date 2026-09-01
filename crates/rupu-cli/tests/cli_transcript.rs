@@ -34,6 +34,8 @@ fn write_transcript(
         model: "claude-sonnet-4-6".to_string(),
         started_at: Utc::now(),
         mode: RunMode::Bypass,
+        schema: None,
+        system_prompt: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -64,6 +66,8 @@ fn write_transcript_with_assistant(
         model: "claude-sonnet-4-6".to_string(),
         started_at: Utc::now(),
         mode: RunMode::Bypass,
+        schema: None,
+        system_prompt: None,
     })
     .unwrap();
     w.write(&Event::AssistantMessage {

@@ -2529,6 +2529,13 @@ impl SessionInteractiveState {
             // skip rather than clutter the entry list. Out of scope for
             // the capture-wiring task; a future task can add rendering.
             TranscriptEvent::NetFlow { .. } => {}
+            TranscriptEvent::Thinking { .. }
+            | TranscriptEvent::ThinkingDelta { .. }
+            | TranscriptEvent::UserMessage { .. }
+            | TranscriptEvent::Seed { .. }
+            | TranscriptEvent::Compaction { .. }
+            | TranscriptEvent::Notice { .. }
+            | TranscriptEvent::Unknown => {} // upgraded to real rows in Task 4
         }
     }
 
@@ -4723,6 +4730,7 @@ fn transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => {
             if view_mode == LiveViewMode::Compact {
                 return Vec::new();
@@ -4800,6 +4808,13 @@ fn transcript_event_lines(
         // No dedicated session-view row for netflow yet (see the
         // matching no-op in `push_transcript_event` above).
         TranscriptEvent::NetFlow { .. } => Vec::new(),
+        TranscriptEvent::Thinking { .. }
+        | TranscriptEvent::ThinkingDelta { .. }
+        | TranscriptEvent::UserMessage { .. }
+        | TranscriptEvent::Seed { .. }
+        | TranscriptEvent::Compaction { .. }
+        | TranscriptEvent::Notice { .. }
+        | TranscriptEvent::Unknown => Vec::new(), // upgraded to real rows in Task 4
     }
 }
 
@@ -6600,6 +6615,9 @@ async fn run_compact_request(
         model: session.model.clone(),
         started_at,
         mode: run_mode,
+        // TODO(Task 2, transcript fidelity plan 1): schema/system_prompt.
+        schema: None,
+        system_prompt: None,
     })?;
     writer.flush()?;
 
@@ -7695,6 +7713,8 @@ mod tests {
                 model: "gpt-5".into(),
                 started_at: Utc::now(),
                 mode: RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
             })
             .unwrap(),
         );

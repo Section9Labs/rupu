@@ -74,6 +74,8 @@ fn write_run_transcript(path: &std::path::Path, model: &str) {
         model: model.into(),
         started_at: chrono::Utc::now(),
         mode: rupu_transcript::RunMode::Ask,
+        schema: None,
+        system_prompt: None,
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "internal-vllm".into(),
@@ -249,6 +251,8 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 model: "claude-sonnet-4-6".into(),
                 started_at: chrono::Utc::now(),
                 mode: rupu_transcript::RunMode::Ask,
+                schema: None,
+                system_prompt: None,
             })
             .unwrap(),
             serde_json::to_string(&rupu_transcript::Event::Usage {
@@ -525,6 +529,8 @@ fn write_run_transcript_for(
         model: model.into(),
         started_at: chrono::Utc::now(),
         mode: rupu_transcript::RunMode::Ask,
+        schema: None,
+        system_prompt: None,
     };
     let usage = rupu_transcript::Event::Usage {
         provider: provider.into(),

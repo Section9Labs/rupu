@@ -1636,6 +1636,7 @@ fn workflow_transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => {
             if !view_mode.shows_full_payloads() {
                 return Vec::new();
@@ -1715,6 +1716,13 @@ fn workflow_transcript_event_lines(
         // No dedicated workflow-view row for netflow yet — it streams
         // into the JSONL for offline inspection, not this pretty view.
         TxEvent::NetFlow { .. } => Vec::new(),
+        TxEvent::Thinking { .. }
+        | TxEvent::ThinkingDelta { .. }
+        | TxEvent::UserMessage { .. }
+        | TxEvent::Seed { .. }
+        | TxEvent::Compaction { .. }
+        | TxEvent::Notice { .. }
+        | TxEvent::Unknown => Vec::new(), // upgraded to real rows in Task 4
     }
 }
 
@@ -4139,6 +4147,8 @@ mod tests {
                     model: "claude-sonnet-4-6".into(),
                     started_at: run_started,
                     mode: rupu_transcript::RunMode::Readonly,
+                    schema: None,
+                    system_prompt: None,
                 },
                 TxEvent::AssistantMessage {
                     content: "Summarized the implementation plan.".into(),
@@ -4406,6 +4416,8 @@ mod tests {
                 model: "claude-sonnet-4-6".into(),
                 started_at: Utc::now(),
                 mode: rupu_transcript::RunMode::Readonly,
+                schema: None,
+                system_prompt: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Child output\n\n- item one\n- item two".into(),
@@ -4533,6 +4545,8 @@ mod tests {
                 model: "claude-sonnet-4-6".into(),
                 started_at: Utc::now(),
                 mode: rupu_transcript::RunMode::Readonly,
+                schema: None,
+                system_prompt: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Reviewer output\n\n- looks good".into(),

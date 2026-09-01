@@ -638,6 +638,7 @@ fn extract_transcript_snapshot_meta(events: &[TranscriptEvent]) -> TranscriptSna
                 model,
                 started_at,
                 mode,
+                ..
             } => {
                 meta.run_id = Some(run_id.clone());
                 meta.workspace_id = Some(workspace_id.clone());
@@ -1012,6 +1013,7 @@ fn transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => vec![transcript_event_line(
             Status::Complete,
             0,
@@ -1076,6 +1078,13 @@ fn transcript_event_lines(
         // No dedicated transcript-view row for netflow yet — it streams
         // into the JSONL for offline inspection, not this pretty view.
         TranscriptEvent::NetFlow { .. } => Vec::new(),
+        TranscriptEvent::Thinking { .. }
+        | TranscriptEvent::ThinkingDelta { .. }
+        | TranscriptEvent::UserMessage { .. }
+        | TranscriptEvent::Seed { .. }
+        | TranscriptEvent::Compaction { .. }
+        | TranscriptEvent::Notice { .. }
+        | TranscriptEvent::Unknown => Vec::new(), // upgraded to real rows in Task 4
     }
 }
 
@@ -1234,6 +1243,7 @@ pub(crate) fn render_pretty_transcript_event(
             model,
             started_at,
             mode,
+            ..
         } => {
             if context == TranscriptPrettyContext::Standalone {
                 printer.agent_header(agent, provider, model, run_id);
@@ -1380,6 +1390,7 @@ pub(crate) fn render_pretty_transcript_event(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => {
             let detail = format!(
                 "turn {turn_idx}  ·  in {} out {}",
@@ -1427,6 +1438,13 @@ pub(crate) fn render_pretty_transcript_event(
         // No dedicated live-view rendering for netflow yet — it streams
         // into the JSONL for offline inspection, not this pretty printer.
         TranscriptEvent::NetFlow { .. } => {}
+        TranscriptEvent::Thinking { .. }
+        | TranscriptEvent::ThinkingDelta { .. }
+        | TranscriptEvent::UserMessage { .. }
+        | TranscriptEvent::Seed { .. }
+        | TranscriptEvent::Compaction { .. }
+        | TranscriptEvent::Notice { .. }
+        | TranscriptEvent::Unknown => {} // upgraded to real rows in Task 4
     }
 }
 

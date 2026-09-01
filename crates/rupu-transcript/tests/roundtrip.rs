@@ -20,6 +20,8 @@ fn roundtrip_run_start() {
         model: "claude-sonnet-4-6".into(),
         started_at: Utc.with_ymd_and_hms(2026, 5, 1, 17, 0, 0).unwrap(),
         mode: RunMode::Ask,
+        schema: None,
+        system_prompt: None,
     });
 }
 
@@ -120,6 +122,8 @@ fn roundtrip_turn_end() {
         turn_idx: 0,
         tokens_in: Some(1234),
         tokens_out: Some(567),
+        stop_reason: Some("end_turn".into()),
+        response_id: Some("msg_01".into()),
     });
 }
 
@@ -129,6 +133,8 @@ fn roundtrip_turn_end_no_token_counts() {
         turn_idx: 0,
         tokens_in: None,
         tokens_out: None,
+        stop_reason: None,
+        response_id: None,
     });
 }
 

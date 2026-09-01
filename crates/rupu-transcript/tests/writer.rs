@@ -10,6 +10,8 @@ fn writes_events_one_per_line() {
         turn_idx: 0,
         tokens_in: Some(10),
         tokens_out: Some(20),
+        stop_reason: None,
+        response_id: None,
     })
     .unwrap();
     w.flush().unwrap();
@@ -34,6 +36,8 @@ fn append_extends_existing_file() {
             turn_idx: 0,
             tokens_in: Some(1),
             tokens_out: Some(1),
+            stop_reason: None,
+            response_id: None,
         })
         .unwrap();
     }

@@ -19,6 +19,8 @@ fn write_two_event_jsonl(path: &std::path::Path) {
         model: "claude-opus-4-8".into(),
         started_at: chrono::Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap(),
         mode: RunMode::Ask,
+        schema: None,
+        system_prompt: None,
     };
     let e1 = Event::AssistantMessage {
         content: "hello".into(),
@@ -161,6 +163,8 @@ fn write_one_event_jsonl(path: &std::path::Path) -> &'static str {
         model: "claude-opus-4-8".into(),
         started_at: chrono::Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap(),
         mode: RunMode::Ask,
+        schema: None,
+        system_prompt: None,
     };
     std::fs::write(path, format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
     "run_start"

@@ -4,11 +4,47 @@
 //! `data` payload. JSONL on disk is one event per line.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+/// Tag strings (post `rename_all = "snake_case"`) for every variant except
+/// [`Event::Unknown`]. Used by the hand-written [`Deserialize`] impl below
+/// to recognize a known `type` before handing off to the derive-generated
+/// logic — see that impl's doc comment for why this indirection exists.
+/// Kept in sync by construction: every variant has a roundtrip test
+/// (`event::tests` / `tests/roundtrip.rs`) that would start failing (parsing
+/// as `Unknown` instead of the real variant) if its tag were missing here.
+const KNOWN_EVENT_TAGS: &[&str] = &[
+    "run_start",
+    "turn_start",
+    "assistant_delta",
+    "assistant_message",
+    "tool_call",
+    "tool_result",
+    "file_edit",
+    "command_run",
+    "action_emitted",
+    "gate_requested",
+    "turn_end",
+    "usage",
+    "run_complete",
+    "tool_audit",
+    "net_flow",
+    "thinking",
+    "thinking_delta",
+    "user_message",
+    "seed",
+    "compaction",
+    "notice",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[serde(
+    remote = "Self",
+    tag = "type",
+    content = "data",
+    rename_all = "snake_case"
+)]
 pub enum Event {
     RunStart {
         run_id: String,
@@ -18,6 +54,13 @@ pub enum Event {
         model: String,
         started_at: DateTime<Utc>,
         mode: RunMode,
+        /// Transcript schema version. `None` = v1 (pre-2026-08-31 writer).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        schema: Option<u32>,
+        /// The effective system prompt actually sent (post coverage-section
+        /// append). `None` on legacy transcripts.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        system_prompt: Option<String>,
     },
     TurnStart {
         turn_idx: u32,
@@ -81,6 +124,13 @@ pub enum Event {
         tokens_in: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         tokens_out: Option<u64>,
+        /// Provider-reported stop reason for the turn (snake_case of
+        /// `rupu_providers::StopReason`), when known.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        stop_reason: Option<String>,
+        /// Provider response id for the turn, when non-empty.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        response_id: Option<String>,
     },
     Usage {
         provider: String,
@@ -143,6 +193,108 @@ pub enum Event {
     NetFlow {
         flow: Box<rupu_netflow::FlowRecord>,
     },
+    /// One model reasoning block, in its true position within the turn's
+    /// block order. `raw` is the producing provider's byte-exact block
+    /// (signature payloads included) — persisted for replay, never for
+    /// display. `text: None` means redacted / display-omitted reasoning:
+    /// the block existed, its content is not human-readable.
+    Thinking {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        text: Option<String>,
+        provider: String,
+        model: String,
+        raw: Value,
+    },
+    /// A streamed chunk of reasoning text — the thinking counterpart of
+    /// `AssistantDelta`. After-the-fact renderers drop it (the committed
+    /// `Thinking` event carries the whole block); live tails may stream it.
+    ThinkingDelta {
+        content: String,
+    },
+    /// The user turn appended for this run (`opts.user_message`). Absent on
+    /// seed-only resumes.
+    UserMessage {
+        content: String,
+    },
+    /// The pre-existing conversation this run was seeded with
+    /// (`opts.initial_messages`, e.g. a session's history or an orchestrator
+    /// pause/resume seed). Stored ONCE, not re-embedded per turn (spec §3
+    /// seed dedup rule): `source_transcript` names a transcript whose
+    /// replay-reconstruction equals the seed byte-exact (chains resolve
+    /// recursively); `messages` is the full inline `Vec<Message>` fallback
+    /// (reasoning `raw` intact) when no caller vouches for a source.
+    /// Exactly one of the two is `Some`. `sha256` is over the canonical
+    /// seed JSON either way, so replay verifies the chain instead of
+    /// trusting it.
+    Seed {
+        message_count: u32,
+        sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        source_transcript: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        messages: Option<Value>,
+    },
+    /// Context compaction rewrote the conversation. `messages` is the full
+    /// post-compaction `Vec<Message>` — the only way a reader can know the
+    /// conversation state the following turns were actually built from.
+    Compaction {
+        seq: u32,
+        summarized_messages: u32,
+        backup_path: String,
+        messages: Value,
+    },
+    /// A runtime intervention worth showing but not part of the
+    /// conversation: `kind` ∈ {"context_trim", "provider_retry"} today.
+    Notice {
+        kind: String,
+        message: String,
+    },
+    /// Forward-compatibility catch-all (mirrors
+    /// `rupu_providers::ContentBlock::Unknown`): an unrecognized `type` tag
+    /// lands here instead of failing the line. Never written.
+    #[serde(other)]
+    Unknown,
+}
+
+// `#[serde(remote = "Self")]` above turns the derive output into inherent
+// `Event::serialize`/`Event::deserialize` associated functions instead of
+// trait impls (the standard trick for hooking custom logic around derived
+// serde code — see https://serde.rs/remote-derive.html). We need that hook
+// because serde's `#[serde(other)]` fallback, for an *adjacently* tagged
+// enum (`tag`+`content`, as opposed to internally tagged), still tries to
+// deserialize the unrecognized tag's `content` payload as the catch-all
+// variant. Since `Unknown` is a unit variant, that only succeeds when
+// `content` is `null`/absent — a `content` of `{"x":1}` (any real-world
+// unrecognized event's `data`) fails with "invalid type: map, expected unit
+// variant Event::Unknown" before `#[serde(other)]` ever gets a chance to
+// apply. So we peek the `type` tag ourselves first via a generic
+// `serde_json::Value` buffer, and only hand off to the derived
+// `Event::deserialize` when the tag is one we recognize; an unrecognized
+// tag short-circuits straight to `Event::Unknown` without ever trying to
+// interpret `content`.
+impl Serialize for Event {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Event::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let tag = value.get("type").and_then(|t| t.as_str());
+        match tag {
+            Some(known) if KNOWN_EVENT_TAGS.contains(&known) => {
+                Event::deserialize(value).map_err(serde::de::Error::custom)
+            }
+            _ => Ok(Event::Unknown),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,5 +444,127 @@ mod tests {
         let line = r#"{"type":"turn_start","data":{"turn_idx":0}}"#;
         let back: Event = serde_json::from_str(line).unwrap();
         assert!(matches!(back, Event::TurnStart { turn_idx: 0 }));
+    }
+
+    #[test]
+    fn thinking_event_roundtrips_with_raw_payload() {
+        let e = Event::Thinking {
+            text: Some("weighing options".into()),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            raw: serde_json::json!({"type":"thinking","thinking":"weighing options","signature":"sig-x"}),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "thinking");
+        assert_eq!(v["data"]["raw"]["signature"], "sig-x");
+        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+
+        // Redacted: text omitted from JSON entirely, parses back as None.
+        let redacted = Event::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            raw: serde_json::json!({"type":"redacted_thinking","data":"opaque"}),
+        };
+        let s2 = serde_json::to_string(&redacted).unwrap();
+        assert!(!s2.contains("\"text\""));
+        assert_eq!(serde_json::from_str::<Event>(&s2).unwrap(), redacted);
+    }
+
+    #[test]
+    fn new_v2_variants_roundtrip() {
+        for (e, tag) in [
+            (
+                Event::ThinkingDelta {
+                    content: "chunk".into(),
+                },
+                "thinking_delta",
+            ),
+            (
+                Event::UserMessage {
+                    content: "do the task".into(),
+                },
+                "user_message",
+            ),
+            (
+                Event::Seed {
+                    message_count: 3,
+                    sha256: "ab".repeat(32),
+                    source_transcript: None,
+                    messages: Some(serde_json::json!([{"role":"user","content":[]}])),
+                },
+                "seed",
+            ),
+            (
+                Event::Seed {
+                    message_count: 7,
+                    sha256: "cd".repeat(32),
+                    source_transcript: Some("/w/.rupu/transcripts/run_prev.jsonl".into()),
+                    messages: None,
+                },
+                "seed",
+            ),
+            (
+                Event::Compaction {
+                    seq: 1,
+                    summarized_messages: 12,
+                    backup_path: "/tmp/b.json".into(),
+                    messages: serde_json::json!([]),
+                },
+                "compaction",
+            ),
+            (
+                Event::Notice {
+                    kind: "context_trim".into(),
+                    message: "trimmed".into(),
+                },
+                "notice",
+            ),
+        ] {
+            let s = serde_json::to_string(&e).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(v["type"], tag);
+            assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+        }
+    }
+
+    #[test]
+    fn unrecognized_event_type_parses_as_unknown_not_error() {
+        let line = r#"{"type":"hologram_projection","data":{"x":1}}"#;
+        assert_eq!(serde_json::from_str::<Event>(line).unwrap(), Event::Unknown);
+    }
+
+    #[test]
+    fn run_start_and_turn_end_additive_fields_are_optional_and_roundtrip() {
+        // Legacy line without the new fields still parses.
+        let legacy = r#"{"type":"turn_end","data":{"turn_idx":0,"tokens_in":1,"tokens_out":2}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Event>(legacy).unwrap(),
+            Event::TurnEnd {
+                stop_reason: None,
+                response_id: None,
+                ..
+            }
+        ));
+        let e = Event::TurnEnd {
+            turn_idx: 4,
+            tokens_in: Some(10),
+            tokens_out: Some(20),
+            stop_reason: Some("tool_use".into()),
+            response_id: Some("msg_01".into()),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&s).unwrap(), e);
+
+        let legacy_start = r#"{"type":"run_start","data":{"run_id":"r","workspace_id":"w","agent":"a","provider":"p","model":"m","started_at":"2026-08-31T00:00:00Z","mode":"bypass"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Event>(legacy_start).unwrap(),
+            Event::RunStart {
+                schema: None,
+                system_prompt: None,
+                ..
+            }
+        ));
     }
 }

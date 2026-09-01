@@ -1069,6 +1069,8 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             started_at: Utc::now(),
             mode: rupu_transcript::RunMode::Ask,
+            schema: None,
+            system_prompt: None,
         };
         let usage = rupu_transcript::Event::Usage {
             provider: "anthropic".into(),

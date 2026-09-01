@@ -4588,6 +4588,7 @@ fn live_run_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
+            ..
         } => {
             if !view_mode.shows_full_payloads() {
                 return Vec::new();

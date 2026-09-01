@@ -496,6 +496,8 @@ mod tests {
             model: "m".into(),
             started_at: chrono::Utc::now(),
             mode: RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
         })
         .unwrap();
         w.write(&Event::AssistantMessage {

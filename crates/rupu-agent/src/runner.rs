@@ -777,6 +777,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         model: opts.model.clone(),
         started_at: Utc::now(),
         mode: parse_mode_for_event(&opts.mode_str),
+        // TODO(Task 2, transcript fidelity plan 1): schema: Some(2) + the
+        // effective system_prompt, once this write moves after the
+        // coverage prompt-section append.
+        schema: None,
+        system_prompt: None,
     })?;
     writer.flush()?;
 
@@ -1365,6 +1370,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 turn_idx,
                 tokens_in: Some(resp.usage.input_tokens as u64),
                 tokens_out: Some(billable_output_tokens),
+                // TODO(Task 2, transcript fidelity plan 1): populate from
+                // resp.stop_reason / resp.id.
+                stop_reason: None,
+                response_id: None,
             })?;
             writer.flush()?;
 
@@ -1622,11 +1631,7 @@ mod on_tool_call_tests {
         run_agent(opts).await.expect("agent run succeeds");
 
         let log = calls.lock().unwrap();
-        assert_eq!(
-            log.len(),
-            1,
-            "expected exactly one on_tool_call, got {log:?}"
-        );
+        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
         assert!(
             log[0].starts_with("s1:"),
             "expected step_id 's1' prefix, got {}",

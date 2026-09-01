@@ -78,6 +78,8 @@ impl AgentDispatcher for FakeDispatcher {
                 model: "mock-1".into(),
                 started_at: chrono::Utc::now(),
                 mode: rupu_transcript::RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
             })
             .unwrap();
         writer

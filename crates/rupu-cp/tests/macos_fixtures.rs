@@ -346,6 +346,8 @@ fn transcript_events_fixture_is_current() {
             model: "claude-sonnet-4-6".into(),
             started_at: t,
             mode: rupu_transcript::RunMode::Ask,
+            schema: None,
+            system_prompt: None,
         },
         rupu_transcript::Event::TurnStart { turn_idx: 0 },
         rupu_transcript::Event::AssistantDelta {
@@ -420,11 +422,15 @@ fn transcript_events_fixture_is_current() {
             turn_idx: 0,
             tokens_in: Some(500),
             tokens_out: Some(120),
+            stop_reason: None,
+            response_id: None,
         },
         rupu_transcript::Event::TurnEnd {
             turn_idx: 1,
             tokens_in: None,
             tokens_out: None,
+            stop_reason: None,
+            response_id: None,
         },
         rupu_transcript::Event::Usage {
             provider: "anthropic".into(),
@@ -567,6 +573,16 @@ fn assert_transcript_events_cover_every_variant(events: &[rupu_transcript::Event
             rupu_transcript::Event::RunComplete { .. } => {}
             rupu_transcript::Event::ToolAudit { .. } => {}
             rupu_transcript::Event::NetFlow { .. } => {}
+            // Schema v2 (transcript fidelity plan 1, Task 1): the macOS app
+            // doesn't consume these yet. Sample events + fixture
+            // regeneration land when the app grows a renderer for them.
+            rupu_transcript::Event::Thinking { .. }
+            | rupu_transcript::Event::ThinkingDelta { .. }
+            | rupu_transcript::Event::UserMessage { .. }
+            | rupu_transcript::Event::Seed { .. }
+            | rupu_transcript::Event::Compaction { .. }
+            | rupu_transcript::Event::Notice { .. }
+            | rupu_transcript::Event::Unknown => {} // upgraded to real rows in Task 4
         }
     }
 }

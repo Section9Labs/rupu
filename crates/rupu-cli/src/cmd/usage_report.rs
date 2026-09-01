@@ -685,6 +685,8 @@ mod tests {
                 model: model.into(),
                 started_at,
                 mode: rupu_transcript::RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
             })
             .unwrap();
         writer
@@ -1010,6 +1012,8 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             started_at,
             mode: rupu_transcript::RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
         };
         events[0] = Ok(run_start);
         let mut writer = JsonlWriter::create(&transcript_path).unwrap();

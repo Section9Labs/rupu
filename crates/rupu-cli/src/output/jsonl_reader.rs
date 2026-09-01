@@ -309,6 +309,8 @@ mod tests {
             model: "claude-test".into(),
             started_at: chrono::Utc::now(),
             mode: RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
         };
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "{}", serde_json::to_string(&ev).unwrap()).unwrap();
@@ -330,6 +332,8 @@ mod tests {
             turn_idx: 0,
             tokens_in: None,
             tokens_out: None,
+            stop_reason: None,
+            response_id: None,
         };
 
         let mut f = std::fs::File::create(&path).unwrap();
@@ -384,6 +388,8 @@ mod tests {
                 turn_idx: 0,
                 tokens_in: None,
                 tokens_out: None,
+                stop_reason: None,
+                response_id: None,
             },
         ];
 
