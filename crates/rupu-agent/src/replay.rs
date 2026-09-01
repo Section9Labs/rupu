@@ -13,7 +13,7 @@
 
 use rupu_providers::types::{ContentBlock, Message, Role};
 use rupu_transcript::Event;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -33,6 +33,8 @@ pub enum ReplayError {
     SeedHashMismatch { path: String },
     #[error("seed reference chain exceeds depth limit")]
     SeedChainTooDeep,
+    #[error("seed reference chain revisits {path} — cyclic chain detected (self-reference or A→B→A loop)")]
+    SeedChainCycle { path: String },
 }
 
 #[derive(Default)]
@@ -91,34 +93,117 @@ pub fn reconstruct_messages(events: &[Event]) -> Result<Vec<Message>, ReplayErro
     })
 }
 
-/// Read `path` and reconstruct its conversation, recursively resolving
-/// `Seed.source_transcript` chains (each hop re-enters this function) and
-/// verifying every resolved seed against its recorded `sha256`. Depth-capped
-/// so a cyclic/hostile chain terminates.
+/// Read `path` and reconstruct its conversation, resolving any
+/// `Seed.source_transcript` reference chain ITERATIVELY — a bounded loop,
+/// never recursion — and verifying every resolved link against its recorded
+/// `sha256`.
+///
+/// A naive "each hop re-enters this function" recursive implementation blows
+/// the thread stack on a self-referencing or A→B→A cyclic chain long before
+/// any depth counter would catch it (each frame is large enough that a debug
+/// build SIGABRTs well under 1024 hops). So chain *walking* happens in a
+/// `loop` (phase 1 below) with a `HashSet` of visited transcript paths: a
+/// path seen twice is `SeedChainCycle`, never a stack overflow. The existing
+/// depth cap (`MAX_SEED_CHAIN_DEPTH`) still applies as a belt-and-braces
+/// bound on very long but non-cyclic chains. Phase 2 then folds each link's
+/// events with [`reconstruct_with`] — itself non-recursive — from the origin
+/// outward, so hash verification still runs at every resolved link exactly
+/// as a single-hop resolve would.
 pub fn reconstruct_transcript(path: &std::path::Path) -> Result<Vec<Message>, ReplayError> {
-    reconstruct_transcript_at_depth(path, 0)
+    // Phase 1: walk the reference chain from `path` back to a self-contained
+    // origin (an inline seed, no seed at all, or a malformed seed with
+    // neither field set — see `seed_reference`'s doc). `chain[0]` is `path`
+    // itself; `chain`'s last entry is the origin that needs no further
+    // resolution.
+    let mut chain: Vec<(String, Vec<Event>)> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    let mut current = path.display().to_string();
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(ReplayError::SeedChainCycle { path: current });
+        }
+        // `chain.len()` here is the number of hops already resolved before
+        // `current` — the same count a recursive `depth` parameter would
+        // have carried into this hop.
+        if chain.len() as u32 > MAX_SEED_CHAIN_DEPTH {
+            return Err(ReplayError::SeedChainTooDeep);
+        }
+        let events = read_transcript_events(std::path::Path::new(&current))?;
+        let next = seed_reference(&events);
+        chain.push((current.clone(), events));
+        match next {
+            Some(src) => current = src,
+            None => break,
+        }
+    }
+
+    // Phase 2: fold from the origin outward. Each link's own resolve
+    // callback only ever needs the PRECEDING link's already-computed
+    // messages (looked up by path), never re-entering the chain walk.
+    let mut resolved: HashMap<String, Vec<Message>> = HashMap::new();
+    for (p, events) in chain.into_iter().rev() {
+        let already_resolved = &resolved;
+        let messages = reconstruct_with(&events, &mut |src| {
+            already_resolved.get(src).cloned().ok_or_else(|| {
+                // Unreachable given the phase-1 walk above (every reference
+                // this file's Seed event could carry was already resolved
+                // before we get here) — guarded rather than panicking, in
+                // case a future writer ever breaks the
+                // one-seed-event-per-transcript assumption `seed_reference`
+                // relies on.
+                ReplayError::SeedUnresolved {
+                    path: src.to_string(),
+                }
+            })
+        })?;
+        resolved.insert(p, messages);
+    }
+    Ok(resolved
+        .remove(&path.display().to_string())
+        .unwrap_or_default())
 }
 
 const MAX_SEED_CHAIN_DEPTH: u32 = 1024;
 
-fn reconstruct_transcript_at_depth(
-    path: &std::path::Path,
-    depth: u32,
-) -> Result<Vec<Message>, ReplayError> {
-    if depth > MAX_SEED_CHAIN_DEPTH {
-        return Err(ReplayError::SeedChainTooDeep);
-    }
-    let read = |p: &std::path::Path| -> Result<Vec<Event>, rupu_transcript::ReadError> {
-        Ok(rupu_transcript::JsonlReader::iter(p)?
-            .filter_map(Result::ok)
-            .collect())
-    };
-    let events = read(path).map_err(|e| ReplayError::SeedSource {
+/// Read and parse `path`'s JSONL events, mapping an unreadable file to
+/// `ReplayError::SeedSource`. Bad JSON lines mid-file are tolerated (masked
+/// by `filter_map(Result::ok)`), matching `JsonlReader`'s documented
+/// aborted-write tolerance.
+fn read_transcript_events(path: &std::path::Path) -> Result<Vec<Event>, ReplayError> {
+    let iter = rupu_transcript::JsonlReader::iter(path).map_err(|e| ReplayError::SeedSource {
         path: path.display().to_string(),
         source: e,
     })?;
-    reconstruct_with(&events, &mut |src| {
-        reconstruct_transcript_at_depth(std::path::Path::new(src), depth + 1)
+    Ok(iter.filter_map(Result::ok).collect())
+}
+
+/// The `source_transcript` a transcript's events reference, if resolving it
+/// requires reading another file — mirrors `reconstruct_with`'s own
+/// `(inline, source_transcript)` match so the phase-1 walk and phase-2 fold
+/// agree on when a hop is needed:
+/// - an inline seed (`messages: Some(_)`) needs no further resolution,
+///   regardless of `source_transcript` — inline always wins, exactly as
+///   `reconstruct_with` does;
+/// - `(None, Some(src))` is a real reference to walk to;
+/// - `(None, None)` (malformed but tolerated) resolves to an empty seed
+///   in-place, no walk needed.
+///
+/// Assumes at most one `Seed` event per transcript (the writer's contract:
+/// "Stored ONCE, not re-embedded per turn"), so the first one found decides
+/// the whole file.
+fn seed_reference(events: &[Event]) -> Option<String> {
+    events.iter().find_map(|ev| match ev {
+        Event::Seed {
+            source_transcript,
+            messages,
+            ..
+        } => match (messages, source_transcript) {
+            (Some(_), _) => None,
+            (None, Some(src)) => Some(src.clone()),
+            (None, None) => None,
+        },
+        _ => None,
     })
 }
 
@@ -424,5 +509,81 @@ mod tests {
             reconstruct_transcript(&t2),
             Err(ReplayError::SeedHashMismatch { .. }) | Err(ReplayError::SeedSource { .. })
         ));
+    }
+
+    /// Regression for a reviewer-reproduced CRITICAL: a transcript whose own
+    /// `Seed.source_transcript` points at itself used to recurse forever
+    /// (each hop re-entering the reconstruction function), blowing the
+    /// thread stack (SIGABRT in a debug build, the profile `cargo test`
+    /// itself uses) long before `MAX_SEED_CHAIN_DEPTH` could return
+    /// `SeedChainTooDeep`. The fix walks the chain in a loop with a
+    /// visited-paths set, so this must come back as a clean `Err`, not a
+    /// crash — a `#[test]` that panics via `SIGABRT` fails the whole test
+    /// binary run rather than reporting a single failed test, so if this
+    /// regresses, expect the harness itself to abort here.
+    #[test]
+    fn self_referencing_seed_chain_errors_instead_of_crashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("self.jsonl");
+        let mut w = rupu_transcript::JsonlWriter::create(&path).unwrap();
+        w.write(&rupu_transcript::Event::Seed {
+            message_count: 0,
+            sha256: "0".repeat(64),
+            source_transcript: Some(path.display().to_string()),
+            messages: None,
+        })
+        .unwrap();
+        w.flush().unwrap();
+
+        let err =
+            reconstruct_transcript(&path).expect_err("self-reference must error, not hang/crash");
+        assert!(
+            matches!(
+                err,
+                ReplayError::SeedChainCycle { .. } | ReplayError::SeedChainTooDeep
+            ),
+            "expected a chain-cycle/too-deep error, got {err:?}"
+        );
+    }
+
+    /// Same regression, two files: A's seed references B, B's seed
+    /// references A. The recursive implementation alternated stack frames
+    /// between the two `reconstruct_transcript_at_depth` calls forever;
+    /// the iterative walk's visited set catches the repeat the second time
+    /// `a.jsonl` is revisited.
+    #[test]
+    fn two_file_seed_cycle_errors_instead_of_crashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.jsonl");
+        let b = tmp.path().join("b.jsonl");
+
+        let mut wa = rupu_transcript::JsonlWriter::create(&a).unwrap();
+        wa.write(&rupu_transcript::Event::Seed {
+            message_count: 0,
+            sha256: "0".repeat(64),
+            source_transcript: Some(b.display().to_string()),
+            messages: None,
+        })
+        .unwrap();
+        wa.flush().unwrap();
+
+        let mut wb = rupu_transcript::JsonlWriter::create(&b).unwrap();
+        wb.write(&rupu_transcript::Event::Seed {
+            message_count: 0,
+            sha256: "0".repeat(64),
+            source_transcript: Some(a.display().to_string()),
+            messages: None,
+        })
+        .unwrap();
+        wb.flush().unwrap();
+
+        let err = reconstruct_transcript(&a).expect_err("A→B→A must error, not hang/crash");
+        assert!(
+            matches!(
+                err,
+                ReplayError::SeedChainCycle { .. } | ReplayError::SeedChainTooDeep
+            ),
+            "expected a chain-cycle/too-deep error, got {err:?}"
+        );
     }
 }
