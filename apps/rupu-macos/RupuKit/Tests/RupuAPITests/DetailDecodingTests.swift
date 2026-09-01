@@ -92,6 +92,9 @@ import Foundation
     #expect(ok.asn?.asn == 15169)
     #expect(ok.asn?.org == "Google LLC")
     #expect(ok.ctx.runID == "run-40")
+    // Server-resolved attribution (top-level, distinct from ctx.run_id).
+    #expect(ok.runID == "run-40")
+    #expect(ok.workflow == "nightly-scan")
 
     let transportError = netflow.flows[1]
     #expect(transportError.outcome == "transport_error")

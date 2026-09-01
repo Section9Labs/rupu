@@ -1,11 +1,10 @@
 // The ONE place every netflow scope-limit sentence in the CP is authored.
-// Three surfaces render <NetflowScopeDisclosure /> — the global Netflow
-// page, the project Network tab, and the run Network tab (Fix 3, netflow
-// Plan 3 review round 3: the run surface previously disclosed nothing at
-// all). NetflowTable's empty-state hint and NetflowGraph's empty-state hint
-// (Fix 2, review round 4) both draw from the exports here too, so the
-// covered-surface list can't drift out of sync the way it did before this
-// fix (four copy-pasted/hand-written fragments, several of them wrong).
+// Since the v3 explorer redesign the disclosure text surfaces through the
+// explorer's CoveragePopover (`disclosureText`, at every scope), and the
+// empty-state hints here feed NetflowTable and the explorer's
+// Topology/Timeline views — so the covered-surface list still can't drift
+// out of sync the way it did before this file existed (four
+// copy-pasted/hand-written fragments, several of them wrong).
 //
 // Coverage list intentionally excludes MCP and webhooks (Fix 2, round 3):
 // `rupu_netflow::ctx::Origin` no longer even HAS an `Mcp`/`Webhook` variant
@@ -99,7 +98,10 @@ const RUN_SCOPE_SUB_AGENT_NOTE =
   ' Includes any sub-agents this run dispatched — at any depth, not just the first level — ' +
   'folded into the same totals, not shown as a separate scope.';
 
-function disclosureText(scope: NetflowScope): string {
+/** Exported (previously private to `NetflowScopeDisclosure`) so the
+ *  explorer's CoveragePopover can render the same single-sourced text —
+ *  run scope appends the sub-agent folding note here and nowhere else. */
+export function disclosureText(scope: NetflowScope): string {
   const coverage = netflowCoverageList(scope);
   return (
     `This covers rupu's own egress — ${coverage} — never traffic from the agent's bash ` +
@@ -111,19 +113,10 @@ function disclosureText(scope: NetflowScope): string {
   );
 }
 
-export function NetflowScopeDisclosure({
-  scope,
-  className = '',
-}: {
-  scope: NetflowScope;
-  className?: string;
-}) {
-  return (
-    <p className={['text-note text-ink-mute max-w-2xl', className].filter(Boolean).join(' ')}>
-      {disclosureText(scope)}
-    </p>
-  );
-}
+// (The `NetflowScopeDisclosure` paragraph component was retired with the
+// v3 redesign — the popover renders `disclosureText` directly, and a dead
+// component that LOOKS like the live surface is exactly what someone
+// would edit by mistake.)
 
 /** NetflowTable's empty-state hint (Blocker 1, whole-branch review) --
  *  authored here for the same reason `netflowSystemSourceHint` is: a
@@ -160,34 +153,9 @@ export function netflowEmptyStateHint(scope: NetflowScope): string {
   );
 }
 
-/** NetflowGraph's empty-state hint — folded in here (Fix 2, round 4) so its
- *  source-labelling claim can't drift from the same scope rules as the
- *  rest of this file.
- *
- *  UPDATED (Finding 4, whole-branch review): the graph's source id is no
- *  longer ever the literal string `system`. `rupu_netflow::ledger::
- *  graph_view` used to derive the source from `f.ctx.run_id`, which no
- *  production `FlowCtx` has ever populated — every graph, at every scope,
- *  was a hub-and-spoke picture of one node called `system`. The read side
- *  now passes the OWNING RUN ID in explicitly (`rupu-cp/src/api/
- *  netflow.rs`'s `resolve_ledger_paths`/`read_all_run_ledgers_in_dir`
- *  already know it — it's the ledger FILE's own name), so every source
- *  node is a real run id: one per run at run scope, one per contributing
- *  run at project/global scope. There is no longer an "unattributed"
- *  fallback case in the graph endpoint's own code, so this hint no
- *  longer promises one.
- *
- *  `Origin::System` — auth/oauth token exchange (`resolver.rs`,
- *  `oauth/device.rs`, `oauth/callback.rs`), the theme-URL fetch
- *  (`output/theme.rs`), and the ASN-table refresh (`cmd/cp.rs`'s sweep,
- *  this crate's `maybe_refresh_asn`) — is unrelated to this and worth
- *  noting for a different reason: EVERY production construction site for
- *  it is wired to `Arc::new(NullSink)`, so that traffic reaches no ledger
- *  at any scope either. It was never going to produce a `system`-labelled
- *  node regardless of the `graph_view` bug above. */
-export function netflowSystemSourceHint(_scope: NetflowScope): string {
-  return `Sources — runs — connect to the host:port endpoints they reached.`;
-}
+// (`netflowSystemSourceHint` was retired with `NetflowGraph.tsx` — the
+// explorer's TopologyView words its own empty state; the `Origin::System`
+// NullSink accounting it used to restate lives in this file's header.)
 
 /** `NetflowResponse.window` — the wire shape (kept structurally typed
  *  rather than imported from `lib/netflow.ts` to avoid a dependency
@@ -227,4 +195,4 @@ export function netflowRangeEmptyHint(): string {
   );
 }
 
-export default NetflowScopeDisclosure;
+export default disclosureText;

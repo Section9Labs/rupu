@@ -22,20 +22,13 @@
 // updated the same way, not left as the one example that still claims
 // global-only visibility.
 
-import '@testing-library/jest-dom/vitest';
-import { render, screen, cleanup } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
-  NetflowScopeDisclosure,
+  disclosureText,
   netflowCoverageList,
   netflowEmptyStateHint,
-  netflowSystemSourceHint,
   type NetflowScope,
 } from './ScopeDisclosure';
-
-afterEach(() => {
-  cleanup();
-});
 
 const SCOPES: NetflowScope[] = ['run', 'project', 'global'];
 
@@ -82,44 +75,19 @@ describe('netflowEmptyStateHint', () => {
   });
 });
 
-describe('netflowSystemSourceHint', () => {
-  it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
-    // Task 8: "CP fleet traffic" is gone from this example list
-    // entirely — see the file header note above.
-    expect(netflowSystemSourceHint(scope)).not.toMatch(/CP fleet traffic/i);
-  });
+// (`netflowSystemSourceHint`'s describe block was retired with
+// `NetflowGraph.tsx` — the hint itself is gone; the NullSink accounting it
+// asserted lives on in `netflowCoverageList`'s tests above.)
 
-  it.each(SCOPES)('never claims ASN refresh at %s scope', (scope) => {
-    // `Origin::System` ASN-refresh downloads are wired to `NullSink` at
-    // both call sites (`cmd/cp.rs`'s sweep, this crate's own
-    // `maybe_refresh_asn`) — recorded nowhere, at any scope, global
-    // included. Previously (round 5) this was claimed at global scope
-    // only; that carve-out is gone along with the claim.
-    expect(netflowSystemSourceHint(scope)).not.toMatch(/ASN refresh/i);
-  });
-
-  it.each(SCOPES)('no longer claims a `system` fallback source at %s scope', (scope) => {
-    // Finding 4, whole-branch review: `graph_view` used to derive the
-    // source id from `f.ctx.run_id`, which no production `FlowCtx` ever
-    // populates, so every graph collapsed to one node literally called
-    // `system`. The read side now passes the owning run id in explicitly
-    // (the ledger file's own name), so every source is a real run id and
-    // there is no more "unattributed" fallback case to name here.
-    expect(netflowSystemSourceHint(scope)).not.toMatch(/system for unattributed egress/i);
-    expect(netflowSystemSourceHint(scope)).toMatch(/runs/i);
-  });
-});
-
-describe('NetflowScopeDisclosure sub-agent note', () => {
+describe('disclosureText sub-agent note', () => {
   // Run scope's flows/dropped_total now fold in every sub-agent this run
   // dispatched, at any depth (`RunStore::sub_run_ids_recursive`) — the
-  // operator-facing text must say so on THIS surface, the one place every
-  // netflow scope-limit sentence is authored, or "this run's netflow"
-  // silently reads as "only this run's own provider calls" while actually
-  // including everything its sub-agents did too.
+  // operator-facing text (rendered by the explorer's CoveragePopover)
+  // must say so, or "this run's netflow" silently reads as "only this
+  // run's own provider calls" while actually including everything its
+  // sub-agents did too.
   it('names sub-agent dispatch at run scope', () => {
-    render(<NetflowScopeDisclosure scope="run" />);
-    expect(screen.getByText(/sub-agents/i)).toBeInTheDocument();
+    expect(disclosureText('run')).toMatch(/sub-agents/i);
   });
 
   it.each(['project', 'global'] as NetflowScope[])(
@@ -130,22 +98,19 @@ describe('NetflowScopeDisclosure sub-agent note', () => {
       // sub-agent's ledger file is just one more file in that union, with
       // no separate "folded from a parent" wrinkle to call out there the
       // way run scope's id-driven fold needs explaining.
-      render(<NetflowScopeDisclosure scope={scope} />);
-      expect(screen.queryByText(/sub-agents/i)).not.toBeInTheDocument();
+      expect(disclosureText(scope)).not.toMatch(/sub-agents/i);
     },
   );
 });
 
-describe('NetflowScopeDisclosure', () => {
+describe('disclosureText coverage claims', () => {
   it.each(SCOPES)('never claims MCP or webhook coverage at %s scope', (scope) => {
-    render(<NetflowScopeDisclosure scope={scope} />);
-    expect(screen.queryByText(/MCP/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/webhook/i)).not.toBeInTheDocument();
+    expect(disclosureText(scope)).not.toMatch(/MCP/i);
+    expect(disclosureText(scope)).not.toMatch(/webhook/i);
   });
 
   it.each(SCOPES)('never claims updater coverage at %s scope', (scope) => {
-    render(<NetflowScopeDisclosure scope={scope} />);
-    expect(screen.queryByText(/updater/i)).not.toBeInTheDocument();
+    expect(disclosureText(scope)).not.toMatch(/updater/i);
   });
 
   it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
@@ -153,8 +118,7 @@ describe('NetflowScopeDisclosure', () => {
     // global Network page only") is gone along with the claim it used to
     // qualify — `Origin::Cp` is recorded nowhere, so there is no page to
     // point a project/run viewer at anymore.
-    render(<NetflowScopeDisclosure scope={scope} />);
-    expect(screen.queryByText(/CP fleet traffic/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/global Network page only/i)).not.toBeInTheDocument();
+    expect(disclosureText(scope)).not.toMatch(/CP fleet traffic/i);
+    expect(disclosureText(scope)).not.toMatch(/global Network page only/i);
   });
 });

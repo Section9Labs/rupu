@@ -1,3 +1,4 @@
+pub mod explorer;
 pub mod paths;
 pub mod views;
 pub mod writer;
@@ -7,7 +8,8 @@ pub use paths::{
     project_local_netflow_dir, NetflowPaths, LEGACY_LEDGER_FILENAME,
 };
 pub use views::{
-    graph_view, host_rollup, read_dropped_total, read_flows, read_flows_and_dropped,
-    read_flows_in_range, GraphEdge, GraphNode, GraphView, HostRollup, NodeSide, TimeRange,
+    graph_view, host_rollup, host_rollup_iter, read_dropped_total, read_flows,
+    read_flows_and_dropped, read_flows_in_range, GraphEdge, GraphNode, GraphView, HostRollup,
+    NodeSide, TimeRange,
 };
 pub use writer::{NetflowWriter, NetflowWriterHandle};

@@ -44,6 +44,13 @@ public struct APIFlow: Decodable, Sendable {
     public let durationMS: UInt64?
     public let ctx: APIFlowCtx
     public let asn: APIAsn?
+    /// The TOP-LEVEL run this flow folds into, resolved server-side from
+    /// the ledger file's own id (`FlowView.run_id` on the Rust side) —
+    /// distinct from `ctx.runID`, which is unset on every production
+    /// flow. `nil` when no run record accounts for the ledger id.
+    public let runID: String?
+    /// `RunRecord::workflow_name` of that root run; `nil` with `runID`.
+    public let workflow: String?
 
     public init(
         id: String,
@@ -60,7 +67,9 @@ public struct APIFlow: Decodable, Sendable {
         bytesOut: UInt64?,
         durationMS: UInt64?,
         ctx: APIFlowCtx,
-        asn: APIAsn?
+        asn: APIAsn?,
+        runID: String? = nil,
+        workflow: String? = nil
     ) {
         self.id = id
         self.ts = ts
@@ -77,6 +86,8 @@ public struct APIFlow: Decodable, Sendable {
         self.durationMS = durationMS
         self.ctx = ctx
         self.asn = asn
+        self.runID = runID
+        self.workflow = workflow
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -86,6 +97,8 @@ public struct APIFlow: Decodable, Sendable {
         case durationMS = "duration_ms"
         case ctx
         case asn
+        case runID = "run_id"
+        case workflow
     }
 }
 

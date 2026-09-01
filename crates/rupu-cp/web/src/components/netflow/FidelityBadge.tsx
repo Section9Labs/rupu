@@ -13,7 +13,10 @@ const FIDELITY_TONE: Record<Fidelity, BadgeTone> = {
   full: 'sky',
 };
 
-const FIDELITY_TITLE: Record<Fidelity, string> = {
+/** Exported for the explorer's CoveragePopover fidelity legend — the ONE
+ *  authored copy of what each level means, so the legend and the badge
+ *  tooltips can never drift apart. */
+export const FIDELITY_TITLE: Record<Fidelity, string> = {
   coarse:
     'Coarse — host, outcome and timing are real; byte counts and peer IP were not observable for this connector.',
   http: 'HTTP — exact request and response metadata from the instrumented client.',

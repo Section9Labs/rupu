@@ -39,13 +39,7 @@ import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
-import NetflowTable from '../components/netflow/NetflowTable';
-import NetflowSummary from '../components/netflow/NetflowSummary';
-import NetflowGraph from '../components/netflow/NetflowGraph';
-import NetflowWindowReadout from '../components/netflow/NetflowWindowReadout';
-import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
-import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../components/netflow/TimeRangePicker';
-import { fetchNetflowGraph, fetchRunNetflow, type GraphView, type NetflowResponse } from '../lib/netflow';
+import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
 import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
@@ -54,6 +48,18 @@ import { formatTokens, formatCost } from '../lib/usage';
 const MAX_EVENTS = 2000;
 
 type Tab = 'transcript' | 'events' | 'findings' | 'cycles' | 'netflow';
+
+/** Padding around the run's own span for the Network tab's default
+ *  window (the approved mockup's ±5 minutes) — see the render-site
+ *  comment for why the exact span would silently truncate. */
+const RUN_SPAN_PAD_MS = 5 * 60_000;
+
+/** `iso` shifted by `deltaMs`; returns the input unchanged when it
+ *  doesn't parse (the server enforces its own bounds either way). */
+function padIso(iso: string, deltaMs: number): string {
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? iso : new Date(t + deltaMs).toISOString();
+}
 
 /**
  * A single selection cursor that the whole tab panel follows. `unitIndex` is an
@@ -170,20 +176,21 @@ export default function RunDetail() {
   const [findingsError, setFindingsError] = useState<string | null>(null);
   const findingsRequestedRef = useRef(false);
 
-  // Scoped netflow for THIS run — lazy-loaded when the Network tab is first
-  // opened, same contract as findings above. `null` = not yet loaded / loading.
-  const [netflow, setNetflow] = useState<NetflowResponse | null>(null);
-  const [netflowGraph, setNetflowGraph] = useState<GraphView | null>(null);
-  const [netflowError, setNetflowError] = useState<string | null>(null);
-  // Relative-default time-range filter (Task 4) — see pages/Netflow.tsx's
-  // identical field for the `toNetflowRange` rationale.
-  const [netflowRange, setNetflowRange] = useState<TimeRangeValue>({ preset: 'all' });
-  // Replaces the old plain boolean guard: keyed on (run id, range) rather
-  // than just "has this run's netflow ever been requested", so opening the
-  // tab a second time with an UNCHANGED range still skips the fetch (the
-  // original guard's whole point), but changing the range while the tab is
-  // already open — the one new case Task 4 introduces — DOES re-fire it.
-  const netflowRequestedKeyRef = useRef<string | null>(null);
+  // Netflow lives entirely inside <NetflowExplorer> now (the v3 one-
+  // surface-every-scope component) — mounted with `key={run.id}` under the
+  // Network tab, so its fetch/reset/window state needs no plumbing here.
+  // `netflowVisitedRunId` implements the lazy-mount half of the old
+  // contract, PER RUN: nothing netflow-related mounts (or fetches) until
+  // the tab is first opened for THIS run; after that the explorer stays
+  // mounted-but-hidden so a tab re-click doesn't refetch. Tracking the
+  // run id (not a boolean) is what keeps a sidebar run switch on some
+  // OTHER tab from mounting a hidden explorer that fetches for a Network
+  // tab nobody opened — the render gate below only keeps a previous
+  // run's explorer alive while it IS the previous run's.
+  const [netflowVisitedRunId, setNetflowVisitedRunId] = useState<string | null>(null);
+  useEffect(() => {
+    if (tab === 'netflow' && id) setNetflowVisitedRunId(id);
+  }, [tab, id]);
 
   // Autoflow-history context — `null` means either "not fetched yet" or "this
   // run has no autoflow trail" (a plain, non-autoflow run); either way no
@@ -266,11 +273,6 @@ export default function RunDetail() {
     setFindings(null);
     setFindingsError(null);
     findingsRequestedRef.current = false;
-    setNetflow(null);
-    setNetflowGraph(null);
-    setNetflowError(null);
-    setNetflowRange({ preset: 'all' });
-    netflowRequestedKeyRef.current = null;
     setAutoflowCtx(null);
 
     fetchRunGraphWithRetry(id, () => cancelled, host)
@@ -359,57 +361,6 @@ export default function RunDetail() {
       cancelled = true;
     };
   }, [id, tab]);
-
-  // Lazy-load this run's flows the first time the Network tab is opened,
-  // and re-load when the operator changes the time-range picker while it's
-  // open. Keyed on (id, tab, range) via `netflowRequestedKeyRef` — a
-  // re-render with the SAME key (e.g. re-clicking the tab) skips the
-  // fetch, but a genuinely new key (a different run, or a different range
-  // on the same run) fires it. `cancelled` mirrors the findings effect
-  // above it: RunDetail doesn't unmount across a same-route run switch
-  // (see the sidebar/`<Link>` navigation the existing tests exercise), so
-  // a slow fetch for the previous run id can resolve after `id` has
-  // already moved on and clobber the new run's state with stale data
-  // without this guard.
-  useEffect(() => {
-    if (!id || tab !== 'netflow') return;
-    const q = toNetflowRange(netflowRange);
-    const key = `${id}::${netflowRange.preset}::${q?.from ?? ''}::${q?.to ?? ''}`;
-    if (netflowRequestedKeyRef.current === key) return;
-    netflowRequestedKeyRef.current = key;
-    // Important 3 (whole-branch review round 1): reset before fetching,
-    // matching pages/Netflow.tsx and ProjectNetworkTab.tsx exactly — this
-    // was the one outlier that skipped it. Without this, a range change
-    // on an already-open tab left the PREVIOUS window's table/graph
-    // rendering (and a stale error, since the error branch is checked
-    // first below) under the newly-selected range until the new request
-    // landed.
-    setNetflow(null);
-    setNetflowGraph(null);
-    setNetflowError(null);
-    let cancelled = false;
-    // Combined into one `Promise.all` (Fix 6, netflow Plan 3 review round
-    // 3) — previously each fetch independently swallowed its own failure
-    // into a `null`, so e.g. an unreachable host (`RunLocation::Host`)
-    // produced a permanently blank panel with no message and no retry.
-    // Mirrors pages/Netflow.tsx and ProjectNetworkTab.tsx's identical fix.
-    Promise.all([
-      q ? fetchRunNetflow(id, q) : fetchRunNetflow(id),
-      q ? fetchNetflowGraph(`run:${id}`, q) : fetchNetflowGraph(`run:${id}`),
-    ])
-      .then(([d, g]) => {
-        if (cancelled) return;
-        setNetflow(d);
-        setNetflowGraph(g);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setNetflowError(e instanceof Error ? e.message : 'Failed to load network flows');
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [id, tab, netflowRange]);
 
   // ONE SSE subscription per open run — shared by graph + feed.
   // Thread the host param for remote runs.
@@ -1312,35 +1263,31 @@ export default function RunDetail() {
             />
           </div>
         )}
-        {tab === 'netflow' && (
-          <div className="h-full min-h-0 space-y-4 overflow-auto">
-            <NetflowScopeDisclosure scope="run" />
-            <div className="flex flex-wrap items-center gap-3">
-              <TimeRangePicker value={netflowRange} onChange={setNetflowRange} />
-              {/* Server-echoed, never picker-state-derived — see the
-                  component's header comment (whole-branch review round 1,
-                  "Also do"). */}
-              {netflow && <NetflowWindowReadout appliedWindow={netflow.window} />}
-            </div>
-            {netflowError ? (
-              <p className="text-sm text-err">{netflowError}</p>
-            ) : netflow === null ? (
-              <p className="text-sm text-ink-dim">Loading network flows…</p>
-            ) : (
-              <>
-                {netflowGraph && (
-                  <NetflowGraph graph={netflowGraph} scope="run" appliedWindow={netflow.window} />
-                )}
-                <NetflowSummary hosts={netflow.hosts} />
-                <NetflowTable
-                  flows={netflow.flows}
-                  droppedTotal={netflow.dropped_total}
-                  asnLoaded={netflow.asn_loaded}
-                  scope="run"
-                  appliedWindow={netflow.window}
-                />
-              </>
-            )}
+        {(tab === 'netflow' || netflowVisitedRunId === run.id) && (
+          // Mounted on first visit, then kept alive but `hidden` on other
+          // tabs FOR THE SAME RUN — preserving the pre-explorer lazy-load
+          // contract: no fetch until the tab is first opened, no refetch
+          // on a mere tab re-click, and no hidden fetch for a run whose
+          // Network tab was never opened (the gate drops a previous run's
+          // explorer the moment `run.id` moves on). `key` still resets
+          // everything on a run switch made while ON the Network tab.
+          <div className={tab === 'netflow' ? 'h-full min-h-0 overflow-auto' : 'hidden'}>
+            {/* Run scope: the window defaults to the run's own span,
+                padded ±5 minutes (mockup parity) so teardown/telemetry
+                flows stamped just past finished_at — or ahead of
+                started_at via writer clock skew — aren't silently cut
+                from the run's own audit view. An unfinished run leaves
+                the upper bound open. The sub-agent disclosure note
+                surfaces via the explorer's coverage popover. */}
+            <NetflowExplorer
+              key={run.id}
+              scope="run"
+              runId={run.id}
+              initialWindow={{
+                from: padIso(run.started_at, -RUN_SPAN_PAD_MS),
+                to: run.finished_at ? padIso(run.finished_at, RUN_SPAN_PAD_MS) : undefined,
+              }}
+            />
           </div>
         )}
       </div>

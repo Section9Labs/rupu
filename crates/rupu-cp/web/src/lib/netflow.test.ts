@@ -3,10 +3,11 @@ import { ApiError } from './api';
 import type { HostRollup } from './netflow';
 import {
   fetchGlobalNetflow,
-  fetchNetflowGraph,
+  fetchNetflowExplorer,
   fetchProjectNetflow,
   fetchRunNetflow,
   formatBytes,
+  EMPTY_NETFLOW_FILTERS,
 } from './netflow';
 
 describe('formatBytes', () => {
@@ -37,27 +38,27 @@ describe('fetch helpers', () => {
     vi.unstubAllGlobals();
   });
 
-  it('omits the scope parameter entirely when global', async () => {
+  it('omits the explorer scope parameter entirely when global', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ nodes: [], edges: [] }),
+      json: async () => ({}),
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await fetchNetflowGraph();
-    expect(fetchMock).toHaveBeenCalledWith('/api/netflow/graph');
+    await fetchNetflowExplorer();
+    expect(fetchMock).toHaveBeenCalledWith('/api/netflow/explorer');
     vi.unstubAllGlobals();
   });
 
-  it('includes the scope parameter when given', async () => {
+  it('includes the explorer scope parameter when given', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ nodes: [], edges: [] }),
+      json: async () => ({}),
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    await fetchNetflowGraph('project:ws_1');
-    expect(fetchMock).toHaveBeenCalledWith('/api/netflow/graph?scope=project%3Aws_1');
+    await fetchNetflowExplorer('project:ws_1');
+    expect(fetchMock).toHaveBeenCalledWith('/api/netflow/explorer?scope=project%3Aws_1');
     vi.unstubAllGlobals();
   });
 
@@ -198,18 +199,47 @@ describe('fetch helpers', () => {
     vi.unstubAllGlobals();
   });
 
-  it('joins with `&`, not a second `?`, when the graph URL already carries `?scope=`', async () => {
-    // The non-obvious branch: `fetchNetflowGraph` builds `?scope=...`
+  it('joins with `&`, not a second `?`, when the explorer URL already carries `?scope=`', async () => {
+    // The non-obvious branch: `fetchNetflowExplorer` builds `?scope=...`
     // itself before `appendRange` ever sees the URL.
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ nodes: [], edges: [] }),
+      json: async () => ({}),
     });
     vi.stubGlobal('fetch', fetchMock);
-    await fetchNetflowGraph('project:ws_1', { from: '2026-08-17T14:00:00.000Z' });
+    await fetchNetflowExplorer('project:ws_1', { from: '2026-08-17T14:00:00.000Z' });
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/netflow/graph?scope=project%3Aws_1&from=2026-08-17T14%3A00%3A00.000Z',
+      '/api/netflow/explorer?scope=project%3Aws_1&from=2026-08-17T14%3A00%3A00.000Z',
     );
+    vi.unstubAllGlobals();
+  });
+
+  it('appends the four cross-filter params comma-joined, and only when non-empty', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true, window: { from: null, to: null } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchGlobalNetflow(undefined, {
+      workflows: ['review-wf', 'unknown'],
+      origins: ['provider:anthropic'],
+      orgs: [],
+      hosts: ['api.github.com:443'],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/netflow?workflow=review-wf%2Cunknown&origin=provider%3Aanthropic&host=api.github.com%3A443',
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it('empty filter sets are byte-identical to passing no filters at all', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true, window: { from: null, to: null } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchRunNetflow('r1', undefined, EMPTY_NETFLOW_FILTERS);
+    expect(fetchMock).toHaveBeenCalledWith('/api/runs/r1/netflow');
     vi.unstubAllGlobals();
   });
 });
