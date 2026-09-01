@@ -436,6 +436,19 @@ struct SessionRecord {
     /// Compact-at percentage. Captured from spec at session start.
     #[serde(default)]
     compact_at_percent: Option<u8>,
+    /// Path of a transcript whose replay-reconstruction equals
+    /// `message_history` byte-exact — the ONLY legitimate source for
+    /// `seed_source` when starting the next turn (spec §3 seed dedup
+    /// rule). Set ONLY at the single point where `message_history` is
+    /// replaced with a successful turn's `final_messages`; cleared to
+    /// `None` at every other mutation of `message_history` (compaction,
+    /// in both the offline CLI and worker pseudo-turn paths) so a turn
+    /// whose transcript does NOT reconstruct to the current history can
+    /// never be referenced. Distinct from `last_transcript_path`, which
+    /// is a UX pointer updated unconditionally (including on failed/
+    /// stopped/crashed turns) and must never be used to derive a seed.
+    #[serde(default)]
+    history_source_transcript: Option<PathBuf>,
 }
 
 impl SessionRecord {
@@ -1483,6 +1496,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         max_tokens: spec.max_tokens,
         context_window_tokens: spec.context_window_tokens,
         compact_at_percent: spec.compact_at_percent,
+        history_source_transcript: None,
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach, args.view).await
@@ -6647,6 +6661,11 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             let before = session.message_history.len();
             session.message_history = outcome.messages;
             let after = session.message_history.len();
+            // Compaction rewrites history in place with no transcript of its
+            // own that reconstructs to the summarized result — the next
+            // turn must seed inline, never reference a pre-compaction
+            // transcript.
+            session.history_source_transcript = None;
             session.updated_at = Utc::now();
             write_session(&global, scope, &session)?;
             println!(
@@ -6695,6 +6714,15 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
     {
         let _ = terminate_pid(pid);
     }
+    // NOTE on `history_source_transcript`: below, `last_transcript_path` (a
+    // UX pointer only) is promoted to the killed run's transcript, which may
+    // carry only the runner prologue's `UserMessage` event with no matching
+    // turn ever committed to `message_history`. `history_source_transcript`
+    // is deliberately left untouched here — this function never mutates
+    // `message_history`, so whatever it already pointed at (the transcript
+    // of the last turn that actually completed and was folded into
+    // `message_history`) is still exactly reconstructible into the current
+    // `message_history` and remains a valid seed source for the next turn.
     session.status = SessionStatus::Stopped;
     session.updated_at = Utc::now();
     session.last_error = Some("stopped by operator".into());
@@ -7097,6 +7125,11 @@ async fn run_compact_request(
         Ok(Some(outcome)) => {
             let summarized = outcome.summarized_messages;
             session.message_history = outcome.messages;
+            // Same reasoning as the offline `rupu session compact` path: the
+            // compaction pseudo-transcript this function writes does NOT
+            // reconstruct to the summarized history (it replays to an empty
+            // conversation), so the next turn must never reference it.
+            session.history_source_transcript = None;
             let after = session.message_history.len();
             let content = format!(
                 "[context compacted: summarized {} messages; {} → {} kept]\n",
@@ -7199,6 +7232,12 @@ fn finalize_compact_run(
     s.last_transcript_path = Some(request.transcript_path.clone());
     // Persist compacted message history.
     s.message_history = session.message_history.clone();
+    // Mirror `session.history_source_transcript` (cleared above on the
+    // compacting branch, unchanged otherwise) onto the freshly re-read `s`
+    // — otherwise `s`'s on-disk value would survive this write untouched
+    // and could keep referencing a transcript that no longer matches the
+    // history just persisted above.
+    s.history_source_transcript = session.history_source_transcript.clone();
     s.status = if status == RunStatus::Ok {
         SessionStatus::Idle
     } else {
@@ -7374,10 +7413,17 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         // Reference the previous turn's transcript instead of re-embedding
         // `message_history` inline — the O(n²) dedup this field exists for
-        // (see `AgentRunOpts::seed_source`). Only valid when a previous turn
-        // actually ran and its transcript file is still on disk; otherwise
-        // fall back to an inline seed (first turn, or a pruned transcript).
-        let seed_source = session.last_transcript_path.clone().filter(|p| p.exists());
+        // (see `AgentRunOpts::seed_source`). Read `history_source_transcript`
+        // (NOT `last_transcript_path`, which is a UX pointer updated
+        // unconditionally — including on failed/stopped/crashed turns whose
+        // transcript does not reconstruct to `message_history`). Only valid
+        // when a prior turn actually left history in this exact state and
+        // its transcript file is still on disk; otherwise fall back to an
+        // inline seed (first turn, a pruned transcript, or any divergence).
+        let seed_source = session
+            .history_source_transcript
+            .clone()
+            .filter(|p| p.exists());
 
         let opts = AgentRunOpts {
             agent_name: session.agent_name.clone(),
@@ -7487,6 +7533,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 session.total_tokens_out += result.total_tokens_out;
                 session.total_tokens_cached += cached_tokens;
                 session.message_history = result.final_messages;
+                // This turn's own transcript always reconstructs to exactly
+                // `final_messages`: `run_agent` writes a `RunComplete` event
+                // at every `Ok(RunResult)` exit (success, max-turns, or a
+                // cooperative pause) immediately before returning, so the
+                // transcript on disk at `transcript_path` and the message
+                // list assigned above are the same snapshot. Safe to record
+                // as the seed source regardless of `result.status`.
+                session.history_source_transcript = Some(transcript_path.clone());
                 session.last_error = if result.status == RunStatus::Ok {
                     None
                 } else {
@@ -7595,6 +7649,10 @@ fn reconcile_stale_session(session: &mut SessionRecord) -> bool {
         .active_run_id
         .clone()
         .or_else(|| session.last_run_id.clone());
+    // As in `stop_session_in_place`: `last_transcript_path` (UX only) is
+    // promoted to the crashed run's possibly-incomplete transcript, but
+    // `message_history` — and therefore `history_source_transcript` — is
+    // never touched here, so it stays a valid seed reference.
     session.last_transcript_path = session
         .active_transcript_path
         .clone()
@@ -9572,6 +9630,7 @@ mod tests {
             max_tokens: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            history_source_transcript: None,
         }
     }
 
@@ -9707,6 +9766,332 @@ mod tests {
             ])
             .unwrap(),
             "replay must reconstruct the full two-turn conversation across the seed reference"
+        );
+    }
+
+    /// I-1 (transcript fidelity plan 1, whole-branch review): a turn's
+    /// transcript may only ever be referenced as a seed source when
+    /// `message_history` was actually advanced to match it — i.e. only at
+    /// the single successful-turn assignment site. `last_transcript_path`
+    /// is a UX pointer set unconditionally, including on a failed turn
+    /// (whose transcript already recorded a `UserMessage` from the runner
+    /// prologue with no matching assistant reply): deriving `seed_source`
+    /// from it would let a later turn reference that broken, incomplete
+    /// transcript and blow up at replay with a `SeedHashMismatch`.
+    ///
+    /// Drives three real turns through `run_turn`: turn 1 succeeds
+    /// (establishing a genuinely valid, still-replayable transcript), turn
+    /// 2 fails outright (`ProviderError`, scripted via the same
+    /// `RUPU_MOCK_PROVIDER_SCRIPT` seam used for the happy-path test above),
+    /// and turn 3 succeeds again. Because `history_source_transcript` is
+    /// only ever mutated at the one successful-assignment site, turn 2's
+    /// failure leaves it exactly as turn 1 left it — so turn 3 correctly
+    /// keeps referencing turn 1's transcript (the reference is still
+    /// perfectly valid; there is no reason to fall back to an inline
+    /// embed). What the fix actually prevents is turn 3 referencing turn
+    /// 2's transcript instead — which is exactly what `last_transcript_path`
+    /// would point to, and exactly what reproduces the corruption.
+    #[tokio::test]
+    async fn failed_turn_does_not_poison_next_turns_seed_chain() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_seed_fail01".into();
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.history_source_transcript = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_turns = 0;
+        record.total_tokens_in = 0;
+        record.total_tokens_out = 0;
+        record.total_tokens_cached = 0;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let transcript_1 = record.transcripts_dir.join("run_seed_fail_1.jsonl");
+        let transcript_2 = record.transcripts_dir.join("run_seed_fail_2.jsonl");
+        let transcript_3 = record.transcripts_dir.join("run_seed_fail_3.jsonl");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#,
+        );
+        let turn1 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fail_1".into(),
+            prompt: "first prompt".into(),
+        })
+        .await;
+
+        turn1.expect("turn 1 completes");
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "ProviderError": "boom" }]"#,
+        );
+        let turn2 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fail_2".into(),
+            prompt: "second prompt".into(),
+        })
+        .await;
+        // `run_turn` records a failed agent run in the session's own
+        // bookkeeping rather than propagating a Rust-level error — the
+        // worker process keeps running so later turns can still be sent.
+        turn2.expect("turn 2 (failing) completes without propagating a Rust-level error");
+
+        let (after_turn2, _) =
+            read_session(&global, &record.session_id).expect("read session after turn 2");
+        assert_eq!(
+            after_turn2.status,
+            SessionStatus::Failed,
+            "turn 2 must be recorded as failed: {after_turn2:?}"
+        );
+        assert_eq!(
+            after_turn2.message_history.len(),
+            2,
+            "a failed turn must never advance message_history"
+        );
+        assert_eq!(
+            after_turn2.history_source_transcript,
+            Some(transcript_1.clone()),
+            "a failed turn must never touch history_source_transcript"
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack3", "stop": "end_turn" } }]"#,
+        );
+        let turn3 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_fail_3".into(),
+            prompt: "third prompt".into(),
+        })
+        .await;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        turn3.expect("turn 3 completes");
+
+        let (after_turn3, _) =
+            read_session(&global, &record.session_id).expect("read session after turn 3");
+        assert_eq!(
+            after_turn3.status,
+            SessionStatus::Idle,
+            "turn 3 must succeed against the mock provider: {after_turn3:?}"
+        );
+
+        let events: Vec<TranscriptEvent> = JsonlReader::iter(&transcript_3)
+            .expect("open turn 3 transcript")
+            .filter_map(Result::ok)
+            .collect();
+        let (source_transcript, messages) = events
+            .iter()
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript,
+                    messages,
+                    ..
+                } => Some((source_transcript.clone(), messages.clone())),
+                _ => None,
+            })
+            .expect("turn 3 transcript must contain a Seed event");
+        assert_eq!(
+            source_transcript,
+            Some(transcript_1.display().to_string()),
+            "turn 3 must reference turn 1's still-valid transcript — NEVER turn 2's, which is \
+             what `last_transcript_path` (unconditionally promoted on every turn, including \
+             failures) would incorrectly point to"
+        );
+        assert_ne!(
+            source_transcript,
+            Some(transcript_2.display().to_string()),
+            "turn 3 must never reference the failed turn's own transcript"
+        );
+        assert!(
+            messages.is_none(),
+            "a referenced seed must not also carry an inline copy of the messages"
+        );
+
+        // End-to-end: replay must succeed (no SeedHashMismatch) and must
+        // reproduce exactly turn 1 + turn 3's conversation — turn 2's
+        // orphaned "second prompt" (recorded in transcript_2 but never
+        // folded into message_history) must not leak in.
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_3)
+            .expect("turn 3 transcript reconstructs cleanly via the seed chain");
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("first prompt"),
+                Message::assistant("ack"),
+                Message::user("third prompt"),
+                Message::assistant("ack3"),
+            ])
+            .unwrap(),
+            "replay must skip turn 2 entirely — it never joined message_history"
+        );
+    }
+
+    /// I-1 (transcript fidelity plan 1, whole-branch review): compaction
+    /// rewrites `message_history` in place with no transcript of its own
+    /// that reconstructs to the summarized result (the CLI `compact`
+    /// command writes no transcript at all), so `history_source_transcript`
+    /// must be cleared whenever compaction actually fires — regardless of
+    /// what it pointed at beforehand — and the next turn must seed inline.
+    #[tokio::test]
+    async fn compact_clears_history_source_transcript_and_next_turn_seeds_inline() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_compact_seed01".into();
+        record.status = SessionStatus::Idle;
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        std::fs::create_dir_all(&record.transcripts_dir).expect("create transcripts dir");
+
+        // Dense history that reliably exceeds a tiny compaction window —
+        // same recipe as
+        // `rupu_agent::runner::tests::compact_messages_returns_outcome_with_mock_provider`.
+        let dense_chunk = "x".repeat(1000);
+        let mut history = vec![Message::user(&format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            history.push(Message::assistant(&format!("assistant {i}: {dense_chunk}")));
+            history.push(Message::user(&format!("user {i}: {dense_chunk}")));
+        }
+        record.message_history = history;
+        record.compact_at_percent = Some(80);
+        record.context_window_tokens = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        // Seed a fake prior reference to prove compaction clears it
+        // unconditionally, regardless of what it held beforehand.
+        let fake_prior_transcript = record.transcripts_dir.join("run_prior.jsonl");
+        std::fs::write(&fake_prior_transcript, b"").expect("touch fake transcript");
+        record.history_source_transcript = Some(fake_prior_transcript);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#,
+        );
+
+        let compact_result = compact(&record.session_id, Some(1000)).await;
+        compact_result.expect("compact completes");
+
+        let (after_compact, _) =
+            read_session(&global, &record.session_id).expect("read session after compact");
+        assert!(
+            after_compact.history_source_transcript.is_none(),
+            "compaction must clear history_source_transcript, got {:?}",
+            after_compact.history_source_transcript
+        );
+        assert!(
+            after_compact.message_history.len() < record.message_history.len(),
+            "compaction must actually have fired (summarized some messages away): {} -> {}",
+            record.message_history.len(),
+            after_compact.message_history.len()
+        );
+
+        let transcript_next = record.transcripts_dir.join("run_after_compact.jsonl");
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#,
+        );
+        let turn = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_after_compact".into(),
+            prompt: "post-compact prompt".into(),
+        })
+        .await;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        turn.expect("post-compact turn completes");
+
+        let events: Vec<TranscriptEvent> = JsonlReader::iter(&transcript_next)
+            .expect("open post-compact transcript")
+            .filter_map(Result::ok)
+            .collect();
+        let (source_transcript, messages) = events
+            .iter()
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript,
+                    messages,
+                    ..
+                } => Some((source_transcript.clone(), messages.clone())),
+                _ => None,
+            })
+            .expect("post-compact transcript must contain a Seed event");
+        assert_eq!(
+            source_transcript, None,
+            "the turn right after compaction must seed inline — there is no transcript that \
+             reconstructs to the summarized history"
+        );
+        assert!(
+            messages.is_some(),
+            "an inline seed must carry the actual messages"
+        );
+
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_next)
+            .expect("post-compact transcript reconstructs cleanly");
+        let mut expected = after_compact.message_history.clone();
+        expected.push(Message::user("post-compact prompt"));
+        expected.push(Message::assistant("ack"));
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "replay must reproduce exactly the post-compaction history plus the new turn"
         );
     }
 
