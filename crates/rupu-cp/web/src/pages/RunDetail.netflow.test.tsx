@@ -74,7 +74,6 @@ function emptyExplorer(): ExplorerResponse {
       runs_in_window: 0,
     },
     histogram: { from: null, to: null, bucket_ms: 0, buckets: [] },
-    hosts: [],
     kpis: {
       flows: 0,
       endpoints: 0,
@@ -134,8 +133,10 @@ const FINDINGS: FindingsResponse = {
   summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
 };
 
-/** The window the explorer must seed at run scope: the run's OWN span. */
-const RUN_SPAN = { from: '2026-06-01T00:00:00Z', to: '2026-06-01T00:05:00Z' };
+/** The window the explorer must seed at run scope: the run's OWN span,
+ *  padded ±5 minutes (mockup parity — teardown flows stamped just past
+ *  finished_at must not silently fall outside the default window). */
+const RUN_SPAN = { from: '2026-05-31T23:55:00.000Z', to: '2026-06-01T00:10:00.000Z' };
 
 function stubApi(graph: RunGraphResponse) {
   vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);

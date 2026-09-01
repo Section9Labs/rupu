@@ -49,6 +49,18 @@ const MAX_EVENTS = 2000;
 
 type Tab = 'transcript' | 'events' | 'findings' | 'cycles' | 'netflow';
 
+/** Padding around the run's own span for the Network tab's default
+ *  window (the approved mockup's ±5 minutes) — see the render-site
+ *  comment for why the exact span would silently truncate. */
+const RUN_SPAN_PAD_MS = 5 * 60_000;
+
+/** `iso` shifted by `deltaMs`; returns the input unchanged when it
+ *  doesn't parse (the server enforces its own bounds either way). */
+function padIso(iso: string, deltaMs: number): string {
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? iso : new Date(t + deltaMs).toISOString();
+}
+
 /**
  * A single selection cursor that the whole tab panel follows. `unitIndex` is an
  * optional hint for a for_each unit (the file-browser owns its own unit
@@ -167,14 +179,18 @@ export default function RunDetail() {
   // Netflow lives entirely inside <NetflowExplorer> now (the v3 one-
   // surface-every-scope component) — mounted with `key={run.id}` under the
   // Network tab, so its fetch/reset/window state needs no plumbing here.
-  // `netflowVisited` implements the lazy-mount half of the old contract:
-  // nothing netflow-related mounts (or fetches) until the tab is first
-  // opened; after that the explorer stays mounted-but-hidden so a tab
-  // re-click doesn't refetch.
-  const [netflowVisited, setNetflowVisited] = useState(false);
+  // `netflowVisitedRunId` implements the lazy-mount half of the old
+  // contract, PER RUN: nothing netflow-related mounts (or fetches) until
+  // the tab is first opened for THIS run; after that the explorer stays
+  // mounted-but-hidden so a tab re-click doesn't refetch. Tracking the
+  // run id (not a boolean) is what keeps a sidebar run switch on some
+  // OTHER tab from mounting a hidden explorer that fetches for a Network
+  // tab nobody opened — the render gate below only keeps a previous
+  // run's explorer alive while it IS the previous run's.
+  const [netflowVisitedRunId, setNetflowVisitedRunId] = useState<string | null>(null);
   useEffect(() => {
-    if (tab === 'netflow') setNetflowVisited(true);
-  }, [tab]);
+    if (tab === 'netflow' && id) setNetflowVisitedRunId(id);
+  }, [tab, id]);
 
   // Autoflow-history context — `null` means either "not fetched yet" or "this
   // run has no autoflow trail" (a plain, non-autoflow run); either way no
@@ -1247,23 +1263,30 @@ export default function RunDetail() {
             />
           </div>
         )}
-        {netflowVisited && (
+        {(tab === 'netflow' || netflowVisitedRunId === run.id) && (
           // Mounted on first visit, then kept alive but `hidden` on other
-          // tabs — preserving the pre-explorer lazy-load contract: no
-          // fetch until the tab is first opened, no refetch on a mere tab
-          // re-click (the explorer owns its own fetch state now, so
-          // unmounting it would forget it). `key` still resets everything
-          // on a run switch — RunDetail doesn't unmount across one.
+          // tabs FOR THE SAME RUN — preserving the pre-explorer lazy-load
+          // contract: no fetch until the tab is first opened, no refetch
+          // on a mere tab re-click, and no hidden fetch for a run whose
+          // Network tab was never opened (the gate drops a previous run's
+          // explorer the moment `run.id` moves on). `key` still resets
+          // everything on a run switch made while ON the Network tab.
           <div className={tab === 'netflow' ? 'h-full min-h-0 overflow-auto' : 'hidden'}>
-            {/* Run scope: the window defaults to the run's own span (an
-                unfinished run leaves the upper bound open); the sub-agent
-                disclosure note surfaces via the explorer's coverage
-                popover. */}
+            {/* Run scope: the window defaults to the run's own span,
+                padded ±5 minutes (mockup parity) so teardown/telemetry
+                flows stamped just past finished_at — or ahead of
+                started_at via writer clock skew — aren't silently cut
+                from the run's own audit view. An unfinished run leaves
+                the upper bound open. The sub-agent disclosure note
+                surfaces via the explorer's coverage popover. */}
             <NetflowExplorer
               key={run.id}
               scope="run"
               runId={run.id}
-              initialWindow={{ from: run.started_at, to: run.finished_at ?? undefined }}
+              initialWindow={{
+                from: padIso(run.started_at, -RUN_SPAN_PAD_MS),
+                to: run.finished_at ? padIso(run.finished_at, RUN_SPAN_PAD_MS) : undefined,
+              }}
             />
           </div>
         )}

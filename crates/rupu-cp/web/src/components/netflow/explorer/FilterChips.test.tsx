@@ -62,11 +62,36 @@ describe('FilterChips', () => {
         onClearAll={noop}
       />,
     );
-    fireEvent.click(screen.getByRole('button', { name: /remove filter api.anthropic.com/i }));
+    // Accessible names carry the dim-prefixed id, not the bare label —
+    // labels are not unique (two ASNs can share one org name).
+    fireEvent.click(
+      screen.getByRole('button', { name: /remove filter host:api.anthropic.com/i }),
+    );
     expect(onRemove).toHaveBeenCalledWith('hosts', 'api.anthropic.com:443');
 
     fireEvent.click(screen.getByRole('button', { name: /remove filter window/i }));
     expect(onClearWindow).toHaveBeenCalled();
+  });
+
+  it('two orgs sharing one display label stay distinct chips (id-keyed, id-labelled)', () => {
+    // ASN org names are not unique per ASN — e.g. one operator announcing
+    // several ASNs under one org string. Keys and accessible names carry
+    // the `as<number>` id so the chips never collide.
+    const onRemove = vi.fn();
+    render(
+      <FilterChips
+        filters={{ ...EMPTY_NETFLOW_FILTERS, orgs: ['as15169', 'as396982'] }}
+        orgLabel={() => 'Google LLC'}
+        windowApplied={false}
+        onRemove={onRemove}
+        onClearWindow={noop}
+        onClearAll={noop}
+      />,
+    );
+    expect(screen.getAllByText('net:Google LLC').length).toBe(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Remove filter org:as396982' }));
+    expect(onRemove).toHaveBeenCalledWith('orgs', 'as396982');
+    expect(onRemove).not.toHaveBeenCalledWith('orgs', 'as15169');
   });
 
   it('Clear all clears everything at once', () => {

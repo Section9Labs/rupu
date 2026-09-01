@@ -156,6 +156,23 @@ describe('NetflowTable', () => {
     expect(screen.getByText(/No network flows recorded for this scope/i)).toBeInTheDocument();
   });
 
+  it('words a filtered-to-nothing empty list by the filters, not the scope or the range', () => {
+    // The third distinct cause of emptiness (v3 cross-filters): claiming
+    // "nothing recorded for this scope" — or even "nothing in this
+    // range" — over a set the user just filtered to zero would be false.
+    render(
+      <NetflowTable
+        flows={[]}
+        droppedTotal={0}
+        asnLoaded
+        filtersActive
+        appliedWindow={{ from: '2026-08-17T14:00:00Z', to: null }}
+      />,
+    );
+    expect(screen.getByText(/no flows match the current filters/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no network flows/i)).not.toBeInTheDocument();
+  });
+
   it('does not apply the range-empty wording when flows are present, even with a window applied', () => {
     render(
       <NetflowTable

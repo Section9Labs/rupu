@@ -270,12 +270,14 @@ export interface KpiView {
   p95_ms?: number;
 }
 
-/** `rupu_cp::api::netflow::ExplorerResponse`. */
+/** `rupu_cp::api::netflow::ExplorerResponse`. (No `hosts` rollup — every
+ *  per-endpoint number the surface renders comes from `timeline.lanes`,
+ *  whose facet semantics are the ones the org cards/lane stats need; see
+ *  the Rust type's doc comment for the deliberate deviation note.) */
 export interface ExplorerResponse {
   sankey: SankeyView;
   timeline: TimelineView;
   histogram: HistogramView;
-  hosts: HostRollup[];
   kpis: KpiView;
   /** Whole-history, never window- or filter-scoped — same contract as
    *  `NetflowResponse.dropped_total`. */

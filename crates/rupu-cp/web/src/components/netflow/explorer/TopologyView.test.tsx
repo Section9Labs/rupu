@@ -20,6 +20,7 @@ function renderView(props: Partial<React.ComponentProps<typeof TopologyView>> = 
       sankey={populatedExplorerResponse().sankey}
       selected={NO_SELECTION}
       onToggle={() => {}}
+      scope="global"
       {...props}
     />,
   );

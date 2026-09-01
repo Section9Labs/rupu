@@ -140,13 +140,29 @@ export interface PairSets {
   ab: Set<string>;
   /** origin→org adjacency, from `sankey.origin_org`. */
   bc: Set<string>;
+  /** TRANSITIVE workflow→org adjacency (through any shared origin) —
+   *  precomputed here, where the result is memoized per sankey, so the
+   *  per-node-per-hover `isConnected` calls are single `Set.has` lookups
+   *  instead of materializing the whole adjacency set each time. */
+  ac: Set<string>;
 }
 
 export function buildPairSets(sankey: SankeyView): PairSets {
-  return {
-    ab: new Set(sankey.wf_origin.map((l) => l.from + SEP + l.to)),
-    bc: new Set(sankey.origin_org.map((l) => l.from + SEP + l.to)),
-  };
+  const ab = new Set(sankey.wf_origin.map((l) => l.from + SEP + l.to));
+  const bc = new Set(sankey.origin_org.map((l) => l.from + SEP + l.to));
+  const orgsByOrigin = new Map<string, string[]>();
+  for (const l of sankey.origin_org) {
+    const list = orgsByOrigin.get(l.from);
+    if (list) list.push(l.to);
+    else orgsByOrigin.set(l.from, [l.to]);
+  }
+  const ac = new Set<string>();
+  for (const l of sankey.wf_origin) {
+    for (const org of orgsByOrigin.get(l.to) ?? []) {
+      ac.add(l.from + SEP + org);
+    }
+  }
+  return { ab, bc, ac };
 }
 
 export interface HoverKey {
@@ -167,17 +183,10 @@ export function isConnected(
   if (hover.dim === 'or' && dim === 'wf') return has(pairs.ab, key, hover.key);
   if (hover.dim === 'or' && dim === 'org') return has(pairs.bc, hover.key, key);
   if (hover.dim === 'org' && dim === 'or') return has(pairs.bc, key, hover.key);
-  if (hover.dim === 'wf' && dim === 'org') {
-    // Two hops: any origin adjacent to BOTH the hovered workflow and this org.
-    return [...pairs.ab]
-      .filter((p) => p.startsWith(hover.key + SEP))
-      .some((p) => has(pairs.bc, p.split(SEP)[1], key));
-  }
-  if (hover.dim === 'org' && dim === 'wf') {
-    return [...pairs.bc]
-      .filter((p) => p.endsWith(SEP + hover.key))
-      .some((p) => has(pairs.ab, key, p.split(SEP)[0]));
-  }
+  // Two hops (workflow↔org through any shared origin): precomputed as
+  // `ac` in buildPairSets so this stays O(1) per node per hover frame.
+  if (hover.dim === 'wf' && dim === 'org') return has(pairs.ac, hover.key, key);
+  if (hover.dim === 'org' && dim === 'wf') return has(pairs.ac, key, hover.key);
   return true;
 }
 

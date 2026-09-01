@@ -9,7 +9,6 @@
 // and the server sorts them busiest-org-first with lanes contiguous per
 // org. Re-aggregating here would just be a second implementation.
 
-import { Fragment } from 'react';
 import type { LaneAgg } from '../../../lib/netflow';
 import { cn } from '../../../lib/cn';
 
@@ -66,8 +65,8 @@ export function OrgCards({ lanes, selectedHosts, onToggleHost }: OrgCardsProps) 
             const key = `${lane.host}:${lane.port}`;
             const selected = selectedHosts.includes(key);
             return (
-              <Fragment key={key}>
                 <button
+                  key={key}
                   type="button"
                   onClick={() => onToggleHost(key)}
                   aria-pressed={selected}
@@ -88,7 +87,6 @@ export function OrgCards({ lanes, selectedHosts, onToggleHost }: OrgCardsProps) 
                     {lane.p95_ms != null ? `${lane.p95_ms} ms` : '—'}
                   </span>
                 </button>
-              </Fragment>
             );
           })}
         </div>

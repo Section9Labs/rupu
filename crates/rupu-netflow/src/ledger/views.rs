@@ -168,6 +168,14 @@ fn accumulate(total: Option<u64>, sample: Option<u64>) -> Option<u64> {
 }
 
 pub fn host_rollup(flows: &[FlowRecord]) -> Vec<HostRollup> {
+    host_rollup_iter(flows)
+}
+
+/// [`host_rollup`] over an iterator of REFERENCES — for callers whose
+/// flows live inside a wrapper type (`FlowView`/`ExplorerFlow` on the CP
+/// read side), so they never deep-clone the whole set into a `Vec` just
+/// to satisfy the slice signature.
+pub fn host_rollup_iter<'a>(flows: impl IntoIterator<Item = &'a FlowRecord>) -> Vec<HostRollup> {
     let mut acc: HashMap<(String, u16), RollupAcc> = HashMap::new();
 
     for f in flows {

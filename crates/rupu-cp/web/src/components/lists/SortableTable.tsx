@@ -109,11 +109,12 @@ export default function SortableTable<T>({
   rowKey: (row: T) => string;
   initialSort?: SortSpec;
   rowHref?: (row: T) => string | undefined;
-  /** Row-level click handler for tables whose rows open an in-page panel
-   *  rather than navigate (e.g. the netflow flow table's detail
+  /** Row-level activation handler for tables whose rows open an in-page
+   *  panel rather than navigate (e.g. the netflow flow table's detail
    *  slide-over). Mutually exclusive with `rowHref` by convention — a row
-   *  that navigates should stay a real link. Adds the pointer cursor +
-   *  hover treatment so the affordance is visible. */
+   *  that navigates should stay a real link. Rows become focusable
+   *  (`tabIndex=0`) and activate on Enter/Space as well as click, so
+   *  whatever the panel discloses is never mouse-only. */
   onRowClick?: (row: T) => void;
   /** Per-row: return the detail-panel content for a row, or `null` (or
    *  `false`) when that particular row has nothing to expand. A row is
@@ -256,10 +257,21 @@ export default function SortableTable<T>({
               <Fragment key={key}>
                 <tr
                   onClick={onRowClick ? () => onRowClick(row) : undefined}
+                  tabIndex={onRowClick ? 0 : undefined}
+                  onKeyDown={
+                    onRowClick
+                      ? (e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            onRowClick(row);
+                          }
+                        }
+                      : undefined
+                  }
                   className={cn(
                     'transition-colors',
                     !isDeadLinkRow && 'hover:bg-bg/60',
-                    onRowClick && 'cursor-pointer',
+                    onRowClick && 'cursor-pointer focus-visible:bg-bg/60 focus-visible:outline-none',
                   )}
                 >
                   {hasDetailFeature && (

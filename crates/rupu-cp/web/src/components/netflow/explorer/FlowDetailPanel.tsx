@@ -8,8 +8,11 @@
 // timings/IPs) — this panel is where a curious reader lands, so it is
 // exactly where "we could not see it" must never read as "it was zero".
 
+import { useEffect } from 'react';
 import { formatBytes, type FlowView } from '../../../lib/netflow';
+import { absoluteTime } from '../../../lib/time';
 import { FidelityBadge, FIDELITY_TITLE } from '../FidelityBadge';
+import { originLabel } from '../NetflowTable';
 import { Badge } from '../../ui/Badge';
 import type { NetflowScope } from '../ScopeDisclosure';
 
@@ -24,10 +27,24 @@ const COARSE_NOTE =
 const OBSERVED_NOTE = 'All fields observed directly by the instrumented HTTP client.';
 
 export function FlowDetailPanel({ flow, scope, onClose }: FlowDetailPanelProps) {
+  // Escape closes — the keyboard exit every dialog needs (row activation
+  // is keyboard-reachable via SortableTable's onRowClick handling, so the
+  // way OUT must be too).
+  useEffect(() => {
+    if (!flow) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [flow, onClose]);
+
   if (!flow) return null;
   const coarse = flow.fidelity === 'coarse';
   const rows: { k: string; v: string }[] = [
-    { k: 'Time', v: new Date(flow.ts).toLocaleString() },
+    // `absoluteTime` (not a raw Date round-trip): the shared formatter
+    // renders an unparseable ts as an em dash, never "Invalid Date".
+    { k: 'Time', v: absoluteTime(flow.ts) },
     // Attribution rows only where they mean something: at run scope every
     // flow belongs to the run already on screen.
     ...(scope !== 'run'
@@ -36,7 +53,7 @@ export function FlowDetailPanel({ flow, scope, onClose }: FlowDetailPanelProps) 
           { k: 'Workflow', v: flow.workflow ?? '—' },
         ]
       : []),
-    { k: 'Origin', v: flow.ctx.origin.name ?? flow.ctx.origin.kind },
+    { k: 'Origin', v: originLabel(flow) },
     { k: 'Status', v: flow.status != null ? String(flow.status) : '—' },
     { k: 'Bytes in', v: formatBytes(flow.bytes_in) },
     { k: 'Bytes out', v: formatBytes(flow.bytes_out) },

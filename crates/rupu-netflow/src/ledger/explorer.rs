@@ -158,13 +158,45 @@ impl ExplorerFilters {
     /// Whether `f` passes every active filter, optionally skipping one
     /// dimension (see [`SkipDim`]).
     pub fn passes(&self, f: &ExplorerFlow, skip: Option<SkipDim>) -> bool {
-        let dim = |skip_this: SkipDim, set: &[String], key: &str| {
-            skip == Some(skip_this) || set.is_empty() || set.iter().any(|v| v == key)
+        self.passes_parts(
+            f.workflow.as_deref(),
+            &f.flow.ctx.origin,
+            f.asn.as_ref(),
+            &f.flow.host,
+            f.flow.port,
+            skip,
+        )
+    }
+
+    /// The ONE four-dimension predicate, taking the raw parts — so a
+    /// caller holding a different flow shape (rupu-cp's `FlowView`, which
+    /// carries the same attribution fields) matches by exactly the same
+    /// rules and key alphabet as the aggregate views. A second predicate
+    /// implementation is how the table and the aggregates above it would
+    /// start disagreeing about which rows are "in".
+    pub fn passes_parts(
+        &self,
+        workflow: Option<&str>,
+        origin: &Origin,
+        asn: Option<&AsnInfo>,
+        host: &str,
+        port: u16,
+        skip: Option<SkipDim>,
+    ) -> bool {
+        // Fast path for the common unfiltered request: no key needs
+        // deriving (three of the four keys allocate) when nothing is
+        // being matched against.
+        if self.is_empty() {
+            return true;
+        }
+        let dim = |skip_this: SkipDim, set: &[String], key: &dyn Fn() -> String| {
+            skip == Some(skip_this) || set.is_empty() || set.contains(&key())
         };
-        dim(SkipDim::Workflow, &self.workflows, f.workflow_key())
-            && dim(SkipDim::Origin, &self.origins, &f.origin_key())
-            && dim(SkipDim::Org, &self.orgs, &f.org_key())
-            && dim(SkipDim::Host, &self.hosts, &f.endpoint_key())
+        dim(SkipDim::Workflow, &self.workflows, &|| {
+            workflow_key_of(workflow).to_string()
+        }) && dim(SkipDim::Origin, &self.origins, &|| origin_key(origin))
+            && dim(SkipDim::Org, &self.orgs, &|| org_key_of(asn))
+            && dim(SkipDim::Host, &self.hosts, &|| endpoint_key_of(host, port))
     }
 }
 
@@ -478,7 +510,10 @@ pub fn sankey_view(
 /// `from`/`to` here are the RESOLVED window: the caller substitutes the
 /// scope's full retained range (the histogram bounds) for an unbounded
 /// side before calling, so the lanes always have concrete bounds to
-/// bucket against.
+/// bucket against. A CROSSED pair (`from > to` — the requested window
+/// lies entirely outside the retained range) is an empty window: no
+/// lanes, zero runs, dense zero buckets — never a lane the KPI strip
+/// (built from the raw request range) would contradict.
 pub fn timeline_view(
     scope_flows: &[ExplorerFlow],
     from: DateTime<Utc>,
@@ -487,6 +522,16 @@ pub fn timeline_view(
     runs: &[RunSpan],
     n: usize,
 ) -> TimelineView {
+    if from > to {
+        return TimelineView {
+            bucket_ms: 0,
+            from,
+            to,
+            lanes: Vec::new(),
+            runs: vec![0; n],
+            runs_in_window: 0,
+        };
+    }
     let visible: Vec<&ExplorerFlow> = scope_flows
         .iter()
         .filter(|f| f.flow.ts >= from && f.flow.ts <= to)
@@ -494,19 +539,28 @@ pub fn timeline_view(
         .collect();
 
     struct LaneAcc<'a> {
-        first: &'a ExplorerFlow,
+        /// The lane's org attribution: the first flow whose ASN RESOLVED —
+        /// not merely the first flow in read order. A coarse flow (no peer
+        /// IP) arriving first must not file a lane under "Unknown network"
+        /// when its siblings resolve; every other org consumer (the
+        /// topology column, the KPI org count, the org filter) keys each
+        /// flow by its OWN ASN, and the lane header must agree with them
+        /// whenever any contributor resolved at all.
+        attribution: &'a ExplorerFlow,
         flows: Vec<&'a ExplorerFlow>,
     }
     let mut lanes_by_key: BTreeMap<String, LaneAcc> = BTreeMap::new();
     for f in &visible {
-        lanes_by_key
+        let acc = lanes_by_key
             .entry(f.endpoint_key())
             .or_insert_with(|| LaneAcc {
-                first: f,
+                attribution: f,
                 flows: Vec::new(),
-            })
-            .flows
-            .push(f);
+            });
+        if acc.attribution.asn.is_none() && f.asn.is_some() {
+            acc.attribution = f;
+        }
+        acc.flows.push(f);
     }
 
     let mut lanes: Vec<LaneAgg> = lanes_by_key
@@ -530,14 +584,14 @@ pub fn timeline_view(
                     Fidelity::Full => 2,
                 })
                 .unwrap_or(Fidelity::Coarse);
-            let org_id = org_key_of(acc.first.asn.as_ref());
-            let (org, asn) = match &acc.first.asn {
+            let org_id = org_key_of(acc.attribution.asn.as_ref());
+            let (org, asn) = match &acc.attribution.asn {
                 Some(a) => (a.org.clone(), Some(a.asn)),
                 None => (UNKNOWN_ORG_LABEL.to_string(), None),
             };
             LaneAgg {
-                host: acc.first.flow.host.clone(),
-                port: acc.first.flow.port,
+                host: acc.attribution.flow.host.clone(),
+                port: acc.attribution.flow.port,
                 org,
                 org_id,
                 asn,
@@ -620,7 +674,10 @@ pub fn histogram_view(scope_flows: &[ExplorerFlow], n: usize) -> HistogramView {
 
 /// Build the KPI strip over the fully filtered, windowed set (the caller
 /// passes exactly that set — this function applies no filtering itself).
-pub fn kpi_view(filtered: &[ExplorerFlow]) -> KpiView {
+/// Takes an iterator of REFERENCES so callers never clone their flow set
+/// just to satisfy the signature.
+pub fn kpi_view<'a>(filtered: impl IntoIterator<Item = &'a ExplorerFlow>) -> KpiView {
+    let mut flows = 0u64;
     let mut endpoints: HashSet<String> = HashSet::new();
     let mut orgs: HashSet<String> = HashSet::new();
     let mut errors = 0u64;
@@ -630,6 +687,7 @@ pub fn kpi_view(filtered: &[ExplorerFlow]) -> KpiView {
     let mut ms: Vec<u64> = Vec::new();
 
     for f in filtered {
+        flows += 1;
         endpoints.insert(f.endpoint_key());
         orgs.insert(f.org_key());
         if f.is_error() {
@@ -653,7 +711,7 @@ pub fn kpi_view(filtered: &[ExplorerFlow]) -> KpiView {
     ms.sort_unstable();
 
     KpiView {
-        flows: filtered.len() as u64,
+        flows,
         endpoints: endpoints.len() as u64,
         orgs: orgs.len() as u64,
         errors,
@@ -891,6 +949,57 @@ mod tests {
             2,
             "an endpoint filter must not hide the other lanes (facet semantics)"
         );
+    }
+
+    #[test]
+    fn timeline_lane_org_comes_from_a_resolved_contributor_not_read_order() {
+        // A coarse flow (no peer IP → no ASN) arriving FIRST must not file
+        // the lane under "Unknown network" when a sibling resolves — the
+        // topology's org column and the KPI org count key each flow by its
+        // own ASN, and the lane header has to agree with them.
+        let mut coarse_first = github(1, 100);
+        coarse_first.asn = None;
+        coarse_first.flow.fidelity = Fidelity::Coarse;
+        let flows = vec![coarse_first, github(2, 150)];
+
+        let t = timeline_view(&flows, at(0), at(200), &ExplorerFilters::default(), &[], 4);
+
+        assert_eq!(t.lanes.len(), 1);
+        assert_eq!(t.lanes[0].org_id, "as36459", "resolved sibling wins");
+        assert_eq!(t.lanes[0].org, "GitHub");
+        assert_eq!(t.lanes[0].calls, 2, "both flows still count");
+        assert_eq!(
+            t.lanes[0].fidelity,
+            Fidelity::Coarse,
+            "fidelity still reduces across ALL contributors"
+        );
+    }
+
+    #[test]
+    fn timeline_with_a_crossed_window_is_empty_not_a_contradiction() {
+        // from > to = the requested window lies entirely outside the
+        // retained range. The KPI strip (raw request range) reports zero
+        // flows there; the timeline must agree — no lanes, zero runs —
+        // rather than rendering data at clamped-up bounds the user never
+        // asked for.
+        let flows = vec![anthropic(1, 500, true)];
+        let runs = vec![RunSpan {
+            start: at(0),
+            end: None,
+        }];
+
+        let t = timeline_view(
+            &flows,
+            at(500),
+            at(100),
+            &ExplorerFilters::default(),
+            &runs,
+            4,
+        );
+
+        assert!(t.lanes.is_empty());
+        assert_eq!(t.runs_in_window, 0);
+        assert_eq!(t.runs, vec![0, 0, 0, 0], "dense zeros, still n buckets");
     }
 
     #[test]

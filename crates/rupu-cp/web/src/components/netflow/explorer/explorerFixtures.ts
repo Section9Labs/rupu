@@ -61,7 +61,6 @@ export function emptyExplorerResponse(): ExplorerResponse {
     sankey: emptySankey(),
     timeline: emptyTimeline(),
     histogram: emptyHistogram(),
-    hosts: [],
     kpis: emptyKpis(),
     dropped_total: 0,
     asn_loaded: true,
@@ -123,7 +122,6 @@ export function populatedExplorerResponse(): ExplorerResponse {
       bucket_ms: 42_857,
       buckets: [bucket(2), bucket(1, 1), bucket(), bucket(), bucket(), bucket(), bucket()],
     },
-    hosts: [],
     kpis: {
       flows: 3,
       endpoints: 2,

@@ -57,6 +57,13 @@ export function CoveragePopover({
           ⓘ
         </span>
         Coverage &amp; gaps
+        {/* Loss is stated ON the always-visible pill, not only inside the
+            popover — a pill that looks identical at 0 and 40,000 dropped
+            flows would be the silent-incompleteness defect the old
+            always-on banner existed to prevent. */}
+        {droppedTotal > 0 && (
+          <span className="font-semibold">· {droppedTotal} dropped</span>
+        )}
       </button>
       {open && (
         <div

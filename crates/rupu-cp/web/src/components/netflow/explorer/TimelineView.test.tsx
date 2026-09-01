@@ -26,6 +26,7 @@ function renderView(props: Partial<React.ComponentProps<typeof TimelineView>> = 
       onZoomBucket={() => {}}
       canZoomOut={false}
       onZoomOut={() => {}}
+      scope="global"
       {...props}
     />,
   );

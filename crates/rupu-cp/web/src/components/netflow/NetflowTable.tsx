@@ -71,9 +71,16 @@ export interface NetflowTableProps {
   showAttribution?: boolean;
   /** Row click → the explorer's flow-detail slide-over. */
   onRowClick?: (flow: FlowView) => void;
+  /** Whether any cross-filter (workflow/origin/org/host chips) is active —
+   *  the THIRD cause of an empty list, with its own honest wording: a
+   *  filtered-to-nothing table must not claim the scope recorded nothing. */
+  filtersActive?: boolean;
 }
 
-function originLabel(f: FlowView): string {
+/** Exported for the explorer's FlowDetailPanel — one authored rendering of
+ *  a flow's origin, so the table and the detail panel for the same row can
+ *  never disagree on what the origin is called. */
+export function originLabel(f: FlowView): string {
   return f.ctx.origin.name ?? f.ctx.origin.kind;
 }
 
@@ -126,16 +133,25 @@ export function NetflowTable({
   appliedWindow,
   showAttribution = false,
   onRowClick,
+  filtersActive = false,
 }: NetflowTableProps) {
   if (flows.length === 0) {
     // A bound is "applied" per the SERVER's echo, not per whatever the
     // picker's local value happens to be — see this prop's doc comment and
-    // `netflowWindowApplied`'s.
+    // `netflowWindowApplied`'s. Cross-filters are the third distinct cause
+    // of emptiness and get their own wording FIRST: with filters active,
+    // neither "nothing in this range" nor "nothing recorded" is what the
+    // empty list actually means.
     const windowApplied = netflowWindowApplied(appliedWindow);
     return (
       <div className="space-y-3">
         <DroppedBanner droppedTotal={droppedTotal} />
-        {windowApplied ? (
+        {filtersActive ? (
+          <EmptyState
+            title="No flows match the current filters"
+            hint="None of this scope's recorded flows pass the active filter chips — remove some, or choose Clear all."
+          />
+        ) : windowApplied ? (
           <EmptyState
             title="No network flows in this range"
             hint={

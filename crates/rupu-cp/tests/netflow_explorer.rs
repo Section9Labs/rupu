@@ -279,6 +279,37 @@ async fn explorer_run_scope_reads_that_runs_ledger_only() {
 }
 
 #[tokio::test]
+async fn a_run_recorded_in_two_stores_counts_once_in_the_active_runs_strip() {
+    // The same run RECORD can exist in both the global store and the
+    // project-local one (the split `project_run_and_unit_ids`'s dedup
+    // exists for). `RunMetaIndex` must fold it once — a duplicate span
+    // would double-count the timeline's one correlation signal.
+    let global = tempfile::TempDir::new().unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    seed_project(&global, &project);
+    let local_store = RunStore::new(project.path().join(".rupu").join("runs"));
+    local_store
+        .create(
+            seed_run("run-a", "review-wf", project.path()),
+            "name: review-wf\n",
+        )
+        .unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow/explorer"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body["timeline"]["runs_in_window"], 1,
+        "one real run, one strip entry: {body}"
+    );
+}
+
+#[tokio::test]
 async fn flows_list_cross_filters_server_side_and_attributes_rows() {
     let global = tempfile::TempDir::new().unwrap();
     let project = tempfile::TempDir::new().unwrap();

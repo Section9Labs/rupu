@@ -21,8 +21,10 @@ import { useThemeColors } from '../../../lib/useThemeColors';
 import { cn } from '../../../lib/cn';
 import { EmptyState } from '../../ui/EmptyState';
 import {
+  netflowEmptyStateHint,
   netflowRangeEmptyHint,
   netflowWindowApplied,
+  type NetflowScope,
   type NetflowWindowEcho,
 } from '../ScopeDisclosure';
 import {
@@ -42,6 +44,9 @@ export interface TopologyViewProps {
   /** Currently-selected keys per dimension (drives the selected outline). */
   selected: Record<TopoDim, string[]>;
   onToggle: (dim: TopoDim, key: string) => void;
+  /** Selects the scope-limit sentence for the empty state (the README's
+   *  non-negotiable "empty states keep ... the scope-limit sentence"). */
+  scope: NetflowScope;
   appliedWindow?: NetflowWindowEcho;
 }
 
@@ -51,7 +56,13 @@ const COLUMNS: { dim: TopoDim; title: string; pick: (s: SankeyView) => NodeAgg[]
   { dim: 'org', title: 'Networks', pick: (s) => s.orgs },
 ];
 
-export function TopologyView({ sankey, selected, onToggle, appliedWindow }: TopologyViewProps) {
+export function TopologyView({
+  sankey,
+  selected,
+  onToggle,
+  scope,
+  appliedWindow,
+}: TopologyViewProps) {
   const colors = useThemeColors();
   const [hover, setHover] = useState<HoverKey | null>(null);
   const laid = useMemo(() => layoutTopology(sankey), [sankey]);
@@ -60,13 +71,20 @@ export function TopologyView({ sankey, selected, onToggle, appliedWindow }: Topo
   const empty =
     sankey.workflows.length === 0 && sankey.origins.length === 0 && sankey.orgs.length === 0;
   if (empty) {
+    // Both branches carry the scope-limit sentence (`netflowEmptyStateHint`)
+    // — an empty topology must never imply "no network activity happened"
+    // when the coverage is simply narrower than the reader assumes.
     return netflowWindowApplied(appliedWindow) ? (
-      <EmptyState title="No flows to graph in this range" hint={netflowRangeEmptyHint()} />
-    ) : (
       <EmptyState
-        title="No flows to graph for this scope"
-        hint="Workflows connect to the origins they call through and the networks those calls reach."
+        title="No flows to graph in this range"
+        hint={
+          <>
+            {netflowRangeEmptyHint()} {netflowEmptyStateHint(scope)}
+          </>
+        }
       />
+    ) : (
+      <EmptyState title="No flows to graph for this scope" hint={netflowEmptyStateHint(scope)} />
     );
   }
 

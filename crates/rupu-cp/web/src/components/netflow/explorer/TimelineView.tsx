@@ -14,7 +14,7 @@
 //   - `p50/p95` absent renders an em dash, never `0 ms`; a lane whose
 //     least-observable contributor is coarse carries the amber tag.
 
-import { Fragment } from 'react';
+import { Fragment, useMemo } from 'react';
 import { absoluteTime } from '../../../lib/time';
 import { useThemeColors } from '../../../lib/useThemeColors';
 import type { TimelineView as TimelineViewData } from '../../../lib/netflow';
@@ -23,8 +23,10 @@ import { Button } from '../../ui/Button';
 import { EmptyState } from '../../ui/EmptyState';
 import { FidelityBadge } from '../FidelityBadge';
 import {
+  netflowEmptyStateHint,
   netflowRangeEmptyHint,
   netflowWindowApplied,
+  type NetflowScope,
   type NetflowWindowEcho,
 } from '../ScopeDisclosure';
 
@@ -35,6 +37,8 @@ export interface TimelineViewProps {
   onZoomBucket: (fromIso: string, toIso: string) => void;
   canZoomOut: boolean;
   onZoomOut: () => void;
+  /** Selects the scope-limit sentence for the empty state. */
+  scope: NetflowScope;
   appliedWindow?: NetflowWindowEcho;
 }
 
@@ -48,35 +52,63 @@ export function TimelineView({
   onZoomBucket,
   canZoomOut,
   onZoomOut,
+  scope,
   appliedWindow,
 }: TimelineViewProps) {
   const colors = useThemeColors();
   const t0 = Date.parse(timeline.from);
   const span = Math.max(1, Date.parse(timeline.to) - t0);
 
+  // Every lane shares one set of bucket boundaries (dense, fixed count),
+  // so the ISO strings + tooltip time labels are computed ONCE per
+  // timeline — not two Date constructions plus an Intl format per cell
+  // per render. Reduce-based maxima: a spread of lanes×84 numbers as
+  // function arguments hits engine argument limits on wide fleets.
+  const laneBucketCount = timeline.lanes[0]?.buckets.length ?? 0;
+  const boundaries = useMemo(() => {
+    const at = (i: number, count: number) =>
+      new Date(t0 + (span * i) / Math.max(1, count));
+    return {
+      laneIso: Array.from({ length: laneBucketCount + 1 }, (_, i) =>
+        at(i, laneBucketCount).toISOString(),
+      ),
+      laneLabel: Array.from({ length: laneBucketCount }, (_, i) =>
+        absoluteTime(at(i, laneBucketCount).toISOString()),
+      ),
+      runLabel: Array.from({ length: timeline.runs.length }, (_, i) =>
+        absoluteTime(at(i, timeline.runs.length).toISOString()),
+      ),
+    };
+  }, [t0, span, laneBucketCount, timeline.runs.length]);
+
   if (timeline.lanes.length === 0) {
+    // Both branches carry the scope-limit sentence — an empty timeline
+    // must never imply "no network activity happened".
     return netflowWindowApplied(appliedWindow) ? (
-      <EmptyState title="No endpoint activity in this range" hint={netflowRangeEmptyHint()} />
+      <EmptyState
+        title="No endpoint activity in this range"
+        hint={
+          <>
+            {netflowRangeEmptyHint()} {netflowEmptyStateHint(scope)}
+          </>
+        }
+      />
     ) : (
       <EmptyState
         title="No endpoint activity for this scope"
-        hint="Each endpoint reached in the window gets a swimlane here."
+        hint={netflowEmptyStateHint(scope)}
       />
     );
   }
 
   const globalMax = Math.max(
     1,
-    ...timeline.lanes.flatMap((l) => l.buckets.map((b) => b.calls)),
+    timeline.lanes.reduce(
+      (m, l) => l.buckets.reduce((mm, b) => Math.max(mm, b.calls), m),
+      0,
+    ),
   );
-  const maxRuns = Math.max(1, ...timeline.runs);
-
-  // Bucket index → wall time, per the CALLER's bucket count (the runs
-  // strip and each lane carry their own dense arrays; dividing by a
-  // different array's length — or a zero-length one — would corrupt or
-  // NaN the mapping).
-  const bucketTime = (i: number, count: number) =>
-    new Date(t0 + (span * i) / Math.max(1, count));
+  const maxRuns = Math.max(1, timeline.runs.reduce((m, n) => Math.max(m, n), 0));
 
   let lastOrg: string | null = null;
 
@@ -111,7 +143,7 @@ export function TimelineView({
             {timeline.runs.map((n, i) => (
               <div
                 key={i}
-                title={`${n} active runs · ${absoluteTime(bucketTime(i, timeline.runs.length).toISOString())}`}
+                title={`${n} active runs · ${boundaries.runLabel[i]}`}
                 className="flex-1 rounded-[1px]"
                 style={{
                   background: colors.alpha('inkMute', Math.min(0.75, (n / maxRuns) * 0.75)),
@@ -156,14 +188,14 @@ export function TimelineView({
                 </button>
                 <div className="flex h-[22px] flex-1 gap-px">
                   {lane.buckets.map((b, i) => {
-                    const from = bucketTime(i, lane.buckets.length).toISOString();
-                    const to = bucketTime(i + 1, lane.buckets.length).toISOString();
+                    const from = boundaries.laneIso[i];
+                    const to = boundaries.laneIso[i + 1];
                     return (
                       <button
                         key={i}
                         type="button"
                         tabIndex={-1}
-                        title={`${b.calls} calls${b.errors ? ` · ${b.errors} errors` : ''} · ${absoluteTime(from)}`}
+                        title={`${b.calls} calls${b.errors ? ` · ${b.errors} errors` : ''} · ${boundaries.laneLabel[i]}`}
                         onClick={() => {
                           if (b.calls > 0) onZoomBucket(from, to);
                         }}

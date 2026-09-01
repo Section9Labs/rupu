@@ -1,11 +1,10 @@
 // The ONE place every netflow scope-limit sentence in the CP is authored.
-// Three surfaces render <NetflowScopeDisclosure /> — the global Netflow
-// page, the project Network tab, and the run Network tab (Fix 3, netflow
-// Plan 3 review round 3: the run surface previously disclosed nothing at
-// all). NetflowTable's empty-state hint and NetflowGraph's empty-state hint
-// (Fix 2, review round 4) both draw from the exports here too, so the
-// covered-surface list can't drift out of sync the way it did before this
-// fix (four copy-pasted/hand-written fragments, several of them wrong).
+// Since the v3 explorer redesign the disclosure text surfaces through the
+// explorer's CoveragePopover (`disclosureText`, at every scope), and the
+// empty-state hints here feed NetflowTable and the explorer's
+// Topology/Timeline views — so the covered-surface list still can't drift
+// out of sync the way it did before this file existed (four
+// copy-pasted/hand-written fragments, several of them wrong).
 //
 // Coverage list intentionally excludes MCP and webhooks (Fix 2, round 3):
 // `rupu_netflow::ctx::Origin` no longer even HAS an `Mcp`/`Webhook` variant
@@ -114,19 +113,10 @@ export function disclosureText(scope: NetflowScope): string {
   );
 }
 
-export function NetflowScopeDisclosure({
-  scope,
-  className = '',
-}: {
-  scope: NetflowScope;
-  className?: string;
-}) {
-  return (
-    <p className={['text-note text-ink-mute max-w-2xl', className].filter(Boolean).join(' ')}>
-      {disclosureText(scope)}
-    </p>
-  );
-}
+// (The `NetflowScopeDisclosure` paragraph component was retired with the
+// v3 redesign — the popover renders `disclosureText` directly, and a dead
+// component that LOOKS like the live surface is exactly what someone
+// would edit by mistake.)
 
 /** NetflowTable's empty-state hint (Blocker 1, whole-branch review) --
  *  authored here for the same reason `netflowSystemSourceHint` is: a
@@ -205,4 +195,4 @@ export function netflowRangeEmptyHint(): string {
   );
 }
 
-export default NetflowScopeDisclosure;
+export default disclosureText;

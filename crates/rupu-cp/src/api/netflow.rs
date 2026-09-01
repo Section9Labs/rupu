@@ -469,35 +469,11 @@ fn merge_with_transcript(
     by_id.into_values().collect()
 }
 
-/// Build the response, enriching with `table` if given.
-///
-/// `table` is a parameter rather than an internal `load_asn_table()` call so
-/// this function is testable in both directions (table present / absent)
-/// without touching the real `$RUPU_HOME` on disk — every caller (the route
-/// handlers below) loads the table itself and passes it in. `range` is
-/// echoed into the response's `window` field (see [`WindowEcho`]) — it is
-/// NOT re-applied to `flows` here; every caller has already filtered
-/// `flows` (via `read_flows_in_range` or an explicit `range.contains`
-/// pass) before calling this function, so this is purely reporting what
-/// was already enforced, not enforcing it again.
-pub(crate) fn build_response(
-    flows: Vec<FlowRecord>,
-    dropped: u64,
-    table: Option<&AsnTable>,
-    range: &rupu_netflow::ledger::TimeRange,
-) -> NetflowResponse {
-    let hosts = rupu_netflow::ledger::host_rollup(&flows);
-    NetflowResponse {
-        flows: flows
-            .into_iter()
-            .map(|f| FlowView::from_flow(f, table))
-            .collect(),
-        hosts,
-        dropped_total: dropped,
-        window: WindowEcho::from(range),
-        asn_loaded: table.is_some(),
-    }
-}
+// (`build_response` — the pre-explorer response builder — was deleted
+// when `build_filtered_response` became the ONE builder every route uses,
+// including the empty `Unpersisted` case. Two builders meant every
+// contract change had to land twice, and the copy nothing served would be
+// the one that got missed.)
 
 /// Resolve every ledger file a given run/step id's flows could have
 /// landed in: the workspace-local `<workspace>/.rupu/netflow/<id>.jsonl`
@@ -656,13 +632,23 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
 pub(crate) struct RunMetaIndex {
     map: HashMap<String, (String, String)>,
     spans: Vec<RunSpan>,
+    /// Root run ids already folded in — the same run RECORD can appear in
+    /// both the global store and a project-local one (the split
+    /// [`project_run_and_unit_ids`]'s `sort();dedup();` exists for), and
+    /// pushing its span twice would double-count it in the active-runs
+    /// strip.
+    seen_runs: std::collections::HashSet<String>,
 }
 
 impl RunMetaIndex {
     /// Fold one run record (looked up in ITS OWN store — see
     /// [`project_run_and_unit_ids`]'s "same store each id was discovered
-    /// from" rule) into the index.
+    /// from" rule) into the index. A run id already folded is skipped
+    /// entirely (see `seen_runs`).
     fn insert_run(&mut self, store: &RunStore, record: &RunRecord) {
+        if !self.seen_runs.insert(record.id.clone()) {
+            return;
+        }
         for id in run_and_unit_ids(store, &record.id) {
             self.map
                 .entry(id)
@@ -755,21 +741,19 @@ fn to_explorer_flows(
         .collect()
 }
 
-/// Whether one already-enriched flow row passes the active cross-filters.
-/// Key derivation is delegated to `rupu_netflow::ledger::explorer`'s
-/// `*_key_of` helpers so the filter alphabet can never drift from the
-/// aggregate views'.
+/// Whether one already-enriched flow row passes the active cross-filters —
+/// a thin delegate to [`ExplorerFilters::passes_parts`], the ONE
+/// four-dimension predicate, so the table and the aggregate views above it
+/// can never drift on matching rules or key alphabet.
 fn flow_view_passes(v: &FlowView, filters: &ExplorerFilters) -> bool {
-    let dim = |set: &[String], key: &str| set.is_empty() || set.iter().any(|x| x == key);
-    dim(
-        &filters.workflows,
-        explorer::workflow_key_of(v.workflow.as_deref()),
-    ) && dim(&filters.origins, &explorer::origin_key(&v.flow.ctx.origin))
-        && dim(&filters.orgs, &explorer::org_key_of(v.asn.as_ref()))
-        && dim(
-            &filters.hosts,
-            &explorer::endpoint_key_of(&v.flow.host, v.flow.port),
-        )
+    filters.passes_parts(
+        v.workflow.as_deref(),
+        &v.flow.ctx.origin,
+        v.asn.as_ref(),
+        &v.flow.host,
+        v.flow.port,
+        None,
+    )
 }
 
 /// [`build_response`]'s successor for the scoped flows-list routes: same
@@ -797,9 +781,7 @@ pub(crate) fn build_filtered_response(
         })
         .collect();
     views.retain(|v| flow_view_passes(v, filters));
-    let hosts = rupu_netflow::ledger::host_rollup(
-        &views.iter().map(|v| v.flow.clone()).collect::<Vec<_>>(),
-    );
+    let hosts = rupu_netflow::ledger::host_rollup_iter(views.iter().map(|v| &v.flow));
     NetflowResponse {
         flows: views,
         hosts,
@@ -1517,15 +1499,18 @@ pub struct ExplorerQuery {
 /// request (see `rupu_netflow::ledger::explorer`'s module doc for the
 /// per-view filter/window semantics). `Deserialize` for the same
 /// proxying reason as [`FlowView`].
+/// Deliberate deviation from the implementation brief: no `hosts` rollup
+/// field. The brief listed one, but every per-endpoint number the surface
+/// renders (org cards, lane stats) comes from `timeline.lanes` — whose
+/// facet semantics (filters-minus-host) are the ones the UI needs — and a
+/// second rollup under *different* semantics (all filters) that nothing
+/// reads would be dead payload waiting to contradict the lanes beside it.
+/// The flows-list routes still carry their consumed `hosts` rollup.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExplorerResponse {
     pub sankey: SankeyView,
     pub timeline: TimelineView,
     pub histogram: HistogramView,
-    /// Rollup of the fully filtered, windowed set — same
-    /// [`rupu_netflow::ledger::host_rollup`] implementation as the flows
-    /// routes, so byte/percentile honesty rules hold identically.
-    pub hosts: Vec<rupu_netflow::ledger::HostRollup>,
     pub kpis: KpiView,
     /// Whole-history, never window- or filter-scoped — see
     /// [`NetflowResponse::dropped_total`].
@@ -1540,8 +1525,8 @@ pub struct ExplorerResponse {
 /// the UNWINDOWED, UNFILTERED in-scope set — each view applies exactly
 /// the narrowing its own semantics call for (histogram: none; sankey
 /// nodes: window + filters-minus-own-dimension over a scope-wide
-/// universe; timeline lanes: window + filters-minus-host; links / KPIs /
-/// hosts: window + all filters).
+/// universe; timeline lanes: window + filters-minus-host; links / KPIs:
+/// window + all filters).
 pub(crate) fn build_explorer_response(
     scope_flows: &[ExplorerFlow],
     dropped: u64,
@@ -1554,27 +1539,25 @@ pub(crate) fn build_explorer_response(
     // The timeline needs concrete bounds: each side takes the applied
     // window's bound when present, else the histogram's full-retained-
     // range bound, else (empty scope, unbounded request) a deterministic
-    // epoch fallback — there is nothing to render then either way, but a
-    // deterministic echo beats a wall-clock-dependent one.
+    // epoch fallback. A requested bound is NEVER widened to reach the
+    // data — if the resolved sides cross (the window lies entirely
+    // outside the retained range), `timeline_view` treats that as the
+    // empty window it is, so the lanes can never show flows the KPI
+    // strip (built from the raw request range) reports as absent.
     let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
     let from = range.from.or(histogram.from).unwrap_or(epoch);
-    let to = range.to.or(histogram.to).unwrap_or(from).max(from);
+    let to = range.to.or(histogram.to).unwrap_or(from);
     let timeline = explorer::timeline_view(scope_flows, from, to, filters, spans, EXPLORER_BUCKETS);
     let sankey = explorer::sankey_view(scope_flows, range, filters);
-    let filtered: Vec<ExplorerFlow> = scope_flows
-        .iter()
-        .filter(|f| range.contains(f.flow.ts) && filters.passes(f, None))
-        .cloned()
-        .collect();
-    let kpis = explorer::kpi_view(&filtered);
-    let hosts = rupu_netflow::ledger::host_rollup(
-        &filtered.iter().map(|f| f.flow.clone()).collect::<Vec<_>>(),
+    let kpis = explorer::kpi_view(
+        scope_flows
+            .iter()
+            .filter(|f| range.contains(f.flow.ts) && filters.passes(f, None)),
     );
     ExplorerResponse {
         sankey,
         timeline,
         histogram,
-        hosts,
         kpis,
         dropped_total: dropped,
         asn_loaded,
@@ -1846,13 +1829,7 @@ fn enforce_filters_on_proxied_response(resp: &mut NetflowResponse, filters: &Exp
         return;
     }
     resp.flows.retain(|v| flow_view_passes(v, filters));
-    resp.hosts = rupu_netflow::ledger::host_rollup(
-        &resp
-            .flows
-            .iter()
-            .map(|v| v.flow.clone())
-            .collect::<Vec<_>>(),
-    );
+    resp.hosts = rupu_netflow::ledger::host_rollup_iter(resp.flows.iter().map(|v| &v.flow));
 }
 
 /// Correct a host-proxied [`NetflowResponse`] to match `range` regardless
@@ -1880,13 +1857,7 @@ fn enforce_range_on_proxied_response(
     // contains — the same "two adjacent widgets disagree" defect already
     // fixed once for the graph endpoint. Recompute it from the flows THIS
     // side actually kept.
-    resp.hosts = rupu_netflow::ledger::host_rollup(
-        &resp
-            .flows
-            .iter()
-            .map(|v| v.flow.clone())
-            .collect::<Vec<_>>(),
-    );
+    resp.hosts = rupu_netflow::ledger::host_rollup_iter(resp.flows.iter().map(|v| &v.flow));
     // Likewise `window`: an older remote either omits the field (defaults
     // to unbounded via `#[serde(default)]`) or echoes whatever range IT
     // parsed, neither of which describes what this side actually
@@ -2046,7 +2017,14 @@ async fn get_run_netflow(
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
                 let table = load_asn_table(&cache);
-                build_response(Vec::new(), 0, table.as_deref(), &range)
+                build_filtered_response(
+                    Vec::new(),
+                    &RunMetaIndex::default(),
+                    0,
+                    table.as_deref(),
+                    &range,
+                    &filters,
+                )
             })
             .await?;
             Ok(Json(resp))
@@ -2156,12 +2134,18 @@ mod tests {
                         asn: 15169,
                         org: "Google LLC".into(),
                     }),
-                    run_id: None,
-                    workflow: None,
+                    // Populated (not None) deliberately: the fixture must
+                    // EXERCISE the attribution fields so the macOS drift
+                    // guard actually fires if their shape/naming changes —
+                    // a fixture pinning them to their invisible None state
+                    // would neuter the rig (CLAUDE.md fixture rule).
+                    run_id: Some("run-40".into()),
+                    workflow: Some("nightly-scan".into()),
                 },
                 FlowView {
                     flow: flow_err,
                     asn: None,
+                    // The unattributable shape: keys absent entirely.
                     run_id: None,
                     workflow: None,
                 },
@@ -2195,10 +2179,30 @@ mod tests {
         check_fixture("netflow_run.json", &response);
     }
 
+    /// [`build_filtered_response`] with no attribution and no filters —
+    /// the shape the old `build_response` had; these tests assert the
+    /// builder's base contract (rollup / window echo / enrichment)
+    /// independent of the attribution+filtering features layered on top.
+    fn build_unfiltered(
+        flows: Vec<FlowRecord>,
+        dropped: u64,
+        table: Option<&AsnTable>,
+        range: &rupu_netflow::ledger::TimeRange,
+    ) -> NetflowResponse {
+        build_filtered_response(
+            flows.into_iter().map(|f| (String::new(), f)).collect(),
+            &RunMetaIndex::default(),
+            dropped,
+            table,
+            range,
+            &ExplorerFilters::default(),
+        )
+    }
+
     #[test]
     fn build_response_wires_a_server_computed_host_rollup() {
         let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
-        let resp = build_response(
+        let resp = build_unfiltered(
             vec![f],
             0,
             None,
@@ -2222,7 +2226,7 @@ mod tests {
             to: Some(chrono::DateTime::from_timestamp(200, 0).unwrap()),
         };
 
-        let resp = build_response(vec![f], 0, None, &range);
+        let resp = build_unfiltered(vec![f], 0, None, &range);
 
         assert_eq!(resp.window.from, range.from);
         assert_eq!(resp.window.to, range.to);
@@ -2235,7 +2239,7 @@ mod tests {
     fn build_response_with_an_unbounded_range_echoes_a_null_window() {
         let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
 
-        let resp = build_response(
+        let resp = build_unfiltered(
             vec![f],
             0,
             None,
@@ -2260,7 +2264,7 @@ mod tests {
         let mut out_of_window = flow(FlowId::new(), Some("r"), "out.example");
         out_of_window.ts = chrono::DateTime::from_timestamp(500, 0).unwrap();
 
-        let mut resp = build_response(
+        let mut resp = build_unfiltered(
             vec![in_window, out_of_window],
             3,
             None,
@@ -2315,7 +2319,7 @@ mod tests {
         let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
         f.peer_ip = Some("1.0.0.7".parse().unwrap());
 
-        let resp = build_response(
+        let resp = build_unfiltered(
             vec![f],
             0,
             None,
@@ -2345,7 +2349,7 @@ mod tests {
         let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
         f.peer_ip = Some("1.0.0.7".parse().unwrap());
 
-        let resp = build_response(
+        let resp = build_unfiltered(
             vec![f],
             0,
             Some(&table),

@@ -93,6 +93,12 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
   const [explorer, setExplorer] = useState<ExplorerResponse | null>(null);
   const [flows, setFlows] = useState<NetflowResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // True while a refetch is in flight OVER existing data (the initial
+  // load has its own full-surface loading state). Previous data staying
+  // on screen is deliberate — but only honest with a visible "Updating…"
+  // beside it, or whole-history numbers would render under a
+  // just-selected narrower label with nothing saying so.
+  const [refreshing, setRefreshing] = useState(false);
 
   const scopeParam =
     scope === 'run' && runId
@@ -114,15 +120,20 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
           : fetchGlobalNetflow(q, f);
     // Previous data stays on screen while a refetch is in flight — a
     // cross-filter click narrowing the set must not collapse the whole
-    // surface to a loading line and rebuild it.
+    // surface to a loading line and rebuild it. `refreshing` marks the
+    // interim so the stale numbers are never silently presented as the
+    // new selection's.
+    setRefreshing(true);
     Promise.all([fetchNetflowExplorer(scopeParam, q, f), flowsFetch])
       .then(([e, fl]) => {
         if (cancelled) return;
         setExplorer(e);
         setFlows(fl);
+        setRefreshing(false);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
+        setRefreshing(false);
         setError(e instanceof Error ? e.message : 'Failed to load network flows');
       });
     return () => {
@@ -194,9 +205,16 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
     org: filters.orgs,
   };
 
+  const filtersActive = !filtersAreEmpty(filters);
+
   return (
     <div className="space-y-4">
-      <div className="flex justify-end">
+      <div className="flex items-center justify-end gap-3">
+        {refreshing && (
+          <p role="status" className="text-note text-ink-mute">
+            Updating…
+          </p>
+        )}
         <CoveragePopover scope={scope} droppedTotal={explorer.dropped_total} />
       </div>
       <ActivityStrip
@@ -223,6 +241,7 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
             sankey={explorer.sankey}
             selected={selectedTopo}
             onToggle={(dim, key) => toggleFilter(TOPO_DIM_TO_FILTER[dim], key)}
+            scope={scope}
             appliedWindow={explorer.window}
           />
         ) : (
@@ -233,6 +252,7 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
             onZoomBucket={zoomTo}
             canZoomOut={zoomStack.length > 0}
             onZoomOut={zoomOut}
+            scope={scope}
             appliedWindow={explorer.window}
           />
         )}
@@ -260,6 +280,7 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
         appliedWindow={flows.window}
         showAttribution={scope !== 'run'}
         onRowClick={setSelectedFlow}
+        filtersActive={filtersActive}
       />
       <FlowDetailPanel flow={selectedFlow} scope={scope} onClose={() => setSelectedFlow(null)} />
     </div>

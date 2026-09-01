@@ -117,6 +117,12 @@ export function ActivityStrip({
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        // An interrupted drag (touch-scroll interception, lost capture)
+        // must not leave the strip in permanent drag mode — the next
+        // unrelated pointer sequence would silently commit a window the
+        // user never dragged.
+        onPointerCancel={() => setDrag(null)}
+        onLostPointerCapture={() => setDrag(null)}
         className="relative flex h-16 touch-none select-none items-end gap-px cursor-crosshair"
       >
         {histogram.buckets.map((b, i) => (
