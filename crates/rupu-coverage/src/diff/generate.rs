@@ -392,6 +392,7 @@ mod tests {
             id: format!("find_{summary}"),
             file_path: None,
             line_range: None,
+            target_ref: None,
             scope: FindingScope::File,
             summary: summary.to_string(),
             severity: Severity::Medium,

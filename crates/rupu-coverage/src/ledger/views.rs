@@ -139,6 +139,7 @@ mod tests {
             id: "fnd_1".to_string(),
             file_path: Some("src/a.rs".to_string()),
             line_range: Some([1, 5]),
+            target_ref: None,
             scope: FindingScope::Line,
             summary: "x".to_string(),
             severity: Severity::High,
