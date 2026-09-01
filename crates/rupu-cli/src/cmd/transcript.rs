@@ -788,16 +788,27 @@ fn transcript_event_lines(
         TranscriptEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                out.push(transcript_event_line(
-                    Status::Active,
-                    0,
-                    false,
-                    transcript_event_text(
+                match view_mode {
+                    LiveViewMode::Focused => out.push(transcript_event_line(
                         Status::Active,
-                        "thinking",
-                        &truncate_single_line(thinking, 96),
-                    ),
-                ));
+                        0,
+                        false,
+                        transcript_event_text(
+                            Status::Active,
+                            "thinking",
+                            &truncate_single_line(thinking, 96),
+                        ),
+                    )),
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload = crate::output::rich_payload::render_payload(thinking, prefs);
+                        out.extend(render_payload_body_lines(
+                            Status::Active,
+                            "thinking",
+                            &payload.rendered,
+                            0,
+                        ));
+                    }
+                }
             }
             if !content.trim().is_empty() {
                 match view_mode {
@@ -1075,16 +1086,104 @@ fn transcript_event_lines(
                 transcript_event_text(ui_status, "run complete", &detail),
             )]
         }
-        // No dedicated transcript-view row for netflow yet — it streams
-        // into the JSONL for offline inspection, not this pretty view.
-        TranscriptEvent::NetFlow { .. } => Vec::new(),
-        TranscriptEvent::Thinking { .. }
-        | TranscriptEvent::ThinkingDelta { .. }
-        | TranscriptEvent::UserMessage { .. }
-        | TranscriptEvent::Seed { .. }
-        | TranscriptEvent::Compaction { .. }
-        | TranscriptEvent::Notice { .. }
-        | TranscriptEvent::Unknown => Vec::new(), // upgraded to real rows in Task 4
+        TranscriptEvent::Thinking { text, provider, .. } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => vec![transcript_event_line(
+                    Status::Active,
+                    0,
+                    false,
+                    transcript_event_text(
+                        Status::Active,
+                        "thinking",
+                        &format!("[redacted reasoning · {provider}]"),
+                    ),
+                )],
+                Some(t) => match view_mode {
+                    LiveViewMode::Focused => vec![transcript_event_line(
+                        Status::Active,
+                        0,
+                        false,
+                        transcript_event_text(Status::Active, "thinking", &truncate_single_line(t, 96)),
+                    )],
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload = crate::output::rich_payload::render_payload(t, prefs);
+                        render_payload_body_lines(Status::Active, "thinking", &payload.rendered, 0)
+                    }
+                },
+            }
+        }
+        TranscriptEvent::ThinkingDelta { .. } => Vec::new(),
+        TranscriptEvent::UserMessage { content } => match view_mode {
+            LiveViewMode::Focused => vec![transcript_event_line(
+                Status::Active,
+                0,
+                false,
+                transcript_event_text(Status::Active, "prompt", &truncate_single_line(content, 96)),
+            )],
+            LiveViewMode::Compact | LiveViewMode::Full => {
+                let payload = crate::output::rich_payload::render_payload(content, prefs);
+                render_payload_body_lines(Status::Active, "prompt", &payload.rendered, 0)
+            }
+        },
+        TranscriptEvent::Seed { message_count, source_transcript, .. } => {
+            let detail = match source_transcript {
+                Some(src) => format!(
+                    "{message_count} prior messages seed this run  ·  from {}",
+                    truncate_single_line(src, 48)
+                ),
+                None => format!("{message_count} prior messages seed this run"),
+            };
+            vec![transcript_event_line(
+                Status::Active,
+                0,
+                false,
+                transcript_event_text(Status::Active, "seed", &detail),
+            )]
+        }
+        TranscriptEvent::Notice { kind, message } => vec![transcript_event_line(
+            Status::Awaiting,
+            0,
+            false,
+            transcript_event_text(
+                Status::Awaiting, "notice",
+                &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+            ),
+        )],
+        TranscriptEvent::Compaction { seq, summarized_messages, backup_path, .. } => {
+            vec![transcript_event_line(
+                Status::Active,
+                0,
+                false,
+                transcript_event_text(
+                    Status::Active, "compaction",
+                    &format!("seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"),
+                ),
+            )]
+        }
+        TranscriptEvent::NetFlow { flow } => {
+            let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+            let status = if ok { Status::Complete } else { Status::Failed };
+            vec![transcript_event_line(
+                status,
+                0,
+                false,
+                transcript_event_text(
+                    status, "net flow",
+                    &format!(
+                        "{} {}{}  ·  {}  ·  {}ms",
+                        flow.method, flow.host, flow.path,
+                        flow.status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                        flow.duration_ms.unwrap_or(0),
+                    ),
+                ),
+            )]
+        }
+        TranscriptEvent::Unknown => vec![transcript_event_line(
+            Status::Active,
+            0,
+            false,
+            transcript_event_text(Status::Active, "event", "unrecognized event type (newer rupu wrote this transcript)"),
+        )],
     }
 }
 
@@ -1267,8 +1366,23 @@ pub(crate) fn render_pretty_transcript_event(
         TranscriptEvent::AssistantDelta { .. } => {}
         TranscriptEvent::AssistantMessage { content, thinking } => {
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                let detail = truncate_single_line(thinking, 96);
-                printer.sideband_event(Status::Active, "thinking", Some(&detail));
+                match view_mode {
+                    LiveViewMode::Focused => {
+                        let detail = truncate_single_line(thinking, 96);
+                        printer.sideband_event(Status::Active, "thinking", Some(&detail));
+                    }
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload =
+                            crate::output::rich_payload::render_payload(thinking, printer.prefs());
+                        let mut lines = payload.rendered.lines();
+                        if let Some(first) = lines.next() {
+                            printer.sideband_event(Status::Active, "thinking", Some(first));
+                            for line in lines {
+                                printer.sideband_event(Status::Active, "", Some(line));
+                            }
+                        }
+                    }
+                }
             }
             if !content.trim().is_empty() {
                 match view_mode {
@@ -1435,16 +1549,108 @@ pub(crate) fn render_pretty_transcript_event(
             }
             printer.sideband_event(ui_status, "run complete", Some(&detail));
         }
-        // No dedicated live-view rendering for netflow yet — it streams
-        // into the JSONL for offline inspection, not this pretty printer.
-        TranscriptEvent::NetFlow { .. } => {}
-        TranscriptEvent::Thinking { .. }
-        | TranscriptEvent::ThinkingDelta { .. }
-        | TranscriptEvent::UserMessage { .. }
-        | TranscriptEvent::Seed { .. }
-        | TranscriptEvent::Compaction { .. }
-        | TranscriptEvent::Notice { .. }
-        | TranscriptEvent::Unknown => {} // upgraded to real rows in Task 4
+        TranscriptEvent::Thinking { text, provider, .. } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => {
+                    printer.sideband_event(
+                        Status::Active,
+                        "thinking",
+                        Some(&format!("[redacted reasoning · {provider}]")),
+                    );
+                }
+                Some(t) => match view_mode {
+                    LiveViewMode::Focused => {
+                        printer.sideband_event(
+                            Status::Active,
+                            "thinking",
+                            Some(&truncate_single_line(t, 96)),
+                        );
+                    }
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload =
+                            crate::output::rich_payload::render_payload(t, printer.prefs());
+                        let mut lines = payload.rendered.lines();
+                        if let Some(first) = lines.next() {
+                            printer.sideband_event(Status::Active, "thinking", Some(first));
+                            for line in lines {
+                                printer.sideband_event(Status::Active, "", Some(line));
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        // `ThinkingDelta` is dropped here just like `AssistantDelta` above —
+        // this pretty printer only renders the committed block, never the
+        // streamed chunks that preceded it.
+        TranscriptEvent::ThinkingDelta { .. } => {}
+        TranscriptEvent::UserMessage { content } => {
+            printer.sideband_event(
+                Status::Active,
+                "prompt",
+                Some(&truncate_single_line(content, 96)),
+            );
+        }
+        TranscriptEvent::Seed {
+            message_count,
+            source_transcript,
+            ..
+        } => {
+            let detail = match source_transcript {
+                Some(src) => format!(
+                    "{message_count} prior messages seed this run  ·  from {}",
+                    truncate_single_line(src, 48)
+                ),
+                None => format!("{message_count} prior messages seed this run"),
+            };
+            printer.sideband_event(Status::Active, "seed", Some(&detail));
+        }
+        TranscriptEvent::Notice { kind, message } => {
+            printer.sideband_event(
+                Status::Awaiting,
+                "notice",
+                Some(&format!("{kind}  ·  {}", truncate_single_line(message, 96))),
+            );
+        }
+        TranscriptEvent::Compaction {
+            seq,
+            summarized_messages,
+            backup_path,
+            ..
+        } => {
+            printer.sideband_event(
+                Status::Active,
+                "compaction",
+                Some(&format!(
+                    "seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"
+                )),
+            );
+        }
+        TranscriptEvent::NetFlow { flow } => {
+            let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+            let status = if ok { Status::Complete } else { Status::Failed };
+            printer.sideband_event(
+                status,
+                "net flow",
+                Some(&format!(
+                    "{} {}{}  ·  {}  ·  {}ms",
+                    flow.method,
+                    flow.host,
+                    flow.path,
+                    flow.status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    flow.duration_ms.unwrap_or(0),
+                )),
+            );
+        }
+        TranscriptEvent::Unknown => {
+            printer.sideband_event(
+                Status::Active,
+                "event",
+                Some("unrecognized event type (newer rupu wrote this transcript)"),
+            );
+        }
     }
 }
 
@@ -2134,6 +2340,116 @@ fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_event_renders_full_body_in_full_view_and_redacted_marker() {
+        let prefs = transcript_list_test_prefs();
+        let long = "x".repeat(300);
+        let ev = TranscriptEvent::Thinking {
+            text: Some(long.clone()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let full = transcript_event_lines(&ev, &prefs, LiveViewMode::Full);
+        let joined: String = full.iter().map(|l| l.text.as_str()).collect();
+        assert!(
+            joined.contains(&long),
+            "--view full must show the whole thinking body"
+        );
+
+        let focused = transcript_event_lines(&ev, &prefs, LiveViewMode::Focused);
+        assert!(focused
+            .iter()
+            .any(|l| l.text.contains('…') || l.text.len() < 300));
+
+        let redacted = TranscriptEvent::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let lines = transcript_event_lines(&redacted, &prefs, LiveViewMode::Full);
+        assert!(lines[0].text.contains("redacted reasoning"));
+    }
+
+    #[test]
+    fn v2_rows_exist_for_every_new_variant_and_netflow() {
+        let prefs = transcript_list_test_prefs();
+        let cases: Vec<TranscriptEvent> = vec![
+            TranscriptEvent::UserMessage {
+                content: "do it".into(),
+            },
+            TranscriptEvent::Seed {
+                message_count: 4,
+                sha256: "abc".into(),
+                source_transcript: None,
+                messages: Some(serde_json::json!([])),
+            },
+            TranscriptEvent::Notice {
+                kind: "context_trim".into(),
+                message: "trimmed".into(),
+            },
+            TranscriptEvent::Compaction {
+                seq: 1,
+                summarized_messages: 8,
+                backup_path: "/b".into(),
+                messages: serde_json::json!([]),
+            },
+            TranscriptEvent::Unknown,
+        ];
+        for ev in &cases {
+            assert!(
+                !transcript_event_lines(ev, &prefs, LiveViewMode::Compact).is_empty(),
+                "no row for {ev:?} — silent drop"
+            );
+        }
+        // thinking_delta stays dropped, like assistant_delta.
+        assert!(transcript_event_lines(
+            &TranscriptEvent::ThinkingDelta {
+                content: "c".into()
+            },
+            &prefs,
+            LiveViewMode::Full
+        )
+        .is_empty());
+
+        // NetFlow: reuses the FlowRecord literal shape from
+        // rupu-transcript's netflow_event_round_trips test.
+        use rupu_netflow::{Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome};
+        let flow = FlowRecord {
+            id: FlowId::from_parts(5, 5),
+            ts: chrono::Utc::now(),
+            ctx: FlowCtx {
+                run_id: Some("run-9".into()),
+                step_id: Some("step-1".into()),
+                agent: Some("reviewer".into()),
+                workspace_id: Some("ws".into()),
+                origin: Origin::Provider("anthropic".into()),
+            },
+            fidelity: Fidelity::Http,
+            method: "POST".into(),
+            scheme: "https".into(),
+            host: "api.anthropic.com".into(),
+            port: 443,
+            path: "/v1/messages".into(),
+            peer_ip: None,
+            resolved_ips: vec![],
+            http_version: Some("HTTP/1.1".into()),
+            status: Some(200),
+            outcome: Outcome::Ok,
+            error: None,
+            bytes_out: Some(10),
+            bytes_in: Some(20),
+            body_complete: true,
+            ttfb_ms: Some(5),
+            duration_ms: Some(50),
+        };
+        let netflow_ev = TranscriptEvent::NetFlow {
+            flow: Box::new(flow),
+        };
+        assert!(!transcript_event_lines(&netflow_ev, &prefs, LiveViewMode::Compact).is_empty());
+    }
 
     #[test]
     fn one_line_preview_passes_short_text_through() {

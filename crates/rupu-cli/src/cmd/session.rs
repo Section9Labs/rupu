@@ -1940,6 +1940,13 @@ enum SessionEntry {
         thinking: Option<String>,
         streaming: bool,
     },
+    /// A standalone reasoning block (schema-v2 `Thinking` event) — not
+    /// bundled with an `Assistant` entry's content. `text: None` means the
+    /// block was redacted by the provider.
+    Thinking {
+        text: Option<String>,
+        provider: String,
+    },
     ToolCall {
         tool: String,
         input: serde_json::Value,
@@ -2523,19 +2530,110 @@ impl SessionInteractiveState {
                     error: error.clone(),
                 });
             }
-            // Netflow capture streams into the transcript for offline
-            // inspection (`rupu transcript show`), but the interactive
-            // session view has no dedicated row for it yet — silently
-            // skip rather than clutter the entry list. Out of scope for
-            // the capture-wiring task; a future task can add rendering.
-            TranscriptEvent::NetFlow { .. } => {}
-            TranscriptEvent::Thinking { .. }
-            | TranscriptEvent::ThinkingDelta { .. }
-            | TranscriptEvent::UserMessage { .. }
-            | TranscriptEvent::Seed { .. }
-            | TranscriptEvent::Compaction { .. }
-            | TranscriptEvent::Notice { .. }
-            | TranscriptEvent::Unknown => {} // upgraded to real rows in Task 4
+            TranscriptEvent::NetFlow { flow } => {
+                let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+                let status = if ok {
+                    crate::output::palette::Status::Complete
+                } else {
+                    crate::output::palette::Status::Failed
+                };
+                self.push_line(
+                    status,
+                    retained_session_event_line_raw(
+                        status,
+                        "net flow",
+                        &format!(
+                            "{} {}{}  ·  {}  ·  {}ms",
+                            flow.method,
+                            flow.host,
+                            flow.path,
+                            flow.status
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            flow.duration_ms.unwrap_or(0),
+                        ),
+                    ),
+                );
+            }
+            TranscriptEvent::Thinking { text, provider, .. } => {
+                self.activity = SessionActivity::Thinking;
+                self.push_entry(SessionEntry::Thinking {
+                    text: text.clone(),
+                    provider: provider.clone(),
+                });
+            }
+            // `ThinkingDelta` is dropped just like `AssistantDelta` isn't
+            // pushed as its own entry — the committed `Thinking`/`Assistant`
+            // entry carries the whole block.
+            TranscriptEvent::ThinkingDelta { .. } => {}
+            TranscriptEvent::UserMessage { content } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line(
+                        crate::output::palette::Status::Active,
+                        "prompt",
+                        &truncate_single_line(content, 96),
+                    ),
+                );
+            }
+            TranscriptEvent::Seed {
+                message_count,
+                source_transcript,
+                ..
+            } => {
+                let detail = match source_transcript {
+                    Some(src) => format!(
+                        "{message_count} prior messages seed this run  ·  from {}",
+                        truncate_single_line(src, 48)
+                    ),
+                    None => format!("{message_count} prior messages seed this run"),
+                };
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "seed",
+                        &detail,
+                    ),
+                );
+            }
+            TranscriptEvent::Notice { kind, message } => {
+                self.push_line(
+                    crate::output::palette::Status::Awaiting,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Awaiting,
+                        "notice",
+                        &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+                    ),
+                );
+            }
+            TranscriptEvent::Compaction {
+                seq,
+                summarized_messages,
+                backup_path,
+                ..
+            } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "compaction",
+                        &format!(
+                            "seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"
+                        ),
+                    ),
+                );
+            }
+            TranscriptEvent::Unknown => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "event",
+                        "unrecognized event type (newer rupu wrote this transcript)",
+                    ),
+                );
+            }
         }
     }
 
@@ -3739,15 +3837,17 @@ fn render_session_entry_rows(
             );
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
                 if view_mode == LiveViewMode::Full {
-                    rows.extend(render_role_body(
-                        &[retained_session_event_line(
+                    let payload = render_payload(thinking, prefs);
+                    let mut lines = payload.rendered.lines();
+                    if let Some(first) = lines.next() {
+                        let mut body = vec![retained_session_event_line_raw(
                             Status::Active,
                             "thinking",
-                            &truncate_single_line(thinking, 96),
-                        )],
-                        role_color,
-                        width,
-                    ));
+                            first,
+                        )];
+                        body.extend(lines.map(str::to_string));
+                        rows.extend(render_role_body(&body, role_color, width));
+                    }
                 }
             }
             if !content.trim().is_empty() {
@@ -3763,6 +3863,51 @@ fn render_session_entry_rows(
                 rows.extend(render_role_body(&body_lines, role_color, width));
             }
             rows
+        }
+        SessionEntry::Thinking { text, provider } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => render_nested_event_rows(
+                    next_is_nested,
+                    Status::Active,
+                    retained_session_event_line(
+                        Status::Active,
+                        "thinking",
+                        &format!("[redacted reasoning · {provider}]"),
+                    ),
+                    width,
+                ),
+                Some(t) => match view_mode {
+                    LiveViewMode::Focused | LiveViewMode::Compact => render_nested_event_rows(
+                        next_is_nested,
+                        Status::Active,
+                        retained_session_event_line(
+                            Status::Active,
+                            "thinking",
+                            &truncate_single_line(t, 96),
+                        ),
+                        width,
+                    ),
+                    LiveViewMode::Full => {
+                        let payload = render_payload(t, prefs);
+                        let mut lines = payload.rendered.lines();
+                        let mut rows = Vec::new();
+                        if let Some(first) = lines.next() {
+                            rows = render_nested_event_rows(
+                                next_is_nested,
+                                Status::Active,
+                                retained_session_event_line_raw(Status::Active, "thinking", first),
+                                width,
+                            );
+                            rows.extend(render_nested_body_lines(
+                                next_is_nested,
+                                &lines.map(str::to_string).collect::<Vec<_>>(),
+                                width,
+                            ));
+                        }
+                        rows
+                    }
+                },
+            }
         }
         SessionEntry::ToolCall { tool, input } => {
             let mut rows = render_nested_event_rows(
@@ -4160,6 +4305,7 @@ fn session_entry_is_nested(entry: Option<&SessionEntry>) -> bool {
                 | SessionEntry::ActionEmitted { .. }
                 | SessionEntry::ToolAudit { .. }
                 | SessionEntry::GateRequested { .. }
+                | SessionEntry::Thinking { .. }
         )
     )
 }
@@ -4387,15 +4533,35 @@ fn transcript_event_lines(
         TranscriptEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                out.push(SessionViewLine {
-                    status: Status::Active,
-                    text: retained_session_event_line(
-                        Status::Active,
-                        "thinking",
-                        &truncate_single_line(thinking, 96),
-                    ),
-                    continuation: false,
-                });
+                match view_mode {
+                    LiveViewMode::Focused => out.push(SessionViewLine {
+                        status: Status::Active,
+                        text: retained_session_event_line(
+                            Status::Active,
+                            "thinking",
+                            &truncate_single_line(thinking, 96),
+                        ),
+                        continuation: false,
+                    }),
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload = render_payload(thinking, prefs);
+                        let mut lines = payload.rendered.lines();
+                        if let Some(first) = lines.next() {
+                            out.push(SessionViewLine {
+                                status: Status::Active,
+                                text: retained_session_event_line_raw(Status::Active, "thinking", first),
+                                continuation: false,
+                            });
+                            for line in lines {
+                                out.push(SessionViewLine {
+                                    status: Status::Active,
+                                    text: line.to_string(),
+                                    continuation: true,
+                                });
+                            }
+                        }
+                    }
+                }
             }
             if !content.trim().is_empty() {
                 match view_mode {
@@ -4805,16 +4971,124 @@ fn transcript_event_lines(
                 continuation: false,
             }]
         }
-        // No dedicated session-view row for netflow yet (see the
-        // matching no-op in `push_transcript_event` above).
-        TranscriptEvent::NetFlow { .. } => Vec::new(),
-        TranscriptEvent::Thinking { .. }
-        | TranscriptEvent::ThinkingDelta { .. }
-        | TranscriptEvent::UserMessage { .. }
-        | TranscriptEvent::Seed { .. }
-        | TranscriptEvent::Compaction { .. }
-        | TranscriptEvent::Notice { .. }
-        | TranscriptEvent::Unknown => Vec::new(), // upgraded to real rows in Task 4
+        TranscriptEvent::Thinking { text, provider, .. } => {
+            match text.as_deref().filter(|t| !t.trim().is_empty()) {
+                None => vec![SessionViewLine {
+                    status: Status::Active,
+                    text: retained_session_event_line(
+                        Status::Active,
+                        "thinking",
+                        &format!("[redacted reasoning · {provider}]"),
+                    ),
+                    continuation: false,
+                }],
+                Some(t) => match view_mode {
+                    LiveViewMode::Focused => vec![SessionViewLine {
+                        status: Status::Active,
+                        text: retained_session_event_line(Status::Active, "thinking", &truncate_single_line(t, 96)),
+                        continuation: false,
+                    }],
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let payload = render_payload(t, prefs);
+                        let mut lines = payload.rendered.lines();
+                        let mut out = Vec::new();
+                        if let Some(first) = lines.next() {
+                            out.push(SessionViewLine {
+                                status: Status::Active,
+                                text: retained_session_event_line_raw(Status::Active, "thinking", first),
+                                continuation: false,
+                            });
+                            for line in lines {
+                                out.push(SessionViewLine {
+                                    status: Status::Active,
+                                    text: line.to_string(),
+                                    continuation: true,
+                                });
+                            }
+                        }
+                        out
+                    }
+                },
+            }
+        }
+        TranscriptEvent::ThinkingDelta { .. } => Vec::new(),
+        TranscriptEvent::UserMessage { content } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line(Status::Active, "prompt", &truncate_single_line(content, 96)),
+            continuation: false,
+        }],
+        TranscriptEvent::Seed {
+            message_count,
+            source_transcript,
+            ..
+        } => {
+            let detail = match source_transcript {
+                Some(src) => format!(
+                    "{message_count} prior messages seed this run  ·  from {}",
+                    truncate_single_line(src, 48)
+                ),
+                None => format!("{message_count} prior messages seed this run"),
+            };
+            vec![SessionViewLine {
+                status: Status::Active,
+                text: retained_session_event_line_raw(Status::Active, "seed", &detail),
+                continuation: false,
+            }]
+        }
+        TranscriptEvent::Notice { kind, message } => vec![SessionViewLine {
+            status: Status::Awaiting,
+            text: retained_session_event_line_raw(
+                Status::Awaiting,
+                "notice",
+                &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::Compaction {
+            seq,
+            summarized_messages,
+            backup_path,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "compaction",
+                &format!(
+                    "seq {seq}  ·  summarized {summarized_messages} messages  ·  backup {backup_path}"
+                ),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::NetFlow { flow } => {
+            let ok = flow.status.is_some_and(|s| s < 400) && flow.error.is_none();
+            let status = if ok { Status::Complete } else { Status::Failed };
+            vec![SessionViewLine {
+                status,
+                text: retained_session_event_line_raw(
+                    status,
+                    "net flow",
+                    &format!(
+                        "{} {}{}  ·  {}  ·  {}ms",
+                        flow.method,
+                        flow.host,
+                        flow.path,
+                        flow.status.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                        flow.duration_ms.unwrap_or(0),
+                    ),
+                ),
+                continuation: false,
+            }]
+        }
+        TranscriptEvent::Unknown => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "event",
+                "unrecognized event type (newer rupu wrote this transcript)",
+            ),
+            continuation: false,
+        }],
     }
 }
 
@@ -8669,6 +8943,113 @@ mod tests {
         assert!(!compact.is_empty());
         assert!(compact[0].text.contains("assistant"));
         assert!(compact.len() > 1);
+    }
+
+    #[test]
+    fn transcript_event_lines_thinking_full_body_and_redacted_marker() {
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let long = "x".repeat(300);
+        let ev = TranscriptEvent::Thinking {
+            text: Some(long.clone()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let full = transcript_event_lines(&ev, LiveViewMode::Full, &full_prefs);
+        let joined: String = full.iter().map(|l| l.text.as_str()).collect();
+        assert!(joined.contains(&long));
+
+        let focused = transcript_event_lines(&ev, LiveViewMode::Focused, &focused_prefs);
+        assert_eq!(focused.len(), 1);
+        assert!(focused[0].text.len() < 300);
+
+        let redacted = TranscriptEvent::Thinking {
+            text: None,
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        };
+        let lines = transcript_event_lines(&redacted, LiveViewMode::Full, &full_prefs);
+        assert!(lines[0].text.contains("redacted reasoning"));
+    }
+
+    #[test]
+    fn transcript_event_lines_v2_rows_exist_for_every_new_variant() {
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let cases: Vec<TranscriptEvent> = vec![
+            TranscriptEvent::UserMessage {
+                content: "do it".into(),
+            },
+            TranscriptEvent::Seed {
+                message_count: 4,
+                sha256: "abc".into(),
+                source_transcript: None,
+                messages: Some(serde_json::json!([])),
+            },
+            TranscriptEvent::Notice {
+                kind: "context_trim".into(),
+                message: "trimmed".into(),
+            },
+            TranscriptEvent::Compaction {
+                seq: 1,
+                summarized_messages: 8,
+                backup_path: "/b".into(),
+                messages: serde_json::json!([]),
+            },
+            TranscriptEvent::Unknown,
+        ];
+        for ev in &cases {
+            assert!(
+                !transcript_event_lines(ev, LiveViewMode::Compact, &prefs).is_empty(),
+                "no row for {ev:?} — silent drop"
+            );
+        }
+        assert!(transcript_event_lines(
+            &TranscriptEvent::ThinkingDelta {
+                content: "c".into()
+            },
+            LiveViewMode::Full,
+            &prefs,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn push_transcript_event_thinking_renders_a_real_row_not_a_silent_drop() {
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_thinking.jsonl"),
+            Some("run_thinking".into()),
+            LiveViewMode::Full,
+        );
+        state.push_transcript_event(&TranscriptEvent::Thinking {
+            text: Some("reasoning about the fix".into()),
+            provider: "anthropic".into(),
+            model: "m".into(),
+            raw: serde_json::json!({}),
+        });
+        assert!(matches!(
+            state.entries.last(),
+            Some(SessionEntry::Thinking { .. })
+        ));
     }
 
     #[test]
