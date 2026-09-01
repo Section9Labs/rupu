@@ -7224,11 +7224,36 @@ fn parse_fanout_items(rendered: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Field names a fan-out item may use to identify itself, in preference
+/// order. `id` first because that is what task lists actually carry.
+const FANOUT_IDENTITY_KEYS: [&str; 5] = ["id", "name", "target", "path", "key"];
+
 /// Render a fan-out item value to a short, single-line live-view label.
+///
+/// An object item is labelled by its identity field when it has one. Without
+/// this, a unit is labelled with its own serialized JSON truncated to 60
+/// characters — so a task list whose items begin with a long `rationale`
+/// renders every unit as the same unreadable prefix, and the operator cannot
+/// tell unit 3 from unit 11 in the live view. The full item is still on the
+/// unit's detail panel; this is the label, and a label's whole job is to
+/// distinguish.
 fn fanout_unit_key(item: &serde_json::Value) -> String {
     const MAX: usize = 60;
     let raw = match item {
         serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) => FANOUT_IDENTITY_KEYS
+            .iter()
+            .find_map(|k| match map.get(*k) {
+                // A blank or whitespace-only id identifies nothing; fall
+                // through to the next candidate rather than labelling the
+                // unit with an empty string.
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                    Some(s.trim().to_string())
+                }
+                Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| item.to_string()),
         other => other.to_string(),
     };
     let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -8029,6 +8054,47 @@ impl RawFindingsBag {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fanout_unit_key_prefers_an_identity_field_over_the_raw_blob() {
+        // The shape that motivated this: a task item whose first field is a
+        // long rationale. Labelling by serialized JSON made every unit in the
+        // fan-out render as the same truncated prefix.
+        let item = serde_json::json!({
+            "id": "t-10001",
+            "rationale": "The last sweep found this uncovered: recon/surface.json lists the host but no full-range TCP enumeration was attempted against it",
+            "target": "identity.example"
+        });
+        assert_eq!(fanout_unit_key(&item), "t-10001");
+    }
+
+    #[test]
+    fn fanout_unit_key_falls_through_blank_ids_and_then_to_the_blob() {
+        // Blank id -> next candidate.
+        let blank = serde_json::json!({ "id": "   ", "name": "netprobe" });
+        assert_eq!(fanout_unit_key(&blank), "netprobe");
+
+        // Numeric ids are identities too.
+        let numeric = serde_json::json!({ "id": 42 });
+        assert_eq!(fanout_unit_key(&numeric), "42");
+
+        // No identity field at all -> previous behaviour, truncated JSON.
+        let anon = serde_json::json!({ "rationale": "x" });
+        assert_eq!(fanout_unit_key(&anon), r#"{"rationale":"x"}"#);
+    }
+
+    #[test]
+    fn fanout_unit_key_still_truncates_and_keeps_strings_verbatim() {
+        let long = "a".repeat(120);
+        let out = fanout_unit_key(&serde_json::Value::String(long));
+        assert_eq!(out.chars().count(), 60);
+        assert!(out.ends_with('\u{2026}'));
+
+        assert_eq!(
+            fanout_unit_key(&serde_json::Value::String("src/a.rs".into())),
+            "src/a.rs"
+        );
+    }
     use super::*;
     use std::sync::{Arc, Mutex};
 
