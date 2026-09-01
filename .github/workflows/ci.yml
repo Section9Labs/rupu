@@ -353,6 +353,17 @@ jobs:
     name: macos-app (swift test + xcodebuild)
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      # Pin the SAME Xcode release.yml's macos-app job pins (the gate/release
+      # same-toolchain invariant). The image default (16.4, Swift 6.1.2)
+      # stack-overflows swift-frontend's deserializer on RupuShell's
+      # cross-module generic nesting — Release configuration only, which is
+      # why v0.76.0-beta.2/.3 shipped without a .app while this gate stayed
+      # green: it only built Debug. Full diagnosis: ISSUES.md I-91. A later
+      # Swift fixes it (26.6 verified locally; 26.3 is the newest on the
+      # macos-15 image). Hence also the Release-config step below, so a
+      # toolchain/config crash lands in a PR, never first in a release.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app
     steps:
       - uses: actions/checkout@v5
       - name: Install XcodeGen
@@ -361,3 +372,5 @@ jobs:
         run: make macos-test
       - name: App target builds
         run: make macos-build
+      - name: App target builds (Release config — the shipped configuration)
+        run: make macos-release
