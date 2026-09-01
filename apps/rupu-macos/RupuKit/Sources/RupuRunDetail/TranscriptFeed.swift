@@ -38,22 +38,43 @@ import RupuDesign
 /// and `AgentRunDetailScreen`/`RunDetailScreen`'s transcript tab pass their
 /// own `runID`/`host` straight through.
 ///
-/// **`assistant_delta` is deliberately never rendered** (review fix, web-
-/// viewer parity, carried over unchanged from the pre-Task-7 feed): the
-/// transcript JSONL persists both per-chunk `assistant_delta` events *and*
-/// the consolidated `assistant_message` for the same turn, so rendering both
-/// would show every assistant turn twice. `usage`/`action_emitted` (once
-/// merged onto a standalone audit entry)/`tool_audit`/`net_flow`/`run_start`/
-/// `.unknown` all stay non-rendered top-level rows too — `usage`/`run_start`
-/// carry no per-row content this phase; `tool_audit`/`action_emitted` are
-/// folded into their `ToolEntry` by `buildTranscriptViewModel` and rendered
-/// as part of that entry's `ToolCardView`/`FindingCard`, never as their own
-/// row.
+/// **Every other event kind renders as its own row too** (transcript-
+/// fidelity v2, Plan 3 Task 2 — spec §5's display parity matrix: "no silent
+/// drops anywhere"). `thinking`/`user_message`/`seed`/`notice`/`compaction`
+/// and a forward-compat `unknown(type:)` are transcript-level narrative
+/// events, not turn-scoped tool activity — `buildFeedRows` positions each as
+/// a standalone row chronologically among the turns, the same way
+/// `gate_requested` always has (see that function's doc comment). `turn_end`
+/// likewise gains its own `turnSeparator` row surfacing that turn's
+/// `tokens_in`/`tokens_out`, previously computed onto `TurnVM` but never
+/// displayed anywhere.
+///
+/// **Only three kinds are deliberately still never rendered, and this is the
+/// complete list**: `assistant_delta`/`thinking_delta` (review fix, web-
+/// viewer parity — the transcript JSONL persists both the per-chunk delta
+/// events *and* the consolidated `assistant_message`/`thinking` event for
+/// the same content, so rendering both would show it twice), `run_start`/
+/// `usage` (carry no per-row content this phase), and `net_flow` (the
+/// Netflow tab's own concern, never the transcript feed's). `tool_audit`/
+/// `action_emitted`/`file_edit`/`command_run` are NOT top-level rows either,
+/// but they are not silently dropped: `buildTranscriptViewModel` folds each
+/// onto its owning (or, for an audit/action-node call with none, a
+/// synthesized standalone) `ToolEntry`, rendered as part of that entry's own
+/// `ToolCardView`/`FindingCard` — an `AuditBadge` in the card header, the
+/// action's merged payload in the card body, the diff/command in their
+/// respective kind bodies — never emitted as a second, separate row.
 public struct TranscriptFeed: View {
     private let events: [TranscriptEvent]
     private let runID: String?
     private let host: String?
     private let sourcePreviewStore: SourcePreviewStore?
+    /// Plan 3, Task 2: how many trailing transcript lines the server
+    /// dropped as unparseable (`APITranscriptPage.unparsed`) — defaulted
+    /// `0` so no existing call site needed to change to keep compiling.
+    /// Threaded from `RunDetailStore.transcriptUnparsedCount` by
+    /// `TranscriptTabContent`; `SessionDetailScreen`/`AgentRunDetailScreen`
+    /// don't hold an `APITranscriptPage` today, so they keep the default.
+    private let unparsedCount: Int
     private let computeRows: ([TranscriptEvent]) -> [FeedRow]
 
     /// Perf & interaction arc, Plan 5 Task 3: `rows`/`sawRunComplete` used to
@@ -74,8 +95,8 @@ public struct TranscriptFeed: View {
     @State var rows: [FeedRow]
     @State var sawRunComplete: Bool
 
-    public init(events: [TranscriptEvent], runID: String? = nil, host: String? = nil, sourcePreviewStore: SourcePreviewStore? = nil) {
-        self.init(events: events, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, computeRows: buildFeedRows)
+    public init(events: [TranscriptEvent], runID: String? = nil, host: String? = nil, sourcePreviewStore: SourcePreviewStore? = nil, unparsedCount: Int = 0) {
+        self.init(events: events, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, unparsedCount: unparsedCount, computeRows: buildFeedRows)
     }
 
     /// Test-only seam (default `internal`, reached via `@testable import
@@ -89,12 +110,14 @@ public struct TranscriptFeed: View {
         runID: String?,
         host: String?,
         sourcePreviewStore: SourcePreviewStore?,
+        unparsedCount: Int = 0,
         computeRows: @escaping ([TranscriptEvent]) -> [FeedRow]
     ) {
         self.events = events
         self.runID = runID
         self.host = host
         self.sourcePreviewStore = sourcePreviewStore
+        self.unparsedCount = unparsedCount
         self.computeRows = computeRows
         self._rows = State(initialValue: computeRows(events))
         self._sawRunComplete = State(initialValue: Self.sawRunComplete(in: events))
@@ -118,6 +141,12 @@ public struct TranscriptFeed: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
+                    if unparsedCount > 0 {
+                        MetaLineRow(
+                            label: "warning",
+                            detail: "\(unparsedCount) transcript line\(unparsedCount == 1 ? "" : "s") could not be parsed (older app or newer rupu)"
+                        )
+                    }
                     ForEach(rows) { row in
                         rowView(row)
                     }
@@ -153,7 +182,30 @@ public struct TranscriptFeed: View {
             GateRequestedRow(gateID: gateID, prompt: prompt, decision: decision, decidedBy: decidedBy)
         case .runComplete(let runID, let status, let totalTokens, let durationMS, let error):
             RunCompleteRow(runID: runID, status: status, totalTokens: totalTokens, durationMS: durationMS, error: error)
+        case .turnSeparator(let turnIdx, let tokensIn, let tokensOut, _):
+            TurnSeparatorRow(turnIdx: turnIdx, tokensIn: tokensIn, tokensOut: tokensOut)
+        case .thinking(let text, _):
+            ThinkingRow(text: text)
+        case .userMessage(let content, _):
+            UserPromptRow(content: content)
+        case .seed(let messageCount, let sourceTranscript, _):
+            MetaLineRow(label: "seed", detail: Self.seedDetail(messageCount: messageCount, sourceTranscript: sourceTranscript))
+        case .notice(let kind, let message, _):
+            MetaLineRow(label: kind, detail: message)
+        case .compaction(let seq, let summarizedMessages, _):
+            MetaLineRow(label: "compaction", detail: "seq \(seq) · summarized \(summarizedMessages) messages")
+        case .unknownEvent(let type, _):
+            MetaLineRow(label: "event", detail: "unrecognized: \(type)")
         }
+    }
+
+    /// `seed`'s detail line — names the source transcript's own filename
+    /// (not its full path, which is a local disk path with no meaning to
+    /// the reader) when the seed chains onto one, per spec §3's "reference,
+    /// not full embed" seed-dedup rule.
+    private static func seedDetail(messageCount: UInt32, sourceTranscript: String?) -> String {
+        guard let sourceTranscript else { return "\(messageCount) prior messages seed this run" }
+        return "\(messageCount) prior messages seed this run · from \((sourceTranscript as NSString).lastPathComponent)"
     }
 }
 
@@ -162,14 +214,26 @@ public struct TranscriptFeed: View {
 // two standalone event kinds that model deliberately excludes
 // ---------------------------------------------------------------------------
 
-/// One rendered feed row: a full `TurnVM`, or a standalone `gate_requested`/
+/// One rendered feed row: a full `TurnVM`, a standalone `gate_requested`/
 /// `run_complete` event — the same two variants the pre-Task-7 flat feed
 /// rendered as its own rows, restyled in place (`GateRequestedRow`/
-/// `RunCompleteRow` below) rather than removed.
+/// `RunCompleteRow` below) rather than removed — or (Plan 3, Task 2) one of
+/// the six transcript-fidelity v2 narrative events `buildTranscriptViewModel`
+/// excludes from every `TurnVM` (see that function's doc comment), plus a
+/// `turnSeparator` surfacing `turn_end`'s own `tokens_in`/`tokens_out` (spec
+/// §5's "new turn separator row" cell) and an `unknownEvent` for a
+/// forward-compat `.unknown(type:)` decode.
 enum FeedRow: Identifiable {
     case turn(TurnVM)
     case gate(gateID: String, prompt: String, decision: String?, decidedBy: String?)
     case runComplete(runID: String, status: String, totalTokens: UInt64, durationMS: UInt64, error: String?)
+    case turnSeparator(turnIdx: UInt32, tokensIn: UInt64?, tokensOut: UInt64?, rowIndex: Int)
+    case thinking(text: String?, rowIndex: Int)
+    case userMessage(content: String, rowIndex: Int)
+    case seed(messageCount: UInt32, sourceTranscript: String?, rowIndex: Int)
+    case notice(kind: String, message: String, rowIndex: Int)
+    case compaction(seq: UInt32, summarizedMessages: UInt32, rowIndex: Int)
+    case unknownEvent(type: String, rowIndex: Int)
 
     /// Perf & interaction arc, Plan 5 Task 3: lets `TranscriptFeed`'s
     /// `ForEach` key on stable row identity instead of positional
@@ -181,11 +245,26 @@ enum FeedRow: Identifiable {
     /// unique per their own event kind. Kind-prefixed so the three variants
     /// can never collide with each other even if their underlying ids ever
     /// happened to share a value.
+    ///
+    /// The six new variants have no inherent unique identifier of their own
+    /// (unlike `gateID`/`runID`) — more than one `notice`, for instance, can
+    /// appear in the same transcript — so each carries its own position in
+    /// the source `events` array (`rowIndex`, assigned once by
+    /// `buildFeedRows`'s `enumerated()` walk) purely to make this id stable
+    /// and unique across an unchanged transcript, the same role a real id
+    /// plays for the other variants.
     var id: String {
         switch self {
         case .turn(let turn): "turn:\(turn.id)"
         case .gate(let gateID, _, _, _): "gate:\(gateID)"
         case .runComplete(let runID, _, _, _, _): "runComplete:\(runID)"
+        case .turnSeparator(_, _, _, let rowIndex): "turnSeparator:\(rowIndex)"
+        case .thinking(_, let rowIndex): "thinking:\(rowIndex)"
+        case .userMessage(_, let rowIndex): "userMessage:\(rowIndex)"
+        case .seed(_, _, let rowIndex): "seed:\(rowIndex)"
+        case .notice(_, _, let rowIndex): "notice:\(rowIndex)"
+        case .compaction(_, _, let rowIndex): "compaction:\(rowIndex)"
+        case .unknownEvent(_, let rowIndex): "unknown:\(rowIndex)"
         }
     }
 }
@@ -262,16 +341,49 @@ func buildFeedRows(events: [TranscriptEvent]) -> [FeedRow] {
         }
     }
 
-    for event in events {
+    /// Review fix (critical): flushes only turns that have already
+    /// CLOSED — never the turn currently open. `turnsOpenedSoFar` counts a
+    /// turn as soon as its `turn_start` arrives, before its `turn_end`, so
+    /// flushing straight to `turnsOpenedSoFar` (as every other flush site
+    /// here does) would treat a still-open turn as flushable. That is
+    /// exactly wrong for a narrative event: the runner's emission-order
+    /// contract writes `Thinking` right after `turn_start` and BEFORE that
+    /// turn's own `assistant_message`/`tool_call` — the normal case, not an
+    /// edge case — so a `thinking` (or `notice`/`seed`/etc.) arriving while
+    /// its enclosing turn is still open must render BEFORE that turn's
+    /// card, never after it. Subtracting one open turn, when one is open,
+    /// defers that turn's card until something else flushes it for real —
+    /// its own `turn_end` (which flushes unadjusted, right before that
+    /// turn's `turnSeparator`), a later `gate_requested`/`run_complete`
+    /// (which also flush unadjusted — a gate/run-complete legitimately
+    /// follows a turn's activity, so holding it back would be wrong), or
+    /// the final catch-all flush at the end of the walk.
+    ///
+    /// Only used by the six narrative-event cases below — never by
+    /// `turn_end`'s own flush (which must include the turn it's closing)
+    /// or `gate_requested`'s (a gate is a pause point that follows a
+    /// turn's activity, not content the turn produced, so it keeps the
+    /// old "flush everything opened so far" contract).
+    func flushClosedTurnsOnly() {
+        flushTurns(upTo: turnsOpenedSoFar - (turnOpen ? 1 : 0))
+    }
+
+    for (index, event) in events.enumerated() {
         switch event {
         case .turnStart:
             guard hasTurnEvents else { continue }
             turnsOpenedSoFar += 1
             turnOpen = true
 
-        case .turnEnd:
+        case .turnEnd(let turnIdx, let tokensIn, let tokensOut):
             guard hasTurnEvents else { continue }
             turnOpen = false
+            // The just-closed turn was already counted into
+            // `turnsOpenedSoFar` when its `turn_start` opened it — flushing
+            // up to that count here always includes it, so the separator
+            // lands directly after its own turn row, never ahead of it.
+            flushTurns(upTo: turnsOpenedSoFar)
+            rows.append(.turnSeparator(turnIdx: turnIdx, tokensIn: tokensIn, tokensOut: tokensOut, rowIndex: index))
 
         case .assistantMessage:
             if hasTurnEvents {
@@ -297,7 +409,50 @@ func buildFeedRows(events: [TranscriptEvent]) -> [FeedRow] {
         case .runComplete(let runID, let status, let totalTokens, let durationMS, let error):
             runCompleteRow = .runComplete(runID: runID, status: status, totalTokens: totalTokens, durationMS: durationMS, error: error)
 
-        case .fileEdit, .commandRun, .actionEmitted, .runStart, .usage, .netFlow, .assistantDelta, .unknown:
+        // Transcript-fidelity v2 (Plan 3, Task 2): transcript-level
+        // narrative events, not turn-scoped tool activity — each flushes
+        // only turns that have already closed (`flushClosedTurnsOnly` —
+        // see its own doc comment for why: a narrative event arriving
+        // while its enclosing turn is still open, the normal case for
+        // `thinking`, must render BEFORE that turn's card), then appends
+        // this row where it chronologically occurred. None of these ever
+        // open/close a turn themselves.
+        case .thinking(let text, _, _):
+            flushClosedTurnsOnly()
+            rows.append(.thinking(text: text, rowIndex: index))
+
+        case .userMessage(let content):
+            flushClosedTurnsOnly()
+            rows.append(.userMessage(content: content, rowIndex: index))
+
+        case .seed(let messageCount, let sourceTranscript):
+            flushClosedTurnsOnly()
+            rows.append(.seed(messageCount: messageCount, sourceTranscript: sourceTranscript, rowIndex: index))
+
+        case .notice(let kind, let message):
+            flushClosedTurnsOnly()
+            rows.append(.notice(kind: kind, message: message, rowIndex: index))
+
+        case .compaction(let seq, let summarizedMessages, _):
+            flushClosedTurnsOnly()
+            rows.append(.compaction(seq: seq, summarizedMessages: summarizedMessages, rowIndex: index))
+
+        // Forward-compat fallback (an unrecognized wire `type`) — rendered,
+        // never dropped, same "no event may vanish" contract as every other
+        // variant here.
+        case .unknown(let type):
+            flushClosedTurnsOnly()
+            rows.append(.unknownEvent(type: type, rowIndex: index))
+
+        // `file_edit`/`command_run` are adjacency-paired onto their owning
+        // `ToolEntry` by `buildTranscriptViewModel` and rendered as part of
+        // that entry's card — never their own row. `action_emitted` is
+        // merged onto a standalone audit entry the same way. `run_start`/
+        // `usage` carry no per-row content this phase. `assistant_delta`/
+        // `thinking_delta` are dropped outright — the consolidated
+        // `assistant_message`/`thinking` event for the same content already
+        // renders; showing both would duplicate it.
+        case .fileEdit, .commandRun, .actionEmitted, .runStart, .usage, .netFlow, .assistantDelta, .thinkingDelta:
             continue
         }
     }
@@ -628,5 +783,118 @@ private struct RunCompleteRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript-fidelity v2 rows (Plan 3, Task 2) — the six narrative events
+// `buildTranscriptViewModel` excludes from every `TurnVM`, plus the
+// `turn_end` separator. Each mirrors this file's existing standalone-row
+// idiom (`.panelStyle(.innerCard)`, `Eyebrow`, `Color.rupu*`) rather than
+// introducing new chrome.
+// ---------------------------------------------------------------------------
+
+/// A standalone `thinking` event — full reasoning block in its true
+/// transcript position, collapsed by default (spec §5: "dim DisclosureGroup
+/// row in true position"). `text == nil` (or empty) is a redacted/omitted
+/// reasoning block, per spec §3's `text: Option<String>` contract — shown as
+/// a plain italic marker rather than an empty, uselessly-toggleable
+/// disclosure.
+private struct ThinkingRow: View {
+    let text: String?
+    @State private var expanded = false
+
+    var body: some View {
+        Group {
+            if let text, !text.isEmpty {
+                DisclosureGroup(isExpanded: $expanded) {
+                    Text(text)
+                        .font(.uiText)
+                        .foregroundStyle(Color.rupuDim)
+                        .padding(.top, 4)
+                        .textSelection(.enabled)
+                } label: {
+                    Eyebrow("Thinking")
+                }
+            } else {
+                Text("[redacted reasoning]")
+                    .font(.noteText)
+                    .italic()
+                    .foregroundStyle(Color.rupuMute)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panelStyle(.innerCard)
+    }
+}
+
+/// A standalone `user_message` event — the turn-opening prompt, rendered at
+/// full weight (`leadText`, `rupuInk`) rather than the dimmer treatment
+/// every other narrative row here uses, since this is the one row a reader
+/// is most likely to actually want to read in full.
+private struct UserPromptRow: View {
+    let content: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Eyebrow("Prompt")
+            Text(content)
+                .font(.leadText)
+                .foregroundStyle(Color.rupuInk)
+                .textSelection(.enabled)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .panelStyle(.innerCard)
+    }
+}
+
+/// Shared one-line label + detail treatment for `seed`/`notice`/
+/// `compaction`/`unknown(type:)` — and the unparsed-lines warning banner
+/// (`TranscriptFeed.body`) — none of which need more than a label and a
+/// short line of context.
+struct MetaLineRow: View {
+    let label: String
+    let detail: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(label).font(.metaText).foregroundStyle(Color.rupuDim)
+            Text(detail)
+                .font(.noteText)
+                .foregroundStyle(Color.rupuMute)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .panelStyle(.innerCard)
+    }
+}
+
+/// A `turn_end` boundary — spec §5's "new turn separator row" cell,
+/// surfacing that turn's `tokens_in`/`tokens_out` (computed onto `TurnVM`
+/// by `buildTranscriptViewModel` but, before this task, never actually
+/// displayed anywhere). Renders with no token suffix when the transcript's
+/// `turn_end` didn't carry them (both fields stay optional on the wire).
+private struct TurnSeparatorRow: View {
+    let turnIdx: UInt32
+    let tokensIn: UInt64?
+    let tokensOut: UInt64?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Rectangle().fill(Color.rupuMute.opacity(0.25)).frame(height: 1)
+            Text("turn \(turnIdx)\(tokenSuffix)")
+                .font(.dataMono(10))
+                .foregroundStyle(Color.rupuMute)
+                .fixedSize()
+            Rectangle().fill(Color.rupuMute.opacity(0.25)).frame(height: 1)
+        }
+    }
+
+    private var tokenSuffix: String {
+        guard let tokensIn, let tokensOut else { return "" }
+        return " · \(Fmt.count(Int(tokensIn))) in · \(Fmt.count(Int(tokensOut))) out"
     }
 }

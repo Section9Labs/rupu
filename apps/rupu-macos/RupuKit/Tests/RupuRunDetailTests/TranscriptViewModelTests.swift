@@ -52,9 +52,9 @@ struct TranscriptViewModelTests {
         #expect(entry.output == "late output")
     }
 
-    // MARK: - file_edit adjacency
+    // MARK: - file_edit FIFO pairing
 
-    @Test func fileEditPairsByAdjacencyOntoThePrecedingUnpairedDiffCall() {
+    @Test func fileEditPairsOntoThePrecedingUnpairedDiffCallViaFIFO() {
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "editing", thinking: nil),
             .toolCall(callID: "c1", tool: "write_file", input: .object(["path": .string("a.rs")])),
@@ -71,9 +71,11 @@ struct TranscriptViewModelTests {
         #expect(entry.fileEdit?.diff == "-old\n+new")
     }
 
-    @Test func fileEditWithNoPendingDiffCallIsDroppedRatherThanMisattached() {
+    @Test func fileEditWithNoPendingDiffCallBecomesAStandaloneEntryRatherThanBeingDropped() {
         // No preceding diff-kind call armed — the file_edit has nothing to
-        // pair onto and must not create a phantom entry or crash.
+        // pair onto. It must still surface as a standalone row rather than
+        // being silently dropped (the Plan 3 review's must-fix: the old
+        // no-else `if let` swallowed this case entirely).
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "nothing to edit yet", thinking: nil),
             .fileEdit(path: "a.rs", kind: "modified", diff: "-old\n+new"),
@@ -81,12 +83,18 @@ struct TranscriptViewModelTests {
 
         let turns = buildTranscriptViewModel(events: events)
 
-        #expect(turns[0].tools.isEmpty)
+        #expect(turns[0].tools.count == 1, "an unpaired file_edit must still surface as a row, not vanish")
+        let entry = turns[0].tools[0]
+        #expect(entry.tool == "")
+        #expect(entry.kind == .diff)
+        #expect(entry.fileEdit?.path == "a.rs")
+        #expect(entry.fileEdit?.kind == "modified")
+        #expect(entry.fileEdit?.diff == "-old\n+new")
     }
 
-    // MARK: - command_run adjacency
+    // MARK: - command_run FIFO pairing
 
-    @Test func commandRunPairsByAdjacencyOntoThePrecedingUnpairedBashCall() {
+    @Test func commandRunPairsOntoThePrecedingUnpairedBashCallViaFIFO() {
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "running", thinking: nil),
             .toolCall(callID: "c1", tool: "bash", input: .object(["command": .string("ls")])),
@@ -101,6 +109,113 @@ struct TranscriptViewModelTests {
         #expect(entry.command?.argv == ["/bin/sh", "-c", "ls"])
         #expect(entry.command?.cwd == "/tmp")
         #expect(entry.command?.exitCode == 0)
+    }
+
+    @Test func commandRunWithNoPendingTerminalCallBecomesAStandaloneEntryRatherThanBeingDropped() {
+        let events: [TranscriptEvent] = [
+            .assistantMessage(content: "nothing running yet", thinking: nil),
+            .commandRun(argv: ["/bin/sh", "-c", "ls"], cwd: "/tmp", exitCode: 0, stdoutBytes: 10, stderrBytes: 0),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns[0].tools.count == 1, "an unpaired command_run must still surface as a row, not vanish")
+        let entry = turns[0].tools[0]
+        #expect(entry.tool == "")
+        #expect(entry.kind == .terminal)
+        #expect(entry.command?.argv == ["/bin/sh", "-c", "ls"])
+        #expect(entry.command?.cwd == "/tmp")
+        #expect(entry.command?.exitCode == 0)
+    }
+
+    // MARK: - file_edit/command_run FIFO across a multi-tool-call turn (Plan 3 review must-fix)
+
+    /// The runner emits ALL of a turn's `tool_call`s in block order before
+    /// dispatching any of them, so a turn with [edit A, bash B, edit C] can
+    /// see `file_edit(a)`, `command_run(b)`, `file_edit(c)` arrive in call
+    /// order too. A single adjacency slot (armed by the LAST tool_call seen)
+    /// would attach diff `a` to call C instead of A, and drop `c` outright
+    /// since nothing would still be "pending" for it. FIFO queues, one for
+    /// diff-capable calls and one for terminal-capable calls, must attribute
+    /// each exactly onto the call that actually produced it.
+    @Test func multiCallTurnAttributesEachFileEditAndCommandRunToTheCorrectCallInOrder() {
+        let events: [TranscriptEvent] = [
+            .assistantMessage(content: "three tool calls", thinking: nil),
+            .toolCall(callID: "A", tool: "write_file", input: .object(["path": .string("a.rs")])),
+            .toolCall(callID: "B", tool: "bash", input: .object(["command": .string("b")])),
+            .toolCall(callID: "C", tool: "edit_file", input: .object(["path": .string("c.rs")])),
+            .fileEdit(path: "a.rs", kind: "created", diff: "diff-a"),
+            .commandRun(argv: ["/bin/sh", "-c", "b"], cwd: "/tmp", exitCode: 0, stdoutBytes: 1, stderrBytes: 0),
+            .fileEdit(path: "c.rs", kind: "modified", diff: "diff-c"),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns[0].tools.count == 3)
+        let entryA = turns[0].tools.first { $0.id == "A" }!
+        let entryB = turns[0].tools.first { $0.id == "B" }!
+        let entryC = turns[0].tools.first { $0.id == "C" }!
+        #expect(entryA.fileEdit?.path == "a.rs")
+        #expect(entryA.fileEdit?.diff == "diff-a")
+        #expect(entryB.command?.argv == ["/bin/sh", "-c", "b"])
+        #expect(entryC.fileEdit?.path == "c.rs")
+        #expect(entryC.fileEdit?.diff == "diff-c")
+        // Cross-check: A must NOT have picked up c's diff, nor C a's.
+        #expect(entryA.fileEdit?.diff != entryC.fileEdit?.diff)
+    }
+
+    // MARK: - a failed call must be evicted from the FIFO queue, not park forever (review regression)
+
+    /// Reviewer-reproduced regression: the runner only emits file_edit on a
+    /// write_file/edit_file's SUCCESS path — a failed call gets
+    /// `tool_result(error)` and no file_edit at all, ever. Left in the
+    /// queue, a failed call in turn 0 would still be sitting there when
+    /// turn 1's unrelated successful call's file_edit arrives, stealing
+    /// that diff FIFO-first and leaving the real match with nothing. A
+    /// `tool_result` with an error must evict its call from the pending
+    /// queue immediately.
+    @Test func failedWriteCallIsEvictedFromTheDiffQueueSoALaterUnrelatedCallIsNotMisattributed() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .toolCall(callID: "A", tool: "write_file", input: .object(["path": .string("a.rs")])),
+            .toolResult(callID: "A", output: "", error: "permission denied", durationMS: 1, structured: nil),
+            .turnEnd(turnIdx: 0, tokensIn: 1, tokensOut: 1),
+            .turnStart(turnIdx: 1),
+            .toolCall(callID: "B", tool: "write_file", input: .object(["path": .string("b.rs")])),
+            .toolResult(callID: "B", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .fileEdit(path: "b.rs", kind: "modified", diff: "diff-b"),
+            .turnEnd(turnIdx: 1, tokensIn: 1, tokensOut: 1),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        let entryA = turns[0].tools.first { $0.id == "A" }!
+        let entryB = turns[1].tools.first { $0.id == "B" }!
+        #expect(entryA.fileEdit == nil, "the failed call must never receive another call's diff")
+        #expect(entryB.fileEdit?.path == "b.rs")
+        #expect(entryB.fileEdit?.diff == "diff-b")
+    }
+
+    /// Same regression, bash/command_run side.
+    @Test func failedBashCallIsEvictedFromTheTerminalQueueSoALaterUnrelatedCallIsNotMisattributed() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .toolCall(callID: "A", tool: "bash", input: .object(["command": .string("false")])),
+            .toolResult(callID: "A", output: "", error: "exit 1", durationMS: 1, structured: nil),
+            .turnEnd(turnIdx: 0, tokensIn: 1, tokensOut: 1),
+            .turnStart(turnIdx: 1),
+            .toolCall(callID: "B", tool: "bash", input: .object(["command": .string("true")])),
+            .toolResult(callID: "B", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .commandRun(argv: ["/bin/sh", "-c", "true"], cwd: "/tmp", exitCode: 0, stdoutBytes: 0, stderrBytes: 0),
+            .turnEnd(turnIdx: 1, tokensIn: 1, tokensOut: 1),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        let entryA = turns[0].tools.first { $0.id == "A" }!
+        let entryB = turns[1].tools.first { $0.id == "B" }!
+        #expect(entryA.command == nil, "the failed call must never receive another call's command")
+        #expect(entryB.command?.argv == ["/bin/sh", "-c", "true"])
     }
 
     // MARK: - tool_audit FIFO-per-name, NOT adjacency (out-of-order two-same-name-calls)
@@ -155,7 +270,7 @@ struct TranscriptViewModelTests {
         let payload = JSONValue.object(["channel": .string("#eng")])
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "action node ran", thinking: nil),
-            .actionEmitted(data: .object(["kind": .string("notify_slack"), "payload": payload, "allowed": .bool(true), "applied": .bool(true)])),
+            .actionEmitted(kind: "notify_slack", payload: payload, allowed: true, applied: true, reason: nil),
             .toolAudit(tool: "notify_slack", declared: true, granted: true, blocked: false, restricted: true),
         ]
 
@@ -173,9 +288,9 @@ struct TranscriptViewModelTests {
         let payloadB = JSONValue.object(["channel": .string("#b")])
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "two action calls", thinking: nil),
-            .actionEmitted(data: .object(["kind": .string("notify_slack"), "payload": payloadA])),
+            .actionEmitted(kind: "notify_slack", payload: payloadA, allowed: true, applied: true, reason: nil),
             .toolAudit(tool: "notify_slack", declared: true, granted: true, blocked: false, restricted: true),
-            .actionEmitted(data: .object(["kind": .string("notify_slack"), "payload": payloadB])),
+            .actionEmitted(kind: "notify_slack", payload: payloadB, allowed: true, applied: true, reason: nil),
             .toolAudit(tool: "notify_slack", declared: true, granted: true, blocked: false, restricted: true),
         ]
 
@@ -273,6 +388,28 @@ struct TranscriptViewModelTests {
         #expect(turns[1].id == 1)
         #expect(turns[1].tokensIn == 10)
         #expect(turns[1].tokensOut == 5)
+    }
+
+    /// v2 emits one `assistant_message` PER Text block, so a turn with
+    /// interleaved [text, tool_use, text] (or a multi-part Gemini response)
+    /// carries more than one of these between its `turn_start`/`turn_end`.
+    /// The old code overwrote (`t.assistantText = content`, last-wins),
+    /// silently dropping every text block but the final one — a must-fix
+    /// from the Plan 3 review. Both texts must survive, in order.
+    @Test func twoAssistantMessageEventsInOneTurnAccumulateInOrderRatherThanOverwriting() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "first part", thinking: nil),
+            .toolCall(callID: "c1", tool: "read_file", input: .null),
+            .toolResult(callID: "c1", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .assistantMessage(content: "second part", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: 10, tokensOut: 5),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns.count == 1)
+        #expect(turns[0].assistantText == "first part\n\nsecond part")
     }
 
     /// Review fix (Critical): two non-adjacent gaps — content arriving
@@ -376,6 +513,27 @@ struct TranscriptViewModelTests {
 
         #expect(turns.count == 1, "none of these variants may open a new turn")
         #expect(turns[0].tools.isEmpty, "none of these variants may populate a turn's tools")
+    }
+
+    /// Transcript-fidelity v2 (Plan 3, Task 2): the six new event kinds are
+    /// transcript-level narrative content, not turn-scoped tool activity —
+    /// they render as their own standalone `FeedRow`s in `TranscriptFeed.
+    /// swift` instead of ever opening/closing/populating a `TurnVM`.
+    @Test func v2NarrativeEventKindsAreAlsoIgnoredEntirely() {
+        let events: [TranscriptEvent] = [
+            .assistantMessage(content: "only turn", thinking: nil),
+            .thinking(text: "reasoning...", provider: "anthropic", model: "m"),
+            .thinkingDelta(content: "partial reasoning..."),
+            .userMessage(content: "do it"),
+            .seed(messageCount: 3, sourceTranscript: nil),
+            .notice(kind: "context_trim", message: "trimmed"),
+            .compaction(seq: 1, summarizedMessages: 5, backupPath: nil),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns.count == 1, "none of these v2 variants may open a new turn")
+        #expect(turns[0].tools.isEmpty, "none of these v2 variants may populate a turn's tools")
     }
 }
 

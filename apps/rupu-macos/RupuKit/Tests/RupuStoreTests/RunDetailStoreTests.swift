@@ -1035,6 +1035,74 @@ private func makeStore(
     cancellingStore.deactivate()
 }
 
+// MARK: - (f2) transcriptUnparsedCount threading (Plan 3, Task 2)
+
+/// A REST transcript snapshot's `unparsed` count surfaces on
+/// `transcriptUnparsedCount` — the value `TranscriptTabContent` threads into
+/// `TranscriptFeed`'s unparsed-lines warning badge.
+@MainActor @Test func focusStepSurfacesThePageUnparsedCountFromARESTSnapshot() async {
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(activeStepID: "plan"),
+                steps: [stepResult(stepID: "plan", transcriptPath: "t/plan.jsonl", success: true)]
+            )
+        },
+        transcriptResult: { _ in
+            APITranscriptPage(events: [.assistantMessage(content: "plan output", thinking: nil)], summary: nil, unparsed: 3)
+        }
+    )
+    await store.activate()
+    #expect(store.transcriptUnparsedCount == 3)
+
+    store.deactivate()
+}
+
+/// A server that doesn't send `unparsed` at all (`nil`, the pre-Plan-2
+/// contract) reads as zero, not some other sentinel — `APITranscriptPage.
+/// unparsed` is `Int?`, decoded `nil` on an older server via `decodeIfPresent`.
+@MainActor @Test func focusStepTreatsAMissingUnparsedFieldAsZero() async {
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(activeStepID: "plan"),
+                steps: [stepResult(stepID: "plan", transcriptPath: "t/plan.jsonl", success: true)]
+            )
+        },
+        transcriptResult: { _ in
+            APITranscriptPage(events: [.assistantMessage(content: "plan output", thinking: nil)], summary: nil)
+        }
+    )
+    await store.activate()
+    #expect(store.transcriptUnparsedCount == 0)
+
+    store.deactivate()
+}
+
+/// Clearing focus (no resolvable path) resets `transcriptUnparsedCount`
+/// alongside `transcript` — a stale count from a previously focused step
+/// must never survive onto an unfocused panel.
+@MainActor @Test func clearingFocusResetsTranscriptUnparsedCountToZero() async {
+    let store = makeStore(
+        detailResult: {
+            detail(
+                run: runRecord(activeStepID: "plan"),
+                steps: [stepResult(stepID: "plan", transcriptPath: "t/plan.jsonl", success: true)]
+            )
+        },
+        transcriptResult: { _ in
+            APITranscriptPage(events: [.assistantMessage(content: "plan output", thinking: nil)], summary: nil, unparsed: 5)
+        }
+    )
+    await store.activate()
+    #expect(store.transcriptUnparsedCount == 5)
+
+    await store.focusStep("nonexistent-step")
+    #expect(store.transcriptUnparsedCount == 0)
+
+    store.deactivate()
+}
+
 // MARK: - (g) Mutations: pending-state contract (Phase 3, Task 5)
 
 /// Approve is marker-only: the POST's 200 leaves the key `.pending` — only

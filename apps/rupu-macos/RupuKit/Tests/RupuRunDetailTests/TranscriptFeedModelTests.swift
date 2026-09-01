@@ -49,12 +49,36 @@ struct TranscriptFeedModelTests {
             .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
         ]
         let rows = buildFeedRows(events: events)
-        #expect(rows.count == 1)
+        #expect(rows.count == 2, "the turn row plus its own turnSeparator row")
         guard case .turn(let turn) = rows[0] else {
             Issue.record("expected a .turn row")
             return
         }
         #expect(turn.id == 0)
+        guard case .turnSeparator(let turnIdx, _, _, _) = rows[1] else {
+            Issue.record("expected a .turnSeparator row right after its turn")
+            return
+        }
+        #expect(turnIdx == 0)
+    }
+
+    // MARK: - buildFeedRows: turn_end becomes its own turnSeparator row
+
+    @Test func turnEndCarryingTokensSurfacesThemOnTheTurnSeparatorRow() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "hi", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: 11, tokensOut: 7),
+        ]
+        let rows = buildFeedRows(events: events)
+        #expect(rows.count == 2)
+        guard case .turnSeparator(let turnIdx, let tokensIn, let tokensOut, _) = rows[1] else {
+            Issue.record("expected a .turnSeparator row, got \(rows)")
+            return
+        }
+        #expect(turnIdx == 0)
+        #expect(tokensIn == 11)
+        #expect(tokensOut == 7)
     }
 
     // MARK: - buildFeedRows: run_complete is always last
@@ -67,7 +91,7 @@ struct TranscriptFeedModelTests {
             .runComplete(runID: "r1", status: "ok", totalTokens: 10, durationMS: 100, error: nil),
         ]
         let rows = buildFeedRows(events: events)
-        #expect(rows.count == 2)
+        #expect(rows.count == 3, "turn + its turnSeparator + run_complete")
         guard case .runComplete(let runID, _, _, _, _) = rows.last else {
             Issue.record("expected the last row to be .runComplete")
             return
@@ -91,19 +115,25 @@ struct TranscriptFeedModelTests {
             .runComplete(runID: "r1", status: "ok", totalTokens: 10, durationMS: 100, error: nil),
         ]
         let rows = buildFeedRows(events: events)
-        #expect(rows.count == 4)
+        #expect(rows.count == 6, "2 turns + their 2 turnSeparators + the gate + run_complete")
 
         guard case .turn(let first) = rows[0] else { Issue.record("row 0 should be a turn"); return }
         #expect(first.id == 0)
 
-        guard case .gate(let gateID, let prompt, _, _) = rows[1] else { Issue.record("row 1 should be the gate"); return }
+        guard case .turnSeparator(let firstIdx, _, _, _) = rows[1] else { Issue.record("row 1 should be the first turn's separator"); return }
+        #expect(firstIdx == 0)
+
+        guard case .gate(let gateID, let prompt, _, _) = rows[2] else { Issue.record("row 2 should be the gate"); return }
         #expect(gateID == "g1")
         #expect(prompt == "continue?")
 
-        guard case .turn(let second) = rows[2] else { Issue.record("row 2 should be a turn"); return }
+        guard case .turn(let second) = rows[3] else { Issue.record("row 3 should be a turn"); return }
         #expect(second.id == 1)
 
-        guard case .runComplete = rows[3] else { Issue.record("row 3 should be run_complete"); return }
+        guard case .turnSeparator(let secondIdx, _, _, _) = rows[4] else { Issue.record("row 4 should be the second turn's separator"); return }
+        #expect(secondIdx == 1)
+
+        guard case .runComplete = rows[5] else { Issue.record("row 5 should be run_complete"); return }
     }
 
     @Test func gateRequestedBeforeAnyTurnStartsLandsFirst() {
@@ -114,7 +144,7 @@ struct TranscriptFeedModelTests {
             .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
         ]
         let rows = buildFeedRows(events: events)
-        #expect(rows.count == 2)
+        #expect(rows.count == 3, "the leading gate + the turn + its turnSeparator")
         guard case .gate(let gateID, _, let decision, let decidedBy) = rows[0] else {
             Issue.record("row 0 should be the leading gate")
             return
@@ -123,6 +153,7 @@ struct TranscriptFeedModelTests {
         #expect(decision == "approved")
         #expect(decidedBy == "matt")
         guard case .turn = rows[1] else { Issue.record("row 1 should be the turn"); return }
+        guard case .turnSeparator = rows[2] else { Issue.record("row 2 should be the turn's separator"); return }
     }
 
     // MARK: - buildFeedRows: fallback mode (no turn_start/turn_end at all)
@@ -224,7 +255,7 @@ struct TranscriptFeedModelTests {
         )
 
         #expect(counter.count == 1, "init must call computeRows exactly once, not twice (the old computed-property bug)")
-        #expect(feed.rows.count == 2, "one turn row + the run_complete row")
+        #expect(feed.rows.count == 3, "one turn row + its turnSeparator + the run_complete row")
         #expect(feed.sawRunComplete == true)
     }
 }

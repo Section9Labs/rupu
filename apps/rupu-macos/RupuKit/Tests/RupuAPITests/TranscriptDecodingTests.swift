@@ -32,38 +32,42 @@ import Foundation
     #expect(gateID == "gate-1" && prompt == "Deploy to prod?")
     #expect(decision == "approved" && decidedBy == "matt")
 
-    let last = events[events.count - 1]
-    guard case .netFlow = last else {
-        Issue.record("last event should be net_flow"); return
+    guard case .netFlow = events[23] else {
+        Issue.record("events[23] should be net_flow"); return
     }
+
+    // The fixture's trailing run is v2-only events (thinking / thinking_delta
+    // / user_message / seed / compaction / notice), added after net_flow —
+    // none of them decode as .unknown, which the top-of-test assertion above
+    // already covers.
+    let last = events[events.count - 1]
+    guard case let .notice(kind, message) = last else {
+        Issue.record("last event should be notice"); return
+    }
+    #expect(kind == "provider_retry" && message == "Retrying after a 529 overloaded response")
 }
 
 @Test func actionEmittedPreservesPayloadAsJSONValue() throws {
     let events = try JSONDecoder().decode([TranscriptEvent].self, from: Fixtures.data("transcript_events.json"))
 
-    guard case let .actionEmitted(data) = events[10] else {
+    guard case let .actionEmitted(kind, payload, allowed, applied, reason) = events[10] else {
         Issue.record("events[10] should be action_emitted"); return
     }
-    guard case let .object(fields) = data else {
-        Issue.record("action_emitted data should decode as a JSON object"); return
-    }
-    #expect(fields["kind"] == .string("issues.create"))
-    #expect(fields["allowed"] == .bool(true))
-    #expect(fields["applied"] == .bool(true))
-    #expect(fields["reason"] == .string("auto-approved"))
-    guard case let .object(payload) = fields["payload"] else {
+    #expect(kind == "issues.create")
+    #expect(allowed)
+    #expect(applied)
+    #expect(reason == "auto-approved")
+    guard case let .object(payloadFields) = payload else {
         Issue.record("action_emitted payload should decode as a JSON object"); return
     }
-    #expect(payload["title"] == .string("x"))
+    #expect(payloadFields["title"] == .string("x"))
 
-    guard case let .actionEmitted(secondData) = events[11] else {
+    guard case let .actionEmitted(_, _, secondAllowed, secondApplied, secondReason) = events[11] else {
         Issue.record("events[11] should be action_emitted"); return
     }
-    guard case let .object(secondFields) = secondData else {
-        Issue.record("action_emitted data should decode as a JSON object"); return
-    }
-    #expect(secondFields["allowed"] == .bool(false))
-    #expect(secondFields["reason"] == nil)
+    #expect(!secondAllowed)
+    #expect(!secondApplied)
+    #expect(secondReason == nil)
 }
 
 @Test func toolAuditDecodesAllFieldsIncludingBlockedTrue() throws {

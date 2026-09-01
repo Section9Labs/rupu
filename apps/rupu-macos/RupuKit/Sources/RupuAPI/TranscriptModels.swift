@@ -38,10 +38,16 @@ public enum JSONValue: Decodable, Equatable, Sendable {
 ///
 /// `net_flow` decodes successfully but carries no associated payload —
 /// nothing renders it yet, so its `data` body is intentionally left
-/// unparsed. `tool_audit` and `action_emitted` DO carry payloads: the
-/// former mirrors the web's `lib/transcript.ts:22` fixed shape, the
-/// latter stays an opaque `JSONValue` (opaque on the web too, `lib/
+/// unparsed. `tool_audit` and `action_emitted` carry real payloads: the
+/// former mirrors the web's `lib/transcript.ts:22` fixed shape; the latter
+/// carries its `kind`/`allowed`/`applied`/`reason` fields directly, with
+/// `payload` staying an opaque `JSONValue` (opaque on the web too, `lib/
 /// transcript.ts:21`).
+///
+/// `thinking`/`seed`/`compaction` each carry a `raw`/`messages` field on the
+/// wire that is deliberately NOT decoded here — spec §3: that data is
+/// persisted for replay only, never displayed; the counts/text below are
+/// the actual display surface.
 ///
 /// Unknown `type` tags decode as `.unknown(type:)` rather than throwing, so
 /// the client stays forward-compatible with variants added on the Rust side
@@ -59,8 +65,14 @@ public enum TranscriptEvent: Decodable, Equatable, Sendable {
     case commandRun(argv: [String], cwd: String, exitCode: Int32, stdoutBytes: UInt64, stderrBytes: UInt64)
     case usage(provider: String, model: String, servedModel: String?, inputTokens: UInt64, outputTokens: UInt64, cachedTokens: UInt64)
     case runComplete(runID: String, status: String, totalTokens: UInt64, durationMS: UInt64, error: String?)
-    case actionEmitted(data: JSONValue)
+    case actionEmitted(kind: String, payload: JSONValue, allowed: Bool, applied: Bool, reason: String?)
     case toolAudit(tool: String, declared: Bool, granted: Bool, blocked: Bool, restricted: Bool)
+    case thinking(text: String?, provider: String, model: String)
+    case thinkingDelta(content: String)
+    case userMessage(content: String)
+    case seed(messageCount: UInt32, sourceTranscript: String?)
+    case notice(kind: String, message: String)
+    case compaction(seq: UInt32, summarizedMessages: UInt32, backupPath: String?)
     case netFlow
     case unknown(type: String)
 
@@ -96,6 +108,14 @@ public enum TranscriptEvent: Decodable, Equatable, Sendable {
         case status
         case totalTokens = "total_tokens"
         case declared, granted, blocked, restricted
+        case allowed, applied, reason, payload
+        case text
+        case message
+        case seq
+        case messageCount = "message_count"
+        case sourceTranscript = "source_transcript"
+        case summarizedMessages = "summarized_messages"
+        case backupPath = "backup_path"
     }
 
     public init(from decoder: Decoder) throws {
@@ -193,7 +213,14 @@ public enum TranscriptEvent: Decodable, Equatable, Sendable {
                 error: try data.decodeIfPresent(String.self, forKey: .error)
             )
         case "action_emitted":
-            self = .actionEmitted(data: try root.decode(JSONValue.self, forKey: .data))
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .actionEmitted(
+                kind: try data.decode(String.self, forKey: .kind),
+                payload: try data.decode(JSONValue.self, forKey: .payload),
+                allowed: try data.decode(Bool.self, forKey: .allowed),
+                applied: try data.decode(Bool.self, forKey: .applied),
+                reason: try data.decodeIfPresent(String.self, forKey: .reason)
+            )
         case "tool_audit":
             let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
             self = .toolAudit(
@@ -202,6 +229,38 @@ public enum TranscriptEvent: Decodable, Equatable, Sendable {
                 granted: try data.decode(Bool.self, forKey: .granted),
                 blocked: try data.decode(Bool.self, forKey: .blocked),
                 restricted: try data.decode(Bool.self, forKey: .restricted)
+            )
+        case "thinking":
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .thinking(
+                text: try data.decodeIfPresent(String.self, forKey: .text),
+                provider: try data.decode(String.self, forKey: .provider),
+                model: try data.decode(String.self, forKey: .model)
+            )
+        case "thinking_delta":
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .thinkingDelta(content: try data.decode(String.self, forKey: .content))
+        case "user_message":
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .userMessage(content: try data.decode(String.self, forKey: .content))
+        case "seed":
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .seed(
+                messageCount: try data.decode(UInt32.self, forKey: .messageCount),
+                sourceTranscript: try data.decodeIfPresent(String.self, forKey: .sourceTranscript)
+            )
+        case "notice":
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .notice(
+                kind: try data.decode(String.self, forKey: .kind),
+                message: try data.decode(String.self, forKey: .message)
+            )
+        case "compaction":
+            let data = try root.nestedContainer(keyedBy: DataKeys.self, forKey: .data)
+            self = .compaction(
+                seq: try data.decode(UInt32.self, forKey: .seq),
+                summarizedMessages: try data.decode(UInt32.self, forKey: .summarizedMessages),
+                backupPath: try data.decodeIfPresent(String.self, forKey: .backupPath)
             )
         case "net_flow":
             self = .netFlow
@@ -264,9 +323,26 @@ public struct APIRunSummary: Decodable, Sendable {
 public struct APITranscriptPage: Decodable, Sendable {
     public let events: [TranscriptEvent]
     public let summary: APIRunSummary?
+    /// Plan 2 Task 1's server field: how many trailing lines of the
+    /// transcript file failed to parse and were dropped. `nil` on an older
+    /// server that doesn't send it yet — decoded with `decodeIfPresent` so
+    /// this client keeps parsing against both.
+    public let unparsed: Int?
 
-    public init(events: [TranscriptEvent], summary: APIRunSummary?) {
+    public init(events: [TranscriptEvent], summary: APIRunSummary?, unparsed: Int? = nil) {
         self.events = events
         self.summary = summary
+        self.unparsed = unparsed
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case events, summary, unparsed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        events = try container.decode([TranscriptEvent].self, forKey: .events)
+        summary = try container.decodeIfPresent(APIRunSummary.self, forKey: .summary)
+        unparsed = try container.decodeIfPresent(Int.self, forKey: .unparsed)
     }
 }
