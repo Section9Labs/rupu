@@ -164,6 +164,60 @@ struct TranscriptViewModelTests {
         #expect(entryA.fileEdit?.diff != entryC.fileEdit?.diff)
     }
 
+    // MARK: - a failed call must be evicted from the FIFO queue, not park forever (review regression)
+
+    /// Reviewer-reproduced regression: the runner only emits file_edit on a
+    /// write_file/edit_file's SUCCESS path — a failed call gets
+    /// `tool_result(error)` and no file_edit at all, ever. Left in the
+    /// queue, a failed call in turn 0 would still be sitting there when
+    /// turn 1's unrelated successful call's file_edit arrives, stealing
+    /// that diff FIFO-first and leaving the real match with nothing. A
+    /// `tool_result` with an error must evict its call from the pending
+    /// queue immediately.
+    @Test func failedWriteCallIsEvictedFromTheDiffQueueSoALaterUnrelatedCallIsNotMisattributed() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .toolCall(callID: "A", tool: "write_file", input: .object(["path": .string("a.rs")])),
+            .toolResult(callID: "A", output: "", error: "permission denied", durationMS: 1, structured: nil),
+            .turnEnd(turnIdx: 0, tokensIn: 1, tokensOut: 1),
+            .turnStart(turnIdx: 1),
+            .toolCall(callID: "B", tool: "write_file", input: .object(["path": .string("b.rs")])),
+            .toolResult(callID: "B", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .fileEdit(path: "b.rs", kind: "modified", diff: "diff-b"),
+            .turnEnd(turnIdx: 1, tokensIn: 1, tokensOut: 1),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        let entryA = turns[0].tools.first { $0.id == "A" }!
+        let entryB = turns[1].tools.first { $0.id == "B" }!
+        #expect(entryA.fileEdit == nil, "the failed call must never receive another call's diff")
+        #expect(entryB.fileEdit?.path == "b.rs")
+        #expect(entryB.fileEdit?.diff == "diff-b")
+    }
+
+    /// Same regression, bash/command_run side.
+    @Test func failedBashCallIsEvictedFromTheTerminalQueueSoALaterUnrelatedCallIsNotMisattributed() {
+        let events: [TranscriptEvent] = [
+            .turnStart(turnIdx: 0),
+            .toolCall(callID: "A", tool: "bash", input: .object(["command": .string("false")])),
+            .toolResult(callID: "A", output: "", error: "exit 1", durationMS: 1, structured: nil),
+            .turnEnd(turnIdx: 0, tokensIn: 1, tokensOut: 1),
+            .turnStart(turnIdx: 1),
+            .toolCall(callID: "B", tool: "bash", input: .object(["command": .string("true")])),
+            .toolResult(callID: "B", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .commandRun(argv: ["/bin/sh", "-c", "true"], cwd: "/tmp", exitCode: 0, stdoutBytes: 0, stderrBytes: 0),
+            .turnEnd(turnIdx: 1, tokensIn: 1, tokensOut: 1),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        let entryA = turns[0].tools.first { $0.id == "A" }!
+        let entryB = turns[1].tools.first { $0.id == "B" }!
+        #expect(entryA.command == nil, "the failed call must never receive another call's command")
+        #expect(entryB.command?.argv == ["/bin/sh", "-c", "true"])
+    }
+
     // MARK: - tool_audit FIFO-per-name, NOT adjacency (out-of-order two-same-name-calls)
 
     /// Mirrors the exact on-disk order `transcriptView.ts`'s module doc

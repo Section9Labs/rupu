@@ -400,6 +400,18 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
                 tb.errorText = error
                 tb.durationMS = durationMS
                 tb.structured = structured
+                // The runner only emits file_edit/command_run on the tool's
+                // success path — a failed write_file/edit_file/bash gets a
+                // tool_result(error) and NO derived event, ever. Left
+                // parked, a failed call would sit in its FIFO queue
+                // forever and steal a LATER unrelated turn's successful
+                // call's diff/command (reviewer-reproduced regression).
+                // A failed call can never receive its derived event, so
+                // pull it out of whichever queue it's waiting in now.
+                if error != nil {
+                    pendingDiffQueue.removeAll { $0 === tb }
+                    pendingTerminalQueue.removeAll { $0 === tb }
+                }
             } else {
                 // Orphan result — deliberately surfaced as a standalone
                 // entry rather than dropped; see the type doc comment's
