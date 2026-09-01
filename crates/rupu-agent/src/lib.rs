@@ -17,6 +17,10 @@ pub mod loader;
 pub mod mcp_tool;
 // implemented in Task 4
 pub mod permission;
+// Task 3 (transcript fidelity plan 1): reconstructs the exact provider
+// conversation from a v2 transcript — the inverse of the runner's emission
+// contract.
+pub mod replay;
 // implemented in Task 5/7
 pub mod runner;
 // implemented in Task 2

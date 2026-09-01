@@ -3500,7 +3500,7 @@ mod reasoning_tests {
         }
     }
 
-    fn opts_for(
+    pub(crate) fn opts_for(
         provider: Box<dyn LlmProvider>,
         workspace: &std::path::Path,
         transcript_path: PathBuf,
@@ -3826,4 +3826,15 @@ mod reasoning_tests {
             "thinking must precede the text blocks it motivated: {tags:?}"
         );
     }
+}
+
+/// Shared test-only helpers reachable from sibling modules (`replay.rs`'s
+/// round-trip tests) as `crate::runner::tests::opts_for`. `opts_for` itself
+/// is defined in `reasoning_tests` (it has no reasoning-specific behavior —
+/// it just happened to be written there first); this module re-exports it
+/// under the name external test modules expect rather than duplicating the
+/// ~20-line `AgentRunOpts` literal.
+#[cfg(test)]
+pub(crate) mod tests {
+    pub(crate) use super::reasoning_tests::opts_for;
 }

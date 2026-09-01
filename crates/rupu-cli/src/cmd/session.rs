@@ -9034,6 +9034,23 @@ mod tests {
             messages.is_none(),
             "a referenced seed must not also carry an inline copy of the messages"
         );
+
+        // End-to-end: replay resolves the reference chain (turn 2's Seed ->
+        // turn 1's transcript) and rebuilds the full two-turn conversation,
+        // not just turn 2's own slice of it.
+        let full = rupu_agent::replay::reconstruct_transcript(&transcript_2)
+            .expect("turn 2 transcript reconstructs via the seed chain");
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(vec![
+                Message::user("first prompt"),
+                Message::assistant("ack"),
+                Message::user("second prompt"),
+                Message::assistant("ack"),
+            ])
+            .unwrap(),
+            "replay must reconstruct the full two-turn conversation across the seed reference"
+        );
     }
 
     #[test]
