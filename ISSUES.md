@@ -211,6 +211,15 @@ run afterwards (macOS rule 7), since a toolchain bump can move rendering behavio
 **Not reproducible on a developer machine running a newer Xcode**, which is what makes
 this expensive: each attempt costs a tag plus a full release cycle.
 
+**Resolution in flight (#639).** Pins `DEVELOPER_DIR: /Applications/Xcode_26.3.app` (the
+newest Xcode on the `macos-15` image; the 26.x line I-91 verified clean locally at 26.6)
+on BOTH `ci.yml`'s `macos-app` gate and `release.yml`'s `macos-app` job in one change, and
+adds a `make macos-release` step to the PR gate — closing the "only a `v*` tag reaches the
+Release configuration" hole, so this class fails a PR instead of a release from now on.
+The PR's own gate is the empirical test of the lead. Remaining before closing: a green
+release with a published `.app`, and matt's GUI run on the 26.3-built bundle (macOS rule
+7 — a toolchain bump can move rendering behaviour).
+
 ---
 
 ### I-90 — a sub-agent's ledger has no transcript fallback if its ledger degrades

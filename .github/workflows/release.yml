@@ -504,6 +504,14 @@ jobs:
       # One definition of the product path, read by every step below.
       # `make macos-release` writes the bundle here (see the Makefile target).
       APP: apps/rupu-macos/DerivedData/Build/Products/Release/rupu.app
+      # Pin the SAME Xcode ci.yml's macos-app gate pins (the gate/release
+      # same-toolchain invariant this job's runs-on comment describes). The
+      # image default (16.4, Swift 6.1.2) stack-overflows swift-frontend's
+      # deserializer on RupuShell's cross-module generic nesting under the
+      # Release configuration — the failure that shipped v0.76.0-beta.2/.3
+      # without a .app (ISSUES.md I-91). Bump this and the gate's copy
+      # TOGETHER, never one alone.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app
     steps:
       - uses: actions/checkout@v5
         with:
