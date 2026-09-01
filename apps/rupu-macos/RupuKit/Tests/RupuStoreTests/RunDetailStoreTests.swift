@@ -348,7 +348,8 @@ private func makeStore(
 
     runBox.latest.yield(.connection(true))
     runBox.latest.yield(.event(.stepAwaitingApproval(runID: "run-1", stepID: "gate", reason: "deploy?")))
-    try? await Task.sleep(for: .milliseconds(30))
+    let settled = await pollUntil { store.liveStates["gate"] == .gatePending }
+    #expect(settled, "expected the stepAwaitingApproval event to land in liveStates")
 
     #expect(store.liveStates["gate"] == .gatePending)
 
@@ -368,7 +369,12 @@ private func makeStore(
     runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "plan", kind: "step", agent: "rupuso", host: nil)))
     runBox.latest.yield(.event(.stepCompleted(runID: "run-1", stepID: "review", success: false, durationMS: 10, host: nil)))
     runBox.latest.yield(.event(.stepSkipped(runID: "run-1", stepID: "skip-me", reason: "condition false")))
-    try? await Task.sleep(for: .milliseconds(30))
+    let settled = await pollUntil {
+        store.liveStates["plan"] == .running
+            && store.liveStates["review"] == .done(success: false)
+            && store.liveStates["skip-me"] == .skipped
+    }
+    #expect(settled, "expected all three lifecycle events to land in liveStates")
 
     #expect(store.liveStates["plan"] == .running)
     #expect(store.liveStates["review"] == .done(success: false))
@@ -394,7 +400,8 @@ private func makeStore(
     await store.activate()
     runBox.latest.yield(.connection(true))
     runBox.latest.yield(.event(.stepFailed(runID: "run-1", stepID: "build", error: "connector timeout")))
-    try? await Task.sleep(for: .milliseconds(30))
+    let settled = await pollUntil { store.liveStates["build"] == .done(success: false) }
+    #expect(settled, "expected the stepFailed event to land in liveStates")
 
     #expect(store.liveStates["build"] == .done(success: false))
 
@@ -491,7 +498,13 @@ private func makeStore(
     runBox.latest.onTermination = { _ in terminated.value = true }
     runBox.latest.yield(.connection(true))
     runBox.latest.yield(.event(.runCompleted(runID: "run-1", status: "completed", finishedAt: "2026-08-20T13:00:00Z")))
-    try? await Task.sleep(for: .milliseconds(60))
+    let settled = await pollUntil {
+        detailCalls.value == 2
+            && findingsCalls.value == 2
+            && netflowCalls.value == 2
+            && terminated.value == true
+    }
+    #expect(settled, "expected the terminal event to refresh all three blocks and terminate the stream")
 
     #expect(detailCalls.value == 2)
     #expect(findingsCalls.value == 2)
@@ -499,7 +512,9 @@ private func makeStore(
     #expect(terminated.value == true)
 
     // A second terminal event (e.g. a stray `.unknown` racing a real one)
-    // never double-fires the refresh.
+    // never double-fires the refresh. (Deliberately a fixed sleep, not
+    // `pollUntil`: this brackets a NEGATIVE — polling for "still == 2"
+    // would pass vacuously before the second event was even consumed.)
     runBox.latest.yield(.event(.runFailed(runID: "run-1", error: "x", finishedAt: "y")))
     try? await Task.sleep(for: .milliseconds(30))
     #expect(detailCalls.value == 2)
@@ -540,7 +555,13 @@ private func makeStore(
     runBox.latest.yield(.connection(true))
     tailBox.latest.yield(.connection(true))
     runBox.latest.yield(.event(.runCompleted(runID: "run-1", status: "completed", finishedAt: "2026-08-20T13:00:00Z")))
-    try? await Task.sleep(for: .milliseconds(60))
+    let settled = await pollUntil {
+        tailTerminated.value == true
+            && store.transcriptTailActive == false
+            && transcriptCalls.value == 1
+            && store.transcript == [.assistantMessage(content: "final snapshot", thinking: nil)]
+    }
+    #expect(settled, "expected the terminal event to stop the tail and land the reloaded snapshot")
 
     #expect(tailTerminated.value == true)
     #expect(store.transcriptTailActive == false)
@@ -670,7 +691,14 @@ private func makeStore(
     tailBox.latest.yield(.event(.assistantMessage(content: "replayed from byte 0", thinking: nil)))
     tailBox.latest.yield(.event(.assistantDelta(content: "first")))
     tailBox.latest.yield(.event(.assistantDelta(content: "second")))
-    try? await Task.sleep(for: .milliseconds(30))
+    let settled = await pollUntil {
+        store.transcript == [
+            .assistantMessage(content: "replayed from byte 0", thinking: nil),
+            .assistantDelta(content: "first"),
+            .assistantDelta(content: "second"),
+        ]
+    }
+    #expect(settled, "expected the tail's replay + live events to land in transcript")
 
     #expect(store.transcript == [
         .assistantMessage(content: "replayed from byte 0", thinking: nil),
@@ -706,7 +734,8 @@ private func makeStore(
     tailBox.latest.yield(.connection(true)) // pristine first connect -> no resnapshot
     tailBox.latest.yield(.event(.assistantMessage(content: "line 1", thinking: nil)))
     tailBox.latest.yield(.event(.assistantDelta(content: "line 2")))
-    try? await Task.sleep(for: .milliseconds(20))
+    let firstConnectLanded = await pollUntil { store.transcript.count == 2 }
+    #expect(firstConnectLanded, "expected the first connection's two events to land in transcript")
     #expect(store.transcript.count == 2)
 
     // Disconnect then reconnect: `StreamLifecycle` awaits `resnapshot()` to
@@ -714,13 +743,17 @@ private func makeStore(
     // continuation.
     tailBox.latest.yield(.connection(false))
     tailBox.latest.yield(.connection(true))
-    try? await Task.sleep(for: .milliseconds(20))
+    let cleared = await pollUntil { store.transcript.isEmpty }
+    #expect(cleared, "expected the reconnect's resnapshot closure to clear transcript")
     #expect(store.transcript.isEmpty) // cleared by the resnapshot closure, replay not yet arrived
 
     // The new connection's own replay, from byte 0, same content as before.
     tailBox.latest.yield(.event(.assistantMessage(content: "line 1", thinking: nil)))
     tailBox.latest.yield(.event(.assistantDelta(content: "line 2")))
-    try? await Task.sleep(for: .milliseconds(20))
+    let replayLanded = await pollUntil {
+        store.transcript == [.assistantMessage(content: "line 1", thinking: nil), .assistantDelta(content: "line 2")]
+    }
+    #expect(replayLanded, "expected the reconnect's replay to land exactly once")
 
     // Landed exactly once — not appended on top of a stale prior copy.
     #expect(store.transcript == [.assistantMessage(content: "line 1", thinking: nil), .assistantDelta(content: "line 2")])
@@ -755,7 +788,8 @@ private func makeStore(
     // Switch focus to a finished (non-running) step: the prior tail must be
     // torn down even though the new step gets no tail of its own.
     await store.focusStep("other")
-    try? await Task.sleep(for: .milliseconds(20))
+    let tornDown = await pollUntil { terminatedFirst.value == true && store.transcriptTailActive == false }
+    #expect(tornDown, "expected the focus switch to tear down the prior tail")
 
     #expect(terminatedFirst.value == true)
     #expect(store.transcriptTailActive == false)
@@ -818,7 +852,8 @@ private func makeStore(
     // entirely and starts a tail with no await to race at all.
     runBox.latest.yield(.connection(true))
     runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "stepB", kind: "step", agent: nil, host: nil)))
-    try? await Task.sleep(for: .milliseconds(20))
+    let stepBRunning = await pollUntil { store.liveStates["stepB"] == .running }
+    #expect(stepBRunning, "stepB must read as running (tail-eligible) before the overlapping focus calls")
 
     async let first: Void = store.focusStep("stepA")
     try? await Task.sleep(for: .milliseconds(10)) // let stepA's slow fetch actually begin
@@ -866,18 +901,26 @@ private func makeStore(
     tailBox.latest.onTermination = { _ in tailTerminated.value = true }
     runBox.latest.yield(.connection(true))
     tailBox.latest.yield(.connection(true))
+    // Fixed sleep on purpose: brackets a NEGATIVE (streams NOT yet
+    // terminated) — there is no positive condition to poll for.
     try? await Task.sleep(for: .milliseconds(20))
     #expect(runTerminated.value == false)
     #expect(tailTerminated.value == false)
 
     store.deactivate()
-    try? await Task.sleep(for: .milliseconds(30))
+    let cancelled = await pollUntil {
+        runTerminated.value == true
+            && tailTerminated.value == true
+            && store.transcriptTailActive == false
+    }
+    #expect(cancelled, "expected deactivate to terminate both streams")
 
     #expect(runTerminated.value == true)
     #expect(tailTerminated.value == true)
     #expect(store.transcriptTailActive == false)
 
-    // Events yielded after deactivate() are never applied.
+    // Events yielded after deactivate() are never applied. (Fixed sleep on
+    // purpose: a NEGATIVE has no condition `pollUntil` could wait on.)
     let before = store.liveStates
     runBox.latest.yield(.event(.stepStarted(runID: "run-1", stepID: "plan", kind: "step", agent: nil, host: nil)))
     try? await Task.sleep(for: .milliseconds(20))
