@@ -623,26 +623,26 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
 /// `(None, None)` and the explorer groups it under the explicit `unknown`
 /// workflow — never dropped (mirrors the unknown-org rule).
 ///
-/// Cost: building this walks the same records
-/// [`project_run_and_unit_ids`] already walks per request (its doc has
-/// the full accounting); global scope does that across EVERY registered
-/// workspace's store plus the global one. Same order of magnitude as the
-/// ledger-directory union those scopes already read.
+/// Cost: building this is the expensive walk of the netflow read path —
+/// see [`project_run_meta`]'s doc for the per-run accounting. Project
+/// scope builds it ONCE per request and derives the global-fallback id
+/// set from it ([`project_scoped_flows_meta_and_dropped`]); global scope
+/// does the same walk across EVERY registered workspace's store plus the
+/// global one, so it is memoized on [`AppState`] instead — see
+/// [`RunMetaCache`].
 #[derive(Debug, Default)]
 pub(crate) struct RunMetaIndex {
     map: HashMap<String, (String, String)>,
     spans: Vec<RunSpan>,
     /// Root run ids already folded in — the same run RECORD can appear in
-    /// both the global store and a project-local one (the split
-    /// [`project_run_and_unit_ids`]'s `sort();dedup();` exists for), and
-    /// pushing its span twice would double-count it in the active-runs
-    /// strip.
+    /// both the global store and a project-local one, and pushing its
+    /// span twice would double-count it in the active-runs strip.
     seen_runs: std::collections::HashSet<String>,
 }
 
 impl RunMetaIndex {
     /// Fold one run record (looked up in ITS OWN store — see
-    /// [`project_run_and_unit_ids`]'s "same store each id was discovered
+    /// [`project_run_meta`]'s "same store each record was discovered
     /// from" rule) into the index. A run id already folded is skipped
     /// entirely (see `seen_runs`).
     fn insert_run(&mut self, store: &RunStore, record: &RunRecord) {
@@ -666,11 +666,69 @@ impl RunMetaIndex {
             None => (None, None),
         }
     }
+
+    /// Every ledger-file id this index accounts for — the run/unit/
+    /// sub-agent ids of every run folded in. At project scope this IS the
+    /// project's own id set, which is what makes the index reusable as
+    /// the global-fallback recovery pass's input
+    /// ([`project_fallback_flows_and_dropped`]) instead of a second,
+    /// identical walk producing the same ids.
+    fn ledger_ids(&self) -> impl Iterator<Item = &String> {
+        self.map.keys()
+    }
 }
 
-/// [`RunMetaIndex`] over one project's own runs — the same two-store
-/// enumeration (global store filtered by canonicalized `workspace_path`,
-/// plus the project-local store) as [`project_run_and_unit_ids`].
+/// [`RunMetaIndex`] over one project's own runs. Two sources, mirroring
+/// `resolve_run_location`'s `Global`/`ProjectLocal` split: the global
+/// store filtered to this workspace's own runs, plus a project-local
+/// store rooted at `<workspace>/.rupu/runs` (whatever it holds belongs to
+/// this project by construction — there is no `workspace_path` filter to
+/// apply there).
+///
+/// This is the attribution-safety property the id-driven global-fallback
+/// pass ([`project_fallback_flows_and_dropped`]) depends on: a run
+/// belonging to some OTHER project never contributes an id here just
+/// because its ledger happens to live in the same shared
+/// `<global_dir>/netflow/` directory — only a run record that itself
+/// declares THIS workspace as its own does.
+///
+/// Both sides of the `workspace_path` comparison go through
+/// [`canonicalize_or_self`], not a bare `==`: `RunRecord::workspace_path`
+/// is stamped canonicalized at run creation (`rupu-cli`'s
+/// `canonicalize_if_exists`), but `workspace` here comes from the
+/// registered `Workspace`'s own path, which this function has no control
+/// over — comparing raw strings would silently miss a match across e.g. a
+/// symlinked temp/mount path, the same hazard [`resolve_ledger_paths`] and
+/// [`read_all_workspaces_sync`] already guard against for directory
+/// identity.
+///
+/// [`RunMetaIndex::insert_run`] expands each record against the SAME
+/// store the record was discovered from — never unconditionally against
+/// `global_store` — so a project-local run's dispatched steps/units are
+/// looked up in the project-local store's own `step_results.jsonl`, not
+/// the global one's (which has no record of it at all, and
+/// `unwrap_or_default()` would silently swallow that miss, resolving only
+/// the parent run's own id and dropping every dispatched step's own
+/// global-fallback ledger). Run scope ([`run_scoped_flows_and_dropped`])
+/// already gets this right by constructing the correct store per branch;
+/// this mirrors it.
+///
+/// Cost: `global_store.list()` is one `read_dir` plus one small
+/// `run.json` parse per run IN THE WHOLE GLOBAL STORE (not filtered by
+/// workspace at the I/O layer — `RunStore` has no index by
+/// `workspace_path`), so this is O(total runs across every project) on
+/// every project-scope request, not O(this project's own runs). At ~500
+/// runs total that's ~500 small file opens. For each of this project's
+/// own k run ids (k ≤ total runs) found in either store,
+/// [`run_and_unit_ids`] then issues one `read_step_results` call (a small
+/// `step_results.jsonl` read, `Ok(vec![])` if the run never dispatched a
+/// step) plus one `sub_run_ids` `read_dir` per (run, step/item,
+/// sub-agent-at-any-depth) id — bounded in practice by how deep/wide any
+/// one run's dispatch tree actually grew (`MAX_SUB_RUN_RECURSION_DEPTH`
+/// backstops the pathological case), not by the total run count. This
+/// walk used to run TWICE per project request (once for the fallback id
+/// set, once for attribution); it now runs once, with the fallback ids
+/// derived from the index ([`RunMetaIndex::ledger_ids`]).
 fn project_run_meta(global_store: &RunStore, workspace: &StdPath) -> RunMetaIndex {
     let canonical = canonicalize_or_self(workspace);
     let mut meta = RunMetaIndex::default();
@@ -686,36 +744,206 @@ fn project_run_meta(global_store: &RunStore, workspace: &StdPath) -> RunMetaInde
     meta
 }
 
+/// The deduped, canonicalized project roots global scope enumerates —
+/// shared by [`global_run_meta`] (which walks each root's local run
+/// store) and [`global_store_fingerprint`] (which stats it) so the walk
+/// and the cache key can never drift on WHICH stores "the global run-store
+/// set" means. Dedup mirrors [`read_all_workspaces_sync`]'s ledger-dir
+/// dedup: one physical store is never walked (or statted) twice, which
+/// for the walk would double its spans in the active-runs strip.
+fn global_meta_workspace_roots(global_dir: &StdPath) -> std::collections::HashSet<PathBuf> {
+    (WorkspaceStore {
+        root: global_dir.join("workspaces"),
+    })
+    .list()
+    .unwrap_or_default()
+    .iter()
+    .map(|w| canonicalize_or_self(std::path::Path::new(&w.path)))
+    .collect()
+}
+
 /// [`RunMetaIndex`] over every run any store knows about: the global
 /// store plus each registered workspace's project-local store — the same
 /// workspace enumeration [`read_all_workspaces_sync`] unions ledger
 /// directories over, so a flow readable at global scope has its owning
 /// run's record enumerated whenever that record exists at all.
+///
+/// Production requests reach this only through [`global_run_meta_cached`]
+/// — see [`RunMetaCache`] for why the full walk stopped running on every
+/// request.
 fn global_run_meta(global_dir: &StdPath, global_store: &RunStore) -> RunMetaIndex {
     let mut meta = RunMetaIndex::default();
     for r in global_store.list().unwrap_or_default() {
         meta.insert_run(global_store, &r);
     }
-    let workspaces = (WorkspaceStore {
-        root: global_dir.join("workspaces"),
-    })
-    .list()
-    .unwrap_or_default();
-    // Dedup canonicalized workspace roots the same way
-    // `read_all_workspaces_sync` dedups ledger dirs, so one physical
-    // store is never walked twice (which would double its spans in the
-    // active-runs strip).
-    let roots: std::collections::HashSet<PathBuf> = workspaces
-        .iter()
-        .map(|w| canonicalize_or_self(std::path::Path::new(&w.path)))
-        .collect();
-    for root in roots {
+    for root in global_meta_workspace_roots(global_dir) {
         let local_store = RunStore::new(root.join(".rupu").join("runs"));
         for r in local_store.list().unwrap_or_default() {
             meta.insert_run(&local_store, &r);
         }
     }
     meta
+}
+
+/// One run directory's cheap change stamp: its name plus the mtimes of
+/// its `run.json` (rewritten on every status/span change — `write_atomic`
+/// replaces the file, so the mtime always moves) and `step_results.jsonl`
+/// (appended per completed step). `None` when the file doesn't exist —
+/// distinct from "not statted".
+type RunDirStamp = (
+    std::ffi::OsString,
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+);
+
+/// The whole global run-store set's change fingerprint, one entry per
+/// store root (see [`global_meta_workspace_roots`]), each carrying a
+/// sorted [`RunDirStamp`] list. Everything is sorted so equality is
+/// order-independent of `read_dir`/`HashSet` iteration.
+type GlobalStoreFingerprint = Vec<(PathBuf, Vec<RunDirStamp>)>;
+
+/// Stamp one store root: one `read_dir` plus two `stat`s per run
+/// directory — no file is opened, read, or parsed, which is the entire
+/// point (compare [`project_run_meta`]'s cost accounting for what
+/// the full walk does per run). A missing root stamps as an empty list,
+/// matching `RunStore::list()`'s own missing-directory tolerance.
+fn store_fingerprint(root: &StdPath) -> Vec<RunDirStamp> {
+    let mut stamps = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return stamps;
+    };
+    let mtime = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        stamps.push((
+            entry.file_name(),
+            mtime(dir.join("run.json")),
+            mtime(dir.join("step_results.jsonl")),
+        ));
+    }
+    stamps.sort();
+    stamps
+}
+
+/// Fingerprint every store [`global_run_meta`] would walk. Catches: a run
+/// created/deleted/archived (directory entry appears/disappears), a
+/// status or span change (`run.json` rewrite), a dispatched step or
+/// fan-out unit completing (`step_results.jsonl` append), and a workspace
+/// (de)registration (root list changes). Deliberately does NOT descend
+/// into `sub/` trees — a sub-agent dispatched via `create_sub_run` writes
+/// only under `<runs>/<parent>/sub/`, invisible to these stats. That gap
+/// is closed by [`global_run_meta_cached`]'s unaccounted-ledger-id check,
+/// not by statting deeper (which would rebuild the very walk this
+/// fingerprint exists to avoid).
+fn global_store_fingerprint(
+    global_dir: &StdPath,
+    global_store: &RunStore,
+) -> GlobalStoreFingerprint {
+    let mut roots: Vec<PathBuf> = global_meta_workspace_roots(global_dir)
+        .into_iter()
+        .map(|root| root.join(".rupu").join("runs"))
+        .collect();
+    roots.push(global_store.root.clone());
+    roots.sort();
+    roots.dedup();
+    roots
+        .into_iter()
+        .map(|root| {
+            let stamps = store_fingerprint(&root);
+            (root, stamps)
+        })
+        .collect()
+}
+
+/// Process-wide memoization of the global-scope [`RunMetaIndex`], keyed
+/// on [`global_store_fingerprint`].
+///
+/// Before this cache, [`global_run_meta`]'s full walk — every run record
+/// in the global store plus every registered workspace's local store,
+/// each expanded through [`run_and_unit_ids`] (a `step_results.jsonl`
+/// read + recursive `sub/` `read_dir`s per run) — ran on EVERY
+/// `/api/netflow` and `/api/netflow/explorer` request, twice per explorer
+/// interaction (both endpoints build their own index). The fingerprint
+/// reduces the steady-state cost to stats, and the index is rebuilt only
+/// when a store actually changed.
+///
+/// **Honesty contract** (the part that keeps "unknown" attribution
+/// honest): the fingerprint alone cannot see a freshly-created sub-run
+/// (see [`global_store_fingerprint`]'s doc), so a cached index is only
+/// served when every ledger-file id the current request actually read is
+/// ACCOUNTED FOR — resolvable by the index, or already proven
+/// unresolvable by a prior rebuild (`known_unknown`). An id that is
+/// neither forces one rebuild before it can ever be reported as the
+/// explicit `unknown` workflow; an id a rebuild still can't resolve (an
+/// orphaned ledger whose run record is gone — permanently unresolvable
+/// by construction, see [`project_fallback_flows_and_dropped`]'s closing
+/// note) is remembered so it cannot silently degrade the cache to a
+/// per-request full walk forever. `known_unknown` is reset whenever the
+/// fingerprint changes — a store change is exactly the event that could
+/// make a formerly-unknown id resolvable.
+///
+/// Lives on [`AppState`] rather than as a `static` for the same reason
+/// [`AsnCache`] does: handlers only see it through `AppState`, and tests
+/// construct a fresh `AppState` per case.
+#[derive(Default)]
+pub struct RunMetaCache {
+    inner: std::sync::Mutex<Option<RunMetaCacheEntry>>,
+}
+
+struct RunMetaCacheEntry {
+    fingerprint: GlobalStoreFingerprint,
+    index: Arc<RunMetaIndex>,
+    /// Ledger-file ids a rebuild at THIS fingerprint already failed to
+    /// resolve — see the honesty contract in [`RunMetaCache`]'s doc.
+    known_unknown: std::collections::HashSet<String>,
+}
+
+/// [`global_run_meta`] through [`RunMetaCache`]. `ledger_ids` is the
+/// distinct set of ledger-file ids the caller's flow read actually
+/// produced — the accounting universe for the honesty contract above.
+///
+/// The lock is deliberately held across the rebuild: every caller is
+/// already on the blocking pool (`run_blocking`), and a burst of
+/// concurrent requests against a changed store should collapse to ONE
+/// walk with the rest reusing its result, not race N identical walks —
+/// the same single-flight rationale as [`RefreshGuard`], solved here by
+/// the mutex itself since (unlike the ASN download) the work is
+/// synchronous.
+fn global_run_meta_cached(
+    cache: &RunMetaCache,
+    global_dir: &StdPath,
+    global_store: &RunStore,
+    ledger_ids: &std::collections::HashSet<String>,
+) -> Arc<RunMetaIndex> {
+    let fingerprint = global_store_fingerprint(global_dir, global_store);
+    let mut guard = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.as_ref() {
+        let accounted =
+            |id: &String| entry.index.map.contains_key(id) || entry.known_unknown.contains(id);
+        if entry.fingerprint == fingerprint && ledger_ids.iter().all(accounted) {
+            return Arc::clone(&entry.index);
+        }
+    }
+    let index = Arc::new(global_run_meta(global_dir, global_store));
+    // Carry known-unknowns forward only while the fingerprint is stable
+    // (kept from being re-proven on every request whose window happens to
+    // exclude them); a changed fingerprint resets the set, since the
+    // store change may be exactly what makes one resolvable.
+    let mut known_unknown = match guard.take() {
+        Some(entry) if entry.fingerprint == fingerprint => entry.known_unknown,
+        _ => std::collections::HashSet::new(),
+    };
+    known_unknown.extend(ledger_ids.iter().cloned());
+    known_unknown.retain(|id| !index.map.contains_key(id));
+    *guard = Some(RunMetaCacheEntry {
+        fingerprint,
+        index: Arc::clone(&index),
+        known_unknown,
+    });
+    index
 }
 
 /// Wrap ledger-tagged flows as [`ExplorerFlow`]s: run/workflow attribution
@@ -935,82 +1163,6 @@ fn read_all_run_ledgers_in_dir(
     (flows, dropped)
 }
 
-/// Every run+unit id (see [`run_and_unit_ids`]) belonging to a project's
-/// OWN run records, named via their `workspace_path` field — never
-/// inferred from scanning a directory's file names. Two sources, mirroring
-/// `resolve_run_location`'s `Global`/`ProjectLocal` split: `global_store`
-/// (rooted at `<global_dir>/runs`) filtered to `workspace_path ==
-/// workspace`, and a project-local store rooted at `<workspace>/.rupu/runs`
-/// (whatever it holds belongs to this project by construction — there is
-/// no `workspace_path` filter to apply there).
-///
-/// This is the attribution-safety property the id-driven global-fallback
-/// pass depends on: a run belonging to some OTHER project never
-/// contributes an id here just because its ledger happens to live in the
-/// same shared `<global_dir>/netflow/` directory — only a run record that
-/// itself declares THIS workspace as its own does.
-///
-/// Both sides of the `workspace_path` comparison go through
-/// [`canonicalize_or_self`], not a bare `==`: `RunRecord::workspace_path`
-/// is stamped canonicalized at run creation (`rupu-cli`'s
-/// `canonicalize_if_exists`), but `workspace` here comes from the
-/// registered `Workspace`'s own path, which this function has no control
-/// over — comparing raw strings would silently miss a match across e.g. a
-/// symlinked temp/mount path, the same hazard [`resolve_ledger_paths`] and
-/// [`read_all_workspaces_sync`] already guard against for directory
-/// identity.
-///
-/// [`run_and_unit_ids`] is called against the SAME store each run id was
-/// discovered from — never unconditionally against `global_store` — so a
-/// project-local run's dispatched steps/units are looked up in the
-/// project-local store's own `step_results.jsonl`, not the global one's
-/// (which has no record of it at all, and `unwrap_or_default()` would
-/// silently swallow that miss, resolving only the parent run's own id and
-/// dropping every dispatched step's own global-fallback ledger). Run scope
-/// ([`run_scoped_flows_and_dropped`]) already gets this right by
-/// constructing the correct store per branch; this mirrors it.
-///
-/// Cost: `global_store.list()` is one `read_dir` plus one small
-/// `run.json` parse per run IN THE WHOLE GLOBAL STORE (not filtered by
-/// workspace at the I/O layer — `RunStore` has no index by
-/// `workspace_path`), so this is O(total runs across every project) on
-/// every project-scope request, not O(this project's own runs). At ~500
-/// runs total that's ~500 small file opens. For each of this project's own
-/// k run ids (k ≤ total runs) found in either store, one additional
-/// `read_step_results` call (a small `step_results.jsonl` read, `Ok(vec![])`
-/// if the run never dispatched a step) discovers its units' own ids — see
-/// the caller's doc comment for what happens to the ids after this.
-///
-/// On top of that (added when [`run_and_unit_ids`] started folding in
-/// sub-agent ids): `run_and_unit_ids` now issues one `sub_run_ids`
-/// directory listing (a `read_dir`, cheap and Ok(empty)-on-missing) per id
-/// it already has — the run itself, plus every step/item id — and
-/// `sub_run_ids_recursive` issues one more per sub-agent id it discovers
-/// while walking that run's dispatch tree. So the true cost is the above
-/// PLUS one `read_dir` per (run, step/item, sub-agent-at-any-depth) id
-/// across this project's own k runs — bounded in practice by how deep/wide
-/// any one run's dispatch tree actually grew (`MAX_SUB_RUN_RECURSION_DEPTH`
-/// backstops the pathological case), not by the total run count.
-fn project_run_and_unit_ids(global_store: &RunStore, workspace: &StdPath) -> Vec<String> {
-    let workspace = canonicalize_or_self(workspace);
-    let mut ids: Vec<String> = Vec::new();
-
-    for r in global_store.list().unwrap_or_default() {
-        if canonicalize_or_self(&r.workspace_path) == workspace {
-            ids.extend(run_and_unit_ids(global_store, &r.id));
-        }
-    }
-
-    let local_store = RunStore::new(workspace.join(".rupu").join("runs"));
-    for r in local_store.list().unwrap_or_default() {
-        ids.extend(run_and_unit_ids(&local_store, &r.id));
-    }
-
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
 /// The id-driven recovery pass: every flow in `<global_dir>/netflow/`
 /// belonging to one of THIS project's own runs (or their dispatched
 /// steps/units — see [`run_and_unit_ids`]), for projects whose
@@ -1037,20 +1189,23 @@ fn project_run_and_unit_ids(global_store: &RunStore, workspace: &StdPath) -> Vec
 /// practice — ids are unique per run/unit — but costs nothing to guard)
 /// is still only opened once.
 ///
-/// Cost, continued from [`project_run_and_unit_ids`]'s doc comment (which
-/// already accounts for the `RunStore::list()`/`read_step_results` calls
-/// that produce the id set): one `read_flows_in_range` per distinct
-/// resolved global path on top of that. This scales with the TOTAL run
-/// count in the global store (the `workspace_path` filter inside
-/// `project_run_and_unit_ids`) and with this project's own run/unit count,
-/// never with the size of the global directory itself — the opposite
-/// scaling from a `read_dir` over that directory, which is what made a
-/// directory-scan-based fix unworkable here (a project has no way to
-/// tell, from the global directory's contents alone, which files are its
-/// own — see the removed KNOWN GAP note this function replaces). All
-/// synchronous, but always run through [`run_blocking`] by the caller,
-/// same as every other read in this module, so it never stalls the async
-/// task.
+/// The id set comes from an already-built [`RunMetaIndex`] over this
+/// project's own runs ([`RunMetaIndex::ledger_ids`]) — the same walk that
+/// produces attribution, done once by the caller, rather than a second
+/// identical `RunStore` enumeration of its own (which is exactly what
+/// this function used to do). Cost, continued from [`project_run_meta`]'s
+/// doc comment (which accounts for the walk that produces the id set):
+/// one `read_flows_in_range` per distinct resolved global path on top of
+/// that. This scales with the TOTAL run count in the global store (the
+/// `workspace_path` filter inside `project_run_meta`) and with this
+/// project's own run/unit count, never with the size of the global
+/// directory itself — the opposite scaling from a `read_dir` over that
+/// directory, which is what made a directory-scan-based fix unworkable
+/// here (a project has no way to tell, from the global directory's
+/// contents alone, which files are its own — see the removed KNOWN GAP
+/// note this function replaces). All synchronous, but always run through
+/// [`run_blocking`] by the caller, same as every other read in this
+/// module, so it never stalls the async task.
 ///
 /// Two things this can NEVER recover, by construction, not by omission:
 /// a `system`-origin flow with `ctx.run_id: None` has no run record to be
@@ -1064,14 +1219,13 @@ fn project_run_and_unit_ids(global_store: &RunStore, workspace: &StdPath) -> Vec
 /// outcome for a deleted run, not a bug to chase; an archived one is a
 /// narrower, accepted gap in the same direction.
 fn project_fallback_flows_and_dropped(
-    global_store: &RunStore,
-    workspace: &StdPath,
+    meta: &RunMetaIndex,
     global_dir: &StdPath,
     range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<(String, FlowRecord)>, u64) {
     let mut paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for id in project_run_and_unit_ids(global_store, workspace) {
-        paths.insert(NetflowPaths::for_run(&global_netflow_dir(global_dir), &id).flows);
+    for id in meta.ledger_ids() {
+        paths.insert(NetflowPaths::for_run(&global_netflow_dir(global_dir), id).flows);
     }
 
     let mut flows = Vec::new();
@@ -1087,16 +1241,24 @@ fn project_fallback_flows_and_dropped(
     (flows, dropped)
 }
 
-/// Every flow at project scope: the workspace-local ledger directory
-/// (whole-directory scan, [`read_all_run_ledgers_in_dir`]) UNIONED with
-/// the id-driven global-fallback recovery pass
-/// ([`project_fallback_flows_and_dropped`]) for runs whose ledgers landed
-/// in `<global_dir>/netflow/` instead — see that function's doc for the
-/// full cost accounting and what it deliberately cannot recover. Shared
-/// by [`get_project_netflow`] and the graph endpoint's `project:` scope so
-/// the table and the graph are always built from the identical set,
-/// mirroring [`run_scoped_flows_and_dropped`]'s equivalent role at run
-/// scope.
+/// Every flow at project scope — plus the project's own [`RunMetaIndex`]:
+/// the workspace-local ledger directory (whole-directory scan,
+/// [`read_all_run_ledgers_in_dir`]) UNIONED with the id-driven
+/// global-fallback recovery pass ([`project_fallback_flows_and_dropped`])
+/// for runs whose ledgers landed in `<global_dir>/netflow/` instead — see
+/// that function's doc for the full cost accounting and what it
+/// deliberately cannot recover. Shared by [`get_project_netflow`], the
+/// project explorer scope, and the graph endpoint's `project:` scope so
+/// the table, the aggregates, and the graph are always built from the
+/// identical set, mirroring [`run_scoped_flows_and_dropped`]'s equivalent
+/// role at run scope.
+///
+/// Returns the index it built alongside the flows because the ONE record
+/// walk ([`project_run_meta`]) serves both needs: the fallback pass's id
+/// set and the response's attribution/spans. Callers that need no
+/// attribution (the graph endpoint) simply drop it — the walk is not
+/// avoidable for them anyway, since the fallback pass requires the id
+/// set regardless.
 ///
 /// Guards the same `$HOME`/`RUPU_HOME` collision [`resolve_ledger_paths`]
 /// guards at run scope: when the workspace-local netflow dir and the
@@ -1105,24 +1267,25 @@ fn project_fallback_flows_and_dropped(
 /// above has already read every file in it, so the id-driven pass is
 /// skipped entirely rather than re-reading (and double-counting) that
 /// same directory a second time.
-fn project_scoped_flows_and_dropped(
+fn project_scoped_flows_meta_and_dropped(
     global_store: &RunStore,
     workspace: &StdPath,
     global_dir: &StdPath,
     range: &rupu_netflow::ledger::TimeRange,
-) -> (Vec<(String, FlowRecord)>, u64) {
+) -> (Vec<(String, FlowRecord)>, RunMetaIndex, u64) {
+    let meta = project_run_meta(global_store, workspace);
     let local_dir = project_local_netflow_dir(workspace);
     let (mut flows, mut dropped) = read_all_run_ledgers_in_dir(&local_dir, range);
 
     if canonicalize_or_self(&local_dir) == canonicalize_or_self(&global_netflow_dir(global_dir)) {
-        return (flows, dropped);
+        return (flows, meta, dropped);
     }
 
     let (fallback_flows, fallback_dropped) =
-        project_fallback_flows_and_dropped(global_store, workspace, global_dir, range);
+        project_fallback_flows_and_dropped(&meta, global_dir, range);
     flows.extend(fallback_flows);
     dropped += fallback_dropped;
-    (flows, dropped)
+    (flows, meta, dropped)
 }
 
 /// Every flow across every registered workspace's ledger directory, PLUS
@@ -1213,7 +1376,7 @@ fn canonicalize_or_self(path: &StdPath) -> PathBuf {
 /// ledger at all — `rupu-update`'s client is wired to `Arc::new(NullSink)`)
 /// UNIONED with an id-driven recovery pass over `<global_dir>/netflow/`
 /// for this project's own runs whose ledgers landed there instead — see
-/// [`project_scoped_flows_and_dropped`]'s doc comment for the full
+/// [`project_scoped_flows_meta_and_dropped`]'s doc comment for the full
 /// mechanism, cost accounting, and what it deliberately cannot recover
 /// (an unattributable `run_id: None` global-scope flow, or an orphaned
 /// ledger whose run record is gone).
@@ -1230,9 +1393,8 @@ async fn get_project_netflow(
     let store = Arc::clone(&state.run_store);
     let global_dir = state.global_dir.clone();
     let resp = run_blocking(move || {
-        let (flows, dropped) =
-            project_scoped_flows_and_dropped(&store, &workspace, &global_dir, &range);
-        let meta = project_run_meta(&store, &workspace);
+        let (flows, meta, dropped) =
+            project_scoped_flows_meta_and_dropped(&store, &workspace, &global_dir, &range);
         let table = load_asn_table(&cache);
         build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters)
     })
@@ -1251,9 +1413,11 @@ async fn get_global_netflow(
     let global_dir = state.global_dir.clone();
     let store = Arc::clone(&state.run_store);
     let cache = Arc::clone(&state.asn_cache);
+    let meta_cache = Arc::clone(&state.run_meta_cache);
     let resp = run_blocking(move || {
         let (flows, dropped) = read_all_workspaces_sync(&global_dir, &range);
-        let meta = global_run_meta(&global_dir, &store);
+        let ledger_ids = flows.iter().map(|(id, _)| id.clone()).collect();
+        let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
         let table = load_asn_table(&cache);
         build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters)
     })
@@ -1461,12 +1625,14 @@ async fn get_netflow_graph(
         let workspace = workspace_for_project(&state, project_id)?;
         let store = Arc::clone(&state.run_store);
         let global_dir = state.global_dir.clone();
-        // Shares `project_scoped_flows_and_dropped` with `get_project_netflow`
-        // so the graph and the table are always built from the identical
-        // set, including the id-driven global-fallback recovery pass — see
-        // that function's doc comment.
+        // Shares `project_scoped_flows_meta_and_dropped` with
+        // `get_project_netflow` so the graph and the table are always
+        // built from the identical set, including the id-driven
+        // global-fallback recovery pass — see that function's doc comment
+        // (including why the unused meta index costs this caller nothing
+        // extra).
         run_blocking(move || {
-            project_scoped_flows_and_dropped(&store, &workspace, &global_dir, &range).0
+            project_scoped_flows_meta_and_dropped(&store, &workspace, &global_dir, &range).0
         })
         .await?
     } else {
@@ -1569,7 +1735,7 @@ pub(crate) fn build_explorer_response(
 /// — the aggregate read behind the Network explorer surface. Scope
 /// resolution mirrors [`get_netflow_graph`]; the underlying flow sets are
 /// the SAME ones the flows-list routes read
-/// ([`run_scoped_flows_and_dropped`] / [`project_scoped_flows_and_dropped`]
+/// ([`run_scoped_flows_and_dropped`] / [`project_scoped_flows_meta_and_dropped`]
 /// / [`read_all_workspaces_sync`]), so the explorer's aggregates and the
 /// table beneath them can never be built from different data.
 async fn get_netflow_explorer(
@@ -1588,13 +1754,12 @@ async fn get_netflow_explorer(
         let global_dir = state.global_dir.clone();
         let cache = Arc::clone(&state.asn_cache);
         let resp = run_blocking(move || {
-            let (tagged, dropped) = project_scoped_flows_and_dropped(
+            let (tagged, meta, dropped) = project_scoped_flows_meta_and_dropped(
                 &store,
                 &workspace,
                 &global_dir,
                 &rupu_netflow::ledger::TimeRange::unbounded(),
             );
-            let meta = project_run_meta(&store, &workspace);
             let table = load_asn_table(&cache);
             let flows = to_explorer_flows(tagged, &meta, table.as_deref());
             build_explorer_response(
@@ -1612,12 +1777,14 @@ async fn get_netflow_explorer(
         let store = Arc::clone(&state.run_store);
         let global_dir = state.global_dir.clone();
         let cache = Arc::clone(&state.asn_cache);
+        let meta_cache = Arc::clone(&state.run_meta_cache);
         let resp = run_blocking(move || {
             let (tagged, dropped) = read_all_workspaces_sync(
                 &global_dir,
                 &rupu_netflow::ledger::TimeRange::unbounded(),
             );
-            let meta = global_run_meta(&global_dir, &store);
+            let ledger_ids = tagged.iter().map(|(id, _)| id.clone()).collect();
+            let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
             let table = load_asn_table(&cache);
             let flows = to_explorer_flows(tagged, &meta, table.as_deref());
             build_explorer_response(
@@ -2541,5 +2708,173 @@ mod tests {
         std::env::remove_var("RUPU_HOME");
 
         assert!(result.is_none());
+    }
+
+    // ── RunMetaCache (global-scope RunMetaIndex memoization) ────────────────
+    //
+    // Same `Arc::ptr_eq` observability contract as the AsnCache tests
+    // above: a cache hit returns the SAME Arc, a rebuild returns a fresh
+    // one, so reuse-vs-rebuild is directly assertable without any
+    // instrumentation counter.
+
+    fn seed_record(id: &str, workflow: &str, workspace: &std::path::Path) -> RunRecord {
+        RunRecord {
+            id: id.into(),
+            workflow_name: workflow.into(),
+            status: rupu_orchestrator::runs::RunStatus::Completed,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_meta_cache".into(),
+            workspace_path: workspace.to_path_buf(),
+            transcript_dir: workspace.join(".rupu/transcripts"),
+            started_at: chrono::DateTime::from_timestamp(50, 0).unwrap(),
+            finished_at: Some(chrono::DateTime::from_timestamp(2_000, 0).unwrap()),
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            resume_approver: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            final_output: None,
+            loop_progress: Default::default(),
+        }
+    }
+
+    fn ids(list: &[&str]) -> std::collections::HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn run_meta_cache_reuses_the_index_while_the_stores_are_unchanged() {
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        store
+            .create(seed_record("run-a", "review-wf", global.path()), "x: 1\n")
+            .unwrap();
+
+        let cache = RunMetaCache::default();
+        let first = global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a"]));
+        let second = global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a"]));
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged stores + fully-accounted ids must reuse the SAME index Arc"
+        );
+        assert_eq!(
+            first.attribution("run-a"),
+            (Some("run-a".into()), Some("review-wf".into()))
+        );
+    }
+
+    #[test]
+    fn run_meta_cache_rebuilds_when_a_run_store_changes() {
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        store
+            .create(seed_record("run-a", "review-wf", global.path()), "x: 1\n")
+            .unwrap();
+
+        let cache = RunMetaCache::default();
+        let first = global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a"]));
+        assert_eq!(first.attribution("run-b"), (None, None), "sanity");
+
+        store
+            .create(seed_record("run-b", "nightly-wf", global.path()), "x: 1\n")
+            .unwrap();
+        let second =
+            global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a", "run-b"]));
+
+        assert_eq!(
+            second.attribution("run-b"),
+            (Some("run-b".into()), Some("nightly-wf".into())),
+            "a run created after the cache warmed must be attributed on the next read"
+        );
+    }
+
+    #[test]
+    fn run_meta_cache_rebuilds_for_an_unaccounted_ledger_id_despite_unchanged_mtimes() {
+        // `create_sub_run` writes only under `<runs>/<parent>/sub/` — it
+        // touches neither `run.json` nor `step_results.jsonl`, so the
+        // store fingerprint alone cannot see it. The honesty backstop is
+        // the ledger-id check: a tagged flow set naming an id the cached
+        // index can't account for forces one rebuild BEFORE that id is
+        // ever served as "unknown".
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        store
+            .create(seed_record("run-a", "review-wf", global.path()), "x: 1\n")
+            .unwrap();
+
+        let cache = RunMetaCache::default();
+        let first = global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a"]));
+
+        let (sub_id, _) = store.create_sub_run("run-a", "reviewer").unwrap();
+        let second =
+            global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a", &sub_id]));
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an unaccounted ledger id must force a rebuild even with an unchanged fingerprint"
+        );
+        assert_eq!(
+            second.attribution(&sub_id),
+            (Some("run-a".into()), Some("review-wf".into())),
+            "the sub-agent's ledger id must fold into its dispatching run"
+        );
+    }
+
+    #[test]
+    fn run_meta_cache_is_not_defeated_by_a_genuinely_unknown_id() {
+        // An orphaned ledger (its run record deleted, or never recorded)
+        // stays unknown across rebuilds. Once one rebuild has proven an id
+        // unresolvable, that id must be remembered as known-unknown — NOT
+        // trigger a fresh rebuild on every subsequent request, which would
+        // silently degrade the cache to a per-request full walk forever on
+        // any installation with a single orphan.
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        store
+            .create(seed_record("run-a", "review-wf", global.path()), "x: 1\n")
+            .unwrap();
+
+        let cache = RunMetaCache::default();
+        let first = global_run_meta_cached(
+            &cache,
+            global.path(),
+            &store,
+            &ids(&["run-a", "orphan-run"]),
+        );
+        let second = global_run_meta_cached(
+            &cache,
+            global.path(),
+            &store,
+            &ids(&["run-a", "orphan-run"]),
+        );
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a known-unknown id must be served from cache, not rebuilt every request"
+        );
+        assert_eq!(first.attribution("orphan-run"), (None, None));
     }
 }

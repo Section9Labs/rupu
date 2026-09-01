@@ -78,6 +78,12 @@ pub struct AppState {
     /// re-reading and re-parsing the multi-megabyte table file on every
     /// request.
     pub asn_cache: Arc<crate::api::netflow::AsnCache>,
+    /// Process-wide memoization of the global-scope netflow attribution
+    /// index — see [`crate::api::netflow::RunMetaCache`]'s doc comment
+    /// for the fingerprint keying and the unaccounted-ledger-id honesty
+    /// contract that lets it skip re-walking every run store on every
+    /// `/api/netflow` + `/api/netflow/explorer` request.
+    pub run_meta_cache: Arc<crate::api::netflow::RunMetaCache>,
 }
 
 impl AppState {
@@ -136,6 +142,7 @@ impl AppState {
             bind: "127.0.0.1:7878".to_string(),
             token_set: false,
             asn_cache: Arc::new(crate::api::netflow::AsnCache::default()),
+            run_meta_cache: Arc::new(crate::api::netflow::RunMetaCache::default()),
         }
     }
 
