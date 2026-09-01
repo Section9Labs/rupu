@@ -310,6 +310,92 @@ async fn a_run_recorded_in_two_stores_counts_once_in_the_active_runs_strip() {
 }
 
 #[tokio::test]
+async fn attribution_stays_fresh_across_the_run_meta_cache_when_a_run_is_created() {
+    // Global scope memoizes its RunMetaIndex on AppState (`RunMetaCache`,
+    // keyed on run-store mtimes). The first request warms it; a run
+    // created AFTER that must still be attributed on the next request —
+    // the store fingerprint sees the new run directory and rebuilds.
+    let global = tempfile::TempDir::new().unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    seed_project(&global, &project);
+
+    let addr = serve(new_state(global.path())).await;
+    let warm: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(warm["flows"].as_array().unwrap().len(), 3, "sanity: {warm}");
+
+    let run_store = RunStore::new(global.path().join("runs"));
+    run_store
+        .create(
+            seed_run("run-b", "nightly-wf", project.path()),
+            "name: nightly-wf\n",
+        )
+        .unwrap();
+    write_ledger(project.path(), "run-b", &[flow(1_200, "crates.io", true)]);
+
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    let new_flow = flows.iter().find(|f| f["host"] == "crates.io").unwrap();
+    assert_eq!(
+        new_flow["run_id"], "run-b",
+        "a run created after the cache warmed must be attributed, not served stale: {body}"
+    );
+    assert_eq!(new_flow["workflow"], "nightly-wf", "{body}");
+}
+
+#[tokio::test]
+async fn attribution_stays_fresh_across_the_run_meta_cache_when_a_sub_agent_is_dispatched() {
+    // The harder staleness case: `create_sub_run` writes only under
+    // `<runs>/<parent>/sub/`, which the store fingerprint's stats cannot
+    // see. The cache's honesty backstop — a ledger id the cached index
+    // can't account for forces a rebuild — is what keeps this flow from
+    // being served under the `unknown` workflow.
+    let global = tempfile::TempDir::new().unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    seed_project(&global, &project);
+
+    let addr = serve(new_state(global.path())).await;
+    let warm: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow/explorer"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(warm["kpis"]["flows"], 3, "sanity: {warm}");
+
+    let run_store = RunStore::new(global.path().join("runs"));
+    let (sub_id, _) = run_store.create_sub_run("run-a", "reviewer").unwrap();
+    write_ledger(
+        project.path(),
+        &sub_id,
+        &[flow(700, "api.anthropic.com", true)],
+    );
+
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow/explorer"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let workflows = body["sankey"]["workflows"].as_array().unwrap();
+    let review = workflows.iter().find(|n| n["id"] == "review-wf").unwrap();
+    assert_eq!(
+        review["calls"], 3,
+        "the sub-agent's flow must fold into its dispatching run's workflow \
+         even though the store fingerprint never saw the dispatch: {body}"
+    );
+}
+
+#[tokio::test]
 async fn flows_list_cross_filters_server_side_and_attributes_rows() {
     let global = tempfile::TempDir::new().unwrap();
     let project = tempfile::TempDir::new().unwrap();
