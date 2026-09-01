@@ -377,6 +377,27 @@ struct TranscriptViewModelTests {
         #expect(turns.count == 1, "none of these variants may open a new turn")
         #expect(turns[0].tools.isEmpty, "none of these variants may populate a turn's tools")
     }
+
+    /// Transcript-fidelity v2 (Plan 3, Task 2): the six new event kinds are
+    /// transcript-level narrative content, not turn-scoped tool activity —
+    /// they render as their own standalone `FeedRow`s in `TranscriptFeed.
+    /// swift` instead of ever opening/closing/populating a `TurnVM`.
+    @Test func v2NarrativeEventKindsAreAlsoIgnoredEntirely() {
+        let events: [TranscriptEvent] = [
+            .assistantMessage(content: "only turn", thinking: nil),
+            .thinking(text: "reasoning...", provider: "anthropic", model: "m"),
+            .thinkingDelta(content: "partial reasoning..."),
+            .userMessage(content: "do it"),
+            .seed(messageCount: 3, sourceTranscript: nil),
+            .notice(kind: "context_trim", message: "trimmed"),
+            .compaction(seq: 1, summarizedMessages: 5, backupPath: nil),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns.count == 1, "none of these v2 variants may open a new turn")
+        #expect(turns[0].tools.isEmpty, "none of these v2 variants may populate a turn's tools")
+    }
 }
 
 /// Mirrors `classify(_:)` for the one test that needs to assert an exact

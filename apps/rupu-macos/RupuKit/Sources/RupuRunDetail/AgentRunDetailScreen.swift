@@ -126,7 +126,7 @@ public struct AgentRunDetailScreen: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .panelStyle(.panel)
             case .content(let events):
-                TranscriptFeed(events: events, runID: runID, host: host)
+                TranscriptFeed(events: events, runID: runID, host: host, unparsedCount: store.transcriptUnparsedCount)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .panelStyle(.panel)
             }

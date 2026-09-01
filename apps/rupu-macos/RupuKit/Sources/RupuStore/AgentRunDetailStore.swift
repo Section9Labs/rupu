@@ -50,6 +50,11 @@ import RupuAPI
 @Observable
 public final class AgentRunDetailStore {
     public private(set) var transcript: BlockState<[TranscriptEvent]> = .loading
+    /// Plan 3, Task 2: `APITranscriptPage.unparsed` for whichever transcript
+    /// `transcript` currently holds — `0` until the first successful
+    /// `activate()` fetch lands (matching `RunDetailStore.
+    /// transcriptUnparsedCount`'s own "no signal yet" default).
+    public private(set) var transcriptUnparsedCount: Int = 0
 
     /// Whichever transcript path `activate()` actually used — the
     /// constructor's own `transcriptPath` when it was non-nil, else
@@ -126,12 +131,14 @@ public final class AgentRunDetailStore {
 
         guard let path else {
             transcript = .empty
+            transcriptUnparsedCount = 0
             return
         }
         transcript = .loading
         do {
             let page = try await fetchTranscript(path)
             transcript = page.events.isEmpty ? .empty : .content(page.events)
+            transcriptUnparsedCount = page.unparsed ?? 0
         } catch {
             guard !isCancellation(error) else { return }
             transcript = .failed(String(describing: error))

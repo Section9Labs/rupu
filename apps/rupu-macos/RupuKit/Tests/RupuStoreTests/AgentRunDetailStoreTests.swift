@@ -124,6 +124,22 @@ private func makeStore(
     #expect(events == [.assistantMessage(content: "hello", thinking: nil)])
 }
 
+/// Plan 3, Task 2: `transcriptUnparsedCount` surfaces the fetched page's
+/// `unparsed` field, the same signal `RunDetailStore.transcriptUnparsedCount`
+/// exposes for the orchestrator-run transcript tab.
+@MainActor @Test func activatePopulatesTranscriptUnparsedCountFromThePage() async {
+    let store = makeStore(
+        transcriptPath: "t/run-99.jsonl",
+        fetchTranscript: { _ in
+            APITranscriptPage(events: [.assistantMessage(content: "hello", thinking: nil)], summary: nil, unparsed: 2)
+        }
+    )
+
+    await store.activate()
+
+    #expect(store.transcriptUnparsedCount == 2)
+}
+
 // MARK: - (c) a real transcriptPath resolving to zero events is .empty, not .failed
 
 @MainActor @Test func transcriptPathResolvingToZeroEventsIsEmptyNotFailed() async {

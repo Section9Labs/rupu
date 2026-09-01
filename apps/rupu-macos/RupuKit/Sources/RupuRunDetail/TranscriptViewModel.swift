@@ -71,7 +71,19 @@ import RupuAPI
 /// text), `net_flow`, `usage`, `run_start`/`run_complete` (header/footer
 /// concerns), and `gate_requested` (a standalone feed row, Task 7's
 /// concern) — none of these five ever open, close, or populate a turn.
-/// `unknown(type:)` is likewise ignored.
+/// `unknown(type:)` is likewise ignored here (it renders as its own
+/// standalone `FeedRow` in `TranscriptFeed.swift` instead).
+///
+/// Transcript-fidelity v2 (Plan 3, Task 2) added six more variants that are
+/// likewise excluded from turn folding: `thinking`/`user_message`/`seed`/
+/// `notice`/`compaction` are transcript-level narrative events, not tool
+/// activity scoped to one turn, so each renders as its own standalone
+/// `FeedRow` in `TranscriptFeed.swift`, positioned chronologically among the
+/// turns exactly like `gate_requested` already is — not folded into any
+/// `TurnVM`. `thinking_delta` is dropped outright, the same "consolidated
+/// event already carries this" convention `assistant_delta` established:
+/// the `thinking` event is `thinking_delta`'s own after-the-fact
+/// consolidation, so rendering both would show the same reasoning twice.
 ///
 /// The LAST turn in the returned array has `isOpenByDefault == true`; every
 /// earlier turn has it `false`.
@@ -297,7 +309,8 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
     for event in events {
         switch event {
         // Excluded from turns entirely — see the file-header doc comment.
-        case .runStart, .runComplete, .usage, .netFlow, .assistantDelta, .gateRequested, .unknown:
+        case .runStart, .runComplete, .usage, .netFlow, .assistantDelta, .gateRequested, .unknown,
+             .thinking, .thinkingDelta, .userMessage, .seed, .notice, .compaction:
             continue
 
         case .turnStart(let turnIdx):
@@ -392,10 +405,6 @@ public func buildTranscriptViewModel(events: [TranscriptEvent]) -> [TurnVM] {
 
         case .actionEmitted(let kind, let payload, _, _, _):
             pendingActionArgsByTool[kind, default: []].append(payload)
-
-        // upgraded in Task 2
-        case .thinking, .thinkingDelta, .userMessage, .seed, .notice, .compaction:
-            continue
         }
     }
 

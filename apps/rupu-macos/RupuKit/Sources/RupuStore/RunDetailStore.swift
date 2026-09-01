@@ -143,6 +143,15 @@ public final class RunDetailStore {
     public private(set) var stepTranscripts: [String: String] = [:]
 
     public private(set) var transcript: [TranscriptEvent] = []
+    /// Plan 3, Task 2: `APITranscriptPage.unparsed` — how many trailing
+    /// transcript lines the server dropped as unparseable — for whichever
+    /// step/path `transcript` currently reflects. Only a REST fetch
+    /// (`focusPath`'s non-tailing branch, `reloadTranscriptSnapshot`) can
+    /// set this to a real value; every place that resets `transcript` to
+    /// `[]` (a cleared focus, a tail start/reconnect) resets this to `0`
+    /// alongside it, since a live tail carries no page-level unparsed count
+    /// of its own to report.
+    public private(set) var transcriptUnparsedCount: Int = 0
     public private(set) var transcriptTailActive: Bool = false
     public private(set) var focusedTranscriptPath: String?
 
@@ -598,6 +607,7 @@ public final class RunDetailStore {
             stopTail()
             focusedTranscriptPath = nil
             transcript = []
+            transcriptUnparsedCount = 0
             return
         }
 
@@ -611,8 +621,11 @@ public final class RunDetailStore {
         }
 
         let events: [TranscriptEvent]
+        let unparsedCount: Int
         do {
-            events = try await fetchTranscript(path).events
+            let page = try await fetchTranscript(path)
+            events = page.events
+            unparsedCount = page.unparsed ?? 0
         } catch {
             // Cancellation (a rapid re-focus, or the whole screen tearing
             // down) is benign — leave `transcript`/`focusedTranscriptPath`
@@ -630,6 +643,7 @@ public final class RunDetailStore {
             // label) is the honest failure state here — but only if this
             // call is still the current one; see the generation check below.
             events = []
+            unparsedCount = 0
         }
 
         // A newer `focusStep`/`select(stepID:unitIndex:)` call started while
@@ -643,6 +657,7 @@ public final class RunDetailStore {
         stopTail()
         focusedTranscriptPath = path
         transcript = events
+        transcriptUnparsedCount = unparsedCount
     }
 
     // MARK: - Selection (Task 4, flows-composition)
@@ -1093,6 +1108,7 @@ public final class RunDetailStore {
         // duplicate on top of any REST snapshot `focusStep` might have left
         // behind for a *previous* step's focus.
         transcript = []
+        transcriptUnparsedCount = 0
         lifecycle.start(
             signals: factory(path),
             resnapshot: { [weak self] in
@@ -1127,6 +1143,7 @@ public final class RunDetailStore {
 
     private func clearTranscriptForTailReconnect() async {
         transcript = []
+        transcriptUnparsedCount = 0
     }
 
     /// REST reload, replacing `transcript` wholesale (never appended) —
@@ -1145,6 +1162,7 @@ public final class RunDetailStore {
         guard let page = try? await fetchTranscript(path) else { return }
         guard generation == tailTeardownGeneration else { return }
         transcript = page.events
+        transcriptUnparsedCount = page.unparsed ?? 0
     }
 
     private func stopTail() {
