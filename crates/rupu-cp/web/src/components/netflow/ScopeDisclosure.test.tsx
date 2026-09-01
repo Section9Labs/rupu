@@ -29,7 +29,6 @@ import {
   NetflowScopeDisclosure,
   netflowCoverageList,
   netflowEmptyStateHint,
-  netflowSystemSourceHint,
   type NetflowScope,
 } from './ScopeDisclosure';
 
@@ -82,33 +81,9 @@ describe('netflowEmptyStateHint', () => {
   });
 });
 
-describe('netflowSystemSourceHint', () => {
-  it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
-    // Task 8: "CP fleet traffic" is gone from this example list
-    // entirely — see the file header note above.
-    expect(netflowSystemSourceHint(scope)).not.toMatch(/CP fleet traffic/i);
-  });
-
-  it.each(SCOPES)('never claims ASN refresh at %s scope', (scope) => {
-    // `Origin::System` ASN-refresh downloads are wired to `NullSink` at
-    // both call sites (`cmd/cp.rs`'s sweep, this crate's own
-    // `maybe_refresh_asn`) — recorded nowhere, at any scope, global
-    // included. Previously (round 5) this was claimed at global scope
-    // only; that carve-out is gone along with the claim.
-    expect(netflowSystemSourceHint(scope)).not.toMatch(/ASN refresh/i);
-  });
-
-  it.each(SCOPES)('no longer claims a `system` fallback source at %s scope', (scope) => {
-    // Finding 4, whole-branch review: `graph_view` used to derive the
-    // source id from `f.ctx.run_id`, which no production `FlowCtx` ever
-    // populates, so every graph collapsed to one node literally called
-    // `system`. The read side now passes the owning run id in explicitly
-    // (the ledger file's own name), so every source is a real run id and
-    // there is no more "unattributed" fallback case to name here.
-    expect(netflowSystemSourceHint(scope)).not.toMatch(/system for unattributed egress/i);
-    expect(netflowSystemSourceHint(scope)).toMatch(/runs/i);
-  });
-});
+// (`netflowSystemSourceHint`'s describe block was retired with
+// `NetflowGraph.tsx` — the hint itself is gone; the NullSink accounting it
+// asserted lives on in `netflowCoverageList`'s tests above.)
 
 describe('NetflowScopeDisclosure sub-agent note', () => {
   // Run scope's flows/dropped_total now fold in every sub-agent this run

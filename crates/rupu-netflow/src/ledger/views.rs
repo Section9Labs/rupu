@@ -124,7 +124,7 @@ fn is_error(f: &FlowRecord) -> bool {
 /// Do NOT "fix" the non-empty case to `ceil(pct * (n - 1))` to make a test
 /// pass. That is a different, nonstandard definition; if a test disagrees
 /// with nearest-rank, the test's expected value is what is wrong.
-fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
+pub(crate) fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
     if sorted.is_empty() {
         return None;
     }

@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+:root{--c-bg:250 250 250;--c-panel:255 255 255;--c-surface:241 245 249;--c-surface-hover:226 232 240;--c-border:229 231 235;--c-border-strong:203 213 225;--c-ink:15 23 42;--c-ink-dim:100 116 139;--c-ink-mute:148 163 184;--c-brand-50:245 243 255;--c-brand-100:237 233 254;--c-brand-500:124 58 237;--c-brand-600:109 40 217;--c-brand-700:91 33 182;--c-status-failed:239 68 68;--c-err:220 38 38;--c-err-bg:254 242 242;--c-ok:22 163 74;--c-ok-bg:240 253 244;--c-warn:217 119 6;--c-warn-bg:255 251 235;--c-info:37 99 235;--c-info-bg:239 246 255}
+[data-theme="dark"]{--c-bg:10 10 10;--c-panel:20 20 22;--c-surface:27 27 31;--c-surface-hover:35 35 39;--c-border:38 38 42;--c-border-strong:63 63 70;--c-ink:245 245 245;--c-ink-dim:161 161 170;--c-ink-mute:113 113 122;--c-brand-50:33 23 56;--c-brand-100:45 33 74;--c-brand-500:124 58 237;--c-brand-600:124 58 237;--c-brand-700:167 139 250;--c-status-failed:248 113 113;--c-err:248 113 113;--c-err-bg:43 22 22;--c-ok:74 222 128;--c-ok-bg:18 40 27;--c-warn:251 191 36;--c-warn-bg:48 36 12;--c-info:96 165 250;--c-info-bg:20 32 54}
+html,body{height:100%;margin:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:rgb(var(--c-brand-600));text-decoration:none}a:hover{color:rgb(var(--c-brand-700))}
+.nf-seg[data-on="true"]{background:rgb(var(--c-surface));color:rgb(var(--c-ink));font-weight:600}
+.nf-navi:hover{background:rgb(var(--c-surface-hover))}
+.nf-node[data-on="true"]{border-color:rgb(var(--c-brand-500) / .6);background:rgb(var(--c-brand-50))}
+.nf-node[data-dim="true"]{opacity:.35}
+.nf-hostrow[data-on="true"]{background:rgb(var(--c-brand-50))}
+</style>
+<script src="https://unpkg.com/lucide@0.462.0/dist/umd/lucide.min.js"></script>
+</helmet>
+<div data-theme="{{ theme }}" data-screen-label="Network — v2: Explorer with Topology/Timeline views" style="display:flex;height:100vh;overflow:hidden;background:rgb(var(--c-bg));color:rgb(var(--c-ink))">
+  <aside style="width:240px;flex:none;border-right:1px solid rgb(var(--c-border));background:rgb(var(--c-panel));display:flex;flex-direction:column">
+    <div style="padding:20px;display:flex;align-items:center;gap:8px;border-bottom:1px solid rgb(var(--c-border))">
+      <span style="display:flex;height:28px;width:28px;flex:none;align-items:center;justify-content:center;border-radius:6px;background:rgb(var(--c-brand-600));color:#fff;font-size:15px;font-weight:300;line-height:1">&#8734;</span>
+      <span style="line-height:1.25"><span style="display:block;font-size:14px;font-weight:600">rupu</span><span style="display:block;font-size:11px;color:rgb(var(--c-ink-mute))">Control Plane</span></span>
+    </div>
+    <nav style="flex:1;padding:12px 8px;overflow-y:auto">
+      <div class="nf-navi" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;cursor:pointer"><i data-lucide="layout-dashboard" style="width:16px;height:16px"></i><span>Dashboard</span></div>
+      <div class="nf-navi" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;cursor:pointer;margin-top:2px"><i data-lucide="folder-git-2" style="width:16px;height:16px"></i><span>Projects</span></div>
+      <div class="nf-navi" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;cursor:pointer;margin-top:2px"><i data-lucide="radio" style="width:16px;height:16px"></i><span>Live Events</span></div>
+      <div class="nf-navi" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;cursor:pointer;margin-top:2px"><i data-lucide="dollar-sign" style="width:16px;height:16px"></i><span>Usage</span></div>
+      <div style="border-top:1px solid rgb(var(--c-border));margin:8px 0"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 4px;font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;color:rgb(var(--c-ink-mute))"><span>Runs</span><i data-lucide="chevron-down" style="width:10px;height:10px;transform:rotate(-90deg)"></i></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 4px;font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;color:rgb(var(--c-brand-700))"><span>Security</span><i data-lucide="chevron-down" style="width:10px;height:10px"></i></div>
+      <div class="nf-navi" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;cursor:pointer"><i data-lucide="shield-check" style="width:16px;height:16px"></i><span>Coverage</span></div>
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;background:rgb(var(--c-brand-50));color:rgb(var(--c-brand-700));font-weight:500;margin-top:2px"><i data-lucide="network" style="width:16px;height:16px"></i><span>Network</span></div>
+      <div class="nf-navi" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;cursor:pointer;margin-top:2px"><i data-lucide="shield-alert" style="width:16px;height:16px"></i><span>Findings</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 4px;font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;color:rgb(var(--c-ink-mute))"><span>Build</span><i data-lucide="chevron-down" style="width:10px;height:10px;transform:rotate(-90deg)"></i></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 4px;font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;color:rgb(var(--c-ink-mute))"><span>Fleet</span><i data-lucide="chevron-down" style="width:10px;height:10px;transform:rotate(-90deg)"></i></div>
+      <div style="border-top:1px solid rgb(var(--c-border));margin:8px 0"></div>
+      <div class="nf-navi" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;font-size:14px;cursor:pointer"><i data-lucide="settings" style="width:16px;height:16px"></i><span>Settings</span></div>
+    </nav>
+    <div style="border-top:1px solid rgb(var(--c-border));padding:8px">
+      <button onClick="{{ toggleTheme }}" style="display:flex;align-items:center;gap:8px;width:100%;padding:6px 10px;border:0;border-radius:6px;background:transparent;color:rgb(var(--c-ink-dim));font:inherit;font-size:13px;cursor:pointer" style-hover="background:rgb(var(--c-surface-hover));color:rgb(var(--c-ink))"><span style="font-size:14px;line-height:1">&#9681;</span><span>{{ themeLabel }}</span></button>
+    </div>
+  </aside>
+  <main style="flex:1;overflow:auto;position:relative">
+    <div style="padding:28px 32px 48px;max-width:1240px">
+      <header style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:20px">
+        <div>
+          <h1 style="margin:0;font-size:24px;font-weight:600;line-height:32px">Network</h1>
+          <p style="margin:4px 0 0;font-size:14px;color:rgb(var(--c-ink-dim))">Where rupu's runs actually reached &#8212; grouped, filterable, and linked to every recorded flow.</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;position:relative;flex:none">
+          <button onClick="{{ toggleCoverage }}" style="display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:11px;font-weight:500;padding:5px 10px;border:1px solid rgb(var(--c-warn) / .35);border-radius:999px;background:rgb(var(--c-warn-bg));color:rgb(var(--c-warn));cursor:pointer">
+            <span style="font-weight:700">&#9432;</span><span>{{ coverageChip }}</span>
+          </button>
+          <sc-if value="{{ covOpen }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:36px;right:0;z-index:50;width:420px;background:rgb(var(--c-panel));border:1px solid rgb(var(--c-border));border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.14);padding:16px">
+              <p style="margin:0 0 8px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute))">What this view covers</p>
+              <p style="margin:0 0 12px;font-size:12px;line-height:1.55;color:rgb(var(--c-ink-dim))">{{ disclosure }}</p>
+              <div style="border-top:1px solid rgb(var(--c-border));padding-top:10px;display:flex;flex-direction:column;gap:8px">
+                <div style="display:flex;gap:8px;align-items:baseline"><span style="flex:none;display:inline-flex;border-radius:4px;font-weight:500;padding:2px 6px;font-size:10px;background:rgb(var(--c-ok-bg));color:rgb(var(--c-ok))">http</span><span style="font-size:11px;color:rgb(var(--c-ink-dim))">Exact request and response metadata from the instrumented client.</span></div>
+                <div style="display:flex;gap:8px;align-items:baseline"><span style="flex:none;display:inline-flex;border-radius:4px;font-weight:500;padding:2px 6px;font-size:10px;background:rgb(var(--c-warn-bg));color:rgb(var(--c-warn))">coarse</span><span style="font-size:11px;color:rgb(var(--c-ink-dim))">Host, outcome and timing are real; byte counts and peer IP were not observable. Never rendered as 0 &#8212; always as &#8212;.</span></div>
+                <div style="display:flex;gap:8px;align-items:baseline"><span style="flex:none;display:inline-flex;border-radius:4px;font-weight:500;padding:2px 6px;font-size:10px;background:rgb(var(--c-warn-bg));color:rgb(var(--c-warn))">{{ dropped }} dropped</span><span style="font-size:11px;color:rgb(var(--c-ink-dim))">Lost to writer overflow across the full history of every ledger this view reads &#8212; the totals here may be incomplete regardless of the selected range.</span></div>
+              </div>
+            </div>
+          </sc-if>
+        </div>
+      </header>
+      <div style="background:rgb(var(--c-panel));border:1px solid rgb(var(--c-border));border-radius:12px;padding:14px 16px 10px;margin-bottom:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px">
+          <div role="group" aria-label="Time range" style="display:inline-flex;align-items:center;gap:2px;border-radius:6px;border:1px solid rgb(var(--c-border));background:rgb(var(--c-panel));padding:2px">
+            <sc-for list="{{ presets }}" as="p" hint-placeholder-count="4">
+              <button class="nf-seg" data-on="{{ p.on }}" onClick="{{ p.onSelect }}" style="border:0;background:transparent;border-radius:4px;padding:2px 8px;font:inherit;font-size:11px;font-weight:500;color:rgb(var(--c-ink-dim));cursor:pointer;white-space:nowrap" style-hover="color:rgb(var(--c-ink))">{{ p.label }}</button>
+            </sc-for>
+          </div>
+          <p style="margin:0;font-size:11px;color:rgb(var(--c-ink-mute))">{{ readout }} <span style="color:rgb(var(--c-ink-mute))">Drag on the chart to zoom a window.</span></p>
+        </div>
+        <div onPointerDown="{{ hDown }}" onPointerMove="{{ hMove }}" onPointerUp="{{ hUp }}" style="position:relative;height:64px;display:flex;align-items:flex-end;gap:1px;cursor:crosshair;touch-action:none;user-select:none">
+          <sc-for list="{{ bars }}" as="b" hint-placeholder-count="40">
+            <div style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;pointer-events:none">
+              <div style="height:{{ b.eh }}%;background:rgb(var(--c-status-failed) / .8);border-radius:1px 1px 0 0"></div>
+              <div style="height:{{ b.oh }}%;background:rgb(var(--c-brand-500) / .45);border-radius:1px"></div>
+            </div>
+          </sc-for>
+          <sc-if value="{{ hasOverlay }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:0;bottom:0;left:{{ ovL }}%;width:{{ ovW }}%;background:rgb(var(--c-brand-500) / .08);border-left:1px solid rgb(var(--c-brand-500) / .55);border-right:1px solid rgb(var(--c-brand-500) / .55);pointer-events:none"></div>
+          </sc-if>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:rgb(var(--c-ink-mute));padding-top:4px">
+          <span>{{ axisL }}</span><span>{{ axisM }}</span><span>now</span>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:16px">
+        <sc-for list="{{ kpis }}" as="k" hint-placeholder-count="6">
+          <div title="{{ k.tip }}" style="background:rgb(var(--c-panel));border:1px solid rgb(var(--c-border));border-radius:10px;padding:10px 14px">
+            <p style="margin:0;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:rgb(var(--c-ink-mute))">{{ k.label }}</p>
+            <p style="margin:4px 0 0;font-size:20px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.1;color:{{ k.color }}">{{ k.value }}<span style="font-size:11px;font-weight:400;color:rgb(var(--c-ink-mute))"> {{ k.unit }}</span></p>
+          </div>
+        </sc-for>
+      </div>
+      <div style="background:rgb(var(--c-panel));border:1px solid rgb(var(--c-border));border-radius:12px;padding:18px 20px;margin-bottom:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px">
+          <div role="group" aria-label="Visualization" style="display:inline-flex;align-items:center;gap:2px;border-radius:6px;border:1px solid rgb(var(--c-border));background:rgb(var(--c-panel));padding:2px">
+            <sc-for list="{{ viewModes }}" as="p" hint-placeholder-count="2">
+              <button class="nf-seg" data-on="{{ p.on }}" onClick="{{ p.onSelect }}" style="border:0;background:transparent;border-radius:4px;padding:2px 10px;font:inherit;font-size:11px;font-weight:500;color:rgb(var(--c-ink-dim));cursor:pointer;white-space:nowrap" style-hover="color:rgb(var(--c-ink))">{{ p.label }}</button>
+            </sc-for>
+          </div>
+          <p style="margin:0;font-size:11px;color:rgb(var(--c-ink-mute))">{{ panelHint }}</p>
+        </div>
+        <sc-if value="{{ viewTopo }}" hint-placeholder-val="{{ true }}">
+        <div style="position:relative;width:1040px;max-width:100%;height:{{ sankeyH }}px;margin:0 auto">
+          <svg width="1040" height="{{ sankeyH }}" style="position:absolute;inset:0;pointer-events:none">
+            <sc-for list="{{ links }}" as="l" hint-placeholder-count="0">
+              <path d="{{ l.d }}" fill="none" stroke="{{ l.stroke }}" stroke-opacity="{{ l.op }}" stroke-width="{{ l.w }}" stroke-linecap="round"></path>
+            </sc-for>
+          </svg>
+          <div style="position:absolute;left:0;top:0;width:240px"><p style="margin:0 0 6px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:rgb(var(--c-ink-mute))">Workflows</p>
+            <sc-for list="{{ wfNodes }}" as="n" hint-placeholder-count="4">
+              <div class="nf-node" data-on="{{ n.on }}" data-dim="{{ n.dim }}" onClick="{{ n.onClick }}" onMouseEnter="{{ n.onEnter }}" onMouseLeave="{{ onLeave }}" style="display:flex;align-items:center;justify-content:space-between;gap:8px;height:34px;margin-bottom:6px;padding:0 10px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-panel));cursor:pointer;transition:border-color .12s,opacity .12s" style-hover="border-color:rgb(var(--c-brand-500) / .5)">
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ n.label }}</span>
+                <span style="flex:none;display:flex;align-items:baseline;gap:6px;font-size:11px;font-variant-numeric:tabular-nums;color:rgb(var(--c-ink-mute))"><span style="color:{{ n.errColor }}">{{ n.err }}</span><span>{{ n.calls }}</span></span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="position:absolute;left:400px;top:0;width:240px"><p style="margin:0 0 6px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:rgb(var(--c-ink-mute))">Origins</p>
+            <sc-for list="{{ orNodes }}" as="n" hint-placeholder-count="4">
+              <div class="nf-node" data-on="{{ n.on }}" data-dim="{{ n.dim }}" onClick="{{ n.onClick }}" onMouseEnter="{{ n.onEnter }}" onMouseLeave="{{ onLeave }}" style="display:flex;align-items:center;justify-content:space-between;gap:8px;height:34px;margin-bottom:6px;padding:0 10px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-panel));cursor:pointer;transition:border-color .12s,opacity .12s" style-hover="border-color:rgb(var(--c-brand-500) / .5)">
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ n.label }}</span>
+                <span style="flex:none;display:flex;align-items:baseline;gap:6px;font-size:11px;font-variant-numeric:tabular-nums;color:rgb(var(--c-ink-mute))"><span style="color:{{ n.errColor }}">{{ n.err }}</span><span>{{ n.calls }}</span></span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="position:absolute;left:800px;top:0;width:240px"><p style="margin:0 0 6px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:rgb(var(--c-ink-mute))">Networks</p>
+            <sc-for list="{{ orgNodes }}" as="n" hint-placeholder-count="4">
+              <div class="nf-node" data-on="{{ n.on }}" data-dim="{{ n.dim }}" onClick="{{ n.onClick }}" onMouseEnter="{{ n.onEnter }}" onMouseLeave="{{ onLeave }}" style="display:flex;align-items:center;justify-content:space-between;gap:8px;height:34px;margin-bottom:6px;padding:0 10px;border:1px solid rgb(var(--c-border));border-radius:8px;background:rgb(var(--c-panel));cursor:pointer;transition:border-color .12s,opacity .12s" style-hover="border-color:rgb(var(--c-brand-500) / .5)">
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ n.label }}</span>
+                <span style="flex:none;display:flex;align-items:baseline;gap:6px;font-size:11px;font-variant-numeric:tabular-nums;color:rgb(var(--c-ink-mute))"><span style="color:{{ n.errColor }}">{{ n.err }}</span><span>{{ n.calls }}</span></span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        </sc-if>
+        <sc-if value="{{ viewTime }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:2px">
+            <span style="flex:none;width:236px"></span>
+            <div style="flex:1;display:flex;justify-content:space-between;font-size:10px;color:rgb(var(--c-ink-mute))"><span>{{ tAxisL }}</span><span>{{ tAxisM }}</span><span>{{ tAxisR }}</span></div>
+            <span style="flex:none;width:170px"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid rgb(var(--c-border))">
+            <span style="flex:none;width:236px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:rgb(var(--c-ink-mute))">Active runs</span>
+            <div style="flex:1;display:flex;gap:1px;height:14px">
+              <sc-for list="{{ runCells }}" as="c" hint-placeholder-count="48">
+                <div title="{{ c.tip }}" style="flex:1;border-radius:1px;background:rgb(var(--c-ink-mute) / {{ c.op }})"></div>
+              </sc-for>
+            </div>
+            <span style="flex:none;width:170px;font-size:10px;color:rgb(var(--c-ink-mute));text-align:right">{{ runCount }} runs in window</span>
+          </div>
+          <sc-for list="{{ lanes }}" as="ln" hint-placeholder-count="6">
+            <div style="display:flex;flex-direction:column">
+              <sc-if value="{{ ln.groupStart }}" hint-placeholder-val="{{ false }}">
+                <p style="margin:10px 0 2px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:rgb(var(--c-ink-mute))">{{ ln.group }}</p>
+              </sc-if>
+              <div class="nf-hostrow" data-on="{{ ln.on }}" style="display:flex;align-items:center;gap:12px;padding:4px 0;border-radius:6px">
+                <button onClick="{{ ln.onSelect }}" title="Filter everything below to this endpoint" style="flex:none;width:236px;display:flex;align-items:center;gap:6px;border:0;background:transparent;font:inherit;text-align:left;cursor:pointer;padding:0 0 0 4px">
+                  <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:rgb(var(--c-ink));overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ ln.host }}</span>
+                  <span style="flex:none;font-size:9px;padding:1px 5px;border-radius:4px;background:{{ ln.fidBg }};color:{{ ln.fidColor }}">{{ ln.fid }}</span>
+                </button>
+                <div style="flex:1;display:flex;gap:1px;height:22px">
+                  <sc-for list="{{ ln.cells }}" as="c" hint-placeholder-count="48">
+                    <div onClick="{{ c.onZoom }}" title="{{ c.tip }}" style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;border-radius:1px;background:rgb(var(--c-brand-500) / {{ c.op }});cursor:pointer">
+                      <div style="height:3px;border-radius:1px;background:rgb(var(--c-status-failed) / {{ c.eop }})"></div>
+                    </div>
+                  </sc-for>
+                </div>
+                <span style="flex:none;width:170px;display:flex;justify-content:flex-end;gap:10px;font-size:11px;font-variant-numeric:tabular-nums;color:rgb(var(--c-ink-mute))"><span style="color:{{ ln.errColor }}">{{ ln.err }}</span><span style="width:56px;text-align:right">{{ ln.calls }} calls</span><span style="width:52px;text-align:right">{{ ln.p95 }}</span></span>
+              </div>
+            </div>
+          </sc-for>
+          <p style="margin:10px 0 0;font-size:10px;color:rgb(var(--c-ink-mute))">Cell shade = calls in that slice &#183; red baseline = errors &#183; click a cell to zoom the window to it &#183; amber tag = coarse fidelity.</p>
+        </sc-if>
+      </div>
+      <sc-if value="{{ viewTopo }}" hint-placeholder-val="{{ true }}">
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin-bottom:16px">
+        <sc-for list="{{ orgCards }}" as="c" hint-placeholder-count="3">
+          <div style="background:rgb(var(--c-panel));border:1px solid rgb(var(--c-border));border-radius:12px;overflow:hidden">
+            <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;padding:10px 14px;border-bottom:1px solid rgb(var(--c-border));background:rgb(var(--c-surface) / .6)">
+              <span style="font-size:12px;font-weight:600">{{ c.org }}</span>
+              <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;color:rgb(var(--c-ink-mute))">AS{{ c.asn }} &#183; {{ c.calls }} calls</span>
+            </div>
+            <sc-for list="{{ c.hosts }}" as="h" hint-placeholder-count="2">
+              <div class="nf-hostrow" data-on="{{ h.on }}" onClick="{{ h.onClick }}" style="display:flex;align-items:center;gap:8px;padding:8px 14px;border-top:1px solid rgb(var(--c-border));cursor:pointer;font-size:11px" style-hover="background:rgb(var(--c-surface-hover) / .5)">
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ h.host }}</span>
+                <span style="flex:none;color:{{ h.errColor }};font-variant-numeric:tabular-nums">{{ h.err }}</span>
+                <span style="flex:none;color:rgb(var(--c-ink-mute));font-variant-numeric:tabular-nums;width:52px;text-align:right">{{ h.calls }} calls</span>
+                <span style="flex:none;color:rgb(var(--c-ink-mute));font-variant-numeric:tabular-nums;width:56px;text-align:right">{{ h.p95 }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </sc-for>
+      </div>
+      </sc-if>
+      <sc-if value="{{ hasChips }}" hint-placeholder-val="{{ false }}">
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:10px">
+          <span style="font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:rgb(var(--c-ink-mute))">Filters</span>
+          <sc-for list="{{ chips }}" as="ch" hint-placeholder-count="0">
+            <button onClick="{{ ch.onRemove }}" style="display:inline-flex;align-items:center;gap:5px;font:inherit;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;padding:3px 8px;border-radius:6px;background:rgb(var(--c-brand-500) / .1);color:rgb(var(--c-brand-500));border:1px solid rgb(var(--c-brand-500) / .28);cursor:pointer">{{ ch.label }}<span style="opacity:.6">&#215;</span></button>
+          </sc-for>
+          <button onClick="{{ clearAll }}" style="font:inherit;font-size:11px;color:rgb(var(--c-ink-mute));background:transparent;border:0;cursor:pointer;text-decoration:underline">Clear all</button>
+        </div>
+      </sc-if>
+      <div style="background:rgb(var(--c-panel));border:1px solid rgb(var(--c-border));border-radius:12px;box-shadow:0 1px 2px rgba(15,23,42,.04),0 0 0 1px rgba(15,23,42,.06);overflow-x:auto">
+        <table style="width:100%;font-size:14px;border-collapse:collapse">
+          <thead><tr style="border-bottom:1px solid rgb(var(--c-border))">
+            <th style="text-align:left;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute));width:1%;white-space:nowrap">Time</th>
+            <th style="text-align:left;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute));width:1%;white-space:nowrap">Run</th>
+            <th style="text-align:left;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute));width:1%;white-space:nowrap">Workflow</th>
+            <th style="text-align:left;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute));width:1%;white-space:nowrap">Host</th>
+            <th style="text-align:left;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute))">Path</th>
+            <th style="text-align:right;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute));width:1%;white-space:nowrap">Status</th>
+            <th style="text-align:right;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute));width:1%;white-space:nowrap">In</th>
+            <th style="text-align:right;padding:8px 16px;font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute));width:1%;white-space:nowrap">Duration</th>
+          </tr></thead>
+          <tbody>
+            <sc-for list="{{ flowRows }}" as="f" hint-placeholder-count="8">
+              <tr onClick="{{ f.onOpen }}" style="border-top:1px solid rgb(var(--c-border));cursor:pointer" style-hover="background:rgb(var(--c-bg) / .6)">
+                <td style="padding:9px 16px;white-space:nowrap;font-variant-numeric:tabular-nums">{{ f.time }}</td>
+                <td style="padding:9px 16px;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:rgb(var(--c-brand-500))">{{ f.run }}</td>
+                <td style="padding:9px 16px;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:rgb(var(--c-ink-dim))">{{ f.wf }}</td>
+                <td style="padding:9px 16px;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px">{{ f.host }}</td>
+                <td style="padding:9px 16px;max-width:0"><span title="{{ f.pathTitle }}" style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:rgb(var(--c-ink-dim))">{{ f.path }}</span></td>
+                <td style="padding:9px 16px;text-align:right;font-variant-numeric:tabular-nums;color:{{ f.statusColor }}">{{ f.status }}</td>
+                <td style="padding:9px 16px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap">{{ f.bin }}</td>
+                <td style="padding:9px 16px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap">{{ f.dur }}</td>
+              </tr>
+            </sc-for>
+          </tbody>
+        </table>
+        <p style="margin:0;padding:8px 16px;font-size:11px;color:rgb(var(--c-ink-mute));border-top:1px solid rgb(var(--c-border))">{{ tableNote }}</p>
+      </div>
+    </div>
+    <sc-if value="{{ hasDetail }}" hint-placeholder-val="{{ false }}">
+      <div style="position:fixed;top:0;right:0;bottom:0;width:400px;z-index:60;background:rgb(var(--c-panel));border-left:1px solid rgb(var(--c-border));box-shadow:-12px 0 32px rgba(0,0,0,.12);overflow-y:auto">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid rgb(var(--c-border))">
+          <p style="margin:0;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgb(var(--c-ink-mute))">Flow detail</p>
+          <button onClick="{{ closeDetail }}" style="font:inherit;font-size:16px;line-height:1;border:0;background:transparent;color:rgb(var(--c-ink-mute));cursor:pointer" style-hover="color:rgb(var(--c-ink))">&#215;</button>
+        </div>
+        <div style="padding:20px">
+          <p style="margin:0 0 2px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600">{{ d.host }}</p>
+          <p style="margin:0 0 14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:rgb(var(--c-ink-dim));word-break:break-all">{{ d.method }} {{ d.path }}</p>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">
+            <span style="display:inline-flex;border-radius:4px;font-weight:500;padding:2px 8px;font-size:11px;background:{{ d.statusBg }};color:{{ d.statusColor }}">{{ d.outcome }}</span>
+            <span title="{{ d.fidTitle }}" style="display:inline-flex;border-radius:4px;font-weight:500;padding:2px 8px;font-size:11px;background:{{ d.fidBg }};color:{{ d.fidColor }};cursor:help">{{ d.fid }} fidelity</span>
+          </div>
+          <sc-for list="{{ d.rows }}" as="r" hint-placeholder-count="6">
+            <div style="display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid rgb(var(--c-border));font-size:12px">
+              <span style="color:rgb(var(--c-ink-mute));flex:none">{{ r.k }}</span>
+              <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;text-align:right;word-break:break-all">{{ r.v }}</span>
+            </div>
+          </sc-for>
+          <p style="margin:14px 0 0;font-size:11px;line-height:1.55;color:rgb(var(--c-ink-mute))">{{ d.note }}</p>
+        </div>
+      </div>
+    </sc-if>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;'light'|'dark'&quot;},&quot;view&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;topology&quot;,&quot;timeline&quot;],&quot;default&quot;:&quot;topology&quot;,&quot;tsType&quot;:&quot;'topology'|'timeline'&quot;}}">
+class Component extends DCLogic {
+  state = { theme: this.props.theme ?? 'light', view: this.props.view ?? 'topology', win: null, preset: 'all', hov: null, selWf: [], selOr: [], selOrg: [], selHost: [], selFlow: null, covOpen: false, drag: null, ready: false };
+  componentDidMount() {
+    import('./netflow-data.js').then((m) => { this.M = m; this.setState({ ready: true }); });
+    this._icons();
+  }
+  componentDidUpdate() { this._icons(); }
+  _icons() { if (window.lucide) window.lucide.createIcons(); else setTimeout(() => window.lucide && window.lucide.createIcons(), 300); }
+  _toggle(dim, val) {
+    const cur = this.state[dim];
+    this.setState({ [dim]: cur.includes(val) ? cur.filter((x) => x !== val) : [...cur, val], selFlow: null });
+  }
+  _histT(e) {
+    const r = e.currentTarget.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    return this._t0 + frac * (this._t1 - this._t0);
+  }
+  renderVals() {
+    const M = this.M, st = this.state;
+    const empty = { calls: '', err: '' };
+    const base = {
+      theme: st.theme, themeLabel: st.theme === 'dark' ? 'Dark' : 'Light',
+      toggleTheme: () => this.setState({ theme: st.theme === 'dark' ? 'light' : 'dark' }),
+      toggleCoverage: () => this.setState({ covOpen: !st.covOpen }),
+      covOpen: st.covOpen, coverageChip: 'Coverage & gaps', dropped: 128,
+      disclosure: '', presets: [], readout: '', bars: [], hasOverlay: false, ovL: 0, ovW: 0,
+      axisL: '7d ago', axisM: '3.5d ago', kpis: [], links: [], wfNodes: [], orNodes: [], orgNodes: [],
+      sankeyH: 300, orgCards: [], hasChips: false, chips: [], clearAll: () => {},
+      flowRows: [], tableNote: st.ready ? '' : 'Loading network flows…',
+      hasDetail: false, d: { rows: [] }, closeDetail: () => {},
+      onLeave: () => this.setState({ hov: null }),
+      hDown: () => {}, hMove: () => {}, hUp: () => {},
+      viewTopo: st.view === 'topology', viewTime: st.view === 'timeline', viewModes: [], panelHint: '',
+      tAxisL: '', tAxisM: '', tAxisR: 'now', runCells: [], runCount: 0, lanes: [],
+    };
+    if (!M) return base;
+    base.disclosure = M.DISCLOSURE;
+    base.dropped = M.DROPPED_TOTAL;
+    const H = 36e5;
+    this._t0 = M.NOW - 7 * 24 * H; this._t1 = M.NOW;
+    // ---- window ----
+    const HRS = { hour: 1, '24h': 24, '7d': 168 };
+    const win = st.win;
+    base.presets = [['all', 'All'], ['hour', 'Last hour'], ['24h', '24h'], ['7d', '7d']].map(([v, label]) => ({
+      label, on: st.preset === v && !st.drag,
+      onSelect: () => this.setState({ preset: v, win: v === 'all' ? null : { from: M.NOW - HRS[v] * H, to: M.NOW }, selFlow: null }),
+    }));
+    const fmtT = (t) => new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    base.readout = win ? `Showing flows from ${fmtT(win.from)} to ${fmtT(win.to)}.` : 'Showing all recorded flows (7 days).';
+    // ---- histogram (always full 7d for context) ----
+    const buckets = M.bucketize(M.flows, this._t0, this._t1, 84);
+    const maxB = Math.max(1, ...buckets.map((b) => b.calls));
+    base.bars = buckets.map((b) => ({ oh: Math.round(100 * (b.calls - b.errors) / maxB), eh: Math.round(100 * b.errors / maxB) }));
+    const ov = st.drag ? { from: Math.min(st.drag.a, st.drag.b), to: Math.max(st.drag.a, st.drag.b) } : win;
+    if (ov) {
+      base.hasOverlay = true;
+      base.ovL = 100 * (ov.from - this._t0) / (this._t1 - this._t0);
+      base.ovW = Math.max(0.5, 100 * (ov.to - ov.from) / (this._t1 - this._t0));
+    }
+    base.hDown = (e) => { e.currentTarget.setPointerCapture(e.pointerId); const t = this._histT(e); this.setState({ drag: { a: t, b: t } }); };
+    base.hMove = (e) => { if (st.drag) this.setState({ drag: { ...st.drag, b: this._histT(e) } }); };
+    base.hUp = () => {
+      if (!st.drag) return;
+      const a = Math.min(st.drag.a, st.drag.b), b = Math.max(st.drag.a, st.drag.b);
+      if (b - a > 30 * 60000) this.setState({ drag: null, win: { from: a, to: b }, preset: 'custom', selFlow: null });
+      else this.setState({ drag: null });
+    };
+    // ---- filter pipeline ----
+    const inWin = (f) => !win || (f.ts >= win.from && f.ts <= win.to);
+    const okey = (f) => f.origin.kind + ':' + (f.origin.name ?? '');
+    const pass = (f, skip) => inWin(f)
+      && (skip === 'wf' || !st.selWf.length || st.selWf.includes(f.workflow))
+      && (skip === 'or' || !st.selOr.length || st.selOr.includes(okey(f)))
+      && (skip === 'org' || !st.selOrg.length || st.selOrg.includes(f.orgId))
+      && (skip === 'host' || !st.selHost.length || st.selHost.includes(f.host));
+    const filtered = M.flows.filter((f) => pass(f));
+    const windowed = M.flows.filter(inWin);
+    // ---- KPIs ----
+    const errs = filtered.filter((f) => f.outcome !== 'ok').length;
+    const binSum = filtered.reduce((s, f) => s + (f.bytes_in ?? 0), 0);
+    const boutSum = filtered.reduce((s, f) => s + (f.bytes_out ?? 0), 0);
+    const anyCoarse = filtered.some((f) => f.bytes_in == null);
+    const durs = filtered.map((f) => f.duration_ms).sort((a, b) => a - b);
+    base.kpis = [
+      { label: 'Flows', value: String(filtered.length), unit: '', color: 'rgb(var(--c-ink))', tip: 'Recorded flows matching the current filters' },
+      { label: 'Endpoints', value: String(new Set(filtered.map((f) => f.host + ':' + f.port)).size), unit: '', color: 'rgb(var(--c-ink))', tip: 'Distinct host:port endpoints reached' },
+      { label: 'Networks', value: String(new Set(filtered.map((f) => f.orgId)).size), unit: '', color: 'rgb(var(--c-ink))', tip: 'Distinct ASN organizations' },
+      { label: 'Error rate', value: filtered.length ? (100 * errs / filtered.length).toFixed(1) : '0', unit: '%', color: errs ? 'rgb(var(--c-err))' : 'rgb(var(--c-ink))', tip: errs + ' flows with a non-ok outcome' },
+      { label: 'Bytes in', value: M.fmtBytes(binSum), unit: anyCoarse ? '†' : '', color: 'rgb(var(--c-ink))', tip: anyCoarse ? '† observed (HTTP-fidelity) flows only — coarse flows have unobservable byte counts' : 'Sum of observed response bytes' },
+      { label: 'p95 latency', value: durs.length ? String(M.quantile(durs, .95)) : '—', unit: 'ms', color: 'rgb(var(--c-ink))', tip: '95th percentile flow duration' },
+    ];
+    // ---- sankey ----
+    const agg = (fl, key) => { const m = new Map(); for (const f of fl) { const k = key(f); const v = m.get(k) ?? { calls: 0, errors: 0 }; v.calls++; if (f.outcome !== 'ok') v.errors++; m.set(k, v); } return m; };
+    const wfAgg = agg(M.flows.filter((f) => pass(f, 'wf')), (f) => f.workflow);
+    const orAgg = agg(M.flows.filter((f) => pass(f, 'or')), okey);
+    const orgAgg = agg(M.flows.filter((f) => pass(f, 'org')), (f) => f.orgId);
+    const wfIds = M.WORKFLOWS.map((w) => w.id);
+    const orIds = [...new Set(M.HOSTS.map((h) => h.origin.kind + ':' + h.origin.name))];
+    const orgIds = M.ORGS.map((o) => o.id);
+    const rowY = (i) => 22 + i * 40 + 17;
+    base.sankeyH = 22 + Math.max(wfIds.length, orIds.length, orgIds.length) * 40 + 6;
+    const conn = st.hov;
+    const mkNodes = (ids, aggMap, dim, keyOf, labelOf) => ids.map((id) => {
+      const a = aggMap.get(keyOf(id)) ?? { calls: 0, errors: 0 };
+      const on = st['sel' + dim].includes(keyOf(id));
+      return {
+        label: labelOf(id), calls: a.calls || '·', err: a.errors ? a.errors + ' err' : '',
+        errColor: 'rgb(var(--c-err))', on,
+        dim: conn ? conn !== dim.toLowerCase() + ':' + keyOf(id) && !this._connected(conn, dim.toLowerCase(), keyOf(id)) : a.calls === 0,
+        onClick: () => this._toggle('sel' + dim, keyOf(id)),
+        onEnter: () => this.setState({ hov: dim.toLowerCase() + ':' + keyOf(id) }),
+      };
+    });
+    // connection maps for hover
+    this._pairsAB = new Set(); this._pairsBC = new Set();
+    const abAgg = new Map(), bcAgg = new Map();
+    for (const f of filtered) {
+      const ka = f.workflow + '|' + okey(f), kb = okey(f) + '|' + f.orgId;
+      const va = abAgg.get(ka) ?? { calls: 0, errors: 0 }; va.calls++; if (f.outcome !== 'ok') va.errors++; abAgg.set(ka, va);
+      const vb = bcAgg.get(kb) ?? { calls: 0, errors: 0 }; vb.calls++; if (f.outcome !== 'ok') vb.errors++; bcAgg.set(kb, vb);
+      this._pairsAB.add(ka); this._pairsBC.add(kb);
+    }
+    base.wfNodes = mkNodes(wfIds, wfAgg, 'Wf', (x) => x, (x) => x);
+    base.orNodes = mkNodes(orIds, orAgg, 'Or', (x) => x, (x) => x);
+    base.orgNodes = mkNodes(orgIds, orgAgg, 'Org', (x) => x, (x) => M.orgById[x].org + ' · AS' + M.orgById[x].asn);
+    const maxL = Math.max(1, ...[...abAgg.values(), ...bcAgg.values()].map((v) => v.calls));
+    const mkLinks = (aggMap, x1, x2, idxA, idxB) => [...aggMap.entries()].map(([k, v]) => {
+      const [a, b] = k.split('|');
+      const ia = idxA.indexOf(a), ib = idxB.indexOf(b);
+      if (ia < 0 || ib < 0) return null;
+      const y1 = rowY(ia), y2 = rowY(ib);
+      const touched = conn && (conn.endsWith(':' + a) || conn.endsWith(':' + b));
+      return {
+        d: `M ${x1} ${y1} C ${x1 + 70} ${y1}, ${x2 - 70} ${y2}, ${x2} ${y2}`,
+        w: 2 + 24 * v.calls / maxL,
+        stroke: v.errors / v.calls > .05 ? 'rgb(var(--c-status-failed))' : 'rgb(var(--c-brand-500))',
+        op: conn ? (touched ? .55 : .05) : .22,
+      };
+    }).filter(Boolean);
+    // hover uses okey strings split on '|' — origin keys contain ':' which is fine
+    base.links = [
+      ...mkLinks(abAgg, 240, 400, wfIds, orIds),
+      ...mkLinks(bcAgg, 640, 800, orIds, orgIds),
+    ];
+    // ---- view switcher + timeline lanes ----
+    base.viewModes = [['topology', 'Topology'], ['timeline', 'Timeline']].map(([v, label]) => ({
+      label, on: st.view === v, onSelect: () => this.setState({ view: v }),
+    }));
+    base.panelHint = st.view === 'topology'
+      ? 'Click any node to filter everything below. Ribbon width = calls; red = errors on the path.'
+      : 'Same filters, over time. Click an endpoint to filter; click a cell to zoom the window.';
+    {
+      const tw = win ?? { from: this._t0, to: this._t1 };
+      const tspan = tw.to - tw.from, NB = 84, bw = tspan / NB;
+      base.tAxisL = fmtT(tw.from); base.tAxisM = fmtT(tw.from + tspan / 2);
+      base.tAxisR = tw.to === M.NOW ? 'now' : fmtT(tw.to);
+      const activeRuns = M.runs.filter((r) => r.end >= tw.from && r.start <= tw.to);
+      base.runCount = activeRuns.length;
+      base.runCells = Array.from({ length: NB }, (_, i) => {
+        const t0 = tw.from + i * bw, t1 = t0 + bw;
+        const n = activeRuns.filter((r) => r.end >= t0 && r.start <= t1).length;
+        const mx = Math.max(1, activeRuns.length / 3);
+        return { op: Math.min(.75, n / mx * .75).toFixed(2), tip: n + ' active runs · ' + fmtT(t0) };
+      });
+      const laneOrgs = M.rollupOrgs(M.flows.filter((f) => pass(f, 'host')));
+      let gMax = 1;
+      const laneDefs = [];
+      for (const o of laneOrgs) for (const h of o.hosts) {
+        const fl = M.flows.filter((f) => pass(f, 'host') && f.host === h.host);
+        const cells = M.bucketize(fl, tw.from, tw.to, NB);
+        gMax = Math.max(gMax, ...cells.map((c) => c.calls));
+        laneDefs.push({ org: o.org + ' · AS' + o.asn, h, cells });
+      }
+      let lastGroup = null;
+      base.lanes = laneDefs.map((ld) => {
+        const groupStart = ld.org !== lastGroup; lastGroup = ld.org;
+        const coarse = ld.h.fidelity === 'coarse';
+        return {
+          group: ld.org, groupStart,
+          host: ld.h.host + ':' + ld.h.port, on: st.selHost.includes(ld.h.host),
+          fid: ld.h.fidelity, fidBg: coarse ? 'rgb(var(--c-warn-bg))' : 'rgb(var(--c-ok-bg))', fidColor: coarse ? 'rgb(var(--c-warn))' : 'rgb(var(--c-ok))',
+          calls: ld.h.calls, err: ld.h.errors ? ld.h.errors + ' err' : '', errColor: 'rgb(var(--c-err))',
+          p95: ld.h.p95_ms != null ? ld.h.p95_ms + ' ms' : '—',
+          onSelect: () => this._toggle('selHost', ld.h.host),
+          cells: ld.cells.map((c) => ({
+            op: c.calls ? (0.12 + 0.78 * c.calls / gMax).toFixed(2) : '0',
+            eop: c.errors ? '0.9' : '0',
+            tip: c.calls + ' calls' + (c.errors ? ' · ' + c.errors + ' errors' : '') + ' · ' + fmtT(c.t0),
+            onZoom: () => { if (c.calls) this.setState({ win: { from: c.t0, to: c.t1 }, preset: 'custom', selFlow: null }); },
+          })),
+        };
+      });
+    }
+    // ---- org cards ----
+    const orgRoll = M.rollupOrgs(M.flows.filter((f) => pass(f, 'host')));
+    base.orgCards = orgRoll.map((o) => ({
+      org: o.org, asn: o.asn, calls: o.calls,
+      hosts: o.hosts.map((h) => ({
+        host: h.host + ':' + h.port, calls: h.calls,
+        err: h.errors ? h.errors + ' err' : '', errColor: 'rgb(var(--c-err))',
+        p95: h.p95_ms != null ? h.p95_ms + ' ms' : '—',
+        on: st.selHost.includes(h.host),
+        onClick: () => this._toggle('selHost', h.host),
+      })),
+    }));
+    // ---- filter chips ----
+    const chips = [];
+    for (const v of st.selWf) chips.push({ label: 'workflow:' + v, onRemove: () => this._toggle('selWf', v) });
+    for (const v of st.selOr) chips.push({ label: v, onRemove: () => this._toggle('selOr', v) });
+    for (const v of st.selOrg) chips.push({ label: 'net:' + M.orgById[v].org, onRemove: () => this._toggle('selOrg', v) });
+    for (const v of st.selHost) chips.push({ label: v, onRemove: () => this._toggle('selHost', v) });
+    if (win) chips.push({ label: 'window', onRemove: () => this.setState({ win: null, preset: 'all' }) });
+    base.chips = chips; base.hasChips = chips.length > 0;
+    base.clearAll = () => this.setState({ selWf: [], selOr: [], selOrg: [], selHost: [], win: null, preset: 'all', selFlow: null });
+    // ---- table ----
+    const recent = [...filtered].sort((a, b) => b.ts - a.ts).slice(0, 40);
+    base.flowRows = recent.map((f) => ({
+      time: M.fmtShort(f.ts), run: f.runId, wf: f.workflow, host: f.host,
+      path: f.path, pathTitle: f.method + ' ' + f.path,
+      status: f.status ?? f.outcome, statusColor: f.outcome === 'ok' ? 'rgb(var(--c-ink-dim))' : 'rgb(var(--c-err))',
+      bin: M.fmtBytes(f.bytes_in), dur: f.duration_ms + ' ms',
+      onOpen: () => this.setState({ selFlow: f.id }),
+    }));
+    base.tableNote = `Showing ${recent.length} of ${filtered.length} matching flows — newest first. Click a row for the full record.`;
+    // ---- detail ----
+    const f = st.selFlow != null ? M.flows.find((x) => x.id === st.selFlow) : null;
+    if (f) {
+      const coarse = f.fidelity === 'coarse';
+      base.hasDetail = true;
+      base.closeDetail = () => this.setState({ selFlow: null });
+      base.d = {
+        host: f.host + ':' + f.port, method: f.method, path: f.path,
+        outcome: f.outcome + (f.status ? ' · ' + f.status : ''),
+        statusBg: f.outcome === 'ok' ? 'rgb(var(--c-ok-bg))' : 'rgb(var(--c-err-bg))',
+        statusColor: f.outcome === 'ok' ? 'rgb(var(--c-ok))' : 'rgb(var(--c-err))',
+        fid: f.fidelity,
+        fidBg: coarse ? 'rgb(var(--c-warn-bg))' : 'rgb(var(--c-ok-bg))',
+        fidColor: coarse ? 'rgb(var(--c-warn))' : 'rgb(var(--c-ok))',
+        fidTitle: coarse ? 'Coarse — host, outcome and timing are real; byte counts and peer IP were not observable for this connector.' : 'HTTP — exact request and response metadata from the instrumented client.',
+        rows: [
+          { k: 'Time', v: new Date(f.ts).toLocaleString() },
+          { k: 'Run', v: f.runId },
+          { k: 'Workflow', v: f.workflow },
+          { k: 'Project', v: f.project },
+          { k: 'Origin', v: f.origin.kind + ':' + (f.origin.name ?? '') },
+          { k: 'Bytes in', v: M.fmtBytes(f.bytes_in) },
+          { k: 'Bytes out', v: M.fmtBytes(f.bytes_out) },
+          { k: 'TTFB', v: f.ttfb_ms + ' ms' },
+          { k: 'Duration', v: f.duration_ms + ' ms' },
+          { k: 'Peer IP', v: f.peer_ip ?? '—' },
+          { k: 'Network', v: 'AS' + f.asn.asn + ' ' + f.asn.org },
+          ...(f.error ? [{ k: 'Error', v: f.error }] : []),
+        ],
+        note: coarse
+          ? 'Em dashes mean “not observable”, never zero — this connector (octocrab) cannot report byte counts or peer IPs. Host, outcome and timing are real.'
+          : 'All fields observed directly by the instrumented HTTP client.',
+      };
+    }
+    return base;
+  }
+  _connected(hovKey, dim, key) {
+    // hovKey like 'wf:security-review' / 'or:provider:anthropic' / 'org:github'
+    const i = hovKey.indexOf(':');
+    const hd = hovKey.slice(0, i), hk = hovKey.slice(i + 1);
+    if (hd === dim) return hk === key;
+    const has = (set, a, b) => set.has(a + '|' + b);
+    if (hd === 'wf' && dim === 'or') return has(this._pairsAB, hk, key);
+    if (hd === 'or' && dim === 'wf') return has(this._pairsAB, key, hk);
+    if (hd === 'or' && dim === 'org') return has(this._pairsBC, hk, key);
+    if (hd === 'org' && dim === 'or') return has(this._pairsBC, key, hk);
+    if (hd === 'wf' && dim === 'org') return [...this._pairsAB].some((p) => p.startsWith(hk + '|') && has(this._pairsBC, p.split('|')[1], key));
+    if (hd === 'org' && dim === 'wf') return [...this._pairsBC].some((p) => p.endsWith('|' + hk) && has(this._pairsAB, key, p.split('|')[0]));
+    return true;
+  }
+}
+</script>
+</body>
+</html>

@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
-// RunDetail's Network tab — lazy-loads run-scoped netflow the same way the
-// Findings tab lazy-loads findings (see RunDetail.tsx lines ~160 and
-// ~313-334): a fetch keyed on (id, tab) with a ref guard for a single fetch
-// per run id. This file only exercises that lazy-load/reset contract; the
-// rendered content (table/summary/graph) is covered by the netflow
-// component's own tests.
+// RunDetail's Network tab — mounts the shared <NetflowExplorer> lazily
+// (nothing fetches until the tab is first opened), keeps it alive but
+// hidden across tab re-clicks (no refetch), keys it on the run id (a run
+// switch remounts and refetches), and seeds the run's OWN span as the
+// initial window. The explorer's internal behavior (filters, views,
+// popover) is covered by the explorer component tests; this file only
+// exercises RunDetail's mounting/keying/window-seeding contract.
 //
 // Heavy children (RunGraph, TranscriptPanel, RunEventFeed,
 // StepTranscriptBrowser, RunUsageTimeline) are mocked the same way
@@ -16,17 +17,17 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { Link, MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, type RunGraphResponse, type FindingsResponse } from '../lib/api';
-import type { NetflowResponse, GraphView } from '../lib/netflow';
+import type { ExplorerResponse, NetflowResponse } from '../lib/netflow';
 
-// ---- Mock the netflow API client (Task 4) — the SUT under test here -------
+// ---- Mock the netflow API client — the SUT under test here ----------------
 
-const { fetchRunNetflow, fetchNetflowGraph } = vi.hoisted(() => ({
+const { fetchRunNetflow, fetchNetflowExplorer } = vi.hoisted(() => ({
   fetchRunNetflow: vi.fn(),
-  fetchNetflowGraph: vi.fn(),
+  fetchNetflowExplorer: vi.fn(),
 }));
 vi.mock('../lib/netflow', async () => {
   const actual = await vi.importActual<typeof import('../lib/netflow')>('../lib/netflow');
-  return { ...actual, fetchRunNetflow, fetchNetflowGraph };
+  return { ...actual, fetchRunNetflow, fetchNetflowExplorer };
 });
 
 // ---- Mocks for heavy children (mirrors RunDetail.test.tsx) -----------------
@@ -61,17 +62,50 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-beforeEach(() => {
-  fetchRunNetflow.mockReset();
-  fetchNetflowGraph.mockReset();
-  fetchRunNetflow.mockResolvedValue({
+function emptyExplorer(): ExplorerResponse {
+  return {
+    sankey: { workflows: [], origins: [], orgs: [], wf_origin: [], origin_org: [] },
+    timeline: {
+      bucket_ms: 0,
+      from: '2026-06-01T00:00:00Z',
+      to: '2026-06-01T00:05:00Z',
+      lanes: [],
+      runs: [],
+      runs_in_window: 0,
+    },
+    histogram: { from: null, to: null, bucket_ms: 0, buckets: [] },
+    hosts: [],
+    kpis: {
+      flows: 0,
+      endpoints: 0,
+      orgs: 0,
+      errors: 0,
+      bytes_in: null,
+      bytes_out: null,
+      bytes_partial: false,
+      p95_ms: undefined,
+    },
+    dropped_total: 0,
+    asn_loaded: true,
+    window: { from: '2026-06-01T00:00:00Z', to: '2026-06-01T00:05:00Z' },
+  };
+}
+
+function emptyFlows(): NetflowResponse {
+  return {
     flows: [],
     hosts: [],
     dropped_total: 0,
     asn_loaded: true,
-    window: { from: null, to: null },
-  } satisfies NetflowResponse);
-  fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] } satisfies GraphView);
+    window: { from: '2026-06-01T00:00:00Z', to: '2026-06-01T00:05:00Z' },
+  };
+}
+
+beforeEach(() => {
+  fetchRunNetflow.mockReset();
+  fetchNetflowExplorer.mockReset();
+  fetchRunNetflow.mockResolvedValue(emptyFlows());
+  fetchNetflowExplorer.mockResolvedValue(emptyExplorer());
   vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
 });
 
@@ -100,6 +134,9 @@ const FINDINGS: FindingsResponse = {
   summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
 };
 
+/** The window the explorer must seed at run scope: the run's OWN span. */
+const RUN_SPAN = { from: '2026-06-01T00:00:00Z', to: '2026-06-01T00:05:00Z' };
+
 function stubApi(graph: RunGraphResponse) {
   vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);
   vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
@@ -118,9 +155,9 @@ function renderPage(runId = 'run-1') {
 }
 
 // Same route element instance across a run-1 -> run-2 navigation (React
-// Router does not remount on a param change alone) — the ONLY thing that
-// can reset the netflow state between runs is RunDetail's own [id] effect.
-// Renders a Link so the test can navigate without unmounting.
+// Router does not remount on a param change alone) — only the explorer's
+// `key={run.id}` can reset netflow state between runs. Renders a Link so
+// the test can navigate without unmounting.
 function renderWithNav() {
   return render(
     <MemoryRouter initialEntries={['/runs/run-1']}>
@@ -150,28 +187,34 @@ describe('RunDetail netflow tab', () => {
 
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
     expect(fetchRunNetflow).not.toHaveBeenCalled();
-    expect(fetchNetflowGraph).not.toHaveBeenCalled();
+    expect(fetchNetflowExplorer).not.toHaveBeenCalled();
   });
 
-  it('fetches once when the tab is opened, and not again on re-click', async () => {
+  it("fetches once on open — seeded with the run's own span — and not again on re-click", async () => {
     stubApi(GRAPH);
     renderPage();
 
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: /network/i }));
-    await waitFor(() => expect(fetchRunNetflow).toHaveBeenCalledWith('run-1'));
-    expect(fetchNetflowGraph).toHaveBeenCalledWith('run:run-1');
+    // Run scope: the initial window IS the run's span (the server echo
+    // still decides all wording downstream), and both fetches carry it.
+    await waitFor(() =>
+      expect(fetchRunNetflow).toHaveBeenCalledWith('run-1', RUN_SPAN, undefined),
+    );
+    expect(fetchNetflowExplorer).toHaveBeenCalledWith('run:run-1', RUN_SPAN, undefined);
 
     fireEvent.click(screen.getByRole('button', { name: /transcript/i }));
     fireEvent.click(screen.getByRole('button', { name: /network/i }));
 
+    // Kept mounted-but-hidden across the tab round-trip: no refetch.
     expect(fetchRunNetflow).toHaveBeenCalledTimes(1);
-    expect(fetchNetflowGraph).toHaveBeenCalledTimes(1);
+    expect(fetchNetflowExplorer).toHaveBeenCalledTimes(1);
   });
 
   it('renders the fetched flows once loaded', async () => {
     fetchRunNetflow.mockResolvedValue({
+      ...emptyFlows(),
       flows: [
         {
           id: 'f1',
@@ -187,10 +230,6 @@ describe('RunDetail netflow tab', () => {
           body_complete: true,
         },
       ],
-      hosts: [],
-      dropped_total: 0,
-      asn_loaded: true,
-      window: { from: null, to: null },
     } satisfies NetflowResponse);
     stubApi(GRAPH);
     renderPage();
@@ -201,7 +240,7 @@ describe('RunDetail netflow tab', () => {
     await screen.findByText('api.anthropic.com');
   });
 
-  it('resets and re-fetches when navigating to a different run without unmounting', async () => {
+  it('remounts (and re-fetches) when navigating to a different run without unmounting RunDetail', async () => {
     const getRunGraphSpy = vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
     vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
     vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
@@ -211,29 +250,25 @@ describe('RunDetail netflow tab', () => {
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: /network/i }));
-    await waitFor(() => expect(fetchRunNetflow).toHaveBeenCalledWith('run-1'));
+    await waitFor(() =>
+      expect(fetchRunNetflow).toHaveBeenCalledWith('run-1', RUN_SPAN, undefined),
+    );
     expect(fetchRunNetflow).toHaveBeenCalledTimes(1);
 
-    // Navigate to run-2 in the SAME mounted RunDetail instance (React Router
-    // does not remount on a param-only change) — the [id] reset effect is
-    // the only thing that can clear netflowRequestedRef here. The Network
-    // tab stays selected (RunDetail never resets `tab` on an id change), so
-    // the lazy-load effect should re-fire on its own once id flips.
+    // Navigate to run-2 in the SAME mounted RunDetail instance — the
+    // explorer's `key={run.id}` is what remounts it with run-2's scope.
     getRunGraphSpy.mockResolvedValue(GRAPH_2);
     fireEvent.click(screen.getByText('go-to-run-2'));
 
-    await waitFor(() => expect(fetchRunNetflow).toHaveBeenCalledWith('run-2'));
+    await waitFor(() =>
+      expect(fetchRunNetflow).toHaveBeenCalledWith('run-2', RUN_SPAN, undefined),
+    );
     expect(fetchRunNetflow).toHaveBeenCalledTimes(2);
   });
 
-  // --- Important 3 (whole-branch review round 1): unlike pages/Netflow.tsx
-  // and ProjectNetworkTab.tsx, this effect used to skip resetting
-  // netflow/netflowGraph/netflowError before starting a range-change fetch,
-  // so the PREVIOUS window's table/graph/error kept rendering under the
-  // NEW range selection until the request landed. ---
-
-  it('clears the previous window\'s flows and shows Loading while a range change is in flight', async () => {
+  it('keeps the previous data on screen while a range change is in flight (no loading flash)', async () => {
     fetchRunNetflow.mockResolvedValueOnce({
+      ...emptyFlows(),
       flows: [
         {
           id: 'f1',
@@ -249,10 +284,6 @@ describe('RunDetail netflow tab', () => {
           body_complete: true,
         },
       ],
-      hosts: [],
-      dropped_total: 0,
-      asn_loaded: true,
-      window: { from: null, to: null },
     } satisfies NetflowResponse);
     stubApi(GRAPH);
     renderPage();
@@ -261,30 +292,29 @@ describe('RunDetail netflow tab', () => {
     fireEvent.click(screen.getByRole('button', { name: /network/i }));
     await screen.findByText('first-window-host.example.com');
 
-    // Deferred: the second fetch (triggered by the range change below)
-    // never resolves during this test's assertions, so we can observe the
-    // in-flight state.
+    // The second fetch (triggered by the range change below) never
+    // resolves during this test's assertions, so the in-flight state is
+    // observable.
     let resolveSecond!: (v: NetflowResponse) => void;
     fetchRunNetflow.mockReturnValueOnce(
       new Promise<NetflowResponse>((resolve) => {
         resolveSecond = resolve;
       }),
     );
-    fetchNetflowGraph.mockResolvedValueOnce({ nodes: [], edges: [] } satisfies GraphView);
+    fetchNetflowExplorer.mockResolvedValueOnce(emptyExplorer());
 
     fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
 
-    // The previous window's flow must be gone immediately, replaced by
-    // the loading state — not left rendering under the new, unresolved
-    // range (the exact stale-render bug this test guards against).
+    // Deliberate v3 behavior change from the pre-explorer tab: a filter/
+    // range change must NOT collapse the whole surface to a loading line —
+    // the previous result stays visible until the new one lands.
+    expect(screen.getByText('first-window-host.example.com')).toBeInTheDocument();
+    expect(screen.queryByText(/loading network flows/i)).not.toBeInTheDocument();
+
+    resolveSecond(emptyFlows());
     await waitFor(() =>
       expect(screen.queryByText('first-window-host.example.com')).not.toBeInTheDocument(),
     );
-    expect(screen.getByText(/loading network flows/i)).toBeInTheDocument();
-
-    // Clean up the in-flight promise so it doesn't leak into later tests.
-    resolveSecond({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true, window: { from: null, to: null } });
-    await waitFor(() => expect(screen.queryByText(/loading network flows/i)).not.toBeInTheDocument());
   });
 
   it('clears a stale netflow error once a subsequent range change succeeds', async () => {
@@ -296,24 +326,14 @@ describe('RunDetail netflow tab', () => {
     fireEvent.click(screen.getByRole('button', { name: /network/i }));
     await screen.findByText(/boom/i);
 
-    fetchRunNetflow.mockResolvedValueOnce({
-      flows: [],
-      hosts: [],
-      dropped_total: 0,
-      asn_loaded: true,
-      window: { from: '2026-08-17T14:00:00.000Z', to: null },
-    } satisfies NetflowResponse);
-    fetchNetflowGraph.mockResolvedValueOnce({ nodes: [], edges: [] } satisfies GraphView);
+    fetchRunNetflow.mockResolvedValueOnce(emptyFlows());
+    fetchNetflowExplorer.mockResolvedValueOnce(emptyExplorer());
 
     fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
 
-    // The old error must not survive a range change that actually
-    // succeeds — and the error branch is checked first in RunDetail's
-    // render, so a stale error would otherwise permanently hide the data
-    // the new range just fetched.
     await waitFor(() => expect(screen.queryByText(/boom/i)).not.toBeInTheDocument());
-    // Window WAS applied this time (from set) — the range-aware empty
-    // state, not the unbounded one, is the honest read here.
+    // Window WAS applied (the fixtures echo a bounded window) — the
+    // range-aware empty state, not the unbounded one, is the honest read.
     await waitFor(() =>
       expect(screen.getByText(/no network flows in this range/i)).toBeInTheDocument(),
     );

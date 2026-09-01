@@ -40,9 +40,29 @@ describe('NetflowTable', () => {
     expect(screen.getByText(/AS13335/)).toBeInTheDocument();
   });
 
-  it('always shows the fidelity badge', () => {
+  it('no longer renders a fidelity column — fidelity lives in the detail panel and coverage popover', () => {
+    // v3 redesign ("honesty on demand"): the per-row badge moved into
+    // `FlowDetailPanel` (opened by row click) and the explorer's
+    // CoveragePopover legend, both of which have their own tests.
     render(<NetflowTable flows={[flow({ fidelity: 'coarse' })]} droppedTotal={0} asnLoaded />);
-    expect(screen.getByText('coarse')).toBeInTheDocument();
+    expect(screen.queryByText('coarse')).not.toBeInTheDocument();
+    expect(screen.queryByText(/fidelity/i)).not.toBeInTheDocument();
+  });
+
+  it('shows Run and Workflow attribution columns only when showAttribution is set', () => {
+    const attributed = flow({ run_id: 'run-9', workflow: 'review-wf' });
+    const { unmount } = render(
+      <NetflowTable flows={[attributed]} droppedTotal={0} asnLoaded showAttribution />,
+    );
+    expect(screen.getByText('run-9')).toBeInTheDocument();
+    expect(screen.getByText('review-wf')).toBeInTheDocument();
+    unmount();
+
+    // Run scope (default): the columns would be noise — every row belongs
+    // to the run already on screen.
+    render(<NetflowTable flows={[attributed]} droppedTotal={0} asnLoaded />);
+    expect(screen.queryByText('run-9')).not.toBeInTheDocument();
+    expect(screen.queryByText('review-wf')).not.toBeInTheDocument();
   });
 
   it('renders an unknown byte count as a dash, not zero', () => {
@@ -63,9 +83,13 @@ describe('NetflowTable', () => {
     expect(screen.getAllByText('—').length).toBeGreaterThan(0);
   });
 
-  it('surfaces dropped flows rather than under-reporting silently', () => {
+  it('moves the dropped sentence off populated tables (it lives in the coverage popover)', () => {
+    // v3: on a NON-empty table the loss accounting surfaces through the
+    // explorer's always-reachable CoveragePopover (same single-sourced
+    // `droppedTotalSentence`), not a permanent banner. The all-dropped
+    // empty case below still gets the loud in-place banner.
     render(<NetflowTable flows={[flow()]} droppedTotal={17} asnLoaded />);
-    expect(screen.getByText(/17 flows dropped/i)).toBeInTheDocument();
+    expect(screen.queryByText(/17 flows dropped/i)).not.toBeInTheDocument();
   });
 
   it('explains a missing ASN table instead of leaving a blank column', () => {

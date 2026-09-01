@@ -7,16 +7,16 @@
 // Every honesty rule this subsystem exists to enforce lives here:
 //   - `formatBytes` (Task 4) renders `null`/`undefined` as an em dash, never
 //     `0 B` — an unobserved byte count must never read as a real zero.
-//   - The fidelity badge is unconditional: every row gets one, so a Coarse
-//     row never LOOKS as complete as an HTTP row.
-//   - `droppedTotal > 0` gets a loud banner, explicitly scoped ("full
-//     history", across every ledger this view reads) rather than any
-//     active date filter — the list is silently incomplete without it,
-//     which is the exact defect this subsystem prevents. This banner
-//     renders even when
-//     `flows` is empty (an all-dropped scope): the empty state and the
-//     loss banner are not mutually exclusive, and showing only the empty
-//     state there would be the same silent-loss defect in its worst form.
+//   - Fidelity moved from a per-row column into the flow detail panel and
+//     the explorer's CoveragePopover (the v3 redesign's "honesty on
+//     demand" decision) — a row's dashes still read honestly because the
+//     detail panel a click away explains them, and the coverage popover
+//     carries the legend on every scope.
+//   - `droppedTotal > 0` on an EMPTY flows list still gets the loud
+//     banner: an all-dropped scope showing only "no flows recorded" would
+//     be the silent-loss defect in its worst form. For non-empty lists
+//     the same sentence (single-sourced: `droppedTotalSentence`) lives in
+//     the CoveragePopover instead of a permanent banner.
 //   - `asnLoaded === false` gets its own note: a blank Network column would
 //     read as "this peer has no ASN", not "enrichment wasn't available".
 //   - The empty state states netflow's scope limit (rupu's own egress, not
@@ -26,7 +26,6 @@
 import { formatBytes, type FlowView } from '../../lib/netflow';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { EmptyState } from '../ui/EmptyState';
-import { FidelityBadge } from './FidelityBadge';
 import {
   netflowEmptyStateHint,
   netflowRangeEmptyHint,
@@ -65,39 +64,47 @@ export interface NetflowTableProps {
    *  `window`) purely to avoid shadowing the global `window` object inside
    *  this component. */
   appliedWindow?: NetflowWindowEcho;
+  /** Show the Run + Workflow attribution columns (`FlowView.run_id`/
+   *  `.workflow`, server-resolved). The explorer passes `true` at project
+   *  and global scope; at run scope every row belongs to the same run, so
+   *  the columns would be noise. */
+  showAttribution?: boolean;
+  /** Row click → the explorer's flow-detail slide-over. */
+  onRowClick?: (flow: FlowView) => void;
 }
 
 function originLabel(f: FlowView): string {
   return f.ctx.origin.name ?? f.ctx.origin.kind;
 }
 
+/** The one authored copy of the dropped-loss sentence — the empty-state
+ *  banner below and the explorer's CoveragePopover both render exactly
+ *  this string, so the "whole history, every ledger this view reads"
+ *  scoping can't drift between the two surfaces. */
+export function droppedTotalSentence(droppedTotal: number): string {
+  return (
+    `${droppedTotal} flows dropped across the full history of every ledger this view ` +
+    `reads — the capture buffer overflowed at some point, so this list may be ` +
+    `incomplete regardless of any date range shown here.`
+  );
+}
+
 /**
- * `droppedTotal > 0` banner — factored out so it renders identically
- * whether the surviving-flows list is empty or not. Fix round 1: this used
- * to live only in the non-empty return path, so a scope where EVERY flow
- * was dropped rendered a bare "No network flows recorded" with zero
- * indication that anything was lost — the exact silent-incompleteness
- * defect this banner exists to prevent, reachable in the one case
- * (all-dropped) where it matters most. The empty state and the loss banner
- * are not mutually exclusive; the loss is the more important of the two, so
- * it renders first.
+ * `droppedTotal > 0` banner — v3 redesign: renders ONLY on the empty-flows
+ * path now. On a populated table the same sentence (single-sourced via
+ * [`droppedTotalSentence`]) lives in the explorer's always-reachable
+ * CoveragePopover instead of a permanent page banner — "honesty on
+ * demand". The all-dropped empty case KEEPS the loud in-place banner: a
+ * bare "no flows recorded" over a scope that in fact lost every record
+ * would be the silent-incompleteness defect this subsystem exists to
+ * prevent, in its worst form, and a popover nobody is prompted to open is
+ * not loud enough for that.
  *
- * Netflow Plan 3 Task 3, review round 1: the copy explicitly says "full
- * history" rather than just "N flows dropped" — `droppedTotal` is the whole
- * loss regardless of any date-range filter applied to `flows`
- * (`NetflowResponse.dropped_total`'s doc comment), and once Task 4 puts a
- * date picker above this table, an unqualified count would read as
- * "dropped within the selected range", which is exactly the silent-gap
- * misreading this whole subsystem exists to prevent.
- *
- * Deliberately says "every ledger this view reads", not "this ledger" (a
- * wording this banner used to carry): even at run scope, `droppedTotal` is
- * already a sum across more than one file — this run's own ledger, plus
- * any dispatched step's, plus any sub-agent's, at any dispatch depth (see
- * `rupu-cp::api::netflow::run_and_unit_ids`) — and project/global scope
- * sum across every contributing run's ledger on top of that. Naming a
- * single ledger would have undersold how wide "incomplete" can actually
- * be.
+ * The wording still says "full history" / "every ledger this view reads"
+ * for the reasons the pre-v3 banner documented: `droppedTotal` is
+ * whole-history regardless of any window (a drop batch has no timestamp),
+ * and even run scope sums across this run's + every dispatched step's +
+ * sub-agent's ledger files (`rupu-cp::api::netflow::run_and_unit_ids`).
  */
 function DroppedBanner({ droppedTotal }: { droppedTotal: number }) {
   if (droppedTotal <= 0) return null;
@@ -106,9 +113,7 @@ function DroppedBanner({ droppedTotal }: { droppedTotal: number }) {
       role="status"
       className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn"
     >
-      <span className="font-medium">{droppedTotal} flows dropped</span> across the full
-      history of every ledger this view reads — the capture buffer overflowed at some
-      point, so this list may be incomplete regardless of any date range shown here.
+      {droppedTotalSentence(droppedTotal)}
     </div>
   );
 }
@@ -119,6 +124,8 @@ export function NetflowTable({
   asnLoaded,
   scope = 'run',
   appliedWindow,
+  showAttribution = false,
+  onRowClick,
 }: NetflowTableProps) {
   if (flows.length === 0) {
     // A bound is "applied" per the SERVER's echo, not per whatever the
@@ -156,6 +163,39 @@ export function NetflowTable({
       sortValue: (f) => f.ts,
       render: (f) => new Date(f.ts).toLocaleTimeString(),
     },
+    // Attribution columns (non-run scopes only): server-resolved root run
+    // + workflow. `—` is an honest "no run record accounts for this
+    // ledger" (e.g. a standalone agent run), not missing data.
+    ...(showAttribution
+      ? ([
+          {
+            key: 'run',
+            header: 'Run',
+            fit: true,
+            sortable: true,
+            sortValue: (f) => f.run_id ?? null,
+            render: (f) =>
+              f.run_id ? (
+                <span className="font-mono text-note text-brand-500">{f.run_id}</span>
+              ) : (
+                <span className="text-ink-mute">—</span>
+              ),
+          },
+          {
+            key: 'workflow',
+            header: 'Workflow',
+            fit: true,
+            sortable: true,
+            sortValue: (f) => f.workflow ?? null,
+            render: (f) =>
+              f.workflow ? (
+                <span className="font-mono text-note text-ink-dim">{f.workflow}</span>
+              ) : (
+                <span className="text-ink-mute">—</span>
+              ),
+          },
+        ] as Column<FlowView>[])
+      : []),
     {
       key: 'origin',
       header: 'Origin',
@@ -228,17 +268,10 @@ export function NetflowTable({
       sortValue: (f) => f.duration_ms ?? null,
       render: (f) => (f.duration_ms != null ? `${f.duration_ms} ms` : '—'),
     },
-    {
-      key: 'fidelity',
-      header: 'Fidelity',
-      fit: true,
-      render: (f) => <FidelityBadge fidelity={f.fidelity} />,
-    },
   ];
 
   return (
     <div className="space-y-3">
-      <DroppedBanner droppedTotal={droppedTotal} />
       {!asnLoaded && (
         <p className="text-note text-ink-mute">
           ASN data not loaded — network enrichment will appear once the table has been fetched.
@@ -249,6 +282,7 @@ export function NetflowTable({
         rows={flows}
         rowKey={(f) => f.id}
         initialSort={{ key: 'ts', dir: 'desc' }}
+        onRowClick={onRowClick}
       />
     </div>
   );

@@ -36,9 +36,6 @@ export type Fidelity = 'coarse' | 'http' | 'full';
 
 export type Outcome = 'ok' | 'http_error' | 'transport_error' | 'timeout';
 
-/** `rupu_netflow::ledger::views::NodeSide` — bipartite graph side. */
-export type NodeSide = 'source' | 'endpoint';
-
 /**
  * `rupu_netflow::ctx::Origin` — adjacently tagged (`tag = "kind", content =
  * "name"`). `name` is present only for the variants that carry data
@@ -109,6 +106,14 @@ export interface FlowView {
   ttfb_ms?: number;
   duration_ms?: number;
   asn?: AsnInfo;
+  /** The TOP-LEVEL run this flow folds into (ledger-file id mapped back
+   *  through step/fan-out/sub-agent records — `rupu_cp::api::netflow::
+   *  RunMetaIndex`). Distinct from `ctx.run_id`, which is unset on every
+   *  production flow. Omitted when no run record accounts for the ledger
+   *  id (e.g. a standalone agent run). */
+  run_id?: string;
+  /** `RunRecord::workflow_name` of that root run; omitted with `run_id`. */
+  workflow?: string;
 }
 
 /**
@@ -162,32 +167,153 @@ export interface NetflowResponse {
   window: { from: string | null; to: string | null };
 }
 
-/** `rupu_netflow::ledger::views::GraphNode`. */
-export interface GraphNode {
+// ---------------------------------------------------------------------------
+// Explorer aggregate types — mirror `rupu_netflow::ledger::explorer` and
+// `rupu_cp::api::netflow::ExplorerResponse` field-for-field. Same
+// optionality rule as above: `skip_serializing_if` → `field?: T`, plain
+// `Option<T>` → `field: T | null`.
+// ---------------------------------------------------------------------------
+
+/** `rupu_netflow::ledger::explorer::UNKNOWN_KEY` — the explicit bucket
+ *  both the workflow and org dimensions use for unresolved flows (never
+ *  silently dropped). */
+export const NETFLOW_UNKNOWN_KEY = 'unknown';
+
+/** One topology-column node. `calls: 0` means "in scope but filtered /
+ *  windowed out" — render dimmed, never remove (out-of-scope nodes are
+ *  absent from the response entirely). */
+export interface NodeAgg {
   id: string;
   label: string;
-  side: NodeSide;
-}
-
-/**
- * `rupu_netflow::ledger::views::GraphEdge`. `bytes` is a visual-scale
- * weight (`bytes_in.unwrap_or(0) + bytes_out.unwrap_or(0)` summed across
- * the edge's flows) — not an honest total the way `HostRollup.bytes_in`/
- * `bytes_out` are. Don't present it as an authoritative byte count.
- */
-export interface GraphEdge {
-  from: string;
-  to: string;
   calls: number;
-  bytes: number;
   errors: number;
 }
 
-/** `rupu_netflow::ledger::views::GraphView`. */
-export interface GraphView {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
+/** One ribbon between adjacent topology columns. `calls` is the ONLY
+ *  sanctioned visual weight (never bytes — Fix 4 rationale). */
+export interface LinkAgg {
+  from: string;
+  to: string;
+  calls: number;
+  errors: number;
 }
+
+/** `rupu_netflow::ledger::explorer::SankeyView`. */
+export interface SankeyView {
+  workflows: NodeAgg[];
+  origins: NodeAgg[];
+  orgs: NodeAgg[];
+  wf_origin: LinkAgg[];
+  origin_org: LinkAgg[];
+}
+
+/** One dense time bucket. */
+export interface BucketAgg {
+  calls: number;
+  errors: number;
+}
+
+/** One endpoint swimlane. `buckets` is dense — always the view's full
+ *  bucket count, zeros included. `fidelity` is the LEAST-observable
+ *  contributor's level. `p50_ms`/`p95_ms` mirror `HostRollup`'s
+ *  omitted-when-unobservable convention. */
+export interface LaneAgg {
+  host: string;
+  port: number;
+  /** Org display label ("Unknown network" for the unknown group). */
+  org: string;
+  /** Org filter key (`as<number>` / `unknown`). */
+  org_id: string;
+  asn?: number;
+  fidelity: Fidelity;
+  calls: number;
+  errors: number;
+  p50_ms?: number;
+  p95_ms?: number;
+  buckets: BucketAgg[];
+}
+
+/** `rupu_netflow::ledger::explorer::TimelineView`. */
+export interface TimelineView {
+  bucket_ms: number;
+  from: string;
+  to: string;
+  lanes: LaneAgg[];
+  /** Dense: active in-scope run count per bucket. */
+  runs: number[];
+  runs_in_window: number;
+}
+
+/** The activity strip's full-history histogram. Bounds are the SERVER's
+ *  (min/max recorded ts across the scope, ignoring window and filters);
+ *  both `null` (all buckets zero) when the scope has no flows at all. */
+export interface HistogramView {
+  from: string | null;
+  to: string | null;
+  bucket_ms: number;
+  buckets: BucketAgg[];
+}
+
+/** `rupu_netflow::ledger::explorer::KpiView`. `bytes_in`/`bytes_out` are
+ *  observed-only sums — `null` when NO flow contributed an observed value
+ *  (rendering that as `0 B` would claim we saw zero bytes); when
+ *  `bytes_partial` is true the sums exclude at least one unobservable
+ *  flow and must be marked as partial. */
+export interface KpiView {
+  flows: number;
+  endpoints: number;
+  orgs: number;
+  errors: number;
+  bytes_in: number | null;
+  bytes_out: number | null;
+  bytes_partial: boolean;
+  p95_ms?: number;
+}
+
+/** `rupu_cp::api::netflow::ExplorerResponse`. */
+export interface ExplorerResponse {
+  sankey: SankeyView;
+  timeline: TimelineView;
+  histogram: HistogramView;
+  hosts: HostRollup[];
+  kpis: KpiView;
+  /** Whole-history, never window- or filter-scoped — same contract as
+   *  `NetflowResponse.dropped_total`. */
+  dropped_total: number;
+  asn_loaded: boolean;
+  window: { from: string | null; to: string | null };
+}
+
+/** The four cross-filter sets, keyed by the server's dimension keys
+ *  (workflow names / `provider:x`,`scm:x` / `as<number>`,`unknown` /
+ *  `host:port`). Empty array = dimension unfiltered. */
+export interface NetflowFilters {
+  workflows: string[];
+  origins: string[];
+  orgs: string[];
+  hosts: string[];
+}
+
+export const EMPTY_NETFLOW_FILTERS: NetflowFilters = {
+  workflows: [],
+  origins: [],
+  orgs: [],
+  hosts: [],
+};
+
+export function filtersAreEmpty(f: NetflowFilters): boolean {
+  return (
+    f.workflows.length === 0 &&
+    f.origins.length === 0 &&
+    f.orgs.length === 0 &&
+    f.hosts.length === 0
+  );
+}
+
+// (The bipartite `GraphView`/`GraphNode`/`GraphEdge` types and their
+// `fetchNetflowGraph` helper were retired with `NetflowGraph.tsx` when the
+// explorer replaced the last caller; `/api/netflow/graph` itself still
+// exists server-side for non-web consumers.)
 
 // ---------------------------------------------------------------------------
 // Fetch helpers
@@ -235,40 +361,64 @@ export interface NetflowRange {
   to?: string;
 }
 
-/** Appends `from`/`to` to `url` only when present on `range`, and only
- *  when `range` itself is given at all — an omitted `range` argument
- *  produces byte-identical URLs to before this parameter existed, so
- *  every unfiltered call site (still the common case) is unaffected. */
-function appendRange(url: string, range?: NetflowRange): string {
-  if (!range) return url;
+/** Appends `from`/`to` (from `range`) and the four cross-filter params
+ *  (from `filters`, comma-joined — the encoding `rupu_cp`'s
+ *  `split_filter` reads back) only when present — omitted `range` AND
+ *  empty/omitted `filters` produce byte-identical URLs to before either
+ *  parameter existed, so every unfiltered call site is unaffected. */
+function appendRange(url: string, range?: NetflowRange, filters?: NetflowFilters): string {
   const params = new URLSearchParams();
-  if (range.from) params.set('from', range.from);
-  if (range.to) params.set('to', range.to);
+  if (range?.from) params.set('from', range.from);
+  if (range?.to) params.set('to', range.to);
+  if (filters) {
+    if (filters.workflows.length) params.set('workflow', filters.workflows.join(','));
+    if (filters.origins.length) params.set('origin', filters.origins.join(','));
+    if (filters.orgs.length) params.set('org', filters.orgs.join(','));
+    if (filters.hosts.length) params.set('host', filters.hosts.join(','));
+  }
   const qs = params.toString();
   if (!qs) return url;
   return `${url}${url.includes('?') ? '&' : '?'}${qs}`;
 }
 
-export const fetchRunNetflow = (runId: string, range?: NetflowRange): Promise<NetflowResponse> =>
-  getJson<NetflowResponse>(appendRange(`/api/runs/${encodeURIComponent(runId)}/netflow`, range));
+export const fetchRunNetflow = (
+  runId: string,
+  range?: NetflowRange,
+  filters?: NetflowFilters,
+): Promise<NetflowResponse> =>
+  getJson<NetflowResponse>(
+    appendRange(`/api/runs/${encodeURIComponent(runId)}/netflow`, range, filters),
+  );
 
 export const fetchProjectNetflow = (
   projectId: string,
   range?: NetflowRange,
+  filters?: NetflowFilters,
 ): Promise<NetflowResponse> =>
   getJson<NetflowResponse>(
-    appendRange(`/api/projects/${encodeURIComponent(projectId)}/netflow`, range),
+    appendRange(`/api/projects/${encodeURIComponent(projectId)}/netflow`, range, filters),
   );
 
-export const fetchGlobalNetflow = (range?: NetflowRange): Promise<NetflowResponse> =>
-  getJson<NetflowResponse>(appendRange('/api/netflow', range));
+export const fetchGlobalNetflow = (
+  range?: NetflowRange,
+  filters?: NetflowFilters,
+): Promise<NetflowResponse> =>
+  getJson<NetflowResponse>(appendRange('/api/netflow', range, filters));
 
-/** `scope` is `run:<id>` or `project:<id>`; omitted entirely for global. */
-export const fetchNetflowGraph = (scope?: string, range?: NetflowRange): Promise<GraphView> =>
-  getJson<GraphView>(
+/** `scope` is `run:<id>` or `project:<id>`; omitted entirely for global —
+ *  the same contract as `GET /api/netflow/graph`'s scope param. */
+export const fetchNetflowExplorer = (
+  scope?: string,
+  range?: NetflowRange,
+  filters?: NetflowFilters,
+): Promise<ExplorerResponse> =>
+  getJson<ExplorerResponse>(
     appendRange(
-      scope ? `/api/netflow/graph?scope=${encodeURIComponent(scope)}` : '/api/netflow/graph',
+      scope
+        ? `/api/netflow/explorer?scope=${encodeURIComponent(scope)}`
+        : '/api/netflow/explorer',
       range,
+      filters,
     ),
   );
 

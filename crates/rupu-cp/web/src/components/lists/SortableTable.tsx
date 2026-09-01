@@ -101,6 +101,7 @@ export default function SortableTable<T>({
   rowKey,
   initialSort,
   rowHref,
+  onRowClick,
   renderDetail,
 }: {
   columns: Column<T>[];
@@ -108,6 +109,12 @@ export default function SortableTable<T>({
   rowKey: (row: T) => string;
   initialSort?: SortSpec;
   rowHref?: (row: T) => string | undefined;
+  /** Row-level click handler for tables whose rows open an in-page panel
+   *  rather than navigate (e.g. the netflow flow table's detail
+   *  slide-over). Mutually exclusive with `rowHref` by convention — a row
+   *  that navigates should stay a real link. Adds the pointer cursor +
+   *  hover treatment so the affordance is visible. */
+  onRowClick?: (row: T) => void;
   /** Per-row: return the detail-panel content for a row, or `null` (or
    *  `false`) when that particular row has nothing to expand. A row is
    *  expandable (gets the leading chevron + toggles a full-width detail
@@ -247,7 +254,14 @@ export default function SortableTable<T>({
             const isDeadLinkRow = Boolean(rowHref) && !href && !isRowExpandable;
             return (
               <Fragment key={key}>
-                <tr className={cn('transition-colors', !isDeadLinkRow && 'hover:bg-bg/60')}>
+                <tr
+                  onClick={onRowClick ? () => onRowClick(row) : undefined}
+                  className={cn(
+                    'transition-colors',
+                    !isDeadLinkRow && 'hover:bg-bg/60',
+                    onRowClick && 'cursor-pointer',
+                  )}
+                >
                   {hasDetailFeature && (
                     <td className="w-8 pl-3 align-middle">
                       {isRowExpandable && (

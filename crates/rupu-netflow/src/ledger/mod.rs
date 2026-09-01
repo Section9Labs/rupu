@@ -1,3 +1,4 @@
+pub mod explorer;
 pub mod paths;
 pub mod views;
 pub mod writer;

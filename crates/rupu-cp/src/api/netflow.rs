@@ -67,10 +67,14 @@ use axum::{
     Json, Router,
 };
 use rupu_netflow::{
-    global_netflow_dir, is_per_run_ledger_path, project_local_netflow_dir, AsnInfo, AsnTable,
-    FlowId, FlowRecord, NetflowPaths,
+    global_netflow_dir, is_per_run_ledger_path,
+    ledger::explorer::{
+        self, ExplorerFilters, ExplorerFlow, HistogramView, KpiView, RunSpan, SankeyView,
+        TimelineView, EXPLORER_BUCKETS,
+    },
+    project_local_netflow_dir, AsnInfo, AsnTable, FlowId, FlowRecord, NetflowPaths,
 };
-use rupu_orchestrator::runs::RunStore;
+use rupu_orchestrator::runs::{RunRecord, RunStore};
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader};
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -85,6 +89,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/:id/netflow", get(get_project_netflow))
         .route("/api/netflow", get(get_global_netflow))
         .route("/api/netflow/graph", get(get_netflow_graph))
+        .route("/api/netflow/explorer", get(get_netflow_explorer))
 }
 
 /// Run `f` — a synchronous ledger/transcript/ASN-table read — on the tokio
@@ -115,12 +120,30 @@ pub struct FlowView {
     /// table has no entry. The UI distinguishes both from "AS0".
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub asn: Option<AsnInfo>,
+    /// The TOP-LEVEL run this flow folds into — the ledger file's own id
+    /// mapped back through step/fan-out/sub-agent records to its root run
+    /// (see [`RunMetaIndex`]). Distinct from the flattened `ctx.run_id`,
+    /// which is `None` on every production flow (attribution is by ledger
+    /// FILE — module doc). `None` when the ledger id matched no run record
+    /// anywhere (e.g. a standalone agent run, which never enters
+    /// `RunStore`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run_id: Option<String>,
+    /// `RunRecord::workflow_name` of that root run; `None` when
+    /// unresolvable (same cases as `run_id`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub workflow: Option<String>,
 }
 
 impl FlowView {
     pub fn from_flow(flow: FlowRecord, table: Option<&AsnTable>) -> Self {
         let asn = flow.peer_ip.and_then(|ip| table.and_then(|t| t.lookup(ip)));
-        Self { flow, asn }
+        Self {
+            flow,
+            asn,
+            run_id: None,
+            workflow: None,
+        }
     }
 }
 
@@ -611,6 +634,181 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
     ids
 }
 
+// ── Explorer attribution (run/workflow per ledger id) ───────────────────
+
+/// Ledger-file id → (root run id, workflow name) for every run this
+/// scope's stores know about, plus each run's lifetime span for the
+/// timeline's active-runs strip.
+///
+/// This is how a flow read at project/global scope (tagged with the
+/// ledger FILE's own id — a step/fan-out unit's or sub-agent's id at any
+/// depth, not necessarily the root run's) folds back up to the run and
+/// workflow the explorer displays. An id no store can account for maps to
+/// `(None, None)` and the explorer groups it under the explicit `unknown`
+/// workflow — never dropped (mirrors the unknown-org rule).
+///
+/// Cost: building this walks the same records
+/// [`project_run_and_unit_ids`] already walks per request (its doc has
+/// the full accounting); global scope does that across EVERY registered
+/// workspace's store plus the global one. Same order of magnitude as the
+/// ledger-directory union those scopes already read.
+#[derive(Debug, Default)]
+pub(crate) struct RunMetaIndex {
+    map: HashMap<String, (String, String)>,
+    spans: Vec<RunSpan>,
+}
+
+impl RunMetaIndex {
+    /// Fold one run record (looked up in ITS OWN store — see
+    /// [`project_run_and_unit_ids`]'s "same store each id was discovered
+    /// from" rule) into the index.
+    fn insert_run(&mut self, store: &RunStore, record: &RunRecord) {
+        for id in run_and_unit_ids(store, &record.id) {
+            self.map
+                .entry(id)
+                .or_insert_with(|| (record.id.clone(), record.workflow_name.clone()));
+        }
+        self.spans.push(RunSpan {
+            start: record.started_at,
+            end: record.finished_at,
+        });
+    }
+
+    fn attribution(&self, ledger_id: &str) -> (Option<String>, Option<String>) {
+        match self.map.get(ledger_id) {
+            Some((run, wf)) => (Some(run.clone()), Some(wf.clone())),
+            None => (None, None),
+        }
+    }
+}
+
+/// [`RunMetaIndex`] over one project's own runs — the same two-store
+/// enumeration (global store filtered by canonicalized `workspace_path`,
+/// plus the project-local store) as [`project_run_and_unit_ids`].
+fn project_run_meta(global_store: &RunStore, workspace: &StdPath) -> RunMetaIndex {
+    let canonical = canonicalize_or_self(workspace);
+    let mut meta = RunMetaIndex::default();
+    for r in global_store.list().unwrap_or_default() {
+        if canonicalize_or_self(&r.workspace_path) == canonical {
+            meta.insert_run(global_store, &r);
+        }
+    }
+    let local_store = RunStore::new(canonical.join(".rupu").join("runs"));
+    for r in local_store.list().unwrap_or_default() {
+        meta.insert_run(&local_store, &r);
+    }
+    meta
+}
+
+/// [`RunMetaIndex`] over every run any store knows about: the global
+/// store plus each registered workspace's project-local store — the same
+/// workspace enumeration [`read_all_workspaces_sync`] unions ledger
+/// directories over, so a flow readable at global scope has its owning
+/// run's record enumerated whenever that record exists at all.
+fn global_run_meta(global_dir: &StdPath, global_store: &RunStore) -> RunMetaIndex {
+    let mut meta = RunMetaIndex::default();
+    for r in global_store.list().unwrap_or_default() {
+        meta.insert_run(global_store, &r);
+    }
+    let workspaces = (WorkspaceStore {
+        root: global_dir.join("workspaces"),
+    })
+    .list()
+    .unwrap_or_default();
+    // Dedup canonicalized workspace roots the same way
+    // `read_all_workspaces_sync` dedups ledger dirs, so one physical
+    // store is never walked twice (which would double its spans in the
+    // active-runs strip).
+    let roots: std::collections::HashSet<PathBuf> = workspaces
+        .iter()
+        .map(|w| canonicalize_or_self(std::path::Path::new(&w.path)))
+        .collect();
+    for root in roots {
+        let local_store = RunStore::new(root.join(".rupu").join("runs"));
+        for r in local_store.list().unwrap_or_default() {
+            meta.insert_run(&local_store, &r);
+        }
+    }
+    meta
+}
+
+/// Wrap ledger-tagged flows as [`ExplorerFlow`]s: run/workflow attribution
+/// through `meta`, ASN through `table` (read-time enrichment, spec §6.2 —
+/// the one place per scope it happens for the explorer path).
+fn to_explorer_flows(
+    tagged: Vec<(String, FlowRecord)>,
+    meta: &RunMetaIndex,
+    table: Option<&AsnTable>,
+) -> Vec<ExplorerFlow> {
+    tagged
+        .into_iter()
+        .map(|(src, flow)| {
+            let (run_id, workflow) = meta.attribution(&src);
+            let asn = flow.peer_ip.and_then(|ip| table.and_then(|t| t.lookup(ip)));
+            ExplorerFlow {
+                run_id,
+                workflow,
+                asn,
+                flow,
+            }
+        })
+        .collect()
+}
+
+/// Whether one already-enriched flow row passes the active cross-filters.
+/// Key derivation is delegated to `rupu_netflow::ledger::explorer`'s
+/// `*_key_of` helpers so the filter alphabet can never drift from the
+/// aggregate views'.
+fn flow_view_passes(v: &FlowView, filters: &ExplorerFilters) -> bool {
+    let dim = |set: &[String], key: &str| set.is_empty() || set.iter().any(|x| x == key);
+    dim(
+        &filters.workflows,
+        explorer::workflow_key_of(v.workflow.as_deref()),
+    ) && dim(&filters.origins, &explorer::origin_key(&v.flow.ctx.origin))
+        && dim(&filters.orgs, &explorer::org_key_of(v.asn.as_ref()))
+        && dim(
+            &filters.hosts,
+            &explorer::endpoint_key_of(&v.flow.host, v.flow.port),
+        )
+}
+
+/// [`build_response`]'s successor for the scoped flows-list routes: same
+/// contract, plus per-flow run/workflow attribution (`meta`) and
+/// server-side cross-filtering (`filters`). `hosts` is rolled up from the
+/// RETAINED flows only, so the table and any rollup reader always
+/// describe the same set; `dropped_total` stays whole-history and
+/// `window` stays the server's own echo, both untouched by filtering.
+pub(crate) fn build_filtered_response(
+    tagged: Vec<(String, FlowRecord)>,
+    meta: &RunMetaIndex,
+    dropped: u64,
+    table: Option<&AsnTable>,
+    range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
+) -> NetflowResponse {
+    let mut views: Vec<FlowView> = tagged
+        .into_iter()
+        .map(|(src, f)| {
+            let mut v = FlowView::from_flow(f, table);
+            let (run_id, workflow) = meta.attribution(&src);
+            v.run_id = run_id;
+            v.workflow = workflow;
+            v
+        })
+        .collect();
+    views.retain(|v| flow_view_passes(v, filters));
+    let hosts = rupu_netflow::ledger::host_rollup(
+        &views.iter().map(|v| v.flow.clone()).collect::<Vec<_>>(),
+    );
+    NetflowResponse {
+        flows: views,
+        hosts,
+        dropped_total: dropped,
+        window: WindowEcho::from(range),
+        asn_loaded: table.is_some(),
+    }
+}
+
 /// The ledger's run-scoped flows for `run_id` — unioned across every id
 /// [`run_and_unit_ids`] names, each resolved through [`resolve_ledger_paths`]
 /// — merged with the run's own transcript (see the module doc for why the
@@ -665,11 +863,24 @@ fn collect_run_netflow(
     global_dir: &StdPath,
     cache: &AsnCache,
     range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
 ) -> NetflowResponse {
     let (merged, dropped) =
         run_scoped_flows_and_dropped(store, run_id, workspace, global_dir, range);
+    // Every flow at run scope folds into THIS run (the whole point of
+    // `run_and_unit_ids`), so attribution is the run's own record; a
+    // record that fails to load leaves run/workflow unattributed rather
+    // than failing the read (the ledger may still be perfectly readable).
+    let mut meta = RunMetaIndex::default();
+    if let Ok(record) = store.load(run_id) {
+        meta.insert_run(store, &record);
+    }
     let table = load_asn_table(cache);
-    build_response(merged, dropped, table.as_deref(), range)
+    let tagged: Vec<(String, FlowRecord)> = merged
+        .into_iter()
+        .map(|f| (run_id.to_string(), f))
+        .collect();
+    build_filtered_response(tagged, &meta, dropped, table.as_deref(), range, filters)
 }
 
 /// A registered workspace store, rooted at `<global_dir>/workspaces/` —
@@ -1031,6 +1242,7 @@ async fn get_project_netflow(
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
+    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
     let workspace = workspace_for_project(&state, &project_id)?;
     let cache = Arc::clone(&state.asn_cache);
     let store = Arc::clone(&state.run_store);
@@ -1038,9 +1250,9 @@ async fn get_project_netflow(
     let resp = run_blocking(move || {
         let (flows, dropped) =
             project_scoped_flows_and_dropped(&store, &workspace, &global_dir, &range);
-        let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
+        let meta = project_run_meta(&store, &workspace);
         let table = load_asn_table(&cache);
-        build_response(flows, dropped, table.as_deref(), &range)
+        build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters)
     })
     .await?;
     Ok(Json(resp))
@@ -1053,13 +1265,15 @@ async fn get_global_netflow(
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
+    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
     let global_dir = state.global_dir.clone();
+    let store = Arc::clone(&state.run_store);
     let cache = Arc::clone(&state.asn_cache);
     let resp = run_blocking(move || {
         let (flows, dropped) = read_all_workspaces_sync(&global_dir, &range);
-        let flows: Vec<FlowRecord> = flows.into_iter().map(|(_, f)| f).collect();
+        let meta = global_run_meta(&global_dir, &store);
         let table = load_asn_table(&cache);
-        build_response(flows, dropped, table.as_deref(), &range)
+        build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters)
     })
     .await?;
     Ok(Json(resp))
@@ -1104,6 +1318,50 @@ pub struct GraphQuery {
 pub struct TimeRangeQuery {
     pub from: Option<String>,
     pub to: Option<String>,
+    /// Cross-filter params for the explorer's table (and the explorer
+    /// endpoint itself) — each a comma-separated list of dimension KEYS
+    /// (`ExplorerFlow`'s `workflow_key`/`origin_key`/`org_key`/
+    /// `endpoint_key` respectively: workflow names or `unknown`;
+    /// `provider:<name>`/`scm:<name>`; `as<number>`/`unknown`;
+    /// `host:port`). Empty/absent = that dimension unfiltered. Comma is
+    /// safe as a separator: none of the key alphabets contain one
+    /// (workflow names are filename stems).
+    pub workflow: Option<String>,
+    pub origin: Option<String>,
+    pub org: Option<String>,
+    pub host: Option<String>,
+}
+
+/// Split one comma-separated filter param into its keys, dropping empty
+/// segments (`?workflow=` and `?workflow=a,,b` behave as expected).
+fn split_filter(raw: &Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Shared by [`TimeRangeQuery`] (the three flows-list routes) and
+/// [`ExplorerQuery`] — the two carry the same four filter params but can't
+/// share a struct (`serde_urlencoded` flatten limitation, see
+/// [`GraphQuery`]'s doc comment).
+fn parse_filters(
+    workflow: &Option<String>,
+    origin: &Option<String>,
+    org: &Option<String>,
+    host: &Option<String>,
+) -> ExplorerFilters {
+    ExplorerFilters {
+        workflows: split_filter(workflow),
+        origins: split_filter(origin),
+        orgs: split_filter(org),
+        hosts: split_filter(host),
+    }
 }
 
 /// Parse `from`/`to` (see [`TimeRangeQuery`]) into a
@@ -1190,7 +1448,9 @@ async fn run_scoped_flows_for_graph(
             Ok(tag(flows))
         }
         RunLocation::Host { host_id } => {
-            let resp = run_netflow_from_host(s, &host_id, run_id, range).await?;
+            let resp =
+                run_netflow_from_host(s, &host_id, run_id, range, &ExplorerFilters::default())
+                    .await?;
             Ok(tag(resp.flows.into_iter().map(|v| v.flow).collect()))
         }
         // No artifacts anywhere to build a graph from — empty, not an
@@ -1234,6 +1494,294 @@ async fn get_netflow_graph(
     Ok(Json(rupu_netflow::ledger::graph_view(&flows)))
 }
 
+// ── Explorer endpoint (GET /api/netflow/explorer) ───────────────────────
+
+/// Same shape as [`GraphQuery`] plus the four cross-filter params — its
+/// own struct rather than `#[serde(flatten)]` composition for the same
+/// `serde_urlencoded` reason documented there.
+#[derive(Debug, Deserialize)]
+pub struct ExplorerQuery {
+    /// `run:<id>`, `project:<id>`, or absent for global — same permissive
+    /// fallthrough as [`GraphQuery::scope`].
+    pub scope: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// Same contract as [`TimeRangeQuery`]'s filter params.
+    pub workflow: Option<String>,
+    pub origin: Option<String>,
+    pub org: Option<String>,
+    pub host: Option<String>,
+}
+
+/// Everything the explorer surface renders, computed server-side in one
+/// request (see `rupu_netflow::ledger::explorer`'s module doc for the
+/// per-view filter/window semantics). `Deserialize` for the same
+/// proxying reason as [`FlowView`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplorerResponse {
+    pub sankey: SankeyView,
+    pub timeline: TimelineView,
+    pub histogram: HistogramView,
+    /// Rollup of the fully filtered, windowed set — same
+    /// [`rupu_netflow::ledger::host_rollup`] implementation as the flows
+    /// routes, so byte/percentile honesty rules hold identically.
+    pub hosts: Vec<rupu_netflow::ledger::HostRollup>,
+    pub kpis: KpiView,
+    /// Whole-history, never window- or filter-scoped — see
+    /// [`NetflowResponse::dropped_total`].
+    pub dropped_total: u64,
+    pub asn_loaded: bool,
+    /// The applied `?from=`/`?to=` — see [`WindowEcho`]. The histogram's
+    /// own bounds are deliberately NOT this (full retained range).
+    pub window: WindowEcho,
+}
+
+/// Assemble every explorer view from one scope's flows. `scope_flows` is
+/// the UNWINDOWED, UNFILTERED in-scope set — each view applies exactly
+/// the narrowing its own semantics call for (histogram: none; sankey
+/// nodes: window + filters-minus-own-dimension over a scope-wide
+/// universe; timeline lanes: window + filters-minus-host; links / KPIs /
+/// hosts: window + all filters).
+pub(crate) fn build_explorer_response(
+    scope_flows: &[ExplorerFlow],
+    dropped: u64,
+    spans: &[RunSpan],
+    asn_loaded: bool,
+    range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
+) -> ExplorerResponse {
+    let histogram = explorer::histogram_view(scope_flows, EXPLORER_BUCKETS);
+    // The timeline needs concrete bounds: each side takes the applied
+    // window's bound when present, else the histogram's full-retained-
+    // range bound, else (empty scope, unbounded request) a deterministic
+    // epoch fallback — there is nothing to render then either way, but a
+    // deterministic echo beats a wall-clock-dependent one.
+    let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    let from = range.from.or(histogram.from).unwrap_or(epoch);
+    let to = range.to.or(histogram.to).unwrap_or(from).max(from);
+    let timeline = explorer::timeline_view(scope_flows, from, to, filters, spans, EXPLORER_BUCKETS);
+    let sankey = explorer::sankey_view(scope_flows, range, filters);
+    let filtered: Vec<ExplorerFlow> = scope_flows
+        .iter()
+        .filter(|f| range.contains(f.flow.ts) && filters.passes(f, None))
+        .cloned()
+        .collect();
+    let kpis = explorer::kpi_view(&filtered);
+    let hosts = rupu_netflow::ledger::host_rollup(
+        &filtered.iter().map(|f| f.flow.clone()).collect::<Vec<_>>(),
+    );
+    ExplorerResponse {
+        sankey,
+        timeline,
+        histogram,
+        hosts,
+        kpis,
+        dropped_total: dropped,
+        asn_loaded,
+        window: WindowEcho::from(range),
+    }
+}
+
+/// `GET /api/netflow/explorer?scope=&from=&to=&workflow=&origin=&org=&host=`
+/// — the aggregate read behind the Network explorer surface. Scope
+/// resolution mirrors [`get_netflow_graph`]; the underlying flow sets are
+/// the SAME ones the flows-list routes read
+/// ([`run_scoped_flows_and_dropped`] / [`project_scoped_flows_and_dropped`]
+/// / [`read_all_workspaces_sync`]), so the explorer's aggregates and the
+/// table beneath them can never be built from different data.
+async fn get_netflow_explorer(
+    State(state): State<AppState>,
+    Query(q): Query<ExplorerQuery>,
+) -> ApiResult<Json<ExplorerResponse>> {
+    maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
+    let range = parse_time_range(&q.from, &q.to)?;
+    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
+    if let Some(run_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("run:")) {
+        let resp = explorer_run_scope(&state, run_id, &range, &filters).await?;
+        Ok(Json(resp))
+    } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
+        let workspace = workspace_for_project(&state, project_id)?;
+        let store = Arc::clone(&state.run_store);
+        let global_dir = state.global_dir.clone();
+        let cache = Arc::clone(&state.asn_cache);
+        let resp = run_blocking(move || {
+            let (tagged, dropped) = project_scoped_flows_and_dropped(
+                &store,
+                &workspace,
+                &global_dir,
+                &rupu_netflow::ledger::TimeRange::unbounded(),
+            );
+            let meta = project_run_meta(&store, &workspace);
+            let table = load_asn_table(&cache);
+            let flows = to_explorer_flows(tagged, &meta, table.as_deref());
+            build_explorer_response(
+                &flows,
+                dropped,
+                &meta.spans,
+                table.is_some(),
+                &range,
+                &filters,
+            )
+        })
+        .await?;
+        Ok(Json(resp))
+    } else {
+        let store = Arc::clone(&state.run_store);
+        let global_dir = state.global_dir.clone();
+        let cache = Arc::clone(&state.asn_cache);
+        let resp = run_blocking(move || {
+            let (tagged, dropped) = read_all_workspaces_sync(
+                &global_dir,
+                &rupu_netflow::ledger::TimeRange::unbounded(),
+            );
+            let meta = global_run_meta(&global_dir, &store);
+            let table = load_asn_table(&cache);
+            let flows = to_explorer_flows(tagged, &meta, table.as_deref());
+            build_explorer_response(
+                &flows,
+                dropped,
+                &meta.spans,
+                table.is_some(),
+                &range,
+                &filters,
+            )
+        })
+        .await?;
+        Ok(Json(resp))
+    }
+}
+
+/// The explorer's `run:` scope — dispatches on [`resolve_run_location`]
+/// exactly like [`get_run_netflow`]. `Global`/`ProjectLocal` read the
+/// run's own ledgers UNBOUNDED (the histogram wants the run's whole
+/// recorded history; the views window internally); `Host` proxies the
+/// whole explorer request; `Unpersisted` renders honestly empty views.
+async fn explorer_run_scope(
+    s: &AppState,
+    run_id: &str,
+    range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
+) -> ApiResult<ExplorerResponse> {
+    let unbounded = rupu_netflow::ledger::TimeRange::unbounded();
+    match resolve_run_location(s, run_id).await {
+        RunLocation::Global => {
+            let run = s
+                .run_store
+                .load(run_id)
+                .map_err(|e| run_not_found_or_internal(run_id, e))?;
+            let store = Arc::clone(&s.run_store);
+            let rid = run_id.to_string();
+            let workspace = run.workspace_path.clone();
+            let global_dir = s.global_dir.clone();
+            let cache = Arc::clone(&s.asn_cache);
+            let range = range.clone();
+            let filters = filters.clone();
+            run_blocking(move || {
+                let (merged, dropped) =
+                    run_scoped_flows_and_dropped(&store, &rid, &workspace, &global_dir, &unbounded);
+                let mut meta = RunMetaIndex::default();
+                meta.insert_run(&store, &run);
+                let table = load_asn_table(&cache);
+                let tagged: Vec<(String, FlowRecord)> =
+                    merged.into_iter().map(|f| (rid.clone(), f)).collect();
+                let flows = to_explorer_flows(tagged, &meta, table.as_deref());
+                build_explorer_response(
+                    &flows,
+                    dropped,
+                    &meta.spans,
+                    table.is_some(),
+                    &range,
+                    &filters,
+                )
+            })
+            .await
+        }
+        RunLocation::ProjectLocal { path } => {
+            let rid = run_id.to_string();
+            let global_dir = s.global_dir.clone();
+            let cache = Arc::clone(&s.asn_cache);
+            let range = range.clone();
+            let filters = filters.clone();
+            run_blocking(move || {
+                let store = RunStore::new(path.join(".rupu").join("runs"));
+                let (merged, dropped) =
+                    run_scoped_flows_and_dropped(&store, &rid, &path, &global_dir, &unbounded);
+                let mut meta = RunMetaIndex::default();
+                if let Ok(record) = store.load(&rid) {
+                    meta.insert_run(&store, &record);
+                }
+                let table = load_asn_table(&cache);
+                let tagged: Vec<(String, FlowRecord)> =
+                    merged.into_iter().map(|f| (rid.clone(), f)).collect();
+                let flows = to_explorer_flows(tagged, &meta, table.as_deref());
+                build_explorer_response(
+                    &flows,
+                    dropped,
+                    &meta.spans,
+                    table.is_some(),
+                    &range,
+                    &filters,
+                )
+            })
+            .await
+        }
+        RunLocation::Host { host_id } => {
+            explorer_from_host(s, &host_id, run_id, range, filters).await
+        }
+        // No artifacts anywhere — honestly empty views, not an error;
+        // mirrors `get_run_netflow`'s `Unpersisted` branch (including the
+        // `run_blocking` for the potential table parse).
+        RunLocation::Unpersisted { .. } => {
+            let cache = Arc::clone(&s.asn_cache);
+            let range = range.clone();
+            let filters = filters.clone();
+            run_blocking(move || {
+                let table = load_asn_table(&cache);
+                build_explorer_response(&[], 0, &[], table.is_some(), &range, &filters)
+            })
+            .await
+        }
+        RunLocation::NotFound => Err(ApiError::not_found(format!("run {run_id} not found"))),
+    }
+}
+
+/// Proxy the whole explorer request to a resolved host — the remote CP
+/// owns the run's ledgers, run records, and its own ASN table, so it
+/// builds the aggregates and we relay them. Unlike
+/// [`run_netflow_from_host`] there is no local re-enforcement pass: the
+/// explorer route and its `from`/`to`/filter params shipped together, so
+/// any remote that HAS the route applies them; a remote without it 404s
+/// loudly (surfaced via the error below), never silently unfiltered.
+async fn explorer_from_host(
+    s: &AppState,
+    host_id: &str,
+    run_id: &str,
+    range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
+) -> ApiResult<ExplorerResponse> {
+    let conn = resolve_host(s, host_id)?;
+    let mut parts = vec![format!("scope=run:{}", urlencode_query_value(run_id))];
+    parts.extend(time_range_query_parts(range));
+    parts.extend(filter_query_parts(filters));
+    let path = format!("/api/netflow/explorer?{}", parts.join("&"));
+    let value = conn.proxy_get_json(&path).await.map_err(|e| match e {
+        HostConnectorError::NotFound(m) => ApiError::not_found(format!(
+            "host {host_id} has no netflow explorer endpoint ({m}); the remote CP is \
+             likely older than this one"
+        )),
+        HostConnectorError::Unreachable(m) => {
+            ApiError::internal(format!("host {host_id} unreachable: {m}"))
+        }
+        other => ApiError::internal(other.to_string()),
+    })?;
+    serde_json::from_value(value).map_err(|e| {
+        ApiError::internal(format!(
+            "host {host_id} returned an explorer response this build cannot read ({e}); \
+             the remote CP is likely older than this one"
+        ))
+    })
+}
+
 /// Proxy `GET /api/runs/:id/netflow` to a resolved host. Mirrors
 /// `graph.rs`'s `run_graph_from_host` — the remote CP does the same
 /// ledger+transcript merge locally and we just relay its response.
@@ -1253,9 +1801,13 @@ async fn run_netflow_from_host(
     host_id: &str,
     id: &str,
     range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
 ) -> ApiResult<NetflowResponse> {
     let conn = resolve_host(s, host_id)?;
-    let path = format!("/api/runs/{id}/netflow{}", time_range_query_string(range));
+    let path = format!(
+        "/api/runs/{id}/netflow{}",
+        query_string(&time_range_query_parts(range), &filter_query_parts(filters))
+    );
     let value = conn.proxy_get_json(&path).await.map_err(|e| match e {
         HostConnectorError::NotFound(m) => ApiError::not_found(m),
         HostConnectorError::Unreachable(m) => {
@@ -1277,7 +1829,30 @@ async fn run_netflow_from_host(
         ))
     })?;
     enforce_range_on_proxied_response(&mut resp, range);
+    enforce_filters_on_proxied_response(&mut resp, filters);
     Ok(resp)
+}
+
+/// Same defensive posture as [`enforce_range_on_proxied_response`], for
+/// the cross-filter params: a remote old enough to ignore unfamiliar
+/// `workflow`/`origin`/`org`/`host` params would silently return the
+/// unfiltered set, so the retained-and-recomputed correction runs HERE
+/// regardless. Uses the remote's own per-flow `asn`/`workflow` enrichment
+/// (this side has no better source for a remote run's attribution). A
+/// no-op when no filter is active, keeping unfiltered proxied responses
+/// byte-identical to before this existed.
+fn enforce_filters_on_proxied_response(resp: &mut NetflowResponse, filters: &ExplorerFilters) {
+    if filters.is_empty() {
+        return;
+    }
+    resp.flows.retain(|v| flow_view_passes(v, filters));
+    resp.hosts = rupu_netflow::ledger::host_rollup(
+        &resp
+            .flows
+            .iter()
+            .map(|v| v.flow.clone())
+            .collect::<Vec<_>>(),
+    );
 }
 
 /// Correct a host-proxied [`NetflowResponse`] to match `range` regardless
@@ -1327,7 +1902,7 @@ fn enforce_range_on_proxied_response(
 /// `usage.rs`'s `urlencoding_rfc3339`, which a doc comment there notes was
 /// added after a bare `+` silently decoded as a space and corrupted a
 /// forwarded timestamp.
-fn time_range_query_string(range: &rupu_netflow::ledger::TimeRange) -> String {
+fn time_range_query_parts(range: &rupu_netflow::ledger::TimeRange) -> Vec<String> {
     let mut parts = Vec::new();
     if let Some(from) = range.from {
         parts.push(format!("from={}", urlencoding_rfc3339(from)));
@@ -1335,11 +1910,67 @@ fn time_range_query_string(range: &rupu_netflow::ledger::TimeRange) -> String {
     if let Some(to) = range.to {
         parts.push(format!("to={}", urlencoding_rfc3339(to)));
     }
-    if parts.is_empty() {
+    parts
+}
+
+/// The cross-filter params, re-encoded exactly as [`parse_filters`] reads
+/// them back (comma-joined values, one param per dimension) so a proxied
+/// request round-trips losslessly.
+fn filter_query_parts(filters: &ExplorerFilters) -> Vec<String> {
+    let join = |name: &str, values: &[String]| {
+        (!values.is_empty()).then(|| {
+            format!(
+                "{name}={}",
+                values
+                    .iter()
+                    .map(|v| urlencode_query_value(v))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+    };
+    [
+        join("workflow", &filters.workflows),
+        join("origin", &filters.origins),
+        join("org", &filters.orgs),
+        join("host", &filters.hosts),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Join query-string parts into a `?a&b` suffix (empty when there are no
+/// parts at all).
+fn query_string(a: &[String], b: &[String]) -> String {
+    let all: Vec<&String> = a.iter().chain(b.iter()).collect();
+    if all.is_empty() {
         String::new()
     } else {
-        format!("?{}", parts.join("&"))
+        format!(
+            "?{}",
+            all.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("&")
+        )
     }
+}
+
+/// Percent-encode one query VALUE conservatively: unreserved characters
+/// and `:` (legal in a query, and load-bearing for `provider:x` /
+/// `host:port` keys) pass through; everything else — including `,`, so a
+/// value can never masquerade as [`split_filter`]'s separator — is
+/// escaped. `filter_query_parts` joins values with a LITERAL comma after
+/// encoding, which the remote's form-decoder leaves alone.
+fn urlencode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn urlencoding_rfc3339(dt: chrono::DateTime<chrono::Utc>) -> String {
@@ -1363,6 +1994,7 @@ async fn get_run_netflow(
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&s), &s.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
+    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
     match resolve_run_location(&s, &run_id).await {
         RunLocation::Global => {
             let run = s
@@ -1375,7 +2007,15 @@ async fn get_run_netflow(
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
-                collect_run_netflow(&store, &rid, &workspace, &global_dir, &cache, &range)
+                collect_run_netflow(
+                    &store,
+                    &rid,
+                    &workspace,
+                    &global_dir,
+                    &cache,
+                    &range,
+                    &filters,
+                )
             })
             .await?;
             Ok(Json(resp))
@@ -1386,14 +2026,16 @@ async fn get_run_netflow(
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                collect_run_netflow(&store, &rid, &path, &global_dir, &cache, &range)
+                collect_run_netflow(&store, &rid, &path, &global_dir, &cache, &range, &filters)
             })
             .await?;
             Ok(Json(resp))
         }
-        RunLocation::Host { host_id } => run_netflow_from_host(&s, &host_id, &run_id, &range)
-            .await
-            .map(Json),
+        RunLocation::Host { host_id } => {
+            run_netflow_from_host(&s, &host_id, &run_id, &range, &filters)
+                .await
+                .map(Json)
+        }
         // No artifacts anywhere: the run never persisted a workspace to
         // read a ledger or transcript from. Empty, not an error — mirrors
         // `run_graph`'s `Unpersisted` branch. Still routed through
@@ -1489,7 +2131,11 @@ mod tests {
 
     #[test]
     fn netflow_run_fixture_is_current() {
-        let mut flow_ok = flow(FlowId::from_parts(1, 1), Some("run-40"), "api.anthropic.com");
+        let mut flow_ok = flow(
+            FlowId::from_parts(1, 1),
+            Some("run-40"),
+            "api.anthropic.com",
+        );
         flow_ok.peer_ip = Some("142.250.72.14".parse().unwrap());
         flow_ok.ts = chrono::DateTime::from_timestamp(1_755_691_200, 0).unwrap();
 
@@ -1510,10 +2156,14 @@ mod tests {
                         asn: 15169,
                         org: "Google LLC".into(),
                     }),
+                    run_id: None,
+                    workflow: None,
                 },
                 FlowView {
                     flow: flow_err,
                     asn: None,
+                    run_id: None,
+                    workflow: None,
                 },
             ],
             hosts: vec![
