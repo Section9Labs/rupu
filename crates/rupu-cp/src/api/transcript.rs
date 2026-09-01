@@ -162,14 +162,39 @@ async fn get_transcript(
     if !path.exists() {
         return Ok(Json(serde_json::json!({ "events": [], "summary": null })));
     }
-    let events: Vec<rupu_transcript::Event> = rupu_transcript::JsonlReader::iter(&path)
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .filter_map(Result::ok)
-        .collect();
+    let (events, unparsed) =
+        read_events_counting_unparsed(&path).map_err(|e| ApiError::internal(e.to_string()))?;
     let summary = rupu_transcript::JsonlReader::summary(&path).ok();
     Ok(Json(
-        serde_json::json!({ "events": events, "summary": summary }),
+        serde_json::json!({ "events": events, "summary": summary, "unparsed": unparsed }),
     ))
+}
+
+/// Read all parseable events, counting unparseable lines — EXCEPT a parse
+/// failure on the final line, which is the signature of a mid-write tail on
+/// a live transcript, not corruption.
+fn read_events_counting_unparsed(
+    path: &Path,
+) -> Result<(Vec<rupu_transcript::Event>, usize), rupu_transcript::ReadError> {
+    let mut events = Vec::new();
+    let mut unparsed = 0usize;
+    let mut last_line_failed = false;
+    for ev in rupu_transcript::JsonlReader::iter(path)? {
+        match ev {
+            Ok(e) => {
+                events.push(e);
+                last_line_failed = false;
+            }
+            Err(_) => {
+                unparsed += 1;
+                last_line_failed = true;
+            }
+        }
+    }
+    if last_line_failed {
+        unparsed -= 1;
+    }
+    Ok((events, unparsed))
 }
 
 /// `GET /api/transcript/stream?path=` — SSE live-tail of a transcript JSONL.
@@ -199,4 +224,27 @@ async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) ->
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::read_events_counting_unparsed;
+    use std::io::Write as _;
+
+    #[test]
+    fn unparsed_counts_bad_lines_but_forgives_a_truncated_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("t.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, r#"{{"type":"turn_start","data":{{"turn_idx":0}}}}"#).unwrap();
+        writeln!(f, "THIS IS NOT JSON").unwrap();
+        writeln!(f, r#"{{"type":"turn_end","data":{{"turn_idx":0}}}}"#).unwrap();
+        write!(f, r#"{{"type":"assistant_delta","data":{{"conte"#).unwrap(); // torn tail
+        let (events, unparsed) = read_events_counting_unparsed(&p).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            unparsed, 1,
+            "mid-file garbage counts; the torn final line does not"
+        );
+    }
 }

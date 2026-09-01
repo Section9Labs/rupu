@@ -24,6 +24,12 @@ export type TranscriptEvent =
   | { type: 'turn_end'; data: { tokens_in?: number | null; tokens_out?: number | null } }
   | { type: 'usage'; data: { input_tokens: number; output_tokens: number; cached_tokens: number } }
   | { type: 'run_complete'; data: { run_id: string; status: string; total_tokens: number; duration_ms: number; error?: string | null } }
+  | { type: 'thinking'; data: { text?: string | null; provider: string; model: string; raw?: unknown } }
+  | { type: 'thinking_delta'; data: { content: string } }
+  | { type: 'user_message'; data: { content: string } }
+  | { type: 'seed'; data: { message_count: number; sha256?: string; source_transcript?: string | null; messages?: unknown } }
+  | { type: 'notice'; data: { kind: string; message: string } }
+  | { type: 'compaction'; data: { seq: number; summarized_messages: number; backup_path?: string; messages?: unknown } }
   | { type: string; data: Record<string, unknown> }; // catch-all for forward-compat
 
 // ---------------------------------------------------------------------------
@@ -45,4 +51,6 @@ export interface TranscriptSummary {
 export interface TranscriptResponse {
   events: TranscriptEvent[];
   summary: TranscriptSummary | null;
+  /** Lines the server could not parse (absent on older servers). */
+  unparsed?: number;
 }
