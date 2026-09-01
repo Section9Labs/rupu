@@ -11,7 +11,7 @@
 import { it, expect, describe, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import Turn from './Turn';
-import type { TurnView, ToolView } from './transcriptView';
+import type { TurnBlock, TurnView, ToolView } from './transcriptView';
 
 afterEach(cleanup);
 
@@ -26,18 +26,25 @@ function readTool(overrides?: Partial<ToolView>): ToolView {
   };
 }
 
-function makeTurn(overrides?: Partial<TurnView>): TurnView {
+// v2 blocks model: TurnView no longer carries `assistant`/`tools` fields
+// directly — build the equivalent `blocks` array instead. Mechanical
+// adaptation only (Task 3 owns the real Turn.tsx blocks rendering).
+function makeTurn(overrides?: { tools?: ToolView[]; summary?: TurnView['summary'] }): TurnView {
   const tools = overrides?.tools ?? [readTool()];
   const findingCount = tools.filter((t) => t.kind === 'finding').length;
+  const blocks: TurnBlock[] = [
+    { kind: 'assistant', content: 'Looking at the API surface now.' },
+    ...tools.map((view): TurnBlock => ({ kind: 'tool', view })),
+  ];
   return {
-    assistant: { content: 'Looking at the API surface now.' },
-    tools,
-    summary: {
+    blocks,
+    tokensIn: null,
+    tokensOut: null,
+    summary: overrides?.summary ?? {
       toolCount: tools.length,
       findingCount,
       result: 'ok',
     },
-    ...overrides,
   };
 }
 

@@ -16,7 +16,7 @@ import { useState } from 'react';
 import { ChevronRight, ChevronDown, Wrench, AlertTriangle } from 'lucide-react';
 import Markdown from './Markdown';
 import ToolCard from './ToolCard';
-import type { TurnView } from './transcriptView';
+import type { TurnBlock, TurnView } from './transcriptView';
 import { cn } from '../../lib/cn';
 
 // ---------------------------------------------------------------------------
@@ -70,8 +70,20 @@ export default function Turn({
   const [showThinking, setShowThinking] = useState(false);
 
   const { toolCount, findingCount, result } = turn.summary;
-  const content = turn.assistant?.content ?? '';
-  const thinking = turn.assistant?.thinking;
+  // Mechanical adaptation to the v2 blocks model (Task 3 will rewrite this
+  // component to render blocks in order, including multiple
+  // assistant/thinking blocks and the new gate/seed/notice/compaction/user
+  // kinds) — for now, pull the first assistant/thinking block the same way
+  // the old `turn.assistant` shape did.
+  const content =
+    turn.blocks.find((b): b is Extract<TurnBlock, { kind: 'assistant' }> => b.kind === 'assistant')
+      ?.content ?? '';
+  const thinking =
+    turn.blocks.find((b): b is Extract<TurnBlock, { kind: 'thinking' }> => b.kind === 'thinking')
+      ?.text ?? undefined;
+  const tools = turn.blocks
+    .filter((b): b is Extract<TurnBlock, { kind: 'tool' }> => b.kind === 'tool')
+    .map((b) => b.view);
 
   return (
     <div className="rounded-xl border border-border bg-panel">
@@ -151,7 +163,7 @@ export default function Turn({
           )}
 
           {/* Tools */}
-          {turn.tools.map((tool, i) => (
+          {tools.map((tool, i) => (
             <ToolCard
               key={i}
               tool={tool}
