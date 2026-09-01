@@ -3228,7 +3228,17 @@ pub(crate) async fn resume_run(
         kinds.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
-    let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &mode_str);
+    let action_dispatcher = crate::resume::action_dispatcher_for(
+        &mcp_registry,
+        &mode_str,
+        Some(rupu_mcp::FindingsContext {
+            workspace_path: workspace_path.clone(),
+            scope_name: workflow.name.clone(),
+            run_id: run_id.to_string(),
+            model: cfg.default_model.clone().unwrap_or_default(),
+            surface: rupu_coverage::Surface::Workflow,
+        }),
+    );
     let mode_str_for_policy = mode_str.clone();
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
@@ -4768,7 +4778,17 @@ async fn execute_workflow_invocation(
     // same registry + mode the `DefaultStepFactory` below carries, so
     // agent steps and action steps see identical permissions across a
     // pause/resume boundary too.
-    let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &ctx.mode);
+    let action_dispatcher = crate::resume::action_dispatcher_for(
+        &mcp_registry,
+        &ctx.mode,
+        Some(rupu_mcp::FindingsContext {
+            workspace_path: ctx.workspace_path.clone(),
+            scope_name: workflow.name.clone(),
+            run_id: run_id.clone(),
+            model: cfg.default_model.clone().unwrap_or_default(),
+            surface: rupu_coverage::Surface::Workflow,
+        }),
+    );
 
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),

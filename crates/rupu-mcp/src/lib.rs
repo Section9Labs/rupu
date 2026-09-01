@@ -22,5 +22,6 @@ pub use dispatcher::ToolDispatcher;
 pub use error::McpError;
 pub use permission::McpPermission;
 pub use server::{serve_in_process, McpServer, ServeHandle};
+pub use tools::findings::FindingsContext;
 pub use tools::{tool_catalog, ToolKind, ToolSpec};
 pub use transport::{InProcessTransport, StdioTransport, Transport};

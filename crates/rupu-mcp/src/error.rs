@@ -16,6 +16,12 @@ pub enum McpError {
     #[error("tool dispatch failed: {0}")]
     Dispatch(#[from] rupu_scm::ScmError),
 
+    /// A non-SCM tool failed while executing. `Dispatch` carries an
+    /// `ScmError` and so cannot represent a tool that never touches an SCM
+    /// connector — `findings.record` writes to the local ledger.
+    #[error("tool failed: {0}")]
+    Tool(String),
+
     /// `Registry::repo_for`/`issues_for`/`github_extras_for`/
     /// `gitlab_extras_for` failed to pick an account — ambiguous
     /// (`NoRuleMatched`), unconfigured (`NoAccounts`), or a bad
@@ -44,6 +50,7 @@ impl McpError {
             Self::NotWiredInV0(_) => -32002,
             Self::Dispatch(_) => -32003,
             Self::Account(_) => -32004,
+            Self::Tool(_) => -32005,
             Self::Transport(_) => -32603, // internal error
         }
     }

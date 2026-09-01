@@ -873,18 +873,62 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // Wire coverage into tool context.
     if let Some(h) = &coverage_handle {
         opts.tool_context.coverage_writer = Some(h.writer.clone());
-        opts.tool_context.surface_tag = Some(
-            opts.surface_tag
-                .clone()
-                .unwrap_or_else(|| "agent".to_string()),
-        );
-        opts.tool_context.run_id = Some(opts.run_id.clone());
-        opts.tool_context.model = Some(opts.model.clone());
     }
+
+    // Attribution is set unconditionally, NOT only when coverage is enabled.
+    // `attribution_from_ctx` falls back to `String::default()` for a missing
+    // run_id or model, so a finding recorded without the coverage harness
+    // would otherwise be written with EMPTY attribution rather than failing —
+    // a silent hole in the audit trail rather than a loud one. These three
+    // values describe the run, not the coverage harness, so they belong here.
+    opts.tool_context.surface_tag = Some(
+        opts.surface_tag
+            .clone()
+            .unwrap_or_else(|| "agent".to_string()),
+    );
+    opts.tool_context.run_id = Some(opts.run_id.clone());
+    opts.tool_context.model = Some(opts.model.clone());
 
     // Register coverage tools when coverage is enabled.
     if let Some(bundle) = &coverage {
         coverage_tools::register(&mut registry, bundle.catalog.clone(), bundle.paths.clone());
+    }
+
+    // Findings WITHOUT the coverage harness.
+    //
+    // `coverage_tools::register` above is the only thing that registers
+    // `report_finding`, and it runs only when the agent declares a
+    // `concerns:` block. That ties "can record a finding" to "is running the
+    // coverage harness", which assumes findings are about FILES: the harness
+    // needs a catalog of concerns and marks (concern_id, file_path) pairs.
+    //
+    // An assessment of hosts, endpoints or cloud resources has no such
+    // catalog, so it could not record a finding at all — the control plane
+    // showed zero findings while the workflow reported them somewhere else
+    // entirely. Recording a finding and running the coverage harness are
+    // different things and are now separable.
+    //
+    // Opt-in via `tools:`, not automatic: `report_finding` writes to the
+    // project's ledger, and every builtin here is an explicit grant. The
+    // registry insert happens after `filter_to` for the same reason the
+    // coverage tools do — the grant list gates the six builtins, and these
+    // are registered on top of it.
+    if coverage.is_none()
+        && opts
+            .agent_tools
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t == "report_finding"))
+    {
+        let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
+        let target = target_id(&opts.workspace_path, scope);
+        let paths = CoveragePaths::new(&opts.workspace_path, &target);
+        paths
+            .ensure_dir()
+            .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
+        registry.insert(
+            "report_finding",
+            std::sync::Arc::new(coverage_tools::ReportFindingTool::new(paths)),
+        );
     }
 
     // MCP server: spin up before the loop if we have a Registry.

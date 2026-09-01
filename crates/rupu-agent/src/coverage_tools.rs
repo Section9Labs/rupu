@@ -256,6 +256,20 @@ pub struct ReportFindingTool {
     paths: CoveragePaths,
 }
 
+impl ReportFindingTool {
+    /// Build the tool against an explicit ledger location.
+    ///
+    /// `register` below wires this up as part of the coverage harness. This
+    /// constructor exists for the other caller: an agent that records
+    /// findings WITHOUT a `concerns:` block (see `runner`'s
+    /// findings-without-coverage registration). A campaign that assesses
+    /// hosts rather than files has no catalog and no concerns, but still
+    /// produces findings.
+    pub fn new(paths: CoveragePaths) -> Self {
+        Self { paths }
+    }
+}
+
 #[async_trait]
 impl Tool for ReportFindingTool {
     fn name(&self) -> &'static str {
@@ -283,10 +297,14 @@ impl Tool for ReportFindingTool {
                     "maxItems": 2,
                     "description": "Line range [start, end] within the file, if applicable."
                 },
+                "target_ref": {
+                    "type": "string",
+                    "description": "What this finding is about when it is not a file: a host or IP (host), a URL (endpoint), or a cloud resource id such as an OCID/ARN/URN (resource). Required for those three scopes."
+                },
                 "scope": {
                     "type": "string",
-                    "enum": ["line", "file", "repo"],
-                    "description": "Scope at which the finding applies."
+                    "enum": ["line", "file", "repo", "host", "endpoint", "resource"],
+                    "description": "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a specific service URL), 'resource' (a cloud resource by its own id). Pick the narrowest scope the evidence actually supports - claiming a whole host for a defect on one endpoint overstates it."
                 },
                 "summary": {
                     "type": "string",

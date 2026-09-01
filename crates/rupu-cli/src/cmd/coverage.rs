@@ -1955,6 +1955,7 @@ mod tests {
             id: "f1".to_string(),
             file_path: Some("src/auth.rs".to_string()),
             line_range: None,
+            target_ref: None,
             scope: rupu_coverage::FindingScope::File,
             summary: "insecure default".to_string(),
             severity,

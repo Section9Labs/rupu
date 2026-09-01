@@ -150,9 +150,55 @@ pub struct ConcernAssertion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FindingScope {
+    /// A specific line range in a file. Requires `file_path` + `line_range`.
     Line,
+    /// A whole file. Requires `file_path`.
     File,
+    /// The repository or project as a whole. Needs no locator.
     Repo,
+    /// A network host or IP. Requires `target_ref`.
+    Host,
+    /// A specific service endpoint (a URL). Requires `target_ref`.
+    Endpoint,
+    /// A cloud or platform resource named by its own scheme - OCID, ARN,
+    /// URN. Requires `target_ref`.
+    Resource,
+}
+
+impl FindingScope {
+    /// Which locator this scope needs in order to point at anything.
+    ///
+    /// The code scopes locate a finding with `file_path`/`line_range`; the
+    /// target scopes locate it with `target_ref`. `Repo` locates nothing --
+    /// it IS the whole project.
+    pub fn locator(&self) -> ScopeLocator {
+        match self {
+            Self::Line => ScopeLocator::FileAndLine,
+            Self::File => ScopeLocator::File,
+            Self::Repo => ScopeLocator::None,
+            Self::Host | Self::Endpoint | Self::Resource => ScopeLocator::Target,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::File => "file",
+            Self::Repo => "repo",
+            Self::Host => "host",
+            Self::Endpoint => "endpoint",
+            Self::Resource => "resource",
+        }
+    }
+}
+
+/// What a [`FindingScope`] requires in order to point at anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeLocator {
+    None,
+    File,
+    FileAndLine,
+    Target,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +217,17 @@ pub struct FindingRecord {
     pub file_path: Option<String>,
     #[serde(default)]
     pub line_range: Option<[u32; 2]>,
+    /// Locator for a non-code scope: the host, endpoint or resource this
+    /// finding is about. `None` for the code scopes, which use `file_path`.
+    ///
+    /// Added ALONGSIDE `file_path` rather than replacing `scope` with a
+    /// tagged union carrying its own locator. That would be the tidier
+    /// model, but `scope` is consumed as a plain string by the CP DTO (which
+    /// `#[serde(flatten)]`s this record) and by the macOS client
+    /// (`FindingsModels.swift`: `let scope: String`), so changing its shape
+    /// breaks every reader while adding a variant does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
     pub scope: FindingScope,
     pub summary: String,
     pub severity: Severity,
@@ -224,7 +281,9 @@ mod tests {
             line_range: [1, 240],
             tool: "read_file".to_string(),
             attribution: attribution(),
-            at: DateTime::parse_from_rfc3339("2026-05-23T14:01:32Z").unwrap().with_timezone(&Utc),
+            at: DateTime::parse_from_rfc3339("2026-05-23T14:01:32Z")
+                .unwrap()
+                .with_timezone(&Utc),
         };
         let json = serde_json::to_string(&event).unwrap();
         let decoded: FileTouchEvent = serde_json::from_str(&json).unwrap();
@@ -258,6 +317,7 @@ mod tests {
             id: "fnd_01KS19A3".to_string(),
             file_path: Some("src/config.rs".to_string()),
             line_range: Some([20, 28]),
+            target_ref: None,
             scope: FindingScope::Line,
             summary: "Hardcoded API key.".to_string(),
             severity: Severity::High,

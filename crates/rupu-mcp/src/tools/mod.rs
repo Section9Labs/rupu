@@ -10,6 +10,7 @@
 //!     / [issues.default] from rupu-config when omitted.
 //!   - All Args structs derive `JsonSchema` so input_schema is auto-generated.
 
+pub mod findings;
 pub mod github_extras;
 pub mod gitlab_extras;
 pub mod issues;
@@ -48,5 +49,6 @@ pub fn tool_catalog() -> Vec<ToolSpec> {
     v.extend(issues::specs());
     v.extend(github_extras::specs());
     v.extend(gitlab_extras::specs());
+    v.extend(findings::specs());
     v
 }

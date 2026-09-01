@@ -195,6 +195,19 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     },
   },
   {
+    // Second, not last. This table is where a wall of CYCLE FAILED rows is
+    // read, and the first question about a failure is WHEN — a row from
+    // nineteen hours ago is indistinguishable from a live outage without it.
+    // It was previously the 14th of 14 columns, past the horizontal scroll,
+    // which is exactly where the answer is least reachable.
+    key: 'started',
+    header: 'Started',
+    fit: true,
+    sortable: true,
+    sortValue: (e) => (e.at ? Date.parse(e.at) : null),
+    render: (e) => <span className="text-ink-mute">{relativeTime(e.at)}</span>,
+  },
+  {
     key: 'workflow',
     header: 'Workflow',
     subject: true,
@@ -338,15 +351,6 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     sortValue: (e) => e.duration_ms ?? null,
     render: (e) =>
       isRunEvent(e) ? <span className="text-ink-dim">{formatDuration(e.duration_ms)}</span> : null,
-  },
-  {
-    key: 'started',
-    header: 'Started',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => (e.at ? Date.parse(e.at) : null),
-    render: (e) => <span className="text-ink-mute">{relativeTime(e.at)}</span>,
   },
 ];
 

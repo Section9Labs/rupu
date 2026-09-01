@@ -3653,6 +3653,7 @@ dependencies = [
  "chrono",
  "jsonschema",
  "rupu-config",
+ "rupu-coverage",
  "rupu-scm",
  "rupu-tools",
  "schemars",

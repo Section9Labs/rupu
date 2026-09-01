@@ -12,6 +12,13 @@ use std::sync::Arc;
 pub struct ToolDispatcher {
     registry: Arc<Registry>,
     permission: McpPermission,
+    /// Where `findings.record` writes, and what it attributes findings to.
+    ///
+    /// `None` on a dispatcher built without run context (the stdio server,
+    /// tests). The tool is still LISTED in that case but refuses the call:
+    /// writing a finding into a guessed workspace would file it against the
+    /// wrong project, which is worse than failing loudly.
+    findings: Option<tools::findings::FindingsContext>,
 }
 
 impl ToolDispatcher {
@@ -19,7 +26,15 @@ impl ToolDispatcher {
         Self {
             registry,
             permission,
+            findings: None,
         }
+    }
+
+    /// Attach the run context that `findings.record` needs. Builder-style so
+    /// every existing `new` call site keeps working unchanged.
+    pub fn with_findings(mut self, ctx: tools::findings::FindingsContext) -> Self {
+        self.findings = Some(ctx);
+        self
     }
 
     /// A dispatcher over the same registry whose permission allows exactly
@@ -31,6 +46,7 @@ impl ToolDispatcher {
     /// guarantee structural instead of an invariant a reader has to go find.
     pub fn narrowed_to(&self, tool: &str) -> Self {
         Self {
+            findings: self.findings.clone(),
             registry: Arc::clone(&self.registry),
             permission: self.permission.narrowed_to(tool),
         }
@@ -65,6 +81,20 @@ impl ToolDispatcher {
             }
             "gitlab.pipeline_trigger" => {
                 tools::gitlab_extras::dispatch_pipeline_trigger(args, &self.registry).await
+            }
+            "findings.record" => {
+                let ctx = self.findings.as_ref().ok_or_else(|| {
+                    McpError::Tool(
+                        "findings.record is unavailable: this MCP server was started without \
+                         run context, so there is no workspace to record a finding against"
+                            .to_string(),
+                    )
+                })?;
+                let parsed: tools::findings::RecordArgs = serde_json::from_value(args)
+                    .map_err(|e| McpError::Tool(format!("invalid findings.record input: {e}")))?;
+                tools::findings::dispatch_record(ctx, parsed)
+                    .map(|id| format!("finding_id: {id}"))
+                    .map_err(McpError::Tool)
             }
             other => Err(McpError::UnknownTool(other.to_string())),
         }
@@ -133,9 +163,13 @@ mod is_blocked_tests {
         let wide = McpPermission::new(rupu_tools::PermissionMode::Bypass, vec!["*".into()]);
         let narrow = wide.narrowed_to("issues.comment");
 
-        assert!(narrow.check("issues.comment", crate::tools::ToolKind::Write).is_ok());
+        assert!(narrow
+            .check("issues.comment", crate::tools::ToolKind::Write)
+            .is_ok());
         assert!(
-            narrow.check("scm.prs.create", crate::tools::ToolKind::Write).is_err(),
+            narrow
+                .check("scm.prs.create", crate::tools::ToolKind::Write)
+                .is_err(),
             "a narrowed permission must refuse a tool outside its single-entry allowlist"
         );
     }
@@ -148,7 +182,9 @@ mod is_blocked_tests {
         let ro = McpPermission::new(rupu_tools::PermissionMode::Readonly, vec!["*".into()]);
         let narrow = ro.narrowed_to("issues.comment");
         assert!(
-            narrow.check("issues.comment", crate::tools::ToolKind::Write).is_err(),
+            narrow
+                .check("issues.comment", crate::tools::ToolKind::Write)
+                .is_err(),
             "narrowing must preserve readonly's refusal of Write tools"
         );
     }
