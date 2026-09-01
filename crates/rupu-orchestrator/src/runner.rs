@@ -8824,6 +8824,7 @@ steps:
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         AgentRunOpts {
+            seed_source: None,
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -10060,6 +10061,7 @@ mod dag_scheduler_golden {
                 output_tokens: 1,
             }]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -10603,6 +10605,7 @@ steps:
             };
             let provider = MockProvider::new(vec![turn]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -11121,6 +11124,7 @@ loops:
                 output_tokens: 1,
             }]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -11313,6 +11317,7 @@ loops:
                     output_tokens: 1,
                 }]);
                 AgentRunOpts {
+                    seed_source: None,
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -11600,6 +11605,7 @@ loops:
                 output_tokens: 1,
             }]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -11793,6 +11799,7 @@ loops:
                     output_tokens: 1,
                 }]);
                 AgentRunOpts {
+                    seed_source: None,
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -12018,6 +12025,7 @@ loops:
                 output_tokens: 1,
             }]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -12318,6 +12326,7 @@ loops:
                     output_tokens: 1,
                 }]);
                 AgentRunOpts {
+                    seed_source: None,
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -12466,6 +12475,7 @@ loops:
                     output_tokens: 1,
                 }]);
                 AgentRunOpts {
+                    seed_source: None,
                     agent_name: format!("ag-{agent_name}"),
                     agent_system_prompt: "echo".into(),
                     agent_tools: None,
@@ -12891,6 +12901,7 @@ mod join_and_prune {
             };
             let provider = MockProvider::new(vec![turn]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,
@@ -14513,6 +14524,7 @@ mod resume_and_cancel {
             };
             let provider = MockProvider::new(vec![turn]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "echo".into(),
                 agent_tools: None,

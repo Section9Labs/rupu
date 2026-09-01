@@ -21,6 +21,7 @@ tokio-util = { workspace = true }
 async-trait.workspace = true
 chrono.workspace = true
 ulid.workspace = true
+sha2.workspace = true
 
 # In-workspace
 rupu-transcript = { path = "../rupu-transcript" }

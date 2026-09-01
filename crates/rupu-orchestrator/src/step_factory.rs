@@ -374,6 +374,7 @@ impl StepFactory for DefaultStepFactory {
         );
 
         AgentRunOpts {
+            seed_source: None,
             agent_name: spec.name,
             agent_system_prompt,
             agent_tools: narrow_agent_tools(spec.tools, &step.actions),

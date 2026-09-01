@@ -7004,6 +7004,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             }
         });
 
+        // Reference the previous turn's transcript instead of re-embedding
+        // `message_history` inline — the O(n²) dedup this field exists for
+        // (see `AgentRunOpts::seed_source`). Only valid when a previous turn
+        // actually ran and its transcript file is still on disk; otherwise
+        // fall back to an inline seed (first turn, or a pruned transcript).
+        let seed_source = session.last_transcript_path.clone().filter(|p| p.exists());
+
         let opts = AgentRunOpts {
             agent_name: session.agent_name.clone(),
             agent_system_prompt: session.agent_system_prompt.clone(),
@@ -7050,6 +7057,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             scope_name: Some(session.session_id.clone()),
             surface_tag: Some("session".to_string()),
             pause: None,
+            seed_source,
         };
 
         let outcome = rupu_agent::run_agent(opts).await;
@@ -8908,6 +8916,124 @@ mod tests {
             context_window_tokens: None,
             compact_at_percent: None,
         }
+    }
+
+    /// 3j (transcript fidelity plan 1): the session worker's send path
+    /// must thread the PREVIOUS turn's transcript path into the new
+    /// `AgentRunOpts::seed_source` field instead of re-embedding
+    /// `message_history` inline on every turn — the O(n²) growth that
+    /// field exists to break. Drives two real turns through `run_turn`
+    /// (the exact function the detached worker invokes per turn) against
+    /// the `RUPU_MOCK_PROVIDER_SCRIPT` test-only provider seam, so the
+    /// assertion covers the real wiring rather than a reimplementation
+    /// of it. Task 3 extends this same test with the end-to-end
+    /// assertion that `rupu_agent::replay::reconstruct_transcript` on
+    /// turn 2's transcript returns the full two-turn conversation — that
+    /// function doesn't exist yet at this step.
+    #[tokio::test]
+    async fn second_turn_seeds_from_first_turns_transcript_by_reference() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).expect("create global dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+
+        let mut record = test_session_record();
+        record.session_id = "ses_seed_wiring01".into();
+        record.workspace_path = workspace;
+        // Keep this run entirely local — no project-level config.toml, no
+        // real repo/issue metadata to resolve.
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_turns = 0;
+        record.total_tokens_in = 0;
+        record.total_tokens_out = 0;
+        record.total_tokens_cached = 0;
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        let transcript_1 = record.transcripts_dir.join("run_seed_wiring_1.jsonl");
+        let transcript_2 = record.transcripts_dir.join("run_seed_wiring_2.jsonl");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#,
+        );
+
+        let turn1 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_wiring_1".into(),
+            prompt: "first prompt".into(),
+        })
+        .await;
+        let turn2 = run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_seed_wiring_2".into(),
+            prompt: "second prompt".into(),
+        })
+        .await;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        turn1.expect("turn 1 completes");
+        turn2.expect("turn 2 completes");
+
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(
+            after.status,
+            SessionStatus::Idle,
+            "both turns must succeed against the mock provider: {after:?}"
+        );
+        assert!(
+            transcript_1.is_file(),
+            "turn 1 must have written a transcript"
+        );
+
+        let events: Vec<TranscriptEvent> = JsonlReader::iter(&transcript_2)
+            .expect("open turn 2 transcript")
+            .filter_map(Result::ok)
+            .collect();
+        let (source_transcript, messages) = events
+            .iter()
+            .find_map(|e| match e {
+                TranscriptEvent::Seed {
+                    source_transcript,
+                    messages,
+                    ..
+                } => Some((source_transcript.clone(), messages.clone())),
+                _ => None,
+            })
+            .expect("turn 2 transcript must contain a Seed event");
+        assert_eq!(
+            source_transcript,
+            Some(transcript_1.display().to_string()),
+            "turn 2's seed must reference turn 1's transcript path, not re-embed it"
+        );
+        assert!(
+            messages.is_none(),
+            "a referenced seed must not also carry an inline copy of the messages"
+        );
     }
 
     #[test]

@@ -44,6 +44,7 @@ impl StepFactory for FakeFactory {
             output_tokens: 1,
         }]);
         AgentRunOpts {
+            seed_source: None,
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
@@ -374,6 +375,7 @@ async fn panel_gate_emits_panel_round_events() {
                 output_tokens: 1,
             }]);
             AgentRunOpts {
+                seed_source: None,
                 agent_name: format!("ag-{agent_name}"),
                 agent_system_prompt: "panel".into(),
                 agent_tools: None,

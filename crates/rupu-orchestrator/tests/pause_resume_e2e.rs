@@ -152,6 +152,7 @@ fn linear_agent_opts(
     on_tool_call: Option<rupu_agent::OnToolCallCallback>,
 ) -> AgentRunOpts {
     AgentRunOpts {
+        seed_source: None,
         agent_name: agent_name.to_string(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

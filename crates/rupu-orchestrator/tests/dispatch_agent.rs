@@ -152,6 +152,7 @@ impl StepFactory for DispatchFactory {
 
         let parent_run_id_for_ctx = Some(run_id.clone());
         AgentRunOpts {
+            seed_source: None,
             agent_name: "writer".into(),
             agent_system_prompt: "you are the writer".into(),
             agent_tools: Some(vec!["dispatch_agent".into()]),
@@ -321,6 +322,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
             ]);
             let parent_run_id_for_ctx = Some(run_id.clone());
             AgentRunOpts {
+                seed_source: None,
                 agent_name: "writer".into(),
                 agent_system_prompt: "you are the writer".into(),
                 agent_tools: Some(vec!["dispatch_agent".into()]),

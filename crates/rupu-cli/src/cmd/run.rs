@@ -842,6 +842,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let decider: Arc<dyn PermissionDecider> = pick_decider(mode, Some(printer.multi_handle()));
 
         let opts = AgentRunOpts {
+            seed_source: None,
             agent_name: spec.name.clone(),
             agent_system_prompt,
             agent_tools: spec.tools.clone(),

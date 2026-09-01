@@ -112,7 +112,7 @@ fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
     &input[..end]
 }
 
-fn clamp_tool_result_text(input: &str) -> String {
+pub(crate) fn clamp_tool_result_text(input: &str) -> String {
     if input.len() <= MAX_TOOL_RESULT_BYTES {
         return input.to_string();
     }
@@ -121,6 +121,17 @@ fn clamp_tool_result_text(input: &str) -> String {
         "{prefix}\n… [truncated {} bytes]",
         input.len().saturating_sub(prefix.len())
     )
+}
+
+/// Canonical seed hash: sha256 over the exact serde_json string of the
+/// seeded `Vec<Message>`, hex-encoded. Replay recomputes this with the
+/// same serializer to verify a seed reference chain.
+pub(crate) fn seed_sha256(messages: &[Message]) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(messages).unwrap_or_default();
+    let mut h = Sha256::new();
+    h.update(canonical.as_bytes());
+    format!("{:x}", h.finalize())
 }
 
 /// Drop the oldest assistant↔user exchange from the conversation so the
@@ -460,12 +471,16 @@ async fn compact_context(
         Ok(Some(outcome)) => {
             let middle_len = outcome.summarized_messages;
             *messages = outcome.messages;
-            let note = format!(
-                "[context compacted: summarized {middle_len} turns; backup {backup_display}]\n"
-            );
+            let post = serde_json::to_value(&*messages).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to serialize post-compaction messages");
+                serde_json::Value::Null
+            });
             if let Err(e) = writer
-                .write(&Event::AssistantDelta {
-                    content: note.clone(),
+                .write(&Event::Compaction {
+                    seq,
+                    summarized_messages: middle_len as u32,
+                    backup_path: backup_display.clone(),
+                    messages: post,
                 })
                 .and_then(|_| writer.flush())
             {
@@ -692,6 +707,12 @@ pub struct AgentRunOpts {
     /// `run_agent` call seeded with the persisted transcript messages.
     /// `None` (default) preserves today's behavior exactly.
     pub pause: Option<tokio_util::sync::CancellationToken>,
+    /// Path of a transcript whose replay-reconstruction equals
+    /// `initial_messages` byte-exact (spec §3 seed dedup rule). When set,
+    /// the Seed event stores this reference instead of re-embedding the
+    /// messages; the caller owns that invariant and replay verifies it via
+    /// the recorded sha256. `None` → the seed is embedded inline in full.
+    pub seed_source: Option<PathBuf>,
 }
 
 /// Outcome of a finished run.
@@ -769,21 +790,6 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     JsonlWriter::create(&opts.transcript_path)?;
     let mut writer = JsonlWriter::append(&opts.transcript_path)?;
     let started = Instant::now();
-    writer.write(&Event::RunStart {
-        run_id: opts.run_id.clone(),
-        workspace_id: opts.workspace_id.clone(),
-        agent: opts.agent_name.clone(),
-        provider: opts.provider_name.clone(),
-        model: opts.model.clone(),
-        started_at: Utc::now(),
-        mode: parse_mode_for_event(&opts.mode_str),
-        // TODO(Task 2, transcript fidelity plan 1): schema: Some(2) + the
-        // effective system_prompt, once this write moves after the
-        // coverage prompt-section append.
-        schema: None,
-        system_prompt: None,
-    })?;
-    writer.flush()?;
 
     let mut registry: ToolRegistry = match &opts.agent_tools {
         Some(list) => default_tool_registry().filter_to(list),
@@ -851,6 +857,19 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         opts.agent_system_prompt.push_str(&bundle.prompt_section);
     }
 
+    writer.write(&Event::RunStart {
+        run_id: opts.run_id.clone(),
+        workspace_id: opts.workspace_id.clone(),
+        agent: opts.agent_name.clone(),
+        provider: opts.provider_name.clone(),
+        model: opts.model.clone(),
+        started_at: Utc::now(),
+        mode: parse_mode_for_event(&opts.mode_str),
+        schema: Some(2),
+        system_prompt: Some(opts.agent_system_prompt.clone()),
+    })?;
+    writer.flush()?;
+
     // Wire coverage into tool context.
     if let Some(h) = &coverage_handle {
         opts.tool_context.coverage_writer = Some(h.writer.clone());
@@ -917,6 +936,26 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     let tool_defs = registry.to_tool_definitions();
 
     let mut messages: Vec<Message> = opts.initial_messages.clone();
+    if !opts.initial_messages.is_empty() {
+        let (source_transcript, inline) = match &opts.seed_source {
+            // Stored once at the source; this transcript keeps a verifiable
+            // reference instead of the 1000th copy.
+            Some(src) => (Some(src.display().to_string()), None),
+            None => (
+                None,
+                Some(serde_json::to_value(&opts.initial_messages).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to serialize seed messages for transcript");
+                    serde_json::Value::Null
+                })),
+            ),
+        };
+        writer.write(&Event::Seed {
+            message_count: opts.initial_messages.len() as u32,
+            sha256: seed_sha256(&opts.initial_messages),
+            source_transcript,
+            messages: inline,
+        })?;
+    }
     // Conditional user-turn append. An EMPTY `user_message` means "seed-only":
     // the caller has supplied a complete, ready-to-send transcript via
     // `initial_messages` (e.g. the orchestrator resuming a tool-boundary pause,
@@ -928,7 +967,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // Every existing caller passes a non-empty `user_message` and is unaffected.
     if !opts.user_message.is_empty() {
         messages.push(Message::user(&opts.user_message));
+        writer.write(&Event::UserMessage {
+            content: opts.user_message.clone(),
+        })?;
     }
+    writer.flush()?;
     let mut turn_idx: u32 = opts.turn_index_offset;
     let initial_turn_idx = turn_idx;
     let mut total_in: u64 = 0;
@@ -1010,8 +1053,18 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             }
                             StreamEvent::UsageSnapshot(_) => {}
                             StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
-                            // Plan 2: no live reasoning stream-to-stdout wiring yet.
-                            StreamEvent::ReasoningDelta(_) => {}
+                            StreamEvent::ReasoningDelta(chunk) => {
+                                if !chunk.is_empty() && stream_transcript_error.is_none() {
+                                    if let Err(err) = writer
+                                        .write(&Event::ThinkingDelta {
+                                            content: chunk.clone(),
+                                        })
+                                        .and_then(|_| writer.flush())
+                                    {
+                                        stream_transcript_error = Some(err);
+                                    }
+                                }
+                            }
                         }
                     };
                     // Race the stream against the pause token. On pause the
@@ -1049,8 +1102,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         if is_context_overflow(&e_str) && trim_attempts <= 64 {
                             if trim_oldest_exchange(&mut req.messages) > 0 {
                                 trim_attempts += 1;
-                                writer.write(&Event::AssistantDelta {
-                                    content: "[context trimmed to fit window; retrying]\n".into(),
+                                writer.write(&Event::Notice {
+                                    kind: "context_trim".into(),
+                                    message: format!(
+                                        "context trimmed to fit window; retrying (attempt {trim_attempts})"
+                                    ),
                                 })?;
                                 writer.flush()?;
                                 tracing::warn!(
@@ -1076,9 +1132,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         if is_retryable_provider_error(&e) && http_retries < MAX_HTTP_RETRIES {
                             http_retries += 1;
                             let backoff = retry_backoff(http_retries);
-                            writer.write(&Event::AssistantDelta {
-                                content: format!(
-                                    "[transient provider error (retry {http_retries}/{MAX_HTTP_RETRIES}): {e_str}]\n"
+                            writer.write(&Event::Notice {
+                                kind: "provider_retry".into(),
+                                message: format!(
+                                    "transient provider error (retry {http_retries}/{MAX_HTTP_RETRIES}): {e_str}"
                                 ),
                             })?;
                             writer.flush()?;
@@ -1180,18 +1237,29 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 }
             }
 
-            // Emit any text content as assistant_message events; collect
-            // tool_use blocks for dispatch.
+            // Emit the turn's content blocks in the provider's own order —
+            // thinking, text, and tool_use land in the transcript exactly as
+            // the model produced them (spec §3 emission-order contract).
             let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
-            // Reasoning precedes text in an assistant turn, so compute it up
-            // front and attach it to the turn's first assistant message.
-            let mut turn_thinking = resp.reasoning_text();
             for block in &resp.content {
                 match block {
                     ContentBlock::Text { text } => {
                         writer.write(&Event::AssistantMessage {
                             content: text.clone(),
-                            thinking: turn_thinking.take(),
+                            thinking: None,
+                        })?;
+                    }
+                    ContentBlock::Reasoning {
+                        text,
+                        provider,
+                        model,
+                        raw,
+                    } => {
+                        writer.write(&Event::Thinking {
+                            text: text.clone(),
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            raw: raw.clone(),
                         })?;
                     }
                     ContentBlock::ToolUse { id, name, input } => {
@@ -1202,27 +1270,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         })?;
                         tool_uses.push((id.clone(), name.clone(), input.clone()));
                     }
-                    ContentBlock::ToolResult { .. } => {
-                        // Models don't produce tool_result blocks themselves;
-                        // those originate from the runtime feeding tool
-                        // outputs back. Ignore if seen.
-                    }
-                    ContentBlock::Reasoning { .. } => {
-                        // Readable text is consumed via `turn_thinking` above,
-                        // which rides on the turn's first assistant message.
-                    }
+                    ContentBlock::ToolResult { .. } => {}
                     ContentBlock::Unknown => {}
                 }
-            }
-
-            // A tool-only turn has no Text block to hang the reasoning on, but
-            // the reasoning is still worth recording — that is the turn where
-            // the model decided which tool to call.
-            if let Some(thinking) = turn_thinking.take() {
-                writer.write(&Event::AssistantMessage {
-                    content: String::new(),
-                    thinking: Some(thinking),
-                })?;
             }
 
             // Dispatch tool calls in order.
@@ -1282,14 +1332,15 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             writer.flush()?;
                             cb(&opts.step_id, &tool_name, true);
                         }
+                        let err = format!("unknown tool: {tool_name}");
                         writer.write(&Event::ToolResult {
                             call_id: call_id.clone(),
                             output: String::new(),
-                            error: Some(format!("unknown tool: {tool_name}")),
+                            error: Some(err.clone()),
                             duration_ms: 0,
                             structured: None,
                         })?;
-                        tool_results.push((call_id, String::new(), Some("unknown_tool".into())));
+                        tool_results.push((call_id, String::new(), Some(err)));
                         continue;
                     }
                 };
@@ -1370,10 +1421,23 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 turn_idx,
                 tokens_in: Some(resp.usage.input_tokens as u64),
                 tokens_out: Some(billable_output_tokens),
-                // TODO(Task 2, transcript fidelity plan 1): populate from
-                // resp.stop_reason / resp.id.
-                stop_reason: None,
-                response_id: None,
+                stop_reason: resp.stop_reason.as_ref().map(|s| {
+                    match s {
+                        StopReason::EndTurn => "end_turn",
+                        StopReason::MaxTokens => "max_tokens",
+                        StopReason::StopSequence => "stop_sequence",
+                        StopReason::ToolUse => "tool_use",
+                    }
+                    .to_string()
+                }),
+                response_id: {
+                    let id = resp.id.trim();
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some(id.to_string())
+                    }
+                },
             })?;
             writer.flush()?;
 
@@ -1583,6 +1647,7 @@ mod on_tool_call_tests {
         ]);
 
         let opts = AgentRunOpts {
+            seed_source: None,
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -1682,6 +1747,7 @@ mod on_tool_call_tests {
         ]);
 
         let opts = AgentRunOpts {
+            seed_source: None,
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: Some(vec!["read_file".to_string()]),
@@ -1795,6 +1861,7 @@ mod on_tool_call_tests {
         ]);
 
         let opts = AgentRunOpts {
+            seed_source: None,
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -1877,6 +1944,7 @@ mod on_tool_call_tests {
         }]);
 
         let opts = AgentRunOpts {
+            seed_source: None,
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -1952,6 +2020,7 @@ mod on_tool_call_tests {
         }]);
 
         let opts = AgentRunOpts {
+            seed_source: None,
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -2048,6 +2117,7 @@ mod on_tool_call_tests {
             }]);
 
             let opts = AgentRunOpts {
+                seed_source: None,
                 agent_name: "test-agent".into(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,
@@ -2835,6 +2905,7 @@ mod compaction_tests {
         )]);
 
         let mut opts = AgentRunOpts {
+            seed_source: None,
             agent_name: "test".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3096,6 +3167,7 @@ mod pause_tests {
         user_message: &str,
     ) -> AgentRunOpts {
         AgentRunOpts {
+            seed_source: None,
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3420,7 +3492,11 @@ mod reasoning_tests {
             text: Some(text.to_string()),
             provider: "anthropic".into(),
             model: "mock-1".into(),
-            raw: serde_json::json!({ "type": "thinking", "thinking": text }),
+            raw: serde_json::json!({
+                "type": "thinking",
+                "thinking": text,
+                "signature": "sig-test",
+            }),
         }
     }
 
@@ -3430,6 +3506,7 @@ mod reasoning_tests {
         transcript_path: PathBuf,
     ) -> AgentRunOpts {
         AgentRunOpts {
+            seed_source: None,
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3490,11 +3567,22 @@ mod reasoning_tests {
             .collect()
     }
 
+    /// Collect (type-tag, data) pairs from the transcript for order assertions.
+    fn event_tags(path: &std::path::Path) -> Vec<String> {
+        rupu_transcript::JsonlReader::iter(path)
+            .expect("open transcript")
+            .filter_map(Result::ok)
+            .map(|e| {
+                let v = serde_json::to_value(&e).unwrap();
+                v["type"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn assistant_message_carries_reasoning_text() {
+    async fn thinking_is_a_first_class_event_in_block_order() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp.path().join("run.jsonl");
-
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantBlocks {
             content: vec![
                 reasoning("thought"),
@@ -3507,66 +3595,148 @@ mod reasoning_tests {
         let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
         run_agent(opts).await.expect("run completes");
 
-        let msgs = assistant_messages(&transcript_path);
-        assert_eq!(
-            msgs.len(),
-            1,
-            "expected one assistant message, got {msgs:?}"
+        let tags = event_tags(&transcript_path);
+        let thinking_idx = tags
+            .iter()
+            .position(|t| t == "thinking")
+            .expect("thinking event");
+        let msg_idx = tags
+            .iter()
+            .position(|t| t == "assistant_message")
+            .expect("assistant_message");
+        assert!(
+            thinking_idx < msg_idx,
+            "thinking must precede the text it motivated: {tags:?}"
         );
-        assert_eq!(msgs[0].0, "answer");
-        assert_eq!(
-            msgs[0].1.as_deref(),
-            Some("thought"),
-            "the turn's reasoning must ride on its assistant message"
-        );
+        // v2 writer never populates the legacy field.
+        for ev in rupu_transcript::JsonlReader::iter(&transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            if let rupu_transcript::Event::AssistantMessage { thinking, .. } = ev {
+                assert!(thinking.is_none(), "legacy thinking field must stay None");
+            }
+        }
     }
 
     #[tokio::test]
-    async fn reasoning_only_turn_still_records_thinking() {
-        // The turn that matters most: the model reasoned about which tool to
-        // call, then called it, emitting no text block at all. Without a
-        // post-loop flush that reasoning is silently dropped.
+    async fn tool_only_turn_records_thinking_before_the_tool_call() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp.path().join("run.jsonl");
-
         let provider = MockProvider::new(vec![
             ScriptedTurn::AssistantBlocks {
                 content: vec![
-                    reasoning("planning"),
+                    reasoning("pick a tool"),
                     ContentBlock::ToolUse {
-                        id: "call_read_1".into(),
-                        name: "read_file".into(),
-                        input: serde_json::json!({
-                            "path": tmp.path().to_str().unwrap_or("/tmp")
-                        }),
+                        id: "call_1".into(),
+                        name: "no_such_tool".into(),
+                        input: serde_json::json!({}),
                     },
                 ],
                 stop: StopReason::ToolUse,
             },
-            ScriptedTurn::AssistantText {
-                text: "done".into(),
+            ScriptedTurn::AssistantBlocks {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
                 stop: StopReason::EndTurn,
-                input_tokens: 1,
-                output_tokens: 1,
             },
         ]);
         let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
         run_agent(opts).await.expect("run completes");
 
-        let msgs = assistant_messages(&transcript_path);
-        assert_eq!(
-            msgs.len(),
-            2,
-            "the tool-only turn must still write an assistant message, got {msgs:?}"
+        let tags = event_tags(&transcript_path);
+        let thinking_idx = tags.iter().position(|t| t == "thinking").unwrap();
+        let call_idx = tags.iter().position(|t| t == "tool_call").unwrap();
+        assert!(
+            thinking_idx < call_idx,
+            "on-disk order must match block order: {tags:?}"
         );
-        assert_eq!(msgs[0].0, "", "a tool-only turn carries no text");
-        assert_eq!(
-            msgs[0].1.as_deref(),
-            Some("planning"),
-            "reasoning must survive a turn with no text block"
-        );
-        assert_eq!(msgs[1].0, "done");
-        assert_eq!(msgs[1].1, None, "the final turn had no reasoning");
+    }
+
+    #[tokio::test]
+    async fn prologue_records_seed_user_message_and_v2_run_start() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantBlocks {
+            content: vec![ContentBlock::Text { text: "ok".into() }],
+            stop: StopReason::EndTurn,
+        }]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
+        opts.initial_messages = vec![Message::user("earlier"), Message::assistant("noted")];
+        run_agent(opts).await.expect("run completes");
+
+        let events: Vec<rupu_transcript::Event> =
+            rupu_transcript::JsonlReader::iter(&transcript_path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+        match &events[0] {
+            rupu_transcript::Event::RunStart {
+                schema,
+                system_prompt,
+                ..
+            } => {
+                assert_eq!(*schema, Some(2));
+                assert!(system_prompt.is_some());
+            }
+            other => panic!("first event must be run_start, got {other:?}"),
+        }
+        assert!(matches!(
+            &events[1],
+            rupu_transcript::Event::Seed {
+                message_count: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[2],
+            rupu_transcript::Event::UserMessage { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_transcript_error_matches_what_the_model_is_fed() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "c1".into(),
+                tool_name: "no_such_tool".into(),
+                tool_input: serde_json::json!({}),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantBlocks {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop: StopReason::EndTurn,
+            },
+        ]);
+        let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
+        let result = run_agent(opts).await.expect("run completes");
+        // The recorded error string and the fed tool_result content must agree.
+        let recorded_error = rupu_transcript::JsonlReader::iter(&transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|e| match e {
+                rupu_transcript::Event::ToolResult {
+                    error: Some(err), ..
+                } => Some(err),
+                _ => None,
+            })
+            .expect("tool_result with error");
+        let fed = result
+            .final_messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("fed tool_result block");
+        assert_eq!(fed, format!("error: {recorded_error}\n"));
     }
 
     #[tokio::test]
@@ -3596,7 +3766,10 @@ mod reasoning_tests {
     }
 
     #[tokio::test]
-    async fn thinking_attaches_once_across_multiple_text_blocks() {
+    async fn thinking_emits_once_before_multiple_text_blocks() {
+        // New contract: reasoning is its own `Thinking` event, emitted once
+        // in provider order, never duplicated onto (or split across) the
+        // `AssistantMessage` events for the text blocks that follow it.
         let tmp = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp.path().join("run.jsonl");
 
@@ -3611,6 +3784,16 @@ mod reasoning_tests {
         let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
         run_agent(opts).await.expect("run completes");
 
+        let events: Vec<Event> = rupu_transcript::JsonlReader::iter(&transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        let thinking_count = events
+            .iter()
+            .filter(|e| matches!(e, Event::Thinking { .. }))
+            .count();
+        assert_eq!(thinking_count, 1, "reasoning must emit exactly once");
+
         let msgs = assistant_messages(&transcript_path);
         assert_eq!(
             msgs.len(),
@@ -3619,14 +3802,28 @@ mod reasoning_tests {
         );
         assert_eq!(msgs[0].0, "a");
         assert_eq!(
-            msgs[0].1.as_deref(),
-            Some("thought"),
-            "the turn's first text block takes the reasoning"
+            msgs[0].1, None,
+            "the v2 writer never populates the legacy field"
         );
         assert_eq!(msgs[1].0, "b");
         assert_eq!(
             msgs[1].1, None,
-            "reasoning must not be duplicated per block"
+            "the v2 writer never populates the legacy field"
+        );
+
+        let tags: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                Event::Thinking { .. } => "thinking",
+                Event::AssistantMessage { .. } => "assistant_message",
+                _ => "other",
+            })
+            .collect();
+        let thinking_idx = tags.iter().position(|t| *t == "thinking").unwrap();
+        let first_msg_idx = tags.iter().position(|t| *t == "assistant_message").unwrap();
+        assert!(
+            thinking_idx < first_msg_idx,
+            "thinking must precede the text blocks it motivated: {tags:?}"
         );
     }
 }
