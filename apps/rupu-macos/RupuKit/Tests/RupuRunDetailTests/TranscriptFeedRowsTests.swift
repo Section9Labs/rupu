@@ -108,6 +108,98 @@ struct TranscriptFeedRowsTests {
         #expect(tokensOut == 7)
     }
 
+    // MARK: - Review fix (critical): a narrative event arriving while its
+    // enclosing turn is still open must render BEFORE that turn's card, not
+    // after. This is the NORMAL case, not an edge case — the runner's
+    // emission-order contract writes `Thinking` right after `turn_start`
+    // and before that turn's own `assistant_message`/`tool_call`. Before
+    // this fix, `flushTurns(upTo: turnsOpenedSoFar)` treated the
+    // still-open turn as flushable (`turnsOpenedSoFar` counts a turn from
+    // its `turn_start`, not its `turn_end`), so the fully-built turn card
+    // rendered ahead of the very reasoning that produced it.
+
+    @Test func thinkingInsideAnOpenTurnRendersBeforeThatTurnsCardNotAfter() {
+        let rows = buildFeedRows(events: [
+            .turnStart(turnIdx: 0),
+            .thinking(text: "pick", provider: "anthropic", model: "m"),
+            .assistantMessage(content: "done", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+        ])
+        #expect(rows.count == 3, "thinking + the turn card + its turnSeparator")
+        guard case .thinking(let text, _) = rows[0] else {
+            Issue.record("expected .thinking FIRST — reasoning in true position, ahead of the turn it produced, got \(rows)")
+            return
+        }
+        #expect(text == "pick")
+        guard case .turn(let turn) = rows[1] else { Issue.record("expected the turn card second, got \(rows)"); return }
+        #expect(turn.assistantText == "done")
+        guard case .turnSeparator = rows[2] else { Issue.record("expected the turnSeparator last, got \(rows)"); return }
+    }
+
+    @Test func noticeInsideAnOpenTurnRendersBeforeThatTurnsCardNotAfter() {
+        let rows = buildFeedRows(events: [
+            .turnStart(turnIdx: 0),
+            .toolCall(callID: "c1", tool: "bash", input: .null),
+            .notice(kind: "context_trim", message: "trimmed"),
+            .toolResult(callID: "c1", output: "ok", error: nil, durationMS: 1, structured: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+        ])
+        #expect(rows.count == 3, "the notice + the turn card + its turnSeparator")
+        guard case .notice(let kind, let message, _) = rows[0] else {
+            Issue.record("expected .notice FIRST — mid-turn, ahead of that turn's own card, got \(rows)")
+            return
+        }
+        #expect(kind == "context_trim")
+        #expect(message == "trimmed")
+        guard case .turn(let turn) = rows[1] else { Issue.record("expected the turn card second, got \(rows)"); return }
+        #expect(turn.tools.count == 1)
+        guard case .turnSeparator = rows[2] else { Issue.record("expected the turnSeparator last, got \(rows)"); return }
+    }
+
+    /// A narrative event AFTER a turn has already closed (a real boundary,
+    /// not a still-open one) must still render after that turn's card —
+    /// the fix must not defer every narrative row unconditionally, only
+    /// ones arriving while a turn is genuinely still open.
+    @Test func noticeAfterATurnHasAlreadyClosedStillRendersAfterItsCard() {
+        let rows = buildFeedRows(events: [
+            .turnStart(turnIdx: 0),
+            .assistantMessage(content: "done", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+            .notice(kind: "provider_retry", message: "retrying"),
+        ])
+        #expect(rows.count == 3, "the turn card + its turnSeparator + the notice")
+        guard case .turn = rows[0] else { Issue.record("expected the turn card first, got \(rows)"); return }
+        guard case .turnSeparator = rows[1] else { Issue.record("expected the turnSeparator second, got \(rows)"); return }
+        guard case .notice = rows[2] else { Issue.record("expected the notice last — it arrived after the turn closed, got \(rows)"); return }
+    }
+
+    /// Two turns, each with its own mid-turn thinking — every narrative row
+    /// stays paired with its OWN enclosing turn, never leaking into the
+    /// wrong turn's position.
+    @Test func thinkingInEachOfTwoTurnsStaysPairedWithItsOwnTurnNotTheOther() {
+        let rows = buildFeedRows(events: [
+            .turnStart(turnIdx: 0),
+            .thinking(text: "first", provider: "anthropic", model: "m"),
+            .assistantMessage(content: "one", thinking: nil),
+            .turnEnd(turnIdx: 0, tokensIn: nil, tokensOut: nil),
+            .turnStart(turnIdx: 1),
+            .thinking(text: "second", provider: "anthropic", model: "m"),
+            .assistantMessage(content: "two", thinking: nil),
+            .turnEnd(turnIdx: 1, tokensIn: nil, tokensOut: nil),
+        ])
+        #expect(rows.count == 6)
+        guard case .thinking(let firstText, _) = rows[0] else { Issue.record("row 0 should be the first thinking, got \(rows)"); return }
+        #expect(firstText == "first")
+        guard case .turn(let firstTurn) = rows[1] else { Issue.record("row 1 should be turn 0, got \(rows)"); return }
+        #expect(firstTurn.assistantText == "one")
+        guard case .turnSeparator = rows[2] else { Issue.record("row 2 should be turn 0's separator, got \(rows)"); return }
+        guard case .thinking(let secondText, _) = rows[3] else { Issue.record("row 3 should be the second thinking, got \(rows)"); return }
+        #expect(secondText == "second")
+        guard case .turn(let secondTurn) = rows[4] else { Issue.record("row 4 should be turn 1, got \(rows)"); return }
+        #expect(secondTurn.assistantText == "two")
+        guard case .turnSeparator = rows[5] else { Issue.record("row 5 should be turn 1's separator, got \(rows)"); return }
+    }
+
     // MARK: - a v2 narrative row never opens a gap turn of its own
 
     @Test func aStandaloneNoticeBeforeAnyTurnDoesNotOpenAGapTurn() {

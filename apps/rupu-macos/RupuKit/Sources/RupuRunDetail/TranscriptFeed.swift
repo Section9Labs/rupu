@@ -341,6 +341,33 @@ func buildFeedRows(events: [TranscriptEvent]) -> [FeedRow] {
         }
     }
 
+    /// Review fix (critical): flushes only turns that have already
+    /// CLOSED — never the turn currently open. `turnsOpenedSoFar` counts a
+    /// turn as soon as its `turn_start` arrives, before its `turn_end`, so
+    /// flushing straight to `turnsOpenedSoFar` (as every other flush site
+    /// here does) would treat a still-open turn as flushable. That is
+    /// exactly wrong for a narrative event: the runner's emission-order
+    /// contract writes `Thinking` right after `turn_start` and BEFORE that
+    /// turn's own `assistant_message`/`tool_call` — the normal case, not an
+    /// edge case — so a `thinking` (or `notice`/`seed`/etc.) arriving while
+    /// its enclosing turn is still open must render BEFORE that turn's
+    /// card, never after it. Subtracting one open turn, when one is open,
+    /// defers that turn's card until something else flushes it for real —
+    /// its own `turn_end` (which flushes unadjusted, right before that
+    /// turn's `turnSeparator`), a later `gate_requested`/`run_complete`
+    /// (which also flush unadjusted — a gate/run-complete legitimately
+    /// follows a turn's activity, so holding it back would be wrong), or
+    /// the final catch-all flush at the end of the walk.
+    ///
+    /// Only used by the six narrative-event cases below — never by
+    /// `turn_end`'s own flush (which must include the turn it's closing)
+    /// or `gate_requested`'s (a gate is a pause point that follows a
+    /// turn's activity, not content the turn produced, so it keeps the
+    /// old "flush everything opened so far" contract).
+    func flushClosedTurnsOnly() {
+        flushTurns(upTo: turnsOpenedSoFar - (turnOpen ? 1 : 0))
+    }
+
     for (index, event) in events.enumerated() {
         switch event {
         case .turnStart:
@@ -383,35 +410,38 @@ func buildFeedRows(events: [TranscriptEvent]) -> [FeedRow] {
             runCompleteRow = .runComplete(runID: runID, status: status, totalTokens: totalTokens, durationMS: durationMS, error: error)
 
         // Transcript-fidelity v2 (Plan 3, Task 2): transcript-level
-        // narrative events, not turn-scoped tool activity — each is
-        // positioned exactly like `gate_requested` above: flush every turn
-        // opened so far, then append this row where it chronologically
-        // occurred. None of these ever open/close a turn.
+        // narrative events, not turn-scoped tool activity — each flushes
+        // only turns that have already closed (`flushClosedTurnsOnly` —
+        // see its own doc comment for why: a narrative event arriving
+        // while its enclosing turn is still open, the normal case for
+        // `thinking`, must render BEFORE that turn's card), then appends
+        // this row where it chronologically occurred. None of these ever
+        // open/close a turn themselves.
         case .thinking(let text, _, _):
-            flushTurns(upTo: turnsOpenedSoFar)
+            flushClosedTurnsOnly()
             rows.append(.thinking(text: text, rowIndex: index))
 
         case .userMessage(let content):
-            flushTurns(upTo: turnsOpenedSoFar)
+            flushClosedTurnsOnly()
             rows.append(.userMessage(content: content, rowIndex: index))
 
         case .seed(let messageCount, let sourceTranscript):
-            flushTurns(upTo: turnsOpenedSoFar)
+            flushClosedTurnsOnly()
             rows.append(.seed(messageCount: messageCount, sourceTranscript: sourceTranscript, rowIndex: index))
 
         case .notice(let kind, let message):
-            flushTurns(upTo: turnsOpenedSoFar)
+            flushClosedTurnsOnly()
             rows.append(.notice(kind: kind, message: message, rowIndex: index))
 
         case .compaction(let seq, let summarizedMessages, _):
-            flushTurns(upTo: turnsOpenedSoFar)
+            flushClosedTurnsOnly()
             rows.append(.compaction(seq: seq, summarizedMessages: summarizedMessages, rowIndex: index))
 
         // Forward-compat fallback (an unrecognized wire `type`) — rendered,
         // never dropped, same "no event may vanish" contract as every other
         // variant here.
         case .unknown(let type):
-            flushTurns(upTo: turnsOpenedSoFar)
+            flushClosedTurnsOnly()
             rows.append(.unknownEvent(type: type, rowIndex: index))
 
         // `file_edit`/`command_run` are adjacency-paired onto their owning
