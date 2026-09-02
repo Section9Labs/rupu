@@ -23,10 +23,49 @@ use rupu_orchestrator::runner::{
 
 // ── Poll constants ─────────────────────────────────────────────────────────────
 
-/// Maximum number of `get_run` polls before giving up (120 × 500 ms = 60 s).
-const POLL_MAX_ATTEMPTS: u32 = 120;
-/// Interval between polls.
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a placed run may take before the coordinator stops waiting.
+///
+/// This is a WALL-CLOCK budget, not a poll count. It replaces a
+/// `POLL_MAX_ATTEMPTS: u32 = 120` that, at a flat 500 ms interval, gave a
+/// placed run 60 SECONDS total to reach a terminal status.
+///
+/// Sixty seconds cannot accommodate a placed run doing real work. Measured on
+/// a live host: an enumeration agent started at 20:21:33 and finished
+/// `completed` at 20:23:16 — 103 s. The coordinator abandoned it at 60 s,
+/// reported the step failed, and DISCARDED its workspace delta. The run had
+/// succeeded; only the result was thrown away.
+///
+/// Four hours is chosen to be longer than the work, not to be a guess at it.
+/// An offensive campaign step, a long build, or an agent that pages through a
+/// large surface all legitimately run for minutes to hours; a bound below the
+/// work turns a healthy run into a false failure, which is the same defect at
+/// the other end of the run as the startup race this loop already handles.
+const POLL_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
+
+/// Poll interval for the first [`POLL_FAST_ATTEMPTS`] polls.
+///
+/// Kept tight so a short run — the common case for a probe or a precondition
+/// step — still returns promptly.
+const POLL_INTERVAL_FAST: std::time::Duration = std::time::Duration::from_millis(500);
+/// Poll interval after the fast phase.
+///
+/// A four-hour budget at 500 ms would be ~28,800 ssh invocations per placed
+/// unit. Backing off to 5 s keeps a long run's cost proportionate (~2,880) and
+/// leaves the host's ssh capacity for the units actually doing work — this
+/// codebase has already tripped a lasting connection block by hammering a host.
+const POLL_INTERVAL_SLOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// Number of polls served at [`POLL_INTERVAL_FAST`] before backing off. 60 ×
+/// 500 ms = the first 30 s, which covers launch, workspace staging and startup.
+const POLL_FAST_ATTEMPTS: u32 = 60;
+
+/// The interval to wait before poll number `attempt`.
+fn poll_interval_for(attempt: u32) -> std::time::Duration {
+    if attempt < POLL_FAST_ATTEMPTS {
+        POLL_INTERVAL_FAST
+    } else {
+        POLL_INTERVAL_SLOW
+    }
+}
 // Why a `get_run` failure is NOT believed until the run has been seen once.
 //
 // `launch_agent` returns as soon as the DETACHED remote command has been
@@ -193,10 +232,13 @@ impl UnitDispatcher for FleetUnitDispatcher {
         // later error is real and propagates immediately, exactly as before.
         let mut observed = false;
         let mut last_startup_err: Option<String> = None;
-        for attempt in 0..POLL_MAX_ATTEMPTS {
+        let deadline = tokio::time::Instant::now() + POLL_MAX_WALL;
+        let mut attempt: u32 = 0;
+        while tokio::time::Instant::now() < deadline {
             if attempt > 0 {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                tokio::time::sleep(poll_interval_for(attempt)).await;
             }
+            attempt = attempt.saturating_add(1);
 
             let rec = match conn.get_run(&run_id).await {
                 Ok(rec) => {
@@ -304,7 +346,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
             Some(err) => {
                 let mut msg = format!(
                     "remote unit run {run_id} never registered on host {host} \
-                     after {POLL_MAX_ATTEMPTS} polls; the launch was accepted but \
+                     after {attempt} polls; the launch was accepted but \
                      the host never reported the run. Last poll error: {err}"
                 );
                 if let Some(diag) = conn.launch_diagnostics(&run_id).await {
@@ -316,7 +358,9 @@ impl UnitDispatcher for FleetUnitDispatcher {
             }
             None => format!(
                 "timed out waiting for remote unit run {run_id} on host {host} \
-                 after {POLL_MAX_ATTEMPTS} polls"
+                 after {attempt} polls over {}s; the run may STILL BE RUNNING \
+                 on the host — its work is not lost, only unobserved from here",
+                POLL_MAX_WALL.as_secs()
             ),
         }))
     }
@@ -422,6 +466,10 @@ mod tests {
         launch_stderr: Option<&'static str>,
         /// Ordered log of the connector calls the dispatcher made.
         calls: std::sync::Mutex<Vec<&'static str>>,
+        /// How many polls report `running` before the run goes terminal.
+        /// Models a placed run doing real work — the case the old fixed
+        /// 120-poll budget could not express.
+        non_terminal_polls: std::sync::atomic::AtomicU32,
     }
 
     impl FakeConnector {
@@ -438,6 +486,7 @@ mod tests {
                 get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
                 launch_stderr: None,
                 calls: Default::default(),
+                non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
             }
         }
 
@@ -446,6 +495,14 @@ mod tests {
         fn completed_after_startup_delay(n: u32) -> Self {
             let mut c = Self::completed();
             c.get_run_failures_before_ready = std::sync::atomic::AtomicU32::new(n);
+            c
+        }
+
+        /// A run that stays non-terminal for `n` polls before completing —
+        /// a placed run doing real work for longer than the old fixed budget.
+        fn completed_after_non_terminal_polls(n: u32) -> Self {
+            let mut c = Self::completed();
+            c.non_terminal_polls = std::sync::atomic::AtomicU32::new(n);
             c
         }
 
@@ -461,6 +518,7 @@ mod tests {
                 get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
                 launch_stderr: None,
                 calls: Default::default(),
+                non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
             }
         }
     }
@@ -510,6 +568,10 @@ mod tests {
                      host unreachable: [error] unknown run: run_x"
                         .into(),
                 ));
+            }
+            if self.non_terminal_polls.load(Ordering::SeqCst) > 0 {
+                self.non_terminal_polls.fetch_sub(1, Ordering::SeqCst);
+                return Ok(serde_json::json!({ "run": { "status": "running" } }));
             }
             Ok(self.get_run_response.clone())
         }
@@ -1161,6 +1223,29 @@ steps:
     /// 500 ms poll budget (60 s of real time) resolves instantly: with no
     /// other work pending, tokio auto-advances virtual time past each
     /// `sleep`.
+    /// A placed run that outlives the OLD fixed budget still completes.
+    ///
+    /// The previous loop was `for attempt in 0..120` at a flat 500 ms
+    /// interval — 60 SECONDS total for a placed run to reach terminal.
+    /// Measured on a live host, an enumeration agent ran 103 s and finished
+    /// `completed`; the coordinator abandoned it at 60 s, reported the step
+    /// failed, and discarded its workspace delta. The work had succeeded and
+    /// only the result was thrown away.
+    ///
+    /// 400 non-terminal polls is comfortably past 120, so this fails against
+    /// the old bound and passes against a wall-clock budget.
+    #[tokio::test(start_paused = true)]
+    async fn placed_run_outliving_the_old_poll_budget_still_completes() {
+        let conn = Arc::new(FakeConnector::completed_after_non_terminal_polls(400));
+        let d = FleetUnitDispatcher::from_connector(conn);
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(
+            out.success,
+            "a long-running placed run must complete, not time out"
+        );
+        assert_eq!(out.output, "fake-out");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn poll_timeout_after_stage_discards_scratch() {
         let conn = Arc::new(StageOkPollNeverTerminalConnector::new(
