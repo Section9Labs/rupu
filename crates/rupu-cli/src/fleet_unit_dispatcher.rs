@@ -27,6 +27,24 @@ use rupu_orchestrator::runner::{
 const POLL_MAX_ATTEMPTS: u32 = 120;
 /// Interval between polls.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+// Why a `get_run` failure is NOT believed until the run has been seen once.
+//
+// `launch_agent` returns as soon as the DETACHED remote command has been
+// spawned — `setsid <argv> </dev/null >/dev/null 2>&1 &` — so the run record on
+// the host is created asynchronously, after the remote `rupu` has started, read
+// its config and registered the run. Until that lands, `get_run` legitimately
+// answers "unknown run", and "the host does not know this run" is
+// indistinguishable from "the host has not started it yet".
+//
+// That window is not a constant we can pick: a step with `workspace: sync`
+// stages the workspace before the remote `rupu` starts, so it scales with the
+// workspace. Measured — a placed step from a small scratch project registered
+// before the first poll and passed, while the SAME step from a 57 MB project
+// lost the race every time and was reported FAILED even though it went on to
+// complete on the host.
+//
+// So a pre-observation error retries for the whole poll budget instead. See the
+// `observed` flag in the poll loop below.
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -167,12 +185,36 @@ impl UnitDispatcher for FleetUnitDispatcher {
         };
 
         // Poll the mirrored run until a terminal status is reached.
+        //
+        // `observed` gates how a poll ERROR is treated. Before the first
+        // successful read the run may simply not exist yet — the launch is
+        // detached, so registration is asynchronous — and we retry. Once the
+        // run has been read even once the host demonstrably knows it, so any
+        // later error is real and propagates immediately, exactly as before.
+        let mut observed = false;
+        let mut last_startup_err: Option<String> = None;
         for attempt in 0..POLL_MAX_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
 
-            let rec = conn.get_run(&run_id).await.map_err(host_err_to_run_err)?;
+            let rec = match conn.get_run(&run_id).await {
+                Ok(rec) => {
+                    observed = true;
+                    rec
+                }
+                Err(e) if !observed => {
+                    last_startup_err = Some(e.to_string());
+                    tracing::debug!(
+                        run_id = %run_id,
+                        attempt,
+                        error = %last_startup_err.as_deref().unwrap_or(""),
+                        "placed run not registered on the host yet; retrying"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(host_err_to_run_err(e)),
+            };
 
             // All HostConnector::get_run impls return the query_run_detail
             // envelope: {"run": <RunRecord>, "steps": [...], "usage": {...}}.
@@ -235,10 +277,22 @@ impl UnitDispatcher for FleetUnitDispatcher {
             }
         }
 
-        Err(RunError::Provider(format!(
-            "timed out waiting for remote unit run {run_id} on host {host} \
-             after {POLL_MAX_ATTEMPTS} polls"
-        )))
+        Err(RunError::Provider(match last_startup_err {
+            // Never observed: the run was launched but never registered on
+            // the host. Say that, rather than "timed out polling" — the
+            // distinction is the difference between "still running, we gave
+            // up watching" and "it never started", and the connector's own
+            // message for this case blames `rupu run show` support.
+            Some(err) => format!(
+                "remote unit run {run_id} never registered on host {host} \
+                     after {POLL_MAX_ATTEMPTS} polls; the launch was accepted but \
+                     the host never reported the run. Last poll error: {err}"
+            ),
+            None => format!(
+                "timed out waiting for remote unit run {run_id} on host {host} \
+                 after {POLL_MAX_ATTEMPTS} polls"
+            ),
+        }))
     }
 
     /// Bridge the orchestrator's opaque deltas to the `rupu-workspace` codec and
@@ -331,6 +385,11 @@ mod tests {
     struct FakeConnector {
         run_id: &'static str,
         get_run_response: serde_json::Value,
+        /// How many `get_run` calls fail with `Unsupported` before the run
+        /// "registers". Models the real ssh connector: `launch_agent` returns
+        /// once the DETACHED remote command is spawned, so the run record does
+        /// not exist until the remote `rupu` has actually started.
+        get_run_failures_before_ready: std::sync::atomic::AtomicU32,
     }
 
     impl FakeConnector {
@@ -344,7 +403,16 @@ mod tests {
                         "final_output": "fake-out"
                     }
                 }),
+                get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
             }
+        }
+
+        /// A run that is not registered on the host for its first `n` polls —
+        /// the workspace-sync case, where staging delays the remote start.
+        fn completed_after_startup_delay(n: u32) -> Self {
+            let mut c = Self::completed();
+            c.get_run_failures_before_ready = std::sync::atomic::AtomicU32::new(n);
+            c
         }
 
         fn failed() -> Self {
@@ -356,6 +424,7 @@ mod tests {
                         "error_message": "boom"
                     }
                 }),
+                get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
             }
         }
     }
@@ -393,6 +462,18 @@ mod tests {
             unimplemented!()
         }
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            use std::sync::atomic::Ordering;
+            if self.get_run_failures_before_ready.load(Ordering::SeqCst) > 0 {
+                self.get_run_failures_before_ready
+                    .fetch_sub(1, Ordering::SeqCst);
+                // The exact shape the ssh connector produces for a run the
+                // host does not know yet.
+                return Err(HostConnectorError::Unsupported(
+                    "remote host h1 does not support `rupu run show`: \
+                     host unreachable: [error] unknown run: run_x"
+                        .into(),
+                ));
+            }
             Ok(self.get_run_response.clone())
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
@@ -525,6 +606,36 @@ mod tests {
     /// `from_connector` with a fake that returns the real envelope
     /// `{"run":{"status":"completed","final_output":"fake-out"}}` on the
     /// first `get_run` poll → output "fake-out", success true.
+    /// A placed run that is not registered on the host for its first polls
+    /// still completes.
+    ///
+    /// `launch_agent` returns as soon as the DETACHED remote command is
+    /// spawned, so the run record on the host is created asynchronously. The
+    /// first poll therefore races registration and previously aborted the
+    /// whole step: any `get_run` error propagated immediately, and the ssh
+    /// connector reports a not-yet-known run as
+    /// "does not support `rupu run show`" — which named the wrong subsystem
+    /// and made a healthy remote run look like a transport capability gap.
+    ///
+    /// Measured before the fix: a placed step from a small workspace won the
+    /// race and passed, while the same step from a 57 MB workspace lost it
+    /// every time — because `workspace: sync` stages files before the remote
+    /// `rupu` starts. The delay scales with the workspace, so it cannot be
+    /// waited out with a fixed constant.
+    #[tokio::test]
+    async fn placed_run_survives_a_slow_remote_startup() {
+        // Enough polls to fail the old code (which aborted on the very first
+        // error) without making the test itself slow.
+        let conn = Arc::new(FakeConnector::completed_after_startup_delay(5));
+        let d = FleetUnitDispatcher::from_connector(conn);
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(
+            out.success,
+            "a run that registers late must still be reported as completed"
+        );
+        assert_eq!(out.output, "fake-out");
+    }
+
     #[tokio::test]
     async fn fleet_dispatch_reads_final_output_from_mirror() {
         let conn = Arc::new(FakeConnector::completed());
