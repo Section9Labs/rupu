@@ -141,6 +141,22 @@ pub trait HostConnector: Send + Sync {
     /// Cancel an in-flight run.
     async fn cancel_run(&self, run_id: &str) -> Result<(), HostConnectorError>;
 
+    /// Wait until any coordinator-side mirroring for `run_id` has finished
+    /// its terminal work (final transcript catch-up, `run.json`, `finish`).
+    ///
+    /// Transports that mirror asynchronously (SSH's tail pump is a spawned
+    /// task) MUST override this so a short-lived dispatching process — the
+    /// `rupu workflow run` CLI exits the moment the workflow completes — can
+    /// join the mirror before reporting a placed unit terminal. Without the
+    /// join the process exits mid-flight and the mirrored transcript is
+    /// silently truncated at whatever the tail had delivered (measured: the
+    /// `assistant_message` / `turn_end` / `run_complete` tail lost on a real
+    /// host). Transports whose `get_run` already reflects everything the
+    /// coordinator will ever hold (Local, HttpCp, Tunnel, Bucket) keep the
+    /// default no-op. Must never hang a caller indefinitely: implementations
+    /// bound the wait and log if the bound is hit.
+    async fn await_run_mirror(&self, _run_id: &str) {}
+
     /// Cooperatively pause an in-flight (`Pending`/`Running`) run, leaving it
     /// non-terminal and resumable via [`resume_run`](Self::resume_run).
     ///

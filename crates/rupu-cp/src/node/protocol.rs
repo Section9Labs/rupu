@@ -75,6 +75,11 @@ pub enum ArtifactFile {
     StepResults,
     UnitCheckpoints,
     RunJson,
+    /// The run's agent transcript (`$RUPU_HOME/transcripts/<run_id>.jsonl` on
+    /// the executing host — note: NOT under `runs/<run_id>/`). Written by
+    /// placed/standalone agent runs; workflow runs write per-step transcripts
+    /// elsewhere and never produce this artifact.
+    Transcript,
 }
 
 #[cfg(test)]

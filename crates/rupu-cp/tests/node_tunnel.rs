@@ -2433,3 +2433,145 @@ async fn e2e_reject_over_tunnel() {
         "worker_id must carry node_id attribution"
     );
 }
+
+/// A placed agent run's transcript streams in as `ArtifactFile::Transcript`
+/// lines. The mirror must write them to `<global>/transcripts/<run_id>.jsonl`
+/// — the coordinator's own transcript layout, NOT inside the run directory —
+/// and `finish` must synthesize a single `"agent"` step-result row pointing
+/// at that file, because every CP read path (`/api/runs/:id` steps, the run
+/// graph, the usage rollup) locates transcripts through `step_results.jsonl`.
+#[test]
+fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    // Root the store at `<global>/runs` (the coordinator's real layout) so
+    // the transcript lands at the sibling `<global>/transcripts/`.
+    let store = Arc::new(RunStore::new(dir.path().join("runs")));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Agent,
+        name: "reviewer".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRTRANS01";
+    let node_id = "node-42";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    let t1 = r#"{"type":"run_start","agent":"reviewer"}"#;
+    let t2 = r#"{"type":"run_complete","status":"ok"}"#;
+    mirror
+        .append(run_id, node_id, ArtifactFile::Transcript, t1)
+        .expect("append transcript 1");
+    mirror
+        .append(run_id, node_id, ArtifactFile::Transcript, t2)
+        .expect("append transcript 2");
+    mirror.finish(run_id, node_id, "completed").expect("finish");
+
+    // Bytes land at <global>/transcripts/<run_id>.jsonl — outside runs/.
+    let transcript_path = dir
+        .path()
+        .join("transcripts")
+        .join(format!("{run_id}.jsonl"));
+    let content = std::fs::read_to_string(&transcript_path).expect("read mirrored transcript");
+    assert_eq!(content, format!("{t1}\n{t2}\n"));
+
+    // Nothing leaked into events.jsonl.
+    let events = std::fs::read_to_string(store.events_path(run_id)).unwrap_or_default();
+    assert!(
+        !events.contains("run_start"),
+        "transcript lines must not be misfiled into events.jsonl: {events:?}"
+    );
+
+    // Reachability: one synthesized "agent" row in step_results.jsonl.
+    let steps = store.read_step_results(run_id).expect("read step results");
+    assert_eq!(steps.len(), 1, "expected one synthesized step-result row");
+    assert_eq!(steps[0].step_id, "agent");
+    assert_eq!(steps[0].transcript_path, transcript_path);
+    assert!(steps[0].success, "completed run → success:true");
+
+    // Repeated finish (pump fallback path) must not duplicate the row.
+    mirror
+        .finish(run_id, node_id, "completed")
+        .expect("finish again");
+    let steps = store.read_step_results(run_id).expect("read step results");
+    assert_eq!(steps.len(), 1, "finish must be idempotent for synthesis");
+}
+
+/// `tail -n +1 -F` replays the remote transcript from byte zero, so a
+/// respawned pump re-sends every already-mirrored line. The pump calls
+/// `reset_transcript` when the replay starts; the mirror must truncate so
+/// the replay overwrites instead of appending a duplicate copy.
+#[test]
+fn mirror_reset_transcript_makes_replay_idempotent() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().join("runs")));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Agent,
+        name: "reviewer".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRTRANS02";
+    let node_id = "node-42";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    let line = r#"{"type":"run_start","agent":"reviewer"}"#;
+
+    // First pump lifetime: replay starts → reset → line mirrored.
+    mirror.reset_transcript(run_id, node_id).expect("reset 1");
+    mirror
+        .append(run_id, node_id, ArtifactFile::Transcript, line)
+        .expect("append 1");
+
+    // Respawned pump: same full replay again.
+    mirror.reset_transcript(run_id, node_id).expect("reset 2");
+    mirror
+        .append(run_id, node_id, ArtifactFile::Transcript, line)
+        .expect("append 2");
+
+    let transcript_path = dir
+        .path()
+        .join("transcripts")
+        .join(format!("{run_id}.jsonl"));
+    let content = std::fs::read_to_string(&transcript_path).expect("read mirrored transcript");
+    assert_eq!(
+        content,
+        format!("{line}\n"),
+        "replay after reset must overwrite, not duplicate"
+    );
+
+    // Ownership is enforced like every other mirror write.
+    assert!(
+        mirror.reset_transcript(run_id, "other-node").is_err(),
+        "reset from a non-owning node must be refused"
+    );
+    assert!(
+        mirror
+            .replace_transcript(run_id, "other-node", "stolen")
+            .is_err(),
+        "replace from a non-owning node must be refused"
+    );
+}
