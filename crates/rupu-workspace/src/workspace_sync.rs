@@ -367,7 +367,18 @@ fn collect_delta_git(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
         .tree()
         .map_err(git_err)?;
     let mut opts = git2::DiffOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
+    // `show_untracked_content` is NOT redundant with `include_untracked`, and
+    // the difference is silent data loss. `include_untracked` puts an untracked
+    // file in `diff.deltas()` — so it lands in `changed` below and the delta
+    // LOOKS complete — but libgit2 renders it into the patch as a header with
+    // no content hunks. `apply_deltas_git` reconstructs the file from that
+    // patch, so without this flag every file a placed agent CREATES arrives
+    // empty or not at all, while modifications to already-tracked files come
+    // back fine. Measured on a scratch repo: 153 patch bytes without it (new
+    // file's content absent), 344 with it (present).
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
     let diff = repo
         .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))
         .map_err(git_err)?;
@@ -710,6 +721,56 @@ mod git_sync_tests {
         assert_eq!(
             fs::read_to_string(ws.path().join("a.txt")).unwrap(),
             "line1\nEDITED\nline3\n"
+        );
+    }
+
+    /// A file the REMOTE CREATES must arrive with its content.
+    ///
+    /// This is the case `include_untracked` alone does not cover: the new file
+    /// lands in `delta.changed` either way, so the delta looks complete and the
+    /// run reports success, but without `show_untracked_content` libgit2 renders
+    /// it into the patch as a header with no hunks and `apply_deltas_git`
+    /// reconstructs nothing. Asserting only on `delta.changed` would pass
+    /// against the bug — the assertion that matters is the file's CONTENT on
+    /// the coordinator afterwards.
+    ///
+    /// Measured against a placed agent on a real remote host: every file the
+    /// agent created was silently discarded while its edits to already-tracked
+    /// files came back correctly.
+    #[test]
+    fn git_remote_created_file_arrives_with_its_content() {
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+
+        let payload = pack(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage(&payload, scratch.path()).unwrap();
+
+        // The remote creates a file that does not exist on the coordinator,
+        // in a directory that does not exist there either — the shape a placed
+        // agent actually produces (`campaign/<id>/state/x.json`).
+        let nested = scratch.path().join("nested").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("new.json"), "{\"created\":\"remotely\"}\n").unwrap();
+
+        let delta = collect_delta(scratch.path(), &baseline).unwrap();
+        assert!(
+            delta.changed.contains(&"nested/deep/new.json".to_string()),
+            "new file missing from delta.changed: {:?}",
+            delta.changed
+        );
+
+        apply_deltas(ws.path(), &[delta]).unwrap();
+
+        let landed = ws.path().join("nested").join("deep").join("new.json");
+        assert!(
+            landed.exists(),
+            "remote-created file never reached the coordinator"
+        );
+        assert_eq!(
+            fs::read_to_string(&landed).unwrap(),
+            "{\"created\":\"remotely\"}\n",
+            "remote-created file arrived without its content"
         );
     }
 
