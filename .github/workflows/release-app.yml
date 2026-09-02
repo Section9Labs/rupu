@@ -1,0 +1,615 @@
+name: release-app
+
+# rupu.app's release lane, split out of release.yml so that a broken app
+# build can never hold back the CLI. release.yml publishes the binaries and
+# packages for a `v*` tag; this workflow then attaches rupu.app to that same
+# release — and only when the app actually changed since the last release on
+# the same channel that shipped one.
+#
+# Two consequences worth knowing before touching this:
+#
+#   * It is triggered by release.yml COMPLETING, not by the tag push. The
+#     CLI lane takes ~40 minutes (linux-x64 is the long pole); the app lane
+#     takes ~3. Firing on the tag would mean either polling for the release
+#     to exist for most of an hour or racing release.yml to create it —
+#     and a versioned release that exists with only app assets is one
+#     `rupu update` could pick up and find no binary on. Running strictly
+#     after release.yml succeeds removes both problems. The cost is that a
+#     `workflow_dispatch` re-publish of release.yml (which runs from `main`)
+#     does not carry the tag name here; use THIS workflow's own dispatch
+#     for the app side of a re-publish.
+#
+#   * The app's CFBundleShortVersionString is the version of the last tag
+#     whose lane BUILT, so it lags the CLI version between app changes.
+#     That is by design: the app carries its own minimum-CLI-version gate
+#     (RupuBackend's VersionGate), which is what actually has to be right.
+#     A release with no `rupu-app-*` asset is one where nothing under the
+#     app tree moved; the rolling tag still carries the newest bundle.
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build/(re)publish rupu.app for, e.g. v0.70.3-beta. Always builds; the change gate is bypassed."
+        required: true
+      # This lane can only be proven with real Apple secrets, which a fork
+      # or a local run does not have. A dry run exercises every build,
+      # sign, notarize and staple step exactly as a real cut would, and only
+      # `publish-app` is skipped — that single `if:` is the whole mechanism.
+      app_dry_run:
+        description: "Dry run: build/sign/notarize/staple, publish nothing"
+        type: boolean
+        default: false
+
+concurrency:
+  # On workflow_run `github.ref` is `main`, which is useless as a key; the
+  # tag is what two runs must not race on.
+  group: release-app-${{ inputs.tag || github.event.workflow_run.head_branch }}
+  # Same reasoning as release.yml: cancelling mid-upload is how a
+  # half-published release happens.
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    name: derive tag, channel and change gate
+    # A failed CLI lane means there is no release to attach an app to. On
+    # dispatch there is no triggering run to consult.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      # `go` is false when this run has nothing to do at all (the triggering
+      # release.yml run was not for a tag). `build` is false when the app is
+      # unchanged since the baseline. Every downstream job keys on `build`,
+      # which is only ever true when `go` is.
+      go: ${{ steps.tag.outputs.go }}
+      build: ${{ steps.gate.outputs.build }}
+      baseline: ${{ steps.gate.outputs.baseline }}
+      channel: ${{ steps.tag.outputs.channel }}
+      version: ${{ steps.tag.outputs.version }}
+      rolling_tag: ${{ steps.tag.outputs.rolling_tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      tag: ${{ steps.tag.outputs.tag }}
+      dry_run: ${{ steps.tag.outputs.dry_run }}
+    steps:
+      - id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.app_dry_run }}
+          # For a run that a tag push triggered, `head_branch` IS the tag
+          # name. For a workflow_dispatch of release.yml it is `main`.
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            workflow_dispatch) tag="$INPUT_TAG" ;;
+            workflow_run)      tag="$RUN_HEAD_BRANCH" ;;
+            *) echo "::error::unexpected event '$EVENT'"; exit 1 ;;
+          esac
+          echo "dry_run=${INPUT_DRY_RUN:-false}" >> "$GITHUB_OUTPUT"
+
+          # Identical shape rules to release.yml's `meta` job — the two MUST
+          # agree on what a releasable tag looks like. The one difference is
+          # the outcome for a non-tag: release.yml cannot be on one at all,
+          # whereas a workflow_run from a release.yml dispatch legitimately
+          # arrives here with `main`, and that is a skip, not an error.
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*-beta|v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*)
+              echo "channel=beta"            >> "$GITHUB_OUTPUT"
+              echo "rolling_tag=latest-beta" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true"         >> "$GITHUB_OUTPUT" ;;
+            v*[!0-9.]*)
+              echo "::error::tag '$tag' has a malformed version or an unrecognized prerelease suffix"; exit 1 ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              echo "channel=stable"            >> "$GITHUB_OUTPUT"
+              echo "rolling_tag=latest-stable" >> "$GITHUB_OUTPUT"
+              echo "prerelease=false"          >> "$GITHUB_OUTPUT" ;;
+            *)
+              if [ "$EVENT" = "workflow_run" ]; then
+                echo "::notice::triggering release.yml run was for '$tag', not a v<X.Y.Z>[-beta] tag — nothing to attach rupu.app to; skipping (re-publish the app with this workflow's own dispatch)"
+                echo "go=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::error::tag '$tag' is not v<X.Y.Z>[-beta]"; exit 1 ;;
+          esac
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "go=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: steps.tag.outputs.go == 'true'
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          # The change gate diffs two tags; it needs both and the history
+          # between them.
+          fetch-depth: 0
+
+      - name: Should the app be built for this tag?
+        id: gate
+        if: steps.tag.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          CHANNEL: ${{ steps.tag.outputs.channel }}
+          PRERELEASE: ${{ steps.tag.outputs.prerelease }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          # On workflow_run the tag name came from `head_branch`; make sure
+          # the tag we checked out is the commit that run actually built,
+          # not a tag someone has since moved.
+          tag_sha=$(git rev-parse "refs/tags/$TAG^{commit}")
+          if [ "$EVENT" = "workflow_run" ] && [ "$tag_sha" != "$RUN_HEAD_SHA" ]; then
+            echo "::error::$TAG points at $tag_sha but the triggering release.yml run built $RUN_HEAD_SHA"
+            exit 1
+          fi
+
+          # Everything the shipped bundle is a function of. `Makefile` is
+          # coarse (a change to a cargo target rebuilds the app too) but the
+          # rebuild costs three minutes and a missed input costs a stale
+          # bundle under a fresh tag, so err wide.
+          app_paths="apps/rupu-macos scripts/package-app-dmg.sh Makefile .github/workflows/release-app.yml"
+
+          # The baseline: the newest release on the SAME channel, below this
+          # tag, that actually carries the app. "Carries the app", not "is
+          # the previous tag": if the previous tag's lane failed, or was
+          # skipped as unchanged, diffing against it would miss changes that
+          # never shipped. Same channel, because a stable is promoted from a
+          # beta's commit — diffed against that beta it would never change,
+          # and no stable release would ever get an app.
+          candidates=$(gh release list --limit 200 --exclude-drafts \
+              --json tagName,isPrerelease \
+              --jq ".[] | select(.isPrerelease == $PRERELEASE) | .tagName" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-beta(\.[0-9]+)?)?$' \
+            | grep -vx "$TAG" || true)
+          below=$(printf '%s\n%s\n' "$candidates" "$TAG" | grep . | sort -V \
+            | sed "/^${TAG}\$/q" | grep -vx "$TAG" | sort -V -r || true)
+          baseline=""
+          for t in $below; do
+            if gh release view "$t" --json assets --jq '.assets[].name' \
+                | grep -qx 'rupu-app-darwin-arm64.dmg'; then
+              baseline="$t"; break
+            fi
+          done
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$baseline" ]; then
+            echo "::notice::no earlier $CHANNEL release carries rupu-app-darwin-arm64.dmg — building"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "::notice::workflow_dispatch always builds (baseline would have been $baseline)"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # shellcheck disable=SC2086  # app_paths is a deliberate word list
+          if git diff --quiet "refs/tags/$baseline" "refs/tags/$TAG" -- $app_paths; then
+            echo "::notice::rupu.app unchanged since $baseline — not building; $baseline's bundle remains the newest on $CHANNEL"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "rupu.app changed since $baseline:"
+          # shellcheck disable=SC2086
+          git diff --stat "refs/tags/$baseline" "refs/tags/$TAG" -- $app_paths
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  macos-app:
+    if: needs.meta.outputs.build == 'true'
+    name: build rupu.app darwin-arm64
+    # No `web` dependency, unlike release.yml's `macos` job. rupu.app is a native
+    # client that talks to a `rupu cp serve` over HTTP; it embeds no web
+    # assets of its own, so there is no `web-dist` artifact to download.
+    needs: [meta]
+    # Pinned, NOT macos-latest, deliberately diverging from release.yml's `macos`
+    # job: the PR gate (`macos-app` in ci.yml) pins macos-15, and a
+    # released .app must be built by the same Xcode/SDK that gate actually
+    # exercised — a floating image would ship a bundle no PR ever compiled,
+    # with a Swift or SDK version bump landing first in a release rather than
+    # in a pull request. The CLI job is immaterial to this: cargo pins its own
+    # toolchain, so the image underneath it does not change the product.
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      # One definition of the product path, read by every step below.
+      # `make macos-release` writes the bundle here (see the Makefile target).
+      APP: apps/rupu-macos/DerivedData/Build/Products/Release/rupu.app
+      # Pin the SAME Xcode ci.yml's macos-app gate pins (the gate/release
+      # same-toolchain invariant this job's runs-on comment describes). The
+      # image default (16.4, Swift 6.1.2) stack-overflows swift-frontend's
+      # deserializer on RupuShell's cross-module generic nesting under the
+      # Release configuration — the failure that shipped v0.76.0-beta.2/.3
+      # without a .app (ISSUES.md I-91). Bump this and the gate's copy
+      # TOGETHER, never one alone.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Pin the tag explicitly. On a tag push `github.ref_name` is
+          # already the tag, but a `workflow_dispatch` re-publish runs
+          # from the default branch (as every workflow_run does) — a bare checkout would then build
+          # `main` while `publish-app` uploads with `--clobber`, silently
+          # replacing the tag's assets with binaries from a different
+          # tree. The AUR PKGBUILD, Homebrew formula and flake.nix all
+          # pin those checksums, so every community install path would
+          # start failing hash verification.
+          ref: ${{ needs.meta.outputs.tag }}
+
+      # `apps/rupu-macos/rupu.xcodeproj` is gitignored and regenerated from
+      # project.yml by `make macos-gen` (which `macos-release` depends on),
+      # so xcodegen has to exist before anything can build. Same line the
+      # PR gate uses — `macos-app` in ci.yml.
+      - name: Install XcodeGen
+        run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+
+      # Import the Developer ID cert into a throwaway keychain rather than
+      # the runner's login keychain. Discarded with the runner.
+      #
+      # Two deliberate divergences from release.yml's `macos` job's otherwise identical
+      # step, both because this job signs TWICE with a notarization wait in
+      # between (the CLI job signs once, up front):
+      #   * the idle-lock timeout is 7200s, not 3600s — Apple's notary queue
+      #     is usually minutes but has had hour-plus days, and a keychain that
+      #     re-locked mid-job fails the DMG signing at the very end of an
+      #     hour of work;
+      #   * the keychain name and password are exported so the DMG step can
+      #     unlock explicitly rather than betting on that timer. The password
+      #     is a per-run uuid for a keychain that exists only on this runner,
+      #     and it is masked so it cannot surface in the log.
+      - name: Import signing certificate
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -t 7200 -u "$KEYCHAIN"
+          echo "$CERT_B64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f /tmp/cert.p12
+          # Without this, codesign blocks on a GUI prompt that never comes.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security find-identity -v -p codesigning
+          {
+            echo "KEYCHAIN=$KEYCHAIN"
+            echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      # `make macos-release` ad-hoc-signs the product (CODE_SIGN_IDENTITY=-)
+      # so the same target works on a developer machine with no Developer ID;
+      # the next step replaces that signature with the real one. There is no
+      # RUPU_RELEASE_CHANNEL here, unlike the CLI build: the app carries no
+      # channel stamp — only the version, into
+      # CFBundleShortVersionString/CFBundleVersion.
+      - name: Build (version-stamped)
+        env:
+          RUPU_RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: make macos-release
+
+      # The CLI job proves its asset is what the name claims by asking the
+      # binary (`update --print-platform`); the app has no such self-report,
+      # so assert against the bundle instead.
+      - name: Assert the bundle matches the tag and the asset name
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -d "$APP" || { echo "::error::no bundle at $APP"; exit 1; }
+          got=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+            "$APP/Contents/Info.plist")
+          if [ "$got" != "$VERSION" ]; then
+            echo "::error::bundle says version '$got', tag says '$VERSION'"
+            exit 1
+          fi
+          # The assets are named darwin-arm64, so the bundle must CONTAIN an
+          # arm64 slice — it need not be arm64-only. A universal build is a
+          # perfectly shippable superset and must not fail here; what must
+          # fail is a runner-image change that moved this job onto x86_64 and
+          # would publish an Intel-only build under an arm64 name.
+          archs=$(lipo -archs "$APP/Contents/MacOS/rupu")
+          case "$archs" in
+            *arm64*) ;;
+            *)
+              echo "::error::bundle executable is '$archs', which carries no arm64 slice"
+              exit 1 ;;
+          esac
+          echo "rupu.app $got ($archs)"
+
+      # The CLI job signs via scripts/sign-dev.sh; that script signs one bare
+      # binary and has a deliberate fallback to "the first codesigning
+      # identity" for local dev, so it is not the right tool here. Identity
+      # selection matches it (awk the SHA-1 of the first Developer ID
+      # Application identity out of `security find-identity`), but with NO
+      # fallback: a self-signed or Apple Development cert would produce a
+      # bundle that fails notarization and Gatekeeper, and shipping that from
+      # CI is worse than failing the release.
+      - name: Sign the bundle with the Developer ID identity
+        run: |
+          set -euo pipefail
+          # `|| true` because a nonzero `security` under `set -o pipefail`
+          # would abort the step here and the friendly diagnosis below would
+          # never print — an empty identity is the condition to report, and
+          # how it came to be empty is what the dump in that branch shows.
+          identity=$(security find-identity -v -p codesigning 2>/dev/null \
+            | awk '/Developer ID Application/ { print $2; exit }' || true)
+          if [ -z "$identity" ]; then
+            echo "--- security find-identity -v -p codesigning ---"
+            security find-identity -v -p codesigning || true
+            echo "::error::no Developer ID Application identity in the build keychain — refusing to ship an ad-hoc-signed rupu.app"
+            exit 1
+          fi
+          # --force replaces the ad-hoc signature the build applied.
+          # --deep signs nested code too: the bundle carries none today
+          # (RupuKit is a statically linked SPM product), but if a build ever
+          # embeds a framework or helper it would arrive ad-hoc-signed, and
+          # without --deep the outer signature would be applied over it and
+          # fail notarization for a reason nothing here would explain.
+          # --options runtime is the hardened runtime and --timestamp a
+          # trusted timestamp; notarization rejects a bundle missing either.
+          codesign --force --deep --options runtime --timestamp \
+            -s "$identity" "$APP"
+          # --strict --deep verifies the whole tree, not just the outer seal.
+          codesign --verify --strict --deep --verbose=2 "$APP"
+
+      - name: Notarize the app
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          key="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$key"
+          # notarytool takes an archive, not a bundle directory. This zip is
+          # a submission vehicle only — the shipped zip is produced later,
+          # from the STAPLED bundle, by scripts/package-app-dmg.sh.
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/rupu-app-submit.zip"
+
+          # A rejection prints a status and a submission id, and NOTHING about
+          # why — the reason lives in the per-submission log, which needs the
+          # API key to fetch. Diagnosing one afterwards would mean a manual
+          # re-run by whoever holds the secrets, so fetch it here, while the
+          # key is still on disk, and put it in the release run's own log.
+          #
+          # `tee` keeps the progress output live (this step waits for minutes)
+          # while capturing it; PIPESTATUS is why the pipeline is not simply
+          # `set -e`-checked. The status line is checked as well as the exit
+          # code: `submit --wait` has historically exited 0 on a submission
+          # that came back Invalid, and an unnoticed Invalid here means an
+          # un-notarized app gets stapled (which fails) or shipped.
+          log="$RUNNER_TEMP/notarize-app.log"
+          set +e
+          xcrun notarytool submit "$RUNNER_TEMP/rupu-app-submit.zip" \
+            --key "$key" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          id=$(awk '/^ *id: / { print $2; exit }' "$log" || true)
+          status=$(awk '/^ *status: / { s=$2 } END { print s }' "$log" || true)
+          if [ "$rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+            if [ -n "$id" ]; then
+              echo "--- notarytool log $id ---"
+              xcrun notarytool log "$id" \
+                --key "$key" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID" || true
+            fi
+            rm -rf "$RUNNER_TEMP/private_keys"
+            echo "::error::notarizing rupu.app was not accepted (exit $rc, status '${status:-unknown}')"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/private_keys"
+
+      # Unlike the bare CLI binary above — which cannot be stapled (stapler
+      # handles .app/.pkg/.dmg only) and relies on the online ticket — an
+      # .app CAN be stapled, so the ticket travels inside the bundle and a
+      # first launch on a machine with no network still passes Gatekeeper.
+      # This runs BEFORE packaging so the DMG and the zip both contain the
+      # stapled bundle; stapling afterwards would leave the copies inside
+      # them ticketless.
+      - name: Staple the app
+        run: |
+          set -euo pipefail
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          # Ask Gatekeeper the question the user's machine will ask on first
+          # launch, rather than inferring the answer from the fact that each
+          # preceding command exited 0. Nothing in this whole path has ever
+          # run against real secrets, so the first failure must be a red CI
+          # run and not a quarantine report from someone who downloaded it.
+          # `-t exec` is the assessment type for an application. There is no
+          # precedent for this in the CLI `macos` job because a bare binary is
+          # not spctl-assessable this way — it has no bundle to assess.
+          spctl -a -t exec -vv "$APP"
+
+      - name: Package the DMG and the zip
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: scripts/package-app-dmg.sh "$APP" dist "$VERSION"
+
+      # The DMG is a container the user downloads and mounts, so Gatekeeper
+      # checks IT, not only the app inside it: an unsigned DMG is quarantined
+      # on first open even when the bundle it carries is notarized. It goes
+      # through the same three steps for that reason. notarytool accepts a
+      # .dmg directly — no zip vehicle needed, unlike the bundle above.
+      - name: Sign, notarize and staple the DMG
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          dmg=dist/rupu-app-darwin-arm64.dmg
+
+          # Everything since the import step — a build, a signature and a
+          # full notarization wait — has run on the clock of the keychain's
+          # idle-lock timer. That timer is set to 7200s for exactly this
+          # reason, but Apple's queue is not bounded by anything we control,
+          # so do not bet the last step of an hour-long job on it. Unlocking
+          # an already-unlocked keychain is a no-op.
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Same lookup, same `|| true` reasoning as the app signing step.
+          identity=$(security find-identity -v -p codesigning 2>/dev/null \
+            | awk '/Developer ID Application/ { print $2; exit }' || true)
+          if [ -z "$identity" ]; then
+            echo "--- security find-identity -v -p codesigning ---"
+            security find-identity -v -p codesigning || true
+            echo "::error::no Developer ID Application identity in the build keychain — refusing to ship an unsigned DMG"
+            exit 1
+          fi
+          # No --deep: a DMG is a single file, not a tree of nested code.
+          codesign --force --timestamp -s "$identity" "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          key="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$key"
+
+          # Same capture-and-fetch-the-log shape as the app notarization
+          # above, and for the same reason: a rejection has to be diagnosable
+          # from this run's log, without a manual re-run holding the secrets.
+          log="$RUNNER_TEMP/notarize-dmg.log"
+          set +e
+          xcrun notarytool submit "$dmg" \
+            --key "$key" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          id=$(awk '/^ *id: / { print $2; exit }' "$log" || true)
+          status=$(awk '/^ *status: / { s=$2 } END { print s }' "$log" || true)
+          if [ "$rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+            if [ -n "$id" ]; then
+              echo "--- notarytool log $id ---"
+              xcrun notarytool log "$id" \
+                --key "$key" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID" || true
+            fi
+            rm -rf "$RUNNER_TEMP/private_keys"
+            echo "::error::notarizing the DMG was not accepted (exit $rc, status '${status:-unknown}')"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/private_keys"
+
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          # The Gatekeeper question a downloaded DMG actually faces. `-t open`
+          # with the primary-signature context is the assessment macOS runs
+          # when a user opens a disk image — `-t exec` (used on the .app
+          # above) assesses executables and is the wrong question for a
+          # container. Same rationale for asserting at all: this path has
+          # never run against real secrets, so its first failure must be here.
+          spctl -a -t open --context context:primary-signature -vv "$dmg"
+
+      # scripts/package-app-dmg.sh wrote a sidecar for each asset the moment
+      # it created them, but the DMG has been rewritten since — its signature
+      # and its stapled ticket both live inside the file — so that sidecar is
+      # now stale. Without this step EVERY release would fail, not silently
+      # ship a wrong hash: `publish-app` runs `sha256sum -c` across dist/ in its
+      # sanity check, which is the step BEFORE the upload, so a stale sidecar
+      # reliably reddens the release rather than reaching a user. This is
+      # therefore about not shipping a lane that cannot succeed, not about
+      # closing a corruption hole. Recompute BOTH (the zip is untouched;
+      # recomputing it costs nothing and makes "every sidecar in dist/ was
+      # computed over the bytes that ship" true by construction rather than
+      # by argument), and verify locally so the failure names this job.
+      - name: Recompute the checksums over the bytes that ship
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in rupu-app-darwin-arm64.dmg rupu-app-darwin-arm64.zip; do
+            shasum -a 256 "$f" > "$f.sha256"
+            cat "$f.sha256"
+          done
+          shasum -a 256 -c ./*.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-app-darwin-arm64
+          path: dist/
+          if-no-files-found: error
+
+
+  publish-app:
+    name: attach rupu.app to the release
+    needs: [meta, macos-app]
+    # The only conditional the `app_dry_run` input adds: a dry run stops
+    # here with everything built, signed, notarized and stapled.
+    if: needs.meta.outputs.build == 'true' && needs.meta.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: asset-app-darwin-arm64
+          path: dist
+
+      - name: Sanity-check the asset set
+        run: |
+          set -euo pipefail
+          ls -la dist
+          for f in rupu-app-darwin-arm64.dmg rupu-app-darwin-arm64.zip; do
+            test -f "dist/$f"        || { echo "::error::missing $f"; exit 1; }
+            test -f "dist/$f.sha256" || { echo "::error::missing $f.sha256"; exit 1; }
+          done
+          ( cd dist && sha256sum -c ./*.sha256 )
+
+      # release.yml created both releases and force-moved the rolling tag
+      # before this workflow started; this step only ADDS assets. It never
+      # creates a release (a versioned release with only app assets would be
+      # a broken one for `rupu update`) and never touches notes or the
+      # prerelease flag — those are release.yml's.
+      - name: Upload the app assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROLLING: ${{ needs.meta.outputs.rolling_tag }}
+          VERSIONED: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$VERSIONED" >/dev/null 2>&1; then
+            echo "::error::no release for $VERSIONED — release.yml has not published it, so there is nothing to attach rupu.app to"
+            exit 1
+          fi
+          gh release upload "$VERSIONED" dist/* --clobber
+          echo "attached to $VERSIONED"
+
+          # The rolling tag floats. Only put this bundle on it if it still
+          # points at this commit — if a newer release has moved it on since
+          # (a re-publish of an older tag, or two cuts in quick succession),
+          # clobbering its assets would pair a newer CLI with an older app.
+          git fetch --force origin "refs/tags/$ROLLING:refs/tags/$ROLLING"
+          if [ "$(git rev-parse "refs/tags/$ROLLING^{commit}")" = "$(git rev-parse "refs/tags/$VERSIONED^{commit}")" ]; then
+            gh release upload "$ROLLING" dist/* --clobber
+            echo "attached to $ROLLING"
+          else
+            echo "::notice::$ROLLING no longer points at $VERSIONED's commit — leaving its app assets alone"
+          fi

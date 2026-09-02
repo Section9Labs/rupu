@@ -220,6 +220,13 @@ The PR's own gate is the empirical test of the lead. Remaining before closing: a
 release with a published `.app`, and matt's GUI run on the 26.3-built bundle (macOS rule
 7 — a toolchain bump can move rendering behaviour).
 
+**Lane split (follow-up).** The `macos-app` job now lives in `release-app.yml`, a separate
+workflow triggered by `release.yml` completing, with a same-channel change gate. The
+failure mode this issue describes — an app compiler crash reddening or blocking a CLI
+release — is structurally gone: `release.yml` no longer contains, waits on, or can be
+failed by the app build. The Xcode pin above still has to move in lockstep between
+`ci.yml` and `release-app.yml`.
+
 ---
 
 ### I-90 — a sub-agent's ledger has no transcript fallback if its ledger degrades
