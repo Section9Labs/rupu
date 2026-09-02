@@ -2721,23 +2721,35 @@ pub enum PauseError {
 /// for the pattern used to bound it (probe only the newest N distinct
 /// pids) when a caller needs liveness across many rows.
 pub fn pid_is_running(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    run_kill(&["-0"], pid).is_some_and(|output| output.status.success())
 }
 
 /// Send SIGTERM to `pid` via `/bin/kill -TERM`. Returns whether the
 /// signal was delivered successfully.
 fn terminate_pid(pid: u32) -> bool {
+    run_kill(&["-TERM"], pid).is_some_and(|output| output.status.success())
+}
+
+/// Run `/bin/kill <signal> <pid>` with the child's stdio **captured**,
+/// returning its `Output` (or `None` if the binary could not be spawned).
+///
+/// Capturing rather than inheriting is load-bearing, not tidiness.
+/// `/bin/kill` writes to stderr whenever the pid is not signallable
+/// (`kill: <pid>: No such process`), and [`pid_is_running`] is called
+/// per-row on CP list paths over pids that are *expected* to be dead —
+/// every historical standalone run's recorded pid, re-probed on every
+/// `/api/runs` request. With inherited stdio each of those probes printed
+/// a line onto the `rupu cp serve` operator terminal, so a workspace with
+/// N finished runs emitted N lines of `No such process` per request,
+/// forever. The exit status is the whole answer here; the message is
+/// noise.
+fn run_kill(args: &[&str], pid: u32) -> Option<std::process::Output> {
     std::process::Command::new("/bin/kill")
-        .arg("-TERM")
+        .args(args)
         .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
 }
 
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
@@ -4970,6 +4982,28 @@ mod tests {
             }
             other => panic!("expected RunFailed(expired), got {other:?}"),
         }
+    }
+
+    /// `/bin/kill` complains on stderr about a pid it cannot signal. That
+    /// output must land in our pipe, never on the parent's stderr — the
+    /// liveness probe runs per-row on CP list paths over pids that are
+    /// expected to be dead, and inherited stdio turned every `/api/runs`
+    /// request into a burst of `kill: <pid>: No such process` lines on the
+    /// `rupu cp serve` operator terminal.
+    #[test]
+    fn kill_probe_captures_child_stderr_instead_of_inheriting_it() {
+        if !Path::new("/bin/kill").exists() {
+            return;
+        }
+        let output = run_kill(&["-0"], u32::MAX).expect("/bin/kill is spawnable");
+        assert!(
+            !output.status.success(),
+            "u32::MAX must not be a signallable pid"
+        );
+        assert!(
+            !output.stderr.is_empty(),
+            "the child's complaint must be captured, not written to our stderr"
+        );
     }
 
     #[test]

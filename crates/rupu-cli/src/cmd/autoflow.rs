@@ -2182,18 +2182,20 @@ fn load_matching_serve_workers(
 }
 
 fn pid_is_running(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    // Delegate rather than keep a third copy of the probe: the shared one
+    // captures the child's stdio, which a bare `.status()` does not (see
+    // its doc comment — an inherited stderr leaks `/bin/kill`'s
+    // `No such process` onto whatever terminal is hosting us).
+    rupu_orchestrator::runs::pid_is_running(pid)
 }
 
 fn terminate_pid(pid: u32) -> bool {
     std::process::Command::new("/bin/kill")
         .arg("-TERM")
         .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
