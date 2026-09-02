@@ -56,6 +56,83 @@ pub(crate) fn build_remote_command(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Whether `id` is shaped like a locally-minted rupu run id (`run_<ULID>`):
+/// non-empty and `[A-Za-z0-9_]` only.
+///
+/// Every remote command that interpolates a run id UNQUOTED into a
+/// `$HOME/.rupu/...` path — the tail pump's `tail -F` / `cat` commands, the
+/// launch wrapper's stderr redirect, `launch_diagnostics`' `cat` — depends on
+/// this alphabet: it contains no shell metacharacters, so the concatenation
+/// cannot be broken out of, and the paths can't be single-quoted because
+/// `$HOME` has to expand on the remote shell. Ids minted here satisfy it by
+/// construction; ids that arrive from outside (the CP HTTP API, a dispatcher
+/// poll) MUST be checked with this before any such interpolation.
+pub(crate) fn is_safe_run_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The run directory a launched run will populate on the executing host.
+/// Unquoted `$HOME`: must expand remotely. Callers guarantee
+/// [`is_safe_run_id`].
+fn remote_run_dir(run_id: &str) -> String {
+    format!("$HOME/.rupu/runs/{run_id}")
+}
+
+/// Where a detached launch's stderr is captured on the executing host —
+/// `$HOME/.rupu/runs/<run_id>/launch.log`, INSIDE the run directory so it
+/// shares the run's lifecycle: `rupu run delete` / `RunStore::delete` remove
+/// the whole directory, so the logs never accumulate outside their runs.
+/// Callers guarantee [`is_safe_run_id`].
+fn remote_launch_log(run_id: &str) -> String {
+    format!("{}/launch.log", remote_run_dir(run_id))
+}
+
+/// Upper bound on the launch-log excerpt `launch_diagnostics` returns. The
+/// log is the process's whole stderr; the diagnosis of a dead launch is in
+/// its last lines (the `Error: …` a failing `rupu run` prints on exit), so
+/// the excerpt keeps the TAIL.
+pub(crate) const LAUNCH_DIAGNOSTICS_MAX_CHARS: usize = 4096;
+
+/// The last `max_chars` chars of `s` (on a char boundary), prefixed with an
+/// ellipsis when anything was cut.
+pub(crate) fn tail_chars(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let skip = total - max_chars;
+    let start = s
+        .char_indices()
+        .nth(skip)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("…{}", &s[start..])
+}
+
+/// Boundary check on the working dir `rupu __workspace stage` printed.
+///
+/// The value is REMOTE OUTPUT — a line of stdout from the executing host —
+/// and it goes on to be interpolated into three more remote commands (the
+/// launch's `cd`, `__workspace collect`, `__workspace discard`). Each of
+/// those shell-escapes it, so this is defence in depth rather than the only
+/// line: a legitimate stage prints exactly one absolute path, and anything
+/// else (an embedded newline, a control character, a relative path) means a
+/// garbled transport or a host that is not running the helper it claims to,
+/// and is refused HERE so the value never reaches a point of use at all.
+fn validate_staged_working_dir(dir: &str) -> Result<(), HostConnectorError> {
+    if !dir.starts_with('/') {
+        return Err(HostConnectorError::Invalid(format!(
+            "remote stage returned a non-absolute working dir: {dir:?}"
+        )));
+    }
+    if dir.chars().any(char::is_control) {
+        return Err(HostConnectorError::Invalid(format!(
+            "remote stage returned a working dir containing control characters: {dir:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Connect timeout (seconds) for the short request/response ssh calls —
 /// `RemoteExec::run` and `RemoteExec::run_bytes`, which back
 /// `remote_json_rows` / `remote_json_item` / `remote_workflow` / `info` /
@@ -610,9 +687,11 @@ fn classify_remote_cli_failure(stderr: &str) -> HostConnectorError {
 
 /// [`HostConnector`] backed by SSH transport.
 ///
-/// Dispatches workflow/agent runs as detached remote processes via
-/// `setsid … </dev/null >/dev/null 2>&1 &`, mirrors their artifact files
-/// via an `ssh tail -f` pump that routes `==>` file headers to the right
+/// Dispatches workflow/agent runs as detached remote processes (see
+/// [`Self::detach_launch`] for the exact wrapper: `cd` into the staged
+/// working dir when there is one, `setsid`, stdin/stdout to `/dev/null`,
+/// stderr to a per-run `launch.log`), mirrors their artifact files via an
+/// `ssh tail -f` pump that routes `==>` file headers to the right
 /// [`ArtifactFile`] variant, and issues control operations as one-shot
 /// remote `rupu workflow` commands.  Auth is entirely delegated to the
 /// system `ssh`; rupu stores no key material.
@@ -719,10 +798,81 @@ impl SshHostConnector {
         a
     }
 
-    /// Wrap a shell-escaped remote command so the run is detached and
-    /// survives the SSH session closing.
+    /// Wrap a shell-escaped remote control command (`rupu workflow resume`)
+    /// so it is detached and survives the SSH session closing. Plain
+    /// wrapper: no cwd, no log — the run it resumes already has its
+    /// lifecycle on the host. Launches use [`Self::detach_launch`].
     fn detach(remote_cmd: &str) -> String {
         format!("setsid {remote_cmd} </dev/null >/dev/null 2>&1 &")
+    }
+
+    /// Wrap a shell-escaped remote launch (`rupu run …` / `rupu workflow run
+    /// …`) so the run is detached, executes in `working_dir` when one was
+    /// staged, and leaves its stderr on the host where a dead launch can be
+    /// read back ([`HostConnector::launch_diagnostics`]).
+    ///
+    /// Shape (one line; `<log>` = `$HOME/.rupu/runs/<run_id>/launch.log`):
+    ///
+    /// ```text
+    /// mkdir -p $HOME/.rupu/runs/<run_id> && (umask 077; : > <log>) && \
+    ///   cd '<working_dir>' && (setsid <remote_cmd> </dev/null >/dev/null 2>><log> &)
+    /// ```
+    ///
+    /// with the `cd '<working_dir>' &&` segment present only when
+    /// `working_dir` is `Some`. Each piece is load-bearing:
+    ///
+    /// - **`cd` before the launch.** `rupu run` resolves its workspace from
+    ///   the process cwd (`std::env::current_dir()` → workspace upsert →
+    ///   `workspace_path`). Without the `cd` a `workspace: sync` step stages
+    ///   its tree and then runs the agent in the login `$HOME` — the delta is
+    ///   collected from a directory the agent never touched. `None` keeps
+    ///   the self-contained path's cwd exactly as before.
+    /// - **Only the `setsid` is backgrounded** — the `mkdir`/log-create/`cd`
+    ///   run in the ssh session's foreground, so a failure there (staged dir
+    ///   vanished, unwritable `$HOME`) is a non-zero ssh exit that the
+    ///   launch reports, instead of a "successful" detach with no process
+    ///   behind it. The subshell exits immediately after backgrounding;
+    ///   nothing keeps the ssh channel open.
+    /// - **stderr → per-run log, stdout → `/dev/null`.** Everything a dying
+    ///   `rupu` prints (`Error: …`, clap usage, `warn`-level tracing) goes
+    ///   to stderr; stdout for an agent run is the rendered transcript, which
+    ///   the tail pump already mirrors. The log lives inside the run dir so
+    ///   it is removed with the run, and it is created at mode 0600 (the
+    ///   `umask 077` is scoped to its own subshell, so the launched process
+    ///   inherits the login umask — files the agent writes into the staged
+    ///   tree keep their normal modes). The run dir is pre-created here;
+    ///   `RunStore::create` uses `create_dir_all` and keys existence on
+    ///   `run.json`, and `RunStore::list` skips dirs without one, so a
+    ///   pre-existing empty dir changes nothing for the remote `rupu`.
+    ///
+    /// **Trust boundary.** `working_dir` is remote output (`stage_workspace`
+    /// echoes the host's stdout) and is `shell_escape`d — any content is
+    /// inert inside the single quotes. `run_id` is interpolated RAW into the
+    /// `$HOME/...` paths because `$HOME` must expand on the remote shell;
+    /// that is only safe under [`is_safe_run_id`], which this checks and
+    /// refuses to build the command without. Launch ids are minted locally
+    /// (`run_<ULID>`) so the refusal never fires in practice; it is the
+    /// invariant made explicit at the point that depends on it.
+    fn detach_launch(
+        remote_cmd: &str,
+        run_id: &str,
+        working_dir: Option<&str>,
+    ) -> Result<String, HostConnectorError> {
+        if !is_safe_run_id(run_id) {
+            return Err(HostConnectorError::Invalid(format!(
+                "refusing to launch: run id {run_id:?} is not [A-Za-z0-9_]"
+            )));
+        }
+        let dir = remote_run_dir(run_id);
+        let log = remote_launch_log(run_id);
+        let mut cmd = format!("mkdir -p {dir} && (umask 077; : > {log}) && ");
+        if let Some(wd) = working_dir {
+            cmd.push_str(&format!("cd {} && ", shell_escape(wd)));
+        }
+        cmd.push_str(&format!(
+            "(setsid {remote_cmd} </dev/null >/dev/null 2>>{log} &)"
+        ));
+        Ok(cmd)
     }
 
     /// Spawn a background tokio task that tails the JSONL artifact files
@@ -1108,13 +1258,16 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
         };
 
+        // Build the remote command BEFORE creating the mirror run: a refused
+        // build (see `detach_launch`) must not leave a Running mirror record
+        // with no executor behind it.
+        let argv = Self::workflow_argv(&req, &run_id);
+        let remote_cmd = build_remote_command(&argv);
+        let detached = Self::detach_launch(&remote_cmd, &run_id, req.working_dir.as_deref())?;
+
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-
-        let argv = Self::workflow_argv(&req, &run_id);
-        let remote_cmd = build_remote_command(&argv);
-        let detached = Self::detach(&remote_cmd);
 
         let out = match self.exec.run(&detached).await {
             Ok(o) => o,
@@ -1149,13 +1302,15 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
         };
 
+        // Build the remote command BEFORE creating the mirror run — see
+        // `launch_run`.
+        let argv = Self::agent_argv(&req, &run_id);
+        let remote_cmd = build_remote_command(&argv);
+        let detached = Self::detach_launch(&remote_cmd, &run_id, req.working_dir.as_deref())?;
+
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-
-        let argv = Self::agent_argv(&req, &run_id);
-        let remote_cmd = build_remote_command(&argv);
-        let detached = Self::detach(&remote_cmd);
 
         let out = match self.exec.run(&detached).await {
             Ok(o) => o,
@@ -1421,6 +1576,30 @@ impl HostConnector for SshHostConnector {
     /// remote's own in-process executor genuinely honors the pause at its
     /// next safe boundary. Quick, like `cancel`/`approve`/`reject` — no
     /// detach needed.
+    /// `cat` the per-run `launch.log` that [`Self::detach_launch`] pointed the
+    /// detached process's stderr at. `None` when the log is absent or empty
+    /// (the launch is fine, or hasn't written anything yet), when the host
+    /// can't be reached, or when `run_id` fails [`is_safe_run_id`] — this id
+    /// arrives from callers, not from our own minting, and is interpolated
+    /// unquoted into a `$HOME/...` path, so an id outside the alphabet is
+    /// refused without touching the host. The excerpt is bounded to the last
+    /// [`LAUNCH_DIAGNOSTICS_MAX_CHARS`].
+    async fn launch_diagnostics(&self, run_id: &str) -> Option<String> {
+        if !is_safe_run_id(run_id) {
+            return None;
+        }
+        let cmd = format!("cat {}", remote_launch_log(run_id));
+        let out = self.exec.run(&cmd).await.ok()?;
+        if !out.success {
+            return None;
+        }
+        let text = out.stdout.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(tail_chars(text, LAUNCH_DIAGNOSTICS_MAX_CHARS))
+    }
+
     async fn pause_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         self.remote_workflow(&["pause", run_id]).await
     }
@@ -1845,6 +2024,9 @@ impl HostConnector for SshHostConnector {
                 "remote stage returned no working dir".into(),
             ));
         }
+        // Remote output enters the process here; check it once, at the
+        // boundary, rather than trusting it at each later point of use.
+        validate_staged_working_dir(dir)?;
         Ok(dir.to_string())
     }
 
@@ -2083,6 +2265,10 @@ mod tests {
         /// If set, returned as stdout for a `rupu … run show <id>` command
         /// (`get_run`), so a test can drive the dispatcher's poll sequence.
         show_stdout: Option<String>,
+        /// If set, returned as stdout for a `cat …/runs/<id>/launch.log`
+        /// command (`launch_diagnostics`) — the remote process's captured
+        /// stderr. `None` → empty stdout, i.e. a launch that wrote nothing.
+        launch_log_stdout: Option<String>,
         /// Scripted result for `run_bytes`, taken on first call.
         run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
         /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
@@ -2100,6 +2286,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 show_stdout: None,
+                launch_log_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -2115,6 +2302,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 show_stdout: None,
+                launch_log_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -2132,6 +2320,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 show_stdout: None,
+                launch_log_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -2149,6 +2338,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 show_stdout: None,
+                launch_log_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
                 last_bytes_call: Default::default(),
             }
@@ -2165,6 +2355,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 show_stdout: None,
+                launch_log_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
                 last_bytes_call: Default::default(),
             }
@@ -2188,7 +2379,9 @@ mod tests {
                 let stdout = if remote.contains("'show'") {
                     self.show_stdout.clone().unwrap_or_default()
                 } else if remote.starts_with("cat ") {
-                    if remote.contains("/transcripts/") {
+                    if remote.contains("/launch.log") {
+                        self.launch_log_stdout.clone().unwrap_or_default()
+                    } else if remote.contains("/transcripts/") {
                         if let Some(d) = self.cat_transcript_delay {
                             tokio::time::sleep(d).await;
                         }
@@ -3725,7 +3918,315 @@ mod tests {
         );
     }
 
+    // ── Launch cwd + launch-log tests ────────────────────────────────────────
+    //
+    // Two defects in one family — work dispatched correctly, then the remote
+    // process launched without the context it was prepared for:
+    //  (1) `working_dir` was threaded through the launch request and never
+    //      read, so the remote `rupu run` executed in the login `$HOME` and a
+    //      `workspace: sync` step's delta came from a dir the agent never
+    //      touched;
+    //  (2) the detached command sent stderr to `/dev/null`, so a launch that
+    //      died instantly left no trace anywhere.
+
+    const STAGED_WD: &str = "/cache/workspace-sync/01J/work";
+
+    #[test]
+    fn is_safe_run_id_accepts_minted_ids_and_rejects_metacharacters() {
+        assert!(is_safe_run_id(&format!("run_{}", Ulid::new())));
+        assert!(is_safe_run_id("run_01HXYZ_ok"));
+        for bad in [
+            "",
+            "run_01X;x",
+            "run 01X",
+            "run_01X/..",
+            "run_$HOME",
+            "run_01X\n",
+            "run_`id`",
+        ] {
+            assert!(!is_safe_run_id(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn detach_launch_cds_into_working_dir_before_setsid() {
+        let cmd = SshHostConnector::detach_launch("'rupu' 'run' 'a'", "run_01X", Some(STAGED_WD))
+            .unwrap();
+        let cd = cmd
+            .find(&format!("cd '{STAGED_WD}' && "))
+            .unwrap_or_else(|| panic!("launch must cd into the staged dir: {cmd}"));
+        let setsid = cmd
+            .find("setsid 'rupu' 'run' 'a'")
+            .unwrap_or_else(|| panic!("launch must still be detached via setsid: {cmd}"));
+        assert!(cd < setsid, "cd must precede the launch: {cmd}");
+    }
+
+    #[test]
+    fn detach_launch_without_working_dir_emits_no_cd() {
+        let cmd = SshHostConnector::detach_launch("'rupu' 'run' 'a'", "run_01X", None).unwrap();
+        assert!(
+            !cmd.contains("cd "),
+            "self-contained launch must keep the login cwd: {cmd}"
+        );
+        assert!(
+            cmd.contains("setsid 'rupu' 'run' 'a' </dev/null >/dev/null"),
+            "detach shape must be unchanged: {cmd}"
+        );
+    }
+
+    #[test]
+    fn detach_launch_quotes_hostile_working_dir_inert() {
+        // Every metacharacter class in one value: single quote + terminator,
+        // comment, both substitution forms, double quotes, newline, a
+        // redirection, a glob, spaces.
+        let hostile = "/tmp/x'; rm -rf / #$(id)`id` \"q\"\nnext >out *";
+        let cmd =
+            SshHostConnector::detach_launch("'rupu' 'run' 'a'", "run_01X", Some(hostile)).unwrap();
+        let quoted = shell_escape(hostile);
+        assert!(
+            cmd.contains(&format!("cd {quoted} && ")),
+            "working_dir must appear as ONE shell-escaped literal: {cmd}"
+        );
+        // The segment between `cd ` and the launch is exactly that literal —
+        // nothing of the value leaks past the closing quote.
+        let after_cd = &cmd[cmd.find("cd ").unwrap() + 3..];
+        let end = after_cd
+            .find(" && (setsid")
+            .unwrap_or_else(|| panic!("launch must follow the cd: {cmd}"));
+        assert_eq!(&after_cd[..end], quoted);
+        // Remove the one quoted literal; no hostile fragment may survive
+        // outside it.
+        let rest = cmd.replacen(&quoted, "<WD>", 1);
+        for needle in ["rm -rf", "$(", "`", "\n", "\"", ">out", " *", "#"] {
+            assert!(
+                !rest.contains(needle),
+                "{needle:?} escaped the quotes: {rest}"
+            );
+        }
+    }
+
+    #[test]
+    fn detach_launch_refuses_unsafe_run_id() {
+        for bad in [
+            "",
+            "run_01X; rm -rf /",
+            "run_$(id)",
+            "run 01X",
+            "run_01X/../x",
+        ] {
+            let err = SshHostConnector::detach_launch("'rupu'", bad, None).unwrap_err();
+            assert!(
+                matches!(err, HostConnectorError::Invalid(_)),
+                "{bad:?} → {err:?}"
+            );
+        }
+        assert!(SshHostConnector::detach_launch("'rupu'", "run_01HXYZ_ok", None).is_ok());
+    }
+
+    #[test]
+    fn detach_launch_captures_stderr_in_per_run_log_not_dev_null() {
+        let cmd = SshHostConnector::detach_launch("'rupu' 'run' 'a'", "run_01X", None).unwrap();
+        let log = "$HOME/.rupu/runs/run_01X/launch.log";
+        assert!(
+            cmd.contains(&format!("2>>{log} &)")),
+            "stderr must append to the per-run log: {cmd}"
+        );
+        assert!(
+            !cmd.contains("2>&1") && !cmd.contains("2>/dev/null"),
+            "stderr must not be discarded: {cmd}"
+        );
+        assert!(
+            cmd.starts_with("mkdir -p $HOME/.rupu/runs/run_01X && "),
+            "run dir must exist before the redirect opens the log: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("(umask 077; : > {log}) && ")),
+            "log must be created 0600 inside its own subshell: {cmd}"
+        );
+        // stdin/stdout exactly as before.
+        assert!(cmd.contains("</dev/null >/dev/null"), "{cmd}");
+        // Only the setsid is backgrounded: the `&` closes the subshell and the
+        // mkdir / log-create run in the ssh session's foreground, so their
+        // failure is a non-zero ssh exit rather than a silent "success".
+        assert!(cmd.ends_with(" &)"), "{cmd}");
+        let single_amps = cmd.matches('&').count() - 2 * cmd.matches("&&").count();
+        assert_eq!(single_amps, 1, "exactly one backgrounding `&`: {cmd}");
+    }
+
+    #[tokio::test]
+    async fn launch_agent_dispatches_in_staged_working_dir() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let run_id = conn
+            .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "reviewer".into(),
+                prompt: Some("go".into()),
+                mode: None,
+                target: None,
+                working_dir: Some(STAGED_WD.into()),
+            })
+            .await
+            .unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        let launch = cmds
+            .iter()
+            .find(|c| c.contains("setsid"))
+            .unwrap_or_else(|| panic!("no detached launch in {cmds:?}"));
+        assert!(
+            launch.contains(&format!(
+                "cd '{STAGED_WD}' && (setsid 'rupu' 'run' 'reviewer'"
+            )),
+            "agent launch must run in the staged dir: {launch}"
+        );
+        assert!(
+            launch.contains(&format!("2>>$HOME/.rupu/runs/{run_id}/launch.log")),
+            "agent launch must keep its stderr: {launch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_run_dispatches_in_working_dir() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        conn.launch_run(crate::launcher::LaunchRequest {
+            workflow: "deploy".into(),
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: Some(STAGED_WD.into()),
+        })
+        .await
+        .unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        let launch = cmds
+            .iter()
+            .find(|c| c.contains("setsid"))
+            .unwrap_or_else(|| panic!("no detached launch in {cmds:?}"));
+        assert!(
+            launch.contains(&format!(
+                "cd '{STAGED_WD}' && (setsid 'rupu' 'workflow' 'run' 'deploy'"
+            )),
+            "workflow launch must run in the working dir: {launch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_diagnostics_returns_remote_launch_log_tail() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.launch_log_stdout =
+            Some("warning: something benign\nError: agent `reviewer` not found\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let diag = conn
+            .launch_diagnostics("run_01X")
+            .await
+            .expect("captured stderr must surface");
+        assert!(diag.contains("Error: agent `reviewer` not found"), "{diag}");
+        let cmds = fake.commands.lock().unwrap();
+        assert_eq!(
+            cmds.as_slice(),
+            ["cat $HOME/.rupu/runs/run_01X/launch.log"],
+            "must read exactly the per-run log detach_launch writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_diagnostics_reads_the_log_and_is_none_when_empty() {
+        // `launch_log_stdout: None` → the fake answers an empty stdout: a
+        // healthy launch that wrote nothing to stderr.
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        assert_eq!(conn.launch_diagnostics("run_01X").await, None);
+        // Silence must mean "looked and found nothing", not "didn't look".
+        assert!(
+            fake.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "cat $HOME/.rupu/runs/run_01X/launch.log"),
+            "the log must actually be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_diagnostics_refuses_unsafe_run_id_without_shelling_out() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.launch_log_stdout = Some("would leak".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        for bad in ["run_01X; rm -rf /", "run_$(id)", "../etc/passwd", ""] {
+            assert_eq!(conn.launch_diagnostics(bad).await, None, "{bad:?}");
+        }
+        assert!(
+            fake.commands.lock().unwrap().is_empty(),
+            "an id outside [A-Za-z0-9_] must never reach the host: {:?}",
+            fake.commands.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_diagnostics_bounds_excerpt_to_the_tail() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.launch_log_stdout = Some(format!(
+            "{}\nError: the actual reason",
+            "x".repeat(LAUNCH_DIAGNOSTICS_MAX_CHARS * 2)
+        ));
+        let fake = std::sync::Arc::new(fake);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let diag = conn.launch_diagnostics("run_01X").await.unwrap();
+        assert!(
+            diag.chars().count() <= LAUNCH_DIAGNOSTICS_MAX_CHARS + 1,
+            "excerpt must be bounded (got {} chars)",
+            diag.chars().count()
+        );
+        assert!(
+            diag.starts_with('…'),
+            "truncation must be marked: {diag:.20}"
+        );
+        assert!(
+            diag.ends_with("Error: the actual reason"),
+            "the TAIL carries the diagnosis and must survive"
+        );
+    }
+
+    #[test]
+    fn tail_chars_keeps_the_tail_on_char_boundaries() {
+        assert_eq!(tail_chars("abc", 5), "abc");
+        assert_eq!(tail_chars("abc", 3), "abc");
+        assert_eq!(tail_chars("abcdef", 3), "…def");
+        assert_eq!(tail_chars("ééé", 2), "…éé");
+    }
+
     // ── Workspace sync (stage/collect/discard) tests ─────────────────────────
+
+    #[tokio::test]
+    async fn ssh_stage_rejects_multiline_working_dir() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(
+            b"/cache/workspace-sync/x/work\nrm -rf /\n".to_vec(),
+        ));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn.stage_workspace(b"PAYLOAD".to_vec()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_rejects_relative_working_dir() {
+        let fake =
+            std::sync::Arc::new(FakeExec::with_bytes_ok(b"workspace-sync/x/work\n".to_vec()));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn.stage_workspace(b"PAYLOAD".to_vec()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+    }
 
     #[tokio::test]
     async fn ssh_stage_returns_working_dir_line() {

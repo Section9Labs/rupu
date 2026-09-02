@@ -157,6 +157,22 @@ pub trait HostConnector: Send + Sync {
     /// bound the wait and log if the bound is hit.
     async fn await_run_mirror(&self, _run_id: &str) {}
 
+    /// Best-effort diagnostics for a launch this connector ACCEPTED but whose
+    /// run never showed up through [`get_run`](Self::get_run): whatever the
+    /// detached remote process wrote to stderr before dying (wrong cwd,
+    /// missing agent, bad flag, unresolvable provider). `launch_*` returning
+    /// `Ok` means the detach succeeded, not that the run started, so a
+    /// caller that gives up polling asks here for the reason and folds it
+    /// into its error instead of reporting a bare registration timeout.
+    ///
+    /// `None` means "nothing recorded" — the transport doesn't capture launch
+    /// stderr (the default), the log is empty, or the host can't be reached.
+    /// Implementations must bound the excerpt and must never fail loudly:
+    /// this is consulted while a real error is already being reported.
+    async fn launch_diagnostics(&self, _run_id: &str) -> Option<String> {
+        None
+    }
+
     /// Cooperatively pause an in-flight (`Pending`/`Running`) run, leaving it
     /// non-terminal and resumable via [`resume_run`](Self::resume_run).
     ///
