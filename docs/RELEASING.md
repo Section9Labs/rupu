@@ -3,11 +3,22 @@
 Releases are cut by GitHub Actions, on a schedule. Nothing is built or
 uploaded from a laptop.
 
-There is exactly one publishing workflow — **`.github/workflows/release.yml`**,
-triggered by pushing a `v*` tag. It builds every platform, signs and notarizes
-the macOS binaries, publishes the GitHub release and the `.deb`/`.rpm` +
-apt/yum repos, and (for **stable** tags only) syncs the Nix flake, the AUR
-`PKGBUILD` and the Homebrew formula.
+The CLI is published by **`.github/workflows/release.yml`**, triggered by
+pushing a `v*` tag. It builds every platform, signs and notarizes the macOS
+binary, publishes the GitHub release and the `.deb`/`.rpm` + apt/yum repos,
+and (for **stable** tags only) syncs the Nix flake, the AUR `PKGBUILD` and the
+Homebrew formula.
+
+rupu.app has its own lane, **`release-app.yml`**, which is triggered by
+`release.yml` *completing successfully* rather than by the tag itself. It
+attaches `rupu-app-darwin-arm64.dmg`/`.zip` to the release `release.yml` just
+made — and only when something under `apps/rupu-macos/` (or the packaging
+script, the `Makefile`, or the lane itself) changed since the newest release
+*on the same channel* that carries an app. A CLI-only change therefore never
+builds, notarizes, or can be failed by, the app; and a release with no
+`rupu-app-*` asset simply means the app did not change — the rolling tag still
+carries the newest bundle. The app's own version string lags the CLI's between
+app changes; its minimum-CLI-version gate is what actually has to be right.
 
 Two scheduled workflows do nothing but decide which tag to push:
 
@@ -117,8 +128,17 @@ gh workflow run release-stable.yml -f tag=v0.72.0-beta.3
 # Same, but only relax the soak window rather than naming a tag.
 gh workflow run release-stable.yml -f soak_days=0
 
-# Re-publish an existing tag (a failed upload, a runner flake).
+# Re-publish an existing tag (a failed upload, a runner flake). CLI only —
+# a dispatch runs from main, so release-app.yml cannot learn the tag from it.
 gh workflow run release.yml -f tag=v0.72.0
+
+# Build and attach rupu.app to an existing tag's release. Always builds
+# (the change gate only applies to the automatic path).
+gh workflow run release-app.yml -f tag=v0.72.0
+
+# Dry-run the app lane against an existing tag: build, sign, notarize and
+# staple exactly as a release would, publish nothing.
+gh workflow run release-app.yml -f tag=v0.72.0 -f app_dry_run=true
 ```
 
 A bad value for `tag` or `soak_days` is operator error and fails the run
@@ -165,8 +185,9 @@ Set under repo Settings → Secrets and variables → Actions.
   App Store Connect API key for `notarytool`. The CLI binary has no
   `stapler` step — bare command-line binaries cannot be stapled, so its
   ticket is served online and Gatekeeper checks it on first run. rupu.app
-  IS stapled (the `macos-app` job staples both the `.app` bundle and the
-  DMG after notarization; app bundles and disk images accept tickets).
+  IS stapled (`release-app.yml`'s `macos-app` job staples both the `.app`
+  bundle and the DMG after notarization; app bundles and disk images accept
+  tickets). Both workflows read the same Apple secrets.
 - `GPG_PRIVATE_KEY`, `GPG_KEY_ID` — signs the apt/yum repository metadata.
 - `AUR_SSH_PRIVATE_KEY`, `AUR_USERNAME`, `AUR_EMAIL` — deploy key and commit
   identity for the `rupuaur` AUR account. `.SRCINFO` is regenerated inside a
@@ -196,9 +217,12 @@ one repository, none expire, and revoking one touches no other account.
 Assets are bare binaries (`rupu-darwin-arm64`, `rupu-linux-x64`,
 `rupu-linux-arm64`), the macOS app (`rupu-app-darwin-arm64.dmg` and `.zip` —
 signed, notarized, stapled), plus `.deb`/`.rpm` packages, each with a
-`.sha256`. Smoke the app asset too: download the DMG, `hdiutil attach` it,
-and `spctl -a -t exec -vv` the mounted `rupu.app` — Gatekeeper must accept
-it with `source=Notarized Developer ID`:
+`.sha256`. The app assets arrive a few minutes after the CLI ones, from
+`release-app.yml`, and only on releases where the app changed (check that
+workflow's run for the "unchanged since" notice if they are absent). When
+they are there, smoke them too: download the DMG, `hdiutil attach` it, and
+`spctl -a -t exec -vv` the mounted `rupu.app` — Gatekeeper must accept it
+with `source=Notarized Developer ID`:
 
 ```bash
 TAG=v0.72.0
