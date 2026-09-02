@@ -180,22 +180,12 @@ impl NodeMirror {
         match file {
             ArtifactFile::Events => {
                 let path = self.run_store.events_path(run_id);
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?;
+                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
                 writeln!(f, "{line}")?;
             }
             ArtifactFile::StepResults => {
-                let path = self
-                    .run_store
-                    .root
-                    .join(run_id)
-                    .join("step_results.jsonl");
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?;
+                let path = self.run_store.root.join(run_id).join("step_results.jsonl");
+                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
                 writeln!(f, "{line}")?;
             }
             ArtifactFile::UnitCheckpoints => {
@@ -204,10 +194,15 @@ impl NodeMirror {
                     .root
                     .join(run_id)
                     .join("unit_checkpoints.jsonl");
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?;
+                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+                writeln!(f, "{line}")?;
+            }
+            ArtifactFile::Transcript => {
+                let path = self.transcript_mirror_path(run_id);
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
                 writeln!(f, "{line}")?;
             }
             ArtifactFile::RunJson => {
@@ -240,6 +235,67 @@ impl NodeMirror {
         Ok(())
     }
 
+    /// The CP-local path the run's mirrored agent transcript is written to.
+    ///
+    /// Mirrors the coordinator's own layout: the store root is
+    /// `<global>/runs`, so the transcript lands at
+    /// `<global>/transcripts/<run_id>.jsonl` — the exact path a locally-run
+    /// agent's transcript would occupy, inside `/api/transcript`'s allowed
+    /// roots (the CP global dir). `run_id` is validated by every caller
+    /// before this is used for I/O.
+    pub fn transcript_mirror_path(&self, run_id: &str) -> PathBuf {
+        let global = self.run_store.root.parent().unwrap_or(&self.run_store.root);
+        global.join("transcripts").join(format!("{run_id}.jsonl"))
+    }
+
+    /// Truncate (or create empty) the mirrored transcript for `run_id`.
+    ///
+    /// Called by the tail pump when it first starts replaying the remote
+    /// transcript: `tail -n +1 -F` always replays the file from byte zero,
+    /// so a respawned pump would otherwise append a second copy of every
+    /// already-mirrored line. Ownership rules match [`NodeMirror::append`].
+    pub fn reset_transcript(&self, run_id: &str, node_id: &str) -> Result<(), MirrorError> {
+        validate_run_id(run_id)?;
+        let existing = self.run_store.load(run_id)?;
+        if existing.worker_id.as_deref() != Some(node_id) {
+            return Err(MirrorError::WrongNode(run_id.to_string()));
+        }
+        let path = self.transcript_mirror_path(run_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::File::create(path)?;
+        Ok(())
+    }
+
+    /// Overwrite the mirrored transcript for `run_id` with `content`.
+    ///
+    /// Used by the tail pump's terminal path: once the remote run reaches a
+    /// terminal status, a one-shot `cat` of the remote transcript replaces
+    /// the tailed copy wholesale. This closes the gap where the pump's
+    /// select loop is torn down with transcript lines still buffered in the
+    /// tail stream — the final copy is authoritative and complete, and the
+    /// overwrite also makes replays idempotent. Ownership rules match
+    /// [`NodeMirror::append`].
+    pub fn replace_transcript(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        content: &str,
+    ) -> Result<(), MirrorError> {
+        validate_run_id(run_id)?;
+        let existing = self.run_store.load(run_id)?;
+        if existing.worker_id.as_deref() != Some(node_id) {
+            return Err(MirrorError::WrongNode(run_id.to_string()));
+        }
+        let path = self.transcript_mirror_path(run_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
     /// Transition `run_id` to `status` and set `finished_at = now()`.
     ///
     /// Only the node that created the run (identified by `node_id`) may
@@ -263,7 +319,73 @@ impl NodeMirror {
         record.status = parse_status(status);
         record.finished_at = Some(Utc::now());
         self.run_store.update(&record)?;
+        self.synthesize_transcript_step_result(&record);
         Ok(())
+    }
+
+    /// Make a mirrored agent transcript reachable through the existing read
+    /// endpoints by synthesizing a single step-result row for it.
+    ///
+    /// A placed agent run produces NO step results on the executing host —
+    /// its only content is the transcript. But every CP read path locates
+    /// transcripts through `step_results.jsonl` rows: `/api/runs/:id`'s
+    /// `steps`, the run-graph's per-node `transcript_path` (matched against
+    /// `agent_run_dag`'s single `"agent"` node), and the usage rollup
+    /// (`usage::run_transcript_paths`). Without a row, the mirrored bytes
+    /// are unreachable — the run renders with `steps: 0` and no transcript.
+    ///
+    /// So: when a run finishes with an empty `step_results.jsonl` and a
+    /// non-empty mirrored transcript on disk, append one linear step-result
+    /// row whose `step_id` is `"agent"` (matching the synthesized DAG node)
+    /// and whose `transcript_path` is the CP-local mirrored copy. Workflow
+    /// runs never hit this: they don't produce a `Transcript` artifact, so
+    /// the mirrored transcript file doesn't exist for them. The empty-
+    /// step-results guard also makes a repeated `finish` idempotent.
+    ///
+    /// Best-effort by design: `finish`'s status transition must never fail
+    /// because this bookkeeping did.
+    fn synthesize_transcript_step_result(&self, record: &RunRecord) {
+        let transcript = self.transcript_mirror_path(&record.id);
+        let has_transcript = std::fs::metadata(&transcript)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+        if !has_transcript {
+            return;
+        }
+        let steps_empty = self
+            .run_store
+            .read_step_results(&record.id)
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        if !steps_empty {
+            return;
+        }
+        let row = rupu_orchestrator::StepResultRecord {
+            // Matches the single node `api::graph::agent_run_dag` synthesizes
+            // for bare agent runs — the graph joins on step_id.
+            step_id: "agent".to_string(),
+            run_id: record.id.clone(),
+            transcript_path: transcript,
+            output: record.final_output.clone().unwrap_or_default(),
+            success: record.status == RunStatus::Completed,
+            skipped: false,
+            rendered_prompt: String::new(),
+            kind: rupu_orchestrator::StepKind::default(),
+            items: Vec::new(),
+            findings: Vec::new(),
+            iterations: 0,
+            resolved: true,
+            finished_at: record.finished_at.unwrap_or_else(Utc::now),
+            loop_iteration: None,
+            run_outcome: None,
+        };
+        if let Err(e) = self.run_store.append_step_result(&record.id, &row) {
+            tracing::warn!(
+                run_id = %record.id,
+                error = %e,
+                "failed to synthesize step-result row for mirrored transcript"
+            );
+        }
     }
 }
 

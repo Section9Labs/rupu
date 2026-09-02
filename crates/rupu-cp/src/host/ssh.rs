@@ -641,8 +641,9 @@ impl SshHostConnector {
     }
 
     /// Spawn a background tokio task that tails the JSONL artifact files
-    /// for `run_id` on the remote host and feeds each line to
-    /// [`NodeMirror::append`].
+    /// for `run_id` on the remote host — plus the run's agent transcript,
+    /// which lives in a different directory (`$HOME/.rupu/transcripts/`) —
+    /// and feeds each line to [`NodeMirror::append`].
     ///
     /// `tail -n +1 -F` emits `==> <path> <==` headers when switching files;
     /// [`parse_tail_marker`] extracts the path, which determines which
@@ -677,20 +678,43 @@ impl SshHostConnector {
         // every token (as build_remote_command does) would prevent $HOME from
         // expanding, producing a literal path that never exists on the remote.
         // run_id contains only [A-Za-z0-9_] (ULID prefix), so unquoted
-        // concatenation is safe.
+        // concatenation is safe. That invariant covers ALL FOUR tailed paths
+        // and both cat commands below: run_id is their only variable component.
+        //
+        // The fourth path is the run's agent transcript, which lives OUTSIDE
+        // the run directory (`transcripts/<run_id>.jsonl`, not
+        // `runs/<run_id>/…`) — a placed agent run's only real content. It
+        // doesn't exist for workflow runs (and doesn't exist yet at spawn
+        // time even for agent runs); `tail -F` tolerates a missing path and
+        // picks the file up from byte zero when it appears, so the other
+        // artifacts mirror regardless.
         let tail_cmd = format!(
             "tail -n +1 -F \
              $HOME/.rupu/runs/{run_id}/events.jsonl \
              $HOME/.rupu/runs/{run_id}/step_results.jsonl \
-             $HOME/.rupu/runs/{run_id}/unit_checkpoints.jsonl"
+             $HOME/.rupu/runs/{run_id}/unit_checkpoints.jsonl \
+             $HOME/.rupu/transcripts/{run_id}.jsonl"
         );
         let cat_cmd = format!("cat $HOME/.rupu/runs/{run_id}/run.json");
+        let cat_transcript_cmd = format!("cat $HOME/.rupu/transcripts/{run_id}.jsonl");
+        // `==> <path> <==` suffix that identifies the transcript among the
+        // tailed files. The directory component makes mis-attribution
+        // impossible: none of the `runs/<run_id>/*.jsonl` artifacts can end
+        // with `transcripts/<run_id>.jsonl`, and the transcript can't end
+        // with `events.jsonl` / `step_results.jsonl` / `unit_checkpoints.jsonl`.
+        let transcript_suffix = format!("transcripts/{run_id}.jsonl");
 
         tokio::spawn(async move {
             let mut current: Option<ArtifactFile> = None;
             // Set to true when the interval-poll arm observes a terminal status
             // and calls mirror.finish.  Used below to skip the fallback cat.
             let mut terminal_seen = false;
+            // Set once the transcript's first `==>` header is seen. `tail -n +1`
+            // replays the file from byte zero, so the FIRST header (the initial
+            // full replay) truncates the mirrored copy — a respawned pump then
+            // overwrites instead of appending a duplicate copy. Later headers
+            // are ordinary file switches carrying only new lines: no truncate.
+            let mut transcript_replayed = false;
 
             if let Ok(mut stream) = exec.spawn_lines(&tail_cmd) {
                 let mut interval = tokio::time::interval(PUMP_POLL_INTERVAL);
@@ -711,6 +735,17 @@ impl SshHostConnector {
                                             Some(ArtifactFile::StepResults)
                                         } else if path.ends_with("unit_checkpoints.jsonl") {
                                             Some(ArtifactFile::UnitCheckpoints)
+                                        } else if path.ends_with(&transcript_suffix) {
+                                            if !transcript_replayed {
+                                                transcript_replayed = true;
+                                                // First header = full replay from
+                                                // byte zero — start from a clean
+                                                // mirrored copy (see the flag's
+                                                // declaration).
+                                                let _ = mirror
+                                                    .reset_transcript(&run_id, &host_id);
+                                            }
+                                            Some(ArtifactFile::Transcript)
                                         } else {
                                             None
                                         };
@@ -749,6 +784,26 @@ impl SshHostConnector {
                                                     ArtifactFile::RunJson,
                                                     &trimmed,
                                                 );
+                                                // Terminal transcript catch-up:
+                                                // the select loop may tear down
+                                                // with transcript lines still
+                                                // buffered in the tail stream. A
+                                                // one-shot cat of the (small,
+                                                // ~150KB) remote transcript
+                                                // replaces the tailed copy with
+                                                // the complete final content.
+                                                // Missing file (workflow run, or
+                                                // no transcript written) → cat
+                                                // fails → skip, harmless.
+                                                if let Ok(t) =
+                                                    exec.run(&cat_transcript_cmd).await
+                                                {
+                                                    if t.success && !t.stdout.is_empty() {
+                                                        let _ = mirror.replace_transcript(
+                                                            &run_id, &host_id, &t.stdout,
+                                                        );
+                                                    }
+                                                }
                                                 let _ = mirror.finish(
                                                     &run_id, &host_id, &status,
                                                 );
@@ -772,6 +827,16 @@ impl SshHostConnector {
             // drop, spawn failure, etc.), do a best-effort final cat + finish
             // so the run is never stuck in Running.
             if !terminal_seen {
+                // Same terminal transcript catch-up as the interval arm above:
+                // the stream ended without a clean terminal detection, so any
+                // buffered-but-undelivered transcript lines are gone. Replace
+                // the mirrored copy with the remote's full content while we
+                // can still reach the host. Best-effort, like the run.json cat.
+                if let Ok(t) = exec.run(&cat_transcript_cmd).await {
+                    if t.success && !t.stdout.is_empty() {
+                        let _ = mirror.replace_transcript(&run_id, &host_id, &t.stdout);
+                    }
+                }
                 if let Ok(out) = exec.run(&cat_cmd).await {
                     if out.success && !out.stdout.trim().is_empty() {
                         let trimmed = out.stdout.trim().to_string();
@@ -1879,8 +1944,13 @@ mod tests {
         tail_lines: Vec<String>,
         fail: bool,
         fail_stderr: String,
-        /// If set, returned as stdout when `run()` is called for a `cat …` command.
+        /// If set, returned as stdout when `run()` is called for a `cat …`
+        /// command on a `runs/<id>/…` path (i.e. `run.json`).
         cat_stdout: Option<String>,
+        /// If set, returned as stdout for a `cat …/transcripts/<id>.jsonl`
+        /// command (the pump's terminal transcript catch-up). `None` → empty
+        /// stdout, which the pump treats as "no transcript".
+        cat_transcript_stdout: Option<String>,
         /// Scripted result for `run_bytes`, taken on first call.
         run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
         /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
@@ -1895,6 +1965,7 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: None,
+                cat_transcript_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -1907,6 +1978,7 @@ mod tests {
                 fail: true,
                 fail_stderr: stderr.into(),
                 cat_stdout: None,
+                cat_transcript_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -1921,6 +1993,7 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: Some(cat_stdout.into()),
+                cat_transcript_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -1935,6 +2008,7 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: None,
+                cat_transcript_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
                 last_bytes_call: Default::default(),
             }
@@ -1948,6 +2022,7 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: None,
+                cat_transcript_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
                 last_bytes_call: Default::default(),
             }
@@ -1965,10 +2040,15 @@ mod tests {
                     success: false,
                 })
             } else {
-                // Return canned cat_stdout for the `cat …/run.json` call so the
-                // pump can read back the terminal status.
+                // Return the canned stdout for the two `cat` shapes the pump
+                // issues: `cat …/transcripts/<id>.jsonl` (terminal transcript
+                // catch-up) vs `cat …/runs/<id>/run.json` (status poll).
                 let stdout = if remote.starts_with("cat ") {
-                    self.cat_stdout.clone().unwrap_or_default()
+                    if remote.contains("/transcripts/") {
+                        self.cat_transcript_stdout.clone().unwrap_or_default()
+                    } else {
+                        self.cat_stdout.clone().unwrap_or_default()
+                    }
                 } else {
                     String::new()
                 };
@@ -3170,6 +3250,242 @@ mod tests {
         assert!(
             contents.contains(event_json),
             "expected event line in events.jsonl, got: {contents:?}"
+        );
+    }
+
+    /// A placed agent run's only content is its transcript, which lives
+    /// OUTSIDE the run directory (`$HOME/.rupu/transcripts/<run_id>.jsonl`).
+    /// The pump must (1) tail it, (2) route its lines to the mirrored
+    /// transcript file — NOT misfile them into events.jsonl — and (3) leave
+    /// event lines out of the transcript. On finish, the mirror synthesizes
+    /// a single `"agent"` step-result row pointing at the mirrored copy so
+    /// `/api/runs/:id` (steps) and the run graph can actually reach it.
+    ///
+    /// `cat_transcript_stdout` is deliberately unset: the mirrored content
+    /// must arrive via the tail path alone, so this test isolates routing
+    /// from the terminal catch-up (covered separately below).
+    #[tokio::test]
+    async fn tail_pump_mirrors_transcript_lines_as_transcript_not_events() {
+        let run_id = "run_01TESTPUMP02";
+        let event_json = r#"{"type":"step_started","step":"s1"}"#;
+        let t1 = r#"{"type":"run_start","agent":"reviewer"}"#;
+        let t2 = r#"{"type":"assistant_message","content":"hi"}"#;
+        let tail_lines = vec![
+            format!("==> /home/ci/.rupu/runs/{run_id}/events.jsonl <=="),
+            event_json.to_string(),
+            format!("==> /home/ci/.rupu/transcripts/{run_id}.jsonl <=="),
+            t1.to_string(),
+            t2.to_string(),
+        ];
+        let run_json =
+            format!(r#"{{"run_id":"{run_id}","status":"completed","final_output":"done"}}"#);
+
+        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(tail_lines, run_json));
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "reviewer".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.status != rupu_orchestrator::RunStatus::Running {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for pump; status={:?}", rec.status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Transcript lines land in the mirrored transcript, next to the runs
+        // dir the way the coordinator's own layout puts them.
+        let transcript_path = tmp
+            .path()
+            .join("transcripts")
+            .join(format!("{run_id}.jsonl"));
+        let transcript = std::fs::read_to_string(&transcript_path).unwrap_or_default();
+        assert!(
+            transcript.contains(t1) && transcript.contains(t2),
+            "expected transcript lines in {transcript_path:?}, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains(event_json),
+            "event line must not be misfiled into the transcript: {transcript:?}"
+        );
+
+        // Event line lands in events.jsonl; transcript lines must not.
+        let events = std::fs::read_to_string(run_store.events_path(run_id)).unwrap_or_default();
+        assert!(
+            events.contains(event_json),
+            "expected event line in events.jsonl, got: {events:?}"
+        );
+        assert!(
+            !events.contains(t1) && !events.contains(t2),
+            "transcript lines must not be misfiled into events.jsonl: {events:?}"
+        );
+
+        // Reachability: finish synthesized exactly one "agent" step-result row
+        // pointing at the mirrored copy — this is what /api/runs/:id `steps`
+        // and the run graph's transcript panel read.
+        let steps = run_store.read_step_results(run_id).unwrap();
+        assert_eq!(steps.len(), 1, "expected one synthesized step result");
+        assert_eq!(steps[0].step_id, "agent");
+        assert_eq!(steps[0].transcript_path, transcript_path);
+        assert!(steps[0].success);
+    }
+
+    /// A run with no transcript (the workflow case, or an agent that died
+    /// before writing one) must still mirror its other artifacts — `tail -F`
+    /// on a not-yet-existing path is expected, not fatal. The pump must also
+    /// actually ASK for the transcript path (it's in the tail command), or
+    /// the whole feature is silently absent.
+    #[tokio::test]
+    async fn tail_pump_without_transcript_still_mirrors_other_artifacts() {
+        let run_id = "run_01TESTPUMP03";
+        let event_json = r#"{"type":"step_started","step":"s1"}"#;
+        let tail_lines = vec![
+            format!("==> /home/ci/.rupu/runs/{run_id}/events.jsonl <=="),
+            event_json.to_string(),
+        ];
+        let run_json = format!(r#"{{"run_id":"{run_id}","status":"completed"}}"#);
+
+        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(tail_lines, run_json));
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Workflow,
+            name: "deploy".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.status == rupu_orchestrator::RunStatus::Completed {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for pump; status={:?}", rec.status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // The other artifacts still mirror.
+        let events = std::fs::read_to_string(run_store.events_path(run_id)).unwrap_or_default();
+        assert!(
+            events.contains(event_json),
+            "events must mirror: {events:?}"
+        );
+
+        // The tail command must include the transcript path (proves the pump
+        // asks for it at all), with the run_id concatenated bare — the
+        // [A-Za-z0-9_]-only invariant that keeps the raw command injection-safe.
+        let commands = fake.commands.lock().unwrap().clone();
+        let tail = commands
+            .iter()
+            .find(|c| c.starts_with("tail "))
+            .expect("tail command recorded");
+        assert!(
+            tail.contains(&format!("$HOME/.rupu/transcripts/{run_id}.jsonl")),
+            "tail must include the transcript path, got: {tail}"
+        );
+
+        // No transcript existed → nothing mirrored, nothing synthesized.
+        let transcript_path = tmp
+            .path()
+            .join("transcripts")
+            .join(format!("{run_id}.jsonl"));
+        assert!(
+            !transcript_path.exists(),
+            "no transcript must be created when the remote never had one"
+        );
+        let steps = run_store.read_step_results(run_id).unwrap();
+        assert!(
+            steps.is_empty(),
+            "no step result must be synthesized without a transcript: {steps:?}"
+        );
+    }
+
+    /// Terminal catch-up: the pump's select loop can be torn down with
+    /// transcript lines still buffered in the tail stream. On terminal
+    /// detection, a one-shot `cat` of the remote transcript must REPLACE the
+    /// (possibly partial) tailed copy with the complete content — never leave
+    /// a truncated transcript that looks complete, and never duplicate the
+    /// lines the tail already delivered.
+    #[tokio::test]
+    async fn tail_pump_terminal_cat_replaces_partial_transcript() {
+        let run_id = "run_01TESTPUMP04";
+        let l1 = r#"{"type":"run_start","agent":"reviewer"}"#;
+        let l2 = r#"{"type":"assistant_message","content":"mid"}"#;
+        let l3 = r#"{"type":"run_complete","status":"ok"}"#;
+        // The tail only ever delivers l1 — l2/l3 are "still buffered".
+        let tail_lines = vec![
+            format!("==> /home/ci/.rupu/transcripts/{run_id}.jsonl <=="),
+            l1.to_string(),
+        ];
+        let run_json = format!(r#"{{"run_id":"{run_id}","status":"completed"}}"#);
+        let full_transcript = format!("{l1}\n{l2}\n{l3}\n");
+
+        let mut fake = FakeExec::with_cat_stdout(tail_lines, run_json);
+        fake.cat_transcript_stdout = Some(full_transcript.clone());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "reviewer".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.status == rupu_orchestrator::RunStatus::Completed {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for pump; status={:?}", rec.status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let transcript_path = tmp
+            .path()
+            .join("transcripts")
+            .join(format!("{run_id}.jsonl"));
+        let transcript = std::fs::read_to_string(&transcript_path).unwrap_or_default();
+        assert_eq!(
+            transcript, full_transcript,
+            "terminal cat must replace the partial tailed copy with the \
+             complete remote content, without duplicating l1"
         );
     }
 
