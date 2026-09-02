@@ -30,9 +30,9 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500)
 // Why a `get_run` failure is NOT believed until the run has been seen once.
 //
 // `launch_agent` returns as soon as the DETACHED remote command has been
-// spawned — `setsid <argv> </dev/null >/dev/null 2>&1 &` — so the run record on
-// the host is created asynchronously, after the remote `rupu` has started, read
-// its config and registered the run. Until that lands, `get_run` legitimately
+// spawned — `(setsid <argv> </dev/null >/dev/null 2>>…/launch.log &)` — so the
+// run record on the host is created asynchronously, after the remote `rupu`
+// has started, read its config and registered the run. Until that lands, `get_run` legitimately
 // answers "unknown run", and "the host does not know this run" is
 // indistinguishable from "the host has not started it yet".
 //
@@ -294,12 +294,26 @@ impl UnitDispatcher for FleetUnitDispatcher {
             // the host. Say that, rather than "timed out polling" — the
             // distinction is the difference between "still running, we gave
             // up watching" and "it never started", and the connector's own
-            // message for this case blames `rupu run show` support.
-            Some(err) => format!(
-                "remote unit run {run_id} never registered on host {host} \
+            // message for this case blames `rupu run show` support. Then ask
+            // the connector what the remote process itself said: a launch
+            // that dies instantly (wrong cwd, missing agent, bad flag,
+            // unresolvable provider) explains itself on stderr, and the
+            // connector may have kept that. Without it, this error is the
+            // ONLY trace the failure leaves — measured: hours spent on a
+            // "does not support `rupu run show`" that was a dead process.
+            Some(err) => {
+                let mut msg = format!(
+                    "remote unit run {run_id} never registered on host {host} \
                      after {POLL_MAX_ATTEMPTS} polls; the launch was accepted but \
                      the host never reported the run. Last poll error: {err}"
-            ),
+                );
+                if let Some(diag) = conn.launch_diagnostics(&run_id).await {
+                    msg.push_str(&format!(
+                        "\nremote launch stderr (host {host}, run {run_id}):\n{diag}"
+                    ));
+                }
+                msg
+            }
             None => format!(
                 "timed out waiting for remote unit run {run_id} on host {host} \
                  after {POLL_MAX_ATTEMPTS} polls"
@@ -402,6 +416,10 @@ mod tests {
         /// once the DETACHED remote command is spawned, so the run record does
         /// not exist until the remote `rupu` has actually started.
         get_run_failures_before_ready: std::sync::atomic::AtomicU32,
+        /// What `launch_diagnostics` answers — the remote process's captured
+        /// stderr. `None` models a transport that keeps none (the trait
+        /// default) or a launch that wrote nothing.
+        launch_stderr: Option<&'static str>,
         /// Ordered log of the connector calls the dispatcher made.
         calls: std::sync::Mutex<Vec<&'static str>>,
     }
@@ -418,6 +436,7 @@ mod tests {
                     }
                 }),
                 get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
+                launch_stderr: None,
                 calls: Default::default(),
             }
         }
@@ -440,6 +459,7 @@ mod tests {
                     }
                 }),
                 get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
+                launch_stderr: None,
                 calls: Default::default(),
             }
         }
@@ -508,6 +528,10 @@ mod tests {
         }
         async fn await_run_mirror(&self, _run_id: &str) {
             self.calls.lock().unwrap().push("await_run_mirror");
+        }
+        async fn launch_diagnostics(&self, _run_id: &str) -> Option<String> {
+            self.calls.lock().unwrap().push("launch_diagnostics");
+            self.launch_stderr.map(str::to_string)
         }
         // `pause_run`/`resume_run` are intentionally NOT overridden on any
         // fake `HostConnector` in this module — the real fleet dispatch path
@@ -1156,6 +1180,42 @@ steps:
             conn.discard_called_with.lock().unwrap().as_deref(),
             Some("/cache/workspace-sync/leak-2/work"),
             "discard_workspace must be called with the staged dir after a poll timeout"
+        );
+    }
+
+    /// A launch the host ACCEPTED but whose process died before registering
+    /// the run (wrong cwd, missing agent, bad flag …) exhausts the poll
+    /// budget. The dispatcher's error must then carry what the remote
+    /// process wrote to stderr — the connector kept it — not just "never
+    /// registered … does not support `rupu run show`", which is what an
+    /// operator spent hours on when the real cause was a dead process.
+    /// Paused virtual clock, as in `poll_timeout_after_stage_discards_scratch`.
+    #[tokio::test(start_paused = true)]
+    async fn never_registered_error_carries_remote_launch_stderr() {
+        // Never registers: more startup failures than the poll budget.
+        let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
+        fake.launch_stderr = Some("Error: agent `a` not found under ~/.rupu/agents");
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        let err = d
+            .dispatch_unit(make_unit(), "h1")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("never registered"), "{err}");
+        assert!(
+            err.contains("remote launch stderr"),
+            "the diagnostics section must be labelled: {err}"
+        );
+        assert!(
+            err.contains("Error: agent `a` not found under ~/.rupu/agents"),
+            "the remote process's own explanation must reach the operator: {err}"
+        );
+        assert!(
+            conn.calls.lock().unwrap().contains(&"launch_diagnostics"),
+            "the dispatcher must ask the connector for the launch log"
         );
     }
 }
