@@ -277,25 +277,22 @@ impl UnitDispatcher for FleetUnitDispatcher {
             }
         }
 
-        Err(RunError::Provider(format!(
-            "{}",
-            match last_startup_err {
-                // Never observed: the run was launched but never registered on
-                // the host. Say that, rather than "timed out polling" — the
-                // distinction is the difference between "still running, we gave
-                // up watching" and "it never started", and the connector's own
-                // message for this case blames `rupu run show` support.
-                Some(err) => format!(
-                    "remote unit run {run_id} never registered on host {host} \
+        Err(RunError::Provider(match last_startup_err {
+            // Never observed: the run was launched but never registered on
+            // the host. Say that, rather than "timed out polling" — the
+            // distinction is the difference between "still running, we gave
+            // up watching" and "it never started", and the connector's own
+            // message for this case blames `rupu run show` support.
+            Some(err) => format!(
+                "remote unit run {run_id} never registered on host {host} \
                      after {POLL_MAX_ATTEMPTS} polls; the launch was accepted but \
                      the host never reported the run. Last poll error: {err}"
-                ),
-                None => format!(
-                    "timed out waiting for remote unit run {run_id} on host {host} \
-                     after {POLL_MAX_ATTEMPTS} polls"
-                ),
-            }
-        )))
+            ),
+            None => format!(
+                "timed out waiting for remote unit run {run_id} on host {host} \
+                 after {POLL_MAX_ATTEMPTS} polls"
+            ),
+        }))
     }
 
     /// Bridge the orchestrator's opaque deltas to the `rupu-workspace` codec and
