@@ -223,6 +223,18 @@ impl UnitDispatcher for FleetUnitDispatcher {
             let status = run["status"].as_str().unwrap_or("").to_string();
 
             if is_terminal_status(&status) {
+                // The host says terminal, but the coordinator-side mirror
+                // (SSH's tail pump is a spawned task) may still be mid-flight
+                // on its terminal work — final transcript catch-up above all.
+                // This process is `rupu workflow run`: it exits the moment
+                // the workflow completes, and a spawned task dies with it.
+                // Join the mirror BEFORE reporting the unit terminal, or the
+                // mirrored transcript is silently truncated at whatever the
+                // tail happened to deliver (measured on a real host: the
+                // closing assistant_message / turn_end / run_complete lines
+                // lost). No-op for transports that don't mirror this way.
+                conn.await_run_mirror(&run_id).await;
+
                 let output = run["final_output"].as_str().unwrap_or("").to_string();
                 let success = status == "completed";
                 let error = (!success).then(|| {
@@ -390,6 +402,8 @@ mod tests {
         /// once the DETACHED remote command is spawned, so the run record does
         /// not exist until the remote `rupu` has actually started.
         get_run_failures_before_ready: std::sync::atomic::AtomicU32,
+        /// Ordered log of the connector calls the dispatcher made.
+        calls: std::sync::Mutex<Vec<&'static str>>,
     }
 
     impl FakeConnector {
@@ -404,6 +418,7 @@ mod tests {
                     }
                 }),
                 get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
+                calls: Default::default(),
             }
         }
 
@@ -425,6 +440,7 @@ mod tests {
                     }
                 }),
                 get_run_failures_before_ready: std::sync::atomic::AtomicU32::new(0),
+                calls: Default::default(),
             }
         }
     }
@@ -463,6 +479,7 @@ mod tests {
         }
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
             use std::sync::atomic::Ordering;
+            self.calls.lock().unwrap().push("get_run");
             if self.get_run_failures_before_ready.load(Ordering::SeqCst) > 0 {
                 self.get_run_failures_before_ready
                     .fetch_sub(1, Ordering::SeqCst);
@@ -488,6 +505,9 @@ mod tests {
         }
         async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
             unimplemented!()
+        }
+        async fn await_run_mirror(&self, _run_id: &str) {
+            self.calls.lock().unwrap().push("await_run_mirror");
         }
         // `pause_run`/`resume_run` are intentionally NOT overridden on any
         // fake `HostConnector` in this module — the real fleet dispatch path
@@ -644,6 +664,34 @@ mod tests {
         assert_eq!(out.output, "fake-out");
         assert!(out.success);
         assert!(out.error.is_none());
+    }
+
+    /// The dispatcher must join the coordinator-side mirror AFTER it observes
+    /// terminal and BEFORE it returns the outcome. This process is the
+    /// `rupu workflow run` CLI, which exits as soon as the workflow completes;
+    /// the SSH connector's tail pump is a spawned task that dies with it. If
+    /// the join is missing (or happens before the terminal poll), the
+    /// mirrored transcript is truncated at whatever the tail delivered.
+    #[tokio::test]
+    async fn dispatch_joins_mirror_after_terminal_and_before_returning() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(out.success);
+
+        let calls = conn.calls.lock().unwrap().clone();
+        let last_get_run = calls
+            .iter()
+            .rposition(|c| *c == "get_run")
+            .expect("dispatcher polled get_run");
+        let join = calls
+            .iter()
+            .position(|c| *c == "await_run_mirror")
+            .expect("dispatcher must call await_run_mirror before returning a terminal outcome");
+        assert!(
+            join > last_get_run,
+            "await_run_mirror must follow the terminal get_run poll (calls: {calls:?})"
+        );
     }
 
     /// `from_connector` with a fake that returns a failed envelope
