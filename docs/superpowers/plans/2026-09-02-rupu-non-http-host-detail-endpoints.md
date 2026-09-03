@@ -85,7 +85,7 @@ Fixes routes 1 and 2 — the run-detail page, which is the reported symptom.
 
 Name it for the *guarantee* it makes ("this transport's runs are in our mirror"), not for the mechanism it lacks ("can't proxy") — the callers need the former to justify reading the mirror.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/rupu-cp/src/host/ssh.rs`, inside the existing `mod tests`:
 
@@ -125,7 +125,7 @@ async fn run_graph_reads_the_mirror_for_a_transport_that_cannot_proxy() {
 
 `test_state_with_mirrored_run` builds an `AppState` whose `run_store` root is `tmp`, writes a minimal `run.json` + empty `workflow.yaml` for the run id, and registers `host_ssh` in `s.hosts` as a connector whose `serves_runs_from_local_mirror()` returns `true` and whose `proxy_get_json` **panics** — so the test fails loudly if the route still reaches for the wire. Model the fake on `FakeHostConnector` at `crates/rupu-cp/src/api/runs.rs:2543`.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 ```bash
 cargo test -p rupu-cp serves_runs_from_local_mirror reads_the_mirror
@@ -133,7 +133,7 @@ cargo test -p rupu-cp serves_runs_from_local_mirror reads_the_mirror
 
 Expected: FAIL — `no method named serves_runs_from_local_mirror`.
 
-- [ ] **Step 3: Add the trait predicate**
+- [x] **Step 3: Add the trait predicate**
 
 In `crates/rupu-cp/src/host/connector.rs`, directly beneath `proxy_get_json`:
 
@@ -159,7 +159,7 @@ fn serves_runs_from_local_mirror(&self) -> bool {
 }
 ```
 
-- [ ] **Step 4: Route the two endpoints to the mirror**
+- [x] **Step 4: Route the two endpoints to the mirror**
 
 In `crates/rupu-cp/src/api/graph.rs`, replace the body of `run_graph_from_host` (currently lines 34-49) with:
 
@@ -193,7 +193,7 @@ Apply the identical shape to `usage_timeline_from_host` in `crates/rupu-cp/src/a
 
 Note both mirror branches call `run_not_found_or_internal` internally via `store.load`, so a run id that is genuinely absent from the mirror still 404s honestly rather than reporting an empty graph.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test -p rupu-cp serves_runs_from_local_mirror reads_the_mirror
@@ -202,7 +202,7 @@ cargo test -p rupu-cp
 
 Expected: PASS, and no regression elsewhere in `rupu-cp`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 rustfmt crates/rupu-cp/src/host/connector.rs crates/rupu-cp/src/host/ssh.rs \
@@ -227,7 +227,7 @@ Fixes routes 3 and 4. `rupu session show <id> --format json` already emits every
 - Consumes: nothing from Task 1.
 - Produces: `HostConnector::get_session(&self, id: &str) -> Result<serde_json::Value, HostConnectorError>` — returns the `item` object of the remote's `session show` report. Task 3 consumes it to enumerate a session's runs.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/rupu-cp/src/host/ssh.rs`'s `mod tests`, modelled on `list_sessions_shells_rupu_session_list_and_parses_rows` (`ssh.rs:2449`):
 
@@ -272,7 +272,7 @@ async fn get_session_shells_rupu_session_show_and_returns_the_item() {
 
 Match `RemoteExec`'s exact signature and the neighbouring tests' connector-construction helper; copy them from `ssh.rs:2449-2505` rather than inventing new ones.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 ```bash
 cargo test -p rupu-cp get_session_shells_rupu_session_show
@@ -280,7 +280,7 @@ cargo test -p rupu-cp get_session_shells_rupu_session_show
 
 Expected: FAIL — `no method named get_session`.
 
-- [ ] **Step 3: Add the trait method and the SSH override**
+- [x] **Step 3: Add the trait method and the SSH override**
 
 In `connector.rs`, beside `list_sessions`:
 
@@ -327,7 +327,7 @@ async fn get_session(&self, id: &str) -> Result<serde_json::Value, HostConnector
 
 The `--format json` precedes the subcommand deliberately — `Cmd::Run` is `trailing_var_arg` and swallows trailing flags; `get_run` documents this at `ssh.rs:1466-1468`. Keep the order consistent even for non-`run` commands.
 
-- [ ] **Step 4: Wire both routes**
+- [x] **Step 4: Wire both routes**
 
 In `crates/rupu-cp/src/api/sessions.rs`, replace the remote-proxy block of `get_session` (lines 338-354) with:
 
@@ -420,7 +420,7 @@ Then replace `get_session_runs`'s proxy block (lines 558-570) with:
 
 Check the local branch's response envelope before finalising this — if it returns `{ "runs": [...] }` rather than a bare array, wrap accordingly so the web client sees one shape from both branches.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test -p rupu-cp get_session_shells_rupu_session_show
@@ -429,7 +429,7 @@ cargo test -p rupu-cp
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 rustfmt crates/rupu-cp/src/host/connector.rs crates/rupu-cp/src/host/ssh.rs \
@@ -456,7 +456,7 @@ Fixes route 5. The local branch builds a per-*turn* token series by reading each
 - Consumes: Task 2's `get_session` is **not** used here — the new CLI command resolves the session's runs itself, remotely.
 - Produces: `HostConnector::session_usage_timeline(&self, id: &str) -> Result<serde_json::Value, HostConnectorError>` — a JSON array of the same per-turn points the local branch emits.
 
-- [ ] **Step 1: Write the failing CLI test**
+- [x] **Step 1: Write the failing CLI test**
 
 Before writing it, read `crates/rupu-cp/src/api/sessions.rs`'s local `get_session_usage_timeline` body in full and copy its point shape exactly — field names, ordering, and the run-id label. The test asserts that shape:
 
@@ -477,7 +477,7 @@ fn session_usage_timeline_emits_one_point_per_turn_labeled_by_run() {
 
 `write_test_session_with_transcripts` writes a `sessions/<id>/session.json` naming each run plus its `transcript_path`, and a `.jsonl` transcript per run with the given number of assistant turns carrying token counts. Mirror whatever transcript fixture helper `cmd/session.rs`'s existing tests already use rather than inventing a second one.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 ```bash
 cargo test -p rupu-cli session_usage_timeline_emits_one_point_per_turn
@@ -485,7 +485,7 @@ cargo test -p rupu-cli session_usage_timeline_emits_one_point_per_turn
 
 Expected: FAIL — `cannot find function build_session_usage_timeline`.
 
-- [ ] **Step 3: Add the CLI subcommand**
+- [x] **Step 3: Add the CLI subcommand**
 
 In `crates/rupu-cli/src/cmd/session.rs`, add to `enum Action` (after `Show`):
 
@@ -515,7 +515,7 @@ Implement `build_session_usage_timeline(global: &Path, session_id: &str) -> anyh
 
 **Do not duplicate the aggregation logic between crates.** `rupu-cp` and `rupu-cli` both depend on the transcript reader already; if the per-turn fold is more than a few lines, lift it into the shared crate that owns transcript parsing and have both call sites use it. A silently-diverging second implementation of the same series is exactly the kind of drift that makes a remote session's chart disagree with a local one.
 
-- [ ] **Step 4: Run the CLI test to verify it passes**
+- [x] **Step 4: Run the CLI test to verify it passes**
 
 ```bash
 cargo test -p rupu-cli session_usage_timeline_emits_one_point_per_turn
@@ -523,7 +523,7 @@ cargo test -p rupu-cli session_usage_timeline_emits_one_point_per_turn
 
 Expected: PASS.
 
-- [ ] **Step 5: Add the connector method, its test, and the route wiring**
+- [x] **Step 5: Add the connector method, its test, and the route wiring**
 
 Trait default in `connector.rs`:
 
@@ -582,7 +582,7 @@ Finally replace the proxy block in `sessions.rs:415-427`:
     }
 ```
 
-- [ ] **Step 6: Run the full suites to verify**
+- [x] **Step 6: Run the full suites to verify**
 
 ```bash
 cargo test -p rupu-cli && cargo test -p rupu-cp
@@ -590,7 +590,7 @@ cargo test -p rupu-cli && cargo test -p rupu-cp
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 rustfmt crates/rupu-cli/src/cmd/session.rs crates/rupu-cp/src/host/connector.rs \
@@ -613,7 +613,7 @@ Fixes route 6 — today an all-SSH fleet reports every host as `unavailable` and
 **Interfaces:**
 - Produces: `HostConnector::usage_rollup(&self, since: &str, until: &str, group_by: &str) -> Result<serde_json::Value, HostConnectorError>` — `since`/`until` are RFC-3339; `group_by` is the CP's `GroupBy::as_str()` value. Returns the remote `usage` report verbatim; the caller maps it.
 
-- [ ] **Step 1: Write the failing mapper test**
+- [x] **Step 1: Write the failing mapper test**
 
 The CLI's breakdown report and the CP's `RemoteUsageBody` are near-identical but not the same shape: the CLI emits `cost_partial` where the CP wants `priced`, has no `total_tokens` (it is `input + output`), and carries no `host_id`/`workspace_id`. Pin the mapping first, in `crates/rupu-cp/src/api/usage.rs`'s `mod tests`:
 
@@ -642,7 +642,7 @@ fn remote_usage_report_maps_onto_the_cp_body() {
 
 Before writing the implementation, run `rupu usage --group-by model --format json` locally and paste a real row into this test — the field names above are read from `UsageBreakdownOutput::csv_headers` (`crates/rupu-cli/src/cmd/usage.rs:523-537`) and must be confirmed against the actual JSON report, which may differ.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 ```bash
 cargo test -p rupu-cp remote_usage_report_maps_onto_the_cp_body
@@ -650,11 +650,11 @@ cargo test -p rupu-cp remote_usage_report_maps_onto_the_cp_body
 
 Expected: FAIL — `cannot find function usage_body_from_remote_report`.
 
-- [ ] **Step 3: Implement the mapper**
+- [x] **Step 3: Implement the mapper**
 
 In `crates/rupu-cp/src/api/usage.rs`, write `fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsageBody, String>` folding each `rows[]` entry into a `UsageBreakdownRow` (leaving `host_id`/`workspace_id` empty — the caller already overrides `host_id` for `group_by=host` at lines 371-381) and summing the rows into the `UsageSummary`. Compute `unpriced` from the rows carrying `cost_partial: true`, matching however `UnpricedGap` is populated on the local path.
 
-- [ ] **Step 4: Add the connector method and wire the route**
+- [x] **Step 4: Add the connector method and wire the route**
 
 Trait default in `connector.rs`:
 
@@ -696,7 +696,7 @@ Confirm `rupu usage` actually accepts `--group-by` with the CP's group names bef
 
 Then in `usage.rs`'s per-host closure, try `usage_rollup` first and keep the existing `proxy_get_json` path as the HTTP branch. A host that supports neither still renders `unavailable` with a reason — that behaviour is correct and must not regress.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test -p rupu-cp usage
@@ -705,7 +705,7 @@ cargo test -p rupu-cp
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 rustfmt crates/rupu-cp/src/host/connector.rs crates/rupu-cp/src/host/ssh.rs \
@@ -732,7 +732,7 @@ Fixes route 7. **This task expands the public CLI surface** — `rupu netflow` c
 
 Return **raw flows**, not an aggregated response: the CP's existing `enforce_range_on_proxied_response` / `enforce_filters_on_proxied_response` defensive re-filtering (`netflow.rs:1975-1977`) exists precisely because a remote's aggregation cannot be trusted to have applied this build's window and filters. Fetching raw records and aggregating locally removes that whole class of drift, and the local ASN table then applies uniformly across hosts.
 
-- [ ] **Step 1: Write the failing CLI test**
+- [x] **Step 1: Write the failing CLI test**
 
 ```rust
 #[test]
@@ -755,7 +755,7 @@ fn netflow_show_is_empty_for_a_run_with_no_ledger() {
 
 Reuse `rupu_netflow`'s own ledger fixture helpers if the crate exposes any; the on-disk shape is `<global>/netflow/<run_id>.jsonl`.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 ```bash
 cargo test -p rupu-cli netflow_show
@@ -763,7 +763,7 @@ cargo test -p rupu-cli netflow_show
 
 Expected: FAIL — `cannot find function collect_run_ledger`.
 
-- [ ] **Step 3: Add the CLI subcommand**
+- [x] **Step 3: Add the CLI subcommand**
 
 Add to `crates/rupu-cli/src/cmd/netflow.rs`'s `enum Action`:
 
@@ -777,13 +777,13 @@ Add to `crates/rupu-cli/src/cmd/netflow.rs`'s `enum Action`:
 
 with its dispatch arm and `Action::Show { .. } => ("netflow show", report::TABLE_JSON_CSV)`. Implement `collect_run_ledger(global: &Path, run_id: &str) -> anyhow::Result<Vec<FlowRecord>>` reading `<global>/netflow/<run_id>.jsonl` through `rupu_netflow`'s existing reader, returning an empty vec when the file is absent. Emit via `report::emit_collection`.
 
-- [ ] **Step 4: Add the connector method and wire both netflow routes**
+- [x] **Step 4: Add the connector method and wire both netflow routes**
 
 Trait default and SSH override follow Task 3's `session_usage_timeline` shape exactly, shelling `["--format", "json", "netflow", "show", run_id]` and returning `remote_json_rows`.
 
 In `crates/rupu-cp/src/api/netflow.rs`, rewrite `run_netflow_from_host` and `explorer_from_host` so that when `conn.run_netflow(run_id)` succeeds they feed those raw records into the **same** local aggregation the `Global` branch uses (`to_explorer_flows` + `build_explorer_response`, `netflow.rs:1858-1877`), rather than relaying a remote aggregate. Keep the existing proxy path for HTTP hosts, including its re-enforcement passes.
 
-- [ ] **Step 5: Run the suites**
+- [x] **Step 5: Run the suites**
 
 ```bash
 cargo test -p rupu-cli netflow && cargo test -p rupu-cp netflow && cargo test -p rupu-cp
@@ -791,7 +791,7 @@ cargo test -p rupu-cli netflow && cargo test -p rupu-cp netflow && cargo test -p
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 rustfmt crates/rupu-cli/src/cmd/netflow.rs crates/rupu-cp/src/host/connector.rs \
@@ -807,7 +807,7 @@ Unit tests prove the wiring; they cannot prove the remote `rupu` answers as expe
 
 **Files:** none modified — this is a verification task.
 
-- [ ] **Step 1: Rebuild and restart the daemon**
+- [x] **Step 1: Rebuild and restart the daemon**
 
 `cp serve` is a long-lived daemon; a reinstalled binary does **not** update a running one.
 
@@ -817,7 +817,7 @@ make cp-web && make release
 
 Then stop and restart the running `rupu cp serve` before testing anything below.
 
-- [ ] **Step 2: Confirm the reported symptom is gone**
+- [x] **Step 2: Confirm the reported symptom is gone**
 
 Launch a run on an SSH host from the CP web launcher and open its detail page. Confirm the graph, transcript, and token chart render. Then check the raw endpoints directly (substitute a real run id and the ssh host id from `~/.rupu/hosts/*.toml`):
 
@@ -827,7 +827,7 @@ curl -s "http://127.0.0.1:7420/api/runs/<run_id>/graph?host=<ssh_host_id>" | hea
 
 Expected: a `{"run":...,"workflow":...}` body. **Not** `{"error":"invalid: proxy_get_json is not supported for ssh hosts"}`.
 
-- [ ] **Step 3: Exercise every other fixed route**
+- [x] **Step 3: Exercise every other fixed route**
 
 ```bash
 curl -s "http://127.0.0.1:7420/api/runs/<run_id>/usage-timeline?host=<ssh_host_id>" | head -c 200
@@ -842,11 +842,11 @@ For the usage call, confirm the `hosts[]` array reports the ssh hosts as `ok` �
 
 Record the actual output of each command in the PR description. A route that returns an honest empty result is a pass; a route that 500s is not.
 
-- [ ] **Step 4: Confirm no ssh connection burst**
+- [x] **Step 4: Confirm no ssh connection burst**
 
 These endpoints now shell out over ssh. Watch that a single page load does not fan out into many rapid connections to the same host — a burst previously earned a lasting block on one of this fleet's hosts. If a page load issues more than a couple of connections per host, batch them before merging.
 
-- [ ] **Step 5: Open the PR**
+- [x] **Step 5: Open the PR**
 
 Per repo convention this work goes through a feature branch and a PR — never a direct commit to `main`.
 
@@ -861,3 +861,85 @@ Per repo convention this work goes through a feature branch and a PR — never a
 **Type consistency.** Four new trait members, each with a default and each used under one name throughout: `serves_runs_from_local_mirror` (Task 1), `get_session` (Task 2, consumed nowhere else), `session_usage_timeline` (Task 3), `usage_rollup` (Task 4), `run_netflow` (Task 5).
 
 **Known risk carried by this plan.** Tasks 3 and 5 each add a public CLI subcommand, and both create a version dependency: a host running an older `rupu` cannot serve them, and will surface `Unsupported` naming the missing command. That is the intended failure mode — honest and actionable — but it means these two routes stay degraded against any host until its `rupu` is updated. Task 1 and Task 2 have no such dependency (Task 2 uses a command that already exists).
+
+---
+
+## As-built (2026-09-02)
+
+All six tasks executed. Three deliberate deviations from the plan above,
+plus two defects the plan did not anticipate — recorded here rather than
+edited into the tasks, so the plan stays readable as the design it was.
+
+**Deviation 1 — Task 2 became two trait methods, not one.** The plan had
+`get_session` also answering `/runs` from its report body. That silently
+regressed HTTP federation to an empty runs list: the API session DTO has no
+`runs` field, so an HTTP host must proxy the dedicated `/runs` endpoint.
+Caught by `federation_e2e`. Split into `get_session` + `session_runs`, each
+with an HTTP override.
+
+**Deviation 2 — pricing moved out of the mapper.** The plan had the CP map
+the remote report into a `SessionDto` and price it. But `SshHostConnector`
+deliberately carries no pricing config, and an HTTP remote already priced
+its own session with its own config. The connector now returns API-shaped
+fields and `ensure_usage_block` prices only a body that arrived unpriced —
+an HTTP remote's own `usage` is left untouched rather than overwritten.
+
+**Deviation 3 — Task 4's mapper was written against real output.** The plan
+derived field names from `UsageBreakdownOutput::csv_headers`. The actual
+`--format json` report differs: totals nest under `summary` with `total_`-
+prefixed names, and rows populate only the identity fields their `group_by`
+selected. Also handled explicitly: CP's `host` and `project` groupings have
+no CLI counterpart — `host` rebuilds its single row from the summary,
+`project` reports `unavailable` with that reason.
+
+**Defect found mid-task — `session show` says "unknown session".** The
+connector matched only "not found" (which is `run show`'s phrasing), so a
+genuinely-missing remote session would have surfaced as a 500 "this host
+cannot answer" instead of a 404. Found by running the real binary, not by
+reading it. Fixed with a regression test.
+
+**Defect found mid-task — "host unreachable" on a host that answered.**
+`remote_json` maps a non-zero remote exit to `Unreachable`, so an
+out-of-date remote's "unrecognized subcommand" reached the operator prefixed
+with "host unreachable:" — pointing at the network instead of the binary.
+Fixed with `remote_failure_detail`.
+
+### Verification performed
+
+Against an isolated `RUPU_HOME` (seeded with a real mirrored SSH run and the
+real host registry) on port 7599 — never against the live daemon:
+
+| Endpoint | Result |
+|---|---|
+| `/api/runs/:id/graph?host=<ssh>` | **200**, real graph — the reported symptom |
+| `/api/runs/:id/usage-timeline?host=<ssh>` | 200, 44 turn points |
+| `/api/usage` across three ssh hosts | 200, all three `ok`, 20.4M tokens / 55 runs that previously reported zero |
+| `/api/sessions/:id?host=<ssh>` | 404 (live ssh round trip; "unknown session" mapped correctly) |
+| `/api/sessions/:id/runs?host=<ssh>` | 404, same path |
+| `/api/sessions/:id/usage-timeline?host=<ssh>` | 500 naming the missing remote command — correct, remote predates it |
+| `/api/runs/:id/netflow` | see the open finding below |
+
+Not verified live: session detail against a session that exists (no remote
+host has any sessions), and every path that needs the two NEW CLI commands
+on the remote (`session usage-timeline`, `netflow show`) — those require
+deploying this build to the hosts.
+
+### Open finding — placed-run netflow is silently empty
+
+`GET /api/runs/:id/netflow` has **no `?host=` branch** — its `host` query
+param is a flow *filter*, not a host selector — so it dispatches purely
+through `resolve_run_location`. A run placed on an SSH host is mirrored into
+the coordinator's own `RunStore`, so it resolves `Global`, and the endpoint
+reads local ledgers that do not exist for it. The result is an empty flow
+set returned as 200: a silently wrong answer rather than an error.
+
+Task 5 fixed the `RunLocation::Host` path (an autoflow run whose history
+recorded an SSH host), which is the one that produced the reported error.
+The mirrored-run case is a distinct, pre-existing defect. The fix is to
+merge the remote's ledger with the local one when a run's `worker_id` names
+a registered non-local host — both sets are real flows for that run. It is
+NOT done here because it needs a decision the plan cannot make alone: what a
+netflow view should report when the remote fetch fails. Failing the whole
+view whenever a host is offline regresses the local answer; returning
+local-only silently is the same class of bug as the one above, and
+`NetflowResponse` has no field for "this is partial".
