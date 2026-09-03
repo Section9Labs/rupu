@@ -32,6 +32,42 @@ function flow(over: Partial<FlowView> = {}): FlowView {
 }
 
 describe('NetflowTable', () => {
+  // A partial list with no warning reads as a complete one, and every
+  // number above it is understated by an unknown amount. Unlike the
+  // dropped-record popover, this must be loud on BOTH paths.
+  it('warns loudly when a source could not be read, on a POPULATED table', () => {
+    render(
+      <NetflowTable
+        flows={[flow()]}
+        droppedTotal={0}
+        asnLoaded
+        incomplete={[{ host_id: 'host_ssh', reason: 'remote rupu is too old' }]}
+      />,
+    );
+    expect(screen.getByText(/could not be read/i)).toBeInTheDocument();
+    expect(screen.getByText('host_ssh')).toBeInTheDocument();
+    expect(screen.getByText(/remote rupu is too old/)).toBeInTheDocument();
+  });
+
+  it('warns when a source could not be read and the table is EMPTY', () => {
+    render(
+      <NetflowTable
+        flows={[]}
+        droppedTotal={0}
+        asnLoaded
+        incomplete={[{ host_id: 'host_ssh', reason: 'host unreachable' }]}
+      />,
+    );
+    // "No flows recorded" over a scope we could not actually read is the
+    // silent-incompleteness defect in its worst form.
+    expect(screen.getByText(/could not be read/i)).toBeInTheDocument();
+  });
+
+  it('says nothing when every source was read', () => {
+    render(<NetflowTable flows={[flow()]} droppedTotal={0} asnLoaded incomplete={[]} />);
+    expect(screen.queryByText(/could not be read/i)).not.toBeInTheDocument();
+  });
+
   it('renders host, path and ASN org', () => {
     render(<NetflowTable flows={[flow()]} droppedTotal={0} asnLoaded />);
     expect(screen.getByText('api.anthropic.com')).toBeInTheDocument();

@@ -1049,6 +1049,12 @@ async fn usage_timeline_from_host(
     id: &str,
 ) -> ApiResult<serde_json::Value> {
     let conn = resolve_host(s, host_id)?;
+    // Same mirror rule as `graph.rs`'s `run_graph_from_host`: a transport
+    // whose runs live in our RunStore builds the series from those local
+    // artifacts rather than proxying a GET it cannot serve.
+    if conn.serves_runs_from_local_mirror() {
+        return build_usage_timeline_json(&s.run_store, id);
+    }
     conn.proxy_get_json(&format!("/api/runs/{id}/usage-timeline"))
         .await
         .map_err(|e| match e {

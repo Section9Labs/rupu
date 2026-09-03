@@ -275,6 +275,7 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
       <NetflowTable
         flows={flows.flows}
         droppedTotal={flows.dropped_total}
+        incomplete={flows.incomplete}
         asnLoaded={flows.asn_loaded}
         scope={scope}
         appliedWindow={flows.window}

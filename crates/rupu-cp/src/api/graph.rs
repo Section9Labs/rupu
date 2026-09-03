@@ -37,6 +37,14 @@ async fn run_graph_from_host(
     id: &str,
 ) -> ApiResult<serde_json::Value> {
     let conn = resolve_host(s, host_id)?;
+    // SSH/Tunnel/Bucket runs are mirrored into our own RunStore, so the
+    // graph is built from local artifacts — those transports have no
+    // generic-GET surface to proxy to. Reaching for the wire here is what
+    // used to 500 the whole run-detail page with "invalid: proxy_get_json
+    // is not supported for ssh hosts".
+    if conn.serves_runs_from_local_mirror() {
+        return build_run_graph_json(&s.run_store, &s.pricing, id);
+    }
     conn.proxy_get_json(&format!("/api/runs/{id}/graph"))
         .await
         .map_err(|e| match e {
@@ -520,6 +528,141 @@ mod tests {
             "started_at": "2026-06-30T21:07:19Z",
         }))
         .expect("run record from json")
+    }
+
+    /// Fake connector for a transport whose runs live in the coordinator's
+    /// own mirror (SSH / Tunnel / Bucket). `proxy_get_json` panics: reaching
+    /// for the wire here is the bug this test guards against.
+    struct MirrorBackedConnector;
+
+    #[async_trait::async_trait]
+    impl crate::host::connector::HostConnector for MirrorBackedConnector {
+        fn serves_runs_from_local_mirror(&self) -> bool {
+            true
+        }
+        async fn info(&self) -> Result<crate::host::connector::HostInfo, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_run(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_agent(
+            &self,
+            _req: crate::agent_launcher::AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn start_session(
+            &self,
+            _req: crate::session_starter::SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn send_session_turn(
+            &self,
+            _req: crate::session_sender::SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn list_runs(
+            &self,
+            _params: crate::host::connector::RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::EventByteStream, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn proxy_get_json(
+            &self,
+            path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            panic!("run graph must read the local mirror, not proxy {path_and_query}");
+        }
+    }
+
+    /// Register `host_id` as a host resolving to `conn`. A `Local` transport
+    /// under a non-`"local"` id is the registry's injection seam — see the
+    /// same trick in `api::runs`'s `get_run_host_proxies`.
+    fn state_with_host(
+        tmp: &tempfile::TempDir,
+        host_id: &str,
+        conn: std::sync::Arc<dyn crate::host::connector::HostConnector>,
+    ) -> AppState {
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: host_id.into(),
+                name: host_id.into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let registry =
+            std::sync::Arc::new(crate::host::registry::HostRegistry::new(host_store, conn));
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
+        .with_hosts(registry)
+    }
+
+    /// Regression: `?host=<ssh id>` used to proxy a generic GET at a
+    /// transport that has none, 500ing the whole run-detail page with
+    /// "invalid: proxy_get_json is not supported for ssh hosts". The run's
+    /// artifacts are already in our mirror — build from those.
+    #[tokio::test]
+    async fn run_graph_reads_the_mirror_for_a_transport_that_cannot_proxy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state_with_host(&tmp, "host_ssh", std::sync::Arc::new(MirrorBackedConnector));
+        s.run_store
+            .create(run_record("run_mirrored", "agent:ariadne"), "")
+            .unwrap();
+
+        let resp = run_graph(
+            State(s),
+            Path("run_mirrored".to_string()),
+            Query(RunDetailQuery {
+                host: Some("host_ssh".to_string()),
+            }),
+        )
+        .await
+        .expect("a mirrored run must render from the local store, not 500");
+
+        assert_eq!(resp.0["run"]["id"], serde_json::json!("run_mirrored"));
     }
 
     #[test]

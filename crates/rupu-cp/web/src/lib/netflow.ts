@@ -138,6 +138,18 @@ export interface HostRollup {
   p95_ms?: number;
 }
 
+/** `rupu_cp::api::netflow::IncompleteSource` — a source of this run's flows
+ *  that could not be read.
+ *
+ *  Non-empty `incomplete` means the flows shown are INCOMPLETE by an unknown
+ *  amount. A run placed on a remote host keeps its ledger there, so a
+ *  local-only answer for one is not "no traffic", it is "we could not look" —
+ *  which is why this is rendered loudly rather than left to a popover. */
+export interface IncompleteSource {
+  host_id: string;
+  reason: string;
+}
+
 /** `rupu_cp::api::netflow::NetflowResponse`. */
 export interface NetflowResponse {
   flows: FlowView[];
@@ -165,6 +177,10 @@ export interface NetflowResponse {
    *  "nothing recorded at all", since the echo reflects what the server
    *  actually did, not what the UI asked for. */
   window: { from: string | null; to: string | null };
+  /** Sources that own part of this scope's traffic but could not be read.
+   *  Absent (not `[]`) when nothing is missing — the server omits the field
+   *  entirely, so treat `undefined` as complete. */
+  incomplete?: IncompleteSource[];
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +300,8 @@ export interface ExplorerResponse {
   dropped_total: number;
   asn_loaded: boolean;
   window: { from: string | null; to: string | null };
+  /** See `NetflowResponse.incomplete`. */
+  incomplete?: IncompleteSource[];
 }
 
 /** The four cross-filter sets, keyed by the server's dimension keys

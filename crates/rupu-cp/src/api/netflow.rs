@@ -207,6 +207,25 @@ pub struct NetflowResponse {
     /// the `asn` fields are absent because we could not look them up, NOT
     /// because the flows had no ASN.
     pub asn_loaded: bool,
+    /// Sources that own part of this run's traffic but could not be read.
+    ///
+    /// Non-empty means the flows shown are INCOMPLETE, and by how much is
+    /// unknown. Serving a short list silently would be the worse failure —
+    /// a run placed on a remote host keeps its ledger there, so a local-only
+    /// answer for one is not "no traffic", it is "we could not look".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<IncompleteSource>,
+}
+
+/// One source of this run's flows that could not be read, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IncompleteSource {
+    /// The registered host id whose ledger is missing from this response.
+    pub host_id: String,
+    /// Why it could not be read, in the words of whatever refused —
+    /// an out-of-date remote `rupu`, an unreachable host, an unregistered
+    /// host id. Rendered to an operator, so it must name the fix.
+    pub reason: String,
 }
 
 /// Flows belonging to one run, filtered from an in-memory set by
@@ -1016,6 +1035,9 @@ pub(crate) fn build_filtered_response(
         dropped_total: dropped,
         window: WindowEcho::from(range),
         asn_loaded: table.is_some(),
+        // Builders serve local data; a caller that also read a remote
+        // source records any gap on the returned value.
+        incomplete: Vec::new(),
     }
 }
 
@@ -1028,15 +1050,50 @@ pub(crate) fn build_filtered_response(
 /// [`collect_run_netflow`] (which wraps this into the enriched
 /// [`NetflowResponse`]) and the graph endpoint's `run:` scope (which only
 /// needs raw [`FlowRecord`]s to feed [`rupu_netflow::ledger::graph_view`]).
-fn run_scoped_flows_and_dropped(
+///
+/// `pub` because `rupu-cli`'s `netflow show` serves this same read to a
+/// coordinator over ssh — a host with no generic-GET surface. One
+/// implementation of the ledger+transcript merge, not two that can drift.
+pub fn run_scoped_flows_and_dropped(
     store: &RunStore,
     run_id: &str,
     workspace: &StdPath,
     global_dir: &StdPath,
     range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<FlowRecord>, u64) {
-    let mut all = Vec::new();
-    let mut dropped = 0u64;
+    run_scoped_flows_and_dropped_with(store, run_id, workspace, global_dir, range, Vec::new(), 0)
+}
+
+/// [`run_scoped_flows_and_dropped`] plus ledger flows read from somewhere
+/// this machine cannot see — a run placed on a remote host writes its
+/// ledger THERE, and only its transcript is mirrored back.
+///
+/// `extra_ledger_flows` joins the LEDGER side of the merge, not the result,
+/// and that placement is the whole point: a mirrored transcript carries the
+/// snapshot each flow had when it was first recorded, while the ledger
+/// carries the finalized record (bytes, duration, completion). Appending
+/// the remote flows afterwards would let the degraded local snapshot win on
+/// an id collision; feeding them in as ledger flows makes the authoritative
+/// copy win, exactly as a local ledger's would. See
+/// [`merge_with_transcript`] for that precedence rule.
+///
+/// `extra_dropped` is added to the local dropped count — records lost on
+/// the remote are lost just the same, and folding them to zero here would
+/// claim a completeness we do not have.
+pub fn run_scoped_flows_and_dropped_with(
+    store: &RunStore,
+    run_id: &str,
+    workspace: &StdPath,
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+    extra_ledger_flows: Vec<FlowRecord>,
+    extra_dropped: u64,
+) -> (Vec<FlowRecord>, u64) {
+    let mut all: Vec<FlowRecord> = extra_ledger_flows
+        .into_iter()
+        .filter(|f| range.contains(f.ts))
+        .collect();
+    let mut dropped = extra_dropped;
     for id in run_and_unit_ids(store, run_id) {
         for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
             let (f, d) =
@@ -1066,6 +1123,7 @@ fn run_scoped_flows_and_dropped(
 /// reports as this run's step transcript paths, scope to `run_id`, merge,
 /// and build the response. A missing ledger is an empty result, not an
 /// error. Synchronous — see [`run_scoped_flows_and_dropped`].
+#[allow(clippy::too_many_arguments)]
 fn collect_run_netflow(
     store: &RunStore,
     run_id: &str,
@@ -1074,9 +1132,18 @@ fn collect_run_netflow(
     cache: &AsnCache,
     range: &rupu_netflow::ledger::TimeRange,
     filters: &ExplorerFilters,
+    remote: (Vec<FlowRecord>, u64, Vec<IncompleteSource>),
 ) -> NetflowResponse {
-    let (merged, dropped) =
-        run_scoped_flows_and_dropped(store, run_id, workspace, global_dir, range);
+    let (remote_flows, remote_dropped, incomplete) = remote;
+    let (merged, dropped) = run_scoped_flows_and_dropped_with(
+        store,
+        run_id,
+        workspace,
+        global_dir,
+        range,
+        remote_flows,
+        remote_dropped,
+    );
     // Every flow at run scope folds into THIS run (the whole point of
     // `run_and_unit_ids`), so attribution is the run's own record; a
     // record that fails to load leaves run/workflow unattributed rather
@@ -1090,7 +1157,10 @@ fn collect_run_netflow(
         .into_iter()
         .map(|f| (run_id.to_string(), f))
         .collect();
-    build_filtered_response(tagged, &meta, dropped, table.as_deref(), range, filters)
+    let mut resp =
+        build_filtered_response(tagged, &meta, dropped, table.as_deref(), range, filters);
+    resp.incomplete = incomplete;
+    resp
 }
 
 /// A registered workspace store, rooted at `<global_dir>/workspaces/` —
@@ -1685,6 +1755,9 @@ pub struct ExplorerResponse {
     /// The applied `?from=`/`?to=` — see [`WindowEcho`]. The histogram's
     /// own bounds are deliberately NOT this (full retained range).
     pub window: WindowEcho,
+    /// See [`NetflowResponse::incomplete`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<IncompleteSource>,
 }
 
 /// Assemble every explorer view from one scope's flows. `scope_flows` is
@@ -1728,6 +1801,9 @@ pub(crate) fn build_explorer_response(
         dropped_total: dropped,
         asn_loaded,
         window: WindowEcho::from(range),
+        // Builders serve local data; a caller that also read a remote
+        // source records any gap on the returned value.
+        incomplete: Vec::new(),
     }
 }
 
@@ -1819,6 +1895,9 @@ async fn explorer_run_scope(
                 .run_store
                 .load(run_id)
                 .map_err(|e| run_not_found_or_internal(run_id, e))?;
+            // See `get_run_netflow`'s `Global` branch: a placed run's ledger
+            // lives on the host that executed it.
+            let (remote_flows, remote_dropped, incomplete) = worker_host_flows(s, &run).await;
             let store = Arc::clone(&s.run_store);
             let rid = run_id.to_string();
             let workspace = run.workspace_path.clone();
@@ -1827,26 +1906,40 @@ async fn explorer_run_scope(
             let range = range.clone();
             let filters = filters.clone();
             run_blocking(move || {
-                let (merged, dropped) =
-                    run_scoped_flows_and_dropped(&store, &rid, &workspace, &global_dir, &unbounded);
+                let (merged, dropped) = run_scoped_flows_and_dropped_with(
+                    &store,
+                    &rid,
+                    &workspace,
+                    &global_dir,
+                    &unbounded,
+                    remote_flows,
+                    remote_dropped,
+                );
                 let mut meta = RunMetaIndex::default();
                 meta.insert_run(&store, &run);
                 let table = load_asn_table(&cache);
                 let tagged: Vec<(String, FlowRecord)> =
                     merged.into_iter().map(|f| (rid.clone(), f)).collect();
                 let flows = to_explorer_flows(tagged, &meta, table.as_deref());
-                build_explorer_response(
+                let mut resp = build_explorer_response(
                     &flows,
                     dropped,
                     &meta.spans,
                     table.is_some(),
                     &range,
                     &filters,
-                )
+                );
+                resp.incomplete = incomplete;
+                resp
             })
             .await
         }
         RunLocation::ProjectLocal { path } => {
+            let (remote_flows, remote_dropped, incomplete) =
+                match RunStore::new(path.join(".rupu").join("runs")).load(run_id) {
+                    Ok(run) => worker_host_flows(s, &run).await,
+                    Err(_) => (Vec::new(), 0, Vec::new()),
+                };
             let rid = run_id.to_string();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
@@ -1854,8 +1947,15 @@ async fn explorer_run_scope(
             let filters = filters.clone();
             run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                let (merged, dropped) =
-                    run_scoped_flows_and_dropped(&store, &rid, &path, &global_dir, &unbounded);
+                let (merged, dropped) = run_scoped_flows_and_dropped_with(
+                    &store,
+                    &rid,
+                    &path,
+                    &global_dir,
+                    &unbounded,
+                    remote_flows,
+                    remote_dropped,
+                );
                 let mut meta = RunMetaIndex::default();
                 if let Ok(record) = store.load(&rid) {
                     meta.insert_run(&store, &record);
@@ -1864,14 +1964,16 @@ async fn explorer_run_scope(
                 let tagged: Vec<(String, FlowRecord)> =
                     merged.into_iter().map(|f| (rid.clone(), f)).collect();
                 let flows = to_explorer_flows(tagged, &meta, table.as_deref());
-                build_explorer_response(
+                let mut resp = build_explorer_response(
                     &flows,
                     dropped,
                     &meta.spans,
                     table.is_some(),
                     &range,
                     &filters,
-                )
+                );
+                resp.incomplete = incomplete;
+                resp
             })
             .await
         }
@@ -1895,6 +1997,154 @@ async fn explorer_run_scope(
     }
 }
 
+/// What a host could tell us about one run's raw flow records.
+enum HostFlows {
+    /// The host served the structured surface. Raw records plus the
+    /// ledger's own dropped-record count.
+    Records(Vec<FlowRecord>, u64),
+    /// The host has no structured netflow surface. `reason` is that
+    /// refusal, kept because it is the informative one: an HTTP host is
+    /// simply expected to proxy instead, but an SSH host landing here means
+    /// its remote `rupu` predates `netflow show`, and saying THAT beats
+    /// letting the generic-GET attempt report "proxy_get_json is not
+    /// supported for ssh hosts" — true, but not the operator's actual
+    /// problem.
+    NoStructuredSurface { reason: String },
+}
+
+/// Fetch one run's raw flow records from a host that exposes the structured
+/// [`HostConnector::run_netflow`] surface.
+///
+/// Raw records, aggregated locally: the CP applies its own window, filters
+/// and ASN table, so every host's flows are enriched identically and a
+/// remote cannot return something that merely looks filtered.
+async fn host_raw_flows(s: &AppState, host_id: &str, run_id: &str) -> ApiResult<HostFlows> {
+    let conn = resolve_host(s, host_id)?;
+    let value = match conn.run_netflow(run_id).await {
+        Ok(v) => v,
+        // No structured surface — the caller tries the generic-GET proxy,
+        // and falls back to THIS reason if that has nothing to offer either.
+        Err(HostConnectorError::Unsupported(reason)) | Err(HostConnectorError::Invalid(reason)) => {
+            return Ok(HostFlows::NoStructuredSurface { reason })
+        }
+        Err(HostConnectorError::NotFound(m)) => return Err(ApiError::not_found(m)),
+        Err(HostConnectorError::Unreachable(m)) => {
+            return Err(ApiError::internal(format!(
+                "host {host_id} unreachable: {m}"
+            )))
+        }
+        Err(other) => return Err(ApiError::internal(other.to_string())),
+    };
+
+    let flows: Vec<FlowRecord> = serde_json::from_value(
+        value
+            .get("flows")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+    )
+    .map_err(|e| {
+        ApiError::internal(format!(
+            "host {host_id} returned netflow records this build cannot read ({e}); \
+             the remote rupu is likely older than this one"
+        ))
+    })?;
+    let dropped = value
+        .get("dropped_total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Ok(HostFlows::Records(flows, dropped))
+}
+
+/// Read the ledger held by the host a run actually EXECUTED on.
+///
+/// A run placed on a remote host is mirrored into our own `RunStore` — so
+/// it resolves as a local run — but its netflow ledger stays on the host
+/// that made the calls. Reading only local ledgers for such a run returns
+/// an empty set that looks exactly like "this run made no network calls".
+/// `worker_id` is what distinguishes the two, so it is what this keys on.
+///
+/// Never fails the caller: a host that cannot answer yields no flows plus
+/// an [`IncompleteSource`] naming it, so the view renders what it has AND
+/// says what is missing. Failing the whole read would throw away the local
+/// half over an offline host; returning short and silent would be the
+/// original bug.
+async fn worker_host_flows(
+    s: &AppState,
+    run: &rupu_orchestrator::runs::RunRecord,
+) -> (Vec<FlowRecord>, u64, Vec<IncompleteSource>) {
+    let Some(host_id) = run.worker_id.as_deref().filter(|h| !h.is_empty()) else {
+        return (Vec::new(), 0, Vec::new());
+    };
+    if host_id == "local" {
+        return (Vec::new(), 0, Vec::new());
+    }
+    let incomplete = |reason: String| {
+        (
+            Vec::new(),
+            0,
+            vec![IncompleteSource {
+                host_id: host_id.to_string(),
+                reason,
+            }],
+        )
+    };
+
+    let conn = match s.hosts.resolve(host_id) {
+        Ok(c) => c,
+        Err(e) => {
+            // The run says it executed there; we just cannot get to it.
+            return incomplete(format!("host {host_id} could not be resolved: {e}"));
+        }
+    };
+    match conn.run_netflow(&run.id).await {
+        Ok(value) => {
+            let flows: Result<Vec<FlowRecord>, _> = serde_json::from_value(
+                value
+                    .get("flows")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+            );
+            match flows {
+                Ok(flows) => (
+                    flows,
+                    value
+                        .get("dropped_total")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    Vec::new(),
+                ),
+                Err(e) => incomplete(format!(
+                    "host {host_id} returned netflow records this build cannot read ({e}); \
+                     the remote rupu is likely older than this one"
+                )),
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                host_id = %host_id,
+                run_id = %run.id,
+                error = %e,
+                "worker_host_flows: could not read the run's own host ledger"
+            );
+            incomplete(e.to_string())
+        }
+    }
+}
+
+/// The attribution index for a host-sourced run.
+///
+/// A run placed on an SSH/Tunnel host is ALSO mirrored into our own
+/// `RunStore`, so its record is usually right here and attribution is exact.
+/// When it is not, an empty index leaves run/workflow unattributed rather
+/// than failing the read — the same posture the `ProjectLocal` branch takes.
+fn meta_for_host_run(s: &AppState, run_id: &str) -> RunMetaIndex {
+    let mut meta = RunMetaIndex::default();
+    if let Ok(record) = s.run_store.load(run_id) {
+        meta.insert_run(&s.run_store, &record);
+    }
+    meta
+}
+
 /// Proxy the whole explorer request to a resolved host — the remote CP
 /// owns the run's ledgers, run records, and its own ASN table, so it
 /// builds the aggregates and we relay them. Unlike
@@ -1909,6 +2159,35 @@ async fn explorer_from_host(
     range: &rupu_netflow::ledger::TimeRange,
     filters: &ExplorerFilters,
 ) -> ApiResult<ExplorerResponse> {
+    // A transport with a structured netflow surface (SSH) returns raw
+    // records that we aggregate here, with our own window, filters and ASN
+    // table. Only an HTTP host falls through to the proxy below.
+    let no_structured_reason = match host_raw_flows(s, host_id, run_id).await? {
+        HostFlows::NoStructuredSurface { reason } => reason,
+        HostFlows::Records(flows, dropped) => {
+            let meta = meta_for_host_run(s, run_id);
+            let cache = Arc::clone(&s.asn_cache);
+            let rid = run_id.to_string();
+            let range = range.clone();
+            let filters = filters.clone();
+            return run_blocking(move || {
+                let table = load_asn_table(&cache);
+                let tagged: Vec<(String, FlowRecord)> =
+                    flows.into_iter().map(|f| (rid.clone(), f)).collect();
+                let explorer_flows = to_explorer_flows(tagged, &meta, table.as_deref());
+                build_explorer_response(
+                    &explorer_flows,
+                    dropped,
+                    &meta.spans,
+                    table.is_some(),
+                    &range,
+                    &filters,
+                )
+            })
+            .await;
+        }
+    };
+
     let conn = resolve_host(s, host_id)?;
     let mut parts = vec![format!("scope=run:{}", urlencode_query_value(run_id))];
     parts.extend(time_range_query_parts(range));
@@ -1922,6 +2201,12 @@ async fn explorer_from_host(
         HostConnectorError::Unreachable(m) => {
             ApiError::internal(format!("host {host_id} unreachable: {m}"))
         }
+        // Neither surface: report why the STRUCTURED one declined, which
+        // names the actual problem (an out-of-date remote `rupu`), not the
+        // generic-GET refusal that is merely a property of the transport.
+        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => ApiError::internal(
+            format!("host {host_id} cannot serve netflow: {no_structured_reason}"),
+        ),
         other => ApiError::internal(other.to_string()),
     })?;
     serde_json::from_value(value).map_err(|e| {
@@ -1953,6 +2238,26 @@ async fn run_netflow_from_host(
     range: &rupu_netflow::ledger::TimeRange,
     filters: &ExplorerFilters,
 ) -> ApiResult<NetflowResponse> {
+    // Same rule as `explorer_from_host`: raw records from a structured
+    // transport, enriched and filtered here; only HTTP proxies.
+    let no_structured_reason = match host_raw_flows(s, host_id, id).await? {
+        HostFlows::NoStructuredSurface { reason } => reason,
+        HostFlows::Records(flows, dropped) => {
+            let meta = meta_for_host_run(s, id);
+            let cache = Arc::clone(&s.asn_cache);
+            let rid = id.to_string();
+            let range = range.clone();
+            let filters = filters.clone();
+            return run_blocking(move || {
+                let table = load_asn_table(&cache);
+                let tagged: Vec<(String, FlowRecord)> =
+                    flows.into_iter().map(|f| (rid.clone(), f)).collect();
+                build_filtered_response(tagged, &meta, dropped, table.as_deref(), &range, &filters)
+            })
+            .await;
+        }
+    };
+
     let conn = resolve_host(s, host_id)?;
     let path = format!(
         "/api/runs/{id}/netflow{}",
@@ -1963,6 +2268,10 @@ async fn run_netflow_from_host(
         HostConnectorError::Unreachable(m) => {
             ApiError::internal(format!("host {host_id} unreachable: {m}"))
         }
+        // See `explorer_from_host`: prefer the structured surface's reason.
+        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => ApiError::internal(
+            format!("host {host_id} cannot serve netflow: {no_structured_reason}"),
+        ),
         other => ApiError::internal(other.to_string()),
     })?;
     // A deserialization failure here is most likely `dropped_total` not
@@ -2139,6 +2448,10 @@ async fn get_run_netflow(
                 .run_store
                 .load(&run_id)
                 .map_err(|e| run_not_found_or_internal(&run_id, e))?;
+            // A run placed on a remote host keeps its ledger THERE; only
+            // its transcript is mirrored back. Read the owning host too, or
+            // this returns an empty set that reads as "no network calls".
+            let remote = worker_host_flows(&s, &run).await;
             let store = Arc::clone(&s.run_store);
             let rid = run_id.clone();
             let workspace = run.workspace_path.clone();
@@ -2153,18 +2466,34 @@ async fn get_run_netflow(
                     &cache,
                     &range,
                     &filters,
+                    remote,
                 )
             })
             .await?;
             Ok(Json(resp))
         }
         RunLocation::ProjectLocal { path } => {
+            // Same rule as the `Global` branch: a project-local record can
+            // still name a remote worker.
+            let remote = match RunStore::new(path.join(".rupu").join("runs")).load(&run_id) {
+                Ok(run) => worker_host_flows(&s, &run).await,
+                Err(_) => (Vec::new(), 0, Vec::new()),
+            };
             let rid = run_id.clone();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                collect_run_netflow(&store, &rid, &path, &global_dir, &cache, &range, &filters)
+                collect_run_netflow(
+                    &store,
+                    &rid,
+                    &path,
+                    &global_dir,
+                    &cache,
+                    &range,
+                    &filters,
+                    remote,
+                )
             })
             .await?;
             Ok(Json(resp))
@@ -2342,6 +2671,7 @@ mod tests {
             window: WindowEcho::default(),
             dropped_total: 0,
             asn_loaded: true,
+            incomplete: Vec::new(),
         };
         check_fixture("netflow_run.json", &response);
     }
@@ -2531,6 +2861,210 @@ mod tests {
             .expect("peer_ip resolves in the table");
         assert_eq!(asn.asn, 13335);
         assert_eq!(asn.org, "CLOUDFLARENET");
+    }
+
+    /// Register `host_id` resolving to `conn`. A `Local` transport under a
+    /// non-`"local"` id is the registry's injection seam.
+    fn state_with_host(
+        tmp: &tempfile::TempDir,
+        host_id: &str,
+        conn: Arc<dyn crate::host::connector::HostConnector>,
+    ) -> AppState {
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: host_id.into(),
+                name: host_id.into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let registry = Arc::new(crate::host::registry::HostRegistry::new(host_store, conn));
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
+        .with_hosts(registry)
+    }
+
+    fn placed_run(id: &str, host_id: &str, workspace: &std::path::Path) -> RunRecord {
+        let mut r = seed_record(id, "wf", workspace);
+        r.worker_id = Some(host_id.to_string());
+        r
+    }
+
+    /// The reported behaviour: a run placed on a remote host resolves as a
+    /// LOCAL run (it is mirrored here), so a local-only ledger read returned
+    /// an empty set that reads as "this run made no network calls". Its
+    /// ledger lives on the host that made the calls; go and read it.
+    #[tokio::test]
+    async fn a_placed_runs_flows_come_from_the_host_that_executed_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote_flow = flow(FlowId::from(9u128), Some("run_placed"), "api.openai.com");
+        let conn: Arc<dyn crate::host::connector::HostConnector> =
+            Arc::new(crate::host::connector::testing::StubConnector {
+                run_netflow: Some(Ok(serde_json::json!({
+                    "flows": [remote_flow],
+                    "dropped_total": 2,
+                }))),
+            });
+        let s = state_with_host(&tmp, "host_ssh", conn);
+        let run = placed_run("run_placed", "host_ssh", tmp.path());
+
+        let (flows, dropped, incomplete) = worker_host_flows(&s, &run).await;
+
+        assert_eq!(flows.len(), 1, "the host's own ledger is read");
+        assert_eq!(flows[0].host, "api.openai.com");
+        assert_eq!(dropped, 2, "and its dropped count comes with it");
+        assert!(incomplete.is_empty(), "nothing was missing");
+    }
+
+    /// A host that cannot answer must be NAMED, not silently skipped: a
+    /// short flow list that looks complete is the failure this whole change
+    /// exists to remove.
+    #[tokio::test]
+    async fn a_host_that_cannot_answer_is_reported_not_silently_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn: Arc<dyn crate::host::connector::HostConnector> =
+            Arc::new(crate::host::connector::testing::StubConnector {
+                // Default: Unsupported — a remote whose rupu predates
+                // `netflow show`.
+                run_netflow: None,
+            });
+        let s = state_with_host(&tmp, "host_ssh", conn);
+        let run = placed_run("run_placed", "host_ssh", tmp.path());
+
+        let (flows, dropped, incomplete) = worker_host_flows(&s, &run).await;
+
+        assert!(flows.is_empty());
+        assert_eq!(dropped, 0);
+        assert_eq!(incomplete.len(), 1, "the gap is declared");
+        assert_eq!(incomplete[0].host_id, "host_ssh");
+        assert!(
+            !incomplete[0].reason.is_empty(),
+            "and it says why, so an operator knows what to fix"
+        );
+    }
+
+    /// A run that executed here has no remote half to read, and must not be
+    /// marked incomplete for it.
+    #[tokio::test]
+    async fn a_local_run_reads_no_remote_and_is_not_marked_incomplete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn: Arc<dyn crate::host::connector::HostConnector> =
+            Arc::new(crate::host::connector::testing::StubConnector::default());
+        let s = state_with_host(&tmp, "host_ssh", conn);
+        // No worker_id at all, and the explicit "local" spelling.
+        let plain = seed_record("run_here", "wf", tmp.path());
+        let mut local = seed_record("run_here2", "wf", tmp.path());
+        local.worker_id = Some("local".into());
+
+        for run in [plain, local] {
+            let (flows, dropped, incomplete) = worker_host_flows(&s, &run).await;
+            assert!(flows.is_empty());
+            assert_eq!(dropped, 0);
+            assert!(incomplete.is_empty(), "a local run is not incomplete");
+        }
+    }
+
+    /// A run placed on a remote host writes its ledger THERE. Its
+    /// transcript is mirrored back here, so a local-only read recovers a
+    /// degraded snapshot of each flow at best — and nothing at all for a
+    /// flow the transcript never carried. The remote ledger must join the
+    /// LEDGER side of the merge, so its finalized copy wins over the
+    /// mirrored transcript's, exactly as a local ledger's would.
+    #[test]
+    fn remote_ledger_flows_join_the_ledger_side_and_win_over_the_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let run = seed_record("run_placed", "wf", tmp.path());
+        store.create(run, "").unwrap();
+
+        // The mirrored transcript carries a mid-flight snapshot of flow 1
+        // and nothing else. There is no local ledger at all.
+        let shared_id = FlowId::from(1u128);
+        let mut snapshot = flow(shared_id, Some("run_placed"), "api.anthropic.com");
+        snapshot.duration_ms = Some(0);
+        let transcript = tmp.path().join("t.jsonl");
+        write_transcript(&transcript, &[snapshot]);
+        store
+            .append_step_result(
+                "run_placed",
+                &rupu_orchestrator::runs::StepResultRecord {
+                    run_outcome: None,
+                    step_id: "s1".into(),
+                    run_id: "run_placed".into(),
+                    transcript_path: transcript.clone(),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: rupu_orchestrator::runs::StepKind::Linear,
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
+                },
+            )
+            .unwrap();
+
+        // The remote ledger holds the finalized copy of flow 1, plus a flow
+        // the transcript never saw.
+        let mut finalized = flow(shared_id, Some("run_placed"), "api.anthropic.com");
+        finalized.duration_ms = Some(1234);
+        let remote_only = flow(FlowId::from(2u128), Some("run_placed"), "api.github.com");
+
+        let (merged, dropped) = run_scoped_flows_and_dropped_with(
+            &store,
+            "run_placed",
+            tmp.path(),
+            tmp.path(),
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+            vec![finalized, remote_only],
+            3,
+        );
+
+        assert_eq!(merged.len(), 2, "both remote flows survive");
+        let one = merged.iter().find(|f| f.id == shared_id).unwrap();
+        assert_eq!(
+            one.duration_ms,
+            Some(1234),
+            "the remote LEDGER's finalized copy must win over the mirrored transcript snapshot"
+        );
+        assert_eq!(
+            dropped, 3,
+            "the remote's dropped count is carried, not discarded"
+        );
+    }
+
+    /// The existing local-only contract must not shift: with no remote
+    /// flows the function behaves exactly as before.
+    #[test]
+    fn no_remote_flows_leaves_the_local_read_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let run = seed_record("run_local", "wf", tmp.path());
+        store.create(run, "").unwrap();
+
+        let (merged, dropped) = run_scoped_flows_and_dropped_with(
+            &store,
+            "run_local",
+            tmp.path(),
+            tmp.path(),
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+            Vec::new(),
+            0,
+        );
+
+        assert!(merged.is_empty());
+        assert_eq!(dropped, 0);
     }
 
     #[test]

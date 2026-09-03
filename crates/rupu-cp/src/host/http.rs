@@ -410,6 +410,28 @@ impl HostConnector for HttpHostConnector {
             .map_err(|e| HostConnectorError::Remote(0, e.to_string()))
     }
 
+    /// Proxy session detail verbatim: an HTTP remote's `/api/sessions/:id`
+    /// already answers in API shape, `usage` included (priced by that
+    /// remote's own config, which we do not second-guess).
+    async fn get_session(&self, id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        self.proxy_get_json(&format!("/api/sessions/{id}")).await
+    }
+
+    /// Proxy the dedicated runs endpoint — the API session DTO carries no
+    /// `runs` field, so this cannot be read out of `get_session`'s body.
+    async fn session_runs(&self, id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        self.proxy_get_json(&format!("/api/sessions/{id}/runs"))
+            .await
+    }
+
+    async fn session_usage_timeline(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        self.proxy_get_json(&format!("/api/sessions/{id}/usage-timeline"))
+            .await
+    }
+
     async fn proxy_get_json(
         &self,
         path_and_query: &str,

@@ -242,6 +242,18 @@ pub trait HostConnector: Send + Sync {
         path_and_query: &str,
     ) -> Result<serde_json::Value, HostConnectorError>;
 
+    /// Whether this transport's runs are mirrored into the coordinator's own
+    /// `RunStore` (by `NodeMirror`) rather than living only on the remote.
+    ///
+    /// `true` means run-scoped detail endpoints (`graph`, `usage-timeline`)
+    /// must build from the local mirror: the artifacts are already here, and
+    /// these transports have no generic-GET surface to proxy to anyway.
+    /// `false` — the default, and the HTTP connector's answer — means the
+    /// run's artifacts live on the remote and must be fetched over the wire.
+    fn serves_runs_from_local_mirror(&self) -> bool {
+        false
+    }
+
     /// List sessions on this host, optionally filtered by `scope`
     /// (`"active"` | `"archived"`). The structured counterpart to
     /// `proxy_get_json("/api/sessions")`, so non-HTTP transports (SSH) can
@@ -253,6 +265,80 @@ pub trait HostConnector: Send + Sync {
         _scope: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         Err(HostConnectorError::Unsupported("session listing".into()))
+    }
+
+    /// Fetch one session's detail record from this host, **in API shape**
+    /// (the same field names `GET /api/sessions/:id` returns locally —
+    /// `agent_name`, `provider_name`, ...). The structured counterpart to
+    /// `proxy_get_json("/api/sessions/<id>")`, so non-HTTP transports can
+    /// serve session detail too: HTTP proxies verbatim, while the SSH
+    /// connector shells `rupu session show <id> --format json` and renames
+    /// that report's human-table field labels to the API's.
+    ///
+    /// The returned body may omit `usage` — a transport that cannot price
+    /// (SSH carries no pricing config by design; see `SshHostConnector::new`)
+    /// leaves that to the caller. The default errors so transports without
+    /// session enumeration compile unchanged.
+    async fn get_session(&self, _id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session detail".into()))
+    }
+
+    /// The runs one session recorded, newest-last, as a JSON array — the
+    /// structured counterpart to `proxy_get_json("/api/sessions/<id>/runs")`.
+    ///
+    /// Deliberately separate from [`get_session`](Self::get_session): the API
+    /// session DTO carries no `runs` field, so an HTTP host must proxy the
+    /// dedicated `/runs` endpoint rather than dig into the detail body. The
+    /// SSH connector reads the `runs[]` out of the same `session show`
+    /// report — one ssh round trip per call, not two.
+    async fn session_runs(&self, _id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session runs".into()))
+    }
+
+    /// One run's raw netflow records from this host, as
+    /// `{ "flows": [FlowRecord...], "dropped_total": u64 }`.
+    ///
+    /// Deliberately RAW rather than an aggregated response: the CP applies
+    /// its own window, filters and ASN table to the records, so a remote
+    /// cannot return something that looks filtered but is not (the reason
+    /// the proxy path carries a defensive re-filtering pass), and every
+    /// host's flows get enriched identically. The SSH connector shells
+    /// `rupu netflow show <run_id> --format json`.
+    async fn run_netflow(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("run netflow".into()))
+    }
+
+    /// Token/cost rollup for a time window on this host — the structured
+    /// counterpart to `proxy_get_json("/api/usage?...")`.
+    ///
+    /// `since`/`until` are RFC-3339; `group_by` is the CP's own group name.
+    /// Returns the host's report verbatim (shapes differ per transport), so
+    /// the caller maps it. The SSH connector shells `rupu usage --since
+    /// <s> --until <u> --group-by <g> --format json`.
+    async fn usage_rollup(
+        &self,
+        _since: &str,
+        _until: &str,
+        _group_by: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("usage rollup".into()))
+    }
+
+    /// Per-turn token series for one session on this host — the structured
+    /// counterpart to `proxy_get_json("/api/sessions/<id>/usage-timeline")`.
+    ///
+    /// Returns a JSON array of the same points the local branch emits. HTTP
+    /// proxies; the SSH connector shells `rupu session usage-timeline <id>
+    /// --format json`, which computes the series remotely in ONE round trip
+    /// (fetching each run's transcript separately would be N ssh
+    /// connections per page load).
+    async fn session_usage_timeline(
+        &self,
+        _id: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "session usage timeline".into(),
+        ))
     }
 
     /// Archive an active session on this host. The default impl returns
@@ -704,5 +790,115 @@ mod codec_tests {
         assert!(decode_payload(&[]).is_err());
         assert!(decode_payload(&[9]).is_err()); // unknown mode tag
         assert!(decode_delta(&[0, 0]).is_err()); // shorter than 4-byte header len
+    }
+}
+
+/// A configurable [`HostConnector`] for tests.
+///
+/// Every method not explicitly configured panics rather than returning a
+/// plausible empty value: a test that reaches an unconfigured method has
+/// exercised a path it did not mean to, and should say so loudly.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct StubConnector {
+        /// Canned `run_netflow` reply. `None` → `Unsupported`, modelling a
+        /// remote whose `rupu` predates `netflow show`.
+        pub run_netflow: Option<Result<serde_json::Value, HostConnectorError>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostConnector for StubConnector {
+        async fn run_netflow(
+            &self,
+            _run_id: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            match &self.run_netflow {
+                Some(Ok(v)) => Ok(v.clone()),
+                Some(Err(e)) => Err(match e {
+                    HostConnectorError::Unreachable(m) => {
+                        HostConnectorError::Unreachable(m.clone())
+                    }
+                    HostConnectorError::Unsupported(m) => {
+                        HostConnectorError::Unsupported(m.clone())
+                    }
+                    HostConnectorError::Invalid(m) => HostConnectorError::Invalid(m.clone()),
+                    HostConnectorError::NotFound(m) => HostConnectorError::NotFound(m.clone()),
+                    HostConnectorError::Unauthorized => HostConnectorError::Unauthorized,
+                    HostConnectorError::Remote(c, m) => HostConnectorError::Remote(*c, m.clone()),
+                }),
+                None => Err(HostConnectorError::Unsupported("run netflow".into())),
+            }
+        }
+
+        async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+            unimplemented!("StubConnector: info not configured")
+        }
+        async fn launch_run(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: launch_run not configured")
+        }
+        async fn launch_agent(
+            &self,
+            _req: crate::agent_launcher::AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: launch_agent not configured")
+        }
+        async fn start_session(
+            &self,
+            _req: crate::session_starter::SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: start_session not configured")
+        }
+        async fn send_session_turn(
+            &self,
+            _req: crate::session_sender::SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: send_session_turn not configured")
+        }
+        async fn list_runs(
+            &self,
+            _params: RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!("StubConnector: list_runs not configured")
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("StubConnector: get_run not configured")
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("StubConnector: approve_run not configured")
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!("StubConnector: reject_run not configured")
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("StubConnector: cancel_run not configured")
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<EventByteStream, HostConnectorError> {
+            unimplemented!("StubConnector: stream_run_events not configured")
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("StubConnector: get_transcript not configured")
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("StubConnector: proxy_get_json not configured")
+        }
     }
 }

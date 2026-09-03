@@ -774,6 +774,32 @@ struct PumpHandle {
 /// CLI forever would be worse than a logged, explicitly-incomplete mirror.
 const PUMP_FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Rename a `session show` report `item`'s human-table field labels to the
+/// API's, so a remote session renders through the same client code as a
+/// local one.
+///
+/// Only the labels that actually differ are touched (`agent` → `agent_name`,
+/// `provider` → `provider_name`); every other key passes through untouched,
+/// so a newer remote reporting extra fields is not silently truncated here.
+/// `usage` is deliberately not computed — this connector has no pricing.
+fn session_item_to_api_shape(item: &serde_json::Value) -> serde_json::Value {
+    let mut out = item.clone();
+    let Some(map) = out.as_object_mut() else {
+        return out;
+    };
+    for (from, to) in [("agent", "agent_name"), ("provider", "provider_name")] {
+        if let Some(v) = map.remove(from) {
+            map.insert(to.to_string(), v);
+        }
+    }
+    // `runs` belongs to the dedicated `session_runs` surface, not the detail
+    // body (the API session DTO has no such field).
+    map.remove("runs");
+    map.entry("scope")
+        .or_insert_with(|| serde_json::Value::String("active".into()));
+    serde_json::Value::Object(map.clone())
+}
+
 impl SshHostConnector {
     /// Construct a new connector.
     ///
@@ -1288,6 +1314,64 @@ impl SshHostConnector {
             .unwrap_or_default())
     }
 
+    /// The useful half of a failed `remote_json` call.
+    ///
+    /// [`remote_json`](Self::remote_json) maps a NON-ZERO EXIT to
+    /// `Unreachable`, whose Display prefixes "host unreachable:". For a host
+    /// that answered and simply rejected the command (an out-of-date `rupu`
+    /// printing "unrecognized subcommand"), that prefix is actively wrong —
+    /// it points an operator at the network instead of at the binary. Unwrap
+    /// the inner message so callers can report what the remote actually
+    /// said.
+    fn remote_failure_detail(e: &HostConnectorError) -> String {
+        match e {
+            HostConnectorError::Unreachable(m) => m.trim().to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Fetch one session's `session show` report `item` over ssh.
+    ///
+    /// A remote that explicitly says the session is absent maps to
+    /// `NotFound`; anything else (a host predating the command, unreachable,
+    /// malformed body) maps to `Unsupported` — "the host cannot report" is
+    /// not the same as "the session does not exist", and rendering the
+    /// latter would present an empty page as truth. Same rule as
+    /// [`get_run`](Self::get_run).
+    async fn session_show_item(&self, id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        match self
+            .remote_json_item(&["--format", "json", "session", "show", id])
+            .await
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let message = e.to_string();
+                let lower = message.to_lowercase();
+                // `rupu session show` reports an absent session as "unknown
+                // session: <id>" (session.rs's `read_session`), NOT "not
+                // found" the way `run show` does — match the message the
+                // command actually emits, plus the generic phrasing, so an
+                // absent session 404s instead of being reported as a host
+                // that cannot answer.
+                let says_absent = lower.contains("unknown session") || lower.contains("not found");
+                if says_absent && message.contains(id) {
+                    return Err(HostConnectorError::NotFound(id.to_string()));
+                }
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    session_id = %id,
+                    error = %e,
+                    "session_show_item: remote `rupu session show` failed; host may predate it"
+                );
+                Err(HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu session show --format json`: {}",
+                    self.host_id,
+                    Self::remote_failure_detail(&e)
+                )))
+            }
+        }
+    }
+
     /// Run a one-shot `rupu <argv...>` over ssh and return the `item` object
     /// of the CLI's `--format json` report. Used by [`get_run`](Self::get_run).
     async fn remote_json_item(
@@ -1754,6 +1838,13 @@ impl HostConnector for SshHostConnector {
         read_transcript_file(path)
     }
 
+    /// SSH/Tunnel/Bucket runs are created in, and tailed into, the
+    /// coordinator's own `RunStore` by `NodeMirror`, so run-scoped detail
+    /// endpoints read that mirror instead of the wire.
+    fn serves_runs_from_local_mirror(&self) -> bool {
+        true
+    }
+
     async fn proxy_get_json(
         &self,
         _path_and_query: &str,
@@ -1802,6 +1893,112 @@ impl HostConnector for SshHostConnector {
     }
 
     /// Archive an active remote session via `rupu session archive <id>`.
+    /// Fetch one session's detail by shelling `rupu session show <id>
+    /// --format json`, renaming the report's human-table field labels to the
+    /// API's. Sessions aren't mirrored to a local store the way runs are, so
+    /// this is a real remote read.
+    ///
+    /// No `usage` block: this connector carries no pricing config (see
+    /// [`SshHostConnector::new`]), so the caller prices the session from the
+    /// token counts reported here.
+    async fn get_session(&self, id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        let item = self.session_show_item(id).await?;
+        Ok(session_item_to_api_shape(&item))
+    }
+
+    /// The session's runs, read out of the same `session show` report
+    /// [`get_session`](Self::get_session) uses — one ssh round trip. The two
+    /// routes are separate HTTP requests, so a detail page that loads both
+    /// costs two; sessions are not mirrored locally, so there is nothing
+    /// cheaper to read.
+    async fn session_runs(&self, id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        let item = self.session_show_item(id).await?;
+        Ok(item
+            .get("runs")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())))
+    }
+
+    /// Read one run's flow records by shelling `rupu netflow show
+    /// <run_id> --format json`. The remote performs the same
+    /// ledger+transcript merge the CP does locally (both call
+    /// `rupu_cp::api::netflow::run_scoped_flows_and_dropped`); enrichment
+    /// and filtering happen on our side.
+    async fn run_netflow(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        let report = self
+            .remote_json(&["--format", "json", "netflow", "show", run_id])
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    run_id = %run_id,
+                    error = %e,
+                    "run_netflow: remote command failed; host may predate it"
+                );
+                HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu netflow show`: {}",
+                    self.host_id,
+                    Self::remote_failure_detail(&e)
+                ))
+            })?;
+        Ok(serde_json::json!({
+            "flows": report.get("rows").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+            // A dropped record is data the sink could not write; carrying the
+            // count is the only trace it existed. Never fold it into zero.
+            "dropped_total": report.get("dropped_total").and_then(|v| v.as_u64()).unwrap_or(0),
+        }))
+    }
+
+    /// Roll up this host's usage by shelling `rupu usage --format json`.
+    ///
+    /// The remote prices with ITS own config — the same property the HTTP
+    /// path has, since that proxies the remote's `/api/usage`.
+    async fn usage_rollup(
+        &self,
+        since: &str,
+        until: &str,
+        group_by: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        self.remote_json(&[
+            "--format",
+            "json",
+            "usage",
+            "--since",
+            since,
+            "--until",
+            until,
+            "--group-by",
+            group_by,
+        ])
+        .await
+    }
+
+    /// One ssh round trip: the remote CLI walks the session's transcripts
+    /// and returns the finished series, rather than this connector fetching
+    /// each run's transcript separately.
+    async fn session_usage_timeline(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        let rows = self
+            .remote_json_rows(&["--format", "json", "session", "usage-timeline", id])
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    session_id = %id,
+                    error = %e,
+                    "session_usage_timeline: remote command failed; host may predate it"
+                );
+                HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu session usage-timeline`: {}",
+                    self.host_id,
+                    Self::remote_failure_detail(&e)
+                ))
+            })?;
+        Ok(serde_json::Value::Array(rows))
+    }
+
     async fn archive_session(&self, id: &str) -> Result<(), HostConnectorError> {
         self.remote_session(&["archive", id]).await
     }
@@ -2588,6 +2785,288 @@ mod tests {
         assert!(stub.last_cmd.lock().unwrap().contains("--archived"));
     }
 
+    /// `rupu session show` reports an absent session as "unknown session:
+    /// <id>", not "not found". Matching only the latter would report a
+    /// genuinely-missing session as "this host cannot answer" (500) instead
+    /// of a 404.
+    #[tokio::test]
+    async fn get_session_maps_the_cli_unknown_session_message_to_not_found() {
+        let fake = std::sync::Arc::new(FakeExec::offline("unknown session: ses_gone"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.get_session("ses_gone").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_netflow_shells_the_remote_command_and_carries_dropped() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by run_netflow")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by run_netflow")
+            }
+        }
+
+        let json = r#"{"kind":"netflow_show","version":1,"dropped_total":7,"rows":[
+            {"host":"api.anthropic.com"},{"host":"api.github.com"}
+        ]}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let v = conn.run_netflow("run_a").await.unwrap();
+
+        assert_eq!(v["flows"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v["dropped_total"], 7,
+            "a dropped record is data the sink lost; the count must survive"
+        );
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("netflow") && cmd.contains("show") && cmd.contains("run_a"),
+            "cmd: {cmd}"
+        );
+    }
+
+    /// A run with no ledger reports an empty set, and a host that cannot
+    /// answer at all reports Unsupported — the two must not look alike.
+    #[tokio::test]
+    async fn run_netflow_maps_an_old_host_to_unsupported() {
+        let fake = std::sync::Arc::new(FakeExec::offline("unrecognized subcommand 'show'"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.run_netflow("run_a").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_usage_timeline_shells_the_remote_command_once() {
+        struct StubExec {
+            json: String,
+            calls: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                self.calls.lock().unwrap().push(remote.to_string());
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by session_usage_timeline")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by session_usage_timeline")
+            }
+        }
+
+        let json = r#"{"kind":"session_usage_timeline","version":1,"rows":[
+            {"turn":1,"label":"run_a","tokens_in":10,"tokens_out":20,"tokens_cached":0},
+            {"turn":2,"label":"run_a","tokens_in":5,"tokens_out":7,"tokens_cached":0}
+        ]}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let series = conn.session_usage_timeline("ses_1").await.unwrap();
+
+        assert_eq!(series.as_array().unwrap().len(), 2);
+        assert_eq!(series[1]["label"], "run_a");
+        let calls = stub.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the series is computed remotely in ONE round trip, not one per run"
+        );
+        assert!(
+            calls[0].contains("usage-timeline") && calls[0].contains("ses_1"),
+            "cmd: {}",
+            calls[0]
+        );
+    }
+
+    /// A host whose `rupu` predates `session usage-timeline` must say so,
+    /// not report an empty chart as if the session had no turns.
+    /// A host that ANSWERED and rejected the command is not an unreachable
+    /// host. `remote_json` maps a non-zero exit to `Unreachable`, so the
+    /// reported reason must not carry that prefix onward — it would point an
+    /// operator at the network instead of at the out-of-date binary.
+    #[tokio::test]
+    async fn an_old_hosts_reason_does_not_claim_the_host_is_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline(
+            "error: unrecognized subcommand 'usage-timeline'",
+        ));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.session_usage_timeline("ses_1").await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("unrecognized subcommand"),
+            "the remote's own words must survive: {message}"
+        );
+        assert!(
+            !message.contains("host unreachable"),
+            "the host answered; do not call it unreachable: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_usage_timeline_maps_an_old_host_to_unsupported() {
+        let fake = std::sync::Arc::new(FakeExec::offline("unrecognized subcommand"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.session_usage_timeline("ses_1").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn session_item_to_api_shape_renames_cli_labels_and_lifts_runs_out() {
+        // The CLI report labels for a human table (`agent`, `provider`); the
+        // API labels for the web client. A silent drift here renders a
+        // remote session's detail page with blank fields and no error.
+        let item = serde_json::json!({
+            "session_id": "ses_1",
+            "agent": "scout",
+            "provider": "anthropic",
+            "model": "opus",
+            "scope": "archived",
+            "runs": [{"run_id": "run_a"}],
+        });
+
+        let v = session_item_to_api_shape(&item);
+
+        assert_eq!(v["agent_name"], "scout", "agent -> agent_name");
+        assert_eq!(v["provider_name"], "anthropic", "provider -> provider_name");
+        assert!(v.get("agent").is_none(), "old label must not linger");
+        assert_eq!(v["model"], "opus", "untouched keys pass through");
+        assert_eq!(v["scope"], "archived", "scope is carried, not defaulted");
+        assert!(
+            v.get("runs").is_none(),
+            "runs belong to the session_runs surface, not the detail body"
+        );
+    }
+
+    #[test]
+    fn session_item_to_api_shape_defaults_a_missing_scope_to_active() {
+        let v = session_item_to_api_shape(&serde_json::json!({ "session_id": "ses_2" }));
+        assert_eq!(v["scope"], "active");
+    }
+
+    #[tokio::test]
+    async fn get_session_shells_rupu_session_show_and_returns_the_item() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_session")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_session")
+            }
+        }
+
+        let json = r#"{"kind":"session_show","version":1,"item":{
+            "session_id":"ses_1","agent":"scout","scope":"active","status":"idle",
+            "provider":"anthropic","model":"opus","total_turns":3,
+            "total_tokens_in":10,"total_tokens_out":20,
+            "created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T01:00:00Z",
+            "runs":[{"run_id":"run_a","transcript_path":"/t/run_a.jsonl"}]
+        }}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let detail = conn.get_session("ses_1").await.unwrap();
+        assert_eq!(detail["session_id"], "ses_1");
+        assert_eq!(detail["agent_name"], "scout", "returned in API shape");
+        assert!(
+            detail.get("usage").is_none(),
+            "this connector carries no pricing; the caller prices the session"
+        );
+
+        // The same report also answers `session_runs` — no extra round trip.
+        let runs = conn.session_runs("ses_1").await.unwrap();
+        assert_eq!(runs[0]["run_id"], "run_a");
+
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("session") && cmd.contains("show") && cmd.contains("ses_1"),
+            "cmd: {cmd}"
+        );
+    }
+
+    /// A remote whose `rupu` predates `session show --format json` must be
+    /// reported as unable to answer — never as "the session does not exist",
+    /// which would render an empty page as if it were the truth.
+    #[tokio::test]
+    async fn get_session_maps_an_old_host_to_unsupported_not_not_found() {
+        let fake = std::sync::Arc::new(FakeExec::offline("unrecognized subcommand 'show'"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.get_session("ses_missing").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn list_runs_shells_rupu_run_list_not_the_mirror() {
         struct StubExec {
@@ -3357,6 +3836,16 @@ mod tests {
                 && c.contains("'nope'")),
             "reject command not found in: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn ssh_serves_runs_from_local_mirror() {
+        // SSH runs are created in, and tailed into, the coordinator's own
+        // RunStore by NodeMirror, so run-scoped detail endpoints must read
+        // that mirror rather than attempt a generic GET this transport
+        // structurally cannot serve (see `proxy_get_json`).
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FakeExec::ok(vec![])));
+        assert!(conn.serves_runs_from_local_mirror());
     }
 
     #[tokio::test]
