@@ -376,10 +376,37 @@ impl AgentDispatcher for CliAgentDispatcher {
 
         let output = read_final_assistant_text(&transcript_path).unwrap_or_default();
 
+        // `run_agent` returning `Ok` does NOT mean the child did its job: an
+        // `Err` is reserved for failures that stopped the loop from
+        // proceeding at all, so a child that burned its whole `max_turns`
+        // budget comes back `Ok(RunResult { status: Error, .. })`. This used
+        // to be hard-coded `true`, which reported a truncated child to the
+        // parent agent as `"ok": true` (see `rupu-tools`'s `dispatch_agent`
+        // / `dispatch_agents_parallel` result bodies) — the delegation
+        // sibling of the workflow-step bug fixed in `rupu-orchestrator`'s
+        // `dispatch_one`.
+        //
+        // The child's partial `output` is deliberately still returned rather
+        // than collapsed into `DispatchError::ChildRun`: the parent gets both
+        // whatever the child managed to produce AND an honest `ok: false`.
+        // The reason itself lives in the child's own transcript
+        // (`RunComplete.error`) and in the warning below — `DispatchOutcome`
+        // has no error channel to carry it.
+        let terminal = run_result.terminal_error();
+        if let Some(err) = &terminal {
+            tracing::warn!(
+                agent = %agent_name,
+                sub_run_id = %sub_run_id,
+                error = %err,
+                "child agent run did not complete cleanly; reporting the dispatch as failed"
+            );
+        }
+        let success = terminal.is_none();
+
         self.emit_dispatch_completed(
             parent_run_id,
             &sub_run_id,
-            true,
+            success,
             run_result.total_tokens_in,
             run_result.total_tokens_out,
         );
@@ -389,7 +416,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             sub_run_id,
             transcript_path,
             output,
-            success: true,
+            success,
             tokens_used: run_result.total_tokens_in + run_result.total_tokens_out,
             duration_ms,
         })

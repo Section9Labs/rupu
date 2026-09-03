@@ -527,6 +527,13 @@ pub enum RunError {
     OperatorStop { turn: u32 },
     #[error("coverage setup: {0}")]
     Coverage(String),
+    /// The agent loop returned `Ok` — no transport/provider failure — but the
+    /// run's own terminal [`RunStatus`] was not `Ok`. Today the only such
+    /// outcome is a `max_turns` bust (`RunStatus::Error`); a non-pause
+    /// `RunStatus::Aborted` would land here too. Produced by
+    /// [`RunResult::terminal_error`], never returned by [`run_agent`] itself.
+    #[error("agent run ended in status {status:?} ({detail})")]
+    TerminalStatus { status: RunStatus, detail: String },
 }
 
 /// Pluggable permission decider. Three production impls + a `Bypass`
@@ -730,6 +737,44 @@ pub struct RunResult {
     /// compatibility; callers (the orchestrator) map `paused` to their
     /// own `RunStatus::Paused`.
     pub paused: bool,
+    /// Human-readable reason the run ended, when it did not end cleanly:
+    /// `Some("max turns (N) reached")` for a budget bust, `Some("paused")`
+    /// for a cooperative pause, `None` for a normal completion. Mirrors the
+    /// transcript's `RunComplete.error`.
+    ///
+    /// This exists because a run that ends badly can still return `Ok`: an
+    /// `Err` from [`run_agent`] means the loop could not proceed at all
+    /// (transport/provider/io), while a max-turns bust is a run that ran and
+    /// finished — badly. Callers must not read `Result::is_ok()` as "the
+    /// agent did its job"; see [`RunResult::terminal_error`].
+    pub error: Option<String>,
+}
+
+impl RunResult {
+    /// The run's OWN terminal failure, if any — the check every caller that
+    /// only pattern-matches `Ok(_)` was missing.
+    ///
+    /// Returns `None` for a clean completion and for a cooperative pause (a
+    /// pause is neither success nor failure; callers branch on
+    /// [`RunResult::paused`] FIRST and unwind into their own checkpoint).
+    /// Otherwise returns the failure on the same [`RunError`] channel the
+    /// `Err` arm already carries, so a caller can record it exactly the way
+    /// it records a transport failure.
+    pub fn terminal_error(&self) -> Option<RunError> {
+        if self.paused {
+            return None;
+        }
+        match self.status {
+            RunStatus::Ok => None,
+            status => Some(RunError::TerminalStatus {
+                status,
+                detail: self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "no reason recorded".to_string()),
+            }),
+        }
+    }
 }
 
 /// Await a cooperative pause signal. Resolves when the token is cancelled;
@@ -765,8 +810,16 @@ enum CallOutcome {
 
 /// Terminal outcome of the turn loop. `Paused` is a cooperative-pause
 /// outcome (not an error); the caller maps it to a paused `RunResult`.
+///
+/// `Status`'s second field is the human-readable reason for a NON-`Ok`
+/// terminal status. It is not decoration: a run that busts `max_turns`
+/// returns `Ok(RunResult { status: Error, .. })` — an `Err` is reserved
+/// for transport/provider failures — so this string is the only place the
+/// "why" survives out of the loop. It reaches both the transcript's
+/// `RunComplete.error` and [`RunResult::terminal_error`], which the
+/// orchestrator turns into the step's recorded failure message.
 enum LoopOutcome {
-    Status(RunStatus),
+    Status(RunStatus, Option<String>),
     Paused,
 }
 
@@ -1036,7 +1089,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         let mut compaction_seq = 0u32;
         let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
-                break 'turns LoopOutcome::Status(RunStatus::Error);
+                break 'turns LoopOutcome::Status(
+                    RunStatus::Error,
+                    Some(format!("max turns ({}) reached", opts.max_turns)),
+                );
             }
             writer.write(&Event::TurnStart { turn_idx })?;
             let mut req = LlmRequest {
@@ -1529,7 +1585,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             // only a hint: an unrecognized/absent value deserializes to `None`,
             // so it must not be the sole terminator.
             if !made_tool_calls {
-                break 'turns LoopOutcome::Status(RunStatus::Ok);
+                break 'turns LoopOutcome::Status(RunStatus::Ok, None);
             }
             // Cooperative pause after a full tool-calling turn: the tool(s) ran
             // to completion and their results are recorded in both the
@@ -1540,9 +1596,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             }
         };
 
-        let (result_status, paused) = match loop_outcome {
-            LoopOutcome::Status(s) => (s, false),
-            LoopOutcome::Paused => (RunStatus::Aborted, true),
+        let (result_status, paused, terminal_error) = match loop_outcome {
+            LoopOutcome::Status(s, why) => (s, false, why),
+            LoopOutcome::Paused => (RunStatus::Aborted, true, Some("paused".into())),
         };
 
         writer.write(&Event::RunComplete {
@@ -1550,7 +1606,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             status: result_status,
             total_tokens: total_in + total_out,
             duration_ms: started.elapsed().as_millis() as u64,
-            error: if paused { Some("paused".into()) } else { None },
+            // Previously hard-coded to `Some("paused")` / `None`, which left a
+            // max-turns bust writing `status: error` with no reason at all.
+            error: terminal_error.clone(),
         })?;
         writer.flush()?;
 
@@ -1568,6 +1626,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             total_tokens_out: total_out,
             final_messages: messages,
             paused,
+            error: terminal_error,
         })
     }
     .await;

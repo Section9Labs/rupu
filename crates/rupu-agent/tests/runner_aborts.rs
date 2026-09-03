@@ -168,3 +168,83 @@ async fn max_turns_aborts_with_run_complete() {
     let summary = rupu_transcript::JsonlReader::summary(&path).unwrap();
     assert_eq!(summary.status, rupu_transcript::RunStatus::Error);
 }
+
+/// A `max_turns` bust returns `Ok` — an `Err` is reserved for failures that
+/// stopped the loop from proceeding at all — so the ONLY signal a caller has
+/// is `RunResult::status` / `RunResult::terminal_error`. Lock both, plus the
+/// reason string, because every step- and dispatch-recording path downstream
+/// now derives its success from them.
+#[tokio::test]
+async fn a_max_turns_bust_returns_ok_but_reports_a_terminal_error() {
+    let provider = MockProvider::new(vec![ScriptedTurn::AssistantToolUse {
+        text: None,
+        tool_id: "c1".into(),
+        tool_name: "read_file".into(),
+        tool_input: serde_json::json!({ "path": "." }),
+        stop: StopReason::ToolUse,
+    }]);
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let path = tmp.path().join("run.jsonl");
+
+    let res = run_agent(opts(provider, 1, path.clone(), tmp.path().to_path_buf()))
+        .await
+        .expect("a max-turns bust is Ok — Err is reserved for transport failures");
+
+    assert_eq!(res.status, rupu_transcript::RunStatus::Error);
+    assert!(!res.paused, "a budget bust is not a cooperative pause");
+    assert_eq!(
+        res.error.as_deref(),
+        Some("max turns (1) reached"),
+        "the reason must survive out of the loop"
+    );
+
+    let terminal = res
+        .terminal_error()
+        .expect("a non-Ok terminal status must produce a terminal_error");
+    let msg = terminal.to_string();
+    assert!(
+        msg.contains("max turns (1) reached"),
+        "terminal_error must carry the reason; got {msg:?}"
+    );
+    assert!(
+        matches!(terminal, RunError::TerminalStatus { .. }),
+        "and it must be the dedicated variant, not a mis-attributed provider error"
+    );
+
+    // The transcript now records the reason too — it used to write
+    // `status: error` with a bare `error: null`.
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let complete_line = raw
+        .lines()
+        .find(|l| l.contains("run_complete") || l.contains("RunComplete"))
+        .expect("transcript must contain a RunComplete event");
+    assert!(
+        complete_line.contains("max turns (1) reached"),
+        "RunComplete must carry the reason: {complete_line}"
+    );
+}
+
+/// Control: a clean run reports no terminal error, so nothing downstream
+/// flips a healthy step/dispatch to failed.
+#[tokio::test]
+async fn a_clean_run_reports_no_terminal_error() {
+    let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+        text: "done".into(),
+        stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
+    }]);
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let path = tmp.path().join("run.jsonl");
+
+    let res = run_agent(opts(provider, 5, path, tmp.path().to_path_buf()))
+        .await
+        .expect("clean run");
+
+    assert_eq!(res.status, rupu_transcript::RunStatus::Ok);
+    assert!(res.error.is_none());
+    assert!(
+        res.terminal_error().is_none(),
+        "a clean run must not synthesize a failure"
+    );
+}
