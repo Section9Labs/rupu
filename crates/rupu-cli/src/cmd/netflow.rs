@@ -116,15 +116,13 @@ fn collect_run_ledger(
     global: &Path,
     run_id: &str,
 ) -> anyhow::Result<(Vec<rupu_netflow::FlowRecord>, u64)> {
-    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    // The run record supplies its workspace path, which is where a
-    // project-local ledger would live. Without the record we can still read
-    // the global ledger — so an unloadable record degrades attribution
-    // rather than failing the read.
-    let workspace = store
-        .load(run_id)
-        .map(|r| r.workspace_path)
-        .unwrap_or_else(|_| global.to_path_buf());
+    // Resolve the run the way the CP does — global store first, then each
+    // registered project's own `.rupu/runs`. Which store holds the record
+    // matters twice over: it supplies the workspace path a project-local
+    // ledger would live under, AND it is what `run_and_unit_ids` reads
+    // `step_results.jsonl` from, so resolving to the wrong store silently
+    // drops every dispatched step's and fan-out item's ledger.
+    let (store, workspace) = resolve_run_store(global, run_id);
     Ok(rupu_cp::api::netflow::run_scoped_flows_and_dropped(
         &store,
         run_id,
@@ -132,6 +130,34 @@ fn collect_run_ledger(
         global,
         &rupu_netflow::ledger::TimeRange::unbounded(),
     ))
+}
+
+/// The store holding `run_id`'s record, and the workspace its ledgers would
+/// live under.
+///
+/// Falls back to the global store rooted at `global` when no store has the
+/// record: the global ledger directory is still readable, so an unresolvable
+/// record degrades what we can attribute rather than failing the read.
+fn resolve_run_store(global: &Path, run_id: &str) -> (rupu_orchestrator::RunStore, PathBuf) {
+    let global_store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    if let Ok(record) = global_store.load(run_id) {
+        return (global_store, record.workspace_path);
+    }
+
+    let workspaces = (rupu_workspace::WorkspaceStore {
+        root: global.join("workspaces"),
+    })
+    .list()
+    .unwrap_or_default();
+    for ws in workspaces {
+        let path = PathBuf::from(&ws.path);
+        let store = rupu_orchestrator::RunStore::new(path.join(".rupu").join("runs"));
+        if store.load(run_id).is_ok() {
+            return (store, path);
+        }
+    }
+
+    (global_store, global.to_path_buf())
 }
 
 #[derive(Serialize)]
@@ -827,6 +853,55 @@ mod tests {
     /// one whose ledger was pruned. Both are an empty read, never an error —
     /// a coordinator reading this over ssh must not turn "no traffic" into
     /// a failed page.
+    /// A run recorded in a registered PROJECT's store, not the global one.
+    /// Resolving to the wrong store would read no `step_results.jsonl` and
+    /// so silently drop every dispatched step's and fan-out item's ledger —
+    /// the run's own would survive, which is what makes it silent.
+    #[test]
+    fn a_project_local_run_resolves_to_its_own_store_not_the_global_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let project = global.join("proj");
+        std::fs::create_dir_all(project.join(".rupu/runs")).unwrap();
+
+        let ws_store = rupu_workspace::WorkspaceStore {
+            root: global.join("workspaces"),
+        };
+        rupu_workspace::upsert(&ws_store, &project).expect("register the project as a workspace");
+
+        let store = rupu_orchestrator::RunStore::new(project.join(".rupu/runs"));
+        store
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": "run_proj",
+                    "workflow_name": "wf",
+                    "status": "completed",
+                    "inputs": {},
+                    "workspace_id": "ws1",
+                    "workspace_path": project,
+                    "transcript_dir": project.join(".rupu/transcripts"),
+                    "started_at": "2026-09-01T00:00:00Z",
+                }))
+                .unwrap(),
+                "",
+            )
+            .unwrap();
+
+        let (resolved, workspace) = resolve_run_store(global, "run_proj");
+
+        assert!(
+            resolved.load("run_proj").is_ok(),
+            "the project's own store must be the one returned"
+        );
+        // The store canonicalizes on registration (/var -> /private/var on
+        // macOS), so compare canonical forms.
+        assert_eq!(
+            workspace.canonicalize().unwrap(),
+            project.canonicalize().unwrap(),
+            "and its workspace path with it"
+        );
+    }
+
     #[test]
     fn netflow_show_is_empty_for_a_run_with_no_ledger() {
         let tmp = tempfile::tempdir().unwrap();
