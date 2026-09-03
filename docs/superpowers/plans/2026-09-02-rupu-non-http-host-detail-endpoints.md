@@ -924,7 +924,7 @@ host has any sessions), and every path that needs the two NEW CLI commands
 on the remote (`session usage-timeline`, `netflow show`) — those require
 deploying this build to the hosts.
 
-### Open finding — placed-run netflow is silently empty
+### RESOLVED — placed-run netflow is silently empty
 
 `GET /api/runs/:id/netflow` has **no `?host=` branch** — its `host` query
 param is a flow *filter*, not a host selector — so it dispatches purely
@@ -937,9 +937,16 @@ Task 5 fixed the `RunLocation::Host` path (an autoflow run whose history
 recorded an SSH host), which is the one that produced the reported error.
 The mirrored-run case is a distinct, pre-existing defect. The fix is to
 merge the remote's ledger with the local one when a run's `worker_id` names
-a registered non-local host — both sets are real flows for that run. It is
-NOT done here because it needs a decision the plan cannot make alone: what a
-netflow view should report when the remote fetch fails. Failing the whole
-view whenever a host is offline regresses the local answer; returning
-local-only silently is the same class of bug as the one above, and
-`NetflowResponse` has no field for "this is partial".
+a registered non-local host — both sets are real flows for that run. **Fixed** (commit `a4917241`), after the open design question was settled:
+a host that cannot answer never fails the read — that would throw away the
+local half over an offline host — but it is NAMED. Both responses gained
+`incomplete: [{host_id, reason}]`, and the web table renders it as a loud
+banner on the populated path as well as the empty one, because a partial
+list with no warning reads as a complete one and every number above it is
+understated by an unknown amount.
+
+The remote flows join the LEDGER side of the merge
+(`run_scoped_flows_and_dropped_with`), not the result: a mirrored transcript
+carries the snapshot each flow had when first recorded, while the ledger
+carries the finalized record, so appending afterwards would let the degraded
+local copy win an id collision.
