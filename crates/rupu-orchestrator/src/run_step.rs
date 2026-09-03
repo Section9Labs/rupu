@@ -57,6 +57,34 @@ pub enum RunStepError {
     },
 }
 
+/// Render an argv vector the way a person would type it at a POSIX shell:
+/// arguments containing whitespace or shell metacharacters are
+/// single-quoted, with an embedded `'` escaped as `'\''`. Display only —
+/// this string is what the transcript viewers show as "the command"; the
+/// executor never passes it to a shell.
+pub fn shell_join<I, S>(argv: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    argv.into_iter()
+        .map(|a| shell_quote(a.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
 /// Execute a resolved command.
 ///
 /// Never invokes a shell: `cmd` and `args` go to the OS as an argv
@@ -156,6 +184,17 @@ mod tests {
             timeout: None,
             allow_exit_codes: vec![0],
         }
+    }
+
+    #[test]
+    fn shell_join_quotes_only_what_a_shell_would_need_quoted() {
+        assert_eq!(shell_join(["echo", "hello"]), "echo hello");
+        assert_eq!(
+            shell_join(["sh", "-c", "echo out; echo err 1>&2"]),
+            "sh -c 'echo out; echo err 1>&2'"
+        );
+        assert_eq!(shell_join(["printf", "it's"]), "printf 'it'\\''s'");
+        assert_eq!(shell_join(["touch", ""]), "touch ''");
     }
 
     #[tokio::test]

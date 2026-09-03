@@ -176,6 +176,30 @@ describe('buildTranscriptView — terminal / diff pairing', () => {
     expect(tool.terminal?.cwd).toBe('/x');
   });
 
+  it('classifies a workflow `run:` step tool_call as terminal and shows the joined argv', () => {
+    // A `run:` step (no shell) writes tool `run` with input.command already
+    // shell-quoted, and a command_run whose argv is the bare [cmd, ...args] —
+    // NOT the bash tool's [/bin/sh, -c, script] shape.
+    const runCall: TranscriptEvent = {
+      type: 'tool_call',
+      data: {
+        call_id: 'r1',
+        tool: 'run',
+        input: { command: "cargo test -p 'my crate'", cmd: 'cargo', args: ['test', '-p', 'my crate'], cwd: '/w' },
+      },
+    };
+    const cmdRun: TranscriptEvent = {
+      type: 'command_run',
+      data: { argv: ['cargo', 'test', '-p', 'my crate'], cwd: '/w', exit_code: 101, stdout_bytes: 0, stderr_bytes: 9 },
+    };
+    const view = buildTranscriptView([runCall, cmdRun]);
+    const tools = toolsOf(view.turns);
+    expect(tools).toHaveLength(1);
+    expect(tools[0].kind).toBe('terminal');
+    expect(tools[0].terminal?.command).toBe("cargo test -p 'my crate'");
+    expect(tools[0].terminal?.exitCode).toBe(101);
+  });
+
   it('pairs a following file_edit onto an edit_file tool', () => {
     const editCall: TranscriptEvent = {
       type: 'tool_call',

@@ -111,6 +111,25 @@ struct TranscriptViewModelTests {
         #expect(entry.command?.exitCode == 0)
     }
 
+    @Test func workflowRunStepToolCallIsATerminalEntryAndPairsItsBareArgvCommandRun() {
+        // A workflow `run:` step writes tool `run` (no shell) with a
+        // command_run whose argv is the bare [cmd, ...args] — not the bash
+        // tool's [/bin/sh, -c, script] shape.
+        let events: [TranscriptEvent] = [
+            .toolCall(callID: "r1", tool: "run", input: .object(["command": .string("cargo test"), "cmd": .string("cargo"), "args": .array([.string("test")])])),
+            .toolResult(callID: "r1", output: "ok", error: nil, durationMS: 4, structured: nil),
+            .commandRun(argv: ["cargo", "test"], cwd: "/w", exitCode: 0, stdoutBytes: 2, stderrBytes: 0),
+        ]
+
+        let turns = buildTranscriptViewModel(events: events)
+
+        #expect(turns.count == 1)
+        let entry = turns[0].tools[0]
+        #expect(entry.kind == .terminal)
+        #expect(entry.command?.argv == ["cargo", "test"])
+        #expect(entry.output == "ok")
+    }
+
     @Test func commandRunWithNoPendingTerminalCallBecomesAStandaloneEntryRatherThanBeingDropped() {
         let events: [TranscriptEvent] = [
             .assistantMessage(content: "nothing running yet", thinking: nil),

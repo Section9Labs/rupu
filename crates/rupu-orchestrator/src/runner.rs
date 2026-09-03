@@ -5037,11 +5037,21 @@ async fn execute_run_step(
         allow_exit_codes: spec.allow_exit_codes.clone(),
     };
 
-    // One JSONL record so the CP / app can display a run: step's output
-    // the same way they display an agent transcript.
+    // A transcript in the shared event vocabulary (tool_call / tool_result
+    // / command_run) so the CP web viewer, rupu.app, and `rupu transcript`
+    // show the command and its output with their existing terminal card.
     let transcript_path = transcript_dir.join(format!("run_{}.jsonl", Ulid::new()));
 
-    let out = match execute(&resolved).await {
+    let started = std::time::Instant::now();
+    let result = execute(&resolved).await;
+    write_run_step_transcript(
+        &transcript_path,
+        &resolved,
+        &result,
+        started.elapsed().as_millis() as u64,
+    );
+
+    let out = match result {
         Ok(out) => out,
         Err(source) => {
             if continue_on_error {
@@ -5066,8 +5076,6 @@ async fn execute_run_step(
             });
         }
     };
-
-    write_run_step_transcript(&transcript_path, &cmd, &args, &out);
 
     if !out.success && !continue_on_error {
         return Err(RunWorkflowError::RunStepDenied {
@@ -5107,30 +5115,85 @@ async fn execute_run_step(
     })
 }
 
-/// Write a `run:` step's process outcome as a single JSONL record so the
-/// CP and app have something to render where an agent step would have a
-/// transcript. Best-effort: a transcript write failure must not fail an
-/// otherwise-successful benchmark unit.
+/// Write a `run:` step's outcome as the same event trio the agent `bash`
+/// tool emits — `tool_call` (tool `run`, `input.command` shell-quoted for
+/// display), `tool_result` (stdout, then a `[stderr]` section; `error`
+/// set when the exit code is disallowed or the process never ran), and
+/// `command_run` (argv + exit code) — so every transcript viewer renders
+/// it with the terminal card it already has. A spawn failure or timeout
+/// still gets a `tool_call` + `tool_result`, so the attempted command and
+/// the reason are visible; only `command_run` is skipped, since nothing
+/// ran. Best-effort: a transcript write failure must not fail an
+/// otherwise-successful step.
 fn write_run_step_transcript(
     path: &Path,
-    cmd: &str,
-    args: &[String],
-    out: &crate::run_step::RunStepOutput,
+    resolved: &crate::run_step::ResolvedRun,
+    result: &Result<crate::run_step::RunStepOutput, crate::run_step::RunStepError>,
+    elapsed_ms: u64,
 ) {
-    let record = serde_json::json!({
-        "type": "RunStep",
-        "cmd": cmd,
-        "args": args,
-        "exit_code": out.exit_code,
-        "duration_ms": out.duration_ms,
-        "stdout": out.stdout,
-        "stderr": out.stderr,
-        "success": out.success,
-    });
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let argv: Vec<String> = std::iter::once(resolved.cmd.clone())
+        .chain(resolved.args.iter().cloned())
+        .collect();
+    let call_id = format!("run_{}", Ulid::new());
+    let cwd = resolved.cwd.display().to_string();
+
+    let mut events = vec![Event::ToolCall {
+        call_id: call_id.clone(),
+        tool: "run".to_string(),
+        input: serde_json::json!({
+            "command": crate::run_step::shell_join(&argv),
+            "cmd": resolved.cmd,
+            "args": resolved.args,
+            "cwd": cwd,
+        }),
+    }];
+    match result {
+        Ok(out) => {
+            let output = if out.stderr.is_empty() {
+                out.stdout.clone()
+            } else if out.stdout.is_empty() {
+                out.stderr.clone()
+            } else {
+                format!("{}\n[stderr]\n{}", out.stdout, out.stderr)
+            };
+            let error = (!out.success).then(|| {
+                format!(
+                    "exit code {} is not in allow_exit_codes {:?}",
+                    out.exit_code, resolved.allow_exit_codes
+                )
+            });
+            events.push(Event::ToolResult {
+                call_id,
+                output,
+                error,
+                duration_ms: out.duration_ms,
+                structured: None,
+            });
+            events.push(Event::CommandRun {
+                argv,
+                cwd,
+                exit_code: out.exit_code,
+                stdout_bytes: out.stdout.len() as u64,
+                stderr_bytes: out.stderr.len() as u64,
+            });
+        }
+        Err(e) => events.push(Event::ToolResult {
+            call_id,
+            output: String::new(),
+            error: Some(e.to_string()),
+            duration_ms: elapsed_ms,
+            structured: None,
+        }),
     }
-    if let Err(e) = std::fs::write(path, format!("{record}\n")) {
+
+    let write = || -> Result<(), rupu_transcript::WriteError> {
+        let mut writer = JsonlWriter::create(path)?;
+        for ev in &events {
+            writer.write(ev)?;
+        }
+        writer.flush()
+    };
+    if let Err(e) = write() {
         warn!(path = %path.display(), error = %e, "failed to write run step transcript");
     }
 }

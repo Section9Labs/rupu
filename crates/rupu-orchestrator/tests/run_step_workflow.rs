@@ -56,8 +56,19 @@ async fn run_with(
     label: &str,
     policy: RunStepPolicy,
 ) -> Result<OrchestratorRunResult, rupu_orchestrator::runner::RunWorkflowError> {
-    let wf = Workflow::parse(yaml).expect("workflow parses");
     let tmp = tempfile::tempdir().expect("tempdir");
+    run_in(&tmp, yaml, label, policy).await
+}
+
+/// Like [`run_with`], but the caller owns the tempdir — so the transcript
+/// files a run writes outlive the call and can be read back.
+async fn run_in(
+    tmp: &tempfile::TempDir,
+    yaml: &str,
+    label: &str,
+    policy: RunStepPolicy,
+) -> Result<OrchestratorRunResult, rupu_orchestrator::runner::RunWorkflowError> {
+    let wf = Workflow::parse(yaml).expect("workflow parses");
     let store = Arc::new(RunStore::new(tmp.path().join("runs")));
 
     run_workflow(OrchestratorRunOpts {
@@ -599,4 +610,172 @@ steps:
     assert_eq!(items[2].index, 2);
     assert_eq!(items[0].output.trim(), "a");
     assert_eq!(items[2].output.trim(), "c");
+}
+
+// ---------------------------------------------------------------------------
+// Transcript shape: a `run:` step must speak the shared transcript
+// vocabulary (`tool_call` / `tool_result` / `command_run`) so the CP web
+// viewer, rupu.app, and `rupu transcript` render the command and its
+// output with the terminal card they already have — not a private record
+// type every viewer drops on the floor.
+// ---------------------------------------------------------------------------
+
+fn read_transcript_events(path: &std::path::Path) -> Vec<rupu_transcript::Event> {
+    let body = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("run step transcript at {path:?} must exist: {e}"));
+    body.lines()
+        .map(|line| {
+            serde_json::from_str::<rupu_transcript::Event>(line).unwrap_or_else(|e| {
+                panic!("run step transcript line must be a canonical Event: {e}; line: {line}")
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn run_step_transcript_is_a_canonical_tool_call_result_command_run_trio() {
+    use rupu_transcript::Event;
+
+    let yaml = r#"
+name: bench-smoke
+steps:
+  - id: probe
+    run:
+      cmd: sh
+      args: ["-c", "echo out; echo err 1>&2"]
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let res = run_in(&tmp, yaml, "ws_run_transcript", bypass())
+        .await
+        .expect("run completes");
+    let probe = &res.step_results[0];
+
+    let events = read_transcript_events(&probe.transcript_path);
+    assert_eq!(
+        events.len(),
+        3,
+        "tool_call, tool_result, command_run: {events:?}"
+    );
+
+    let Event::ToolCall {
+        call_id,
+        tool,
+        input,
+    } = &events[0]
+    else {
+        panic!("first event must be tool_call: {:?}", events[0]);
+    };
+    assert_eq!(tool, "run");
+    assert_eq!(
+        input["command"].as_str(),
+        Some("sh -c 'echo out; echo err 1>&2'"),
+        "input.command is the shell-quoted argv the viewers display"
+    );
+    assert_eq!(input["cmd"].as_str(), Some("sh"));
+    assert_eq!(input["args"][0].as_str(), Some("-c"));
+
+    let Event::ToolResult {
+        call_id: result_call_id,
+        output,
+        error,
+        ..
+    } = &events[1]
+    else {
+        panic!("second event must be tool_result: {:?}", events[1]);
+    };
+    assert_eq!(result_call_id, call_id, "result pairs onto the call");
+    assert_eq!(
+        output, "out\n\n[stderr]\nerr\n",
+        "stdout then a [stderr] section"
+    );
+    assert!(error.is_none(), "an allowed exit code is not an error");
+
+    let Event::CommandRun {
+        argv,
+        exit_code,
+        stdout_bytes,
+        stderr_bytes,
+        ..
+    } = &events[2]
+    else {
+        panic!("third event must be command_run: {:?}", events[2]);
+    };
+    assert_eq!(argv, &["sh", "-c", "echo out; echo err 1>&2"]);
+    assert_eq!(*exit_code, 0);
+    assert_eq!(*stdout_bytes, 4);
+    assert_eq!(*stderr_bytes, 4);
+}
+
+#[tokio::test]
+async fn run_step_disallowed_exit_code_is_recorded_as_a_tool_result_error() {
+    use rupu_transcript::Event;
+
+    let yaml = r#"
+name: bench-smoke
+steps:
+  - id: probe
+    run:
+      cmd: sh
+      args: ["-c", "echo boom 1>&2; exit 3"]
+    continue_on_error: true
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let res = run_in(&tmp, yaml, "ws_run_transcript_fail", bypass())
+        .await
+        .expect("continue_on_error keeps the run alive");
+    let probe = &res.step_results[0];
+    assert!(!probe.success);
+
+    let events = read_transcript_events(&probe.transcript_path);
+    let Some(Event::ToolResult {
+        error: Some(err), ..
+    }) = events.get(1)
+    else {
+        panic!("tool_result must carry the failure: {events:?}");
+    };
+    assert!(
+        err.contains("exit code 3"),
+        "error names the exit code: {err}"
+    );
+    let Some(Event::CommandRun { exit_code: 3, .. }) = events.get(2) else {
+        panic!("command_run must record exit 3: {events:?}");
+    };
+}
+
+#[tokio::test]
+async fn run_step_spawn_failure_still_writes_a_transcript_with_the_reason() {
+    use rupu_transcript::Event;
+
+    let yaml = r#"
+name: bench-smoke
+steps:
+  - id: probe
+    run:
+      cmd: /definitely/not/a/real/binary
+    continue_on_error: true
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let res = run_in(&tmp, yaml, "ws_run_transcript_spawn", bypass())
+        .await
+        .expect("continue_on_error keeps the run alive");
+    let probe = &res.step_results[0];
+    assert!(!probe.success);
+
+    let events = read_transcript_events(&probe.transcript_path);
+    assert!(
+        matches!(events.first(), Some(Event::ToolCall { tool, .. }) if tool == "run"),
+        "the attempted command is still shown: {events:?}"
+    );
+    let Some(Event::ToolResult {
+        error: Some(err), ..
+    }) = events.get(1)
+    else {
+        panic!("tool_result must carry the spawn failure: {events:?}");
+    };
+    assert!(err.contains("failed to spawn"), "{err}");
+    assert_eq!(
+        events.len(),
+        2,
+        "no command_run for a command that never ran"
+    );
 }
