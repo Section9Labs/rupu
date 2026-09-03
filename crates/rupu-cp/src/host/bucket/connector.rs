@@ -261,6 +261,13 @@ impl HostConnector for BucketHostConnector {
         read_transcript_file(path)
     }
 
+    /// SSH/Tunnel/Bucket runs are created in, and tailed into, the
+    /// coordinator's own `RunStore` by `NodeMirror`, so run-scoped detail
+    /// endpoints read that mirror instead of the wire.
+    fn serves_runs_from_local_mirror(&self) -> bool {
+        true
+    }
+
     async fn proxy_get_json(
         &self,
         _path_and_query: &str,

@@ -1668,6 +1668,13 @@ impl HostConnector for SshHostConnector {
         read_transcript_file(path)
     }
 
+    /// SSH/Tunnel/Bucket runs are created in, and tailed into, the
+    /// coordinator's own `RunStore` by `NodeMirror`, so run-scoped detail
+    /// endpoints read that mirror instead of the wire.
+    fn serves_runs_from_local_mirror(&self) -> bool {
+        true
+    }
+
     async fn proxy_get_json(
         &self,
         _path_and_query: &str,
@@ -3271,6 +3278,16 @@ mod tests {
                 && c.contains("'nope'")),
             "reject command not found in: {cmds:?}"
         );
+    }
+
+    #[test]
+    fn ssh_serves_runs_from_local_mirror() {
+        // SSH runs are created in, and tailed into, the coordinator's own
+        // RunStore by NodeMirror, so run-scoped detail endpoints must read
+        // that mirror rather than attempt a generic GET this transport
+        // structurally cannot serve (see `proxy_get_json`).
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FakeExec::ok(vec![])));
+        assert!(conn.serves_runs_from_local_mirror());
     }
 
     #[tokio::test]
