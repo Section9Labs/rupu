@@ -1244,7 +1244,15 @@ impl SshHostConnector {
             Ok(v) => Ok(v),
             Err(e) => {
                 let message = e.to_string();
-                if message.to_lowercase().contains("not found") && message.contains(id) {
+                let lower = message.to_lowercase();
+                // `rupu session show` reports an absent session as "unknown
+                // session: <id>" (session.rs's `read_session`), NOT "not
+                // found" the way `run show` does — match the message the
+                // command actually emits, plus the generic phrasing, so an
+                // absent session 404s instead of being reported as a host
+                // that cannot answer.
+                let says_absent = lower.contains("unknown session") || lower.contains("not found");
+                if says_absent && message.contains(id) {
                     return Err(HostConnectorError::NotFound(id.to_string()));
                 }
                 tracing::warn!(
@@ -1806,6 +1814,31 @@ impl HostConnector for SshHostConnector {
             .get("runs")
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new())))
+    }
+
+    /// One ssh round trip: the remote CLI walks the session's transcripts
+    /// and returns the finished series, rather than this connector fetching
+    /// each run's transcript separately.
+    async fn session_usage_timeline(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        let rows = self
+            .remote_json_rows(&["--format", "json", "session", "usage-timeline", id])
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    session_id = %id,
+                    error = %e,
+                    "session_usage_timeline: remote command failed; host may predate it"
+                );
+                HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu session usage-timeline`: {e}",
+                    self.host_id
+                ))
+            })?;
+        Ok(serde_json::Value::Array(rows))
     }
 
     async fn archive_session(&self, id: &str) -> Result<(), HostConnectorError> {
@@ -2592,6 +2625,91 @@ mod tests {
         // Archived scope → adds --archived.
         conn.list_sessions(Some("archived")).await.unwrap();
         assert!(stub.last_cmd.lock().unwrap().contains("--archived"));
+    }
+
+    /// `rupu session show` reports an absent session as "unknown session:
+    /// <id>", not "not found". Matching only the latter would report a
+    /// genuinely-missing session as "this host cannot answer" (500) instead
+    /// of a 404.
+    #[tokio::test]
+    async fn get_session_maps_the_cli_unknown_session_message_to_not_found() {
+        let fake = std::sync::Arc::new(FakeExec::offline("unknown session: ses_gone"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.get_session("ses_gone").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_usage_timeline_shells_the_remote_command_once() {
+        struct StubExec {
+            json: String,
+            calls: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                self.calls.lock().unwrap().push(remote.to_string());
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by session_usage_timeline")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by session_usage_timeline")
+            }
+        }
+
+        let json = r#"{"kind":"session_usage_timeline","version":1,"rows":[
+            {"turn":1,"label":"run_a","tokens_in":10,"tokens_out":20,"tokens_cached":0},
+            {"turn":2,"label":"run_a","tokens_in":5,"tokens_out":7,"tokens_cached":0}
+        ]}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let series = conn.session_usage_timeline("ses_1").await.unwrap();
+
+        assert_eq!(series.as_array().unwrap().len(), 2);
+        assert_eq!(series[1]["label"], "run_a");
+        let calls = stub.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the series is computed remotely in ONE round trip, not one per run"
+        );
+        assert!(
+            calls[0].contains("usage-timeline") && calls[0].contains("ses_1"),
+            "cmd: {}",
+            calls[0]
+        );
+    }
+
+    /// A host whose `rupu` predates `session usage-timeline` must say so,
+    /// not report an empty chart as if the session had no turns.
+    #[tokio::test]
+    async fn session_usage_timeline_maps_an_old_host_to_unsupported() {
+        let fake = std::sync::Arc::new(FakeExec::offline("unrecognized subcommand"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.session_usage_timeline("ses_1").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
     }
 
     #[test]

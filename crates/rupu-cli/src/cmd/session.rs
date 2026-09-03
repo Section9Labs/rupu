@@ -82,6 +82,11 @@ pub enum Action {
         #[arg(long, conflicts_with = "pager")]
         no_pager: bool,
     },
+    /// Per-turn token series across every run this session recorded.
+    UsageTimeline {
+        #[arg(add = ArgValueCompleter::new(session_ids))]
+        session_id: String,
+    },
     /// Archive an inactive session and its owned transcripts.
     Archive {
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
@@ -1122,6 +1127,7 @@ pub async fn handle(
             };
             show(&session_id, view, no_color, pager_flag, global_format).await
         }
+        Action::UsageTimeline { session_id } => usage_timeline(&session_id, global_format),
         Action::Archive { session_id } => archive(&session_id).await,
         Action::Restore { session_id } => restore(&session_id).await,
         Action::Delete(args) => delete(args).await,
@@ -1143,6 +1149,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     let (command_name, supported) = match action {
         Action::List(_) => ("session list", report::TABLE_JSON_CSV),
         Action::Show { .. } => ("session show", report::TABLE_JSON),
+        Action::UsageTimeline { .. } => ("session usage-timeline", report::TABLE_JSON_CSV),
         Action::Archive { .. } => ("session archive", report::TABLE_ONLY),
         Action::Restore { .. } => ("session restore", report::TABLE_ONLY),
         Action::Delete(_) => ("session delete", report::TABLE_ONLY),
@@ -1309,6 +1316,116 @@ async fn show(
         },
     };
     report::emit_detail(global_format, &output)
+}
+
+/// Build the per-turn token series for one session: every `usage` event
+/// across the session's run transcripts, in recorded order, labeled by the
+/// run that produced it.
+///
+/// Delegates to [`rupu_cp::usage::turn_series`] — the SAME function
+/// `rupu-cp`'s local `/api/sessions/:id/usage-timeline` branch calls — so a
+/// remote session's chart cannot silently disagree with a local one. A run
+/// whose transcript is missing or partial contributes no points rather than
+/// failing the whole series.
+fn build_session_usage_timeline(
+    global: &Path,
+    session_id: &str,
+) -> anyhow::Result<Vec<rupu_cp::usage::TurnPoint>> {
+    let (session, _scope) = read_session(global, session_id)?;
+    let labeled: Vec<(String, PathBuf)> = session
+        .runs
+        .iter()
+        .map(|r| (r.run_id.clone(), r.transcript_path.clone()))
+        .collect();
+    Ok(rupu_cp::usage::turn_series(&labeled))
+}
+
+#[derive(Serialize)]
+struct SessionUsageTimelineReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<rupu_cp::usage::TurnPoint>,
+}
+
+#[derive(Serialize)]
+struct SessionUsageTimelineCsvRow {
+    turn: u64,
+    run_id: String,
+    tokens_in: u64,
+    tokens_out: u64,
+    tokens_cached: u64,
+}
+
+struct SessionUsageTimelineOutput {
+    report: SessionUsageTimelineReport,
+    csv_rows: Vec<SessionUsageTimelineCsvRow>,
+}
+
+impl CollectionOutput for SessionUsageTimelineOutput {
+    type JsonReport = SessionUsageTimelineReport;
+    type CsvRow = SessionUsageTimelineCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "session usage-timeline"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "turn",
+            "run_id",
+            "tokens_in",
+            "tokens_out",
+            "tokens_cached",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["TURN", "RUN", "IN", "OUT", "CACHED"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(row.turn),
+                Cell::new(&row.label),
+                Cell::new(row.tokens_in),
+                Cell::new(row.tokens_out),
+                Cell::new(row.tokens_cached),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+fn usage_timeline(session_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let rows = build_session_usage_timeline(&global, session_id)?;
+    let csv_rows = rows
+        .iter()
+        .map(|p| SessionUsageTimelineCsvRow {
+            turn: p.turn,
+            run_id: p.label.clone(),
+            tokens_in: p.tokens_in,
+            tokens_out: p.tokens_out,
+            tokens_cached: p.tokens_cached,
+        })
+        .collect();
+    let output = SessionUsageTimelineOutput {
+        report: SessionUsageTimelineReport {
+            kind: "session_usage_timeline",
+            version: 1,
+            rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
 }
 
 async fn start(args: StartArgs) -> anyhow::Result<()> {
@@ -8135,6 +8252,103 @@ fn terminate_pid(pid: u32) -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Write a session whose runs point at transcripts carrying `usage`
+    /// events, and return `(global_dir, session_id)`.
+    fn write_session_with_usage_transcripts(
+        tmp: &tempfile::TempDir,
+        runs: &[(&str, u32)],
+    ) -> String {
+        let global = tmp.path();
+        let session_id = "ses_timeline";
+        let transcripts = global.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+
+        let mut run_entries = Vec::new();
+        for (run_id, turns) in runs {
+            let path = transcripts.join(format!("{run_id}.jsonl"));
+            let mut lines = Vec::new();
+            for _ in 0..*turns {
+                lines.push(
+                    serde_json::to_string(&TranscriptEvent::Usage {
+                        provider: "anthropic".into(),
+                        model: "opus".into(),
+                        served_model: None,
+                        input_tokens: 10,
+                        output_tokens: 20,
+                        cached_tokens: 0,
+                    })
+                    .unwrap(),
+                );
+            }
+            std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+            run_entries.push(serde_json::json!({
+                "run_id": run_id,
+                "prompt": "go",
+                "transcript_path": path,
+                "started_at": Utc::now(),
+            }));
+        }
+
+        let dir = global.join("sessions").join(session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": SessionRecord::VERSION,
+                "session_id": session_id,
+                "agent_name": "scout",
+                "provider_name": "anthropic",
+                "model": "opus",
+                "agent_system_prompt": "",
+                "max_turns": 50,
+                "permission_mode": "bypass",
+                "no_stream": false,
+                "workspace_id": "ws_1",
+                "workspace_path": global,
+                "transcripts_dir": transcripts,
+                "created_at": Utc::now(),
+                "updated_at": Utc::now(),
+                "status": "idle",
+                "runs": run_entries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        session_id.to_string()
+    }
+
+    /// The series is per TURN, labeled by the owning run, and its `turn`
+    /// counter runs globally across the session's runs in recorded order —
+    /// the same contract `rupu-cp`'s local `/api/sessions/:id/usage-timeline`
+    /// branch produces, since both call `rupu_cp::usage::turn_series`.
+    #[test]
+    fn session_usage_timeline_emits_one_point_per_turn_labeled_by_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = write_session_with_usage_transcripts(&tmp, &[("run_a", 2), ("run_b", 2)]);
+
+        let series = build_session_usage_timeline(tmp.path(), &session_id).unwrap();
+
+        assert_eq!(series.len(), 4, "two runs x two turns");
+        assert_eq!(series[0].label, "run_a");
+        assert_eq!(series[0].turn, 1);
+        assert_eq!(series[3].label, "run_b");
+        assert_eq!(series[3].turn, 4, "turn counter is global across runs");
+        assert_eq!(series[0].tokens_in, 10);
+        assert_eq!(series[0].tokens_out, 20);
+    }
+
+    /// A session that has recorded no runs yet is an empty series, never an
+    /// error — the chart renders empty rather than the page 500ing.
+    #[test]
+    fn session_usage_timeline_is_empty_for_a_session_with_no_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_id = write_session_with_usage_transcripts(&tmp, &[]);
+
+        let series = build_session_usage_timeline(tmp.path(), &session_id).unwrap();
+
+        assert!(series.is_empty());
+    }
 
     fn write_session_transcript(path: &Path, assistant_lines: impl IntoIterator<Item = String>) {
         let mut lines = Vec::new();

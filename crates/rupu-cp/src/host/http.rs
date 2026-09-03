@@ -424,6 +424,14 @@ impl HostConnector for HttpHostConnector {
         self.proxy_get_json(&format!("/api/sessions/{id}/runs")).await
     }
 
+    async fn session_usage_timeline(
+        &self,
+        id: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        self.proxy_get_json(&format!("/api/sessions/{id}/usage-timeline"))
+            .await
+    }
+
     async fn proxy_get_json(
         &self,
         path_and_query: &str,

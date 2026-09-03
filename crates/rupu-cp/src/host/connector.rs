@@ -295,6 +295,23 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("session runs".into()))
     }
 
+    /// Per-turn token series for one session on this host — the structured
+    /// counterpart to `proxy_get_json("/api/sessions/<id>/usage-timeline")`.
+    ///
+    /// Returns a JSON array of the same points the local branch emits. HTTP
+    /// proxies; the SSH connector shells `rupu session usage-timeline <id>
+    /// --format json`, which computes the series remotely in ONE round trip
+    /// (fetching each run's transcript separately would be N ssh
+    /// connections per page load).
+    async fn session_usage_timeline(
+        &self,
+        _id: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "session usage timeline".into(),
+        ))
+    }
+
     /// Archive an active session on this host. The default impl returns
     /// [`HostConnectorError::Unsupported`] so transports without session
     /// enumeration/mutation (Local — routed through the `SessionMutator`
