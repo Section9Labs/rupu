@@ -443,10 +443,13 @@ async fn get_session_usage_timeline(
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let v = conn.session_usage_timeline(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
+        let v = conn
+            .session_usage_timeline(&id)
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
         return Ok(Json(v));
     }
 

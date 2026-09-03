@@ -1899,24 +1899,35 @@ async fn explorer_run_scope(
     }
 }
 
+/// What a host could tell us about one run's raw flow records.
+enum HostFlows {
+    /// The host served the structured surface. Raw records plus the
+    /// ledger's own dropped-record count.
+    Records(Vec<FlowRecord>, u64),
+    /// The host has no structured netflow surface. `reason` is that
+    /// refusal, kept because it is the informative one: an HTTP host is
+    /// simply expected to proxy instead, but an SSH host landing here means
+    /// its remote `rupu` predates `netflow show`, and saying THAT beats
+    /// letting the generic-GET attempt report "proxy_get_json is not
+    /// supported for ssh hosts" — true, but not the operator's actual
+    /// problem.
+    NoStructuredSurface { reason: String },
+}
+
 /// Fetch one run's raw flow records from a host that exposes the structured
-/// [`HostConnector::run_netflow`] surface, or `None` when it does not (an
-/// HTTP host, whose caller falls back to the generic-GET proxy below).
+/// [`HostConnector::run_netflow`] surface.
 ///
 /// Raw records, aggregated locally: the CP applies its own window, filters
 /// and ASN table, so every host's flows are enriched identically and a
 /// remote cannot return something that merely looks filtered.
-async fn host_raw_flows(
-    s: &AppState,
-    host_id: &str,
-    run_id: &str,
-) -> ApiResult<Option<(Vec<FlowRecord>, u64)>> {
+async fn host_raw_flows(s: &AppState, host_id: &str, run_id: &str) -> ApiResult<HostFlows> {
     let conn = resolve_host(s, host_id)?;
     let value = match conn.run_netflow(run_id).await {
         Ok(v) => v,
-        // No structured surface on this transport — the caller proxies.
-        Err(HostConnectorError::Unsupported(_)) | Err(HostConnectorError::Invalid(_)) => {
-            return Ok(None)
+        // No structured surface — the caller tries the generic-GET proxy,
+        // and falls back to THIS reason if that has nothing to offer either.
+        Err(HostConnectorError::Unsupported(reason)) | Err(HostConnectorError::Invalid(reason)) => {
+            return Ok(HostFlows::NoStructuredSurface { reason })
         }
         Err(HostConnectorError::NotFound(m)) => return Err(ApiError::not_found(m)),
         Err(HostConnectorError::Unreachable(m)) => {
@@ -1943,7 +1954,7 @@ async fn host_raw_flows(
         .get("dropped_total")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    Ok(Some((flows, dropped)))
+    Ok(HostFlows::Records(flows, dropped))
 }
 
 /// The attribution index for a host-sourced run.
@@ -1977,28 +1988,31 @@ async fn explorer_from_host(
     // A transport with a structured netflow surface (SSH) returns raw
     // records that we aggregate here, with our own window, filters and ASN
     // table. Only an HTTP host falls through to the proxy below.
-    if let Some((flows, dropped)) = host_raw_flows(s, host_id, run_id).await? {
-        let meta = meta_for_host_run(s, run_id);
-        let cache = Arc::clone(&s.asn_cache);
-        let rid = run_id.to_string();
-        let range = range.clone();
-        let filters = filters.clone();
-        return run_blocking(move || {
-            let table = load_asn_table(&cache);
-            let tagged: Vec<(String, FlowRecord)> =
-                flows.into_iter().map(|f| (rid.clone(), f)).collect();
-            let explorer_flows = to_explorer_flows(tagged, &meta, table.as_deref());
-            build_explorer_response(
-                &explorer_flows,
-                dropped,
-                &meta.spans,
-                table.is_some(),
-                &range,
-                &filters,
-            )
-        })
-        .await;
-    }
+    let no_structured_reason = match host_raw_flows(s, host_id, run_id).await? {
+        HostFlows::NoStructuredSurface { reason } => reason,
+        HostFlows::Records(flows, dropped) => {
+            let meta = meta_for_host_run(s, run_id);
+            let cache = Arc::clone(&s.asn_cache);
+            let rid = run_id.to_string();
+            let range = range.clone();
+            let filters = filters.clone();
+            return run_blocking(move || {
+                let table = load_asn_table(&cache);
+                let tagged: Vec<(String, FlowRecord)> =
+                    flows.into_iter().map(|f| (rid.clone(), f)).collect();
+                let explorer_flows = to_explorer_flows(tagged, &meta, table.as_deref());
+                build_explorer_response(
+                    &explorer_flows,
+                    dropped,
+                    &meta.spans,
+                    table.is_some(),
+                    &range,
+                    &filters,
+                )
+            })
+            .await;
+        }
+    };
 
     let conn = resolve_host(s, host_id)?;
     let mut parts = vec![format!("scope=run:{}", urlencode_query_value(run_id))];
@@ -2013,6 +2027,12 @@ async fn explorer_from_host(
         HostConnectorError::Unreachable(m) => {
             ApiError::internal(format!("host {host_id} unreachable: {m}"))
         }
+        // Neither surface: report why the STRUCTURED one declined, which
+        // names the actual problem (an out-of-date remote `rupu`), not the
+        // generic-GET refusal that is merely a property of the transport.
+        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => ApiError::internal(
+            format!("host {host_id} cannot serve netflow: {no_structured_reason}"),
+        ),
         other => ApiError::internal(other.to_string()),
     })?;
     serde_json::from_value(value).map_err(|e| {
@@ -2046,20 +2066,23 @@ async fn run_netflow_from_host(
 ) -> ApiResult<NetflowResponse> {
     // Same rule as `explorer_from_host`: raw records from a structured
     // transport, enriched and filtered here; only HTTP proxies.
-    if let Some((flows, dropped)) = host_raw_flows(s, host_id, id).await? {
-        let meta = meta_for_host_run(s, id);
-        let cache = Arc::clone(&s.asn_cache);
-        let rid = id.to_string();
-        let range = range.clone();
-        let filters = filters.clone();
-        return run_blocking(move || {
-            let table = load_asn_table(&cache);
-            let tagged: Vec<(String, FlowRecord)> =
-                flows.into_iter().map(|f| (rid.clone(), f)).collect();
-            build_filtered_response(tagged, &meta, dropped, table.as_deref(), &range, &filters)
-        })
-        .await;
-    }
+    let no_structured_reason = match host_raw_flows(s, host_id, id).await? {
+        HostFlows::NoStructuredSurface { reason } => reason,
+        HostFlows::Records(flows, dropped) => {
+            let meta = meta_for_host_run(s, id);
+            let cache = Arc::clone(&s.asn_cache);
+            let rid = id.to_string();
+            let range = range.clone();
+            let filters = filters.clone();
+            return run_blocking(move || {
+                let table = load_asn_table(&cache);
+                let tagged: Vec<(String, FlowRecord)> =
+                    flows.into_iter().map(|f| (rid.clone(), f)).collect();
+                build_filtered_response(tagged, &meta, dropped, table.as_deref(), &range, &filters)
+            })
+            .await;
+        }
+    };
 
     let conn = resolve_host(s, host_id)?;
     let path = format!(
@@ -2071,6 +2094,10 @@ async fn run_netflow_from_host(
         HostConnectorError::Unreachable(m) => {
             ApiError::internal(format!("host {host_id} unreachable: {m}"))
         }
+        // See `explorer_from_host`: prefer the structured surface's reason.
+        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => ApiError::internal(
+            format!("host {host_id} cannot serve netflow: {no_structured_reason}"),
+        ),
         other => ApiError::internal(other.to_string()),
     })?;
     // A deserialization failure here is most likely `dropped_total` not

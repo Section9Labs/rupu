@@ -1013,7 +1013,10 @@ mod tests {
 
         let body = usage_body_from_remote_report(&report).expect("mappable");
 
-        assert!(!body.summary.priced, "cost_partial:true -> not fully priced");
+        assert!(
+            !body.summary.priced,
+            "cost_partial:true -> not fully priced"
+        );
         assert_eq!(body.unpriced.models, vec!["mystery".to_string()]);
         assert_eq!(body.unpriced.rows, 1);
     }

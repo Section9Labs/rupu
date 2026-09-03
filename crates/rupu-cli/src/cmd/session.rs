@@ -1378,13 +1378,7 @@ impl CollectionOutput for SessionUsageTimelineOutput {
     }
 
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
-        Some(&[
-            "turn",
-            "run_id",
-            "tokens_in",
-            "tokens_out",
-            "tokens_cached",
-        ])
+        Some(&["turn", "run_id", "tokens_in", "tokens_out", "tokens_cached"])
     }
 
     fn render_table(&self) -> anyhow::Result<()> {

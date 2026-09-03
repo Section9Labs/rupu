@@ -29,9 +29,7 @@ use std::process::ExitCode;
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Print one run's netflow flow records.
-    Show {
-        run_id: String,
-    },
+    Show { run_id: String },
     /// Delete per-run netflow ledgers older than a cutoff.
     Prune(PruneArgs),
 }
