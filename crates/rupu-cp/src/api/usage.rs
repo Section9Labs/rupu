@@ -54,6 +54,196 @@ struct UnpricedGap {
     rows: u64,
 }
 
+/// The `rupu usage --group-by` name matching a CP grouping dimension, or
+/// `None` when the CLI has no equivalent.
+///
+/// `Host` maps to the CLI's default `composite`: a remote is a single host
+/// from our point of view, so only its totals matter and
+/// [`collapse_to_single_host_row`] rebuilds the one row we want from the
+/// report's summary. `Project` genuinely has no counterpart — the CLI
+/// cannot group by workspace — so it returns `None` and the host is
+/// reported `unavailable` with that reason rather than silently omitted.
+fn cli_group_name(group_by: crate::usage::GroupBy) -> Option<&'static str> {
+    use crate::usage::GroupBy;
+    match group_by {
+        GroupBy::Provider => Some("provider"),
+        GroupBy::Model => Some("model"),
+        GroupBy::Agent => Some("agent"),
+        GroupBy::Workflow => Some("workflow"),
+        GroupBy::Host => Some("composite"),
+        GroupBy::Project => None,
+    }
+}
+
+/// Replace a report's per-dimension rows with the single row `group_by=host`
+/// wants: this whole host's totals, taken from the summary the remote
+/// already computed. The caller tags it with the real registered host id.
+fn collapse_to_single_host_row(mut body: RemoteUsageBody) -> RemoteUsageBody {
+    let s = &body.summary;
+    body.breakdown = vec![crate::usage::UsageBreakdownRow {
+        provider: String::new(),
+        model: String::new(),
+        agent: String::new(),
+        workflow: String::new(),
+        host_id: String::new(),
+        workspace_id: String::new(),
+        input_tokens: s.input_tokens,
+        output_tokens: s.output_tokens,
+        cached_tokens: s.cached_tokens,
+        total_tokens: s.total_tokens,
+        cost_usd: s.cost_usd,
+        priced: s.priced,
+        runs: s.runs,
+    }];
+    body
+}
+
+/// Fetch one remote host's usage body, over whichever surface that host
+/// actually has.
+///
+/// Tries the structured [`HostConnector::usage_rollup`] first: the default
+/// impl returns `Unsupported` instantly with no I/O, so an HTTP host falls
+/// straight through to the generic-GET proxy it has always used, and an SSH
+/// host — which has no generic-GET surface at all — answers by shelling
+/// `rupu usage --format json`. A real transport failure (`Unreachable`)
+/// propagates rather than being retried on the other surface.
+///
+/// The outer `Result` is transport failure; the inner one is "this build
+/// cannot read that body", which the caller renders as an offline host with
+/// a reason — never as a silent zero contribution.
+async fn remote_usage_body(
+    conn: &dyn crate::host::connector::HostConnector,
+    proxy_path: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    group_by: crate::usage::GroupBy,
+) -> Result<Result<RemoteUsageBody, String>, HostConnectorError> {
+    let cli_group = cli_group_name(group_by);
+    if let Some(cli_group) = cli_group {
+        match conn
+            .usage_rollup(&start.to_rfc3339(), &end.to_rfc3339(), cli_group)
+            .await
+        {
+            Ok(report) => {
+                let body = usage_body_from_remote_report(&report).map(|b| {
+                    if group_by == crate::usage::GroupBy::Host {
+                        collapse_to_single_host_row(b)
+                    } else {
+                        b
+                    }
+                });
+                return Ok(body);
+            }
+            // No structured surface on this transport — fall through to the
+            // generic-GET proxy below.
+            Err(HostConnectorError::Unsupported(_)) => {}
+            Err(other) => return Err(other),
+        }
+    }
+
+    let v = conn.proxy_get_json(proxy_path).await?;
+    Ok(serde_json::from_value::<RemoteUsageBody>(v).map_err(|e| e.to_string()))
+}
+
+/// Map a remote `rupu usage --format json` report onto the API body the
+/// per-host fan-out expects.
+///
+/// The two shapes are close but not identical: the CLI nests its totals
+/// under `summary` with `total_`-prefixed names, spells "this row could not
+/// be fully priced" as `cost_partial` (the API's `priced`, inverted), and
+/// carries no `total_tokens` per row. Each `rows` entry only populates the
+/// identity fields its `group_by` selected, so the rest map to empty
+/// strings — the UI labels by the grouped dimension anyway.
+///
+/// `host_id` is deliberately left empty here: the caller overwrites it with
+/// the real registered host id (a remote reports its own rows as "local").
+fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsageBody, String> {
+    let summary_val = report
+        .get("summary")
+        .ok_or_else(|| "usage report has no `summary`".to_string())?;
+    let u64_at = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let str_at = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    // `cost_partial` is the CLI's inverse of the API's `priced`.
+    let partial_at = |v: &serde_json::Value| {
+        v.get("cost_partial")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
+    };
+
+    let summary = crate::usage::UsageSummary {
+        input_tokens: u64_at(summary_val, "total_input_tokens"),
+        output_tokens: u64_at(summary_val, "total_output_tokens"),
+        cached_tokens: u64_at(summary_val, "total_cached_tokens"),
+        total_tokens: u64_at(summary_val, "total_tokens"),
+        cost_usd: summary_val.get("total_cost_usd").and_then(|x| x.as_f64()),
+        priced: !partial_at(summary_val),
+        runs: u64_at(summary_val, "total_runs"),
+    };
+
+    let empty = Vec::new();
+    let rows = report
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty);
+
+    let mut breakdown = Vec::with_capacity(rows.len());
+    let mut unpriced_models = std::collections::BTreeSet::new();
+    let mut unpriced_rows = 0u64;
+
+    for r in rows {
+        let input_tokens = u64_at(r, "input_tokens");
+        let output_tokens = u64_at(r, "output_tokens");
+        let priced = !partial_at(r) && r.get("cost_usd").and_then(|x| x.as_f64()).is_some();
+        let model = str_at(r, "model");
+        if !priced {
+            // Name the model when the remote grouped by one; otherwise the
+            // group label is the most specific thing we were told.
+            let label = if model.is_empty() {
+                str_at(r, "group")
+            } else {
+                model.clone()
+            };
+            if !label.is_empty() {
+                unpriced_models.insert(label);
+            }
+            unpriced_rows += 1;
+        }
+        breakdown.push(crate::usage::UsageBreakdownRow {
+            provider: str_at(r, "provider"),
+            model,
+            agent: str_at(r, "agent"),
+            workflow: str_at(r, "workflow"),
+            // Overwritten by the caller with the real registered host id.
+            host_id: String::new(),
+            // A remote's workspace ids are meaningless in our registry.
+            workspace_id: String::new(),
+            input_tokens,
+            output_tokens,
+            cached_tokens: u64_at(r, "cached_tokens"),
+            // The CLI report has no per-row total; cached tokens are not
+            // added in, matching `crate::usage::breakdown`'s own arithmetic.
+            total_tokens: input_tokens + output_tokens,
+            cost_usd: r.get("cost_usd").and_then(|x| x.as_f64()),
+            priced,
+            runs: u64_at(r, "runs"),
+        });
+    }
+
+    Ok(RemoteUsageBody {
+        summary,
+        breakdown,
+        unpriced: UnpricedGap {
+            models: unpriced_models.into_iter().collect(),
+            rows: unpriced_rows,
+        },
+    })
+}
+
 /// Distinct unpriced model ids + the row count they account for, computed
 /// with the SAME price-resolution path `summarize`/`breakdown` use
 /// (`rupu_config::pricing::lookup`) — no second lookup implementation to
@@ -172,6 +362,7 @@ struct HostUsage {
 /// Wire shape parsed out of a remote host's `/api/usage?host=local&...`
 /// response. Only the fields this endpoint needs to re-aggregate.
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 struct RemoteUsageBody {
     summary: crate::usage::UsageSummary,
     breakdown: Vec<crate::usage::UsageBreakdownRow>,
@@ -361,8 +552,12 @@ async fn get_usage(
                 group_by.as_str(),
             );
 
-            match conn.proxy_get_json(&path).await {
-                Ok(v) => match serde_json::from_value::<RemoteUsageBody>(v) {
+            // A transport with no generic-GET surface (SSH) answers through
+            // its structured `usage_rollup` instead, shelling `rupu usage
+            // --format json` on the remote. `remote_usage_body` picks the
+            // path and normalizes both onto `RemoteUsageBody`.
+            match remote_usage_body(conn.as_ref(), &path, start, end, group_by).await {
+                Ok(v) => match v {
                     Ok(body) => {
                         // `group_by=host`: the remote's own rows are tagged
                         // "local" from ITS point of view — override to the
@@ -407,13 +602,12 @@ async fn get_usage(
                         None,
                     ),
                 },
-                // SSH (and Tunnel/Bucket) connectors return `Invalid`
-                // INSTANTLY for `proxy_get_json` — no round trip, no stall —
-                // because they structurally have no generic-GET surface.
-                // `Unsupported` is handled the same way for forward
-                // compatibility with a future connector that returns it
-                // instead. Either way this renders `unavailable`, never a
-                // silent omission from `hosts[]`.
+                // A transport with NEITHER surface for this request: a
+                // Tunnel/Bucket host (no generic GET, no `usage_rollup`),
+                // or an SSH host asked to group by `project`, which the
+                // remote CLI cannot do. Both connectors answer INSTANTLY —
+                // no round trip, no stall. Renders `unavailable` with the
+                // reason, never a silent omission from `hosts[]`.
                 Err(HostConnectorError::Invalid(reason))
                 | Err(HostConnectorError::Unsupported(reason)) => (
                     HostFreshness {
@@ -744,6 +938,275 @@ async fn get_usage_runs(
 
 #[cfg(test)]
 mod tests {
+    /// Shape captured from a real `rupu --format json usage --group-by
+    /// model` run, not inferred from the CSV headers: the report nests its
+    /// totals under `summary` with `total_`-prefixed names, and each `rows`
+    /// entry carries only the identity fields its `group_by` populates.
+    #[test]
+    fn remote_usage_report_maps_onto_the_cp_body() {
+        let report = serde_json::json!({
+            "kind": "usage_breakdown",
+            "version": 1,
+            "group_by": "model",
+            "summary": {
+                "total_input_tokens": 100,
+                "total_output_tokens": 50,
+                "total_cached_tokens": 10,
+                "total_tokens": 150,
+                "total_runs": 2,
+                "total_cost_usd": 1.25,
+                "cost_partial": false
+            },
+            "rows": [{
+                "group": "opus",
+                "model": "opus",
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cached_tokens": 10,
+                "runs": 2,
+                "cost_usd": 1.25,
+                "cost_partial": false
+            }]
+        });
+
+        let body = usage_body_from_remote_report(&report).expect("mappable");
+
+        assert_eq!(body.summary.input_tokens, 100);
+        assert_eq!(body.summary.output_tokens, 50);
+        assert_eq!(body.summary.total_tokens, 150);
+        assert_eq!(body.summary.runs, 2);
+        assert_eq!(body.summary.cost_usd, Some(1.25));
+        assert!(body.summary.priced, "cost_partial:false -> priced");
+
+        assert_eq!(body.breakdown.len(), 1);
+        let row = &body.breakdown[0];
+        assert_eq!(row.model, "opus");
+        assert_eq!(row.total_tokens, 150, "input + output, cached excluded");
+        assert_eq!(row.runs, 2);
+        assert!(row.priced);
+        assert!(
+            row.host_id.is_empty(),
+            "the caller tags rows with the real host id"
+        );
+    }
+
+    /// A partially-priced remote must not be reported as fully priced, and
+    /// its unpriced models must be named — the Usage screen surfaces that
+    /// gap explicitly rather than showing a silently-low cost.
+    #[test]
+    fn remote_usage_report_carries_the_unpriced_gap() {
+        let report = serde_json::json!({
+            "summary": {
+                "total_input_tokens": 10, "total_output_tokens": 5,
+                "total_cached_tokens": 0, "total_tokens": 15,
+                "total_runs": 2, "total_cost_usd": 0.5, "cost_partial": true
+            },
+            "rows": [
+                {"group": "opus", "model": "opus", "input_tokens": 10,
+                 "output_tokens": 5, "cached_tokens": 0, "runs": 1,
+                 "cost_usd": 0.5, "cost_partial": false},
+                {"group": "mystery", "model": "mystery", "input_tokens": 0,
+                 "output_tokens": 0, "cached_tokens": 0, "runs": 1,
+                 "cost_usd": null, "cost_partial": true}
+            ]
+        });
+
+        let body = usage_body_from_remote_report(&report).expect("mappable");
+
+        assert!(!body.summary.priced, "cost_partial:true -> not fully priced");
+        assert_eq!(body.unpriced.models, vec!["mystery".to_string()]);
+        assert_eq!(body.unpriced.rows, 1);
+    }
+
+    /// A transport with no generic-GET surface at all — an SSH host. Its
+    /// `proxy_get_json` errors the way the real one does; only
+    /// `usage_rollup` answers.
+    struct RollupOnlyConnector {
+        report: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::host::connector::HostConnector for RollupOnlyConnector {
+        async fn usage_rollup(
+            &self,
+            _since: &str,
+            _until: &str,
+            _group_by: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            Ok(self.report.clone())
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            Err(HostConnectorError::Invalid(
+                "proxy_get_json is not supported for ssh hosts".into(),
+            ))
+        }
+        async fn info(&self) -> Result<crate::host::connector::HostInfo, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_run(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_agent(
+            &self,
+            _req: crate::agent_launcher::AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn start_session(
+            &self,
+            _req: crate::session_starter::SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn send_session_turn(
+            &self,
+            _req: crate::session_sender::SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn list_runs(
+            &self,
+            _params: crate::host::connector::RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::EventByteStream, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    fn sample_report() -> serde_json::Value {
+        serde_json::json!({
+            "summary": {
+                "total_input_tokens": 100, "total_output_tokens": 50,
+                "total_cached_tokens": 10, "total_tokens": 150,
+                "total_runs": 2, "total_cost_usd": 1.25, "cost_partial": false
+            },
+            "rows": [
+                {"group": "opus", "model": "opus", "input_tokens": 60,
+                 "output_tokens": 30, "cached_tokens": 6, "runs": 1,
+                 "cost_usd": 0.75, "cost_partial": false},
+                {"group": "sonnet", "model": "sonnet", "input_tokens": 40,
+                 "output_tokens": 20, "cached_tokens": 4, "runs": 1,
+                 "cost_usd": 0.5, "cost_partial": false}
+            ]
+        })
+    }
+
+    /// The behaviour change this task exists for: an SSH host used to report
+    /// `unavailable` and contribute nothing, because `proxy_get_json` is the
+    /// only surface the fan-out knew about. It now answers through
+    /// `usage_rollup` and contributes real numbers.
+    #[tokio::test]
+    async fn a_host_without_generic_get_still_reports_usage_through_the_rollup() {
+        let conn = RollupOnlyConnector {
+            report: sample_report(),
+        };
+
+        let body = remote_usage_body(
+            &conn,
+            "/api/usage?host=local",
+            Utc::now() - chrono::Duration::days(30),
+            Utc::now(),
+            crate::usage::GroupBy::Model,
+        )
+        .await
+        .expect("the rollup surface answers; no transport failure")
+        .expect("and this build can read its body");
+
+        assert_eq!(body.summary.total_tokens, 150);
+        assert_eq!(body.breakdown.len(), 2, "grouped by model, two models");
+    }
+
+    /// `group_by=host` wants ONE row per host. The remote CLI has no `host`
+    /// grouping, so the rows it returns are collapsed back to the host's own
+    /// totals rather than leaking a per-model breakdown into a host pivot.
+    #[tokio::test]
+    async fn host_grouping_collapses_the_remote_rows_to_a_single_total() {
+        let conn = RollupOnlyConnector {
+            report: sample_report(),
+        };
+
+        let body = remote_usage_body(
+            &conn,
+            "/api/usage?host=local",
+            Utc::now() - chrono::Duration::days(30),
+            Utc::now(),
+            crate::usage::GroupBy::Host,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(body.breakdown.len(), 1, "one row for this whole host");
+        assert_eq!(body.breakdown[0].total_tokens, 150, "the host's total");
+        assert_eq!(body.breakdown[0].runs, 2);
+    }
+
+    /// `group_by=project` has no remote-CLI equivalent. The host must say so
+    /// and render `unavailable` — never quietly report a different pivot's
+    /// numbers under the project label.
+    #[tokio::test]
+    async fn project_grouping_is_unsupported_rather_than_silently_wrong() {
+        let conn = RollupOnlyConnector {
+            report: sample_report(),
+        };
+
+        let err = remote_usage_body(
+            &conn,
+            "/api/usage?host=local",
+            Utc::now() - chrono::Duration::days(30),
+            Utc::now(),
+            crate::usage::GroupBy::Project,
+        )
+        .await
+        .expect_err("no surface can serve a project pivot on this transport");
+
+        assert!(
+            matches!(err, HostConnectorError::Invalid(_)),
+            "falls through to the generic GET, which this transport refuses: {err:?}"
+        );
+    }
+
+    /// A body this build cannot read is an error the caller renders as an
+    /// offline host with a reason — never a silent zero contribution.
+    #[test]
+    fn remote_usage_report_without_a_summary_is_an_error() {
+        let report = serde_json::json!({ "rows": [] });
+        assert!(usage_body_from_remote_report(&report).is_err());
+    }
+
     use super::*;
 
     #[test]

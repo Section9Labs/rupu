@@ -295,6 +295,22 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("session runs".into()))
     }
 
+    /// Token/cost rollup for a time window on this host — the structured
+    /// counterpart to `proxy_get_json("/api/usage?...")`.
+    ///
+    /// `since`/`until` are RFC-3339; `group_by` is the CP's own group name.
+    /// Returns the host's report verbatim (shapes differ per transport), so
+    /// the caller maps it. The SSH connector shells `rupu usage --since
+    /// <s> --until <u> --group-by <g> --format json`.
+    async fn usage_rollup(
+        &self,
+        _since: &str,
+        _until: &str,
+        _group_by: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("usage rollup".into()))
+    }
+
     /// Per-turn token series for one session on this host — the structured
     /// counterpart to `proxy_get_json("/api/sessions/<id>/usage-timeline")`.
     ///

@@ -1816,6 +1816,30 @@ impl HostConnector for SshHostConnector {
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new())))
     }
 
+    /// Roll up this host's usage by shelling `rupu usage --format json`.
+    ///
+    /// The remote prices with ITS own config — the same property the HTTP
+    /// path has, since that proxies the remote's `/api/usage`.
+    async fn usage_rollup(
+        &self,
+        since: &str,
+        until: &str,
+        group_by: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        self.remote_json(&[
+            "--format",
+            "json",
+            "usage",
+            "--since",
+            since,
+            "--until",
+            until,
+            "--group-by",
+            group_by,
+        ])
+        .await
+    }
+
     /// One ssh round trip: the remote CLI walks the session's transcripts
     /// and returns the finished series, rather than this connector fetching
     /// each run's transcript separately.
