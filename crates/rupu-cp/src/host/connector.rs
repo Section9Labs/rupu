@@ -792,3 +792,113 @@ mod codec_tests {
         assert!(decode_delta(&[0, 0]).is_err()); // shorter than 4-byte header len
     }
 }
+
+/// A configurable [`HostConnector`] for tests.
+///
+/// Every method not explicitly configured panics rather than returning a
+/// plausible empty value: a test that reaches an unconfigured method has
+/// exercised a path it did not mean to, and should say so loudly.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct StubConnector {
+        /// Canned `run_netflow` reply. `None` → `Unsupported`, modelling a
+        /// remote whose `rupu` predates `netflow show`.
+        pub run_netflow: Option<Result<serde_json::Value, HostConnectorError>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostConnector for StubConnector {
+        async fn run_netflow(
+            &self,
+            _run_id: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            match &self.run_netflow {
+                Some(Ok(v)) => Ok(v.clone()),
+                Some(Err(e)) => Err(match e {
+                    HostConnectorError::Unreachable(m) => {
+                        HostConnectorError::Unreachable(m.clone())
+                    }
+                    HostConnectorError::Unsupported(m) => {
+                        HostConnectorError::Unsupported(m.clone())
+                    }
+                    HostConnectorError::Invalid(m) => HostConnectorError::Invalid(m.clone()),
+                    HostConnectorError::NotFound(m) => HostConnectorError::NotFound(m.clone()),
+                    HostConnectorError::Unauthorized => HostConnectorError::Unauthorized,
+                    HostConnectorError::Remote(c, m) => HostConnectorError::Remote(*c, m.clone()),
+                }),
+                None => Err(HostConnectorError::Unsupported("run netflow".into())),
+            }
+        }
+
+        async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+            unimplemented!("StubConnector: info not configured")
+        }
+        async fn launch_run(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: launch_run not configured")
+        }
+        async fn launch_agent(
+            &self,
+            _req: crate::agent_launcher::AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: launch_agent not configured")
+        }
+        async fn start_session(
+            &self,
+            _req: crate::session_starter::SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: start_session not configured")
+        }
+        async fn send_session_turn(
+            &self,
+            _req: crate::session_sender::SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("StubConnector: send_session_turn not configured")
+        }
+        async fn list_runs(
+            &self,
+            _params: RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!("StubConnector: list_runs not configured")
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("StubConnector: get_run not configured")
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("StubConnector: approve_run not configured")
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!("StubConnector: reject_run not configured")
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("StubConnector: cancel_run not configured")
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<EventByteStream, HostConnectorError> {
+            unimplemented!("StubConnector: stream_run_events not configured")
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("StubConnector: get_transcript not configured")
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("StubConnector: proxy_get_json not configured")
+        }
+    }
+}

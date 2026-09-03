@@ -23,7 +23,7 @@
 //     the agent's `bash` subprocess) so an empty table doesn't imply "no
 //     network activity happened".
 
-import { formatBytes, type FlowView } from '../../lib/netflow';
+import { formatBytes, type FlowView, type IncompleteSource } from '../../lib/netflow';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { EmptyState } from '../ui/EmptyState';
 import {
@@ -45,6 +45,14 @@ export interface NetflowTableProps {
    *  Non-zero means this list is incomplete — surfaced as a banner, never
    *  silently absorbed. */
   droppedTotal: number;
+  /** Sources that own part of this scope's traffic but could not be read
+   *  (`NetflowResponse.incomplete`). Non-empty means this list is short by
+   *  an unknown amount — a run placed on a remote host keeps its ledger
+   *  there, so an empty local answer for one is "we could not look", not
+   *  "no traffic". Rendered as a loud banner on BOTH the empty and the
+   *  populated path, unlike `droppedTotal`'s honesty-on-demand popover:
+   *  a whole missing source changes what the numbers shown MEAN. */
+  incomplete?: IncompleteSource[];
   /** `false` means ASN enrichment was unavailable, not that flows lack an
    *  ASN. Drives an explanatory note rather than a blank Network column. */
   asnLoaded: boolean;
@@ -125,9 +133,41 @@ function DroppedBanner({ droppedTotal }: { droppedTotal: number }) {
   );
 }
 
+/**
+ * A source of this scope's flows that could not be read at all.
+ *
+ * Unlike [`DroppedBanner`], this renders on the POPULATED path too: a
+ * partial list with no warning reads as a complete one, and the numbers
+ * above it (counts, rollups, KPIs) are all understated by an unknown
+ * amount. The reason is the remote's own words, because it names the fix —
+ * an out-of-date `rupu` on that host, or a host that is simply down.
+ */
+function IncompleteBanner({ incomplete }: { incomplete?: IncompleteSource[] }) {
+  if (!incomplete || incomplete.length === 0) return null;
+  return (
+    <div
+      role="status"
+      className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn"
+    >
+      <p className="font-medium">
+        Incomplete — {incomplete.length === 1 ? 'a source' : `${incomplete.length} sources`} of this
+        scope&rsquo;s traffic could not be read, so the flows below are short by an unknown amount.
+      </p>
+      <ul className="mt-1 space-y-0.5">
+        {incomplete.map((s) => (
+          <li key={s.host_id} className="text-note">
+            <span className="font-mono">{s.host_id}</span>: {s.reason}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function NetflowTable({
   flows,
   droppedTotal,
+  incomplete,
   asnLoaded,
   scope = 'run',
   appliedWindow,
@@ -145,6 +185,7 @@ export function NetflowTable({
     const windowApplied = netflowWindowApplied(appliedWindow);
     return (
       <div className="space-y-3">
+        <IncompleteBanner incomplete={incomplete} />
         <DroppedBanner droppedTotal={droppedTotal} />
         {filtersActive ? (
           <EmptyState
@@ -288,6 +329,7 @@ export function NetflowTable({
 
   return (
     <div className="space-y-3">
+      <IncompleteBanner incomplete={incomplete} />
       {!asnLoaded && (
         <p className="text-note text-ink-mute">
           ASN data not loaded — network enrichment will appear once the table has been fetched.

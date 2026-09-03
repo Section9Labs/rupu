@@ -75,6 +75,7 @@ fn unfiltered_remote_response(flows: Vec<FlowRecord>, dropped_total: u64) -> Net
         window: WindowEcho::default(),
         dropped_total,
         asn_loaded: false,
+        incomplete: Vec::new(),
     }
 }
 
