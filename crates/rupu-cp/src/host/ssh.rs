@@ -1228,6 +1228,22 @@ impl SshHostConnector {
             .unwrap_or_default())
     }
 
+    /// The useful half of a failed `remote_json` call.
+    ///
+    /// [`remote_json`](Self::remote_json) maps a NON-ZERO EXIT to
+    /// `Unreachable`, whose Display prefixes "host unreachable:". For a host
+    /// that answered and simply rejected the command (an out-of-date `rupu`
+    /// printing "unrecognized subcommand"), that prefix is actively wrong —
+    /// it points an operator at the network instead of at the binary. Unwrap
+    /// the inner message so callers can report what the remote actually
+    /// said.
+    fn remote_failure_detail(e: &HostConnectorError) -> String {
+        match e {
+            HostConnectorError::Unreachable(m) => m.trim().to_string(),
+            other => other.to_string(),
+        }
+    }
+
     /// Fetch one session's `session show` report `item` over ssh.
     ///
     /// A remote that explicitly says the session is absent maps to
@@ -1262,8 +1278,9 @@ impl SshHostConnector {
                     "session_show_item: remote `rupu session show` failed; host may predate it"
                 );
                 Err(HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu session show --format json`: {e}",
-                    self.host_id
+                    "remote host {} does not support `rupu session show --format json`: {}",
+                    self.host_id,
+                    Self::remote_failure_detail(&e)
                 )))
             }
         }
@@ -1833,8 +1850,9 @@ impl HostConnector for SshHostConnector {
                     "run_netflow: remote command failed; host may predate it"
                 );
                 HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu netflow show`: {e}",
-                    self.host_id
+                    "remote host {} does not support `rupu netflow show`: {}",
+                    self.host_id,
+                    Self::remote_failure_detail(&e)
                 ))
             })?;
         Ok(serde_json::json!({
@@ -1887,8 +1905,9 @@ impl HostConnector for SshHostConnector {
                     "session_usage_timeline: remote command failed; host may predate it"
                 );
                 HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu session usage-timeline`: {e}",
-                    self.host_id
+                    "remote host {} does not support `rupu session usage-timeline`: {}",
+                    self.host_id,
+                    Self::remote_failure_detail(&e)
                 ))
             })?;
         Ok(serde_json::Value::Array(rows))
@@ -2818,6 +2837,30 @@ mod tests {
 
     /// A host whose `rupu` predates `session usage-timeline` must say so,
     /// not report an empty chart as if the session had no turns.
+    /// A host that ANSWERED and rejected the command is not an unreachable
+    /// host. `remote_json` maps a non-zero exit to `Unreachable`, so the
+    /// reported reason must not carry that prefix onward — it would point an
+    /// operator at the network instead of at the out-of-date binary.
+    #[tokio::test]
+    async fn an_old_hosts_reason_does_not_claim_the_host_is_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline(
+            "error: unrecognized subcommand 'usage-timeline'",
+        ));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.session_usage_timeline("ses_1").await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("unrecognized subcommand"),
+            "the remote's own words must survive: {message}"
+        );
+        assert!(
+            !message.contains("host unreachable"),
+            "the host answered; do not call it unreachable: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn session_usage_timeline_maps_an_old_host_to_unsupported() {
         let fake = std::sync::Arc::new(FakeExec::offline("unrecognized subcommand"));
