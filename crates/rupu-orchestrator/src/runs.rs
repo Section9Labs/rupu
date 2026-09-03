@@ -2706,50 +2706,66 @@ pub enum PauseError {
     Store(String),
 }
 
-/// True when `pid` names a live process on this machine. Shells out to
-/// `/bin/kill -0` (the no-op signal): exit 0 means the process exists.
+/// True when `pid` names a live process on this machine.
 ///
-/// Exposed so the duplicate-execution guard on the resume path
-/// (`rupu workflow resume` / the CP resume worker) can refuse to spawn a
-/// second process while a run's recorded `runner_pid` is still live.
+/// A `kill(pid, 0)` syscall (rustix's safe `test_kill_process` wrapper —
+/// the workspace forbids `unsafe_code`, so libc is not an option): it
+/// checks whether the pid is signallable without sending a signal.
 ///
-/// This spawns a child process on every call. It is fine for a guard that
-/// checks one pid before a single mutating action, but it is NOT suitable
-/// for per-row use in a hot or unpaginated list path without an explicit
-/// bound — a few hundred rows means a few hundred blocking spawns per
-/// request. See `rupu_cp::api::run_streams::STANDALONE_LIVENESS_PROBE_CAP`
-/// for the pattern used to bound it (probe only the newest N distinct
-/// pids) when a caller needs liveness across many rows.
+/// This is a plain syscall, not a subprocess, so it is cheap enough to
+/// call per-row on an unpaginated list path. It used to shell out to
+/// `/bin/kill -0`, which cost a `fork`+`exec` per pid AND — because the
+/// child inherited stdio — printed `kill: <pid>: No such process` onto
+/// the `rupu cp serve` operator terminal for every dead pid probed. Both
+/// problems are gone with the syscall; callers no longer need to ration
+/// probes.
+///
+/// `EPERM` counts as alive: the process exists, we merely lack permission
+/// to signal it. The old `/bin/kill` version reported that case as dead
+/// (any non-zero exit was "dead"), which could reap a run that was in
+/// fact still going. Only `ESRCH` — and any other error, conservatively —
+/// means "no such process".
 pub fn pid_is_running(pid: u32) -> bool {
-    run_kill(&["-0"], pid).is_some_and(|output| output.status.success())
+    let Some(pid) = rustix_pid(pid) else {
+        return false;
+    };
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::PERM) => true,
+        Err(_) => false,
+    }
 }
 
-/// Send SIGTERM to `pid` via `/bin/kill -TERM`. Returns whether the
-/// signal was delivered successfully.
-fn terminate_pid(pid: u32) -> bool {
-    run_kill(&["-TERM"], pid).is_some_and(|output| output.status.success())
-}
-
-/// Run `/bin/kill <signal> <pid>` with the child's stdio **captured**,
-/// returning its `Output` (or `None` if the binary could not be spawned).
+/// Send SIGTERM to `pid`. Returns whether the signal was delivered.
 ///
-/// Capturing rather than inheriting is load-bearing, not tidiness.
-/// `/bin/kill` writes to stderr whenever the pid is not signallable
-/// (`kill: <pid>: No such process`), and [`pid_is_running`] is called
-/// per-row on CP list paths over pids that are *expected* to be dead —
-/// every historical standalone run's recorded pid, re-probed on every
-/// `/api/runs` request. With inherited stdio each of those probes printed
-/// a line onto the `rupu cp serve` operator terminal, so a workspace with
-/// N finished runs emitted N lines of `No such process` per request,
-/// forever. The exit status is the whole answer here; the message is
-/// noise.
-fn run_kill(args: &[&str], pid: u32) -> Option<std::process::Output> {
-    std::process::Command::new("/bin/kill")
-        .args(args)
-        .arg(pid.to_string())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
+/// Never signals this process. A recorded pid equal to our own is always a
+/// corrupt state — a bug that wrote the wrong pid, or an OS pid recycled
+/// onto us — and honoring it makes rupu SIGTERM itself mid-command (inside
+/// `rupu cp serve` that means killing the web server, the resume worker
+/// and every in-flight resume at once). Refusing is strictly better than
+/// obeying: callers read `false` as "could not terminate" and move on.
+pub fn terminate_pid(pid: u32) -> bool {
+    if pid == std::process::id() {
+        tracing::warn!(
+            pid,
+            "refusing to terminate this process: a recorded pid matched our own"
+        );
+        return false;
+    }
+    let Some(pid) = rustix_pid(pid) else {
+        return false;
+    };
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
+}
+
+/// Convert a recorded `u32` pid into a rustix [`Pid`].
+///
+/// `None` for anything that cannot be a real pid — 0 (which would mean
+/// "our whole process group" to `kill(2)`, never what a recorded
+/// `runner_pid` means) and anything past `i32::MAX`. Tests use `u32::MAX`
+/// as the canonical never-alive pid and land here.
+fn rustix_pid(pid: u32) -> Option<rustix::process::Pid> {
+    rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)
 }
 
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
@@ -4984,25 +5000,27 @@ mod tests {
         }
     }
 
-    /// `/bin/kill` complains on stderr about a pid it cannot signal. That
-    /// output must land in our pipe, never on the parent's stderr — the
-    /// liveness probe runs per-row on CP list paths over pids that are
-    /// expected to be dead, and inherited stdio turned every `/api/runs`
-    /// request into a burst of `kill: <pid>: No such process` lines on the
-    /// `rupu cp serve` operator terminal.
+    /// The liveness probe must answer without spawning a process. The old
+    /// `/bin/kill -0` shell-out cost a fork+exec per pid on an
+    /// unpaginated, polled list path, and leaked the child's
+    /// `kill: <pid>: No such process` onto the operator's terminal. This
+    /// pins the observable contract of the syscall version: our own pid is
+    /// alive, a pid that cannot exist is not, and neither answer requires
+    /// `/bin/kill` to be on disk.
     #[test]
-    fn kill_probe_captures_child_stderr_instead_of_inheriting_it() {
-        if !Path::new("/bin/kill").exists() {
-            return;
-        }
-        let output = run_kill(&["-0"], u32::MAX).expect("/bin/kill is spawnable");
+    fn pid_is_running_answers_without_a_subprocess() {
         assert!(
-            !output.status.success(),
-            "u32::MAX must not be a signallable pid"
+            pid_is_running(std::process::id()),
+            "this test's own process must read as alive"
         );
         assert!(
-            !output.stderr.is_empty(),
-            "the child's complaint must be captured, not written to our stderr"
+            !pid_is_running(u32::MAX),
+            "u32::MAX exceeds i32 pid range and can never name a process"
+        );
+        assert!(
+            !pid_is_running(0),
+            "pid 0 means `our whole process group` to kill(2) and must never \
+             be treated as a live runner"
         );
     }
 

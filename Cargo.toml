@@ -54,6 +54,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Process control (safe wrappers over the POSIX syscalls; the workspace
+# forbids `unsafe_code`, so signalling/liveness cannot call libc directly)
+rustix = { version = "1", features = ["process"] }
+
 # IDs / time
 ulid = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
