@@ -6037,6 +6037,11 @@ async fn run_linear_step(
                         seed: rr.final_messages,
                     });
                 }
+                // Safe as a bare `Ok(_)` ONLY because `dispatch_one` folds a
+                // non-`Ok` terminal `RunStatus` (e.g. a max-turns bust) into
+                // `Err` — see its doc. Reading `RunResult::status` again here
+                // would be redundant, but dropping that fold would silently
+                // restore the "truncated run recorded as success" bug.
                 Ok(_) => true,
                 Err(source) => {
                     if continue_on_error {
@@ -7131,6 +7136,24 @@ struct FanoutItemOutcome {
 /// (factories default it to `None`). `resume_seed`, when `Some`, overrides the
 /// factory-built `initial_messages` + `user_message` so a paused-incomplete
 /// step re-runs from its persisted transcript with correct role alternation.
+///
+/// # A non-`Ok` terminal status is folded into `Err` here, on purpose
+///
+/// [`run_agent`] reserves `Err` for failures that stopped the loop from
+/// proceeding at all (transport, provider, io). A run that RAN and ended
+/// badly — today, a `max_turns` bust — comes back as
+/// `Ok(RunResult { status: RunStatus::Error, .. })`. Every caller of this
+/// function derives the step's/unit's `success` by pattern-matching `Ok(_)`,
+/// so that shape silently recorded a truncated run as a successful step, and
+/// the workflow marched on into a downstream step that then failed on the
+/// work the "successful" step never did.
+///
+/// Folding the status here rather than at each of the six call sites is
+/// deliberate: it is one place instead of six, and a future caller inherits
+/// the correct behavior instead of re-introducing the bug. A cooperative
+/// pause is explicitly NOT folded — [`RunResult::terminal_error`] returns
+/// `None` when `paused` is set — so the callers' `Ok(rr) if rr.paused` arms
+/// keep firing exactly as before.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one(
     factory: &Arc<dyn StepFactory>,
@@ -7163,7 +7186,11 @@ async fn dispatch_one(
         agent_opts.initial_messages = initial_messages;
         agent_opts.user_message = user_message;
     }
-    run_agent(agent_opts).await
+    let result = run_agent(agent_opts).await?;
+    match result.terminal_error() {
+        Some(err) => Err(err),
+        None => Ok(result),
+    }
 }
 
 /// Read the just-finished transcript to extract the final assistant
@@ -15286,4 +15313,338 @@ fn scan_for_json_object(s: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Regression cover for the "an agent run's terminal status is discarded"
+/// bug: `run_agent` reserves `Err` for failures that stopped the loop from
+/// proceeding at all, so a run that busts its `max_turns` budget comes back
+/// as `Ok(RunResult { status: RunStatus::Error, .. })`. Every step-recording
+/// path here derives `success` by pattern-matching `Ok(_)`, which recorded a
+/// truncated run as a SUCCESSFUL step — the workflow then marched on into a
+/// downstream step that failed on work the "successful" step never did,
+/// pointing the operator at the wrong step entirely.
+///
+/// These tests assert on the STEP's recorded `success` (and on the workflow
+/// error), never on the agent's own `RunResult` — an assertion on the agent
+/// result passes against the bug, because the agent layer was always
+/// reporting the status correctly. The discard happened above it.
+#[cfg(test)]
+mod agent_terminal_status {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_agent::AgentRunOpts;
+    use rupu_providers::types::StopReason;
+    use rupu_providers::LlmProvider;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Hands out a fresh `MockProvider` per dispatch, with a caller-chosen
+    /// `max_turns`. A low `max_turns` plus a turn that requests a tool is
+    /// the whole fixture: the agent loop runs the tool, comes back for
+    /// another turn, finds the budget spent, and breaks with
+    /// `RunStatus::Error` — WITHOUT returning `Err`.
+    struct ScriptedFactory {
+        max_turns: u32,
+        script: Vec<ScriptedTurn>,
+        /// How many times a step actually dispatched an agent. Proves a
+        /// downstream step did not run after an upstream failure.
+        dispatches: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedFactory {
+        fn new(max_turns: u32, script: Vec<ScriptedTurn>) -> Self {
+            Self {
+                max_turns,
+                script,
+                dispatches: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for ScriptedFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.dispatches.lock().unwrap().push(step_id.to_string());
+            let provider: Box<dyn LlmProvider> = Box::new(MockProvider::new(self.script.clone()));
+            AgentRunOpts {
+                seed_source: None,
+                agent_name: agent_name.to_string(),
+                agent_system_prompt: "test".into(),
+                agent_tools: None,
+                provider,
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: self.max_turns,
+                decider: Arc::new(BypassDecider),
+                tool_context: rupu_tools::ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                scope_name: None,
+                surface_tag: None,
+                pause: None,
+            }
+        }
+    }
+
+    /// Records every `StepCompleted` / `StepFailed` the run emits, so a test
+    /// can assert what the LIVE view was told — not just what the in-memory
+    /// `StepResult` says.
+    #[derive(Default)]
+    struct StepEventSink {
+        seen: Mutex<Vec<(String, bool, String)>>,
+    }
+    impl StepEventSink {
+        fn seen(&self) -> Vec<(String, bool, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+    impl crate::executor::EventSink for StepEventSink {
+        fn emit(&self, _run_id: &str, ev: &crate::executor::Event) {
+            let row = match ev {
+                crate::executor::Event::StepCompleted {
+                    step_id, success, ..
+                } => (step_id.clone(), *success, String::new()),
+                crate::executor::Event::StepFailed { step_id, error, .. } => {
+                    (step_id.clone(), false, error.clone())
+                }
+                _ => return,
+            };
+            self.seen.lock().unwrap().push(row);
+        }
+    }
+
+    fn opts_for(
+        yaml: &str,
+        dir: &Path,
+        factory: Arc<dyn StepFactory>,
+        sink: Arc<dyn crate::executor::EventSink>,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            run_step: Default::default(),
+            workflow: Workflow::parse(yaml).expect("test workflow parses"),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_terminal_status".into(),
+            workspace_path: dir.to_path_buf(),
+            transcript_dir: dir.to_path_buf(),
+            factory,
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: Some(sink),
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    /// One turn that asks for a tool. With `max_turns: 1` this is enough to
+    /// exhaust the budget: the tool runs, the loop wants a second turn, and
+    /// the budget check breaks the loop with `RunStatus::Error`.
+    fn one_tool_call_turn(path: &Path) -> Vec<ScriptedTurn> {
+        vec![ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "call_read_1".into(),
+            tool_name: "read_file".into(),
+            tool_input: serde_json::json!({ "path": path.to_str().unwrap() }),
+            stop: StopReason::ToolUse,
+        }]
+    }
+
+    const WF_ONE_STEP_CONTINUE: &str = r#"
+name: terminal-status-continue
+steps:
+  - id: worker
+    agent: worker
+    prompt: "do work"
+    continue_on_error: true
+"#;
+
+    const WF_TWO_STEPS: &str = r#"
+name: terminal-status-abort
+steps:
+  - id: worker
+    agent: worker
+    prompt: "do work"
+  - id: downstream
+    agent: reader
+    prompt: "consume {{ steps.worker.output }}"
+"#;
+
+    /// THE REGRESSION. A step whose agent blew its turn budget must be
+    /// recorded `success: false`.
+    ///
+    /// `continue_on_error: true` is what makes the assertion possible at
+    /// all: without it the (correct) behaviour is to abort the workflow, so
+    /// there would be no recorded `StepResult` to inspect. See the sibling
+    /// test for the abort direction.
+    ///
+    /// Before the fix: `success` was `true` here.
+    #[tokio::test]
+    async fn a_max_turns_bust_records_the_step_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("input.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let sink = Arc::new(StepEventSink::default());
+        let factory = Arc::new(ScriptedFactory::new(1, one_tool_call_turn(&target)));
+        let opts = opts_for(
+            WF_ONE_STEP_CONTINUE,
+            dir.path(),
+            factory,
+            sink.clone() as Arc<dyn crate::executor::EventSink>,
+        );
+
+        let res = run_workflow(opts)
+            .await
+            .expect("continue_on_error keeps the workflow Ok");
+
+        assert_eq!(res.step_results.len(), 1, "one step ran");
+        let step = &res.step_results[0];
+        assert_eq!(step.step_id, "worker");
+        assert!(
+            !step.success,
+            "an agent run that busted max_turns must NOT be recorded as a successful step"
+        );
+
+        // And the live view was told the same thing.
+        let seen = sink.seen();
+        assert!(
+            seen.iter().any(|(id, ok, _)| id == "worker" && !ok),
+            "the live view must see worker as not-successful; got {seen:?}"
+        );
+    }
+
+    /// The abort direction: with the default `continue_on_error` (false), a
+    /// max-turns bust must stop the workflow AND name the step, instead of
+    /// letting a downstream step run against work that was never done.
+    ///
+    /// Before the fix: `run_workflow` returned `Ok`, `downstream` ran, and
+    /// both steps were recorded `success: true`.
+    #[tokio::test]
+    async fn a_max_turns_bust_aborts_the_workflow_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("input.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let sink = Arc::new(StepEventSink::default());
+        let factory = Arc::new(ScriptedFactory::new(1, one_tool_call_turn(&target)));
+        let dispatches = factory.dispatches.clone();
+        let opts = opts_for(
+            WF_TWO_STEPS,
+            dir.path(),
+            factory,
+            sink.clone() as Arc<dyn crate::executor::EventSink>,
+        );
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("a busted step must fail the workflow");
+
+        match &err {
+            RunWorkflowError::Agent { step, source } => {
+                assert_eq!(step, "worker", "the FAILING step is named, not a later one");
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("max turns"),
+                    "the recorded reason must say why; got {msg:?}"
+                );
+            }
+            other => panic!("expected RunWorkflowError::Agent, got {other:?}"),
+        }
+
+        assert_eq!(
+            dispatches.lock().unwrap().as_slice(),
+            ["worker"],
+            "the downstream step must NOT run after an upstream agent failure"
+        );
+
+        let seen = sink.seen();
+        assert!(
+            seen.iter()
+                .any(|(id, ok, msg)| id == "worker" && !ok && msg.contains("max turns")),
+            "StepFailed must carry the reason; got {seen:?}"
+        );
+    }
+
+    /// Control — proves the fix is not simply inverted. A run that ends
+    /// normally (`RunStatus::Ok`) still records `success: true`, and the
+    /// downstream step still runs.
+    #[tokio::test]
+    async fn a_normal_completion_still_records_the_step_as_succeeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(StepEventSink::default());
+        let factory = Arc::new(ScriptedFactory::new(
+            5,
+            vec![ScriptedTurn::AssistantText {
+                text: "all done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }],
+        ));
+        let opts = opts_for(
+            WF_TWO_STEPS,
+            dir.path(),
+            factory,
+            sink.clone() as Arc<dyn crate::executor::EventSink>,
+        );
+
+        let res = run_workflow(opts).await.expect("clean run completes");
+        assert_eq!(res.step_results.len(), 2, "both steps ran");
+        for step in &res.step_results {
+            assert!(
+                step.success,
+                "step {} must still be recorded successful",
+                step.step_id
+            );
+        }
+        assert_eq!(res.step_results[0].output, "all done");
+
+        let seen = sink.seen();
+        assert!(
+            seen.iter().all(|(_, ok, _)| *ok),
+            "no step may be reported failed on a clean run; got {seen:?}"
+        );
+    }
 }
