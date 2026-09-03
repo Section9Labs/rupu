@@ -240,6 +240,18 @@ function asFinding(input: unknown): FindingView | null {
   return finding;
 }
 
+/**
+ * The command a `command_run`'s argv represents. The agent `bash` tool
+ * records `[sh, -c, <script>]`, where the script is the command; anything
+ * else (a workflow `run:` step's bare `[cmd, ...args]`) is shown joined.
+ */
+function commandFromArgv(argv: unknown[]): string {
+  if (!argv.every((a): a is string => typeof a === 'string')) return '';
+  const isShellScript =
+    argv.length === 3 && /(^|\/)(sh|bash|zsh|dash)$/.test(argv[0]) && /^-l?c$/.test(argv[1]);
+  return isShellScript ? argv[2] : argv.join(' ');
+}
+
 /** Classify a tool by its name. `report_finding` is resolved separately. */
 function classify(tool: string): ToolKind {
   switch (tool) {
@@ -255,6 +267,9 @@ function classify(tool: string): ToolKind {
     case 'edit_file':
       return 'diff';
     case 'bash':
+    // A workflow `run:` step — an argv command with no shell (see
+    // `rupu-orchestrator`'s `write_run_step_transcript`).
+    case 'run':
       return 'terminal';
     case 'dispatch_agent':
     case 'dispatch_agents_parallel':
@@ -543,13 +558,18 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
 
       case 'command_run': {
         const argv = Array.isArray(data.argv) ? data.argv : [];
-        const command = typeof argv[2] === 'string' ? argv[2] : '';
         const terminal = {
-          command,
+          command: commandFromArgv(argv),
           cwd: asString(data.cwd) ?? '',
           exitCode: asNumber(data.exit_code) ?? 0,
         };
         if (pendingTerminal) {
+          // The paired call's own `input.command` is the authoritative
+          // display string when it has one (a `run:` step writes it
+          // shell-quoted); argv is the fallback.
+          const input = (pendingTerminal.input ?? {}) as Record<string, unknown>;
+          const own = asString(input.command);
+          if (own !== null && own !== '') terminal.command = own;
           pendingTerminal.terminal = terminal;
           pendingTerminal = null;
         } else {

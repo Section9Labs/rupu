@@ -223,7 +223,9 @@ private func classify(_ tool: String) -> ToolKind {
     case "grep": return .grep
     case "glob": return .glob
     case "write_file", "edit_file": return .diff
-    case "bash": return .terminal
+    // `run` is a workflow `run:` step — an argv command with no shell
+    // (see `rupu-orchestrator`'s `write_run_step_transcript`).
+    case "bash", "run": return .terminal
     case "dispatch_agent", "dispatch_agents_parallel": return .subrun
     case "ast_grep": return .astGrep
     default: return tool.hasPrefix("coverage_") ? .coverage : .generic
