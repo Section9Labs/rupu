@@ -9,12 +9,28 @@ public struct APINetflow: Decodable, Sendable {
     public let hosts: [APIHostRollup]
     public let droppedTotal: UInt64
     public let asnLoaded: Bool
+    /// Sources that own part of this run's traffic but could not be read.
+    ///
+    /// Optional because the server omits the key entirely when nothing is
+    /// missing — `nil` and `[]` both mean complete. Non-empty means the
+    /// flows are short by an unknown amount: a run placed on a remote host
+    /// keeps its ledger there, so an empty local answer for one is "we
+    /// could not look", not "no traffic". Surfaced in the UI rather than
+    /// decoded and dropped.
+    public let incomplete: [APIIncompleteSource]?
 
-    public init(flows: [APIFlow], hosts: [APIHostRollup], droppedTotal: UInt64, asnLoaded: Bool) {
+    public init(
+        flows: [APIFlow],
+        hosts: [APIHostRollup],
+        droppedTotal: UInt64,
+        asnLoaded: Bool,
+        incomplete: [APIIncompleteSource]? = nil
+    ) {
         self.flows = flows
         self.hosts = hosts
         self.droppedTotal = droppedTotal
         self.asnLoaded = asnLoaded
+        self.incomplete = incomplete
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -22,6 +38,24 @@ public struct APINetflow: Decodable, Sendable {
         case hosts
         case droppedTotal = "dropped_total"
         case asnLoaded = "asn_loaded"
+        case incomplete
+    }
+}
+
+/// `rupu_cp::api::netflow::IncompleteSource` — one source of a run's flows
+/// that could not be read, and why.
+public struct APIIncompleteSource: Decodable, Sendable, Equatable {
+    public let hostID: String
+    public let reason: String
+
+    public init(hostID: String, reason: String) {
+        self.hostID = hostID
+        self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hostID = "host_id"
+        case reason
     }
 }
 

@@ -382,11 +382,19 @@ struct NetflowTabContent: View {
             case .empty:
                 Text("No network calls").font(.noteText).foregroundStyle(Color.rupuMute)
             case .content(let value):
-                if value.hosts.isEmpty {
+                let missing = value.incomplete ?? []
+                if value.hosts.isEmpty && missing.isEmpty {
                     Text("No network calls").font(.noteText).foregroundStyle(Color.rupuMute)
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
+                            // Before the rows, never after: "No network
+                            // calls" over a run whose ledger we could not
+                            // reach is the failure this warns about, and a
+                            // warning below the fold does not prevent it.
+                            if !missing.isEmpty {
+                                incompleteRow(missing)
+                            }
                             ForEach(Array(value.hosts.enumerated()), id: \.offset) { _, host in
                                 hostRow(host)
                             }
@@ -402,6 +410,29 @@ struct NetflowTabContent: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// A source of this run's traffic that could not be read.
+    ///
+    /// Rendered whether or not any flows came back: a partial list with no
+    /// warning reads as a complete one, and an EMPTY one reads as "this run
+    /// made no network calls" — which is exactly wrong for a run placed on
+    /// a host we could not reach.
+    private func incompleteRow(_ sources: [APIIncompleteSource]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(
+                sources.count == 1
+                    ? "Incomplete — 1 source could not be read"
+                    : "Incomplete — \(sources.count) sources could not be read"
+            )
+            .font(.noteText)
+            .foregroundStyle(Color.status(.failed))
+            ForEach(sources, id: \.hostID) { source in
+                Text("\(source.hostID): \(source.reason)")
+                    .font(.dataMono(10))
+                    .foregroundStyle(Color.rupuMute)
+            }
+        }
     }
 
     private func hostRow(_ host: APIHostRollup) -> some View {
