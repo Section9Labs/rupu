@@ -61,6 +61,61 @@ pub struct WorkspaceDelta {
 #[error("workspace conflict on: {0:?}")]
 pub struct WorkspaceConflict(pub Vec<String>);
 
+/// A coordinator workspace that has already been packed for staging.
+///
+/// Opaque to the orchestrator in exactly the way [`WorkspaceDelta::payload`]
+/// is: the bytes are whatever the dispatcher's codec produced, and the
+/// orchestrator only ever moves them.
+///
+/// Held behind an [`Arc`] because the whole point of this type is that a
+/// fan-out step packs its workspace ONCE and every unit in that step shares
+/// the result. Measured on a live campaign before the hoist: 290 units each
+/// packed the identical ~51 MB / 3,345-file coordinator workspace at ~64 s a
+/// pack — ~2.6 hours of a 10-hour run spent re-packing the same tree.
+#[derive(Clone)]
+pub struct PreparedWorkspace {
+    payload: Arc<Vec<u8>>,
+}
+
+impl PreparedWorkspace {
+    /// Wrap already-packed bytes. Called by the dispatcher's
+    /// [`UnitDispatcher::prepare_workspace`].
+    pub fn new(payload: Vec<u8>) -> Self {
+        Self {
+            payload: Arc::new(payload),
+        }
+    }
+
+    /// Borrow the packed bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Copy the packed bytes out, for a connector API that takes ownership.
+    /// This is a memcpy, not a re-pack — the expensive part happened once.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.payload.as_ref().clone()
+    }
+
+    /// Size of the packed payload in bytes.
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// Whether the packed payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+}
+
+// Hand-written so a `{:?}` on a `UnitDispatch` does not dump tens of
+// megabytes of packed workspace into a log line.
+impl std::fmt::Debug for PreparedWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PreparedWorkspace({} bytes)", self.payload.len())
+    }
+}
+
 /// Payload for one unit dispatched to a remote host.
 #[derive(Debug)]
 pub struct UnitDispatch {
@@ -69,9 +124,15 @@ pub struct UnitDispatch {
     pub rendered_prompt: String,
     pub index: usize,
     pub run_id: String,
-    /// Set to `Some(coordinator workspace path)` when this unit's effective
-    /// workspace mode is `Sync`. `None` ⇒ self-contained (unchanged).
-    pub workspace_path: Option<PathBuf>,
+    /// The packed coordinator workspace when this unit's effective workspace
+    /// mode is `Sync`. `None` ⇒ self-contained (unchanged).
+    ///
+    /// This is the packed RESULT, not the path to pack: the pack happens once
+    /// per step in the caller (see [`UnitDispatcher::prepare_workspace`]) and
+    /// every unit of that step carries a clone of the same handle. The staged
+    /// directory each unit gets on the host is still its own — sharing the
+    /// packed input is not sharing a working directory.
+    pub workspace: Option<PreparedWorkspace>,
 }
 
 /// Outcome of one unit dispatched to a remote host.
@@ -96,6 +157,29 @@ pub struct UnitOutcome {
 pub trait UnitDispatcher: Send + Sync {
     /// Run one unit (an agent invocation) on `host` and return its output.
     async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError>;
+
+    /// Pack the coordinator workspace at `workspace_path` for staging.
+    ///
+    /// Called ONCE per step whose effective workspace mode is `Sync` and
+    /// whose units are placed on hosts — never once per unit. Every unit of
+    /// that step then carries a clone of the returned [`PreparedWorkspace`].
+    /// All units of a fan-out step stage from the same coordinator workspace
+    /// at the same logical moment, so packing it per unit was pure repeated
+    /// work: 290 units × ~64 s on a measured campaign.
+    ///
+    /// The default impl FAILS rather than returning an empty payload. A
+    /// dispatcher that cannot pack must not silently stage an empty tree —
+    /// that would look like a successful sync that lost every file.
+    async fn prepare_workspace(
+        &self,
+        _workspace_path: &Path,
+    ) -> Result<PreparedWorkspace, RunError> {
+        Err(RunError::Provider(
+            "workspace: sync requires a dispatcher that implements \
+             UnitDispatcher::prepare_workspace; this one does not"
+                .into(),
+        ))
+    }
 
     /// Apply collected unit workspace deltas to the coordinator workspace at
     /// `workspace_path`. Mode-aware (git 3-way merge / tar disjoint-copy);
@@ -5895,29 +5979,45 @@ async fn dispatch_placed_step(
         let output = source.to_string();
         return placed_failure(step, host, output, source, continue_on_error);
     };
-    // When sync mode is active, pass the coordinator workspace to the unit so
-    // the remote side can mount / apply it. None ⇒ self-contained (unchanged).
-    let workspace_path_opt = sync.then(|| opts.workspace_path.clone());
+    // When sync mode is active, pack the coordinator workspace so the remote
+    // side can mount / apply it. None ⇒ self-contained (unchanged).
+    //
+    // A placed step is a single unit, so this pack was never duplicated the
+    // way the fan-out path duplicated it — but it lives here rather than
+    // inside `dispatch_unit` so BOTH remote paths pack in one place, on the
+    // blocking pool, under the same contract.
+    let prepared = if sync {
+        match dispatcher.prepare_workspace(&opts.workspace_path).await {
+            Ok(w) => Some(w),
+            // Byte-for-byte the shape a pack failure inside `dispatch_unit`
+            // produced: a placed-step failure honoring `continue_on_error`.
+            Err(source) => {
+                let output = source.to_string();
+                return placed_failure(step, host, output, source, continue_on_error);
+            }
+        }
+    } else {
+        None
+    };
     let unit = UnitDispatch {
         step_id: step.id.clone(),
         agent: agent_name.to_string(),
         rendered_prompt: rendered.to_string(),
         index: 0,
         run_id: run_id.to_string(),
-        workspace_path: workspace_path_opt.clone(),
+        workspace: prepared,
     };
     match dispatcher.dispatch_unit(unit, host).await {
         Ok(outcome) if outcome.success => {
             let output = outcome.output;
             let ws_delta = outcome.workspace_delta;
             // Apply the unit's workspace delta back to the coordinator before
-            // the step is considered complete. Guard on both sync mode (workspace_path_opt
-            // is Some) and a dispatcher being present (always true here, but keeps
-            // the guard symmetric with the fan-out path).
+            // the step is considered complete. Guard on both sync mode and a
+            // dispatcher being present (always true here, but keeps the guard
+            // symmetric with the fan-out path).
             if let Some(delta) = ws_delta {
-                if let (Some(disp), Some(ws)) =
-                    (opts.unit_dispatcher.as_ref(), workspace_path_opt.as_ref())
-                {
+                if let (Some(disp), true) = (opts.unit_dispatcher.as_ref(), sync) {
+                    let ws = &opts.workspace_path;
                     if let Err(conflict) = disp.apply_workspace_deltas(ws, &[delta]).await {
                         let src = RunError::Provider(conflict.to_string());
                         return placed_failure(
@@ -6495,6 +6595,36 @@ async fn run_fanout_step(
     let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
     // Clone the dispatcher Arc once; each spawned task gets its own ref.
     let unit_dispatcher = opts.unit_dispatcher.clone();
+
+    // ── Pack the coordinator workspace ONCE for the whole step ───────────────
+    //
+    // Every unit of a fan-out step stages from the SAME coordinator workspace
+    // at the same logical moment, so packing it inside each unit's dispatch
+    // was N copies of one job. Measured on a live campaign: 290 units each
+    // packed the identical ~51 MB / 3,345-file tree at ~64 s — ~2.6 hours of
+    // a 10-hour run, and GROWING through the run as earlier units' deltas
+    // landed back in the workspace, so late units paid more than early ones.
+    //
+    // Guarded on `distribute_hosts` as well as `sync`: a fan-out step with
+    // `workspace: sync` but no `distribute:` runs every unit locally against
+    // `opts.workspace_path` directly and never staged anything, so it must
+    // not start packing now.
+    //
+    // The failure is carried, not returned. A pack failure previously failed
+    // each unit individually (it happened inside `dispatch_unit`), which is
+    // what `continue_on_error` was applied to; keeping it per-unit keeps that
+    // semantics and the "k of N units failed" reporting exactly as it was.
+    let prepared_workspace: Option<Result<PreparedWorkspace, String>> =
+        match (sync, distribute_hosts.is_some(), unit_dispatcher.as_ref()) {
+            (true, true, Some(d)) => Some(
+                d.prepare_workspace(&opts.workspace_path)
+                    .await
+                    .map_err(|e| e.to_string()),
+            ),
+            // No dispatcher ⇒ every placed unit already fails with
+            // "distribute requires fleet access"; nothing to pack for.
+            _ => None,
+        };
     // Cooperative pause token, cloned once; each spawned task gets its own
     // handle. Threaded into the LOCAL agent dispatch below so an in-flight
     // unit honors it mid-turn (same mechanism as a linear step's agent —
@@ -6535,9 +6665,10 @@ async fn run_fanout_step(
         let unit_agent = agent_name_root.clone();
         let dispatcher_for_task = unit_dispatcher.clone();
         let pause_for_task = unit_pause.clone();
-        // Workspace path forwarded to the remote unit when sync mode is active.
-        // None ⇒ self-contained; Some ⇒ unit mounts this path and returns a delta.
-        let unit_workspace_path = sync.then(|| opts.workspace_path.clone());
+        // The step's ONE packed workspace, shared with this unit when sync
+        // mode is active. None ⇒ self-contained; Some ⇒ the unit stages this
+        // payload into its OWN remote directory and returns a delta.
+        let unit_workspace = prepared_workspace.clone();
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -6610,100 +6741,122 @@ async fn run_fanout_step(
                             // Minor 3: reuse `msg` instead of duplicating the literal.
                             (msg.clone(), false, Some(msg), Some(err), None, false)
                         }
-                        Some(dispatcher) => {
-                            let unit = UnitDispatch {
-                                step_id: step_id.clone(),
-                                agent: agent_name.clone(),
-                                rendered_prompt: rendered_clone.clone(),
-                                index: idx,
-                                run_id: run_id_clone.clone(),
-                                workspace_path: unit_workspace_path.clone(),
-                            };
-                            match dispatcher.dispatch_unit(unit, &host).await {
-                                Ok(outcome) => {
-                                    // Important fix: when the agent ran but failed
-                                    // (success=false), synthesize a raw_error so
-                                    // the continue_on_error:false abort below fires
-                                    // — symmetric with the local Err path.
-                                    let err_str = outcome.error.clone();
-                                    let raw = if !outcome.success {
-                                        Some(RunError::Provider(
-                                            outcome
-                                                .error
-                                                .clone()
-                                                .unwrap_or_else(|| "remote unit failed".into()),
-                                        ))
-                                    } else {
-                                        None
-                                    };
-                                    let ws_delta = outcome.workspace_delta;
-                                    (
-                                        outcome.output,
-                                        outcome.success,
-                                        err_str,
-                                        raw,
-                                        ws_delta,
-                                        false,
-                                    )
-                                }
-                                Err(first_err) => {
-                                    // Reassign once to the next host and retry.
-                                    let retry_host = fallback_host.as_deref().unwrap_or(&host);
-                                    let retry_unit = UnitDispatch {
-                                        step_id: step_id.clone(),
-                                        agent: agent_name.clone(),
-                                        rendered_prompt: rendered_clone.clone(),
-                                        index: idx,
-                                        run_id: run_id_clone.clone(),
-                                        workspace_path: unit_workspace_path.clone(),
-                                    };
-                                    warn!(
-                                        step = %step_id,
-                                        index = idx,
-                                        host = %host,
-                                        retry = %retry_host,
-                                        error = %first_err,
-                                        "unit dispatch failed; retrying on next host"
-                                    );
-                                    match dispatcher.dispatch_unit(retry_unit, retry_host).await {
-                                        Ok(outcome) => {
-                                            // Same fix as primary path: synthesize
-                                            // raw_error for a failed-but-Ok outcome.
-                                            let err_str = outcome.error.clone();
-                                            let raw = if !outcome.success {
-                                                Some(RunError::Provider(
-                                                    outcome.error.clone().unwrap_or_else(|| {
-                                                        "remote unit failed".into()
-                                                    }),
-                                                ))
-                                            } else {
-                                                None
-                                            };
-                                            let ws_delta = outcome.workspace_delta;
-                                            (
-                                                outcome.output,
-                                                outcome.success,
-                                                err_str,
-                                                raw,
-                                                ws_delta,
-                                                false,
-                                            )
-                                        }
-                                        Err(second_err) => {
-                                            let msg = second_err.to_string();
-                                            (
-                                                msg.clone(),
-                                                false,
-                                                Some(msg),
-                                                Some(second_err),
-                                                None,
-                                                false,
-                                            )
+                        // The step's workspace was packed ONCE, before any
+                        // unit started. `Some(Err(_))` is that single pack
+                        // having failed: report it per unit, which is the
+                        // exact shape the old per-unit pack produced, so
+                        // `continue_on_error` and the "k of N units failed"
+                        // reporting are unchanged.
+                        Some(dispatcher) => match unit_workspace {
+                            Some(Err(msg)) => {
+                                let err = RunError::Provider(msg);
+                                let m = err.to_string();
+                                (m.clone(), false, Some(m), Some(err), None, false)
+                            }
+                            prepared => {
+                                let unit_ws = match prepared {
+                                    Some(Ok(w)) => Some(w),
+                                    _ => None,
+                                };
+                                let unit = UnitDispatch {
+                                    step_id: step_id.clone(),
+                                    agent: agent_name.clone(),
+                                    rendered_prompt: rendered_clone.clone(),
+                                    index: idx,
+                                    run_id: run_id_clone.clone(),
+                                    workspace: unit_ws.clone(),
+                                };
+                                match dispatcher.dispatch_unit(unit, &host).await {
+                                    Ok(outcome) => {
+                                        // Important fix: when the agent ran but failed
+                                        // (success=false), synthesize a raw_error so
+                                        // the continue_on_error:false abort below fires
+                                        // — symmetric with the local Err path.
+                                        let err_str = outcome.error.clone();
+                                        let raw = if !outcome.success {
+                                            Some(RunError::Provider(
+                                                outcome
+                                                    .error
+                                                    .clone()
+                                                    .unwrap_or_else(|| "remote unit failed".into()),
+                                            ))
+                                        } else {
+                                            None
+                                        };
+                                        let ws_delta = outcome.workspace_delta;
+                                        (
+                                            outcome.output,
+                                            outcome.success,
+                                            err_str,
+                                            raw,
+                                            ws_delta,
+                                            false,
+                                        )
+                                    }
+                                    Err(first_err) => {
+                                        // Reassign once to the next host and retry.
+                                        let retry_host = fallback_host.as_deref().unwrap_or(&host);
+                                        // The retry stages the SAME packed
+                                        // payload on the fallback host — one more
+                                        // reason the pack belongs to the step and
+                                        // not to a dispatch attempt.
+                                        let retry_unit = UnitDispatch {
+                                            step_id: step_id.clone(),
+                                            agent: agent_name.clone(),
+                                            rendered_prompt: rendered_clone.clone(),
+                                            index: idx,
+                                            run_id: run_id_clone.clone(),
+                                            workspace: unit_ws.clone(),
+                                        };
+                                        warn!(
+                                            step = %step_id,
+                                            index = idx,
+                                            host = %host,
+                                            retry = %retry_host,
+                                            error = %first_err,
+                                            "unit dispatch failed; retrying on next host"
+                                        );
+                                        match dispatcher.dispatch_unit(retry_unit, retry_host).await
+                                        {
+                                            Ok(outcome) => {
+                                                // Same fix as primary path: synthesize
+                                                // raw_error for a failed-but-Ok outcome.
+                                                let err_str = outcome.error.clone();
+                                                let raw = if !outcome.success {
+                                                    Some(RunError::Provider(
+                                                        outcome.error.clone().unwrap_or_else(
+                                                            || "remote unit failed".into(),
+                                                        ),
+                                                    ))
+                                                } else {
+                                                    None
+                                                };
+                                                let ws_delta = outcome.workspace_delta;
+                                                (
+                                                    outcome.output,
+                                                    outcome.success,
+                                                    err_str,
+                                                    raw,
+                                                    ws_delta,
+                                                    false,
+                                                )
+                                            }
+                                            Err(second_err) => {
+                                                let msg = second_err.to_string();
+                                                (
+                                                    msg.clone(),
+                                                    false,
+                                                    Some(msg),
+                                                    Some(second_err),
+                                                    None,
+                                                    false,
+                                                )
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
+                        },
                     }
                 } else {
                     // --- Local (inline) path ---
@@ -8708,7 +8861,9 @@ steps:
     // -----------------------------------------------------------------------
 
     /// A `UnitDispatcher` that:
-    /// - Records whether each dispatched unit's `workspace_path` was `Some`.
+    /// - Records whether each dispatched unit received a packed `workspace`.
+    /// - Counts `prepare_workspace` calls — i.e. how many times the caller
+    ///   packed the coordinator workspace for a step.
     /// - Always returns a `UnitOutcome` with `workspace_delta: Some(...)`.
     /// - Records the number of deltas passed to each `apply_workspace_deltas` call.
     /// - When built with `with_conflict()`, returns `Err(WorkspaceConflict)`
@@ -8716,7 +8871,9 @@ steps:
     struct WorkspaceFakeDispatcher {
         saw_ws_path: Mutex<Vec<bool>>,
         applied_counts: Mutex<Vec<usize>>,
+        prepare_calls: std::sync::atomic::AtomicUsize,
         conflict_mode: bool,
+        prepare_fails: bool,
     }
 
     impl WorkspaceFakeDispatcher {
@@ -8724,7 +8881,9 @@ steps:
             Self {
                 saw_ws_path: Mutex::new(Vec::new()),
                 applied_counts: Mutex::new(Vec::new()),
+                prepare_calls: std::sync::atomic::AtomicUsize::new(0),
                 conflict_mode: false,
+                prepare_fails: false,
             }
         }
 
@@ -8732,7 +8891,21 @@ steps:
             Self {
                 saw_ws_path: Mutex::new(Vec::new()),
                 applied_counts: Mutex::new(Vec::new()),
+                prepare_calls: std::sync::atomic::AtomicUsize::new(0),
                 conflict_mode: true,
+                prepare_fails: false,
+            }
+        }
+
+        /// A dispatcher whose single per-step pack FAILS. Models an
+        /// unreadable / vanished coordinator workspace.
+        fn with_failing_prepare() -> Self {
+            Self {
+                saw_ws_path: Mutex::new(Vec::new()),
+                applied_counts: Mutex::new(Vec::new()),
+                prepare_calls: std::sync::atomic::AtomicUsize::new(0),
+                conflict_mode: false,
+                prepare_fails: true,
             }
         }
 
@@ -8743,10 +8916,27 @@ steps:
         fn applied_delta_counts(&self) -> Vec<usize> {
             self.applied_counts.lock().unwrap().clone()
         }
+
+        /// How many times the coordinator workspace was packed.
+        fn prepare_count(&self) -> usize {
+            self.prepare_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
     impl UnitDispatcher for WorkspaceFakeDispatcher {
+        async fn prepare_workspace(
+            &self,
+            _workspace_path: &std::path::Path,
+        ) -> Result<PreparedWorkspace, RunError> {
+            self.prepare_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.prepare_fails {
+                return Err(RunError::Provider("pack exploded".into()));
+            }
+            Ok(PreparedWorkspace::new(b"packed".to_vec()))
+        }
+
         async fn dispatch_unit(
             &self,
             unit: UnitDispatch,
@@ -8755,7 +8945,7 @@ steps:
             self.saw_ws_path
                 .lock()
                 .unwrap()
-                .push(unit.workspace_path.is_some());
+                .push(unit.workspace.is_some());
             Ok(UnitOutcome {
                 output: format!("out-{}", unit.index),
                 success: true,
@@ -8846,6 +9036,177 @@ steps:
         assert_eq!(disp.saw_workspace_path(), vec![true, true, true]);
         // applied once, with all 3 deltas together
         assert_eq!(disp.applied_delta_counts(), vec![3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pack-once-per-fan-out-step
+    //
+    // The defect: `rupu_workspace::pack` was called inside `dispatch_unit`,
+    // i.e. ONCE PER UNIT. Measured on a live campaign — 290 units each packed
+    // the identical ~51 MB / 3,345-file coordinator workspace at ~64 s a pack,
+    // ~2.6 hours of a 10-hour run (26%) spent packing the same tree 290 times,
+    // and growing through the run as earlier units' deltas landed back in the
+    // workspace. All units of a fan-out step stage from the same coordinator
+    // workspace at the same logical moment, so one pack is all there ever was.
+    // -----------------------------------------------------------------------
+
+    /// A fan-out step with N distributed `workspace: sync` units must pack the
+    /// coordinator workspace ONCE — not N times.
+    #[tokio::test]
+    async fn fanout_sync_packs_the_coordinator_workspace_once_for_the_whole_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(
+            r#"
+name: fan-sync-pack-once
+steps:
+  - id: edit
+    for_each: "a\nb\nc\nd\ne"
+    agent: coder
+    prompt: "edit {{ item }}"
+    max_parallel: 3
+    workspace: sync
+    distribute:
+      hosts: [w1, w2]
+"#,
+        )
+        .unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), disp.clone());
+        let res = run_workflow(opts).await.expect("ok");
+        assert!(res.step_results[0].success);
+
+        // THE assertion. Before the hoist this was 5.
+        assert_eq!(
+            disp.prepare_count(),
+            1,
+            "a fan-out step must pack the coordinator workspace exactly once, \
+             not once per unit; packed {} times for 5 units",
+            disp.prepare_count()
+        );
+
+        // …and every unit still received the packed workspace, so "pack once"
+        // did not become "sync only the first unit".
+        assert_eq!(
+            disp.saw_workspace_path(),
+            vec![true; 5],
+            "all 5 units must still carry the packed workspace"
+        );
+        // …and every unit's delta was still collected and applied together.
+        assert_eq!(
+            disp.applied_delta_counts(),
+            vec![5],
+            "all 5 unit deltas must still be applied in one batch"
+        );
+    }
+
+    /// A host-placed `workspace: sync` step is a single unit, so it packs once
+    /// — the placed path must not regress into packing twice (once for the
+    /// prepare, once inside the dispatch) now that the pack has moved.
+    #[tokio::test]
+    async fn placed_sync_step_packs_the_coordinator_workspace_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED_SYNC).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), disp.clone());
+        run_workflow(opts).await.expect("ok");
+        assert_eq!(disp.prepare_count(), 1);
+        assert_eq!(disp.saw_workspace_path(), vec![true]);
+    }
+
+    /// `workspace: none` must not pack at all — the unit gets no workspace and
+    /// the coordinator tree is never walked.
+    #[tokio::test]
+    async fn workspace_none_step_never_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), disp.clone());
+        opts.inputs.insert("what".into(), "x".into());
+        run_workflow(opts).await.expect("ok");
+        assert_eq!(
+            disp.prepare_count(),
+            0,
+            "a step with no workspace sync must never pack the workspace"
+        );
+        assert_eq!(disp.saw_workspace_path(), vec![false]);
+    }
+
+    /// The hoisted pack is guarded on `distribute:` as well as `sync`, so a
+    /// purely-local fan-out could never start paying for a pack it never used.
+    /// That guard is belt-and-braces: the schema ALREADY refuses
+    /// `workspace: sync` on a step with no placement. This test pins that
+    /// reason, so if the validation is ever relaxed the guard's justification
+    /// is on the record rather than looking like dead code.
+    #[test]
+    fn local_fanout_sync_is_refused_by_validation_so_it_can_never_pack() {
+        let err = Workflow::parse(
+            r#"
+name: fan-sync-local
+steps:
+  - id: edit
+    for_each: "a\nb\nc"
+    agent: coder
+    prompt: "edit {{ item }}"
+    max_parallel: 3
+    workspace: sync
+"#,
+        )
+        .expect_err("workspace: sync on an unplaced step must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::WorkflowParseError::WorkspaceSyncOnLocalStep { ref step }
+                    if step == "edit"
+            ),
+            "expected WorkspaceSyncOnLocalStep, got: {err:?}"
+        );
+    }
+
+    /// The step's single pack failing must fail EVERY unit of the step, with
+    /// `continue_on_error` still governing — the same shape the per-unit pack
+    /// produced when it failed inside `dispatch_unit`.
+    #[tokio::test]
+    async fn a_failed_step_pack_fails_every_unit_and_honors_continue_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::with_failing_prepare());
+        let wf = Workflow::parse(
+            r#"
+name: fan-sync-pack-fails
+steps:
+  - id: edit
+    for_each: "a\nb\nc"
+    agent: coder
+    prompt: "edit {{ item }}"
+    max_parallel: 3
+    workspace: sync
+    continue_on_error: true
+    distribute:
+      hosts: [w1, w2]
+"#,
+        )
+        .unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), disp.clone());
+        let res = run_workflow(opts)
+            .await
+            .expect("continue_on_error tolerates");
+        assert_eq!(disp.prepare_count(), 1, "still only one pack attempt");
+        assert!(
+            !res.step_results[0].success,
+            "a step whose workspace could not be packed cannot succeed"
+        );
+        assert_eq!(res.step_results[0].items.len(), 3);
+        for item in &res.step_results[0].items {
+            assert!(!item.success, "unit {} must fail", item.index);
+            assert!(
+                item.output.contains("pack exploded"),
+                "each unit must carry the pack failure: {:?}",
+                item.output
+            );
+        }
+        assert!(
+            disp.saw_workspace_path().is_empty(),
+            "no unit may be dispatched with an unpacked workspace"
+        );
     }
 
     #[tokio::test]
