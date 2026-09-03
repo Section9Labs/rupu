@@ -264,6 +264,17 @@ fn find_project_local(s: &AppState, run_id: &str) -> Option<PathBuf> {
 /// normal (cached) [`HostRegistry::resolve`] — a registered-but-unreachable
 /// host must fail fast (bounded by [`PROBE_TIMEOUT`]) here, without changing
 /// the timeout behavior of the connector an explicit `?host=` request uses.
+///
+/// Deliberately still `proxy_get_json`, not the structured
+/// [`HostConnector::get_run`](crate::host::connector::HostConnector::get_run)
+/// every transport now implements. Consequence: a non-HTTP host (SSH /
+/// Tunnel / Bucket) refuses instantly and is never *discovered* here. That
+/// is the wanted behaviour, not an oversight — those transports mirror
+/// their runs into this coordinator's own `RunStore`, so one of their runs
+/// resolves `Global` long before the walk reaches this fallback, and this
+/// probe fires speculatively at EVERY registered host. Switching it to
+/// `get_run` would spend one ssh round trip per registered host on every
+/// unresolved run id, to find runs that by construction are already found.
 async fn probe_hosts(s: &AppState, run_id: &str) -> Option<String> {
     for host in s.hosts.list_hosts() {
         if host.id == "local" {
