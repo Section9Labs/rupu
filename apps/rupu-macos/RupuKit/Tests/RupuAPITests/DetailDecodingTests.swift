@@ -80,6 +80,35 @@ import Foundation
     #expect(graph.usage.totalTokens == 3700)
 }
 
+/// The server omits `incomplete` entirely when nothing is missing, so the
+/// common case must decode with the key absent — `nil` and `[]` both mean
+/// complete.
+@Test func netflowWithoutIncompleteDecodesAsComplete() throws {
+    let netflow = try JSONDecoder().decode(APINetflow.self, from: Fixtures.data("netflow_run.json"))
+    #expect(netflow.incomplete == nil)
+}
+
+/// A source that could not be read must survive decoding: dropping it would
+/// render a short flow list as if it were the whole story.
+@Test func netflowCarriesTheSourcesItCouldNotRead() throws {
+    let json = """
+        {
+          "flows": [],
+          "hosts": [],
+          "dropped_total": 0,
+          "asn_loaded": true,
+          "incomplete": [
+            { "host_id": "host_ssh", "reason": "remote rupu does not support `rupu netflow show`" }
+          ]
+        }
+        """
+    let netflow = try JSONDecoder().decode(APINetflow.self, from: Data(json.utf8))
+    let missing = try #require(netflow.incomplete)
+    #expect(missing.count == 1)
+    #expect(missing[0].hostID == "host_ssh")
+    #expect(missing[0].reason.contains("netflow show"))
+}
+
 @Test func decodesNetflowFixtureWithTransportErrorAndRollupErrors() throws {
     let netflow = try JSONDecoder().decode(APINetflow.self, from: Fixtures.data("netflow_run.json"))
     #expect(netflow.flows.count == 2)
