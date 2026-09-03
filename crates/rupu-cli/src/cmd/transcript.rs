@@ -36,8 +36,13 @@ use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
-    /// List all transcripts (project-local + global) sorted newest first.
+    /// List transcripts (project-local + global) sorted newest first.
     List {
+        /// Show only the N most recent transcripts. Pass a large value to
+        /// list everything — every row beyond the limit costs a full read
+        /// of its transcript, and a busy workspace accumulates thousands.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
         /// Disable terminal colors. Honors `NO_COLOR` and the
         /// `[ui].color` config knob too — flag is the explicit override.
         #[arg(long)]
@@ -110,11 +115,13 @@ pub async fn handle(
 ) -> ExitCode {
     let result = match action {
         Action::List {
+            limit,
             no_color,
             all,
             archived,
         } => {
             list(
+                limit,
                 no_color,
                 all,
                 archived,
@@ -1690,6 +1697,7 @@ impl TranscriptScope {
 }
 
 async fn list(
+    limit: usize,
     no_color: bool,
     all: bool,
     archived: bool,
@@ -1768,28 +1776,31 @@ async fn list(
         started_at: chrono::DateTime<chrono::Utc>,
     }
 
-    let mut rows: Vec<Row> = Vec::new();
+    // Pass 1 — sort keys only.
+    //
+    // `JsonlReader::summary` reads a transcript end to end: `status` and
+    // `total_tokens` live in the `run_complete` event at the tail, the
+    // title in an `assistant_message` somewhere in the middle. Doing that
+    // for every file to render the newest N means reading gigabytes to
+    // throw almost all of it away — on a real workspace, 1.16 GB across
+    // 6367 transcripts, and growing with every run.
+    //
+    // `JsonlReader::head` stops at `run_start`, which is the first record,
+    // and carries the one field the ordering needs. Sort on that, take the
+    // limit, and only then pay for a full read (pass 2 below) — 18.7 MB of
+    // first records instead of 1.16 GB, and the cost of the second pass is
+    // set by `--limit` rather than by how much history is on disk.
+    //
+    // A file with no `run_start` is not an agent transcript at all — see
+    // `ReadError::NotAnAgentTranscript`. `<global>/transcripts/` is a
+    // shared namespace holding `run:` step transcripts, action-step
+    // transcripts and netflow ledgers under the same `run_<ulid>.jsonl`
+    // naming; those are skipped quietly here, and only a genuine read
+    // failure (permissions, a bad mount) is worth an operator's attention.
+    let mut heads: Vec<(TranscriptScope, &PathBuf, chrono::DateTime<chrono::Utc>)> = Vec::new();
     for (scope, path) in &paths_to_scan {
-        match JsonlReader::summary(path) {
-            Ok(s) => rows.push(Row {
-                run_id: s.run_id,
-                scope: *scope,
-                title: s.first_assistant_text,
-                agent: s.agent,
-                status: s.status,
-                total_tokens: s.total_tokens,
-                started_at: s.started_at,
-            }),
-            // `<global>/transcripts/` is a shared namespace: `run:` step
-            // transcripts, action-step transcripts and per-run netflow
-            // ledgers all live here under the same `run_<ulid>.jsonl`
-            // naming, each with its own schema. Those are not agent
-            // transcripts and were never meant for this listing — skip
-            // them at debug level. Warning per file made this command (and
-            // the `rupu cp serve` terminal it shares stderr with) emit
-            // thousands of lines of noise per invocation while saying
-            // nothing an operator could act on. A genuine read failure —
-            // permissions, a bad mount — is still a warning.
+        match JsonlReader::head(path) {
+            Ok(head) => heads.push((*scope, path, head.started_at)),
             Err(rupu_transcript::ReadError::NotAnAgentTranscript { first_tag }) => {
                 tracing::debug!(
                     path = %path.display(),
@@ -1802,11 +1813,38 @@ async fn list(
             }
         }
     }
+    let total_matched = heads.len();
 
-    // Sort newest first.
-    rows.sort_by_key(|r| Reverse(r.started_at));
+    // Sort newest first, then keep only what will actually be rendered.
+    heads.sort_by_key(|(_, _, started_at)| Reverse(*started_at));
+    heads.truncate(limit);
 
-    if rows.is_empty()
+    // Pass 2 — full summaries, for the surviving rows only.
+    let mut rows: Vec<Row> = Vec::new();
+    for (scope, path, _) in &heads {
+        match JsonlReader::summary(path) {
+            Ok(s) => rows.push(Row {
+                run_id: s.run_id,
+                scope: *scope,
+                title: s.first_assistant_text,
+                agent: s.agent,
+                status: s.status,
+                total_tokens: s.total_tokens,
+                started_at: s.started_at,
+            }),
+            // Pass 1 already read this file's `run_start`; a failure now
+            // means it changed or became unreadable in between. Rare, and
+            // worth saying out loud rather than dropping the row silently.
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping unreadable transcript");
+            }
+        }
+    }
+
+    // `total_matched`, not `rows`: with `--limit 0` there are no rows to
+    // render but there is plenty of history, and telling the operator
+    // there are no transcripts would be a lie about their disk.
+    if total_matched == 0
         && matches!(
             global_format.unwrap_or(OutputFormat::Table),
             OutputFormat::Table
@@ -1863,7 +1901,26 @@ async fn list(
         },
         csv_rows,
     };
-    report::emit_collection(global_format, &output)
+    report::emit_collection(global_format, &output)?;
+
+    // Say so when there is more history than was shown. Silently rendering
+    // the newest 50 of several thousand would read as "that is all there
+    // is". Table only — JSON/CSV consumers get exactly the rows they asked
+    // for, with no trailing prose in the stream.
+    if total_matched > rows.len()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
+        println!(
+            "(showing {} of {} transcripts — `--limit {}` for all)",
+            rows.len(),
+            total_matched,
+            total_matched
+        );
+    }
+    Ok(())
 }
 
 async fn show(

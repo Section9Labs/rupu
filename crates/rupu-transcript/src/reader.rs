@@ -73,6 +73,26 @@ pub struct RunSummary {
     pub first_assistant_text: Option<String>,
 }
 
+/// What a transcript's `run_start` event carries — everything knowable
+/// about a run without reading past its first record.
+///
+/// [`RunSummary`] needs the whole file: `status`/`total_tokens` come from
+/// `run_complete` at the end, and `first_assistant_text` from somewhere in
+/// the middle. A directory listing that sorts by time and then shows the
+/// newest N runs does not need any of that for the rows it will discard,
+/// so it can sort on [`RunHead`] and summarize only the survivors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RunHead {
+    pub run_id: String,
+    pub workspace_id: String,
+    pub agent: String,
+    pub provider: String,
+    pub model: String,
+    pub started_at: DateTime<Utc>,
+    pub mode: RunMode,
+}
+
 pub struct JsonlReader;
 
 impl JsonlReader {
@@ -150,6 +170,49 @@ impl JsonlReader {
             duration_ms,
             error,
             first_assistant_text: first_assistant,
+        })
+    }
+
+    /// Read a transcript's [`RunHead`], stopping at its `run_start`.
+    ///
+    /// For an agent transcript that is the first line of the file, so this
+    /// reads one record where [`summary`](Self::summary) reads the whole
+    /// file. It does NOT assume the ordering: if `run_start` is not first,
+    /// this keeps scanning for it, and only a file with no `run_start`
+    /// anywhere is reported as [`ReadError::NotAnAgentTranscript`] — the
+    /// same classification `summary` makes, reached the same way.
+    pub fn head(path: impl AsRef<Path>) -> Result<RunHead, ReadError> {
+        let path = path.as_ref();
+        for ev in Self::iter(path)? {
+            match ev {
+                Ok(Event::RunStart {
+                    run_id,
+                    workspace_id,
+                    agent,
+                    provider,
+                    model,
+                    started_at,
+                    mode,
+                    ..
+                }) => {
+                    return Ok(RunHead {
+                        run_id,
+                        workspace_id,
+                        agent,
+                        provider,
+                        model,
+                        started_at,
+                        mode,
+                    })
+                }
+                // A real IO error is fatal; a bad line is not (the tolerated
+                // damage modes are documented on this module).
+                Err(ReadError::Io(e)) => return Err(ReadError::Io(e)),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        Err(ReadError::NotAnAgentTranscript {
+            first_tag: Self::first_record_tag(path),
         })
     }
 

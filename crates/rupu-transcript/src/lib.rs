@@ -9,5 +9,5 @@ pub mod writer;
 pub use aggregate::{aggregate, TimeWindow, UsageRow};
 pub use event::{Event, FileEditKind, RunMode, RunStatus};
 pub use netflow_sink::TranscriptSink;
-pub use reader::{JsonlReader, ReadError, RunSummary};
+pub use reader::{JsonlReader, ReadError, RunHead, RunSummary};
 pub use writer::{JsonlWriter, WriteError};
