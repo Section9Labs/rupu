@@ -91,6 +91,35 @@ fn load_session_file(dir: &std::path::Path) -> Result<Option<SessionDto>, ApiErr
     }
 }
 
+/// Price a remote session-detail body locally, but only when the transport
+/// did not already price it.
+///
+/// An HTTP remote's `/api/sessions/:id` returns `usage` computed with *its*
+/// pricing config, and we do not second-guess that. The SSH connector
+/// deliberately carries no pricing at all (see `SshHostConnector::new`), so
+/// its body arrives without `usage` and is priced here from the token counts
+/// the remote reported — the same computation, and the same
+/// [`PricingConfig`], the local branch uses.
+///
+/// [`PricingConfig`]: rupu_config::PricingConfig
+fn ensure_usage_block(detail: &mut serde_json::Value, pricing: &rupu_config::PricingConfig) {
+    let Some(map) = detail.as_object_mut() else {
+        return;
+    };
+    if map.contains_key("usage") {
+        return;
+    }
+    let dto: SessionDto = match serde_json::from_value(serde_json::Value::Object(map.clone())) {
+        Ok(d) => d,
+        // Every SessionDto field is `#[serde(default)]`, so this only fires
+        // on a body that isn't an object at all — nothing to price.
+        Err(_) => return,
+    };
+    if let Ok(u) = serde_json::to_value(session_usage(&dto, pricing)) {
+        map.insert("usage".to_string(), u);
+    }
+}
+
 /// Try to load and parse `session.json` inside `dir` for list scanning.
 /// Returns `None` when the file is absent or fails to parse (with a warning).
 fn try_load_session(dir: &std::path::Path) -> Option<SessionDto> {
@@ -343,14 +372,12 @@ async fn get_session(
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let v = conn
-            .proxy_get_json(&format!("/api/sessions/{id}"))
-            .await
-            .map_err(|e| match e {
-                HostConnectorError::NotFound(m) => ApiError::not_found(m),
-                other => ApiError::internal(other.to_string()),
-            })?;
-        return Ok(Json(v));
+        let mut detail = conn.get_session(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        ensure_usage_block(&mut detail, &s.pricing);
+        return Ok(Json(detail));
     }
 
     // ── Local path (unchanged) ─────────────────────────────────────────────────
@@ -558,14 +585,11 @@ async fn get_session_runs(
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let v = conn
-            .proxy_get_json(&format!("/api/sessions/{id}/runs"))
-            .await
-            .map_err(|e| match e {
-                HostConnectorError::NotFound(m) => ApiError::not_found(m),
-                other => ApiError::internal(other.to_string()),
-            })?;
-        return Ok(Json(v));
+        let runs = conn.session_runs(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(runs));
     }
 
     // ── Local path (unchanged logic) ───────────────────────────────────────────
@@ -863,6 +887,44 @@ mod tests {
             );
         }
         check_fixture("session_rows.json", &vec![v]);
+    }
+
+    /// SSH bodies arrive unpriced (that connector has no pricing config);
+    /// the CP prices them from the reported token counts.
+    #[test]
+    fn ensure_usage_block_prices_a_body_that_arrived_without_usage() {
+        let mut detail = serde_json::json!({
+            "session_id": "ses_1",
+            "agent_name": "scout",
+            "provider_name": "anthropic",
+            "model": "opus",
+            "total_tokens_in": 10,
+            "total_tokens_out": 20,
+        });
+
+        ensure_usage_block(&mut detail, &rupu_config::PricingConfig::default());
+
+        let usage = detail.get("usage").expect("unpriced body must be priced");
+        assert_eq!(usage["total_tokens"], 30, "priced from in + out");
+    }
+
+    /// An HTTP remote already priced its own session with its own config.
+    /// Re-pricing it here would silently overwrite that with ours.
+    #[test]
+    fn ensure_usage_block_leaves_an_already_priced_body_alone() {
+        let mut detail = serde_json::json!({
+            "session_id": "ses_1",
+            "total_tokens_in": 10,
+            "total_tokens_out": 20,
+            "usage": { "total_tokens": 999, "cost_usd": 1.5 },
+        });
+
+        ensure_usage_block(&mut detail, &rupu_config::PricingConfig::default());
+
+        assert_eq!(
+            detail["usage"]["total_tokens"], 999,
+            "the remote's own usage block must survive untouched"
+        );
     }
 
     #[test]

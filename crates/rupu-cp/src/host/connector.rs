@@ -267,6 +267,34 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("session listing".into()))
     }
 
+    /// Fetch one session's detail record from this host, **in API shape**
+    /// (the same field names `GET /api/sessions/:id` returns locally —
+    /// `agent_name`, `provider_name`, ...). The structured counterpart to
+    /// `proxy_get_json("/api/sessions/<id>")`, so non-HTTP transports can
+    /// serve session detail too: HTTP proxies verbatim, while the SSH
+    /// connector shells `rupu session show <id> --format json` and renames
+    /// that report's human-table field labels to the API's.
+    ///
+    /// The returned body may omit `usage` — a transport that cannot price
+    /// (SSH carries no pricing config by design; see `SshHostConnector::new`)
+    /// leaves that to the caller. The default errors so transports without
+    /// session enumeration compile unchanged.
+    async fn get_session(&self, _id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session detail".into()))
+    }
+
+    /// The runs one session recorded, newest-last, as a JSON array — the
+    /// structured counterpart to `proxy_get_json("/api/sessions/<id>/runs")`.
+    ///
+    /// Deliberately separate from [`get_session`](Self::get_session): the API
+    /// session DTO carries no `runs` field, so an HTTP host must proxy the
+    /// dedicated `/runs` endpoint rather than dig into the detail body. The
+    /// SSH connector reads the `runs[]` out of the same `session show`
+    /// report — one ssh round trip per call, not two.
+    async fn session_runs(&self, _id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session runs".into()))
+    }
+
     /// Archive an active session on this host. The default impl returns
     /// [`HostConnectorError::Unsupported`] so transports without session
     /// enumeration/mutation (Local — routed through the `SessionMutator`
