@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
-    WorkspaceConflict, WorkspaceDelta,
+    run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitDispatch,
+    UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
 };
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::StopReason;
@@ -74,12 +74,19 @@ impl PlacedSyncDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for PlacedSyncDispatcher {
+    async fn prepare_workspace(
+        &self,
+        _workspace_path: &Path,
+    ) -> Result<PreparedWorkspace, RunError> {
+        Ok(PreparedWorkspace::new(b"packed".to_vec()))
+    }
+
     async fn dispatch_unit(
         &self,
         unit: UnitDispatch,
         _host: &str,
     ) -> Result<UnitOutcome, RunError> {
-        *self.saw_workspace_path.lock().unwrap() = unit.workspace_path.is_some();
+        *self.saw_workspace_path.lock().unwrap() = unit.workspace.is_some();
         Ok(UnitOutcome {
             output: "REMOTE-EDITED".to_string(),
             success: true,
@@ -208,27 +215,53 @@ const FANOUT_CONTENTS: [&[u8]; 3] = [b"content-x", b"content-y", b"content-z"];
 /// files under `workspace_path` in a single call.
 struct FanoutSyncDispatcher {
     apply_call_count: Mutex<usize>,
+    /// How many times the coordinator workspace was packed for the step.
+    prepare_call_count: Mutex<usize>,
+    /// The packed payload each unit received, in dispatch order.
+    unit_payloads: Mutex<Vec<Option<Vec<u8>>>>,
 }
 
 impl FanoutSyncDispatcher {
     fn new() -> Self {
         Self {
             apply_call_count: Mutex::new(0),
+            prepare_call_count: Mutex::new(0),
+            unit_payloads: Mutex::new(Vec::new()),
         }
     }
 
     fn apply_call_count(&self) -> usize {
         *self.apply_call_count.lock().unwrap()
     }
+
+    fn prepare_call_count(&self) -> usize {
+        *self.prepare_call_count.lock().unwrap()
+    }
+
+    fn unit_payloads(&self) -> Vec<Option<Vec<u8>>> {
+        self.unit_payloads.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl UnitDispatcher for FanoutSyncDispatcher {
+    async fn prepare_workspace(
+        &self,
+        _workspace_path: &Path,
+    ) -> Result<PreparedWorkspace, RunError> {
+        *self.prepare_call_count.lock().unwrap() += 1;
+        Ok(PreparedWorkspace::new(b"packed-once".to_vec()))
+    }
+
     async fn dispatch_unit(
         &self,
         unit: UnitDispatch,
         _host: &str,
     ) -> Result<UnitOutcome, RunError> {
+        self.unit_payloads
+            .lock()
+            .unwrap()
+            .push(unit.workspace.as_ref().map(|w| w.bytes().to_vec()));
         let idx = unit.index;
         let filename = FANOUT_FILES[idx].to_string();
         let content = FANOUT_CONTENTS[idx].to_vec();
@@ -442,6 +475,25 @@ async fn fanout_sync_disjoint_edits_merge() {
         dispatcher.apply_call_count(),
         1,
         "apply_workspace_deltas must be called exactly once (after all units complete)"
+    );
+
+    // --- The coordinator workspace was PACKED exactly once for the step ---
+    //
+    // The pack used to live inside `dispatch_unit`, so this was 3 — and on a
+    // measured campaign, 290, each one a ~64 s walk of the same ~51 MB tree.
+    assert_eq!(
+        dispatcher.prepare_call_count(),
+        1,
+        "the coordinator workspace must be packed once per fan-out step, not once per unit"
+    );
+    // …and all three units received that one pack.
+    let payloads = dispatcher.unit_payloads();
+    assert_eq!(payloads.len(), 3, "three units dispatched");
+    assert!(
+        payloads
+            .iter()
+            .all(|p| p.as_deref() == Some(b"packed-once".as_slice())),
+        "every unit must carry the step's single packed workspace: {payloads:?}"
     );
 
     // --- All three disjoint files written to workspace_path ---

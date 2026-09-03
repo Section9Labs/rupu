@@ -18,7 +18,7 @@ use rupu_cp::{
     },
 };
 use rupu_orchestrator::runner::{
-    UnitDispatch, UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
+    PreparedWorkspace, UnitDispatch, UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
 };
 
 // ── Poll constants ─────────────────────────────────────────────────────────────
@@ -207,19 +207,46 @@ impl FleetUnitDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for FleetUnitDispatcher {
+    /// Pack the coordinator workspace once for a whole step.
+    ///
+    /// Two things are load-bearing here and neither was true when this pack
+    /// lived inside `dispatch_unit`:
+    ///
+    /// 1. **It runs once per step, not once per unit.** The caller
+    ///    (`run_fanout_step` / `dispatch_placed_step`) owns the "one logical
+    ///    moment" all of a step's units stage from, so it owns the pack.
+    /// 2. **It runs on the blocking pool.** `rupu_workspace::pack` is a fully
+    ///    synchronous tree walk + tar/git pack — measured at ~64 s for a
+    ///    51 MB / 3,345-file workspace. Awaiting nothing while occupying a
+    ///    runtime worker thread for a minute starves the poll loops and the
+    ///    SSH tail pumps that keep every OTHER in-flight unit alive, so with
+    ///    P concurrent packs P worker threads went dark at once. The CLI is
+    ///    `#[tokio::main]` multi-thread; `spawn_blocking` is where this
+    ///    belongs.
+    async fn prepare_workspace(
+        &self,
+        workspace_path: &Path,
+    ) -> Result<PreparedWorkspace, RunError> {
+        let ws = workspace_path.to_path_buf();
+        let payload = tokio::task::spawn_blocking(move || rupu_workspace::pack(&ws))
+            .await
+            .map_err(|e| RunError::Provider(format!("workspace pack task failed: {e}")))?
+            .map_err(|e| RunError::Provider(e.to_string()))?;
+        Ok(PreparedWorkspace::new(encode_payload(&payload)))
+    }
+
     async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
         let conn = self.resolver.resolve(host)?;
 
-        // When the unit runs in `Sync` mode, pack the coordinator workspace and
-        // stage it on the host BEFORE launching, so the agent runs against the
-        // staged tree. `None` ⇒ self-contained: byte-for-byte the prior path.
-        let working_dir = match &unit.workspace_path {
+        // When the unit runs in `Sync` mode, stage the step's ALREADY-PACKED
+        // workspace on the host BEFORE launching, so the agent runs against
+        // the staged tree. The payload is shared with every other unit in the
+        // step; the staged directory the host hands back is this unit's alone.
+        // `None` ⇒ self-contained: byte-for-byte the prior path.
+        let working_dir = match &unit.workspace {
             Some(ws) => {
-                let payload =
-                    rupu_workspace::pack(ws).map_err(|e| RunError::Provider(e.to_string()))?;
-                let encoded = encode_payload(&payload);
                 let dir = conn
-                    .stage_workspace(encoded)
+                    .stage_workspace(ws.to_vec())
                     .await
                     .map_err(host_err_to_run_err)?;
                 Some(dir)
@@ -755,8 +782,20 @@ mod tests {
             rendered_prompt: "p".to_string(),
             index: 0,
             run_id: "r".to_string(),
-            workspace_path: None,
+            workspace: None,
         }
+    }
+
+    /// Pack a real directory through the dispatcher's OWN `prepare_workspace`.
+    ///
+    /// The pack no longer lives inside `dispatch_unit` — it happens once per
+    /// step in the caller — so tests that want a genuinely packed workspace
+    /// (real `rupu_workspace::pack` + real wire encoding) go through the seam
+    /// where it now lives instead of inventing a fixture payload.
+    async fn prepared_ws(d: &FleetUnitDispatcher, path: &Path) -> PreparedWorkspace {
+        d.prepare_workspace(path)
+            .await
+            .expect("packing a real temp dir must succeed")
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -955,6 +994,242 @@ steps:
         rupu_cp::host::connector::encode_delta(&delta)
     }
 
+    // ── Pack-once / per-unit-staging ─────────────────────────────────────────
+    //
+    // The pack was hoisted out of `dispatch_unit` (it ran once per UNIT:
+    // 290 units × ~64 s over the same ~51 MB tree on a measured campaign).
+    // What must NOT be hoisted with it is the staging: every unit still gets
+    // its own directory on the host, and every unit's delta is still
+    // collected from that directory. These tests pin that split.
+
+    /// Fake connector that hands out a DISTINCT staged dir per
+    /// `stage_workspace` call and records, in order:
+    /// * the payload bytes each unit staged,
+    /// * the `working_dir` each `launch_agent` received,
+    /// * the dir each `collect_workspace_delta` was called with.
+    struct StagingRecorder {
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        staged_payloads: std::sync::Mutex<Vec<Vec<u8>>>,
+        launched_working_dirs: std::sync::Mutex<Vec<Option<String>>>,
+        collected_dirs: std::sync::Mutex<Vec<String>>,
+        next_dir: std::sync::atomic::AtomicU32,
+    }
+
+    impl StagingRecorder {
+        fn new() -> Self {
+            Self {
+                calls: Default::default(),
+                staged_payloads: Default::default(),
+                launched_working_dirs: Default::default(),
+                collected_dirs: Default::default(),
+                next_dir: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HostConnector for StagingRecorder {
+        async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn launch_run(&self, _req: LaunchRequest) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn launch_agent(
+            &self,
+            req: AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            self.calls.lock().unwrap().push("launch_agent");
+            self.launched_working_dirs
+                .lock()
+                .unwrap()
+                .push(req.working_dir.clone());
+            Ok("run_staged".to_string())
+        }
+        async fn start_session(
+            &self,
+            _req: SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn send_session_turn(
+            &self,
+            _req: SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn list_runs(
+            &self,
+            _params: RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            Ok(serde_json::json!({
+                "run": { "status": "completed", "final_output": "staged-out" }
+            }))
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<EventByteStream, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {
+            self.calls.lock().unwrap().push("stage_workspace");
+            self.staged_payloads.lock().unwrap().push(payload);
+            let n = self
+                .next_dir
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(format!("/cache/workspace-sync/unit-{n}/work"))
+        }
+        async fn collect_workspace_delta(
+            &self,
+            working_dir: &str,
+        ) -> Result<Vec<u8>, HostConnectorError> {
+            self.calls.lock().unwrap().push("collect_workspace_delta");
+            self.collected_dirs
+                .lock()
+                .unwrap()
+                .push(working_dir.to_string());
+            // Name the file after the dir so the caller can tell whose delta
+            // came back from where.
+            let leaf = working_dir.trim_start_matches('/').replace('/', "_");
+            Ok(tar_one(&format!("{leaf}.txt"), "edited"))
+        }
+        async fn discard_workspace(&self, _working_dir: &str) -> Result<(), HostConnectorError> {
+            self.calls.lock().unwrap().push("discard_workspace");
+            Ok(())
+        }
+    }
+
+    /// The whole point of the hoist, at the dispatcher's own seam: N units
+    /// share ONE packed payload, and each still gets its OWN staged directory,
+    /// launches against that directory, and has its delta collected from it.
+    ///
+    /// Before the hoist, `dispatch_unit` packed the coordinator workspace
+    /// itself, so N units meant N packs of the identical tree. This test is
+    /// the "not hoisted too far" half: sharing the packed INPUT must not
+    /// become sharing a working directory.
+    #[tokio::test]
+    async fn units_share_one_pack_but_never_a_staged_directory() {
+        let conn = Arc::new(StagingRecorder::new());
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        // ONE pack for the whole step — exactly what `run_fanout_step` does.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
+        let packed = prepared_ws(&d, ws.path()).await;
+
+        let mut outcomes = Vec::new();
+        for idx in 0..3 {
+            let mut unit = make_unit();
+            unit.index = idx;
+            unit.workspace = Some(packed.clone());
+            outcomes.push(d.dispatch_unit(unit, "h1").await.unwrap());
+        }
+
+        // --- One pack, staged three times, byte-identical every time ---
+        let staged = conn.staged_payloads.lock().unwrap().clone();
+        assert_eq!(staged.len(), 3, "each unit stages for itself");
+        assert!(
+            staged.iter().all(|p| p.as_slice() == packed.bytes()),
+            "every unit must stage the step's single packed payload"
+        );
+
+        // --- …but each unit got its OWN staged directory ---
+        let dirs = conn.launched_working_dirs.lock().unwrap().clone();
+        assert_eq!(
+            dirs,
+            vec![
+                Some("/cache/workspace-sync/unit-0/work".to_string()),
+                Some("/cache/workspace-sync/unit-1/work".to_string()),
+                Some("/cache/workspace-sync/unit-2/work".to_string()),
+            ],
+            "units must never share a working directory"
+        );
+
+        // --- …and each unit's delta was collected from its own directory ---
+        let collected = conn.collected_dirs.lock().unwrap().clone();
+        assert_eq!(
+            collected,
+            vec![
+                "/cache/workspace-sync/unit-0/work".to_string(),
+                "/cache/workspace-sync/unit-1/work".to_string(),
+                "/cache/workspace-sync/unit-2/work".to_string(),
+            ],
+            "collect_workspace_delta must still run per unit, on that unit's dir"
+        );
+
+        // --- …and each outcome carries that unit's own delta ---
+        for (idx, out) in outcomes.iter().enumerate() {
+            assert!(out.success);
+            let delta = out
+                .workspace_delta
+                .as_ref()
+                .unwrap_or_else(|| panic!("unit {idx} must return a delta"));
+            assert_eq!(
+                delta.changed,
+                vec![format!("cache_workspace-sync_unit-{idx}_work.txt")],
+                "unit {idx}'s delta must be its own, not another unit's"
+            );
+        }
+    }
+
+    /// A unit with no workspace (`workspace: none`) must not stage anything
+    /// and must launch with `working_dir: None` — unchanged by the hoist.
+    #[tokio::test]
+    async fn workspace_none_unit_launches_with_no_working_dir() {
+        let conn = Arc::new(StagingRecorder::new());
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(out.success);
+        assert!(
+            out.workspace_delta.is_none(),
+            "a self-contained unit returns no delta"
+        );
+        assert_eq!(
+            conn.launched_working_dirs.lock().unwrap().clone(),
+            vec![None],
+            "workspace: none must launch with working_dir: None"
+        );
+        let calls = conn.calls.lock().unwrap().clone();
+        assert!(
+            !calls.contains(&"stage_workspace"),
+            "workspace: none must never stage: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&"collect_workspace_delta"),
+            "workspace: none must never collect a delta: {calls:?}"
+        );
+    }
+
     /// A transport that does not support workspace sync (default trait impls)
     /// surfaces a clear Unsupported error through the dispatcher.
     #[tokio::test]
@@ -967,7 +1242,7 @@ steps:
         // Unsupported impl) is the genuine failure point.
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
-        unit.workspace_path = Some(ws.path().to_path_buf());
+        unit.workspace = Some(prepared_ws(&d, ws.path()).await);
         let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
         let msg = err.to_string();
         // `UnreachableConnector` inherits the default `stage_workspace` impl
@@ -1157,7 +1432,7 @@ steps:
         let mut unit = make_unit();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
-        unit.workspace_path = Some(ws.path().to_path_buf());
+        unit.workspace = Some(prepared_ws(&d, ws.path()).await);
 
         let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
         assert!(err.to_string().contains("launch failed after staging"));
@@ -1308,7 +1583,7 @@ steps:
         let mut unit = make_unit();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
-        unit.workspace_path = Some(ws.path().to_path_buf());
+        unit.workspace = Some(prepared_ws(&d, ws.path()).await);
 
         let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
         assert!(err.to_string().contains("timed out"));
