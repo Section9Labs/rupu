@@ -20,7 +20,7 @@ use crate::{
     api::runs::{query_run_detail, query_run_rows},
     host::connector::{
         open_run_events_tail, read_transcript_file, EventByteStream, HostCapabilities,
-        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
+        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, RunStartEvidence,
     },
     host::workspace_stage::{collect_from_dir, discard_from_dir, stage_to_dir},
     launcher::{LaunchRequest, RunLauncher},
@@ -210,6 +210,30 @@ impl HostConnector for LocalHostConnector {
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
         query_run_detail(&self.run_store, run_id, &self.pricing)
             .map_err(|e| map_store_err(run_id, e))
+    }
+
+    /// Local evidence that a launched run's process started: its transcript.
+    ///
+    /// `run_start_evidence` exists precisely because `get_run` above cannot
+    /// answer this — it reads `run.json`, which a `rupu run <agent>` writes
+    /// only after the agent has finished. `run_agent` creates the transcript
+    /// and writes `RunStart` into it as its FIRST act, so the file is the
+    /// early signal. A pure `stat`; no process is spawned.
+    ///
+    /// Honest about its own blind spot: when the transcripts directory itself
+    /// is absent the answer is [`RunStartEvidence::Unknown`], not `NoTrace` —
+    /// a run launched with a project-local `.rupu/transcripts/` writes
+    /// somewhere this connector does not look, and reporting "no trace" for it
+    /// would let a caller blame a launch that was fine.
+    async fn run_start_evidence(&self, run_id: &str) -> RunStartEvidence {
+        let dir = self.global_dir.join("transcripts");
+        if !dir.is_dir() {
+            return RunStartEvidence::Unknown;
+        }
+        match std::fs::metadata(dir.join(format!("{run_id}.jsonl"))) {
+            Ok(m) if m.len() > 0 => RunStartEvidence::Started,
+            _ => RunStartEvidence::NoTrace,
+        }
     }
 
     // Task 5b-2b (spec §7): unlike the CP HTTP handlers (`api/runs.rs`),

@@ -19,7 +19,8 @@ use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
         mirror_stream_run_events, read_transcript_file, EventByteStream, HostCapabilities,
-        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
+        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, RunStartEvidence,
+        MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -85,6 +86,82 @@ fn remote_run_dir(run_id: &str) -> String {
 /// Callers guarantee [`is_safe_run_id`].
 fn remote_launch_log(run_id: &str) -> String {
     format!("{}/launch.log", remote_run_dir(run_id))
+}
+
+/// Token the run-start evidence probe prints when the host DOES show the run
+/// started, and the one it prints when it does not. The probe always exits 0
+/// and answers on stdout so a transport failure (ssh exit 255, no output) is
+/// distinguishable from a real "no trace" answer — testing the exit code
+/// alone conflates the two, and blaming a launch because the network blinked
+/// is exactly the false positive this whole probe exists to remove.
+pub(crate) const RUN_START_EVIDENCE_YES: &str = "rupu_run_started";
+pub(crate) const RUN_START_EVIDENCE_NO: &str = "rupu_run_no_trace";
+
+/// The remote shell command that answers "did this run's process actually
+/// start on this host?".
+///
+/// Four independent pieces of evidence, OR-ed, cheapest first:
+///
+/// 1. **A non-empty transcript.** `run_agent` opens
+///    `$HOME/.rupu/transcripts/<run_id>.jsonl` and writes `RunStart` into it
+///    as its very first act, so this is true within seconds of the remote
+///    `rupu` starting — and stays true. This is the signal that makes the
+///    probe useful at all: `run.json`, the thing `get_run` reads, is not
+///    written until the agent FINISHES.
+/// 2. **A non-empty `run.json` / `events.jsonl` / `step_results.jsonl`** in
+///    the run directory — a workflow run's equivalent early artifacts.
+/// 3. **A live process carrying this run's id.** Both launch argv builders
+///    pass `--run-id <run_id>`, so this answers the question directly and
+///    without depending on where the remote `rupu` decided to put its
+///    transcript (a staged workspace containing its own `.rupu/` moves it).
+///
+/// Deliberately NOT evidence: the run DIRECTORY, and `launch.log`. The
+/// detached launch wrapper (`detach_launch`) creates both itself, BEFORE the
+/// remote `rupu` runs — they exist just as much for a launch that died
+/// instantly, so keying on them would make the probe answer "started" for
+/// exactly the failure it must still catch.
+///
+/// The `pgrep` pattern is written `[-]-run-id` on purpose: the shell running
+/// this command has the pattern in its OWN `/proc/<pid>/cmdline`, and a
+/// literal `--run-id <id>` there would make the probe match itself and report
+/// every dead run as alive. The character class breaks the literal match
+/// while matching the same target text — the classic `grep [p]attern` guard.
+///
+/// `$HOME` is interpolated unquoted so it expands on the remote shell, which
+/// is why `run_id` must satisfy [`is_safe_run_id`] — callers check it.
+pub(crate) fn remote_start_evidence_cmd(run_id: &str) -> String {
+    let dir = remote_run_dir(run_id);
+    format!(
+        "if [ -s $HOME/.rupu/transcripts/{run_id}.jsonl ] \
+|| [ -s {dir}/run.json ] || [ -s {dir}/events.jsonl ] \
+|| [ -s {dir}/step_results.jsonl ] \
+|| pgrep -f -- '[-]-run-id {run_id}' >/dev/null 2>&1; \
+then echo {RUN_START_EVIDENCE_YES}; else echo {RUN_START_EVIDENCE_NO}; fi"
+    )
+}
+
+/// Run [`remote_start_evidence_cmd`] and classify the answer.
+///
+/// Shared by [`HostConnector::run_start_evidence`] and the tail pump so the
+/// coordinator's poll loop and the mirror can never disagree about whether a
+/// run started. Anything that is not one of the two expected tokens — a
+/// failed ssh, an empty answer, a host whose shell printed something else —
+/// is [`RunStartEvidence::Unknown`], never `NoTrace`.
+pub(crate) async fn probe_run_start_evidence(
+    exec: &dyn RemoteExec,
+    run_id: &str,
+) -> RunStartEvidence {
+    if !is_safe_run_id(run_id) {
+        return RunStartEvidence::Unknown;
+    }
+    let Ok(out) = exec.run(&remote_start_evidence_cmd(run_id)).await else {
+        return RunStartEvidence::Unknown;
+    };
+    match out.stdout.trim() {
+        RUN_START_EVIDENCE_YES => RunStartEvidence::Started,
+        RUN_START_EVIDENCE_NO => RunStartEvidence::NoTrace,
+        _ => RunStartEvidence::Unknown,
+    }
 }
 
 /// Upper bound on the launch-log excerpt `launch_diagnostics` returns. The
@@ -591,12 +668,34 @@ const PUMP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 ///
 /// Deliberately the same five minutes as `rupu-cli`'s `POLL_MAX_STARTUP`, and
 /// for the same reason: both are waiting on exactly one event — the remote
-/// `rupu` registering the run — so they should give up on it together. Same
+/// `rupu` starting the run — so they should give up on it together. Same
 /// justification too: ~5x the ~60 s measured for staging a ~50 MB workspace
 /// over SSH plus process start, which is enough that a genuinely slow launch
 /// still gets mirrored, and short enough that a launch that never happened
 /// does not strand an ssh session for hours.
+///
+/// **What "never seen" must mean.** This deadline is only allowed to fire on
+/// the absence of a start, and the pump's two passive signals do not prove
+/// that absence on their own: a `==>` header depends on the transcript
+/// landing at the ONE `$HOME/.rupu/transcripts/` path this pump tails (a
+/// staged workspace carrying its own `.rupu/` moves it), and `run.json` for
+/// an agent run is not written until the agent FINISHES. So before firing,
+/// the pump asks the host directly ([`probe_run_start_evidence`]); only a
+/// definite "no trace of this run" lets the deadline through.
 const PUMP_STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Absolute cap on how long a tail pump may live without ever observing a
+/// terminal `run.json`.
+///
+/// Once [`PUMP_STARTUP_DEADLINE`] has been cleared by real evidence the run
+/// started, the pump is no longer bounded by a STARTUP timer — a four-hour
+/// run must not be cut off by one. It still needs a backstop, though: a run
+/// that started and was then SIGKILLed never writes a terminal `run.json`,
+/// and `tail -F` never ends, so without this the pump would hold its ssh
+/// session forever again. Four hours matches `rupu-cli`'s `POLL_MAX_WALL` —
+/// the longest a placed run is ever waited on — so the pump outlives every
+/// run it could legitimately be mirroring and no run it could not.
+const PUMP_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
 /// Returns `true` when `status` is a terminal [`rupu_orchestrator::RunStatus`]
 /// serialized value.  Mirrors [`RunStatus::is_terminal`] using the
@@ -1120,23 +1219,68 @@ impl SshHostConnector {
                                     PumpProbe::Alive => run_seen_on_host = true,
                                     PumpProbe::Absent => {}
                                 }
-                                // The run has never once been seen on the host and
-                                // the startup deadline has passed: the launch died
-                                // before registering it, so nothing will ever end
-                                // this pump. Break to the fallback below, which
-                                // finishes the run as failed; dropping `stream`
-                                // kills the ssh child and the remote `tail` with it.
+                                // Neither passive signal has shown this run and
+                                // the startup deadline has passed. That is NOT yet
+                                // proof the launch died: for an agent run `run.json`
+                                // only appears when the agent finishes, and the
+                                // `==>` header only appears if the transcript landed
+                                // at the one $HOME path this pump tails. Ask the
+                                // host directly before abandoning a run that may be
+                                // working perfectly well.
                                 if !run_seen_on_host
                                     && pump_started.elapsed() >= PUMP_STARTUP_DEADLINE
                                 {
+                                    match probe_run_start_evidence(exec.as_ref(), &run_id).await {
+                                        RunStartEvidence::Started => {
+                                            // It started. From here the pump is
+                                            // bounded by PUMP_MAX_WALL, not by a
+                                            // startup timer.
+                                            tracing::debug!(
+                                                host_id = %host_id,
+                                                run_id = %run_id,
+                                                "tail pump has not seen this run's \
+                                                 artifacts, but the host reports it \
+                                                 started; keeping the mirror open"
+                                            );
+                                            run_seen_on_host = true;
+                                        }
+                                        evidence => {
+                                            // NoTrace: the launch died before doing
+                                            // anything. Unknown: no probe reached the
+                                            // host, so we are no better informed than
+                                            // before and keep the old bound rather
+                                            // than hold the session open on a guess.
+                                            // Either way, break to the fallback below,
+                                            // which finishes the run as failed;
+                                            // dropping `stream` kills the ssh child
+                                            // and the remote `tail` with it.
+                                            tracing::warn!(
+                                                host_id = %host_id,
+                                                run_id = %run_id,
+                                                deadline_secs = PUMP_STARTUP_DEADLINE.as_secs(),
+                                                ?evidence,
+                                                "tail pump never saw this run on the \
+                                                 host within the startup deadline and \
+                                                 the host shows no sign it started; \
+                                                 abandoning the mirror so the ssh \
+                                                 session and remote tail are not held \
+                                                 open indefinitely"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Backstop for a run that DID start and was then
+                                // killed without writing a terminal run.json: no
+                                // arm of this loop can ever fire for it either.
+                                if pump_started.elapsed() >= PUMP_MAX_WALL {
                                     tracing::warn!(
                                         host_id = %host_id,
                                         run_id = %run_id,
-                                        deadline_secs = PUMP_STARTUP_DEADLINE.as_secs(),
-                                        "tail pump never saw this run on the host \
-                                         within the startup deadline; abandoning the \
-                                         mirror so the ssh session and remote tail \
-                                         are not held open indefinitely"
+                                        wall_secs = PUMP_MAX_WALL.as_secs(),
+                                        "tail pump reached its wall-clock cap without \
+                                         ever observing a terminal run.json; \
+                                         abandoning the mirror"
                                     );
                                     break;
                                 }
@@ -1775,6 +1919,15 @@ impl HostConnector for SshHostConnector {
             return None;
         }
         Some(tail_chars(text, LAUNCH_DIAGNOSTICS_MAX_CHARS))
+    }
+
+    /// Ask the host directly whether this run's process ever started, without
+    /// going through `run.json` — which for an agent run is written only when
+    /// the agent finishes. One ssh round trip; see
+    /// [`remote_start_evidence_cmd`] for what counts as evidence and why the
+    /// run directory and `launch.log` deliberately do not.
+    async fn run_start_evidence(&self, run_id: &str) -> RunStartEvidence {
+        probe_run_start_evidence(self.exec.as_ref(), run_id).await
     }
 
     async fn pause_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
@@ -2567,6 +2720,10 @@ mod tests {
         /// command (`launch_diagnostics`) — the remote process's captured
         /// stderr. `None` → empty stdout, i.e. a launch that wrote nothing.
         launch_log_stdout: Option<String>,
+        /// If set, returned as stdout for the run-start evidence probe
+        /// (`remote_start_evidence_cmd`). `None` → empty stdout, which the
+        /// probe classifies as `Unknown` — a host that did not answer.
+        evidence_stdout: Option<String>,
         /// Scripted result for `run_bytes`, taken on first call.
         run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
         /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
@@ -2585,6 +2742,7 @@ mod tests {
                 cat_transcript_delay: None,
                 show_stdout: None,
                 launch_log_stdout: None,
+                evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -2601,6 +2759,7 @@ mod tests {
                 cat_transcript_delay: None,
                 show_stdout: None,
                 launch_log_stdout: None,
+                evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -2619,6 +2778,7 @@ mod tests {
                 cat_transcript_delay: None,
                 show_stdout: None,
                 launch_log_stdout: None,
+                evidence_stdout: None,
                 run_bytes_out: Default::default(),
                 last_bytes_call: Default::default(),
             }
@@ -2637,6 +2797,7 @@ mod tests {
                 cat_transcript_delay: None,
                 show_stdout: None,
                 launch_log_stdout: None,
+                evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
                 last_bytes_call: Default::default(),
             }
@@ -2654,6 +2815,7 @@ mod tests {
                 cat_transcript_delay: None,
                 show_stdout: None,
                 launch_log_stdout: None,
+                evidence_stdout: None,
                 run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
                 last_bytes_call: Default::default(),
             }
@@ -2674,7 +2836,9 @@ mod tests {
                 // Return the canned stdout for the two `cat` shapes the pump
                 // issues: `cat …/transcripts/<id>.jsonl` (terminal transcript
                 // catch-up) vs `cat …/runs/<id>/run.json` (status poll).
-                let stdout = if remote.contains("'show'") {
+                let stdout = if remote.starts_with("if [ -s ") {
+                    self.evidence_stdout.clone().unwrap_or_default()
+                } else if remote.contains("'show'") {
                     self.show_stdout.clone().unwrap_or_default()
                 } else if remote.starts_with("cat ") {
                     if remote.contains("/launch.log") {
@@ -4260,8 +4424,12 @@ mod tests {
     /// `FakeExec::ok(vec![])` is exactly that host: the tail stream yields no
     /// lines and then pends forever (no `==>` header, because `tail` could
     /// not open any of the four paths and its stderr goes to /dev/null), and
-    /// `cat` answers empty stdout. The pump must give up at the deadline and
-    /// finish the run as failed rather than leave it `Running` forever.
+    /// `cat` answers empty stdout. It also leaves `evidence_stdout` unset, so
+    /// the run-start probe answers nothing either — a host that cannot say
+    /// whether the run started leaves the pump exactly as informed as it was
+    /// before the probe existed, and the old bound stands. The pump must give
+    /// up at the deadline and finish the run as failed rather than leave it
+    /// `Running` forever.
     #[tokio::test(start_paused = true)]
     async fn tail_pump_abandons_a_run_that_never_appears_on_the_host() {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
@@ -4358,6 +4526,198 @@ mod tests {
             "a run the pump has already seen on the host must not be \
              abandoned at the startup deadline (gave up after {:?})",
             gave_up
+        );
+    }
+
+    /// The pump's two PASSIVE signals are not proof a run started, and the
+    /// startup deadline must not fire on their absence alone.
+    ///
+    /// `run.json` for an agent run is written only when the agent FINISHES,
+    /// and the `==>` header only appears if the transcript landed at the one
+    /// `$HOME/.rupu/transcripts/` path this pump tails — a staged workspace
+    /// carrying its own `.rupu/` puts it somewhere else entirely. So a
+    /// healthy long placed run can show NEITHER for hours. Here the host,
+    /// asked directly, says the run started; the pump must keep mirroring.
+    ///
+    /// Without the probe this test is `tail_pump_abandons_a_run_that_never_
+    /// appears_on_the_host` with a live run underneath it — which is exactly
+    /// what shipped.
+    #[tokio::test(start_paused = true)]
+    async fn tail_pump_keeps_mirroring_a_run_the_host_says_started() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.evidence_stdout = Some(RUN_START_EVIDENCE_YES.into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let run_id = "run_01TESTPUMPALIVE";
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "alive-but-quiet".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let gave_up = wait_for_pump_to_finish(
+            &run_store,
+            run_id,
+            PUMP_STARTUP_DEADLINE + std::time::Duration::from_secs(600),
+        )
+        .await;
+
+        assert!(
+            gave_up.is_none(),
+            "a run the host reports as started must not be abandoned at the \
+             startup deadline (gave up after {gave_up:?})"
+        );
+        assert!(
+            fake.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("if [ -s ")),
+            "the pump must ask the host whether the run started before \
+             abandoning it"
+        );
+    }
+
+    /// …but "started" is not a licence to run forever. A run that started and
+    /// was then killed without writing a terminal `run.json` can still end no
+    /// arm of this loop, so `PUMP_MAX_WALL` is the backstop that keeps the
+    /// #655 guarantee — no pump outlives every possible run — while the
+    /// startup deadline stops firing on healthy work.
+    #[tokio::test(start_paused = true)]
+    async fn tail_pump_gives_up_at_the_wall_cap_even_after_evidence_of_a_start() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.evidence_stdout = Some(RUN_START_EVIDENCE_YES.into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let run_id = "run_01TESTPUMPWALL";
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "started-then-killed".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let took = wait_for_pump_to_finish(
+            &run_store,
+            run_id,
+            PUMP_MAX_WALL + std::time::Duration::from_secs(300),
+        )
+        .await
+        .expect("the wall cap must eventually end a pump that never sees terminal");
+
+        assert!(
+            took >= PUMP_STARTUP_DEADLINE * 2,
+            "the wall cap, not the startup deadline, must be what fired; \
+             took {}s",
+            took.as_secs()
+        );
+        assert!(
+            took >= PUMP_MAX_WALL,
+            "and it must be the full wall budget; took {}s",
+            took.as_secs()
+        );
+    }
+
+    /// The evidence probe must not be able to see its own shadow.
+    ///
+    /// The shell running the probe carries the pattern in its own command
+    /// line, so a literal `--run-id <id>` in the `pgrep` pattern would match
+    /// the probe itself and report every dead run as alive — turning the
+    /// whole signal into a constant `true`. The `[-]` character class is what
+    /// prevents that, and it is invisible enough to delete by accident.
+    ///
+    /// Equally load-bearing in the other direction: the run DIRECTORY and
+    /// `launch.log` are created by `detach_launch` BEFORE the remote `rupu`
+    /// runs, so neither may be evidence of anything.
+    #[test]
+    fn start_evidence_cmd_cannot_match_itself_or_the_launch_wrapper() {
+        let cmd = remote_start_evidence_cmd("run_01ABC");
+
+        // The self-match guard.
+        assert!(
+            cmd.contains("[-]-run-id run_01ABC"),
+            "the pgrep pattern must use the [-] guard: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--run-id run_01ABC"),
+            "a literal --run-id would make the probe match its own shell: {cmd}"
+        );
+
+        // The real evidence.
+        assert!(cmd.contains("$HOME/.rupu/transcripts/run_01ABC.jsonl"));
+        assert!(cmd.contains("$HOME/.rupu/runs/run_01ABC/run.json"));
+        assert!(cmd.contains("$HOME/.rupu/runs/run_01ABC/events.jsonl"));
+        assert!(cmd.contains("$HOME/.rupu/runs/run_01ABC/step_results.jsonl"));
+
+        // Not evidence: the launch wrapper creates both of these itself.
+        assert!(
+            !cmd.contains("launch.log"),
+            "launch.log is created by the launch wrapper, not by a started \
+             run: {cmd}"
+        );
+        assert!(
+            !cmd.contains("-d $HOME/.rupu/runs/run_01ABC"),
+            "the run directory is created by the launch wrapper: {cmd}"
+        );
+
+        // Answers on stdout, always exit 0 — so a dead ssh is not mistaken
+        // for a dead launch.
+        assert!(cmd.contains(RUN_START_EVIDENCE_YES));
+        assert!(cmd.contains(RUN_START_EVIDENCE_NO));
+    }
+
+    /// Only the two expected tokens are answers. Everything else — an empty
+    /// reply, a shell that printed something unexpected, an ssh that never
+    /// connected — is `Unknown`, never `NoTrace`: only `NoTrace` licenses a
+    /// caller to blame the launch.
+    #[tokio::test]
+    async fn run_start_evidence_never_reads_silence_as_a_dead_launch() {
+        for (answer, want) in [
+            (Some(RUN_START_EVIDENCE_YES), RunStartEvidence::Started),
+            (Some(RUN_START_EVIDENCE_NO), RunStartEvidence::NoTrace),
+            (Some("something else entirely"), RunStartEvidence::Unknown),
+            (None, RunStartEvidence::Unknown),
+        ] {
+            let mut fake = FakeExec::ok(vec![]);
+            fake.evidence_stdout = answer.map(str::to_string);
+            let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(fake));
+            assert_eq!(
+                conn.run_start_evidence("run_01ABC").await,
+                want,
+                "answer {answer:?}"
+            );
+        }
+
+        // An unreachable host is not a dead launch either.
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FakeExec::offline("no route")));
+        assert_eq!(
+            conn.run_start_evidence("run_01ABC").await,
+            RunStartEvidence::Unknown
+        );
+
+        // And a run id that could break out of the unquoted $HOME paths is
+        // never interpolated at all.
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FakeExec::ok(vec![])));
+        assert_eq!(
+            conn.run_start_evidence("run_01ABC; rm -rf /").await,
+            RunStartEvidence::Unknown
         );
     }
 

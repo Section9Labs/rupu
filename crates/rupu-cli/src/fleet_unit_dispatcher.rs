@@ -13,6 +13,7 @@ use rupu_cp::{
     host::{
         connector::{
             decode_delta, encode_delta, encode_payload, HostConnector, HostConnectorError,
+            RunStartEvidence,
         },
         registry::HostRegistry,
     },
@@ -42,22 +43,30 @@ use rupu_orchestrator::runner::{
 /// the other end of the run as the startup race this loop already handles.
 const POLL_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
-/// How long a placed run may take to be OBSERVED AT ALL before the
-/// coordinator stops waiting.
+/// How long a placed run may take to show ANY sign of having started before
+/// the coordinator stops waiting.
 ///
 /// [`POLL_MAX_WALL`] is the right budget for a run that is demonstrably
 /// alive, and the wrong budget for a run that never started. The two are
 /// different failures and this loop must not conflate them:
 ///
-/// * observed-and-slow — the host answered `get_run` at least once, so the
-///   run exists and is doing work. Four hours.
-/// * never-observed — `get_run` has never once succeeded. Either the remote
-///   `rupu` has not registered the run YET (the startup race
-///   [`POLL_MAX_WALL`]'s predecessor got wrong, see the `observed` flag
-///   below), or it never will because the launch died. Those are
-///   indistinguishable from here, so the bound must be long enough to lose
-///   the race honestly and short enough to fail fast when there is no race
-///   to win.
+/// * started — the host shows the run doing work. Four hours.
+/// * never-started — the host shows no trace of it. The launch was accepted
+///   but the remote process died before doing anything, so no amount of
+///   further waiting will help and every minute of it holds a fan-out
+///   semaphore slot.
+///
+/// **This deadline must never key on `get_run`.** It originally did, and that
+/// was wrong: a standalone `rupu run <agent>` writes `run.json` only after
+/// the agent has FINISHED (`cmd/run.rs` awaits the agent task, then "Write
+/// run.json so the run is observable via RunStore"), so a placed agent run is
+/// invisible to `get_run` for its entire duration. Keying a five-minute
+/// deadline on that signal abandoned healthy runs: measured in production, an
+/// `ariadne-network-pathfinder` unit was killed off at five minutes with its
+/// process alive, its scanner running and 184 result lines already written.
+/// The condition below is [`HostConnector::run_start_evidence`] instead —
+/// true within seconds of the remote `rupu` starting, and false when it never
+/// did.
 ///
 /// Measured in production: a remote agent died in `launch_agent`'s detached
 /// process with `save worker record: io rename …: No such file or directory`
@@ -77,6 +86,19 @@ const POLL_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(4 * 60
 /// large-workspace staging again — the exact #645 regression — and anything
 /// much above ~10 minutes stops being a fast failure.
 const POLL_MAX_STARTUP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How often the poll loop asks the host whether the run has started, while
+/// it has neither observed the run nor seen evidence of a start.
+///
+/// The probe is an extra round trip, so it is throttled rather than run on
+/// every 500 ms poll — but it must run REPEATEDLY, not once at the deadline:
+/// a single probe at one instant would turn a transient ssh failure into a
+/// falsely-blamed launch, which is the same class of bug as the deadline it
+/// guards. Ten probes over the startup window is negligible traffic next to
+/// the poll loop itself, and once the evidence latches (or `get_run`
+/// succeeds) it stops entirely — a run that starts promptly, the common
+/// case, never probes at all.
+const STARTUP_EVIDENCE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Poll interval for the first [`POLL_FAST_ATTEMPTS`] polls.
 ///
@@ -294,24 +316,64 @@ impl UnitDispatcher for FleetUnitDispatcher {
         // run has been read even once the host demonstrably knows it, so any
         // later error is real and propagates immediately, exactly as before.
         //
-        // `observed` also selects WHICH deadline governs. A run that has been
-        // seen alive gets the full `POLL_MAX_WALL`; a run that has never been
-        // seen at all gets only `POLL_MAX_STARTUP`, because "launched but
-        // never registered" is a launch failure, not a long run, and waiting
-        // four hours for it holds a fan-out semaphore slot the whole time.
-        // The deadline only ever LENGTHENS: once `observed` flips true the
-        // wall budget applies and is never shortened again.
+        // WHICH deadline governs is selected by `started` — evidence that the
+        // remote process actually began work — NOT by `observed`.
+        //
+        // This distinction is the whole fix. `observed` cannot bound a
+        // startup, because for a placed AGENT run it only ever becomes true
+        // at the very END: `rupu run <agent>` writes `run.json` after the
+        // agent task completes, so "never observed" is the normal state of a
+        // healthy placed run for its entire life. A startup deadline keyed on
+        // it killed live units at five minutes. `started` is asked of the
+        // host directly (`run_start_evidence`) and is true within seconds of
+        // the remote `rupu` starting.
+        //
+        // Both flags only ever LENGTHEN the budget: once either flips true
+        // the wall budget applies and is never shortened again.
         let mut observed = false;
+        let mut started_evidence = false;
+        let mut last_evidence: Option<RunStartEvidence> = None;
         let mut last_startup_err: Option<String> = None;
         let started = tokio::time::Instant::now();
         let deadline = started + POLL_MAX_WALL;
         let startup_deadline = started + POLL_MAX_STARTUP;
+        // First evidence probe is one interval in, not at t=0: a run that has
+        // only just been launched has nothing to show yet, and the common
+        // case completes before the first probe is ever due.
+        let mut last_probe = started;
         let mut attempt: u32 = 0;
-        while tokio::time::Instant::now() < if observed { deadline } else { startup_deadline } {
+        while tokio::time::Instant::now()
+            < if observed || started_evidence {
+                deadline
+            } else {
+                startup_deadline
+            }
+        {
             if attempt > 0 {
                 tokio::time::sleep(poll_interval_for(attempt)).await;
             }
             attempt = attempt.saturating_add(1);
+
+            // Ask the host whether the run started, while that is still the
+            // question. Throttled, and skipped entirely once either flag is
+            // set, so this costs nothing on the happy path.
+            if !observed
+                && !started_evidence
+                && last_probe.elapsed() >= STARTUP_EVIDENCE_PROBE_INTERVAL
+            {
+                last_probe = tokio::time::Instant::now();
+                let evidence = conn.run_start_evidence(&run_id).await;
+                last_evidence = Some(evidence);
+                if evidence == RunStartEvidence::Started {
+                    started_evidence = true;
+                    tracing::debug!(
+                        run_id = %run_id,
+                        host,
+                        "placed run is not observable through get_run yet, but the \
+                         host shows it started; the wall budget governs from here"
+                    );
+                }
+            }
 
             let rec = match conn.get_run(&run_id).await {
                 Ok(rec) => {
@@ -404,44 +466,74 @@ impl UnitDispatcher for FleetUnitDispatcher {
             }
         }
 
-        Err(RunError::Provider(match last_startup_err {
-            // Never observed: the run was launched but never registered on
-            // the host. Say that, rather than "timed out polling" — the
-            // distinction is the difference between "still running, we gave
-            // up watching" and "it never started", and the connector's own
-            // message for this case blames `rupu run show` support. Then ask
-            // the connector what the remote process itself said: a launch
-            // that dies instantly (wrong cwd, missing agent, bad flag,
-            // unresolvable provider) explains itself on stderr, and the
-            // connector may have kept that. Without it, this error is the
-            // ONLY trace the failure leaves — measured: hours spent on a
-            // "does not support `rupu run show`" that was a dead process.
-            Some(err) => {
-                let mut msg = format!(
-                    "remote unit run {run_id} never registered on host {host}: \
+        // Which deadline actually fired decides what this error is allowed to
+        // claim. Only the startup arm may say the run never started; a wall
+        // timeout on a run the host said WAS running must not.
+        let never_started = !observed && !started_evidence;
+
+        Err(RunError::Provider(
+            match (never_started, last_startup_err) {
+                // Never started: the run was launched but the host never showed
+                // any sign of it. Say that, rather than "timed out polling" — the
+                // distinction is the difference between "still running, we gave
+                // up watching" and "it never started", and the connector's own
+                // message for this case blames `rupu run show` support. Then ask
+                // the connector what the remote process itself said: a launch
+                // that dies instantly (wrong cwd, missing agent, bad flag,
+                // unresolvable provider) explains itself on stderr, and the
+                // connector may have kept that. Without it, this error is the
+                // ONLY trace the failure leaves — measured: hours spent on a
+                // "does not support `rupu run show`" that was a dead process.
+                (true, Some(err)) => {
+                    let mut msg = format!(
+                        "remote unit run {run_id} never registered on host {host}: \
                      gave up after {attempt} polls over {}s (the startup \
                      deadline, not the {}h run budget) WITHOUT EVER OBSERVING \
                      THE RUN. The launch was accepted but the host never \
                      reported the run even once, so the remote process almost \
                      certainly died before registering it — check that host's \
                      launch log for this run. Last poll error: {err}",
-                    POLL_MAX_STARTUP.as_secs(),
-                    POLL_MAX_WALL.as_secs() / 3600,
-                );
-                if let Some(diag) = conn.launch_diagnostics(&run_id).await {
-                    msg.push_str(&format!(
-                        "\nremote launch stderr (host {host}, run {run_id}):\n{diag}"
-                    ));
+                        POLL_MAX_STARTUP.as_secs(),
+                        POLL_MAX_WALL.as_secs() / 3600,
+                    );
+                    // Say what the host itself answered about the run starting —
+                    // and, when it could not answer, say THAT rather than let the
+                    // sentence above read as a confirmed dead launch.
+                    msg.push_str(match last_evidence {
+                        Some(RunStartEvidence::NoTrace) => {
+                            " The host was also asked directly and reported no \
+                         trace of this run (no transcript, no run artifacts, \
+                         no live process carrying its id)."
+                        }
+                        Some(RunStartEvidence::Started) | None => "",
+                        Some(RunStartEvidence::Unknown) => {
+                            " The host could not answer whether the run started, \
+                         so this may be a transport failure rather than a \
+                         dead launch."
+                        }
+                    });
+                    if let Some(diag) = conn.launch_diagnostics(&run_id).await {
+                        msg.push_str(&format!(
+                            "\nremote launch stderr (host {host}, run {run_id}):\n{diag}"
+                        ));
+                    }
+                    msg
                 }
-                msg
-            }
-            None => format!(
-                "timed out waiting for remote unit run {run_id} on host {host} \
+                (true, None) => format!(
+                    "remote unit run {run_id} on host {host} showed no sign of \
+                 starting within {}s and was abandoned after {attempt} polls",
+                    POLL_MAX_STARTUP.as_secs()
+                ),
+                // The run started (the host said so, or answered `get_run` at
+                // least once) and then outlived the wall budget.
+                (false, _) => format!(
+                    "timed out waiting for remote unit run {run_id} on host {host} \
                  after {attempt} polls over {}s; the run may STILL BE RUNNING \
                  on the host — its work is not lost, only unobserved from here",
-                POLL_MAX_WALL.as_secs()
-            ),
-        }))
+                    POLL_MAX_WALL.as_secs()
+                ),
+            },
+        ))
     }
 
     /// Bridge the orchestrator's opaque deltas to the `rupu-workspace` codec and
@@ -523,6 +615,7 @@ mod tests {
     use rupu_cp::{
         host::connector::{
             EventByteStream, HostConnector, HostConnectorError, HostInfo, RunListQuery,
+            RunStartEvidence,
         },
         launcher::LaunchRequest,
         session_sender::SendMessageRequest,
@@ -549,6 +642,12 @@ mod tests {
         /// Models a placed run doing real work — the case the old fixed
         /// 120-poll budget could not express.
         non_terminal_polls: std::sync::atomic::AtomicU32,
+        /// What `run_start_evidence` answers. The default is `NoTrace` — a
+        /// connector that CAN look and found nothing — because that is the
+        /// dead-launch case the startup deadline exists for; `Unknown` (the
+        /// trait default, a transport with no probe) is exercised
+        /// explicitly by its own test.
+        start_evidence: RunStartEvidence,
     }
 
     impl FakeConnector {
@@ -566,6 +665,7 @@ mod tests {
                 launch_stderr: None,
                 calls: Default::default(),
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
+                start_evidence: RunStartEvidence::NoTrace,
             }
         }
 
@@ -598,7 +698,26 @@ mod tests {
                 launch_stderr: None,
                 calls: Default::default(),
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
+                start_evidence: RunStartEvidence::NoTrace,
             }
+        }
+
+        /// THE production shape this module got wrong: a placed agent run
+        /// that is ALIVE and working, but which `get_run` cannot see for `n`
+        /// polls because `rupu run <agent>` does not write `run.json` until
+        /// the agent finishes. The host, asked directly, says it started.
+        fn alive_but_unobservable_for(n: u32) -> Self {
+            let mut c = Self::completed_after_startup_delay(n);
+            c.start_evidence = RunStartEvidence::Started;
+            c
+        }
+
+        /// A transport with no start probe at all — the `HostConnector`
+        /// default. Nothing can clear the startup deadline for it.
+        fn with_unknown_evidence(n: u32) -> Self {
+            let mut c = Self::completed_after_startup_delay(n);
+            c.start_evidence = RunStartEvidence::Unknown;
+            c
         }
     }
 
@@ -673,6 +792,10 @@ mod tests {
         async fn launch_diagnostics(&self, _run_id: &str) -> Option<String> {
             self.calls.lock().unwrap().push("launch_diagnostics");
             self.launch_stderr.map(str::to_string)
+        }
+        async fn run_start_evidence(&self, _run_id: &str) -> RunStartEvidence {
+            self.calls.lock().unwrap().push("run_start_evidence");
+            self.start_evidence
         }
         // `pause_run`/`resume_run` are intentionally NOT overridden on any
         // fake `HostConnector` in this module — the real fleet dispatch path
@@ -1760,5 +1883,135 @@ steps:
             elapsed.as_secs()
         );
         assert!(elapsed < POLL_MAX_WALL, "and stay inside the wall budget");
+    }
+
+    // ── Startup deadline must key on STARTING, not on being observable ───────
+    //
+    // The three tests above were all written against `observed` — "`get_run`
+    // succeeded at least once" — as the proxy for "the run started". That
+    // proxy is false for the only kind of run this dispatcher ever launches.
+    // `dispatch_unit` calls `launch_agent`, and a standalone
+    // `rupu run <agent>` writes `run.json` only after the agent task has
+    // finished (`cmd/run.rs`), so a placed agent run is invisible to
+    // `get_run` from launch until completion. "Never observed" is therefore
+    // the NORMAL state of a healthy placed run for its whole duration, and
+    // bounding it with a five-minute startup deadline abandoned live work:
+    // measured in production, an `ariadne-network-pathfinder` unit was cut
+    // off at five minutes with its process alive, its scanner still running
+    // and 184 result lines already on disk.
+
+    /// A placed run that `get_run` cannot see for FAR longer than
+    /// [`POLL_MAX_STARTUP`], but which the host reports as started, must run
+    /// to completion under the wall budget — the startup deadline must not
+    /// touch it.
+    ///
+    /// 300 failing polls is ~20 minutes of virtual time under
+    /// `poll_interval_for` (59 fast polls = 29.5 s, then 5 s each): four
+    /// times the startup deadline, and nothing like the wall budget. Against
+    /// a dispatcher that still keys the deadline on `get_run` this fails at
+    /// five minutes with "never registered".
+    #[tokio::test(start_paused = true)]
+    async fn alive_run_that_get_run_cannot_see_is_not_abandoned_at_the_startup_deadline() {
+        let conn = Arc::new(FakeConnector::alive_but_unobservable_for(300));
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        let t0 = tokio::time::Instant::now();
+        let out = d
+            .dispatch_unit(make_unit(), "h1")
+            .await
+            .expect("a run the host says is alive must not be abandoned");
+        let elapsed = t0.elapsed();
+
+        assert!(out.success);
+        assert_eq!(out.output, "fake-out");
+        // The load-bearing assertion: it outlived the startup deadline. If the
+        // deadline still governed, the dispatch would have errored instead.
+        assert!(
+            elapsed > POLL_MAX_STARTUP,
+            "this run must outlive the startup deadline for the test to mean \
+             anything; it only took {}s",
+            elapsed.as_secs()
+        );
+        assert!(elapsed < POLL_MAX_WALL, "and stay inside the wall budget");
+        // …and it stayed alive because the dispatcher ASKED, not by accident.
+        assert!(
+            conn.calls.lock().unwrap().contains(&"run_start_evidence"),
+            "the dispatcher must ask the host whether the run started"
+        );
+    }
+
+    /// A transport that cannot answer the start question at all (the
+    /// `HostConnector` default, `Unknown`) keeps the #655 behaviour exactly:
+    /// the startup deadline still fires, and the error still names the
+    /// underlying cause. `Unknown` must never be read as "it started".
+    #[tokio::test(start_paused = true)]
+    async fn transport_with_no_start_probe_still_fails_at_the_startup_deadline() {
+        let conn = Arc::new(FakeConnector::with_unknown_evidence(u32::MAX));
+        let d = FleetUnitDispatcher::from_connector(conn);
+
+        let t0 = tokio::time::Instant::now();
+        let err = d
+            .dispatch_unit(make_unit(), "h1")
+            .await
+            .unwrap_err()
+            .to_string();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed >= POLL_MAX_STARTUP && elapsed < POLL_MAX_STARTUP + POLL_INTERVAL_SLOW * 2,
+            "an unprobeable run must still give up at the {}s startup \
+             deadline; gave up after {}s",
+            POLL_MAX_STARTUP.as_secs(),
+            elapsed.as_secs()
+        );
+        assert!(err.contains("never registered"), "{err}");
+        assert!(err.contains("unknown run"), "{err}");
+        // …but it must not be reported as a confirmed dead launch, because
+        // nothing confirmed it.
+        assert!(
+            err.contains("could not answer whether the run started"),
+            "an Unknown probe must be reported as unknown, not as proof: {err}"
+        );
+    }
+
+    /// When the host IS asked and answers "no trace of this run", the error
+    /// says so — that is the positive evidence that separates a dead launch
+    /// from a run this dispatcher merely cannot see, and it sits alongside
+    /// the launch stderr the operator needs.
+    #[tokio::test(start_paused = true)]
+    async fn no_trace_answer_is_named_in_the_never_started_error() {
+        let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
+        fake.launch_stderr = Some("[error] save worker record: io rename ...: No such file");
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(conn);
+
+        let err = d
+            .dispatch_unit(make_unit(), "h1")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("reported no trace of this run"),
+            "the host's own answer must reach the operator: {err}"
+        );
+        assert!(err.contains("save worker record"), "{err}");
+    }
+
+    /// The probe must cost nothing on the happy path: a run that registers
+    /// promptly is never probed at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_promptly_registered_run_is_never_probed() {
+        let conn = Arc::new(FakeConnector::completed_after_startup_delay(5));
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(out.success);
+        let calls = conn.calls.lock().unwrap().clone();
+        assert!(
+            !calls.contains(&"run_start_evidence"),
+            "a run that registers inside the first probe interval must not \
+             cost an extra round trip: {calls:?}"
+        );
     }
 }
