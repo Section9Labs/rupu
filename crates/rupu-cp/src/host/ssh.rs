@@ -1314,6 +1314,22 @@ impl SshHostConnector {
             .unwrap_or_default())
     }
 
+    /// Whether a failed remote CLI call means "that session does not exist"
+    /// as opposed to "this host could not answer".
+    ///
+    /// The distinction decides a 404 vs a 500, so it must key on what the
+    /// commands actually print. `rupu session show` and `rupu session
+    /// usage-timeline` both resolve through `session.rs`'s `read_session`,
+    /// which bails with "unknown session: <id>" — NOT "not found", which is
+    /// `run show`'s phrasing. Both spellings are matched so either
+    /// command's wording works, and the id must appear too: a generic
+    /// failure that happens to contain the phrase is not a statement about
+    /// THIS session.
+    fn says_session_absent(message: &str, id: &str) -> bool {
+        let lower = message.to_lowercase();
+        (lower.contains("unknown session") || lower.contains("not found")) && message.contains(id)
+    }
+
     /// The useful half of a failed `remote_json` call.
     ///
     /// [`remote_json`](Self::remote_json) maps a NON-ZERO EXIT to
@@ -1345,16 +1361,7 @@ impl SshHostConnector {
         {
             Ok(v) => Ok(v),
             Err(e) => {
-                let message = e.to_string();
-                let lower = message.to_lowercase();
-                // `rupu session show` reports an absent session as "unknown
-                // session: <id>" (session.rs's `read_session`), NOT "not
-                // found" the way `run show` does — match the message the
-                // command actually emits, plus the generic phrasing, so an
-                // absent session 404s instead of being reported as a host
-                // that cannot answer.
-                let says_absent = lower.contains("unknown session") || lower.contains("not found");
-                if says_absent && message.contains(id) {
+                if Self::says_session_absent(&e.to_string(), id) {
                     return Err(HostConnectorError::NotFound(id.to_string()));
                 }
                 tracing::warn!(
@@ -1984,6 +1991,14 @@ impl HostConnector for SshHostConnector {
             .remote_json_rows(&["--format", "json", "session", "usage-timeline", id])
             .await
             .map_err(|e| {
+                // The remote RAN the command and said the session is absent:
+                // that is a 404, not "this host cannot answer". Without this
+                // arm a plain missing session was reported as an
+                // out-of-date remote — false, and it sends an operator to
+                // upgrade a host that is already current.
+                if Self::says_session_absent(&e.to_string(), id) {
+                    return HostConnectorError::NotFound(id.to_string());
+                }
                 tracing::warn!(
                     host_id = %self.host_id,
                     session_id = %id,
@@ -2918,6 +2933,46 @@ mod tests {
             calls[0].contains("usage-timeline") && calls[0].contains("ses_1"),
             "cmd: {}",
             calls[0]
+        );
+    }
+
+    /// Caught live against a real host running the CURRENT binary: the
+    /// remote ran `session usage-timeline`, said "unknown session: <id>",
+    /// and the CP reported "remote host does not support `rupu session
+    /// usage-timeline`" — false, and it sends an operator to upgrade a host
+    /// that is already up to date. An absent session is a 404.
+    #[tokio::test]
+    async fn session_usage_timeline_maps_an_absent_session_to_not_found() {
+        let fake = std::sync::Arc::new(FakeExec::offline("[error] unknown session: ses_gone"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.session_usage_timeline("ses_gone").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// The two conditions are ANDed deliberately: a generic failure that
+    /// happens to contain the phrase is not a statement about THIS session,
+    /// and must not be laundered into a 404.
+    #[test]
+    fn says_session_absent_requires_both_the_phrase_and_the_id() {
+        assert!(SshHostConnector::says_session_absent(
+            "[error] unknown session: ses_1",
+            "ses_1"
+        ));
+        assert!(SshHostConnector::says_session_absent(
+            "not found: ses_1",
+            "ses_1"
+        ));
+        assert!(
+            !SshHostConnector::says_session_absent("unknown session: ses_other", "ses_1"),
+            "a different session's absence says nothing about this one"
+        );
+        assert!(
+            !SshHostConnector::says_session_absent("permission denied for ses_1", "ses_1"),
+            "an unrelated failure must not become a 404"
         );
     }
 
