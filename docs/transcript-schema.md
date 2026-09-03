@@ -10,7 +10,16 @@
 Every rupu run produces an immutable append-only log in JSONL format. Each line is one event.
 The schema is the single source of truth for what happened in a run; there is no separate run
 database in v0. `rupu transcript list` globs JSONL files and reads the `run_start` event from
-each for metadata.
+each for metadata — only that first event, which is what lets it sort thousands of transcripts
+cheaply and then read just the `--limit` most recent ones end to end (`run_complete` at the tail
+carries the status and token totals).
+
+The transcripts directory is a shared namespace: `run:` workflow step transcripts, action-step
+transcripts and per-run netflow ledgers are written there too, under the same `run_<ulid>.jsonl`
+naming but with their own schemas. A file with no `run_start` anywhere is one of those, not a
+damaged transcript — an agent transcript's `run_start` is written before the agent loop starts,
+so it survives every tolerated damage mode. Readers classify such a file as
+`ReadError::NotAnAgentTranscript` and skip it.
 
 ---
 

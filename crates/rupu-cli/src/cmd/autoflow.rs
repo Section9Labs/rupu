@@ -2181,23 +2181,11 @@ fn load_matching_serve_workers(
     Ok(handles)
 }
 
-fn pid_is_running(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn terminate_pid(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
+// Process liveness/termination live in `rupu_orchestrator::runs`: one
+// `kill(2)`-backed implementation, no subprocess, and a single place where
+// the "never signal ourselves" rule is enforced. Local aliases keep the
+// call sites in this module reading the same as before.
+use rupu_orchestrator::runs::{pid_is_running, terminate_pid};
 
 enum RetainedServeExit {
     Completed(crate::cmd::autoflow_runtime::ServeReport),

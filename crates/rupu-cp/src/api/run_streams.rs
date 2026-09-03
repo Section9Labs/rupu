@@ -268,44 +268,18 @@ fn lookup_session_agent_name(
     agent
 }
 
-/// Cap on how many DISTINCT pids `collect_standalone_runs` will shell out to
-/// probe (`pid_is_running` spawns `/bin/kill -0` per call — see its doc
-/// comment on `rupu_orchestrator::runs::pid_is_running`), applied to the
-/// NEWEST rows first (see the sort-before-probe step below).
-///
-/// A live run is, by definition, recent — it was started at some point and
-/// hasn't finished yet — so it is always within the newest slice of
-/// standalone rows. Capping the probe to the newest
-/// `STANDALONE_LIVENESS_PROBE_CAP` distinct pids bounds worst-case cost to
-/// that many process spawns per request, no matter how many historical
-/// standalone runs a workspace has accumulated on disk (hundreds, on the
-/// operator data this cap was added for).
-///
-/// Tradeoff, stated honestly: a run older than this cap that is somehow
-/// still alive (e.g. a very long-running invocation, superseded in the
-/// newest-first ordering by a burst of newer standalone runs) will be
-/// labelled "completed" in this list. That is COSMETIC ONLY — this cap
-/// governs what the unpaginated list endpoint DISPLAYS. The authoritative
-/// liveness check is the CLI's `ensure_standalone_not_running` guard
-/// (`crates/rupu-cli/src/cmd/transcript.rs`), which still runs unbounded,
-/// on the single run actually being archived/deleted, and still refuses
-/// the destructive action if that pid is live. This cap never weakens that
-/// guard.
-const STANDALONE_LIVENESS_PROBE_CAP: usize = 50;
-
 /// Load all `*.meta.json` files from `<global>/transcripts/` and convert to
 /// `AgentRunRow`s with `source = "standalone"`.
+///
+/// Liveness is resolved for EVERY pid-bearing row. This used to be capped
+/// at the newest 50 distinct pids because the probe shelled out to
+/// `/bin/kill -0` — a fork+exec per pid on an unpaginated, polled endpoint
+/// — and the cap bought that bound by lying about older rows: a genuinely
+/// live long-running run that had fallen out of the newest slice was
+/// displayed as completed. `rupu_orchestrator::runs::pid_is_running` is
+/// now a `kill(2)` syscall, so the bound is unnecessary and the lie is
+/// gone with it.
 fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
-    collect_standalone_runs_capped(global_dir, STANDALONE_LIVENESS_PROBE_CAP)
-}
-
-/// `collect_standalone_runs`, parameterized on the liveness-probe cap so
-/// tests can exercise the bound cheaply (a small cap) instead of spawning
-/// `STANDALONE_LIVENESS_PROBE_CAP` real `/bin/kill` processes.
-fn collect_standalone_runs_capped(
-    global_dir: &std::path::Path,
-    probe_cap: usize,
-) -> Vec<AgentRunRow> {
     let transcripts_dir = global_dir.join("transcripts");
     if !transcripts_dir.is_dir() {
         return Vec::new();
@@ -328,10 +302,7 @@ fn collect_standalone_runs_capped(
     // only read from disk once.
     let mut session_cache: HashMap<String, Option<String>> = HashMap::new();
 
-    // Rows paired with their raw `pid`, BEFORE liveness is resolved — the
-    // liveness probe below runs AFTER the newest-first sort, so the cap
-    // applies to genuinely-newest rows rather than `read_dir`'s arbitrary
-    // filesystem order.
+    // Rows paired with their raw `pid`, BEFORE liveness is resolved.
     let mut drafts: Vec<(AgentRunRow, Option<u32>)> = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -405,11 +376,9 @@ fn collect_standalone_runs_capped(
         ));
     }
 
-    // Sort newest-first BEFORE probing — mirrors
-    // `collect_and_sort_local_agent_runs`'s final comparator. The cap below
-    // is only meaningful applied to this order: a live run is always
-    // recent, so it's only guaranteed to land in the newest slice once that
-    // slice is genuinely newest-first rather than readdir order.
+    // Sort newest-first — mirrors `collect_and_sort_local_agent_runs`'s
+    // final comparator, so this endpoint's rows arrive in the same order
+    // as every other run list rather than in `read_dir` order.
     drafts.sort_by(|a, b| match (&b.0.started_at, &a.0.started_at) {
         (Some(bt), Some(at)) => bt.cmp(at),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -427,14 +396,11 @@ fn collect_standalone_runs_capped(
     // exited and nothing has updated the row) falls through to `None`
     // exactly as before — never guessed at.
     //
-    // `pid_is_running` spawns a process per call, so only the newest
-    // `probe_cap` DISTINCT pids get probed (see
-    // `STANDALONE_LIVENESS_PROBE_CAP`'s doc comment for the reasoning and
-    // the tradeoff). A pid repeated across multiple rows (e.g. two
-    // session-turn runs from the same still-running session) is probed
-    // once and the answer reused, so the cap counts distinct pids, not
-    // rows. A pid-bearing row beyond the cap keeps `status = None` (falls
-    // into the completed group) exactly like a row with no pid at all.
+    // `pid_is_running` is a `kill(2)` syscall, so every pid-bearing row is
+    // resolved. A pid repeated across multiple rows (e.g. two session-turn
+    // runs from the same still-running session) is still probed once and
+    // the answer reused — the cache is now about not repeating a syscall
+    // rather than about rationing subprocesses.
     //
     // Known caveat: pid reuse. If the owning process exited and the OS
     // later hands the same pid to an unrelated process, this reports the
@@ -451,12 +417,11 @@ fn collect_standalone_runs_capped(
         let Some(pid) = *pid else { continue };
         let live = match pid_liveness.get(&pid) {
             Some(&live) => live,
-            None if pid_liveness.len() < probe_cap => {
+            None => {
                 let live = rupu_orchestrator::runs::pid_is_running(pid);
                 pid_liveness.insert(pid, live);
                 live
             }
-            None => false, // cap already reached — skip the probe, don't guess
         };
         if live {
             row.status = Some("running".to_string());
@@ -1465,20 +1430,16 @@ mod tests {
         ));
     }
 
-    // ── Liveness-probe cap (STANDALONE_LIVENESS_PROBE_CAP) ────────────────────
+    // ── Standalone liveness probe ─────────────────────────────────────────────
     //
-    // `pid_is_running` shells out to `/bin/kill -0` per call. Probing every
-    // pid-bearing standalone row unconditionally would mean hundreds of
-    // blocking spawns on an unpaginated, polled list endpoint once a
-    // workspace accumulates a few hundred historical runs. These tests use
-    // `collect_standalone_runs_capped` with a small cap (instead of the real
-    // `STANDALONE_LIVENESS_PROBE_CAP = 50`) so the bound can be proven
-    // without actually spawning 50+ real processes per test.
+    // `pid_is_running` is a `kill(2)` syscall, so every pid-bearing row is
+    // resolved on every request. These tests pin that: liveness does not
+    // depend on a row's position in the list, and a pid shared by several
+    // rows costs one probe.
 
     /// Like `write_standalone_meta_with_pid`, but also writes a companion
     /// transcript `run_start` event so the row gets a real `started_at` —
-    /// needed to exercise the sort-before-probe ordering (rows are sorted
-    /// newest-first by `started_at` BEFORE the cap is applied).
+    /// which is what puts these rows in a known newest-first order.
     fn write_standalone_meta_with_pid_and_started_at(
         global: &std::path::Path,
         run_id: &str,
@@ -1490,12 +1451,9 @@ mod tests {
     }
 
     #[test]
-    fn standalone_probe_reports_running_for_live_pid_within_the_newest_cap() {
+    fn standalone_probe_reports_running_for_a_live_pid() {
         let tmp = tempfile::tempdir().unwrap();
         let live_pid = std::process::id();
-        // Newest-first order once sorted: run_newest, run_live, run_oldest.
-        // cap = 2, so the live pid at position 2 (0-indexed: 1) is still
-        // within the probed slice.
         write_standalone_meta_with_pid_and_started_at(
             tmp.path(),
             "run_newest",
@@ -1508,14 +1466,8 @@ mod tests {
             live_pid,
             "2026-06-01T00:00:02Z",
         );
-        write_standalone_meta_with_pid_and_started_at(
-            tmp.path(),
-            "run_oldest",
-            222_222,
-            "2026-06-01T00:00:01Z",
-        );
 
-        let rows = collect_standalone_runs_capped(tmp.path(), 2);
+        let rows = collect_standalone_runs(tmp.path());
         let live_row = rows.iter().find(|r| r.run_id == "run_live").unwrap();
         assert_eq!(live_row.status.as_deref(), Some("running"));
         assert!(agent_in_lifecycle(
@@ -1524,59 +1476,48 @@ mod tests {
         ));
     }
 
-    /// RED test for the bound itself: a row OLDER than the newest `cap`
-    /// distinct pids is never probed at all, even when its pid is
-    /// genuinely live — proving the probe cost per request is bounded by
-    /// `probe_cap`, not by the total number of pid-bearing rows on disk.
-    /// This is the documented cosmetic tradeoff (see
-    /// `STANDALONE_LIVENESS_PROBE_CAP`'s doc comment): the authoritative
-    /// liveness check for a destructive action is
-    /// `ensure_standalone_not_running`, which is untouched by this cap.
+    /// The behavior the removed 50-pid cap used to get wrong: a live run
+    /// that has fallen behind newer rows in the newest-first ordering was
+    /// never probed at all and so was displayed as completed. With a
+    /// syscall-backed probe there is no budget to fall outside of — the
+    /// OLDEST row here is the live one, and it must read as running.
     #[test]
-    fn standalone_probe_skips_rows_beyond_the_cap_even_if_pid_is_live() {
+    fn standalone_probe_reports_running_however_old_the_row_is() {
         let tmp = tempfile::tempdir().unwrap();
         let live_pid = std::process::id();
-        // Two distinct-pid rows newer than `run_beyond_cap` fully consume a
-        // cap of 2 before the probe ever reaches the third (oldest) row.
+        for (i, run_id) in ["run_a", "run_b", "run_c", "run_d"].iter().enumerate() {
+            write_standalone_meta_with_pid_and_started_at(
+                tmp.path(),
+                run_id,
+                // Distinct dead pids, so none of them dedupes with another.
+                200_000 + i as u32,
+                &format!("2026-06-01T00:00:{:02}Z", 10 - i),
+            );
+        }
         write_standalone_meta_with_pid_and_started_at(
             tmp.path(),
-            "run_a",
-            111_111,
-            "2026-06-01T00:00:03Z",
-        );
-        write_standalone_meta_with_pid_and_started_at(
-            tmp.path(),
-            "run_b",
-            222_222,
-            "2026-06-01T00:00:02Z",
-        );
-        write_standalone_meta_with_pid_and_started_at(
-            tmp.path(),
-            "run_beyond_cap",
+            "run_oldest_but_live",
             live_pid,
             "2026-06-01T00:00:01Z",
         );
 
-        let rows = collect_standalone_runs_capped(tmp.path(), 2);
-        let beyond = rows.iter().find(|r| r.run_id == "run_beyond_cap").unwrap();
-        // Not probed → falls through to `None`, same as today's "no pid"
-        // behavior, DESPITE the pid actually being alive.
-        assert_eq!(beyond.status, None);
-        assert!(agent_in_lifecycle(
-            beyond.status.as_deref(),
-            Some("completed")
-        ));
+        let rows = collect_standalone_runs(tmp.path());
+        let oldest = rows
+            .iter()
+            .find(|r| r.run_id == "run_oldest_but_live")
+            .unwrap();
+        assert_eq!(
+            oldest.status.as_deref(),
+            Some("running"),
+            "the oldest row's live pid must still be probed"
+        );
+        assert!(agent_in_lifecycle(oldest.status.as_deref(), Some("active")));
     }
 
-    /// Dedupe: a pid repeated across multiple rows is probed once and the
-    /// result reused, so the cap counts DISTINCT pids, not rows. With
-    /// `probe_cap = 1`, a naive "probe the first `cap` rows" implementation
-    /// would probe `run_1` (consuming the only slot) and then skip `run_2`
-    /// outright (row index 1 >= cap) — reporting it as `None` despite
-    /// sharing the same live pid. The correct behavior is a cache hit for
-    /// `run_2`, so BOTH rows report `running`.
+    /// A pid repeated across rows is probed once and the answer reused, so
+    /// probe count is bounded by DISTINCT pids rather than by row count.
     #[test]
-    fn standalone_probe_dedupes_shared_pid_so_repeats_do_not_consume_extra_budget() {
+    fn standalone_probe_dedupes_a_pid_shared_by_several_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let live_pid = std::process::id();
         write_standalone_meta_with_pid_and_started_at(
@@ -1592,7 +1533,7 @@ mod tests {
             "2026-06-01T00:00:01Z",
         );
 
-        let rows = collect_standalone_runs_capped(tmp.path(), 1);
+        let rows = collect_standalone_runs(tmp.path());
         assert_eq!(rows.len(), 2);
         for row in &rows {
             assert_eq!(row.status.as_deref(), Some("running"));

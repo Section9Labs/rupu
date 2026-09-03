@@ -16,6 +16,40 @@ use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// `write_transcript`, with an explicit `started_at` so a test can pin the
+/// newest-first ordering the listing sorts by.
+fn write_transcript_started_at(
+    dir: &std::path::Path,
+    run_id: &str,
+    agent: &str,
+    started_at: chrono::DateTime<Utc>,
+) -> std::path::PathBuf {
+    let path = dir.join(format!("{run_id}.jsonl"));
+    let mut w = JsonlWriter::create(&path).unwrap();
+    w.write(&Event::RunStart {
+        run_id: run_id.to_string(),
+        workspace_id: "ws-test".to_string(),
+        agent: agent.to_string(),
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        started_at,
+        mode: RunMode::Bypass,
+        schema: None,
+        system_prompt: None,
+    })
+    .unwrap();
+    w.write(&Event::RunComplete {
+        run_id: run_id.to_string(),
+        status: RunStatus::Ok,
+        total_tokens: 10,
+        duration_ms: 100,
+        error: None,
+    })
+    .unwrap();
+    w.flush().unwrap();
+    path
+}
+
 /// Write a minimal but valid two-event transcript (RunStart + RunComplete)
 /// to `dir/<run_id>.jsonl`.
 fn write_transcript(
@@ -720,4 +754,85 @@ async fn prune_deletes_old_archived_standalone_transcripts_and_uses_config_defau
 
     assert!(!archived_dir.join("run_old01.jsonl").exists());
     assert!(archived_dir.join("run_new01.jsonl").exists());
+}
+
+/// `--limit` keeps the listing's cost tied to what is rendered rather than
+/// to how much history is on disk: the scan sorts on each transcript's
+/// `run_start` (its first record) and only then reads the survivors end to
+/// end. This pins the observable half of that — the newest N rows, in
+/// order — plus the hint that says how much was left out, because silently
+/// showing 50 of several thousand would read as "that is all there is".
+#[tokio::test]
+async fn list_limit_returns_the_newest_rows_and_reports_the_remainder() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+    let dir = global.path().join("transcripts");
+
+    let t = |secs: i64| Utc::now() - chrono::Duration::seconds(secs);
+    write_transcript_started_at(&dir, "run_oldest", "agent-a", t(300));
+    write_transcript_started_at(&dir, "run_middle", "agent-b", t(200));
+    write_transcript_started_at(&dir, "run_newest", "agent-c", t(100));
+    // A `run:` step transcript, which shares this directory but is not an
+    // agent transcript — it must not occupy a row or a limit slot.
+    std::fs::write(
+        dir.join("run_step_side_by_side.jsonl"),
+        b"{\"type\":\"RunStep\",\"cmd\":\"nmap\",\"exit_code\":0}\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "json", "transcript", "list", "--limit", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let rows = parsed["rows"].as_array().unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r["run_id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec!["run_newest", "run_middle"],
+        "the two newest rows, newest first"
+    );
+
+    // Table output names what it left out; JSON above carries no such prose.
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "list", "--limit", "2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("showing 2 of 3 transcripts"));
+}
+
+/// The default limit must not silently hide a small workspace's history:
+/// with fewer transcripts than the limit, every row is listed and no
+/// truncation hint is printed.
+#[tokio::test]
+async fn list_below_the_limit_shows_everything_without_a_hint() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+    let dir = global.path().join("transcripts");
+    write_transcript_started_at(&dir, "run_only_one", "agent-a", Utc::now());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run_only_one"))
+        .stdout(predicate::str::contains("showing").not());
 }

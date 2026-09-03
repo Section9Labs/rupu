@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use rupu_transcript::event::{Event, RunMode, RunStatus};
-use rupu_transcript::{JsonlReader, JsonlWriter};
+use rupu_transcript::{JsonlReader, JsonlWriter, ReadError};
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -133,4 +133,91 @@ fn iter_yields_all_events_in_order() {
     assert_eq!(events.len(), 3);
     assert!(matches!(events[0], Event::TurnStart { turn_idx: 0 }));
     assert!(matches!(events[2], Event::TurnStart { turn_idx: 1 }));
+}
+
+/// `<global>/transcripts/` is a shared namespace — a `run:` workflow step
+/// writes a single `{"type":"RunStep",…}` record there under the same
+/// `run_<ulid>.jsonl` naming an agent transcript uses. Summarizing one must
+/// report "not an agent transcript" (with the producer's tag, so a scanner
+/// can skip it quietly) rather than a generic read failure: on a real
+/// workspace this shape outnumbered corrupt files 2951-to-0, and warning
+/// per file buried the `rupu cp serve` log.
+#[test]
+fn summary_of_a_foreign_step_transcript_is_classified_not_reported_as_broken() {
+    let f = NamedTempFile::new().unwrap();
+    std::fs::write(
+        f.path(),
+        b"{\"type\":\"RunStep\",\"cmd\":\"nmap\",\"exit_code\":0}\n",
+    )
+    .unwrap();
+
+    match JsonlReader::summary(f.path()) {
+        Err(ReadError::NotAnAgentTranscript { first_tag }) => {
+            assert_eq!(first_tag.as_deref(), Some("RunStep"));
+        }
+        other => panic!("expected NotAnAgentTranscript, got {other:?}"),
+    }
+}
+
+/// An empty file is classified the same way, with no tag to report — it is
+/// still simply "not an agent transcript".
+#[test]
+fn summary_of_an_empty_file_is_classified_with_no_tag() {
+    let f = NamedTempFile::new().unwrap();
+    match JsonlReader::summary(f.path()) {
+        Err(ReadError::NotAnAgentTranscript { first_tag }) => assert_eq!(first_tag, None),
+        other => panic!("expected NotAnAgentTranscript, got {other:?}"),
+    }
+}
+
+/// `head` exists so a directory listing can sort thousands of transcripts
+/// without reading them: it answers from `run_start`, which is the first
+/// record, where `summary` reads to EOF for `run_complete`.
+#[test]
+fn head_reads_run_start_without_needing_the_rest_of_the_file() {
+    let f = NamedTempFile::new().unwrap();
+    let started = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    write_events(
+        f.path(),
+        &[
+            Event::RunStart {
+                run_id: "run_head".into(),
+                workspace_id: "ws".into(),
+                agent: "agent-a".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                started_at: started,
+                mode: RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
+            },
+            Event::TurnStart { turn_idx: 0 },
+        ],
+    );
+    // Trailing garbage the reader would choke on if it kept going.
+    let mut handle = std::fs::OpenOptions::new()
+        .append(true)
+        .open(f.path())
+        .unwrap();
+    handle.write_all(b"not json at all\n").unwrap();
+
+    let head = JsonlReader::head(f.path()).unwrap();
+    assert_eq!(head.run_id, "run_head");
+    assert_eq!(head.agent, "agent-a");
+    assert_eq!(head.started_at, started);
+}
+
+/// A file sharing the transcripts directory but written by another
+/// producer is classified, not reported as broken — same answer `summary`
+/// gives, reached without assuming `run_start` comes first.
+#[test]
+fn head_of_a_foreign_step_transcript_is_classified() {
+    let f = NamedTempFile::new().unwrap();
+    std::fs::write(f.path(), b"{\"type\":\"RunStep\",\"cmd\":\"nmap\"}\n").unwrap();
+    match JsonlReader::head(f.path()) {
+        Err(ReadError::NotAnAgentTranscript { first_tag }) => {
+            assert_eq!(first_tag.as_deref(), Some("RunStep"))
+        }
+        other => panic!("expected NotAnAgentTranscript, got {other:?}"),
+    }
 }

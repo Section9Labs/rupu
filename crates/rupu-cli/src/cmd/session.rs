@@ -8206,41 +8206,12 @@ fn session_prune_cutoff(
     Ok(Utc::now() - parse_retention_duration(&retention)?)
 }
 
-fn pid_is_running(pid: u32) -> bool {
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn terminate_pid(pid: u32) -> bool {
-    // Never signal ourselves. A recorded `worker_pid` equal to this
-    // process is always a corrupt state — a bug that wrote the wrong pid,
-    // or an OS pid recycled onto us — and honoring it makes rupu SIGTERM
-    // itself mid-command. Refusing is strictly better than obeying: the
-    // caller treats `false` as "could not terminate" and moves on.
-    if pid == std::process::id() {
-        tracing::warn!(
-            pid,
-            "refusing to terminate this process: a recorded worker pid matched our own"
-        );
-        return false;
-    }
-    Command::new("/bin/kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
+// Process liveness/termination live in `rupu_orchestrator::runs`: one
+// `kill(2)`-backed implementation, no subprocess, and a single place where
+// the "never signal ourselves" rule is enforced (the guard below used to
+// live here — see `terminate_pid`'s doc comment, and
+// `terminate_pid_refuses_to_signal_this_process` for the regression test).
+use rupu_orchestrator::runs::{pid_is_running, terminate_pid};
 
 #[cfg(test)]
 mod tests {

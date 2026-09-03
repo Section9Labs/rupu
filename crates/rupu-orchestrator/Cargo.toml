@@ -24,6 +24,7 @@ ulid.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
+rustix.workspace = true
 
 # In-workspace
 rupu-coverage = { path = "../rupu-coverage" }

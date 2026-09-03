@@ -514,7 +514,7 @@ Lifecycle notes:
 
 Standalone transcript lifecycle:
 
-- `rupu transcript list [--all|--archived]`
+- `rupu transcript list [--limit 50] [--all|--archived]` — newest first; the limit bounds how many transcripts are read in full, so raise it deliberately on a large workspace
 - `rupu transcript archive <run-id>`
 - `rupu transcript delete <run-id> --force`
 - `rupu transcript prune [--older-than 30d] [--dry-run]`
