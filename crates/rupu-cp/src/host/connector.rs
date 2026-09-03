@@ -295,6 +295,19 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("session runs".into()))
     }
 
+    /// One run's raw netflow records from this host, as
+    /// `{ "flows": [FlowRecord...], "dropped_total": u64 }`.
+    ///
+    /// Deliberately RAW rather than an aggregated response: the CP applies
+    /// its own window, filters and ASN table to the records, so a remote
+    /// cannot return something that looks filtered but is not (the reason
+    /// the proxy path carries a defensive re-filtering pass), and every
+    /// host's flows get enriched identically. The SSH connector shells
+    /// `rupu netflow show <run_id> --format json`.
+    async fn run_netflow(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("run netflow".into()))
+    }
+
     /// Token/cost rollup for a time window on this host — the structured
     /// counterpart to `proxy_get_json("/api/usage?...")`.
     ///

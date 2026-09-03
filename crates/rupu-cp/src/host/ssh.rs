@@ -1816,6 +1816,35 @@ impl HostConnector for SshHostConnector {
             .unwrap_or_else(|| serde_json::Value::Array(Vec::new())))
     }
 
+    /// Read one run's flow records by shelling `rupu netflow show
+    /// <run_id> --format json`. The remote performs the same
+    /// ledger+transcript merge the CP does locally (both call
+    /// `rupu_cp::api::netflow::run_scoped_flows_and_dropped`); enrichment
+    /// and filtering happen on our side.
+    async fn run_netflow(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        let report = self
+            .remote_json(&["--format", "json", "netflow", "show", run_id])
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    run_id = %run_id,
+                    error = %e,
+                    "run_netflow: remote command failed; host may predate it"
+                );
+                HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu netflow show`: {e}",
+                    self.host_id
+                ))
+            })?;
+        Ok(serde_json::json!({
+            "flows": report.get("rows").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+            // A dropped record is data the sink could not write; carrying the
+            // count is the only trace it existed. Never fold it into zero.
+            "dropped_total": report.get("dropped_total").and_then(|v| v.as_u64()).unwrap_or(0),
+        }))
+    }
+
     /// Roll up this host's usage by shelling `rupu usage --format json`.
     ///
     /// The remote prices with ITS own config — the same property the HTTP
@@ -2664,6 +2693,71 @@ mod tests {
         assert!(
             matches!(err, HostConnectorError::NotFound(_)),
             "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_netflow_shells_the_remote_command_and_carries_dropped() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by run_netflow")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by run_netflow")
+            }
+        }
+
+        let json = r#"{"kind":"netflow_show","version":1,"dropped_total":7,"rows":[
+            {"host":"api.anthropic.com"},{"host":"api.github.com"}
+        ]}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let v = conn.run_netflow("run_a").await.unwrap();
+
+        assert_eq!(v["flows"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v["dropped_total"], 7,
+            "a dropped record is data the sink lost; the count must survive"
+        );
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("netflow") && cmd.contains("show") && cmd.contains("run_a"),
+            "cmd: {cmd}"
+        );
+    }
+
+    /// A run with no ledger reports an empty set, and a host that cannot
+    /// answer at all reports Unsupported — the two must not look alike.
+    #[tokio::test]
+    async fn run_netflow_maps_an_old_host_to_unsupported() {
+        let fake = std::sync::Arc::new(FakeExec::offline("unrecognized subcommand 'show'"));
+        let (conn, _store, _tmp) = make_conn(fake);
+
+        let err = conn.run_netflow("run_a").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
         );
     }
 

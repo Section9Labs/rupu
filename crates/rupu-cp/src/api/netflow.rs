@@ -1028,7 +1028,11 @@ pub(crate) fn build_filtered_response(
 /// [`collect_run_netflow`] (which wraps this into the enriched
 /// [`NetflowResponse`]) and the graph endpoint's `run:` scope (which only
 /// needs raw [`FlowRecord`]s to feed [`rupu_netflow::ledger::graph_view`]).
-fn run_scoped_flows_and_dropped(
+///
+/// `pub` because `rupu-cli`'s `netflow show` serves this same read to a
+/// coordinator over ssh — a host with no generic-GET surface. One
+/// implementation of the ledger+transcript merge, not two that can drift.
+pub fn run_scoped_flows_and_dropped(
     store: &RunStore,
     run_id: &str,
     workspace: &StdPath,
@@ -1895,6 +1899,67 @@ async fn explorer_run_scope(
     }
 }
 
+/// Fetch one run's raw flow records from a host that exposes the structured
+/// [`HostConnector::run_netflow`] surface, or `None` when it does not (an
+/// HTTP host, whose caller falls back to the generic-GET proxy below).
+///
+/// Raw records, aggregated locally: the CP applies its own window, filters
+/// and ASN table, so every host's flows are enriched identically and a
+/// remote cannot return something that merely looks filtered.
+async fn host_raw_flows(
+    s: &AppState,
+    host_id: &str,
+    run_id: &str,
+) -> ApiResult<Option<(Vec<FlowRecord>, u64)>> {
+    let conn = resolve_host(s, host_id)?;
+    let value = match conn.run_netflow(run_id).await {
+        Ok(v) => v,
+        // No structured surface on this transport — the caller proxies.
+        Err(HostConnectorError::Unsupported(_)) | Err(HostConnectorError::Invalid(_)) => {
+            return Ok(None)
+        }
+        Err(HostConnectorError::NotFound(m)) => return Err(ApiError::not_found(m)),
+        Err(HostConnectorError::Unreachable(m)) => {
+            return Err(ApiError::internal(format!(
+                "host {host_id} unreachable: {m}"
+            )))
+        }
+        Err(other) => return Err(ApiError::internal(other.to_string())),
+    };
+
+    let flows: Vec<FlowRecord> = serde_json::from_value(
+        value
+            .get("flows")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+    )
+    .map_err(|e| {
+        ApiError::internal(format!(
+            "host {host_id} returned netflow records this build cannot read ({e}); \
+             the remote rupu is likely older than this one"
+        ))
+    })?;
+    let dropped = value
+        .get("dropped_total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Ok(Some((flows, dropped)))
+}
+
+/// The attribution index for a host-sourced run.
+///
+/// A run placed on an SSH/Tunnel host is ALSO mirrored into our own
+/// `RunStore`, so its record is usually right here and attribution is exact.
+/// When it is not, an empty index leaves run/workflow unattributed rather
+/// than failing the read — the same posture the `ProjectLocal` branch takes.
+fn meta_for_host_run(s: &AppState, run_id: &str) -> RunMetaIndex {
+    let mut meta = RunMetaIndex::default();
+    if let Ok(record) = s.run_store.load(run_id) {
+        meta.insert_run(&s.run_store, &record);
+    }
+    meta
+}
+
 /// Proxy the whole explorer request to a resolved host — the remote CP
 /// owns the run's ledgers, run records, and its own ASN table, so it
 /// builds the aggregates and we relay them. Unlike
@@ -1909,6 +1974,32 @@ async fn explorer_from_host(
     range: &rupu_netflow::ledger::TimeRange,
     filters: &ExplorerFilters,
 ) -> ApiResult<ExplorerResponse> {
+    // A transport with a structured netflow surface (SSH) returns raw
+    // records that we aggregate here, with our own window, filters and ASN
+    // table. Only an HTTP host falls through to the proxy below.
+    if let Some((flows, dropped)) = host_raw_flows(s, host_id, run_id).await? {
+        let meta = meta_for_host_run(s, run_id);
+        let cache = Arc::clone(&s.asn_cache);
+        let rid = run_id.to_string();
+        let range = range.clone();
+        let filters = filters.clone();
+        return run_blocking(move || {
+            let table = load_asn_table(&cache);
+            let tagged: Vec<(String, FlowRecord)> =
+                flows.into_iter().map(|f| (rid.clone(), f)).collect();
+            let explorer_flows = to_explorer_flows(tagged, &meta, table.as_deref());
+            build_explorer_response(
+                &explorer_flows,
+                dropped,
+                &meta.spans,
+                table.is_some(),
+                &range,
+                &filters,
+            )
+        })
+        .await;
+    }
+
     let conn = resolve_host(s, host_id)?;
     let mut parts = vec![format!("scope=run:{}", urlencode_query_value(run_id))];
     parts.extend(time_range_query_parts(range));
@@ -1953,6 +2044,23 @@ async fn run_netflow_from_host(
     range: &rupu_netflow::ledger::TimeRange,
     filters: &ExplorerFilters,
 ) -> ApiResult<NetflowResponse> {
+    // Same rule as `explorer_from_host`: raw records from a structured
+    // transport, enriched and filtered here; only HTTP proxies.
+    if let Some((flows, dropped)) = host_raw_flows(s, host_id, id).await? {
+        let meta = meta_for_host_run(s, id);
+        let cache = Arc::clone(&s.asn_cache);
+        let rid = id.to_string();
+        let range = range.clone();
+        let filters = filters.clone();
+        return run_blocking(move || {
+            let table = load_asn_table(&cache);
+            let tagged: Vec<(String, FlowRecord)> =
+                flows.into_iter().map(|f| (rid.clone(), f)).collect();
+            build_filtered_response(tagged, &meta, dropped, table.as_deref(), &range, &filters)
+        })
+        .await;
+    }
+
     let conn = resolve_host(s, host_id)?;
     let path = format!(
         "/api/runs/{id}/netflow{}",
