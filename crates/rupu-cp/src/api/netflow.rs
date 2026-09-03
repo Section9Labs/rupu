@@ -653,6 +653,16 @@ fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
 pub(crate) struct RunMetaIndex {
     map: HashMap<String, (String, String)>,
     spans: Vec<RunSpan>,
+    /// Registered non-local hosts that in-scope runs actually EXECUTED on.
+    ///
+    /// A run placed on a remote host keeps its netflow ledger there. Run
+    /// scope reads that host directly (see `worker_host_flows`), but
+    /// project/global scope unions ledger DIRECTORIES on this machine and
+    /// has no per-run fetch — so those flows are simply absent. Recording
+    /// which hosts they belong to is what lets those scopes SAY so
+    /// (`scope_gap_from_workers`) instead of serving a short total that
+    /// looks complete.
+    remote_workers: std::collections::BTreeSet<String>,
     /// Root run ids already folded in — the same run RECORD can appear in
     /// both the global store and a project-local one, and pushing its
     /// span twice would double-count it in the active-runs strip.
@@ -667,6 +677,13 @@ impl RunMetaIndex {
     fn insert_run(&mut self, store: &RunStore, record: &RunRecord) {
         if !self.seen_runs.insert(record.id.clone()) {
             return;
+        }
+        if let Some(worker) = record
+            .worker_id
+            .as_deref()
+            .filter(|w| !w.is_empty() && *w != "local")
+        {
+            self.remote_workers.insert(worker.to_string());
         }
         for id in run_and_unit_ids(store, &record.id) {
             self.map
@@ -1436,6 +1453,31 @@ fn canonicalize_or_self(path: &StdPath) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The scope-level gap a project/global netflow view must declare.
+///
+/// These scopes union ledger DIRECTORIES on this machine; they have no
+/// per-run remote fetch (run scope does — see `worker_host_flows`). So every
+/// flow made by a run that executed on a remote host is absent from the
+/// totals, and absent in a way no number on the page reveals. Naming the
+/// hosts is the difference between an understated total and a knowingly
+/// understated one.
+///
+/// Empty when no in-scope run executed remotely — the common single-machine
+/// case declares nothing, so this never becomes a banner people learn to
+/// ignore.
+fn scope_gap_from_workers(meta: &RunMetaIndex) -> Vec<IncompleteSource> {
+    meta.remote_workers
+        .iter()
+        .map(|host_id| IncompleteSource {
+            host_id: host_id.clone(),
+            reason: "runs in this scope executed on this host, and their flows are recorded \
+                     there — this scope reads only local ledgers, so they are not included. \
+                     Open one of those runs to see its own flows."
+                .to_string(),
+        })
+        .collect()
+}
+
 /// `GET /api/projects/:id/netflow` — every flow attributable to a
 /// project: its own `.rupu/netflow/` ledger directory (whole-directory
 /// scan, including unattributed `run_id: None` egress that has no run to
@@ -1466,7 +1508,10 @@ async fn get_project_netflow(
         let (flows, meta, dropped) =
             project_scoped_flows_meta_and_dropped(&store, &workspace, &global_dir, &range);
         let table = load_asn_table(&cache);
-        build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters)
+        let mut resp =
+            build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters);
+        resp.incomplete = scope_gap_from_workers(&meta);
+        resp
     })
     .await?;
     Ok(Json(resp))
@@ -1489,7 +1534,10 @@ async fn get_global_netflow(
         let ledger_ids = flows.iter().map(|(id, _)| id.clone()).collect();
         let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
         let table = load_asn_table(&cache);
-        build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters)
+        let mut resp =
+            build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters);
+        resp.incomplete = scope_gap_from_workers(&meta);
+        resp
     })
     .await?;
     Ok(Json(resp))
@@ -1838,14 +1886,16 @@ async fn get_netflow_explorer(
             );
             let table = load_asn_table(&cache);
             let flows = to_explorer_flows(tagged, &meta, table.as_deref());
-            build_explorer_response(
+            let mut resp = build_explorer_response(
                 &flows,
                 dropped,
                 &meta.spans,
                 table.is_some(),
                 &range,
                 &filters,
-            )
+            );
+            resp.incomplete = scope_gap_from_workers(&meta);
+            resp
         })
         .await?;
         Ok(Json(resp))
@@ -1863,14 +1913,16 @@ async fn get_netflow_explorer(
             let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
             let table = load_asn_table(&cache);
             let flows = to_explorer_flows(tagged, &meta, table.as_deref());
-            build_explorer_response(
+            let mut resp = build_explorer_response(
                 &flows,
                 dropped,
                 &meta.spans,
                 table.is_some(),
                 &range,
                 &filters,
-            )
+            );
+            resp.incomplete = scope_gap_from_workers(&meta);
+            resp
         })
         .await?;
         Ok(Json(resp))
@@ -2970,6 +3022,51 @@ mod tests {
             assert_eq!(dropped, 0);
             assert!(incomplete.is_empty(), "a local run is not incomplete");
         }
+    }
+
+    /// Project/global scope unions ledger DIRECTORIES on this machine, so a
+    /// run that executed elsewhere contributes nothing — and nothing on the
+    /// page reveals that. Naming the host is the difference between an
+    /// understated total and a knowingly understated one.
+    #[test]
+    fn scope_gap_names_the_hosts_in_scope_runs_executed_on() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let mut placed = seed_record("run_placed", "wf", tmp.path());
+        placed.worker_id = Some("host_ssh".into());
+        let mut here = seed_record("run_here", "wf", tmp.path());
+        here.worker_id = None;
+
+        let mut meta = RunMetaIndex::default();
+        meta.insert_run(&store, &placed);
+        meta.insert_run(&store, &here);
+
+        let gap = scope_gap_from_workers(&meta);
+
+        assert_eq!(gap.len(), 1, "one remote host contributed runs");
+        assert_eq!(gap[0].host_id, "host_ssh");
+        assert!(
+            gap[0].reason.contains("not included"),
+            "the reason must say the flows are absent: {}",
+            gap[0].reason
+        );
+    }
+
+    /// The single-machine case must declare NOTHING, or the warning becomes
+    /// a permanent banner people learn to ignore.
+    #[test]
+    fn scope_gap_is_empty_when_every_run_executed_here() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let mut local = seed_record("run_here", "wf", tmp.path());
+        local.worker_id = Some("local".into());
+        let plain = seed_record("run_here2", "wf", tmp.path());
+
+        let mut meta = RunMetaIndex::default();
+        meta.insert_run(&store, &local);
+        meta.insert_run(&store, &plain);
+
+        assert!(scope_gap_from_workers(&meta).is_empty());
     }
 
     /// A run placed on a remote host writes its ledger THERE. Its
