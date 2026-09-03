@@ -91,6 +91,36 @@ pub enum HostConnectorError {
     Unsupported(String),
 }
 
+// ── Run-start evidence ──────────────────────────────────────────
+
+/// What a transport can say about whether a launched run's remote process
+/// actually STARTED — asked independently of, and answerable much earlier
+/// than, [`HostConnector::get_run`].
+///
+/// The distinction exists because "the run is observable through `get_run`"
+/// is NOT a startup signal for an agent run. A standalone `rupu run <agent>`
+/// writes its `run.json` only after the agent has finished
+/// (`cmd/run.rs`: `let run_result = agent_task.await` — then "Write run.json
+/// so the run is observable via RunStore"), so "never observed" is the normal
+/// state of a placed agent run for its ENTIRE duration, however long that is.
+/// A caller that treats "not observed yet" as "never launched" abandons
+/// healthy work; this is the signal it should key on instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStartEvidence {
+    /// The host shows this run actually started: a process carrying its run
+    /// id, or artifacts only a started run writes (a non-empty transcript,
+    /// `run.json`, `events.jsonl`, `step_results.jsonl`).
+    Started,
+    /// The transport looked and found no trace of the run at all. Combined
+    /// with a launch the host ACCEPTED, this is positive evidence that the
+    /// remote process died before doing anything.
+    NoTrace,
+    /// The transport cannot answer — it has no probe for this (the default),
+    /// or the probe itself failed (host unreachable, malformed answer).
+    /// Callers must treat this as "no information", never as `NoTrace`.
+    Unknown,
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 /// Uniform interface over a rupu CP host — local (in-process) or remote (HTTP).
@@ -171,6 +201,28 @@ pub trait HostConnector: Send + Sync {
     /// this is consulted while a real error is already being reported.
     async fn launch_diagnostics(&self, _run_id: &str) -> Option<String> {
         None
+    }
+
+    /// Best-effort evidence that a launched run's remote process actually
+    /// STARTED, for callers that must distinguish "the run has not become
+    /// observable through [`get_run`](Self::get_run) YET" from "the launch
+    /// never happened".
+    ///
+    /// [`get_run`](Self::get_run) cannot answer that question for an agent
+    /// run: `run.json` is written when the agent FINISHES, so a placed agent
+    /// run is unobservable for its whole lifetime and a caller that bounds
+    /// "never observed" with a startup deadline kills healthy long runs. This
+    /// method is the cheap, early-true signal that deadline should key on
+    /// instead — see [`RunStartEvidence`].
+    ///
+    /// Implementations MUST be cheap (one round trip at most), MUST NOT fail
+    /// loudly, and MUST return [`RunStartEvidence::Unknown`] rather than
+    /// [`RunStartEvidence::NoTrace`] when they could not actually look: the
+    /// difference is whether a caller may blame the launch. The default is
+    /// `Unknown`, so a transport without a probe keeps whatever bound its
+    /// caller already applied.
+    async fn run_start_evidence(&self, _run_id: &str) -> RunStartEvidence {
+        RunStartEvidence::Unknown
     }
 
     /// Cooperatively pause an in-flight (`Pending`/`Running`) run, leaving it
