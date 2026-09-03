@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use rupu_transcript::event::{Event, RunMode, RunStatus};
-use rupu_transcript::{JsonlReader, JsonlWriter};
+use rupu_transcript::{JsonlReader, JsonlWriter, ReadError};
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -133,4 +133,39 @@ fn iter_yields_all_events_in_order() {
     assert_eq!(events.len(), 3);
     assert!(matches!(events[0], Event::TurnStart { turn_idx: 0 }));
     assert!(matches!(events[2], Event::TurnStart { turn_idx: 1 }));
+}
+
+/// `<global>/transcripts/` is a shared namespace — a `run:` workflow step
+/// writes a single `{"type":"RunStep",…}` record there under the same
+/// `run_<ulid>.jsonl` naming an agent transcript uses. Summarizing one must
+/// report "not an agent transcript" (with the producer's tag, so a scanner
+/// can skip it quietly) rather than a generic read failure: on a real
+/// workspace this shape outnumbered corrupt files 2951-to-0, and warning
+/// per file buried the `rupu cp serve` log.
+#[test]
+fn summary_of_a_foreign_step_transcript_is_classified_not_reported_as_broken() {
+    let f = NamedTempFile::new().unwrap();
+    std::fs::write(
+        f.path(),
+        b"{\"type\":\"RunStep\",\"cmd\":\"nmap\",\"exit_code\":0}\n",
+    )
+    .unwrap();
+
+    match JsonlReader::summary(f.path()) {
+        Err(ReadError::NotAnAgentTranscript { first_tag }) => {
+            assert_eq!(first_tag.as_deref(), Some("RunStep"));
+        }
+        other => panic!("expected NotAnAgentTranscript, got {other:?}"),
+    }
+}
+
+/// An empty file is classified the same way, with no tag to report — it is
+/// still simply "not an agent transcript".
+#[test]
+fn summary_of_an_empty_file_is_classified_with_no_tag() {
+    let f = NamedTempFile::new().unwrap();
+    match JsonlReader::summary(f.path()) {
+        Err(ReadError::NotAnAgentTranscript { first_tag }) => assert_eq!(first_tag, None),
+        other => panic!("expected NotAnAgentTranscript, got {other:?}"),
+    }
 }

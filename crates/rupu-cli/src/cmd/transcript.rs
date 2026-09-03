@@ -1780,6 +1780,23 @@ async fn list(
                 total_tokens: s.total_tokens,
                 started_at: s.started_at,
             }),
+            // `<global>/transcripts/` is a shared namespace: `run:` step
+            // transcripts, action-step transcripts and per-run netflow
+            // ledgers all live here under the same `run_<ulid>.jsonl`
+            // naming, each with its own schema. Those are not agent
+            // transcripts and were never meant for this listing — skip
+            // them at debug level. Warning per file made this command (and
+            // the `rupu cp serve` terminal it shares stderr with) emit
+            // thousands of lines of noise per invocation while saying
+            // nothing an operator could act on. A genuine read failure —
+            // permissions, a bad mount — is still a warning.
+            Err(rupu_transcript::ReadError::NotAnAgentTranscript { first_tag }) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    first_record = first_tag.as_deref().unwrap_or("<empty file>"),
+                    "not an agent transcript; skipping"
+                );
+            }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "skipping unreadable transcript");
             }
