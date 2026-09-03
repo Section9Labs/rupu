@@ -42,6 +42,42 @@ use rupu_orchestrator::runner::{
 /// the other end of the run as the startup race this loop already handles.
 const POLL_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
+/// How long a placed run may take to be OBSERVED AT ALL before the
+/// coordinator stops waiting.
+///
+/// [`POLL_MAX_WALL`] is the right budget for a run that is demonstrably
+/// alive, and the wrong budget for a run that never started. The two are
+/// different failures and this loop must not conflate them:
+///
+/// * observed-and-slow — the host answered `get_run` at least once, so the
+///   run exists and is doing work. Four hours.
+/// * never-observed — `get_run` has never once succeeded. Either the remote
+///   `rupu` has not registered the run YET (the startup race
+///   [`POLL_MAX_WALL`]'s predecessor got wrong, see the `observed` flag
+///   below), or it never will because the launch died. Those are
+///   indistinguishable from here, so the bound must be long enough to lose
+///   the race honestly and short enough to fail fast when there is no race
+///   to win.
+///
+/// Measured in production: a remote agent died in `launch_agent`'s detached
+/// process with `save worker record: io rename …: No such file or directory`
+/// and never wrote `run.json`. The coordinator polled it for over 90 minutes
+/// and would have gone to four hours — and because the fan-out step had
+/// `max_parallel: 2`, two such units held both semaphore slots and the whole
+/// workflow stopped making progress while still looking healthy.
+///
+/// Five minutes is chosen against the real startup cost, not as a guess:
+/// staging a ~50 MB workspace over SSH has been measured at ~60 s on this
+/// fleet, and the remote process start (config read, provider resolution,
+/// run registration) is seconds on top. Five minutes is ~5× that, so a
+/// genuinely slow launch still wins; it is also ~48× shorter than the wall
+/// budget, so a launch that never happened surfaces while an operator is
+/// still looking at the run rather than after it has blocked a fan-out for
+/// half a working day. Anything much below ~3 minutes would start racing
+/// large-workspace staging again — the exact #645 regression — and anything
+/// much above ~10 minutes stops being a fast failure.
+const POLL_MAX_STARTUP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Poll interval for the first [`POLL_FAST_ATTEMPTS`] polls.
 ///
 /// Kept tight so a short run — the common case for a probe or a precondition
@@ -230,11 +266,21 @@ impl UnitDispatcher for FleetUnitDispatcher {
         // detached, so registration is asynchronous — and we retry. Once the
         // run has been read even once the host demonstrably knows it, so any
         // later error is real and propagates immediately, exactly as before.
+        //
+        // `observed` also selects WHICH deadline governs. A run that has been
+        // seen alive gets the full `POLL_MAX_WALL`; a run that has never been
+        // seen at all gets only `POLL_MAX_STARTUP`, because "launched but
+        // never registered" is a launch failure, not a long run, and waiting
+        // four hours for it holds a fan-out semaphore slot the whole time.
+        // The deadline only ever LENGTHENS: once `observed` flips true the
+        // wall budget applies and is never shortened again.
         let mut observed = false;
         let mut last_startup_err: Option<String> = None;
-        let deadline = tokio::time::Instant::now() + POLL_MAX_WALL;
+        let started = tokio::time::Instant::now();
+        let deadline = started + POLL_MAX_WALL;
+        let startup_deadline = started + POLL_MAX_STARTUP;
         let mut attempt: u32 = 0;
-        while tokio::time::Instant::now() < deadline {
+        while tokio::time::Instant::now() < if observed { deadline } else { startup_deadline } {
             if attempt > 0 {
                 tokio::time::sleep(poll_interval_for(attempt)).await;
             }
@@ -345,9 +391,15 @@ impl UnitDispatcher for FleetUnitDispatcher {
             // "does not support `rupu run show`" that was a dead process.
             Some(err) => {
                 let mut msg = format!(
-                    "remote unit run {run_id} never registered on host {host} \
-                     after {attempt} polls; the launch was accepted but \
-                     the host never reported the run. Last poll error: {err}"
+                    "remote unit run {run_id} never registered on host {host}: \
+                     gave up after {attempt} polls over {}s (the startup \
+                     deadline, not the {}h run budget) WITHOUT EVER OBSERVING \
+                     THE RUN. The launch was accepted but the host never \
+                     reported the run even once, so the remote process almost \
+                     certainly died before registering it — check that host's \
+                     launch log for this run. Last poll error: {err}",
+                    POLL_MAX_STARTUP.as_secs(),
+                    POLL_MAX_WALL.as_secs() / 3600,
                 );
                 if let Some(diag) = conn.launch_diagnostics(&run_id).await {
                     msg.push_str(&format!(
@@ -1302,5 +1354,136 @@ steps:
             conn.calls.lock().unwrap().contains(&"launch_diagnostics"),
             "the dispatcher must ask the connector for the launch log"
         );
+    }
+
+    // ── Startup-deadline tests ────────────────────────────────────────────────
+    //
+    // `POLL_MAX_WALL` is the budget for a run that is ALIVE. Applying it to a
+    // run that was never observed is what let a dead remote launch hold a
+    // fan-out semaphore slot for hours. These three tests pin all three sides
+    // of the split: never-observed fails fast, a realistically-slow startup
+    // still wins the race (#645), and an observed long run keeps the full
+    // wall budget (#649).
+
+    /// A placed run whose `get_run` NEVER succeeds must fail at
+    /// [`POLL_MAX_STARTUP`], not at [`POLL_MAX_WALL`].
+    ///
+    /// Measured in production: a remote agent died at launch
+    /// (`save worker record: io rename …: No such file or directory`) and
+    /// never wrote `run.json`. The coordinator polled it for 90+ minutes and
+    /// was on course for four hours; with `max_parallel: 2`, two such units
+    /// held both slots and the workflow silently stopped progressing.
+    ///
+    /// Paused virtual clock, so the whole budget resolves instantly and the
+    /// elapsed VIRTUAL time is an exact assertion about which deadline fired.
+    #[tokio::test(start_paused = true)]
+    async fn never_observed_run_fails_at_the_startup_deadline_not_the_wall_budget() {
+        let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
+        fake.launch_stderr = Some("[error] save worker record: io rename ...: No such file");
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        let t0 = tokio::time::Instant::now();
+        let err = d
+            .dispatch_unit(make_unit(), "h1")
+            .await
+            .unwrap_err()
+            .to_string();
+        let elapsed = t0.elapsed();
+
+        // The load-bearing assertion: which deadline fired. The loop can only
+        // overshoot by the interval it was sleeping when the deadline passed,
+        // so allow one slow interval of slack — and nothing like four hours.
+        assert!(
+            elapsed >= POLL_MAX_STARTUP && elapsed < POLL_MAX_STARTUP + POLL_INTERVAL_SLOW * 2,
+            "a never-observed run must give up at the {}s startup deadline, \
+             not the {}s wall budget; gave up after {}s",
+            POLL_MAX_STARTUP.as_secs(),
+            POLL_MAX_WALL.as_secs(),
+            elapsed.as_secs()
+        );
+
+        // The operator must be told the cause, not just that time ran out.
+        assert!(err.contains("never registered"), "{err}");
+        assert!(
+            err.contains("WITHOUT EVER OBSERVING THE RUN"),
+            "the error must say plainly that the run was never observed: {err}"
+        );
+        // The underlying `get_run` error — the thing that actually explains it.
+        assert!(
+            err.contains("unknown run"),
+            "the error must carry the underlying get_run error: {err}"
+        );
+        assert!(
+            err.contains("launch log"),
+            "the error must point at the operator's next move: {err}"
+        );
+        // And the remote process's own stderr when the connector kept it.
+        assert!(
+            err.contains("save worker record"),
+            "the remote launch stderr must reach the operator: {err}"
+        );
+    }
+
+    /// A REALISTIC slow startup is still won, not cut off — the #645
+    /// regression must not come back through the new deadline.
+    ///
+    /// 66 failing polls is ~60 s of virtual time under `poll_interval_for`
+    /// (59 fast polls = 29.5 s, then 5 s each), which is the measured cost of
+    /// staging a ~50 MB workspace over SSH before the remote `rupu` starts.
+    /// That is comfortably inside [`POLL_MAX_STARTUP`] — the whole point of
+    /// choosing five minutes rather than the 60 s the pre-#649 bound gave.
+    #[tokio::test(start_paused = true)]
+    async fn run_observed_after_a_realistic_startup_delay_still_completes() {
+        let conn = Arc::new(FakeConnector::completed_after_startup_delay(66));
+        let d = FleetUnitDispatcher::from_connector(conn);
+
+        let t0 = tokio::time::Instant::now();
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            out.success,
+            "a run that registers after a realistic staging delay must complete"
+        );
+        assert_eq!(out.output, "fake-out");
+        assert!(
+            elapsed < POLL_MAX_STARTUP,
+            "sanity: this delay must sit inside the startup deadline, took {}s",
+            elapsed.as_secs()
+        );
+    }
+
+    /// Once the run HAS been observed, the full [`POLL_MAX_WALL`] budget
+    /// governs — the startup deadline must never shorten a run that is
+    /// demonstrably alive (#649).
+    ///
+    /// The fake first loses the startup race for 5 polls, then reports
+    /// `running` for 400 more — ~29 minutes of virtual time, far past
+    /// [`POLL_MAX_STARTUP`] — before completing. If the startup deadline
+    /// leaked into the observed path this would fail instead of completing.
+    #[tokio::test(start_paused = true)]
+    async fn observed_long_run_keeps_the_full_wall_clock_budget() {
+        let mut fake = FakeConnector::completed_after_startup_delay(5);
+        fake.non_terminal_polls = std::sync::atomic::AtomicU32::new(400);
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(conn);
+
+        let t0 = tokio::time::Instant::now();
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            out.success,
+            "an observed long-running placed run must complete, not time out"
+        );
+        assert_eq!(out.output, "fake-out");
+        assert!(
+            elapsed > POLL_MAX_STARTUP,
+            "this run must outlive the startup deadline for the test to mean \
+             anything; it only took {}s",
+            elapsed.as_secs()
+        );
+        assert!(elapsed < POLL_MAX_WALL, "and stay inside the wall budget");
     }
 }

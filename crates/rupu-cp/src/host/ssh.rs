@@ -573,6 +573,31 @@ impl RemoteExec for SshExec {
 /// or when the pump attaches after a fast run).
 const PUMP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a tail pump waits for ANY sign that its run exists on the host
+/// before giving up and finalizing it as failed.
+///
+/// `tail -n +1 -F` NEVER exits on its own: it retries missing paths forever.
+/// The pump's only two exits are (a) the interval arm observing a terminal
+/// `run.json` and (b) the tail stream ending. For a run whose remote process
+/// died before creating `$HOME/.rupu/runs/<run_id>/` at all, NEITHER can ever
+/// happen — `run.json` never appears, and `tail -F` sits on four paths that
+/// never appear either. The pump then spins forever, holding an ssh session
+/// and a remote `tail` process. Measured in production: two such pumps
+/// outlived their runs by 3h40m and 1h39m.
+///
+/// (A CANCELLED run is NOT this case and never was: `cancel_run` shells
+/// `rupu workflow cancel` on the remote, which writes a terminal status into
+/// `run.json`, so the interval arm sees it and the pump exits normally.)
+///
+/// Deliberately the same five minutes as `rupu-cli`'s `POLL_MAX_STARTUP`, and
+/// for the same reason: both are waiting on exactly one event — the remote
+/// `rupu` registering the run — so they should give up on it together. Same
+/// justification too: ~5x the ~60 s measured for staging a ~50 MB workspace
+/// over SSH plus process start, which is enough that a genuinely slow launch
+/// still gets mirrored, and short enough that a launch that never happened
+/// does not strand an ssh session for hours.
+const PUMP_STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Returns `true` when `status` is a terminal [`rupu_orchestrator::RunStatus`]
 /// serialized value.  Mirrors [`RunStatus::is_terminal`] using the
 /// `#[serde(rename_all = "snake_case")]` wire form.
@@ -599,11 +624,29 @@ async fn pump_catch_up_transcript(
     }
 }
 
+/// What one [`pump_finalize_if_terminal`] probe learned about the run.
+///
+/// The pump needs BOTH bits this carries. `Finalized` is its exit condition;
+/// `Absent` vs `Alive` is how it tells "the host has no record of this run at
+/// all" from "the run exists and is still working", which is what
+/// [`PUMP_STARTUP_DEADLINE`] is bounded against. Folding those two into one
+/// `false` is what left the pump with no way to distinguish a run that had
+/// not started yet from one that never would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpProbe {
+    /// `run.json` could not be read (missing, unreachable, empty, unparseable).
+    Absent,
+    /// `run.json` was read and its status is non-terminal — the run exists.
+    Alive,
+    /// `run.json` was read, its status is terminal, and the run was finished.
+    Finalized,
+}
+
 /// One terminal-status probe for the tail pump: `cat run.json`; if the status
 /// is terminal, mirror the record, catch up the transcript, and `finish` the
-/// run. Returns `true` when the run was finalized (the pump should stop).
-/// Shared by the pump's interval tick and its dispatcher nudge so both paths
-/// finalize identically.
+/// run. Returns [`PumpProbe::Finalized`] when the run was finalized (the pump
+/// should stop). Shared by the pump's interval tick and its dispatcher nudge
+/// so both paths finalize identically.
 async fn pump_finalize_if_terminal(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
@@ -611,22 +654,24 @@ async fn pump_finalize_if_terminal(
     host_id: &str,
     cat_cmd: &str,
     cat_transcript_cmd: &str,
-) -> bool {
+) -> PumpProbe {
     let Ok(out) = exec.run(cat_cmd).await else {
-        return false;
+        return PumpProbe::Absent;
     };
     if !out.success || out.stdout.trim().is_empty() {
-        return false;
+        return PumpProbe::Absent;
     }
     let trimmed = out.stdout.trim().to_string();
     let Ok(rec) = serde_json::from_str::<serde_json::Value>(&trimmed) else {
-        return false;
+        return PumpProbe::Absent;
     };
     let Some(status) = rec.get("status").and_then(|v| v.as_str()) else {
-        return false;
+        return PumpProbe::Absent;
     };
     if !is_terminal_status(status) {
-        return false;
+        // The host HAS a record for this run — it is simply not done. That is
+        // the signal that clears the startup deadline.
+        return PumpProbe::Alive;
     }
     let status = status.to_string();
     let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
@@ -634,7 +679,7 @@ async fn pump_finalize_if_terminal(
     // transcript on disk.
     pump_catch_up_transcript(exec, mirror, run_id, host_id, cat_transcript_cmd).await;
     let _ = mirror.finish(run_id, host_id, &status);
-    true
+    PumpProbe::Finalized
 }
 
 /// Map a [`RemoteExecError`] from `run_bytes` to the corresponding
@@ -965,6 +1010,13 @@ impl SshHostConnector {
                 // Set to true when the interval-poll arm observes a terminal status
                 // and calls mirror.finish.  Used below to skip the fallback cat.
                 let mut terminal_seen = false;
+                // Set to true the first time the host shows ANY sign that this
+                // run exists: a `==>` header from `tail` (the file is there) or
+                // a readable `run.json`. Until then the pump is bounded by
+                // PUMP_STARTUP_DEADLINE — see that constant for why a pump with
+                // no such bound spins forever on a launch that died.
+                let mut run_seen_on_host = false;
+                let pump_started = tokio::time::Instant::now();
                 // Set once the transcript's first `==>` header is seen. `tail -n +1`
                 // replays the file from byte zero, so the FIRST header (the initial
                 // full replay) truncates the mirrored copy — a respawned pump then
@@ -982,6 +1034,12 @@ impl SshHostConnector {
                                 match maybe_line {
                                     Some(Ok(line)) => {
                                         if let Some(path) = parse_tail_marker(&line) {
+                                            // A `==>` header means `tail` actually
+                                            // OPENED one of the run's artifact files,
+                                            // so the run exists on the host. (stderr
+                                            // is /dev/null, so an unopenable path
+                                            // produces no line at all.)
+                                            run_seen_on_host = true;
                                             // Route subsequent lines based on filename
                                             // suffix — the expanded absolute path from
                                             // `tail` still ends with the same basename.
@@ -1023,26 +1081,54 @@ impl SshHostConnector {
                                 }
                             }
                             _ = interval.tick() => {
-                                if pump_finalize_if_terminal(
+                                match pump_finalize_if_terminal(
                                     exec.as_ref(), &mirror, &run_id, &host_id,
                                     &cat_cmd, &cat_transcript_cmd,
                                 ).await {
-                                    terminal_seen = true;
+                                    PumpProbe::Finalized => {
+                                        terminal_seen = true;
+                                        break;
+                                        // Dropping `stream` below kills the ssh child
+                                        // via kill_on_drop.
+                                    }
+                                    PumpProbe::Alive => run_seen_on_host = true,
+                                    PumpProbe::Absent => {}
+                                }
+                                // The run has never once been seen on the host and
+                                // the startup deadline has passed: the launch died
+                                // before registering it, so nothing will ever end
+                                // this pump. Break to the fallback below, which
+                                // finishes the run as failed; dropping `stream`
+                                // kills the ssh child and the remote `tail` with it.
+                                if !run_seen_on_host
+                                    && pump_started.elapsed() >= PUMP_STARTUP_DEADLINE
+                                {
+                                    tracing::warn!(
+                                        host_id = %host_id,
+                                        run_id = %run_id,
+                                        deadline_secs = PUMP_STARTUP_DEADLINE.as_secs(),
+                                        "tail pump never saw this run on the host \
+                                         within the startup deadline; abandoning the \
+                                         mirror so the ssh session and remote tail \
+                                         are not held open indefinitely"
+                                    );
                                     break;
-                                    // Dropping `stream` below kills the ssh child
-                                    // via kill_on_drop.
                                 }
                             }
                             _ = nudge.notified() => {
                                 // A dispatcher already observed terminal through
                                 // its own `get_run` poll and is waiting on us:
                                 // probe now rather than at the next interval tick.
-                                if pump_finalize_if_terminal(
+                                match pump_finalize_if_terminal(
                                     exec.as_ref(), &mirror, &run_id, &host_id,
                                     &cat_cmd, &cat_transcript_cmd,
                                 ).await {
-                                    terminal_seen = true;
-                                    break;
+                                    PumpProbe::Finalized => {
+                                        terminal_seen = true;
+                                        break;
+                                    }
+                                    PumpProbe::Alive => run_seen_on_host = true,
+                                    PumpProbe::Absent => {}
                                 }
                             }
                         }
@@ -3590,6 +3676,144 @@ mod tests {
         assert!(
             contents.contains(event_json),
             "expected event line in events.jsonl, got: {contents:?}"
+        );
+    }
+
+    /// Wait, on the PAUSED virtual clock, for the pump to move `run_id` out of
+    /// `Running`. Returns the virtual time it took, or `None` if it never did
+    /// within `bound`. The sleep is what lets tokio auto-advance virtual time
+    /// (it jumps to the earliest pending timer, which is the pump's own
+    /// `PUMP_POLL_INTERVAL` tick), so `PUMP_STARTUP_DEADLINE` resolves in
+    /// milliseconds of real time.
+    async fn wait_for_pump_to_finish(
+        run_store: &rupu_orchestrator::RunStore,
+        run_id: &str,
+        bound: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        let t0 = tokio::time::Instant::now();
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.status != rupu_orchestrator::RunStatus::Running {
+                return Some(t0.elapsed());
+            }
+            if t0.elapsed() >= bound {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    /// A run whose remote process died before creating ANY of its artifacts
+    /// must not leave a tail pump behind.
+    ///
+    /// `tail -n +1 -F` never exits on its own — it retries missing paths
+    /// forever — and `cat run.json` never succeeds for a run directory that
+    /// was never created, so before `PUMP_STARTUP_DEADLINE` the pump had NO
+    /// reachable exit: it spun indefinitely holding an ssh session and a
+    /// remote `tail`. Measured in production: two such pumps outlived their
+    /// runs by 3h40m and 1h39m.
+    ///
+    /// `FakeExec::ok(vec![])` is exactly that host: the tail stream yields no
+    /// lines and then pends forever (no `==>` header, because `tail` could
+    /// not open any of the four paths and its stderr goes to /dev/null), and
+    /// `cat` answers empty stdout. The pump must give up at the deadline and
+    /// finish the run as failed rather than leave it `Running` forever.
+    #[tokio::test(start_paused = true)]
+    async fn tail_pump_abandons_a_run_that_never_appears_on_the_host() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let run_id = "run_01TESTPUMPDEAD";
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "dead-launch".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let took = wait_for_pump_to_finish(
+            &run_store,
+            run_id,
+            PUMP_STARTUP_DEADLINE + std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect(
+            "the pump must give up on a run that never appears on the host, \
+             not hold its ssh session open forever",
+        );
+
+        assert!(
+            took >= PUMP_STARTUP_DEADLINE && took < PUMP_STARTUP_DEADLINE + PUMP_POLL_INTERVAL * 5,
+            "the pump must give up at the {}s startup deadline; took {}s",
+            PUMP_STARTUP_DEADLINE.as_secs(),
+            took.as_secs()
+        );
+
+        // A run that never started is a failed run, not a running one — the
+        // same "never stuck in Running" contract the stream-end fallback has.
+        assert_eq!(
+            run_store.load(run_id).unwrap().status,
+            rupu_orchestrator::RunStatus::Failed
+        );
+
+        // And the pump must have deregistered itself, so a later
+        // `await_run_mirror` finds nothing to wait for.
+        assert!(
+            conn.pumps.lock().unwrap().get(run_id).is_none(),
+            "the pump must deregister when it gives up"
+        );
+    }
+
+    /// The startup deadline must bound only the NEVER-SEEN case. A run whose
+    /// artifacts `tail` actually opened has demonstrably started, so the pump
+    /// keeps mirroring it past the deadline — cutting it off there would be
+    /// the same class of bug as the 60 s poll budget #649 removed, one layer
+    /// down.
+    ///
+    /// Here `tail` emits a `==>` header (so the run is seen) but `run.json` is
+    /// never readable, so the deadline is the ONLY thing that could end this
+    /// pump. It must not.
+    #[tokio::test(start_paused = true)]
+    async fn tail_pump_keeps_mirroring_a_run_it_has_seen_past_the_startup_deadline() {
+        let run_id = "run_01TESTPUMPSEEN";
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![format!(
+            "==> /home/ci/.rupu/transcripts/{run_id}.jsonl <=="
+        )]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "slow-but-alive".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let gave_up = wait_for_pump_to_finish(
+            &run_store,
+            run_id,
+            PUMP_STARTUP_DEADLINE + std::time::Duration::from_secs(120),
+        )
+        .await;
+
+        assert!(
+            gave_up.is_none(),
+            "a run the pump has already seen on the host must not be \
+             abandoned at the startup deadline (gave up after {:?})",
+            gave_up
         );
     }
 
