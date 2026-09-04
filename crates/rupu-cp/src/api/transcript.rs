@@ -192,6 +192,48 @@ fn map_conn_err(host_id: &str, e: HostConnectorError) -> ApiError {
     }
 }
 
+/// Validate `raw` against the LOCAL allowed roots. This is the legacy
+/// fallback path for a connector that doesn't implement the lazy cache
+/// (`Unsupported` from `pull_transcript` / `ensure_transcript_feed`): today's
+/// behaviour for HTTP hosts is to proxy at the connector level (its own
+/// `get_transcript` call), and for tunnel/bucket hosts a remote-only recorded
+/// path is never found under the local roots, so this simply 400s "outside
+/// the allowed roots" — exactly what happens on `main` for those host types.
+fn validate_local(s: &AppState, raw: &str) -> ApiResult<PathBuf> {
+    validate_transcript_path(raw, &allowed_roots(s)).map_err(ApiError::bad_request)
+}
+
+/// Classifies the outcome of `HostConnector::pull_transcript` for
+/// `get_transcript`'s remote cache-miss arm.
+enum PullOutcome {
+    /// The pull succeeded; serve the (now up to date) cache file.
+    ServeCache,
+    /// The host was unreachable, but a previous pull already left something
+    /// on disk — serve it, flagged (§4.2).
+    ServePartial,
+    /// This connector doesn't implement the lazy cache at all (the trait
+    /// default `Unsupported`) — fall back to its own whole-page
+    /// `get_transcript`, i.e. today's behaviour for HTTP/Tunnel/Bucket hosts.
+    ProxyLegacy,
+    /// Any other error, already mapped to its final `ApiError`.
+    Fail(ApiError),
+}
+
+/// Pure classification of a `pull_transcript` result. `cache` is inspected
+/// only in the `Unreachable` case (§4.2's partial-serve rule).
+fn map_pull_result(
+    host_id: &str,
+    cache: &Path,
+    res: Result<(), HostConnectorError>,
+) -> PullOutcome {
+    match res {
+        Ok(()) => PullOutcome::ServeCache,
+        Err(HostConnectorError::Unreachable(_)) if cache.exists() => PullOutcome::ServePartial,
+        Err(HostConnectorError::Unsupported(_)) => PullOutcome::ProxyLegacy,
+        Err(e) => PullOutcome::Fail(map_conn_err(host_id, e)),
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/transcript", get(get_transcript))
@@ -205,11 +247,13 @@ pub fn routes() -> Router<AppState> {
 ///
 /// With `?host=<remote-id>`: read through the connector's lazy transcript
 /// cache (spec §3.3). A validated local file wins outright; otherwise a
-/// complete cache is served as-is; an incomplete/absent cache with `?run=<id>`
-/// triggers a `pull_transcript` (`run` checks the path is one the run itself
-/// claims); an incomplete/absent cache WITHOUT `run` falls back to the
-/// connector's own `get_transcript`, preserving today's whole-page proxy for
-/// host types that haven't adopted the lazy cache (HTTP, Tunnel, Bucket).
+/// complete cache is served as-is; an incomplete/absent cache WITHOUT `run`
+/// falls back to the connector's own `get_transcript` (no run-scoped claim to
+/// check yet); WITH `run` it triggers `pull_transcript` (`run` checks the
+/// path is one the run itself claims) — and if THAT comes back `Unsupported`
+/// (the connector never implemented the lazy cache: HTTP, tunnel, bucket),
+/// falls back to `get_transcript` all the same, so a client that always sends
+/// `run` doesn't regress those host types (see [`PullOutcome::ProxyLegacy`]).
 /// Unknown host id → 404; a host unreachable with nothing cached on disk →
 /// 502; unreachable with a partial file on disk → 200 with `"partial": true`.
 async fn get_transcript(
@@ -248,24 +292,30 @@ async fn get_transcript(
                     .load(run_id)
                     .map(|r| r.status.is_terminal())
                     .unwrap_or(false);
-                match conn
+                let pull = conn
                     .pull_transcript(run_id, Path::new(&q.path), terminal)
-                    .await
-                {
-                    Ok(()) => Ok(Json(read_local_page(&cache)?)),
-                    // Unreachable with something on disk: serve it, flagged (§4.2).
-                    Err(HostConnectorError::Unreachable(_)) if cache.exists() => {
-                        Ok(Json(mark_partial(read_local_page(&cache)?)))
+                    .await;
+                match map_pull_result(host_id, &cache, pull) {
+                    PullOutcome::ServeCache => Ok(Json(read_local_page(&cache)?)),
+                    PullOutcome::ServePartial => Ok(Json(mark_partial(read_local_page(&cache)?))),
+                    // This connector never implemented the lazy cache (HTTP,
+                    // tunnel, bucket) — fall back to its own whole-page proxy,
+                    // exactly as it behaved before this endpoint learned `run`.
+                    PullOutcome::ProxyLegacy => {
+                        let result = conn
+                            .get_transcript(&q.path)
+                            .await
+                            .map_err(|e| map_conn_err(host_id, e))?;
+                        Ok(Json(result))
                     }
-                    Err(e) => Err(map_conn_err(host_id, e)),
+                    PullOutcome::Fail(e) => Err(e),
                 }
             }
         };
     }
 
     // Local path: validate against allowed roots then read from disk.
-    let path =
-        validate_transcript_path(&q.path, &allowed_roots(&s)).map_err(ApiError::bad_request)?;
+    let path = validate_local(&s, &q.path)?;
     Ok(Json(read_local_page(&path)?))
 }
 
@@ -309,7 +359,10 @@ fn read_events_counting_unparsed(
 /// except an incomplete cache is fed by [`HostConnector::ensure_transcript_feed`]
 /// rather than a one-shot pull — the returned [`FeedGuard`] is held for the
 /// whole lifetime of the SSE stream so the remote tail is released the moment
-/// the client disconnects.
+/// the client disconnects. A connector that returns `Unsupported` (HTTP,
+/// tunnel, bucket — no lazy cache) falls back to validating `path` against
+/// the LOCAL allowed roots and tailing it locally, i.e. today's behaviour
+/// (typically a 400, since a genuinely remote path is never local).
 ///
 /// [`TranscriptTail`]: crate::transcript_tail::TranscriptTail
 async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) -> Response {
@@ -317,9 +370,9 @@ async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) ->
     // Held for the SSE stream's lifetime (moved into the map closure below).
     let mut guard: Option<FeedGuard> = None;
     let path = if host_id == "local" {
-        match validate_transcript_path(&q.path, &allowed_roots(&s)) {
+        match validate_local(&s, &q.path) {
             Ok(p) => p,
-            Err(e) => return ApiError::bad_request(e).into_response(),
+            Err(e) => return e.into_response(),
         }
     } else {
         match resolve_remote(&s, host_id, &q.path) {
@@ -353,6 +406,14 @@ async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) ->
                         guard = Some(g);
                         cache
                     }
+                    // This connector never implemented the lazy cache (HTTP,
+                    // tunnel, bucket) — fall back to today's local-only
+                    // validate+tail (a remote-only path 400s "outside the
+                    // allowed roots", exactly as it does on `main`).
+                    Err(HostConnectorError::Unsupported(_)) => match validate_local(&s, &q.path) {
+                        Ok(p) => p,
+                        Err(e) => return e.into_response(),
+                    },
                     Err(e) => return map_conn_err(host_id, e).into_response(),
                 }
             }
@@ -432,6 +493,60 @@ mod remote_read_tests {
         assert!(page.get("partial").is_none());
         let flagged = mark_partial(page);
         assert_eq!(flagged["partial"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn map_pull_result_classifies_every_outcome() {
+        use axum::http::StatusCode;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Ok → serve the (now current) cache, whether or not it existed before.
+        let cache = tmp.path().join("t.jsonl");
+        assert!(matches!(
+            map_pull_result("h", &cache, Ok(())),
+            PullOutcome::ServeCache
+        ));
+
+        // Unreachable + something already on disk → serve it, partial.
+        std::fs::write(&cache, "").unwrap();
+        assert!(matches!(
+            map_pull_result(
+                "h",
+                &cache,
+                Err(HostConnectorError::Unreachable("down".into()))
+            ),
+            PullOutcome::ServePartial
+        ));
+
+        // Unreachable + nothing on disk → a hard failure, 502.
+        let absent = tmp.path().join("missing.jsonl");
+        match map_pull_result(
+            "h",
+            &absent,
+            Err(HostConnectorError::Unreachable("down".into())),
+        ) {
+            PullOutcome::Fail(e) => assert_eq!(e.0, StatusCode::BAD_GATEWAY),
+            _ => panic!("expected Fail(502) for an unreachable host with nothing cached"),
+        }
+
+        // Unsupported → this connector never implemented the lazy cache;
+        // the caller falls back to the connector's own `get_transcript`.
+        assert!(matches!(
+            map_pull_result(
+                "h",
+                &cache,
+                Err(HostConnectorError::Unsupported("no".into()))
+            ),
+            PullOutcome::ProxyLegacy
+        ));
+
+        // Invalid (the run doesn't claim this path, or it's owned by another
+        // host) → a hard failure, 400.
+        match map_pull_result("h", &cache, Err(HostConnectorError::Invalid("bad".into()))) {
+            PullOutcome::Fail(e) => assert_eq!(e.0, StatusCode::BAD_REQUEST),
+            _ => panic!("expected Fail(400) for an invalid pull"),
+        }
     }
 }
 

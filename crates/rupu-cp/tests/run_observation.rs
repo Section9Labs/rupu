@@ -531,6 +531,54 @@ async fn get_transcript_proxies_to_remote_host() {
     );
 }
 
+/// The same proxy behaviour holds when the caller also sends `&run=<id>`
+/// (Tasks 10/11's web/macOS clients send `run` on every remote transcript
+/// read, unconditionally). An `HttpHostConnector` doesn't implement the lazy
+/// cache (`pull_transcript`'s trait default is `Unsupported`), so the handler
+/// must fall back to the connector's own `get_transcript` proxy rather than
+/// 400ing — this is the regression the pre-review fix closed.
+#[tokio::test]
+async fn get_transcript_proxies_to_remote_host_with_run_param() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let transcript_body = serde_json::json!({
+        "events": [{"type": "assistant_message", "content": "hello"}],
+        "summary": null
+    });
+
+    let mock_server = httpmock::MockServer::start_async().await;
+    let _m = mock_server.mock(|when, then| {
+        when.method("GET")
+            .path("/api/transcript")
+            .query_param("path", "/remote/run.jsonl");
+        then.status(200).json_body(transcript_body.clone());
+    });
+
+    let (addr, host_id) =
+        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/transcript?path=/remote/run.jsonl&host={host_id}&run=run_FAKE"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an Unsupported pull_transcript must fall back to the connector's own \
+         get_transcript proxy, not 400"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["events"].is_array(),
+        "proxied transcript response should have events array"
+    );
+}
+
 /// `GET /api/transcript?path=<p>&host=<unknown>` → 404.
 #[tokio::test]
 async fn get_transcript_unknown_host_returns_404() {
