@@ -20,8 +20,11 @@
 use crate::{ModelPricing, PricingConfig};
 
 /// Built-in USD-per-million-tokens defaults for the major models.
-/// Last reviewed: 2026-05-07. Pricing drifts over time — users with
-/// strict cost reporting needs should override in config.
+/// Last reviewed: 2026-09-04 (OpenAI section against
+/// <https://developers.openai.com/api/docs/pricing>; Anthropic and
+/// Gemini sections last reviewed 2026-05-07). Pricing drifts over
+/// time — users with strict cost reporting needs should override in
+/// config.
 ///
 /// Provider keys use the canonical `ProviderId::auth_key()` strings;
 /// [`canonicalize_provider`] maps the friendly aliases users actually
@@ -72,6 +75,173 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
         },
     ),
     // ── OpenAI ────────────────────────────────────────────────────
+    // Standard-tier, short-context text rates from
+    // https://developers.openai.com/api/docs/pricing. OpenAI doubles
+    // input, cached-input, and output rates once a request crosses into
+    // its long-context tier; transcripts record token counts but not
+    // which tier OpenAI billed, so this table carries the short-context
+    // rate and under-bills long-context requests. Batch and Flex
+    // discounts and the Fast-mode uplift are likewise not modeled.
+    (
+        "openai-codex",
+        "gpt-6-astra",
+        ModelPricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 50.0,
+            cached_input_per_mtok: Some(1.0),
+        },
+    ),
+    // Promotional rate, published as available at least through 2026-11-21.
+    (
+        "openai-codex",
+        "gpt-5.6-sol",
+        ModelPricing {
+            input_per_mtok: 4.0,
+            output_per_mtok: 20.0,
+            cached_input_per_mtok: Some(0.40),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.6-terra",
+        ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 12.0,
+            cached_input_per_mtok: Some(0.20),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.6-luna",
+        ModelPricing {
+            input_per_mtok: 0.20,
+            output_per_mtok: 1.20,
+            cached_input_per_mtok: Some(0.02),
+        },
+    ),
+    // Daybreak cyber model; short-context tier only is published.
+    (
+        "openai-codex",
+        "gpt-5.6-cyber",
+        ModelPricing {
+            input_per_mtok: 12.50,
+            output_per_mtok: 75.0,
+            cached_input_per_mtok: Some(1.25),
+        },
+    ),
+    // Daybreak aliases: `blue` currently points at gpt-5.6-sol and `red` at
+    // gpt-5.6-cyber. OpenAI re-points these as new Daybreak models ship, so
+    // re-check them whenever the table is reviewed.
+    (
+        "openai-codex",
+        "gpt-daybreak-blue-latest",
+        ModelPricing {
+            input_per_mtok: 4.0,
+            output_per_mtok: 20.0,
+            cached_input_per_mtok: Some(0.40),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-daybreak-red-latest",
+        ModelPricing {
+            input_per_mtok: 12.50,
+            output_per_mtok: 75.0,
+            cached_input_per_mtok: Some(1.25),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.5",
+        ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 30.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    // Pro-tier models publish no cached-input rate; `None` bills cache hits
+    // at the full input rate rather than inventing a discount.
+    (
+        "openai-codex",
+        "gpt-5.5-pro",
+        ModelPricing {
+            input_per_mtok: 30.0,
+            output_per_mtok: 180.0,
+            cached_input_per_mtok: None,
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.4",
+        ModelPricing {
+            input_per_mtok: 2.50,
+            output_per_mtok: 15.0,
+            cached_input_per_mtok: Some(0.25),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.4-mini",
+        ModelPricing {
+            input_per_mtok: 0.75,
+            output_per_mtok: 4.50,
+            cached_input_per_mtok: Some(0.075),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.4-nano",
+        ModelPricing {
+            input_per_mtok: 0.20,
+            output_per_mtok: 1.25,
+            cached_input_per_mtok: Some(0.02),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.4-pro",
+        ModelPricing {
+            input_per_mtok: 30.0,
+            output_per_mtok: 180.0,
+            cached_input_per_mtok: None,
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.3-codex",
+        ModelPricing {
+            input_per_mtok: 1.75,
+            output_per_mtok: 14.0,
+            cached_input_per_mtok: Some(0.175),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.2",
+        ModelPricing {
+            input_per_mtok: 1.75,
+            output_per_mtok: 14.0,
+            cached_input_per_mtok: Some(0.175),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.2-pro",
+        ModelPricing {
+            input_per_mtok: 21.0,
+            output_per_mtok: 168.0,
+            cached_input_per_mtok: None,
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5.1",
+        ModelPricing {
+            input_per_mtok: 1.25,
+            output_per_mtok: 10.0,
+            cached_input_per_mtok: Some(0.125),
+        },
+    ),
     (
         "openai-codex",
         "gpt-5",
@@ -92,11 +262,142 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
     ),
     (
         "openai-codex",
+        "gpt-5-nano",
+        ModelPricing {
+            input_per_mtok: 0.05,
+            output_per_mtok: 0.40,
+            cached_input_per_mtok: Some(0.005),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-5-pro",
+        ModelPricing {
+            input_per_mtok: 15.0,
+            output_per_mtok: 120.0,
+            cached_input_per_mtok: None,
+        },
+    ),
+    // The ChatGPT-tuned alias listed under "Specialized models".
+    (
+        "openai-codex",
+        "chat-latest",
+        ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 30.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-4.1",
+        ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 8.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-4.1-mini",
+        ModelPricing {
+            input_per_mtok: 0.40,
+            output_per_mtok: 1.60,
+            cached_input_per_mtok: Some(0.10),
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-4.1-nano",
+        ModelPricing {
+            input_per_mtok: 0.10,
+            output_per_mtok: 0.40,
+            cached_input_per_mtok: Some(0.025),
+        },
+    ),
+    (
+        "openai-codex",
         "gpt-4o",
         ModelPricing {
             input_per_mtok: 2.50,
             output_per_mtok: 10.0,
             cached_input_per_mtok: Some(1.25),
+        },
+    ),
+    // The original gpt-4o snapshot is priced differently from the bare id.
+    // `lookup` tries the exact model string before date-stripping, so this
+    // entry wins for that snapshot and every other dated gpt-4o falls back
+    // to the `gpt-4o` row above.
+    (
+        "openai-codex",
+        "gpt-4o-2024-05-13",
+        ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 15.0,
+            cached_input_per_mtok: None,
+        },
+    ),
+    (
+        "openai-codex",
+        "gpt-4o-mini",
+        ModelPricing {
+            input_per_mtok: 0.15,
+            output_per_mtok: 0.60,
+            cached_input_per_mtok: Some(0.075),
+        },
+    ),
+    (
+        "openai-codex",
+        "o1",
+        ModelPricing {
+            input_per_mtok: 15.0,
+            output_per_mtok: 60.0,
+            cached_input_per_mtok: Some(7.50),
+        },
+    ),
+    (
+        "openai-codex",
+        "o1-pro",
+        ModelPricing {
+            input_per_mtok: 150.0,
+            output_per_mtok: 600.0,
+            cached_input_per_mtok: None,
+        },
+    ),
+    (
+        "openai-codex",
+        "o3",
+        ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 8.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    (
+        "openai-codex",
+        "o3-pro",
+        ModelPricing {
+            input_per_mtok: 20.0,
+            output_per_mtok: 80.0,
+            cached_input_per_mtok: None,
+        },
+    ),
+    (
+        "openai-codex",
+        "o3-mini",
+        ModelPricing {
+            input_per_mtok: 1.10,
+            output_per_mtok: 4.40,
+            cached_input_per_mtok: Some(0.55),
+        },
+    ),
+    (
+        "openai-codex",
+        "o4-mini",
+        ModelPricing {
+            input_per_mtok: 1.10,
+            output_per_mtok: 4.40,
+            cached_input_per_mtok: Some(0.275),
         },
     ),
     // ── Google Gemini ─────────────────────────────────────────────
@@ -400,6 +701,114 @@ mod tests {
         assert_eq!(strip_date_suffix("claude-sonnet-4-6"), "claude-sonnet-4-6");
         // Wrong-shape suffix: "-2025-X-07" → not a date, leave alone.
         assert_eq!(strip_date_suffix("gpt-5-2025-aa-07"), "gpt-5-2025-aa-07");
+    }
+
+    #[test]
+    fn openai_current_generation_models_priced_from_builtin() {
+        // Standard-tier short-context rates as published on
+        // developers.openai.com/api/docs/pricing (reviewed 2026-09-04).
+        let cfg = empty_cfg();
+        let p = lookup(&cfg, "openai", "gpt-5.4", "any").unwrap();
+        assert_eq!(p.input_per_mtok, 2.50);
+        assert_eq!(p.output_per_mtok, 15.0);
+        assert_eq!(p.cached_input_per_mtok, Some(0.25));
+
+        let cyber = lookup(&cfg, "openai-codex", "gpt-5.6-cyber", "any").unwrap();
+        assert_eq!(cyber.input_per_mtok, 12.50);
+        assert_eq!(cyber.output_per_mtok, 75.0);
+        assert_eq!(cyber.cached_input_per_mtok, Some(1.25));
+
+        let o3 = lookup(&cfg, "openai", "o3", "any").unwrap();
+        assert_eq!(o3.input_per_mtok, 2.0);
+        assert_eq!(o3.output_per_mtok, 8.0);
+        assert_eq!(o3.cached_input_per_mtok, Some(0.50));
+
+        let mini = lookup(&cfg, "openai", "gpt-4.1-mini", "any").unwrap();
+        assert_eq!(mini.input_per_mtok, 0.40);
+        assert_eq!(mini.output_per_mtok, 1.60);
+        assert_eq!(mini.cached_input_per_mtok, Some(0.10));
+    }
+
+    #[test]
+    fn openai_pro_models_have_no_cached_input_discount() {
+        // The pricing page shows no cached-input rate for the pro tier,
+        // so cache hits bill at the full input rate rather than a
+        // made-up discount.
+        let cfg = empty_cfg();
+        for model in [
+            "gpt-5.5-pro",
+            "gpt-5.4-pro",
+            "gpt-5.2-pro",
+            "gpt-5-pro",
+            "o1-pro",
+            "o3-pro",
+        ] {
+            let p = lookup(&cfg, "openai", model, "any").unwrap();
+            assert_eq!(p.cached_input_per_mtok, None, "{model}");
+            assert!(p.input_per_mtok > 0.0, "{model}");
+        }
+        let pro = lookup(&cfg, "openai", "gpt-5.5-pro", "any").unwrap();
+        assert_eq!(pro.input_per_mtok, 30.0);
+        assert_eq!(pro.output_per_mtok, 180.0);
+    }
+
+    #[test]
+    fn dated_gpt4o_snapshot_keeps_its_own_price_over_date_strip() {
+        // OpenAI prices `gpt-4o-2024-05-13` differently from the bare
+        // `gpt-4o`. The exact dated entry must win; a snapshot the table
+        // doesn't know (`gpt-4o-2024-08-06`) still falls back to `gpt-4o`.
+        let cfg = empty_cfg();
+        let snapshot = lookup(&cfg, "openai", "gpt-4o-2024-05-13", "any").unwrap();
+        assert_eq!(snapshot.input_per_mtok, 5.0);
+        assert_eq!(snapshot.output_per_mtok, 15.0);
+        assert_eq!(snapshot.cached_input_per_mtok, None);
+
+        let other = lookup(&cfg, "openai", "gpt-4o-2024-08-06", "any").unwrap();
+        assert_eq!(other.input_per_mtok, 2.50);
+    }
+
+    #[test]
+    fn daybreak_aliases_track_their_current_targets() {
+        // `gpt-daybreak-blue-latest` → gpt-5.6-sol,
+        // `gpt-daybreak-red-latest` → gpt-5.6-cyber (per the pricing page).
+        let cfg = empty_cfg();
+        let blue = lookup(&cfg, "openai", "gpt-daybreak-blue-latest", "any").unwrap();
+        let sol = lookup(&cfg, "openai", "gpt-5.6-sol", "any").unwrap();
+        assert_eq!(blue, sol);
+
+        let red = lookup(&cfg, "openai", "gpt-daybreak-red-latest", "any").unwrap();
+        let cyber = lookup(&cfg, "openai", "gpt-5.6-cyber", "any").unwrap();
+        assert_eq!(red, cyber);
+    }
+
+    #[test]
+    fn builtin_table_has_no_duplicate_keys_and_only_sane_rates() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (provider, model, price) in BUILTIN_PRICES {
+            assert!(
+                seen.insert((*provider, *model)),
+                "duplicate builtin price entry for {provider}/{model}"
+            );
+            for (label, rate) in [
+                ("input", Some(price.input_per_mtok)),
+                ("output", Some(price.output_per_mtok)),
+                ("cached", price.cached_input_per_mtok),
+            ] {
+                if let Some(rate) = rate {
+                    assert!(
+                        rate.is_finite() && rate >= 0.0,
+                        "{provider}/{model} {label} rate {rate} is not a sane price"
+                    );
+                }
+            }
+            if let Some(cached) = price.cached_input_per_mtok {
+                assert!(
+                    cached <= price.input_per_mtok,
+                    "{provider}/{model} cached rate {cached} exceeds input rate {}",
+                    price.input_per_mtok
+                );
+            }
+        }
     }
 
     #[test]
