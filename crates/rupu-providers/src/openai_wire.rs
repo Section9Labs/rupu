@@ -285,6 +285,12 @@ pub(crate) fn parse_chat_completion(
         Usage {
             input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            // Prompt-cache hits: `prompt_tokens_details.cached_tokens`, a
+            // subset of `prompt_tokens`. Absent on servers that don't
+            // report the breakdown.
+            cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32,
             ..Default::default()
         }
     } else {
@@ -315,6 +321,7 @@ pub(crate) struct CompletionAccumulator {
     pub stop_reason: Option<StopReason>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    cached_tokens: u32,
     /// Concatenated reasoning deltas.
     pub reasoning_text: String,
     /// Which of `REASONING_FIELDS` this stream used — first one wins. The echo
@@ -332,6 +339,7 @@ impl CompletionAccumulator {
             stop_reason: None,
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: 0,
             reasoning_text: String::new(),
             reasoning_field: None,
         }
@@ -380,6 +388,7 @@ impl CompletionAccumulator {
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                cached_tokens: self.cached_tokens,
                 ..Default::default()
             },
         })
@@ -472,13 +481,19 @@ pub(crate) fn process_completion_sse(
         if let Some(output) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
             acc.output_tokens = output as u32;
         }
+        // Prompt-cache hits: `prompt_tokens_details.cached_tokens`, a
+        // subset of `prompt_tokens`. Absent on servers that don't report
+        // the breakdown.
+        if let Some(cached) = u["prompt_tokens_details"]["cached_tokens"].as_u64() {
+            acc.cached_tokens = cached as u32;
+        }
         // `completion_tokens` already includes reasoning tokens on the
         // openai-compatible wire, so reasoning_tokens stays at 0 — see the
         // contrast note on `Usage::reasoning_tokens`.
         on_event(StreamEvent::UsageSnapshot(Usage {
             input_tokens: acc.input_tokens,
             output_tokens: acc.output_tokens,
-            cached_tokens: 0,
+            cached_tokens: acc.cached_tokens,
             reasoning_tokens: 0,
         }));
     }
@@ -521,6 +536,61 @@ mod tests {
         let resp = acc.into_response().expect("response");
         assert_eq!(resp.usage.input_tokens, 11);
         assert_eq!(resp.usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn streamed_usage_chunk_records_cached_prompt_tokens() {
+        // OpenAI reports prompt-cache hits under
+        // `usage.prompt_tokens_details.cached_tokens`; they are a SUBSET of
+        // `prompt_tokens`. Dropping them bills every cached token at the
+        // full input rate (10x the cached rate on gpt-5.x).
+        let mut acc = CompletionAccumulator::new();
+        let mut seen: Vec<Usage> = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::UsageSnapshot(u) = e {
+                seen.push(u);
+            }
+        };
+        process_completion_sse(
+            &ev(r#"{"id":"cmpl_1","model":"gpt-5.6-cyber","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":800}}}"#),
+            &mut acc,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].input_tokens, 1000);
+        assert_eq!(seen[0].cached_tokens, 800);
+
+        let resp = acc.into_response().expect("response");
+        assert_eq!(resp.usage.input_tokens, 1000);
+        assert_eq!(resp.usage.cached_tokens, 800);
+    }
+
+    #[test]
+    fn streamed_usage_without_details_leaves_cached_at_zero() {
+        // Servers that don't report the breakdown (local vLLM, older
+        // proxies) must still parse.
+        let mut acc = CompletionAccumulator::new();
+        let mut sink = |_e: StreamEvent| {};
+        process_completion_sse(
+            &ev(r#"{"id":"cmpl_1","model":"glm","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#),
+            &mut acc,
+            &mut sink,
+        )
+        .unwrap();
+        let resp = acc.into_response().expect("response");
+        assert_eq!(resp.usage.cached_tokens, 0);
+    }
+
+    #[test]
+    fn non_streaming_chat_completion_records_cached_prompt_tokens() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"id":"cmpl_2","model":"gpt-5.6-cyber","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":500,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":320}}}"#,
+        )
+        .unwrap();
+        let resp = parse_chat_completion(&json).unwrap();
+        assert_eq!(resp.usage.input_tokens, 500);
+        assert_eq!(resp.usage.cached_tokens, 320);
     }
 
     /// The single `Reasoning` block in a response, or panic.
