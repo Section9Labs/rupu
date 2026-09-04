@@ -671,13 +671,21 @@ impl OpenAiCodexClient {
                     if let Some(usage) = resp.get("usage") {
                         acc.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
                         acc.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+                        // Prompt-cache hits live under
+                        // `input_tokens_details.cached_tokens` and are a
+                        // subset of `input_tokens` — the convention the
+                        // cost calculator assumes. Absent on servers that
+                        // don't report the breakdown.
+                        acc.cached_tokens = usage["input_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0) as u32;
                         // `output_tokens` already includes reasoning tokens
                         // on the Codex wire, so reasoning_tokens stays at 0
                         // — see the contrast note on `Usage::reasoning_tokens`.
                         on_event(StreamEvent::UsageSnapshot(Usage {
                             input_tokens: acc.input_tokens,
                             output_tokens: acc.output_tokens,
-                            cached_tokens: 0,
+                            cached_tokens: acc.cached_tokens,
                             reasoning_tokens: 0,
                         }));
                     }
@@ -1174,6 +1182,7 @@ struct ResponseAccumulator {
     stop_reason: Option<StopReason>,
     input_tokens: u32,
     output_tokens: u32,
+    cached_tokens: u32,
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     current_tool_input: String,
@@ -1193,6 +1202,7 @@ impl ResponseAccumulator {
             stop_reason: None,
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: 0,
             current_tool_id: None,
             current_tool_name: None,
             current_tool_input: String::new(),
@@ -1225,6 +1235,7 @@ impl ResponseAccumulator {
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                cached_tokens: self.cached_tokens,
                 ..Default::default()
             },
         })
@@ -1636,6 +1647,42 @@ mod tests {
         assert!(events.iter().any(
             |event| event.contains("UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5")
         ));
+    }
+
+    #[test]
+    fn response_completed_records_cached_input_tokens() {
+        // The Responses API reports cache hits under
+        // `usage.input_tokens_details.cached_tokens`, a subset of
+        // `input_tokens`.
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
+        let client = OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
+        let mut acc = ResponseAccumulator::new();
+        let mut usages: Vec<Usage> = Vec::new();
+        let delta = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: r#"{"type":"response.output_text.delta","delta":"ok"}"#.into(),
+        };
+        client
+            .process_sse_event(&delta, &mut acc, &mut |_e| {})
+            .unwrap();
+        let completed = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: r#"{"type":"response.completed","response":{"id":"resp_c","model":"gpt-5.6-cyber","status":"completed","output":[],"usage":{"input_tokens":2000,"output_tokens":9,"input_tokens_details":{"cached_tokens":1536}}}}"#.into(),
+        };
+        client
+            .process_sse_event(&completed, &mut acc, &mut |e| {
+                if let StreamEvent::UsageSnapshot(u) = e {
+                    usages.push(u);
+                }
+            })
+            .unwrap();
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].input_tokens, 2000);
+        assert_eq!(usages[0].cached_tokens, 1536);
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.cached_tokens, 1536);
     }
 
     #[test]
