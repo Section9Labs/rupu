@@ -62,11 +62,12 @@ pub fn layer_files(global: Option<&Path>, project: Option<&Path>) -> Result<Conf
         (None, None) => Value::Table(toml::value::Table::new()),
     };
 
-    let cfg: Config = merged.try_into().map_err(|source| LayerError::Layered {
+    let mut cfg: Config = merged.try_into().map_err(|source| LayerError::Layered {
         global_path: global.map(|p| p.display().to_string()),
         project_path: project.map(|p| p.display().to_string()),
         source: Box::new(source),
     })?;
+    cfg.attach_provider_kinds();
     cfg.validate()?;
     Ok(cfg)
 }
@@ -136,6 +137,32 @@ fn deep_merge(base: Value, overlay: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_files_attaches_provider_account_kinds_to_pricing() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = dir.path().join("global.toml");
+        std::fs::write(
+            &g,
+            "[providers.openai-oracle]\nkind = \"openai\"\n\n[providers.anthropic]\nmax_retries = 3\n",
+        )
+        .unwrap();
+        let cfg = layer_files(Some(&g), None).unwrap();
+        assert_eq!(
+            cfg.pricing
+                .provider_kinds
+                .get("openai-oracle")
+                .map(String::as_str),
+            Some("openai")
+        );
+        // An account with no `kind` IS the vendor; nothing to map.
+        assert!(!cfg.pricing.provider_kinds.contains_key("anthropic"));
+
+        // End to end: the account name prices through the kind's table.
+        let p =
+            crate::pricing::lookup(&cfg.pricing, "openai-oracle", "gpt-5.6-cyber", "x").unwrap();
+        assert_eq!(p.input_per_mtok, 12.50);
+    }
 
     #[test]
     fn deep_merge_replaces_arrays() {

@@ -224,6 +224,7 @@ pub fn resolve(global: Option<&Path>, project: Option<&Path>) -> Result<Resolved
         );
     }
 
+    config.attach_provider_kinds();
     config.validate()?;
     Ok(Resolved { config, provenance })
 }
@@ -326,8 +327,7 @@ mod tests {
              output_per_mtok = 1.42\n\
              cached_input_per_mtok = 0.82\n",
         );
-        let r = resolve(Some(&g), None)
-            .expect("dotted model key must resolve, not error");
+        let r = resolve(Some(&g), None).expect("dotted model key must resolve, not error");
         let mp = r
             .config
             .pricing
@@ -396,9 +396,7 @@ mod tests {
         );
         let p = write_toml(d.path(), "p.toml", "log_level = \"debug\"\n");
         let via_layer = crate::layer_files(Some(&g), Some(&p)).unwrap();
-        let via_resolve = resolve(Some(&g), Some(&p))
-            .unwrap()
-            .config;
+        let via_resolve = resolve(Some(&g), Some(&p)).unwrap().config;
         assert_eq!(via_layer, via_resolve);
     }
 }
