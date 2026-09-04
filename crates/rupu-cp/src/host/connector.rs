@@ -3,6 +3,7 @@
 //! connector implementations.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -22,6 +23,27 @@ use crate::{
 /// `stream_run_events`. Each `Ok(Bytes)` item is a complete `data: …\n\n`
 /// chunk. Used by both the local tail and the HTTP proxy pass-through.
 pub type EventByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+/// Keeps a remote→local transcript feed alive for as long as it lives (spec
+/// §5). Dropping it releases the holder's interest; a connector stops the
+/// underlying feed once the last guard for a file is gone. Connectors whose
+/// recorded paths are already local hand back [`FeedGuard::noop`].
+pub struct FeedGuard {
+    _release: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl FeedGuard {
+    pub fn noop() -> Self {
+        Self { _release: None }
+    }
+
+    /// Hold `inner` (typically an `Arc` refcount on a shared feed) until drop.
+    pub fn holding(inner: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            _release: Some(inner),
+        }
+    }
+}
 
 // ── Info / capabilities ───────────────────────────────────────────────────────
 
@@ -282,6 +304,41 @@ pub trait HostConnector: Send + Sync {
     /// a `.jsonl` file with no `..` components; for the HTTP connector the
     /// request is forwarded to the remote's `/api/transcript?path=<path>`.
     async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError>;
+
+    /// Map a transcript path *as recorded by this host's run artifacts* to
+    /// the coordinator-local file that serves it (spec §3.2). Identity for
+    /// hosts whose recorded paths are already local (Local, HTTP — the
+    /// latter forwards reads to the remote CP instead). Mirror-backed
+    /// transports return their cache path.
+    fn local_transcript_path(&self, recorded: &Path) -> PathBuf {
+        recorded.to_path_buf()
+    }
+
+    /// Ensure `recorded` (a path this host wrote, claimed by `run_id`'s own
+    /// artifacts) is being fed into [`Self::local_transcript_path`] for as
+    /// long as the returned guard lives. Default: unsupported.
+    async fn ensure_transcript_feed(
+        &self,
+        _run_id: &str,
+        _recorded: &Path,
+    ) -> Result<FeedGuard, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "transcript feed is not supported for this host type".into(),
+        ))
+    }
+
+    /// One-shot pull of `recorded` into its local counterpart. `terminal`
+    /// marks the copy authoritative (spec §6.1). Default: unsupported.
+    async fn pull_transcript(
+        &self,
+        _run_id: &str,
+        _recorded: &Path,
+        _terminal: bool,
+    ) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "transcript pull is not supported for this host type".into(),
+        ))
+    }
 
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
@@ -952,5 +1009,89 @@ pub(crate) mod testing {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("StubConnector: proxy_get_json not configured")
         }
+    }
+
+    #[tokio::test]
+    async fn transcript_hooks_default_to_identity_and_unsupported() {
+        struct Bare;
+        #[async_trait::async_trait]
+        impl HostConnector for Bare {
+            async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn launch_run(&self, _r: LaunchRequest) -> Result<String, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn launch_agent(
+                &self,
+                _r: AgentLaunchRequest,
+            ) -> Result<String, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn start_session(
+                &self,
+                _r: SessionStartRequest,
+            ) -> Result<String, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn send_session_turn(
+                &self,
+                _r: SendMessageRequest,
+            ) -> Result<String, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn list_runs(
+                &self,
+                _q: RunListQuery,
+            ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn get_run(&self, _id: &str) -> Result<serde_json::Value, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn approve_run(&self, _id: &str, _m: &str) -> Result<(), HostConnectorError> {
+                unimplemented!()
+            }
+            async fn reject_run(
+                &self,
+                _run_id: &str,
+                _reason: Option<&str>,
+            ) -> Result<(), HostConnectorError> {
+                unimplemented!()
+            }
+            async fn cancel_run(&self, _id: &str) -> Result<(), HostConnectorError> {
+                unimplemented!()
+            }
+            async fn stream_run_events(
+                &self,
+                _id: &str,
+            ) -> Result<EventByteStream, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn get_transcript(
+                &self,
+                _p: &str,
+            ) -> Result<serde_json::Value, HostConnectorError> {
+                unimplemented!()
+            }
+            async fn proxy_get_json(
+                &self,
+                _p: &str,
+            ) -> Result<serde_json::Value, HostConnectorError> {
+                unimplemented!()
+            }
+        }
+        let c = Bare;
+        let p = std::path::Path::new("/remote/.rupu/transcripts/run_01A.jsonl");
+        assert_eq!(c.local_transcript_path(p), p.to_path_buf());
+        assert!(matches!(
+            c.ensure_transcript_feed("run_01R", p).await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+        assert!(matches!(
+            c.pull_transcript("run_01R", p, true).await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+        let _ = FeedGuard::noop();
     }
 }
