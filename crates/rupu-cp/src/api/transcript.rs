@@ -9,7 +9,7 @@
 
 use crate::{
     error::{ApiError, ApiResult},
-    host::connector::HostConnectorError,
+    host::connector::{FeedGuard, HostConnector, HostConnectorError},
     state::AppState,
 };
 use axum::{
@@ -24,6 +24,7 @@ use axum::{
 use futures_util::StreamExt as _;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Validate a requested transcript `?path=`: require a `.jsonl` file, reject
@@ -96,11 +97,14 @@ fn canonicalize_existing_prefix(p: &Path) -> Option<PathBuf> {
 #[derive(serde::Deserialize)]
 struct PathQ {
     path: String,
-    /// When present and not `"local"`, proxy the request to the named host.
-    /// The `path` argument is forwarded verbatim — it is meaningful only on
-    /// the remote host's filesystem.
+    /// When present and not `"local"`, serve from / through the named host.
     #[serde(default)]
     host: Option<String>,
+    /// Spec §3.3: the run that recorded `path`. Required only when `host` is
+    /// remote and the transcript has not been mirrored or cached yet — the
+    /// connector uses it to check the path is one the run itself claims.
+    #[serde(default)]
+    run: Option<String>,
 }
 
 /// The set of directories a transcript path is allowed to resolve into: the
@@ -118,56 +122,151 @@ fn allowed_roots(s: &AppState) -> Vec<PathBuf> {
     roots
 }
 
+/// Where a `?host=<remote>` transcript request is served from (§3.3 steps 1–3).
+enum RemoteRead {
+    /// A validated, existing local file (the PR #646 agent-run mirror).
+    Local(PathBuf),
+    /// The connector's cache file; `complete` = has a `.complete` sidecar.
+    Cache { cache: PathBuf, complete: bool },
+}
+
+/// Pure decision: `local` is the already-validated local path if it exists,
+/// `mapped` is `connector.local_transcript_path(raw)`.
+fn plan_remote_read(local: Option<PathBuf>, mapped: PathBuf) -> RemoteRead {
+    if let Some(p) = local {
+        return RemoteRead::Local(p);
+    }
+    let complete = crate::host::transcript_paths::is_complete(&mapped);
+    RemoteRead::Cache {
+        cache: mapped,
+        complete,
+    }
+}
+
+/// Resolve the connector and the read plan for a remote-host request.
+fn resolve_remote(
+    s: &AppState,
+    host_id: &str,
+    raw: &str,
+) -> ApiResult<(Arc<dyn HostConnector>, RemoteRead)> {
+    let conn = s.hosts.resolve(host_id).map_err(|e| match e {
+        HostConnectorError::NotFound(_) => ApiError::not_found(format!("host {host_id} not found")),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    let local = validate_transcript_path(raw, &allowed_roots(s))
+        .ok()
+        .filter(|p| p.exists());
+    let mapped = conn.local_transcript_path(Path::new(raw));
+    let plan = plan_remote_read(local, mapped);
+    Ok((conn, plan))
+}
+
+/// Read a local transcript file into the `{events, summary, unparsed}` page.
+/// A missing file is an empty page (a freshly-sent turn's transcript).
+fn read_local_page(path: &Path) -> ApiResult<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({ "events": [], "summary": null }));
+    }
+    let (events, unparsed) =
+        read_events_counting_unparsed(path).map_err(|e| ApiError::internal(e.to_string()))?;
+    let summary = rupu_transcript::JsonlReader::summary(path).ok();
+    Ok(serde_json::json!({ "events": events, "summary": summary, "unparsed": unparsed }))
+}
+
+/// §4.2: the coordinator could not collect the rest of this transcript.
+fn mark_partial(mut page: serde_json::Value) -> serde_json::Value {
+    page["partial"] = serde_json::json!(true);
+    page
+}
+
+fn map_conn_err(host_id: &str, e: HostConnectorError) -> ApiError {
+    match e {
+        HostConnectorError::NotFound(m) => ApiError::not_found(m),
+        HostConnectorError::Invalid(m) | HostConnectorError::Unsupported(m) => {
+            ApiError::bad_request(m)
+        }
+        HostConnectorError::Unreachable(m) => {
+            ApiError::bad_gateway(format!("host {host_id} unreachable: {m}"))
+        }
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/transcript", get(get_transcript))
         .route("/api/transcript/stream", get(stream_transcript))
 }
 
-/// `GET /api/transcript?path=<path>[&host=<id>]`
+/// `GET /api/transcript?path=<path>[&host=<id>&run=<id>]`
 ///
 /// Without `?host=` (or `?host=local`): validate the path against local
 /// allowed roots and read from disk (unchanged behaviour).
 ///
-/// With `?host=<remote-id>`: proxy to the remote host's `/api/transcript`
-/// endpoint. The path is forwarded verbatim — it is meaningful only on that
-/// host's filesystem. Unknown host id → 404.
+/// With `?host=<remote-id>`: read through the connector's lazy transcript
+/// cache (spec §3.3). A validated local file wins outright; otherwise a
+/// complete cache is served as-is; an incomplete/absent cache with `?run=<id>`
+/// triggers a `pull_transcript` (`run` checks the path is one the run itself
+/// claims); an incomplete/absent cache WITHOUT `run` falls back to the
+/// connector's own `get_transcript`, preserving today's whole-page proxy for
+/// host types that haven't adopted the lazy cache (HTTP, Tunnel, Bucket).
+/// Unknown host id → 404; a host unreachable with nothing cached on disk →
+/// 502; unreachable with a partial file on disk → 200 with `"partial": true`.
 async fn get_transcript(
     State(s): State<AppState>,
     Query(q): Query<PathQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let host_id = q.host.as_deref().unwrap_or("local");
 
-    // Remote host: proxy via connector.
     if host_id != "local" {
-        let conn = s.hosts.resolve(host_id).map_err(|e| match e {
-            HostConnectorError::NotFound(_) => {
-                ApiError::not_found(format!("host {host_id} not found"))
+        let (conn, plan) = resolve_remote(&s, host_id, &q.path)?;
+        return match plan {
+            RemoteRead::Local(p) => Ok(Json(read_local_page(&p)?)),
+            RemoteRead::Cache {
+                cache,
+                complete: true,
+            } => Ok(Json(read_local_page(&cache)?)),
+            RemoteRead::Cache {
+                cache,
+                complete: false,
+            } => {
+                // No `run`: this connector's transcripts aren't behind the
+                // lazy cache at all — HTTP/Tunnel/Bucket hosts still serve
+                // `GET /api/transcript` by proxying `get_transcript` end to
+                // end (design §10 non-goal: "they keep today's behaviour").
+                // Only a caller that knows it is reading a run-scoped,
+                // not-yet-mirrored path (the SSH case) supplies `run`.
+                let Some(run_id) = q.run.as_deref() else {
+                    let result = conn
+                        .get_transcript(&q.path)
+                        .await
+                        .map_err(|e| map_conn_err(host_id, e))?;
+                    return Ok(Json(result));
+                };
+                let terminal = s
+                    .run_store
+                    .load(run_id)
+                    .map(|r| r.status.is_terminal())
+                    .unwrap_or(false);
+                match conn
+                    .pull_transcript(run_id, Path::new(&q.path), terminal)
+                    .await
+                {
+                    Ok(()) => Ok(Json(read_local_page(&cache)?)),
+                    // Unreachable with something on disk: serve it, flagged (§4.2).
+                    Err(HostConnectorError::Unreachable(_)) if cache.exists() => {
+                        Ok(Json(mark_partial(read_local_page(&cache)?)))
+                    }
+                    Err(e) => Err(map_conn_err(host_id, e)),
+                }
             }
-            other => ApiError::internal(other.to_string()),
-        })?;
-        let result = conn.get_transcript(&q.path).await.map_err(|e| match e {
-            HostConnectorError::NotFound(_) => ApiError::not_found(e.to_string()),
-            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
-        return Ok(Json(result));
+        };
     }
 
     // Local path: validate against allowed roots then read from disk.
     let path =
         validate_transcript_path(&q.path, &allowed_roots(&s)).map_err(ApiError::bad_request)?;
-    // A validated-but-not-yet-written transcript (freshly-sent turn) is an empty
-    // transcript, not an error — the UI opens it and the stream fills it in.
-    if !path.exists() {
-        return Ok(Json(serde_json::json!({ "events": [], "summary": null })));
-    }
-    let (events, unparsed) =
-        read_events_counting_unparsed(&path).map_err(|e| ApiError::internal(e.to_string()))?;
-    let summary = rupu_transcript::JsonlReader::summary(&path).ok();
-    Ok(Json(
-        serde_json::json!({ "events": events, "summary": summary, "unparsed": unparsed }),
-    ))
+    Ok(Json(read_local_page(&path)?))
 }
 
 /// Read all parseable events, counting unparseable lines — EXCEPT a parse
@@ -197,7 +296,8 @@ fn read_events_counting_unparsed(
     Ok((events, unparsed))
 }
 
-/// `GET /api/transcript/stream?path=` — SSE live-tail of a transcript JSONL.
+/// `GET /api/transcript/stream?path=[&host=<id>&run=<id>]` — SSE live-tail of
+/// a transcript JSONL.
 ///
 /// Validation runs first and is the SAME security boundary as the static
 /// [`get_transcript`] endpoint (400 on an invalid / out-of-root path). On
@@ -205,17 +305,66 @@ fn read_events_counting_unparsed(
 /// [`rupu_transcript::Event`] to an SSE `data:` line of JSON; the connection
 /// stays open, emitting events as the transcript grows.
 ///
+/// With `?host=<remote-id>`: the same lazy-cache plan as [`get_transcript`],
+/// except an incomplete cache is fed by [`HostConnector::ensure_transcript_feed`]
+/// rather than a one-shot pull — the returned [`FeedGuard`] is held for the
+/// whole lifetime of the SSE stream so the remote tail is released the moment
+/// the client disconnects.
+///
 /// [`TranscriptTail`]: crate::transcript_tail::TranscriptTail
 async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) -> Response {
-    let path = match validate_transcript_path(&q.path, &allowed_roots(&s)) {
-        Ok(p) => p,
-        Err(e) => return ApiError::bad_request(e).into_response(),
+    let host_id = q.host.as_deref().unwrap_or("local");
+    // Held for the SSE stream's lifetime (moved into the map closure below).
+    let mut guard: Option<FeedGuard> = None;
+    let path = if host_id == "local" {
+        match validate_transcript_path(&q.path, &allowed_roots(&s)) {
+            Ok(p) => p,
+            Err(e) => return ApiError::bad_request(e).into_response(),
+        }
+    } else {
+        match resolve_remote(&s, host_id, &q.path) {
+            Err(e) => return e.into_response(),
+            Ok((_, RemoteRead::Local(p))) => p,
+            Ok((
+                _,
+                RemoteRead::Cache {
+                    cache,
+                    complete: true,
+                },
+            )) => cache,
+            Ok((
+                conn,
+                RemoteRead::Cache {
+                    cache,
+                    complete: false,
+                },
+            )) => {
+                let Some(run_id) = q.run.as_deref() else {
+                    return ApiError::bad_request(
+                        "run is required to stream a transcript that has not been mirrored yet",
+                    )
+                    .into_response();
+                };
+                match conn
+                    .ensure_transcript_feed(run_id, Path::new(&q.path))
+                    .await
+                {
+                    Ok(g) => {
+                        guard = Some(g);
+                        cache
+                    }
+                    Err(e) => return map_conn_err(host_id, e).into_response(),
+                }
+            }
+        }
     };
     let tail = match crate::transcript_tail::TranscriptTail::open(&path).await {
         Ok(t) => t,
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     };
-    let stream = tail.map(|ev| {
+    let stream = tail.map(move |ev| {
+        // Keep the remote feed alive exactly as long as this stream.
+        let _keep = &guard;
         let sse = SseEvent::default()
             .json_data(&ev)
             .unwrap_or_else(|_| SseEvent::default().comment("event serialize error"));
@@ -224,6 +373,66 @@ async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) ->
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+#[cfg(test)]
+mod remote_read_tests {
+    use super::*;
+
+    #[test]
+    fn plan_prefers_a_local_file_then_a_complete_cache_then_a_pull() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("mirror/h/transcripts/run_01A.jsonl");
+
+        // 1. A validated, existing local file wins outright.
+        let local = tmp.path().join("transcripts/run_01A.jsonl");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "").unwrap();
+        assert!(matches!(
+            plan_remote_read(Some(local.clone()), cache.clone()),
+            RemoteRead::Local(p) if p == local
+        ));
+
+        // 2. No local file: an incomplete (or absent) cache means "pull".
+        assert!(matches!(
+            plan_remote_read(None, cache.clone()),
+            RemoteRead::Cache {
+                complete: false,
+                ..
+            }
+        ));
+
+        // 3. A complete cache is served as-is.
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "").unwrap();
+        std::fs::write(crate::host::transcript_paths::complete_marker(&cache), b"").unwrap();
+        assert!(matches!(
+            plan_remote_read(None, cache.clone()),
+            RemoteRead::Cache { complete: true, .. }
+        ));
+    }
+
+    #[test]
+    fn plan_treats_an_identity_mapping_as_a_pull_target_too() {
+        // A connector that maps to itself (Task 2 default) still lands in
+        // the run-scoped branch, where the connector's own allowlist decides.
+        let raw = Path::new("/remote/x/run_01A.jsonl");
+        assert!(matches!(
+            plan_remote_read(None, raw.to_path_buf()),
+            RemoteRead::Cache { complete: false, cache } if cache == raw
+        ));
+    }
+
+    #[test]
+    fn partial_flag_is_absent_unless_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("t.jsonl");
+        std::fs::write(&p, "{\"type\":\"turn_start\",\"data\":{\"turn_idx\":0}}\n").unwrap();
+        let page = read_local_page(&p).unwrap();
+        assert!(page.get("partial").is_none());
+        let flagged = mark_partial(page);
+        assert_eq!(flagged["partial"], serde_json::json!(true));
+    }
 }
 
 #[cfg(test)]

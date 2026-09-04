@@ -33,6 +33,11 @@ impl ApiError {
     pub fn not_available(msg: impl Into<String>) -> Self {
         Self(StatusCode::NOT_IMPLEMENTED, msg.into())
     }
+
+    /// 502 — a remote host this request depends on could not be reached.
+    pub fn bad_gateway(msg: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_GATEWAY, msg.into())
+    }
 }
 
 impl IntoResponse for ApiError {
