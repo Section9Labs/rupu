@@ -18,9 +18,9 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_stream_run_events, read_transcript_file, EventByteStream, HostCapabilities,
-        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, RunStartEvidence,
-        MAX_WORKSPACE_BYTES,
+        mirror_stream_run_events, read_transcript_file, EventByteStream, FeedGuard,
+        HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
+        RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -881,6 +881,9 @@ pub(crate) struct SshHostConnector {
     /// by `spawn_tail_pump` and removed by the pump task itself when its
     /// terminal work is done, so an absent entry means "nothing to wait for".
     pumps: Arc<std::sync::Mutex<std::collections::HashMap<String, PumpHandle>>>,
+    /// Shared registry of live `tail -F` feeds into the transcript cache
+    /// (spec §5.1) — see [`ensure_transcript_feed`].
+    lazy: Arc<crate::host::lazy_tail::LazyTailRegistry>,
 }
 
 /// The dispatcher-facing side of one tail pump.
@@ -945,12 +948,16 @@ impl SshHostConnector {
         mirror: Arc<NodeMirror>,
         run_store: Arc<RunStore>,
     ) -> Self {
+        let lazy = Arc::new(crate::host::lazy_tail::LazyTailRegistry::new(Arc::clone(
+            &exec,
+        )));
         Self {
             host_id: host_id.into(),
             exec,
             mirror,
             run_store,
             pumps: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            lazy,
         }
     }
 
@@ -2117,6 +2124,22 @@ impl HostConnector for SshHostConnector {
             out.stdout
         };
         write_cache_file(&cache, &body, terminal)
+    }
+
+    async fn ensure_transcript_feed(
+        &self,
+        run_id: &str,
+        recorded: &Path,
+    ) -> Result<FeedGuard, HostConnectorError> {
+        let cache = self.authorize_remote_transcript(run_id, recorded)?;
+        let remote = recorded
+            .to_str()
+            .ok_or_else(|| HostConnectorError::Invalid("non-UTF-8 transcript path".into()))?;
+        match self.lazy.subscribe(remote, &cache) {
+            Ok(Some(handle)) => Ok(FeedGuard::holding(Box::new(handle))),
+            Ok(None) => Ok(FeedGuard::noop()),
+            Err(e) => Err(HostConnectorError::Unreachable(e.to_string())),
+        }
     }
 
     /// SSH/Tunnel/Bucket runs are created in, and tailed into, the
@@ -4354,6 +4377,56 @@ mod tests {
             .path()
             .join("mirror/host_abc/transcripts/run_01OFF.jsonl")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn ssh_ensure_transcript_feed_tails_the_claimed_path_into_the_cache() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![r#"{"type":"run_start"}"#.into()]));
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01FEED.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01FEEDRUN", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01FEED.jsonl");
+
+        let guard = conn
+            .ensure_transcript_feed("run_01FEEDRUN", std::path::Path::new(claimed))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if std::fs::read_to_string(&cache)
+                .map(|s| s.contains("run_start"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n"
+        );
+        {
+            let cmds = fake.commands.lock().unwrap();
+            assert!(
+                cmds.iter()
+                    .any(|c| c == &format!("tail -n +1 -F '{claimed}'")),
+                "{cmds:?}"
+            );
+        }
+        drop(guard);
+
+        let err = match conn
+            .ensure_transcript_feed(
+                "run_01FEEDRUN",
+                std::path::Path::new("/home/ci/proj/.rupu/transcripts/run_01X.jsonl"),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected an Invalid error for an unclaimed path"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
     }
 
     #[tokio::test]
