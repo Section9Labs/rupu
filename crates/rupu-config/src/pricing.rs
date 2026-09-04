@@ -20,9 +20,10 @@
 use crate::{ModelPricing, PricingConfig};
 
 /// Built-in USD-per-million-tokens defaults for the major models.
-/// Last reviewed: 2026-09-04 (OpenAI section against
-/// <https://developers.openai.com/api/docs/pricing>; Anthropic and
-/// Gemini sections last reviewed 2026-05-07). Pricing drifts over
+/// Last reviewed: 2026-09-04, all three sections, against
+/// <https://developers.openai.com/api/docs/pricing>,
+/// <https://platform.claude.com/docs/en/about-claude/pricing>, and
+/// <https://ai.google.dev/gemini-api/docs/pricing>. Pricing drifts over
 /// time — users with strict cost reporting needs should override in
 /// config.
 ///
@@ -32,13 +33,124 @@ use crate::{ModelPricing, PricingConfig};
 /// these canonical keys before lookup.
 pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
     // ── Anthropic ─────────────────────────────────────────────────
+    // First-party API rates from
+    // https://platform.claude.com/docs/en/about-claude/pricing.
+    // `cached_input_per_mtok` is the cache-READ (hit) rate. Cache
+    // writes bill at 1.25x (5m) / 2x (1h) the input rate; transcripts
+    // fold cache-creation tokens into `input_tokens`, so writes are
+    // billed here at 1x and slightly under-counted. Long context is
+    // included at standard rates on 4.6+ models, so no surcharge to
+    // model. Batch discounts and the 1.1x `inference_geo: "us"` uplift
+    // are not modeled.
+    // Fable 5.1 / Mythos 5.1 cache hits bill at 0.025x input (all other
+    // models: 0.1x).
+    (
+        "anthropic",
+        "claude-fable-5-1",
+        ModelPricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 50.0,
+            cached_input_per_mtok: Some(0.25),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-mythos-5-1",
+        ModelPricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 50.0,
+            cached_input_per_mtok: Some(0.25),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-fable-5",
+        ModelPricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 50.0,
+            cached_input_per_mtok: Some(1.0),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-mythos-5",
+        ModelPricing {
+            input_per_mtok: 10.0,
+            output_per_mtok: 50.0,
+            cached_input_per_mtok: Some(1.0),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-opus-5",
+        ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-opus-4-8",
+        ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
     (
         "anthropic",
         "claude-opus-4-7",
         ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-opus-4-6",
+        ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-opus-4-5",
+        ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cached_input_per_mtok: Some(0.50),
+        },
+    ),
+    // Retired on the first-party API; still priced for historical runs.
+    (
+        "anthropic",
+        "claude-opus-4-1",
+        ModelPricing {
             input_per_mtok: 15.0,
             output_per_mtok: 75.0,
             cached_input_per_mtok: Some(1.50),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-opus-4",
+        ModelPricing {
+            input_per_mtok: 15.0,
+            output_per_mtok: 75.0,
+            cached_input_per_mtok: Some(1.50),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-sonnet-5",
+        ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 10.0,
+            cached_input_per_mtok: Some(0.20),
         },
     ),
     (
@@ -52,7 +164,36 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
     ),
     (
         "anthropic",
+        "claude-sonnet-4-5",
+        ModelPricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cached_input_per_mtok: Some(0.30),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-sonnet-4",
+        ModelPricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cached_input_per_mtok: Some(0.30),
+        },
+    ),
+    (
+        "anthropic",
         "claude-haiku-4-5",
+        ModelPricing {
+            input_per_mtok: 1.0,
+            output_per_mtok: 5.0,
+            cached_input_per_mtok: Some(0.10),
+        },
+    ),
+    // Haiku 3.5 keeps the older `claude-3-5-haiku-<YYYYMMDD>` id shape;
+    // the compact date strips off before lookup.
+    (
+        "anthropic",
+        "claude-3-5-haiku",
         ModelPricing {
             input_per_mtok: 0.80,
             output_per_mtok: 4.0,
@@ -63,8 +204,10 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
     // (`claude-mythos-preview`) for EVERY Claude request, collapsing
     // opus/sonnet/haiku into one unpriced line. New runs record the requested
     // model (priced correctly); this entry retro-prices the collapsed historical
-    // data at opus-tier rates (the flagship — an approximation for legacy data,
-    // since the underlying requests spanned multiple tiers).
+    // data at the Opus 4.1-era flagship rate it was first approximated with.
+    // Deliberately left at that figure: it is an approximation of historical
+    // data, not a vendor price, and moving it would silently rewrite past
+    // cost reports.
     (
         "anthropic",
         "claude-mythos-preview",
@@ -401,13 +544,106 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
         },
     ),
     // ── Google Gemini ─────────────────────────────────────────────
+    // Paid-tier standard rates from
+    // https://ai.google.dev/gemini-api/docs/pricing, text modality,
+    // prompts <= 200k tokens. Pro models double their rates above 200k
+    // input tokens; transcripts don't record the prompt-size tier, so
+    // that surcharge is not modeled (same class as OpenAI's long-context
+    // tier). Output rates already include thinking tokens, matching
+    // rupu's billable-output fold. Batch/Flex/Priority tiers and the
+    // per-hour cache storage charge are not modeled. The
+    // `google-antigravity` provider serves these same models and
+    // resolves against this section.
+    // Gemini 3.6/3.7/3.8 Flash carry an introductory rate through
+    // 2026-12-31; from 2027-01-01 they double to 1.50 / 7.50 / 0.15.
+    (
+        "google-gemini-cli",
+        "gemini-3.8-flash",
+        ModelPricing {
+            input_per_mtok: 0.75,
+            output_per_mtok: 3.75,
+            cached_input_per_mtok: Some(0.075),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3.7-flash",
+        ModelPricing {
+            input_per_mtok: 0.75,
+            output_per_mtok: 3.75,
+            cached_input_per_mtok: Some(0.075),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3.6-flash",
+        ModelPricing {
+            input_per_mtok: 0.75,
+            output_per_mtok: 3.75,
+            cached_input_per_mtok: Some(0.075),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3.5-flash",
+        ModelPricing {
+            input_per_mtok: 1.50,
+            output_per_mtok: 9.0,
+            cached_input_per_mtok: Some(0.15),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3.5-flash-lite",
+        ModelPricing {
+            input_per_mtok: 0.30,
+            output_per_mtok: 2.50,
+            cached_input_per_mtok: Some(0.03),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3.1-pro-preview",
+        ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 12.0,
+            cached_input_per_mtok: Some(0.20),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3.1-pro-preview-customtools",
+        ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 12.0,
+            cached_input_per_mtok: Some(0.20),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3.1-flash-lite",
+        ModelPricing {
+            input_per_mtok: 0.25,
+            output_per_mtok: 1.50,
+            cached_input_per_mtok: Some(0.025),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-3-flash-preview",
+        ModelPricing {
+            input_per_mtok: 0.50,
+            output_per_mtok: 3.0,
+            cached_input_per_mtok: Some(0.05),
+        },
+    ),
     (
         "google-gemini-cli",
         "gemini-2.5-pro",
         ModelPricing {
             input_per_mtok: 1.25,
             output_per_mtok: 10.0,
-            cached_input_per_mtok: Some(0.31),
+            cached_input_per_mtok: Some(0.125),
         },
     ),
     (
@@ -416,7 +652,16 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
         ModelPricing {
             input_per_mtok: 0.30,
             output_per_mtok: 2.50,
-            cached_input_per_mtok: Some(0.075),
+            cached_input_per_mtok: Some(0.03),
+        },
+    ),
+    (
+        "google-gemini-cli",
+        "gemini-2.5-flash-lite",
+        ModelPricing {
+            input_per_mtok: 0.10,
+            output_per_mtok: 0.40,
+            cached_input_per_mtok: Some(0.01),
         },
     ),
 ];
@@ -436,42 +681,57 @@ fn canonicalize_provider(provider: &str) -> &str {
     }
 }
 
-/// Strip a trailing `-YYYY-MM-DD` date snapshot from a model id.
-/// OpenAI returns dated variants like `gpt-5-2025-08-07` from
-/// `/v1/chat/completions`; users configure `gpt-5` in agents and the
-/// built-in price table keys on the bare name. Returns the original
-/// string when no date suffix matches.
+/// Strip a trailing date snapshot from a model id. Two vendor shapes:
+/// OpenAI's `-YYYY-MM-DD` (`gpt-5-2025-08-07`) and Anthropic's compact
+/// `-YYYYMMDD` (`claude-opus-4-1-20250805`). Users configure the bare
+/// name in agents and the built-in price table keys on it. Returns the
+/// original string when no date suffix matches.
 fn strip_date_suffix(model: &str) -> &str {
-    // Look for the rightmost `-YYYY-MM-DD` (`-` + 4 digits + `-` + 2 digits + `-` + 2 digits).
     let bytes = model.as_bytes();
-    if bytes.len() < 11 {
-        return model;
+    // `-YYYY-MM-DD`: `-` + 4 digits + `-` + 2 digits + `-` + 2 digits.
+    if bytes.len() >= 11 {
+        let tail = &bytes[bytes.len() - 11..];
+        let dashed = tail[0] == b'-'
+            && tail[1..5].iter().all(|c| c.is_ascii_digit())
+            && tail[5] == b'-'
+            && tail[6..8].iter().all(|c| c.is_ascii_digit())
+            && tail[8] == b'-'
+            && tail[9..11].iter().all(|c| c.is_ascii_digit());
+        if dashed {
+            return &model[..model.len() - 11];
+        }
     }
-    let tail = &bytes[bytes.len() - 11..];
-    let is_date_suffix = tail[0] == b'-'
-        && tail[1..5].iter().all(|c| c.is_ascii_digit())
-        && tail[5] == b'-'
-        && tail[6..8].iter().all(|c| c.is_ascii_digit())
-        && tail[8] == b'-'
-        && tail[9..11].iter().all(|c| c.is_ascii_digit());
-    if is_date_suffix {
-        &model[..model.len() - 11]
-    } else {
-        model
+    // `-YYYYMMDD`: `-` + exactly 8 digits (the byte before the `-` must
+    // not be a digit-run continuation — `-` + 9 digits is not a date).
+    if bytes.len() >= 9 {
+        let tail = &bytes[bytes.len() - 9..];
+        let compact = tail[0] == b'-' && tail[1..].iter().all(|c| c.is_ascii_digit());
+        if compact {
+            return &model[..model.len() - 9];
+        }
     }
+    model
 }
 
 /// Resolve a USD price for one `(provider, model, agent)` triple.
 ///
+/// `provider` is whatever the run recorded: a vendor key (`anthropic`),
+/// a friendly alias (`openai`), or a named account from
+/// `[providers.<name>]` (`openai-oracle`). Accounts resolve to their
+/// vendor through `cfg.provider_kinds`, and aliases to the canonical
+/// `ProviderId` key through [`canonicalize_provider`].
+///
 /// Lookup order — first non-`None` wins:
 ///
-/// 1. `cfg.models[provider][model]` (user-configured, exact match)
-/// 2. `cfg.models[provider][stripped]` if the model carries a
-///    `[<suffix>]` tag (e.g. `claude-sonnet-4-6[1m]`); we strip the
-///    suffix and retry so a single price entry covers both base and
-///    extended-context variants.
-/// 3. [`BUILTIN_PRICES`] for `(provider, model)` (then `(provider, stripped)`)
-/// 4. `cfg.agents[agent]` (user-configured agent-level fallback)
+/// 1. `cfg.models[<provider>][model]` (user-configured), trying the
+///    provider as written, then its canonical form, then the account's
+///    kind and the kind's canonical form — so a price keyed on the
+///    account wins over one keyed on the vendor. Per provider, the model
+///    is tried exact, then with a `[<suffix>]` tag stripped
+///    (`claude-sonnet-4-6[1m]`), then with a date snapshot stripped.
+/// 2. [`BUILTIN_PRICES`] for the canonical vendor key and the same model
+///    candidates.
+/// 3. `cfg.agents[agent]` (user-configured agent-level fallback)
 ///
 /// Returns `None` when no tier yields a price; callers render that as
 /// a placeholder (`—`) in the cost column.
@@ -481,7 +741,6 @@ pub fn lookup(
     model: &str,
     agent: &str,
 ) -> Option<ModelPricing> {
-    let canon_provider = canonicalize_provider(provider);
     let no_tag = strip_model_tag(model);
     let no_date = strip_date_suffix(no_tag);
 
@@ -497,26 +756,44 @@ pub fn lookup(
         candidates.push(no_date);
     }
 
-    // Tier 1: user-configured. Try the original provider string first
-    // (lets users target an alias they wrote in their agents) and
-    // then the canonical form, against each candidate model name.
-    for prov in [provider, canon_provider].iter().copied() {
-        if let Some(per_provider) = cfg.models.get(prov) {
+    // Provider keys to try, most specific first: as recorded, its
+    // canonical form, then (for a named account) the account's kind
+    // and the kind's canonical form. Deduped in order so a plain vendor
+    // key is queried once.
+    let kind = cfg.provider_kinds.get(provider).map(String::as_str);
+    let mut providers: Vec<&str> = Vec::with_capacity(4);
+    for prov in [
+        Some(provider),
+        Some(canonicalize_provider(provider)),
+        kind,
+        kind.map(canonicalize_provider),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !providers.contains(&prov) {
+            providers.push(prov);
+        }
+    }
+    // The built-in table is keyed on the canonical vendor: the kind's
+    // canonical form when the provider is an account, else the
+    // provider's own.
+    let canon_vendor = canonicalize_provider(kind.unwrap_or(provider));
+
+    // Tier 1: user-configured, per provider key, per model candidate.
+    for prov in &providers {
+        if let Some(per_provider) = cfg.models.get(*prov) {
             for cand in &candidates {
                 if let Some(p) = per_provider.get(*cand) {
                     return Some(*p);
                 }
             }
         }
-        // Stop after one if alias and canonical are identical.
-        if prov == canon_provider {
-            break;
-        }
     }
 
-    // Tier 2: built-in table — keyed on the canonical provider.
+    // Tier 2: built-in table — keyed on the canonical vendor.
     for cand in &candidates {
-        if let Some(p) = builtin_lookup(canon_provider, cand) {
+        if let Some(p) = builtin_lookup(canon_vendor, cand) {
             return Some(p);
         }
     }
@@ -535,10 +812,21 @@ fn strip_model_tag(model: &str) -> &str {
     }
 }
 
+/// Providers that publish no price list of their own but serve another
+/// provider's models at that provider's list rates. Antigravity is the
+/// Gemini models behind a different endpoint/quota.
+fn builtin_table_provider(canon_provider: &str) -> &str {
+    match canon_provider {
+        "google-antigravity" => "google-gemini-cli",
+        other => other,
+    }
+}
+
 fn builtin_lookup(provider: &str, model: &str) -> Option<ModelPricing> {
+    let table_provider = builtin_table_provider(provider);
     BUILTIN_PRICES
         .iter()
-        .find(|(p, m, _)| *p == provider && *m == model)
+        .find(|(p, m, _)| *p == table_provider && *m == model)
         .map(|(_, _, price)| *price)
 }
 
@@ -809,6 +1097,212 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn anthropic_current_generation_priced_from_builtin() {
+        // Per platform.claude.com/docs/en/about-claude/pricing (reviewed
+        // 2026-09-04). Opus 4.7 and Haiku 4.5 were previously carried at
+        // the wrong tier's rate.
+        let cfg = empty_cfg();
+        let opus47 = lookup(&cfg, "anthropic", "claude-opus-4-7", "any").unwrap();
+        assert_eq!(opus47.input_per_mtok, 5.0);
+        assert_eq!(opus47.output_per_mtok, 25.0);
+        assert_eq!(opus47.cached_input_per_mtok, Some(0.50));
+
+        let haiku = lookup(&cfg, "anthropic", "claude-haiku-4-5", "any").unwrap();
+        assert_eq!(haiku.input_per_mtok, 1.0);
+        assert_eq!(haiku.output_per_mtok, 5.0);
+        assert_eq!(haiku.cached_input_per_mtok, Some(0.10));
+
+        let fable = lookup(&cfg, "anthropic", "claude-fable-5-1", "any").unwrap();
+        assert_eq!(fable.input_per_mtok, 10.0);
+        assert_eq!(fable.output_per_mtok, 50.0);
+        assert_eq!(fable.cached_input_per_mtok, Some(0.25));
+
+        let mythos5 = lookup(&cfg, "anthropic", "claude-mythos-5", "any").unwrap();
+        assert_eq!(mythos5.input_per_mtok, 10.0);
+        assert_eq!(mythos5.cached_input_per_mtok, Some(1.0));
+
+        let sonnet5 = lookup(&cfg, "anthropic", "claude-sonnet-5", "any").unwrap();
+        assert_eq!(sonnet5.input_per_mtok, 2.0);
+        assert_eq!(sonnet5.output_per_mtok, 10.0);
+
+        let opus41 = lookup(&cfg, "anthropic", "claude-opus-4-1", "any").unwrap();
+        assert_eq!(opus41.input_per_mtok, 15.0);
+        assert_eq!(opus41.output_per_mtok, 75.0);
+    }
+
+    #[test]
+    fn anthropic_compact_date_snapshot_resolves_to_base_price() {
+        // Anthropic snapshots use `-YYYYMMDD` (no dashes), unlike OpenAI's
+        // `-YYYY-MM-DD`. Both must strip.
+        let cfg = empty_cfg();
+        let p = lookup(&cfg, "anthropic", "claude-opus-4-1-20250805", "any").unwrap();
+        assert_eq!(p.input_per_mtok, 15.0);
+
+        let h = lookup(&cfg, "anthropic", "claude-3-5-haiku-20241022", "any").unwrap();
+        assert_eq!(h.input_per_mtok, 0.80);
+        assert_eq!(h.output_per_mtok, 4.0);
+
+        let s = lookup(&cfg, "anthropic", "claude-haiku-4-5-20251001", "any").unwrap();
+        assert_eq!(s.input_per_mtok, 1.0);
+    }
+
+    #[test]
+    fn strip_date_suffix_strips_compact_yyyymmdd() {
+        assert_eq!(
+            strip_date_suffix("claude-opus-4-1-20250805"),
+            "claude-opus-4-1"
+        );
+        assert_eq!(
+            strip_date_suffix("claude-3-5-sonnet-20241022"),
+            "claude-3-5-sonnet"
+        );
+        // Seven or nine digits are not a date; leave them alone.
+        assert_eq!(strip_date_suffix("foo-2025080"), "foo-2025080");
+        assert_eq!(strip_date_suffix("foo-202508051"), "foo-202508051");
+        // A trailing `-12-2025` (Gemini preview naming) is not YYYYMMDD.
+        assert_eq!(
+            strip_date_suffix("gemini-2.5-flash-native-audio-preview-12-2025"),
+            "gemini-2.5-flash-native-audio-preview-12-2025"
+        );
+    }
+
+    #[test]
+    fn gemini_refreshed_rates_from_builtin() {
+        // Per ai.google.dev/gemini-api/docs/pricing (reviewed 2026-09-04),
+        // paid tier, <=200k-token prompts, text modality.
+        let cfg = empty_cfg();
+        let pro = lookup(&cfg, "gemini", "gemini-2.5-pro", "any").unwrap();
+        assert_eq!(pro.input_per_mtok, 1.25);
+        assert_eq!(pro.output_per_mtok, 10.0);
+        assert_eq!(pro.cached_input_per_mtok, Some(0.125));
+
+        let flash = lookup(&cfg, "gemini", "gemini-2.5-flash", "any").unwrap();
+        assert_eq!(flash.cached_input_per_mtok, Some(0.03));
+
+        let f38 = lookup(&cfg, "google-gemini-cli", "gemini-3.8-flash", "any").unwrap();
+        assert_eq!(f38.input_per_mtok, 0.75);
+        assert_eq!(f38.output_per_mtok, 3.75);
+        assert_eq!(f38.cached_input_per_mtok, Some(0.075));
+
+        let pro31 = lookup(&cfg, "gemini", "gemini-3.1-pro-preview", "any").unwrap();
+        assert_eq!(pro31.input_per_mtok, 2.0);
+        assert_eq!(pro31.output_per_mtok, 12.0);
+        assert_eq!(pro31.cached_input_per_mtok, Some(0.20));
+
+        let lite = lookup(&cfg, "gemini", "gemini-2.5-flash-lite", "any").unwrap();
+        assert_eq!(lite.input_per_mtok, 0.10);
+        assert_eq!(lite.output_per_mtok, 0.40);
+    }
+
+    #[test]
+    fn antigravity_provider_resolves_gemini_builtin_prices() {
+        // Antigravity serves the same Gemini models through a different
+        // endpoint/quota; without a table of its own it should fall back to
+        // the Gemini list rates rather than render unpriced.
+        let cfg = empty_cfg();
+        let via_antigravity = lookup(&cfg, "antigravity", "gemini-2.5-pro", "any").unwrap();
+        let via_canonical = lookup(&cfg, "google-antigravity", "gemini-2.5-pro", "any").unwrap();
+        let via_gemini = lookup(&cfg, "gemini", "gemini-2.5-pro", "any").unwrap();
+        assert_eq!(via_antigravity, via_gemini);
+        assert_eq!(via_canonical, via_gemini);
+    }
+
+    #[test]
+    fn user_antigravity_entry_wins_over_gemini_fallback() {
+        // A user who prices antigravity explicitly must not be overridden
+        // by the Gemini fallback.
+        let mut cfg = empty_cfg();
+        let mut ag = BTreeMap::new();
+        ag.insert(
+            "gemini-2.5-pro".into(),
+            ModelPricing {
+                input_per_mtok: 0.0,
+                output_per_mtok: 0.0,
+                cached_input_per_mtok: None,
+            },
+        );
+        cfg.models.insert("google-antigravity".into(), ag);
+        let p = lookup(&cfg, "antigravity", "gemini-2.5-pro", "any").unwrap();
+        assert_eq!(p.input_per_mtok, 0.0);
+    }
+
+    #[test]
+    fn named_provider_account_resolves_builtin_via_its_kind() {
+        // `[providers.openai-oracle] kind = "openai"`: runs record the
+        // ACCOUNT name as the provider, which is not a vendor key. The
+        // lookup must follow the account to its kind and then to the
+        // canonical table key (`openai` → `openai-codex`).
+        let mut cfg = empty_cfg();
+        cfg.provider_kinds
+            .insert("openai-oracle".into(), "openai".into());
+        let p = lookup(&cfg, "openai-oracle", "gpt-5.6-cyber", "any").unwrap();
+        assert_eq!(p.input_per_mtok, 12.50);
+        assert_eq!(p.output_per_mtok, 75.0);
+
+        cfg.provider_kinds
+            .insert("anthropic-oracle".into(), "anthropic".into());
+        let a = lookup(&cfg, "anthropic-oracle", "claude-sonnet-4-6", "any").unwrap();
+        assert_eq!(a.input_per_mtok, 3.0);
+    }
+
+    #[test]
+    fn user_price_keyed_on_account_name_wins_over_kind() {
+        // An explicit `[pricing.openai-oracle."gpt-5.6-cyber"]` (say, a
+        // negotiated rate on that account) beats the kind's list price.
+        let mut cfg = empty_cfg();
+        cfg.provider_kinds
+            .insert("openai-oracle".into(), "openai".into());
+        let mut acct = BTreeMap::new();
+        acct.insert(
+            "gpt-5.6-cyber".into(),
+            ModelPricing {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+                cached_input_per_mtok: None,
+            },
+        );
+        cfg.models.insert("openai-oracle".into(), acct);
+        let p = lookup(&cfg, "openai-oracle", "gpt-5.6-cyber", "any").unwrap();
+        assert_eq!(p.input_per_mtok, 1.0);
+    }
+
+    #[test]
+    fn user_price_keyed_on_kind_applies_to_every_account_of_that_kind() {
+        // `[pricing.openai."gpt-5.6-cyber"]` should cover `openai-oracle`
+        // too — the user priced the vendor, not one account.
+        let mut cfg = empty_cfg();
+        cfg.provider_kinds
+            .insert("openai-oracle".into(), "openai".into());
+        let mut kind = BTreeMap::new();
+        kind.insert(
+            "gpt-5.6-cyber".into(),
+            ModelPricing {
+                input_per_mtok: 7.0,
+                output_per_mtok: 8.0,
+                cached_input_per_mtok: None,
+            },
+        );
+        cfg.models.insert("openai".into(), kind);
+        let p = lookup(&cfg, "openai-oracle", "gpt-5.6-cyber", "any").unwrap();
+        assert_eq!(p.input_per_mtok, 7.0);
+    }
+
+    #[test]
+    fn unknown_account_with_no_kind_still_falls_to_agent_rung() {
+        let mut cfg = empty_cfg();
+        cfg.agents.insert(
+            "reviewer".into(),
+            ModelPricing {
+                input_per_mtok: 5.0,
+                output_per_mtok: 25.0,
+                cached_input_per_mtok: None,
+            },
+        );
+        let p = lookup(&cfg, "some-account", "gpt-5.6-cyber", "reviewer").unwrap();
+        assert_eq!(p.input_per_mtok, 5.0);
     }
 
     #[test]
