@@ -21,7 +21,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use futures_util::StreamExt as _;
+use futures_util::{Stream, StreamExt as _};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -234,6 +234,22 @@ fn map_pull_result(
     }
 }
 
+/// Attach `guard` to `stream`'s lifetime: it is held until the returned
+/// stream itself is dropped, then released. Used to keep a remote transcript
+/// feed's [`FeedGuard`] alive for exactly as long as the SSE stream tailing
+/// its cache file — no longer, no shorter, and independent of anything
+/// axum/SSE-specific (kept as a pure `Stream` combinator so the mechanic can
+/// be pinned by a unit test without spinning up an HTTP server).
+fn hold_while_streaming<S>(stream: S, guard: Option<FeedGuard>) -> impl Stream<Item = S::Item>
+where
+    S: Stream,
+{
+    stream.map(move |item| {
+        let _keep = &guard;
+        item
+    })
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/transcript", get(get_transcript))
@@ -423,9 +439,7 @@ async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) ->
         Ok(t) => t,
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     };
-    let stream = tail.map(move |ev| {
-        // Keep the remote feed alive exactly as long as this stream.
-        let _keep = &guard;
+    let stream = hold_while_streaming(tail, guard).map(|ev| {
         let sse = SseEvent::default()
             .json_data(&ev)
             .unwrap_or_else(|_| SseEvent::default().comment("event serialize error"));
@@ -547,6 +561,52 @@ mod remote_read_tests {
             PullOutcome::Fail(e) => assert_eq!(e.0, StatusCode::BAD_REQUEST),
             _ => panic!("expected Fail(400) for an invalid pull"),
         }
+    }
+
+    /// Pins the `FeedGuard` lifetime mechanic `stream_transcript` relies on:
+    /// the guard must survive every item the stream yields and be dropped
+    /// exactly when the stream itself is dropped (client disconnect) — not
+    /// before (mid-stream) and not held forever (leaking the remote feed).
+    #[tokio::test]
+    async fn hold_while_streaming_keeps_the_guard_alive_until_the_stream_drops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = FeedGuard::holding(Box::new(DropFlag(dropped.clone())));
+
+        // `Box::pin`, not `std::pin::pin!`: the latter only shadows a local
+        // with a `Pin<&mut _>`, so dropping the binding wouldn't drop the
+        // stream (and its held guard) at all — the boxed form actually owns
+        // the stream, so `drop(stream)` below is a real drop.
+        let mut stream = Box::pin(hold_while_streaming(
+            futures_util::stream::iter([1, 2]),
+            Some(guard),
+        ));
+
+        assert_eq!(stream.next().await, Some(1));
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "guard must still be alive after the first item"
+        );
+
+        assert_eq!(stream.next().await, Some(2));
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "guard must still be alive after the last item, before the stream itself drops"
+        );
+
+        drop(stream);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the stream must release the guard"
+        );
     }
 }
 
