@@ -277,6 +277,20 @@ impl Config {
         }
     }
 
+    /// Copy each `[providers.<name>].kind` onto `pricing.provider_kinds`
+    /// so the price lookup can follow a named account (`openai-oracle`)
+    /// to its vendor (`openai`). Called by every load path
+    /// (`layer_files`, `resolve`) right before [`Config::validate`]; a
+    /// `Config` built any other way must call it itself or account-named
+    /// runs price as unknown.
+    pub fn attach_provider_kinds(&mut self) {
+        self.pricing.provider_kinds = self
+            .providers
+            .iter()
+            .filter_map(|(name, p)| p.kind.clone().map(|k| (name.clone(), k)))
+            .collect();
+    }
+
     /// Validate cross-field invariants not expressible in serde.
     ///
     /// Also emits [`Config::warn_deprecated_keys`] — this is the one function

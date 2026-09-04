@@ -35,6 +35,15 @@ pub struct PricingConfig {
     pub models: BTreeMap<String, BTreeMap<String, ModelPricing>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, ModelPricing>,
+    /// Named provider account → vendor kind, e.g. `openai-oracle` →
+    /// `openai`, taken from `[providers.<name>].kind`. Runs record the
+    /// ACCOUNT name as their provider, which is not a vendor key, so the
+    /// price lookup follows it here to reach the vendor's table. Not part
+    /// of the `[pricing]` TOML: `Config::attach_provider_kinds` fills it
+    /// after every load. Accounts without a `kind` are the vendor
+    /// themselves and are absent from this map.
+    #[serde(skip)]
+    pub provider_kinds: BTreeMap<String, String>,
 }
 
 /// USD per million tokens for one model (or one agent's fallback
@@ -103,7 +112,6 @@ impl ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn cost_zero_when_no_tokens() {

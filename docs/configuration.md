@@ -129,6 +129,22 @@ fallback when no model-level price is known — the hatch for a private/internal
 with no public pricing (e.g. an `openai-compatible` provider, which otherwise reports
 `$0.00`).
 
+`<provider>` is whatever the run recorded: a vendor key (`anthropic`), a friendly alias
+(`openai`, `gemini`, `copilot`), or a **named account** from `[providers.<name>]`
+(`openai-oracle`). Named accounts resolve through their `kind` — a run on
+`openai-oracle` (`kind = "openai"`) prices from the OpenAI table with no extra config.
+Precedence among user overrides is account first, then vendor: `[pricing.openai-oracle."gpt-5.6-cyber"]`
+beats `[pricing.openai."gpt-5.6-cyber"]`, which in turn applies to every account of that
+kind. An account with no `kind` is the vendor itself. `google-antigravity` has no table of
+its own and falls back to the Gemini rates.
+
+Model ids are matched exact first, then with a trailing `[tag]` stripped
+(`claude-sonnet-4-6[1m]` → `claude-sonnet-4-6`), then with a date snapshot stripped —
+both OpenAI's `-YYYY-MM-DD` and Anthropic's compact `-YYYYMMDD`. The built-in table
+carries each vendor's standard-tier, short-context (≤200k prompt) list rate; long-context
+surcharges (OpenAI, Gemini Pro), batch/flex tiers, cache-write premiums, and regional
+uplifts are not modeled. Override in config when accuracy matters.
+
 ```toml
 [pricing.anthropic."claude-sonnet-4-6"]
 input_per_mtok = 3.0
