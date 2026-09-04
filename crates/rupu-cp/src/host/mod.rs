@@ -16,5 +16,6 @@ pub mod local;
 pub mod registry;
 pub mod ssh;
 pub mod summary_build;
+pub mod transcript_paths;
 pub mod tunnel;
 pub mod workspace_stage;
