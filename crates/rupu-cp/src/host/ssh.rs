@@ -5,7 +5,7 @@
 //! shell-escaped before being joined into the remote command, because `ssh`
 //! re-parses remote args through the remote login shell.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -271,6 +271,39 @@ pub(crate) fn parse_tail_marker(line: &str) -> Option<&str> {
     } else {
         Some(inner)
     }
+}
+
+/// Sentinel the remote prints instead of a body when the file is absent, so
+/// "no such file" (a complete, empty answer once the run is terminal) is
+/// distinguishable from "ssh never reached the host" (no stdout at all).
+pub(crate) const NO_FILE_SENTINEL: &str = "__RUPU_NO_FILE__";
+
+/// One-shot read of a remote transcript. Single-quoted path; stderr dropped.
+pub(crate) fn single_cat_command(remote: &str) -> String {
+    format!(
+        "cat {} 2>/dev/null || printf '{NO_FILE_SENTINEL}\\n'",
+        shell_escape(remote)
+    )
+}
+
+/// Write `body` to `cache` atomically (tmp + rename), then the `.complete`
+/// sidecar when `complete` (spec §6.1 step 4).
+pub(crate) fn write_cache_file(
+    cache: &Path,
+    body: &str,
+    complete: bool,
+) -> Result<(), HostConnectorError> {
+    let io = |e: std::io::Error| HostConnectorError::Invalid(format!("transcript cache io: {e}"));
+    if let Some(dir) = cache.parent() {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    let tmp = PathBuf::from(format!("{}.tmp", cache.display()));
+    std::fs::write(&tmp, body).map_err(io)?;
+    std::fs::rename(&tmp, cache).map_err(io)?;
+    if complete {
+        std::fs::write(crate::host::transcript_paths::complete_marker(cache), b"").map_err(io)?;
+    }
+    Ok(())
 }
 
 // ── Remote-CLI → CP wire-row reshaping ─────────────────────────────────────────
@@ -966,6 +999,54 @@ impl SshHostConnector {
             a.push("--tmp".into());
         }
         a
+    }
+
+    /// The CP global dir, derived exactly as `NodeMirror::transcript_mirror_path`
+    /// derives it: the run store root is `<global>/runs`.
+    fn global_dir(&self) -> PathBuf {
+        self.run_store
+            .root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.run_store.root.clone())
+    }
+
+    /// Spec §3.3: a remote read is scoped to a run. `run_id` must be a run
+    /// this host executed (`worker_id`), and `recorded` must be a path that
+    /// run's own artifacts claim. Returns the cache path the file serves
+    /// from. Never touches the remote.
+    pub(crate) fn authorize_remote_transcript(
+        &self,
+        run_id: &str,
+        recorded: &Path,
+    ) -> Result<PathBuf, HostConnectorError> {
+        let cache =
+            crate::host::transcript_paths::cache_path(&self.global_dir(), &self.host_id, recorded)
+                .ok_or_else(|| {
+                    HostConnectorError::Invalid(format!(
+                        "not a transcript path: {}",
+                        recorded.display()
+                    ))
+                })?;
+        let rec = self
+            .run_store
+            .load(run_id)
+            .map_err(|_| HostConnectorError::NotFound(run_id.to_string()))?;
+        if rec.worker_id.as_deref() != Some(self.host_id.as_str()) {
+            return Err(HostConnectorError::Invalid(format!(
+                "run {run_id} does not belong to host {}",
+                self.host_id
+            )));
+        }
+        let claimed =
+            crate::host::transcript_paths::recorded_transcript_paths(&self.run_store, run_id);
+        if !claimed.iter().any(|p| p == recorded) {
+            return Err(HostConnectorError::Invalid(format!(
+                "run {run_id} did not record transcript {}",
+                recorded.display()
+            )));
+        }
+        Ok(cache)
     }
 
     /// Wrap a shell-escaped remote control command (`rupu workflow resume`)
@@ -1998,6 +2079,46 @@ impl HostConnector for SshHostConnector {
         read_transcript_file(path)
     }
 
+    fn local_transcript_path(&self, recorded: &Path) -> PathBuf {
+        crate::host::transcript_paths::cache_path(&self.global_dir(), &self.host_id, recorded)
+            .unwrap_or_else(|| recorded.to_path_buf())
+    }
+
+    async fn pull_transcript(
+        &self,
+        run_id: &str,
+        recorded: &Path,
+        terminal: bool,
+    ) -> Result<(), HostConnectorError> {
+        let cache = self.authorize_remote_transcript(run_id, recorded)?;
+        let remote = recorded
+            .to_str()
+            .ok_or_else(|| HostConnectorError::Invalid("non-UTF-8 transcript path".into()))?;
+        if remote.contains('\0') {
+            return Err(HostConnectorError::Invalid(
+                "transcript path contains NUL".into(),
+            ));
+        }
+        let out = self
+            .exec
+            .run(&single_cat_command(remote))
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success && out.stdout.is_empty() {
+            return Err(HostConnectorError::Unreachable(format!(
+                "host {} did not answer: {}",
+                self.host_id,
+                out.stderr.trim()
+            )));
+        }
+        let body = if out.stdout.trim_end() == NO_FILE_SENTINEL {
+            String::new()
+        } else {
+            out.stdout
+        };
+        write_cache_file(&cache, &body, terminal)
+    }
+
     /// SSH/Tunnel/Bucket runs are created in, and tailed into, the
     /// coordinator's own `RunStore` by `NodeMirror`, so run-scoped detail
     /// endpoints read that mirror instead of the wire.
@@ -2713,6 +2834,9 @@ mod tests {
         /// If set, the transcript `cat` sleeps this long before answering —
         /// a slow remote, so a teardown test can catch the pump mid-`cat`.
         cat_transcript_delay: Option<std::time::Duration>,
+        /// If set, returned as stdout for the pump's batched terminal pull
+        /// (`for p in …; do printf '==> %s <==' …; cat …; done`, Task 6).
+        batch_cat_stdout: Option<String>,
         /// If set, returned as stdout for a `rupu … run show <id>` command
         /// (`get_run`), so a test can drive the dispatcher's poll sequence.
         show_stdout: Option<String>,
@@ -2740,6 +2864,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2757,6 +2882,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2776,6 +2902,7 @@ mod tests {
                 cat_stdout: Some(cat_stdout.into()),
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2795,6 +2922,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2813,6 +2941,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2840,6 +2969,8 @@ mod tests {
                     self.evidence_stdout.clone().unwrap_or_default()
                 } else if remote.contains("'show'") {
                     self.show_stdout.clone().unwrap_or_default()
+                } else if remote.starts_with("for p in ") {
+                    self.batch_cat_stdout.clone().unwrap_or_default()
                 } else if remote.starts_with("cat ") {
                     if remote.contains("/launch.log") {
                         self.launch_log_stdout.clone().unwrap_or_default()
@@ -4017,6 +4148,212 @@ mod tests {
                 .any(|c| c.contains("setsid") || c.contains("nohup")),
             "command must be wrapped for detachment: {cmds:?}"
         );
+    }
+
+    /// Seed a mirrored run owned by `host_abc` whose step_results claim
+    /// `remote` — the shape every allowlist test starts from.
+    fn seed_claimed_run(
+        conn: &SshHostConnector,
+        run_store: &rupu_orchestrator::RunStore,
+        run_id: &str,
+        remote: &str,
+        terminal: bool,
+    ) {
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Workflow,
+            name: "wf".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+        run_store
+            .append_step_result(
+                run_id,
+                &rupu_orchestrator::runs::StepResultRecord {
+                    step_id: "build".into(),
+                    run_id: "run_01STEPX".into(),
+                    transcript_path: std::path::PathBuf::from(remote),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: Default::default(),
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
+                    run_outcome: None,
+                },
+            )
+            .unwrap();
+        if terminal {
+            conn.mirror
+                .finish(run_id, &conn.host_id, "completed")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn ssh_local_transcript_path_maps_into_the_host_cache() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let recorded = std::path::Path::new("/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl");
+        assert_eq!(
+            conn.local_transcript_path(recorded),
+            tmp.path()
+                .join("mirror/host_abc/transcripts/run_01STEP.jsonl")
+        );
+        // A non-transcript path maps to itself, so the handler's "is it a
+        // local file" check fails and the request falls to the run-scoped
+        // branch, which rejects it.
+        let odd = std::path::Path::new("/etc/passwd");
+        assert_eq!(conn.local_transcript_path(odd), odd.to_path_buf());
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_requires_the_run_to_claim_the_path() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01OWNED", claimed, false);
+
+        let other = std::path::Path::new("/home/ci/proj/.rupu/transcripts/run_01OTHER.jsonl");
+        let err = conn
+            .pull_transcript("run_01OWNED", other, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Invalid(ref m) if m.contains("did not record")),
+            "{err}"
+        );
+
+        let err = conn
+            .pull_transcript("run_01MISSING", std::path::Path::new(claimed), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::NotFound(_)), "{err}");
+
+        // Nothing was shelled for a refused pull.
+        assert!(fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !c.starts_with("cat ")));
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_rejects_a_run_owned_by_another_host() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01FOREIGN", claimed, false);
+        let mut rec = run_store.load("run_01FOREIGN").unwrap();
+        rec.worker_id = Some("host_other".into());
+        run_store.update(&rec).unwrap();
+
+        let err = conn
+            .pull_transcript("run_01FOREIGN", std::path::Path::new(claimed), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Invalid(ref m) if m.contains("does not belong")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_writes_cache_and_marks_complete_only_when_terminal() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.cat_transcript_stdout =
+            Some("{\"type\":\"run_start\"}\n{\"type\":\"turn_start\"}\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01PULL", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01STEP.jsonl");
+
+        conn.pull_transcript("run_01PULL", std::path::Path::new(claimed), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n{\"type\":\"turn_start\"}\n"
+        );
+        assert!(
+            !crate::host::transcript_paths::is_complete(&cache),
+            "non-terminal pull is a snapshot"
+        );
+        assert!(
+            !cache.with_extension("jsonl.tmp").exists(),
+            "tmp file renamed away"
+        );
+
+        conn.pull_transcript("run_01PULL", std::path::Path::new(claimed), true)
+            .await
+            .unwrap();
+        assert!(crate::host::transcript_paths::is_complete(&cache));
+
+        let cmds = fake.commands.lock().unwrap();
+        let cat = cmds
+            .iter()
+            .find(|c| c.starts_with("cat "))
+            .expect("a cat was issued");
+        assert!(
+            cat.contains(&format!("'{claimed}'")),
+            "path must be single-quoted: {cat}"
+        );
+        assert!(
+            cat.contains("__RUPU_NO_FILE__"),
+            "absent-file sentinel present: {cat}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_absent_remote_file_is_an_empty_complete_answer() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.cat_transcript_stdout = Some("__RUPU_NO_FILE__\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01NONE.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01ABSENT", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01NONE.jsonl");
+
+        conn.pull_transcript("run_01ABSENT", std::path::Path::new(claimed), true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), "");
+        assert!(crate::host::transcript_paths::is_complete(&cache));
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_offline_is_unreachable_and_leaves_no_cache() {
+        let fake = std::sync::Arc::new(FakeExec::offline(
+            "ssh: connect to host mini port 22: No route",
+        ));
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01OFF.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01OFFLINE", claimed, false);
+
+        let err = conn
+            .pull_transcript("run_01OFFLINE", std::path::Path::new(claimed), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err}");
+        assert!(!tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01OFF.jsonl")
+            .exists());
     }
 
     #[tokio::test]
