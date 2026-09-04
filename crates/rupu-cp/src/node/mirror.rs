@@ -318,8 +318,43 @@ impl NodeMirror {
         }
         record.status = parse_status(status);
         record.finished_at = Some(Utc::now());
+        record.active_step_id = None;
+        record.active_step_transcript_path = None;
         self.run_store.update(&record)?;
         self.synthesize_transcript_step_result(&record);
+        Ok(())
+    }
+
+    /// The store this mirror writes into. Readers that need the run's own
+    /// artifacts (the tail pump's terminal pull) go through here.
+    pub fn run_store(&self) -> &RunStore {
+        &self.run_store
+    }
+
+    /// The CP global dir (`<global>/runs` is the store root).
+    pub fn global_dir(&self) -> PathBuf {
+        self.run_store
+            .root
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.run_store.root.clone())
+    }
+
+    /// Spec §8: the pump saw the agent transcript's first line. Point the
+    /// local record's active step at the mirrored copy so the frontends'
+    /// existing active-step fallback opens it live. No-op once terminal.
+    pub fn note_transcript_started(&self, run_id: &str, node_id: &str) -> Result<(), MirrorError> {
+        validate_run_id(run_id)?;
+        let mut record = self.run_store.load(run_id)?;
+        if record.worker_id.as_deref() != Some(node_id) {
+            return Err(MirrorError::WrongNode(run_id.to_string()));
+        }
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        record.active_step_id = Some("agent".into());
+        record.active_step_transcript_path = Some(self.transcript_mirror_path(run_id));
+        self.run_store.update(&record)?;
         Ok(())
     }
 

@@ -756,6 +756,108 @@ async fn pump_catch_up_transcript(
     }
 }
 
+/// Spec §6.1 step 3: one ssh invocation that prints the pump's own
+/// `==> <path> <==` header, the file, then a synthetic newline + `==> end <==`
+/// for every path. The synthetic newline guarantees the end marker starts a
+/// fresh line even when the file's last line is torn; `split_batched_cat`
+/// removes it again.
+pub(crate) fn batch_cat_command(paths: &[String]) -> String {
+    let mut cmd = String::from("for p in");
+    for p in paths {
+        cmd.push(' ');
+        cmd.push_str(&shell_escape(p));
+    }
+    cmd.push_str(
+        "; do printf '==> %s <==\\n' \"$p\"; cat \"$p\" 2>/dev/null; printf '\\n==> end <==\\n'; done",
+    );
+    cmd
+}
+
+/// Inverse of [`batch_cat_command`]: `path → body` for every file whose end
+/// marker arrived. A file cut off mid-stream is absent from the map, so the
+/// caller leaves its cache untouched and unmarked (§6.2).
+pub(crate) fn split_batched_cat(stdout: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in stdout.split('\n') {
+        match parse_tail_marker(line) {
+            Some("end") => {
+                if let Some((path, mut lines)) = current.take() {
+                    // Drop the ONE synthetic empty line the command appended.
+                    if lines.last() == Some(&"") {
+                        lines.pop();
+                    }
+                    let mut body = lines.join("\n");
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    out.insert(path, body);
+                }
+            }
+            Some(path) => current = Some((path.to_string(), Vec::new())),
+            None => {
+                if let Some((_, lines)) = current.as_mut() {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Spec §6: pull every step transcript the run's artifacts recorded into the
+/// host's cache, in one ssh round trip, marking each complete. Best-effort:
+/// a failure leaves files unmarked for the on-demand retry (§4.2).
+async fn pump_pull_step_transcripts(
+    exec: &dyn RemoteExec,
+    mirror: &NodeMirror,
+    run_id: &str,
+    host_id: &str,
+) {
+    let global = mirror.global_dir();
+    let agent_mirror = mirror.transcript_mirror_path(run_id);
+    let mut targets: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for recorded in
+        crate::host::transcript_paths::recorded_transcript_paths(mirror.run_store(), run_id)
+    {
+        if recorded == agent_mirror {
+            continue; // handled by pump_catch_up_transcript
+        }
+        let Some(cache) = crate::host::transcript_paths::cache_path(&global, host_id, &recorded)
+        else {
+            continue;
+        };
+        if crate::host::transcript_paths::is_complete(&cache) {
+            continue;
+        }
+        if let Some(remote) = recorded.to_str() {
+            targets.push((remote.to_string(), cache));
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let remotes: Vec<String> = targets.iter().map(|(r, _)| r.clone()).collect();
+    let Ok(out) = exec.run(&batch_cat_command(&remotes)).await else {
+        return;
+    };
+    let files = split_batched_cat(&out.stdout);
+    for (remote, cache) in &targets {
+        if let Some(body) = files.get(remote) {
+            if let Err(e) = write_cache_file(cache, body, true) {
+                tracing::warn!(host_id, run_id, cache = %cache.display(), error = %e, "terminal transcript pull: cache write failed");
+            }
+        } else {
+            tracing::warn!(
+                host_id,
+                run_id,
+                remote,
+                "terminal transcript pull did not deliver this file; left for on-demand retry"
+            );
+        }
+    }
+}
+
 /// What one [`pump_finalize_if_terminal`] probe learned about the run.
 ///
 /// The pump needs BOTH bits this carries. `Finalized` is its exit condition;
@@ -801,8 +903,10 @@ async fn pump_finalize_if_terminal(
         return PumpProbe::Absent;
     };
     if !is_terminal_status(status) {
-        // The host HAS a record for this run — it is simply not done. That is
-        // the signal that clears the startup deadline.
+        // The host HAS a record for this run — it is simply not done. Mirror
+        // it (spec §5.2) so the local record carries the live active step,
+        // then clear the startup deadline.
+        let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
         return PumpProbe::Alive;
     }
     let status = status.to_string();
@@ -810,6 +914,7 @@ async fn pump_finalize_if_terminal(
     // Before `finish`, so the synthesized step-result row sees the complete
     // transcript on disk.
     pump_catch_up_transcript(exec, mirror, run_id, host_id, cat_transcript_cmd).await;
+    pump_pull_step_transcripts(exec, mirror, run_id, host_id).await;
     let _ = mirror.finish(run_id, host_id, &status);
     PumpProbe::Finalized
 }
@@ -1271,6 +1376,8 @@ impl SshHostConnector {
                                                     // declaration).
                                                     let _ = mirror
                                                         .reset_transcript(&run_id, &host_id);
+                                                    let _ = mirror
+                                                        .note_transcript_started(&run_id, &host_id);
                                                 }
                                                 Some(ArtifactFile::Transcript)
                                             } else {
@@ -1412,6 +1519,9 @@ impl SshHostConnector {
                         &cat_transcript_cmd,
                     )
                     .await;
+                    // The host is still reachable here too — pull every
+                    // recorded step transcript before finishing the run.
+                    pump_pull_step_transcripts(exec.as_ref(), &mirror, &run_id, &host_id).await;
                     if let Ok(out) = exec.run(&cat_cmd).await {
                         if out.success && !out.stdout.trim().is_empty() {
                             let trimmed = out.stdout.trim().to_string();
@@ -5880,6 +5990,279 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HostConnectorError::Remote(3, _)), "{err:?}");
+    }
+
+    // ── Task 6: run.json-while-alive, live active step, terminal batch pull ──
+
+    fn agent_spec() -> crate::node::protocol::RunSpec {
+        crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "reviewer".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        }
+    }
+
+    fn workflow_spec() -> crate::node::protocol::RunSpec {
+        crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Workflow,
+            name: "wf".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        }
+    }
+
+    #[test]
+    fn note_transcript_started_sets_the_live_active_step_and_finish_clears_it() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run("run_01LIVE", "host_abc", &agent_spec())
+            .unwrap();
+
+        conn.mirror
+            .note_transcript_started("run_01LIVE", "host_abc")
+            .unwrap();
+        let rec = run_store.load("run_01LIVE").unwrap();
+        assert_eq!(rec.active_step_id.as_deref(), Some("agent"));
+        assert_eq!(
+            rec.active_step_transcript_path,
+            Some(conn.mirror.transcript_mirror_path("run_01LIVE"))
+        );
+        assert!(matches!(
+            conn.mirror
+                .note_transcript_started("run_01LIVE", "host_other"),
+            Err(crate::node::MirrorError::WrongNode(_))
+        ));
+
+        conn.mirror
+            .finish("run_01LIVE", "host_abc", "completed")
+            .unwrap();
+        let rec = run_store.load("run_01LIVE").unwrap();
+        assert_eq!(rec.active_step_id, None);
+        assert_eq!(rec.active_step_transcript_path, None);
+    }
+
+    #[test]
+    fn batch_cat_command_quotes_each_path_and_brackets_each_file() {
+        let cmd = batch_cat_command(&["/a/run_01A.jsonl".into(), "/b/it's.jsonl".into()]);
+        assert_eq!(
+            cmd,
+            "for p in '/a/run_01A.jsonl' '/b/it'\\''s.jsonl'; do printf '==> %s <==\\n' \"$p\"; cat \"$p\" 2>/dev/null; printf '\\n==> end <==\\n'; done"
+        );
+    }
+
+    #[test]
+    fn split_batched_cat_separates_files_and_drops_the_synthetic_trailing_newline() {
+        let stdout = "==> /a/one.jsonl <==\n{\"a\":1}\n{\"a\":2}\n\n==> end <==\n\
+                      ==> /a/absent.jsonl <==\n\n==> end <==\n\
+                      ==> /a/torn.jsonl <==\n{\"t\":1}\n{\"t\":\n==> end <==\n";
+        let files = split_batched_cat(stdout);
+        assert_eq!(files["/a/one.jsonl"], "{\"a\":1}\n{\"a\":2}\n");
+        assert_eq!(files["/a/absent.jsonl"], "");
+        assert_eq!(
+            files["/a/torn.jsonl"], "{\"t\":1}\n{\"t\":\n",
+            "a torn last line is kept"
+        );
+        assert_eq!(files.len(), 3);
+        // A stream cut mid-file never yields that file at all.
+        let cut = "==> /a/one.jsonl <==\n{\"a\":1}\n";
+        assert!(split_batched_cat(cut).is_empty());
+    }
+
+    /// Build the remote's `run.json` body from a REAL `RunRecord` so the
+    /// mirror's `RunJson` parse cannot silently fail on a hand-written shape.
+    fn remote_run_json(
+        run_store: &rupu_orchestrator::RunStore,
+        run_id: &str,
+        status: rupu_orchestrator::RunStatus,
+        active: Option<(&str, &str)>,
+    ) -> String {
+        let mut rec = run_store.load(run_id).unwrap();
+        rec.status = status;
+        rec.worker_id = None; // the remote does not know it is a mirror
+        rec.active_step_id = active.map(|(id, _)| id.to_string());
+        rec.active_step_transcript_path = active.map(|(_, p)| std::path::PathBuf::from(p));
+        serde_json::to_string(&rec).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tail_pump_mirrors_run_json_while_the_run_is_still_alive() {
+        let run_id = "run_01ALIVE";
+        // Two-phase construction: the mirror record must exist before the
+        // remote run.json body can be derived from it.
+        let fake_probe = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn0, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake_probe));
+        conn0
+            .mirror
+            .create_run(run_id, &conn0.host_id, &workflow_spec())
+            .unwrap();
+        let alive_json = remote_run_json(
+            &run_store,
+            run_id,
+            rupu_orchestrator::RunStatus::Running,
+            Some(("build", "/remote/proj/.rupu/transcripts/run_01BUILD.jsonl")),
+        );
+        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(vec![], alive_json));
+        let mirror = std::sync::Arc::clone(&conn0.mirror);
+        let exec: std::sync::Arc<dyn RemoteExec> = fake;
+        let conn =
+            SshHostConnector::new("host_abc", exec, mirror, std::sync::Arc::clone(&run_store));
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.active_step_id.as_deref() == Some("build") {
+                assert_eq!(
+                    rec.active_step_transcript_path,
+                    Some(std::path::PathBuf::from(
+                        "/remote/proj/.rupu/transcripts/run_01BUILD.jsonl"
+                    ))
+                );
+                assert_eq!(rec.status, rupu_orchestrator::RunStatus::Running);
+                assert_eq!(
+                    rec.worker_id.as_deref(),
+                    Some("host_abc"),
+                    "identity re-pinned"
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("non-terminal run.json was never mirrored");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_pump_first_transcript_header_marks_the_agent_step_live() {
+        let run_id = "run_01LIVEHDR";
+        let tail_lines = vec![
+            format!("==> /home/ci/.rupu/transcripts/{run_id}.jsonl <=="),
+            r#"{"type":"run_start","agent":"reviewer"}"#.to_string(),
+        ];
+        // No run.json yet (an agent run writes it only at the end) → the
+        // interval probe answers Absent and the pump stays open.
+        let fake = std::sync::Arc::new(FakeExec::ok(tail_lines));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &agent_spec())
+            .unwrap();
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.active_step_id.as_deref() == Some("agent") {
+                assert_eq!(
+                    rec.active_step_transcript_path,
+                    Some(conn.mirror.transcript_mirror_path(run_id))
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("active step never set from the transcript header");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_pump_terminal_pulls_every_recorded_step_transcript_into_the_cache() {
+        let run_id = "run_01PULLALL";
+        let step_a = "/home/ci/proj/.rupu/transcripts/run_01STEPA.jsonl";
+        let step_b = "/home/ci/proj/.rupu/transcripts/run_01STEPB.jsonl";
+        // The pump's `select!` is unbiased, so the terminal probe can win
+        // before any tailed line is consumed. Pre-seed the LOCAL mirror with
+        // the artifacts the tail would have delivered (that is what
+        // `recorded_transcript_paths` reads), and feed no tail lines.
+        let fake_probe = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn0, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake_probe));
+        conn0
+            .mirror
+            .create_run(run_id, &conn0.host_id, &workflow_spec())
+            .unwrap();
+        conn0
+            .mirror
+            .append(
+                run_id,
+                "host_abc",
+                ArtifactFile::StepResults,
+                &format!(r#"{{"step_id":"a","run_id":"run_01STEPA","transcript_path":"{step_a}","output":"","success":true,"skipped":false,"rendered_prompt":"","finished_at":"2026-09-04T00:00:00Z"}}"#),
+            )
+            .unwrap();
+        conn0
+            .mirror
+            .append(
+                run_id,
+                "host_abc",
+                ArtifactFile::Events,
+                &format!(r#"{{"type":"step_working","run_id":"{run_id}","step_id":"b","transcript_path":"{step_b}"}}"#),
+            )
+            .unwrap();
+        let run_json = remote_run_json(
+            &run_store,
+            run_id,
+            rupu_orchestrator::RunStatus::Completed,
+            None,
+        );
+        let mut fake = FakeExec::with_cat_stdout(vec![], run_json);
+        fake.batch_cat_stdout = Some(format!(
+            "==> {step_a} <==\n{{\"type\":\"run_start\"}}\n\n==> end <==\n==> {step_b} <==\n\n==> end <==\n"
+        ));
+        let fake = std::sync::Arc::new(fake);
+        let mirror = std::sync::Arc::clone(&conn0.mirror);
+        let exec: std::sync::Arc<dyn RemoteExec> = std::sync::Arc::clone(&fake) as _;
+        let conn =
+            SshHostConnector::new("host_abc", exec, mirror, std::sync::Arc::clone(&run_store));
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if run_store.load(run_id).unwrap().status != rupu_orchestrator::RunStatus::Running {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("pump never finalized");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Join the pump's terminal work the way the dispatcher does.
+        conn.await_run_mirror(run_id).await;
+
+        let cache_a = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01STEPA.jsonl");
+        let cache_b = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01STEPB.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&cache_a).unwrap(),
+            "{\"type\":\"run_start\"}\n"
+        );
+        assert!(crate::host::transcript_paths::is_complete(&cache_a));
+        assert_eq!(
+            std::fs::read_to_string(&cache_b).unwrap(),
+            "",
+            "absent remote file → empty complete answer"
+        );
+        assert!(crate::host::transcript_paths::is_complete(&cache_b));
+
+        let cmds = fake.commands.lock().unwrap();
+        let batch: Vec<_> = cmds.iter().filter(|c| c.starts_with("for p in ")).collect();
+        assert_eq!(
+            batch.len(),
+            1,
+            "exactly one ssh invocation for all files: {cmds:?}"
+        );
+        assert!(
+            batch[0].contains(&format!("'{step_a}'")) && batch[0].contains(&format!("'{step_b}'"))
+        );
     }
 
     // ── End-to-end SSH workspace-sync parity (ssh-ws T5) ─────────────────────
