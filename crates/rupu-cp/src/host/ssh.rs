@@ -2135,7 +2135,7 @@ impl HostConnector for SshHostConnector {
         let remote = recorded
             .to_str()
             .ok_or_else(|| HostConnectorError::Invalid("non-UTF-8 transcript path".into()))?;
-        match self.lazy.subscribe(remote, &cache) {
+        match self.lazy.subscribe(remote, &cache).await {
             Ok(Some(handle)) => Ok(FeedGuard::holding(Box::new(handle))),
             Ok(None) => Ok(FeedGuard::noop()),
             Err(e) => Err(HostConnectorError::Unreachable(e.to_string())),

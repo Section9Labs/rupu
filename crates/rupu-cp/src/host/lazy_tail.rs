@@ -6,11 +6,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use tokio::sync::watch;
 
 use super::ssh::{parse_tail_marker, shell_escape, RemoteExec, RemoteExecError};
 use super::transcript_paths::is_complete;
+
+/// How long `subscribe` will wait for a just-replaced feed's task to
+/// confirm it has actually stopped writing before truncating the cache out
+/// from under it. A cooperative `abort()` only takes effect at the aborted
+/// task's next await point, so this is a real (if generous) wait, not a
+/// formality — see [`FeedDone`]. A timeout just proceeds; it trades a
+/// vanishingly rare stuck-task edge case for never hanging a viewer.
+const REPLACE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Refcount + liveness for one shared remote tail. Every subscriber holds an
 /// `Arc`; the feeding task is aborted on drop of the last one, which drops
@@ -22,8 +32,8 @@ pub(crate) struct FeedHandle {
 
 impl FeedHandle {
     /// `false` once the remote stream ended (ssh dropped, remote `tail`
-    /// died). The cache file is left as-is; a later subscribe replaces the
-    /// feed and replays from byte zero.
+    /// died, or the task was aborted). The cache file is left as-is; a
+    /// later subscribe replaces the feed and replays from byte zero.
     pub(crate) fn alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
@@ -35,9 +45,43 @@ impl Drop for FeedHandle {
     }
 }
 
+/// Held by the feeding task for its entire body. `JoinHandle::abort()` is
+/// cooperative: a task that is actively running (not suspended at an
+/// `.await`) finishes its current poll — including any in-flight
+/// synchronous `writeln!`/`flush()` — before the cancellation actually
+/// drops its future. Because Rust only runs a value's `Drop` once nothing
+/// is still executing inside it, this guard's `drop` is the one moment
+/// that is guaranteed to run *after* any write the task was mid-way
+/// through, on every exit path (normal stream end, panic, or abort alike).
+/// `subscribe` waits on `finished` before truncating the same cache file
+/// for a replacement feed, so a stale task's tail end can never land after
+/// the new feed has already started writing (spec §5.1: no duplicate
+/// lines across a replaced feed).
+struct FeedDone {
+    alive: Arc<AtomicBool>,
+    finished: watch::Sender<bool>,
+}
+
+impl Drop for FeedDone {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+        let _ = self.finished.send(true);
+    }
+}
+
+/// One registry entry: a weak handle so the registry itself never keeps a
+/// feed alive, plus a `finished` receiver kept independently of the
+/// `Weak` — once the last `Arc<FeedHandle>` is dropped the `Weak` can no
+/// longer be upgraded, so this is the only way `subscribe` can still learn
+/// when that feed's task has actually stopped.
+struct FeedEntry {
+    handle: Weak<FeedHandle>,
+    finished: watch::Receiver<bool>,
+}
+
 pub(crate) struct LazyTailRegistry {
     exec: Arc<dyn RemoteExec>,
-    feeds: Mutex<HashMap<PathBuf, Weak<FeedHandle>>>,
+    feeds: Mutex<HashMap<PathBuf, FeedEntry>>,
 }
 
 impl LazyTailRegistry {
@@ -55,8 +99,9 @@ impl LazyTailRegistry {
     ///   The first subscriber truncates the cache and spawns
     ///   `tail -n +1 -F` (a byte-zero replay, which is what makes the
     ///   truncate safe); later subscribers share the running feed; a dead
-    ///   feed is replaced.
-    pub(crate) fn subscribe(
+    ///   feed is replaced — after confirming, via [`FeedDone`], that the
+    ///   old feed's task has actually stopped writing.
+    pub(crate) async fn subscribe(
         &self,
         remote: &str,
         cache: &Path,
@@ -64,27 +109,65 @@ impl LazyTailRegistry {
         if is_complete(cache) {
             return Ok(None);
         }
+
+        // Fast path: an existing, live feed is shared without waiting.
+        let wait_rx = {
+            let feeds = self.feeds.lock().unwrap();
+            match feeds.get(cache) {
+                Some(entry) => {
+                    if let Some(existing) = entry.handle.upgrade() {
+                        if existing.alive() {
+                            return Ok(Some(existing));
+                        }
+                    }
+                    Some(entry.finished.clone())
+                }
+                None => None,
+            }
+        };
+
+        // No usable feed. A previous one may still be tearing down — wait
+        // (bounded) for its `FeedDone` guard to fire before truncating the
+        // same cache file underneath it; see `FeedDone`'s doc comment for
+        // why this is a real race, not a formality. Never await while
+        // holding the std `Mutex` (clippy::await_holding_lock) — the lock
+        // above is already released by the time we get here.
+        if let Some(mut rx) = wait_rx {
+            let _ = tokio::time::timeout(REPLACE_WAIT_TIMEOUT, rx.wait_for(|done| *done)).await;
+        }
+
         let mut feeds = self.feeds.lock().unwrap();
-        if let Some(existing) = feeds.get(cache).and_then(Weak::upgrade) {
-            if existing.alive() {
-                return Ok(Some(existing));
+        // Someone else may have installed a fresh, live feed while we
+        // waited — join it rather than spawning a redundant second tail.
+        if let Some(entry) = feeds.get(cache) {
+            if let Some(existing) = entry.handle.upgrade() {
+                if existing.alive() {
+                    return Ok(Some(existing));
+                }
             }
         }
+
         if let Some(dir) = cache.parent() {
             std::fs::create_dir_all(dir).map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
         }
         // Truncate BEFORE spawning: the replay starts from an empty file.
+        // Safe now — any previous feed's task is confirmed fully stopped.
         std::fs::File::create(cache).map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
         let cmd = format!("tail -n +1 -F {}", shell_escape(remote));
         let mut stream = self.exec.spawn_lines(&cmd)?;
         let alive = Arc::new(AtomicBool::new(true));
-        let alive_for_task = Arc::clone(&alive);
+        let (finished_tx, finished_rx) = watch::channel(false);
+        let done = FeedDone {
+            alive: Arc::clone(&alive),
+            finished: finished_tx,
+        };
         let cache_owned = cache.to_path_buf();
         let task = tokio::spawn(async move {
+            // Held for the whole body: its `Drop` is what tells a
+            // replacing `subscribe` this task will never write again.
+            let _done = done;
             use std::io::Write as _;
-            let file = std::fs::OpenOptions::new().append(true).open(&cache_owned);
-            let Ok(mut file) = file else {
-                alive_for_task.store(false, Ordering::SeqCst);
+            let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&cache_owned) else {
                 return;
             };
             while let Some(Ok(line)) = stream.next().await {
@@ -95,10 +178,15 @@ impl LazyTailRegistry {
                     break;
                 }
             }
-            alive_for_task.store(false, Ordering::SeqCst);
         });
         let handle = Arc::new(FeedHandle { task, alive });
-        feeds.insert(cache.to_path_buf(), Arc::downgrade(&handle));
+        feeds.insert(
+            cache.to_path_buf(),
+            FeedEntry {
+                handle: Arc::downgrade(&handle),
+                finished: finished_rx,
+            },
+        );
         Ok(Some(handle))
     }
 
@@ -108,7 +196,7 @@ impl LazyTailRegistry {
             .lock()
             .unwrap()
             .values()
-            .filter(|w| w.strong_count() > 0)
+            .filter(|e| e.handle.strong_count() > 0)
             .count()
     }
 }
@@ -185,6 +273,7 @@ mod tests {
 
         let guard = reg
             .subscribe("/remote/.rupu/transcripts/run_01A.jsonl", &cache)
+            .await
             .unwrap()
             .unwrap();
         wait_for_content(&cache, "turn_start").await;
@@ -210,8 +299,16 @@ mod tests {
         let ex = exec(&[r#"{"type":"run_start"}"#], true);
         let reg = LazyTailRegistry::new(ex.clone());
 
-        let a = reg.subscribe("/r/run_01B.jsonl", &cache).unwrap().unwrap();
-        let b = reg.subscribe("/r/run_01B.jsonl", &cache).unwrap().unwrap();
+        let a = reg
+            .subscribe("/r/run_01B.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        let b = reg
+            .subscribe("/r/run_01B.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(ex.spawns.lock().unwrap().len(), 1);
         assert_eq!(reg.live_feeds(), 1);
@@ -234,7 +331,11 @@ mod tests {
         let ex = exec(&[], true);
         let reg = LazyTailRegistry::new(ex.clone());
 
-        assert!(reg.subscribe("/r/run_01C.jsonl", &cache).unwrap().is_none());
+        assert!(reg
+            .subscribe("/r/run_01C.jsonl", &cache)
+            .await
+            .unwrap()
+            .is_none());
         assert!(ex.spawns.lock().unwrap().is_empty());
         assert_eq!(
             std::fs::read_to_string(&cache).unwrap(),
@@ -251,7 +352,11 @@ mod tests {
         let ex = exec(&[r#"{"type":"run_start"}"#], false);
         let reg = LazyTailRegistry::new(ex.clone());
 
-        let first = reg.subscribe("/r/run_01D.jsonl", &cache).unwrap().unwrap();
+        let first = reg
+            .subscribe("/r/run_01D.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
         wait_for_content(&cache, "run_start").await;
         for _ in 0..100 {
             if !first.alive() {
@@ -263,7 +368,11 @@ mod tests {
 
         // A second viewer, while the first still holds its (dead) handle,
         // gets a fresh tail — which truncates and replays from byte zero.
-        let second = reg.subscribe("/r/run_01D.jsonl", &cache).unwrap().unwrap();
+        let second = reg
+            .subscribe("/r/run_01D.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(ex.spawns.lock().unwrap().len(), 2);
         wait_for_content(&cache, "run_start").await;
@@ -283,11 +392,71 @@ mod tests {
             true,
         );
         let reg = LazyTailRegistry::new(ex.clone());
-        let _g = reg.subscribe("/r/run_01E.jsonl", &cache).unwrap().unwrap();
+        let _g = reg
+            .subscribe("/r/run_01E.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
         wait_for_content(&cache, "run_start").await;
         assert_eq!(
             std::fs::read_to_string(&cache).unwrap(),
             "{\"type\":\"run_start\"}\n"
+        );
+    }
+
+    /// Pins the fix for the real race: `FeedHandle::drop`'s `task.abort()`
+    /// is only a *request* — a task caught mid-write finishes that write
+    /// before the cancellation can actually drop its future. A naive
+    /// `subscribe` that replaces a feed the instant `Weak::upgrade` fails
+    /// could truncate the cache and start a fresh append while the old
+    /// task's tail-end write is still in flight, landing after the new
+    /// feed's own replay and duplicating/corrupting the cache (spec §5.1:
+    /// "a viewer that reconnects never gets duplicate lines"). `subscribe`
+    /// now waits for the old task's `FeedDone` guard to confirm it has
+    /// truly stopped before touching the file.
+    #[tokio::test]
+    async fn replacing_the_just_dropped_last_guard_waits_for_it_to_finish_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("run_01RACE.jsonl");
+        let ex = exec(&[r#"{"type":"run_start"}"#], true);
+        let reg = LazyTailRegistry::new(ex.clone());
+
+        let first = reg
+            .subscribe("/r/run_01RACE.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_content(&cache, "run_start").await;
+        // `first.alive` is a private field, visible here because `tests` is
+        // a child module of `lazy_tail` — clone the flag out before
+        // dropping the only strong `Arc<FeedHandle>`, so it can still be
+        // inspected once `first` itself is gone.
+        let first_alive = Arc::clone(&first.alive);
+        drop(first);
+
+        let second = reg
+            .subscribe("/r/run_01RACE.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_content(&cache, "run_start").await;
+
+        assert_eq!(
+            ex.spawns.lock().unwrap().len(),
+            2,
+            "a fresh tail was spawned"
+        );
+        assert!(
+            !first_alive.load(Ordering::SeqCst),
+            "the replaced feed's task must be confirmed stopped by the time \
+             the second subscribe returns"
+        );
+        assert!(second.alive());
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n",
+            "replay from an empty file: exactly one copy of the line, no \
+             duplicate from the replaced feed's tail end"
         );
     }
 }
