@@ -96,11 +96,16 @@ impl LazyTailRegistry {
     ///
     /// * `Ok(None)` — `cache` is already complete; nothing to tail.
     /// * `Ok(Some(handle))` — hold it for as long as the viewer is attached.
-    ///   The first subscriber truncates the cache and spawns
-    ///   `tail -n +1 -F` (a byte-zero replay, which is what makes the
-    ///   truncate safe); later subscribers share the running feed; a dead
-    ///   feed is replaced — after confirming, via [`FeedDone`], that the
-    ///   old feed's task has actually stopped writing.
+    ///   The first subscriber spawns `tail -n +1 -F` and the feeding task
+    ///   truncates the cache when its FIRST line arrives — a byte-zero
+    ///   replay, which is what makes the truncate safe. Truncating here
+    ///   instead would destroy whatever was already collected whenever the
+    ///   spawn fails or the host never answers, handing the viewer an empty
+    ///   page flagged partial; deferring it costs nothing, because the line
+    ///   that authorises the truncate is the first line of the same replay.
+    ///   Later subscribers share the running feed; a dead feed is replaced —
+    ///   after confirming, via [`FeedDone`], that the old feed's task has
+    ///   actually stopped writing.
     pub(crate) async fn subscribe(
         &self,
         remote: &str,
@@ -137,6 +142,17 @@ impl LazyTailRegistry {
         }
 
         let mut feeds = self.feeds.lock().unwrap();
+        // Dead entries are never otherwise removed, so the map would grow for
+        // the process's lifetime. Prune on the slow path only — the fast path
+        // above must stay lock-and-return.
+        feeds.retain(|_, e| e.handle.strong_count() > 0);
+        // Re-check completeness UNDER the lock. The check at the top of this
+        // function ran before the (awaited) wait for the old feed to stop, and
+        // a terminal pull can write the `.complete` sidecar in that window. A
+        // complete cache is authoritative: never tail it.
+        if is_complete(cache) {
+            return Ok(None);
+        }
         // Someone else may have installed a fresh, live feed while we
         // waited — join it rather than spawning a redundant second tail.
         if let Some(entry) = feeds.get(cache) {
@@ -150,9 +166,6 @@ impl LazyTailRegistry {
         if let Some(dir) = cache.parent() {
             std::fs::create_dir_all(dir).map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
         }
-        // Truncate BEFORE spawning: the replay starts from an empty file.
-        // Safe now — any previous feed's task is confirmed fully stopped.
-        std::fs::File::create(cache).map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
         let cmd = format!("tail -n +1 -F {}", shell_escape(remote));
         let mut stream = self.exec.spawn_lines(&cmd)?;
         let alive = Arc::new(AtomicBool::new(true));
@@ -167,14 +180,32 @@ impl LazyTailRegistry {
             // replacing `subscribe` this task will never write again.
             let _done = done;
             use std::io::Write as _;
-            let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&cache_owned) else {
-                return;
-            };
+            // Opened lazily on the first real line — see `subscribe`'s doc
+            // comment: until the remote has proven it can deliver, the
+            // already-collected partial content stays on disk untouched.
+            let mut file: Option<std::fs::File> = None;
             while let Some(Ok(line)) = stream.next().await {
                 if parse_tail_marker(&line).is_some() || line.trim().is_empty() {
                     continue;
                 }
-                if writeln!(file, "{line}").and_then(|_| file.flush()).is_err() {
+                if file.is_none() {
+                    // `tail -n +1` replays from byte zero, so this line is the
+                    // start of the authoritative body: truncate the cache IN
+                    // PLACE (same inode — a concurrent terminal write may hold
+                    // this very file open) and reopen for append, so writes
+                    // always land at end-of-file even if someone rewrites the
+                    // body underneath us.
+                    if std::fs::File::create(&cache_owned).is_err() {
+                        return;
+                    }
+                    let Ok(opened) = std::fs::OpenOptions::new().append(true).open(&cache_owned)
+                    else {
+                        return;
+                    };
+                    file = Some(opened);
+                }
+                let Some(f) = file.as_mut() else { return };
+                if writeln!(f, "{line}").and_then(|_| f.flush()).is_err() {
                     break;
                 }
             }
@@ -188,6 +219,24 @@ impl LazyTailRegistry {
             },
         );
         Ok(Some(handle))
+    }
+
+    /// Is a feed currently tailing into `cache` AND still alive?
+    ///
+    /// A live feed holds an append handle on `cache`'s inode. Any writer that
+    /// replaces the file by `rename` would swap the dentry out from under it,
+    /// leaving the feed appending to an unlinked inode while readers open the
+    /// path — the SSE stream goes permanently quiet, and `alive()` stays
+    /// `true`, so later subscribers join the same zombie. Callers that are
+    /// about to write `cache` ask this first: `pull_transcript` steps aside
+    /// entirely (the feed is already filling the file), and the terminal pull
+    /// writes in place instead of renaming.
+    pub(crate) fn has_live_feed(&self, cache: &Path) -> bool {
+        let feeds = self.feeds.lock().unwrap();
+        feeds
+            .get(cache)
+            .and_then(|e| e.handle.upgrade())
+            .is_some_and(|h| h.alive())
     }
 
     #[cfg(test)]
@@ -290,6 +339,72 @@ mod tests {
             "tail -n +1 -F '/remote/.rupu/transcripts/run_01A.jsonl'"
         );
         drop(guard);
+    }
+
+    /// Issue 4: `subscribe` used to truncate the cache before the tail had
+    /// proven it could start. A spawn that never yields (host unreachable,
+    /// remote `tail` that never produces a line) then left the viewer with an
+    /// EMPTY page flagged partial, having destroyed content a previous pull
+    /// had already collected. The truncate now waits for the first line.
+    #[tokio::test]
+    async fn stale_content_survives_a_feed_that_never_yields_a_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("run_01STALE.jsonl");
+        std::fs::write(&cache, "PARTIAL CONTENT FROM AN EARLIER PULL\n").unwrap();
+        // Yields nothing, then pends forever: the remote never answers.
+        let ex = exec(&[], true);
+        let reg = LazyTailRegistry::new(ex.clone());
+
+        let _guard = reg
+            .subscribe("/r/run_01STALE.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        // Give the task ample opportunity to (wrongly) truncate.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "PARTIAL CONTENT FROM AN EARLIER PULL\n",
+            "nothing arrived from the remote, so the already-collected \
+             content must still be on disk"
+        );
+    }
+
+    /// C1: `has_live_feed` is what a would-be writer of the cache asks before
+    /// it renames a new file over the inode a feed is appending to.
+    #[tokio::test]
+    async fn has_live_feed_tracks_the_holder_and_ignores_a_complete_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("run_01LIVE.jsonl");
+        let ex = exec(&[r#"{"type":"run_start"}"#], true);
+        let reg = LazyTailRegistry::new(ex.clone());
+
+        assert!(!reg.has_live_feed(&cache), "no feed has been opened yet");
+        let guard = reg
+            .subscribe("/r/run_01LIVE.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_content(&cache, "run_start").await;
+        assert!(reg.has_live_feed(&cache), "a held guard is a live feed");
+        drop(guard);
+        assert!(
+            !reg.has_live_feed(&cache),
+            "the last guard is gone → no live feed"
+        );
+
+        // A complete cache is never tailed, so it never has a feed either.
+        let done = tmp.path().join("run_01DONE.jsonl");
+        std::fs::write(&done, "{\"type\":\"run_start\"}\n").unwrap();
+        std::fs::write(crate::host::transcript_paths::complete_marker(&done), b"").unwrap();
+        assert!(reg
+            .subscribe("/r/run_01DONE.jsonl", &done)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!reg.has_live_feed(&done));
     }
 
     #[tokio::test]
