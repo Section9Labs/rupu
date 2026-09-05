@@ -1078,20 +1078,7 @@ pub fn run_scoped_flows_and_dropped(
     global_dir: &StdPath,
     range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<FlowRecord>, u64) {
-    // No `HostRegistry` in scope here (this is the CLI-facing entry point —
-    // `rupu-cli`'s `netflow show` resolves the run's own store directly,
-    // with no CP host registry to map through), so the transcript side
-    // reads unresolved, exactly as before this task.
-    run_scoped_flows_and_dropped_with(
-        store,
-        run_id,
-        workspace,
-        global_dir,
-        range,
-        Vec::new(),
-        0,
-        None,
-    )
+    run_scoped_flows_and_dropped_with(store, run_id, workspace, global_dir, range, Vec::new(), 0)
 }
 
 /// [`run_scoped_flows_and_dropped`] plus ledger flows read from somewhere
@@ -1110,7 +1097,6 @@ pub fn run_scoped_flows_and_dropped(
 /// `extra_dropped` is added to the local dropped count — records lost on
 /// the remote are lost just the same, and folding them to zero here would
 /// claim a completeness we do not have.
-#[allow(clippy::too_many_arguments)]
 pub fn run_scoped_flows_and_dropped_with(
     store: &RunStore,
     run_id: &str,
@@ -1119,7 +1105,6 @@ pub fn run_scoped_flows_and_dropped_with(
     range: &rupu_netflow::ledger::TimeRange,
     extra_ledger_flows: Vec<FlowRecord>,
     extra_dropped: u64,
-    hosts: Option<&crate::host::registry::HostRegistry>,
 ) -> (Vec<FlowRecord>, u64) {
     let mut all: Vec<FlowRecord> = extra_ledger_flows
         .into_iter()
@@ -1134,15 +1119,7 @@ pub fn run_scoped_flows_and_dropped_with(
             dropped += d;
         }
     }
-    // Spec §6.3: an SSH-hosted run's transcript lives only in the
-    // coordinator-local mirror cache, not at the path recorded in
-    // `step_results.jsonl` — resolve through the host registry when one is
-    // in scope (every CP-side caller has one; the CLI's local-only entry
-    // point above does not, and reads unresolved).
-    let transcript_paths = match hosts {
-        Some(hosts) => crate::usage::run_transcript_paths_resolved(store, hosts, run_id),
-        None => crate::usage::run_transcript_paths(store, run_id),
-    };
+    let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
     // `merge_with_transcript` can add flows the ledger read never saw at
     // all (the degraded-sink recovery case — see its own doc comment), so
     // filtering only the ledger side above is not enough: an out-of-window
@@ -1173,7 +1150,6 @@ fn collect_run_netflow(
     range: &rupu_netflow::ledger::TimeRange,
     filters: &ExplorerFilters,
     remote: (Vec<FlowRecord>, u64, Vec<IncompleteSource>),
-    hosts: Option<&crate::host::registry::HostRegistry>,
 ) -> NetflowResponse {
     let (remote_flows, remote_dropped, incomplete) = remote;
     let (merged, dropped) = run_scoped_flows_and_dropped_with(
@@ -1184,7 +1160,6 @@ fn collect_run_netflow(
         range,
         remote_flows,
         remote_dropped,
-        hosts,
     );
     // Every flow at run scope folds into THIS run (the whole point of
     // `run_and_unit_ids`), so attribution is the run's own record; a
@@ -1718,20 +1693,9 @@ async fn run_scoped_flows_for_graph(
             let rid = run_id.to_string();
             let workspace = run.workspace_path.clone();
             let global_dir = s.global_dir.clone();
-            let hosts = Arc::clone(&s.hosts);
             let range = range.clone();
             let flows = run_blocking(move || {
-                run_scoped_flows_and_dropped_with(
-                    &store,
-                    &rid,
-                    &workspace,
-                    &global_dir,
-                    &range,
-                    Vec::new(),
-                    0,
-                    Some(&hosts),
-                )
-                .0
+                run_scoped_flows_and_dropped(&store, &rid, &workspace, &global_dir, &range).0
             })
             .await?;
             Ok(tag(flows))
@@ -1739,21 +1703,10 @@ async fn run_scoped_flows_for_graph(
         RunLocation::ProjectLocal { path } => {
             let rid = run_id.to_string();
             let global_dir = s.global_dir.clone();
-            let hosts = Arc::clone(&s.hosts);
             let range = range.clone();
             let flows = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                run_scoped_flows_and_dropped_with(
-                    &store,
-                    &rid,
-                    &path,
-                    &global_dir,
-                    &range,
-                    Vec::new(),
-                    0,
-                    Some(&hosts),
-                )
-                .0
+                run_scoped_flows_and_dropped(&store, &rid, &path, &global_dir, &range).0
             })
             .await?;
             Ok(tag(flows))
@@ -2002,7 +1955,6 @@ async fn explorer_run_scope(
             let workspace = run.workspace_path.clone();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
-            let hosts = Arc::clone(&s.hosts);
             let range = range.clone();
             let filters = filters.clone();
             run_blocking(move || {
@@ -2014,7 +1966,6 @@ async fn explorer_run_scope(
                     &unbounded,
                     remote_flows,
                     remote_dropped,
-                    Some(&hosts),
                 );
                 let mut meta = RunMetaIndex::default();
                 meta.insert_run(&store, &run);
@@ -2044,7 +1995,6 @@ async fn explorer_run_scope(
             let rid = run_id.to_string();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
-            let hosts = Arc::clone(&s.hosts);
             let range = range.clone();
             let filters = filters.clone();
             run_blocking(move || {
@@ -2057,7 +2007,6 @@ async fn explorer_run_scope(
                     &unbounded,
                     remote_flows,
                     remote_dropped,
-                    Some(&hosts),
                 );
                 let mut meta = RunMetaIndex::default();
                 if let Ok(record) = store.load(&rid) {
@@ -2560,7 +2509,6 @@ async fn get_run_netflow(
             let workspace = run.workspace_path.clone();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
-            let hosts = Arc::clone(&s.hosts);
             let resp = run_blocking(move || {
                 collect_run_netflow(
                     &store,
@@ -2571,7 +2519,6 @@ async fn get_run_netflow(
                     &range,
                     &filters,
                     remote,
-                    Some(&hosts),
                 )
             })
             .await?;
@@ -2587,7 +2534,6 @@ async fn get_run_netflow(
             let rid = run_id.clone();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
-            let hosts = Arc::clone(&s.hosts);
             let resp = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
                 collect_run_netflow(
@@ -2599,7 +2545,6 @@ async fn get_run_netflow(
                     &range,
                     &filters,
                     remote,
-                    Some(&hosts),
                 )
             })
             .await?;
@@ -3181,7 +3126,6 @@ mod tests {
             &rupu_netflow::ledger::TimeRange::unbounded(),
             vec![finalized, remote_only],
             3,
-            None,
         );
 
         assert_eq!(merged.len(), 2, "both remote flows survive");
@@ -3214,7 +3158,6 @@ mod tests {
             &rupu_netflow::ledger::TimeRange::unbounded(),
             Vec::new(),
             0,
-            None,
         );
 
         assert!(merged.is_empty());

@@ -69,7 +69,7 @@ fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
         other => ApiError::internal(other.to_string()),
     })?;
     let steps = s.run_store.read_step_results(id).unwrap_or_default();
-    let usage = crate::usage::summarize_run_resolved(&s.run_store, &s.hosts, id, &s.pricing);
+    let usage = crate::usage::summarize_run(&s.run_store, id, &s.pricing);
     Ok(Json(
         serde_json::json!({ "run": record, "steps": steps, "usage": usage }),
     ))
@@ -1435,10 +1435,7 @@ mod tests {
         let resp = approve_run(
             State(s.clone()),
             Path("run_app".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1474,10 +1471,7 @@ mod tests {
         let resp = reject_run(
             State(s.clone()),
             Path("run_rej".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             Json(body),
         )
         .await
@@ -1503,10 +1497,7 @@ mod tests {
         let err = approve_run(
             State(s),
             Path("run_done".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1521,10 +1512,7 @@ mod tests {
         let err = reject_run(
             State(s),
             Path("nope".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             Json(RejectBody { reason: None }),
         )
         .await
@@ -1546,10 +1534,7 @@ mod tests {
         let _ = approve_run(
             State(s.clone()),
             Path("run_mode".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             Some(Json(body)),
         )
         .await
@@ -1572,10 +1557,7 @@ mod tests {
         let _ = approve_run(
             State(s.clone()),
             Path("run_nobody".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1618,10 +1600,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(
-                multi_gate_awaiting_record("run_multi_approve_b"),
-                "name: x\n",
-            )
+            .create(multi_gate_awaiting_record("run_multi_approve_b"), "name: x\n")
             .unwrap();
 
         let resp = approve_run(
@@ -1672,10 +1651,7 @@ mod tests {
         let err = approve_run(
             State(s.clone()),
             Path("run_multi_ambig".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1697,10 +1673,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(
-                multi_gate_awaiting_record("run_multi_unknown_gate"),
-                "name: x\n",
-            )
+            .create(multi_gate_awaiting_record("run_multi_unknown_gate"), "name: x\n")
             .unwrap();
 
         let err = approve_run(
@@ -1725,10 +1698,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(
-                multi_gate_awaiting_record("run_multi_reject_a"),
-                "name: x\n",
-            )
+            .create(multi_gate_awaiting_record("run_multi_reject_a"), "name: x\n")
             .unwrap();
 
         let resp = reject_run(
@@ -1761,10 +1731,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(
-                multi_gate_awaiting_record("run_multi_reject_both"),
-                "name: x\n",
-            )
+            .create(multi_gate_awaiting_record("run_multi_reject_both"), "name: x\n")
             .unwrap();
 
         let _ = reject_run(
@@ -1849,10 +1816,7 @@ mod tests {
         let resp = cancel_run(
             State(s.clone()),
             Path("run_cancel".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1884,10 +1848,7 @@ mod tests {
         let err = cancel_run(
             State(s),
             Path("run_term".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             Some(Json(body)),
         )
         .await
@@ -1902,10 +1863,7 @@ mod tests {
         let err = cancel_run(
             State(s),
             Path("ghost".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1964,10 +1922,7 @@ mod tests {
         let resp = pause_run(
             State(s.clone()),
             Path("run_pause".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect("pause should succeed");
@@ -1993,10 +1948,7 @@ mod tests {
         let err = pause_run(
             State(s),
             Path("run_pause_done".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("pausing a completed run should fail");
@@ -2015,10 +1967,7 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("run_resume_nolauncher".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("resume without a launcher should be unavailable");
@@ -2036,10 +1985,7 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("run_resume_running".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("resuming a running (non-paused) run should conflict");
@@ -2063,10 +2009,7 @@ mod tests {
         let resp = resume_run(
             State(s.clone()),
             Path("run_resume_ok".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect("resume should succeed");
@@ -2092,10 +2035,7 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("ghost".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("resume on missing run should 404");
@@ -2125,10 +2065,7 @@ mod tests {
         let _ = archive_run(
             State(s.clone()),
             Path(id.clone()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect("archive ok");
@@ -2139,20 +2076,14 @@ mod tests {
         let _ = delete_run(
             State(s.clone()),
             Path(id.clone()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect("delete ok");
         let err = delete_run(
             State(s.clone()),
             Path(id.clone()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .unwrap_err();
@@ -2221,10 +2152,7 @@ mod tests {
         let err = archive_run(
             State(s.clone()),
             Path("../../etc".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .unwrap_err();
@@ -2240,10 +2168,7 @@ mod tests {
         let err = restore_run(
             State(s),
             Path("../../etc".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .unwrap_err();
@@ -2257,10 +2182,7 @@ mod tests {
         let err = delete_run(
             State(s),
             Path("../../etc".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .unwrap_err();
@@ -2278,10 +2200,7 @@ mod tests {
         let err = archive_run(
             State(s.clone()),
             Path(id),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .unwrap_err();
@@ -2306,10 +2225,7 @@ mod tests {
         let absent = archive_run(
             State(s.clone()),
             Path("run_01ABSENT".into()),
-            Query(RunControlQuery {
-                host: None,
-                gate: None,
-            }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect("absent host should archive locally")
@@ -2910,11 +2826,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
 
-        let d = |day: u32| {
-            chrono::Utc
-                .with_ymd_and_hms(2026, 8, day, 12, 0, 0)
-                .unwrap()
-        };
+        let d = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
         s.run_store
             .create(record_started_at("run_aug_01", d(1)), "name: x\n")
             .unwrap();
@@ -2936,17 +2848,8 @@ mod tests {
 
         // No bounds at all → every run passes, same as before this task.
         let unbounded = crate::pagination::DateRangeQuery::default();
-        let rows = query_run_rows(
-            &s.run_store,
-            0,
-            20,
-            None,
-            false,
-            None,
-            &s.pricing,
-            &unbounded,
-        )
-        .expect("query_run_rows ok");
+        let rows = query_run_rows(&s.run_store, 0, 20, None, false, None, &s.pricing, &unbounded)
+            .expect("query_run_rows ok");
         assert_eq!(rows.len(), 3);
     }
 
@@ -2955,11 +2858,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
 
-        let d = |day: u32| {
-            chrono::Utc
-                .with_ymd_and_hms(2026, 8, day, 12, 0, 0)
-                .unwrap()
-        };
+        let d = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
         s.run_store
             .create(record_started_at("run_early", d(1)), "name: x\n")
             .unwrap();

@@ -215,10 +215,10 @@ async fn get_project(
 
     // ── usage ─────────────────────────────────────────────────────────────
     // Project-level token/cost rollup across every scoped run.
-    let usage =
-        crate::usage::rollup(runs.iter().map(|r| {
-            crate::usage::summarize_run_resolved(&s.run_store, &s.hosts, &r.id, &s.pricing)
-        }));
+    let usage = crate::usage::rollup(
+        runs.iter()
+            .map(|r| crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing)),
+    );
 
     Ok(Json(ProjectDetail {
         project: project_row(&w),

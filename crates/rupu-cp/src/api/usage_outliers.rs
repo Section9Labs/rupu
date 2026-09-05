@@ -152,8 +152,7 @@ async fn get_usage_outliers(
         .iter()
         .filter(|r| r.started_at >= since && r.started_at <= until)
         .map(|r| {
-            let summary =
-                crate::usage::summarize_run_resolved(&s.run_store, &s.hosts, &r.id, &s.pricing);
+            let summary = crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing);
             RunCost {
                 run_id: r.id.clone(),
                 workflow_name: r.workflow_name.clone(),

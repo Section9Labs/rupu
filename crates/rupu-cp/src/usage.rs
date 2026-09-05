@@ -13,7 +13,7 @@ use rupu_transcript::UsageRow;
 use rupu_transcript::{Event, JsonlReader};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Token + cost summary for a run, or any rollup of runs.
 ///
@@ -69,9 +69,25 @@ pub fn summarize_paths(paths: &[PathBuf], pricing: &PricingConfig) -> UsageSumma
     summarize(&rows, pricing)
 }
 
-/// All transcript paths a run produced: one per step result, plus one per
-/// fan-out / panel sub-unit. Missing files are tolerated by
-/// `rupu_transcript::aggregate` (it skips unreadable paths).
+/// All transcript paths a run produced, resolved to the file that serves
+/// each one on this coordinator (spec §6.3): one per step result, plus one
+/// per fan-out / panel sub-unit. A path that does not exist locally and
+/// belongs to a run executed by a remote host (`worker_id`) is mapped to
+/// that host's mirror cache (`host::transcript_paths::cache_path`) when the
+/// cache file exists; otherwise the recorded path is kept unchanged
+/// (`rupu_transcript::aggregate` tolerates unreadable paths, so a still-open
+/// or never-mirrored transcript degrades to "no rows" rather than an
+/// error). A local run, or a `worker_id` this coordinator has no mirror
+/// directory for, is untouched — the existing-file check alone decides
+/// whether the recorded path is trusted.
+///
+/// Every caller of this function — `summarize_run`, `run_metrics`,
+/// `RunListRow::with_usage`, `query_run_detail`, `rupu-cli`'s `run show`/`run
+/// list`, and `LocalHostConnector` (which is what `GET /api/runs` and
+/// `GET /api/runs/:id` reach for a run mirrored from SSH, since the mirror
+/// lives in the LOCAL store) — gets this resolution for free, with no
+/// signature change and no `HostRegistry` dependency (which would be
+/// circular: the registry owns the local connector).
 pub fn run_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
     let records = store.read_step_results(run_id).unwrap_or_default();
     let mut paths = Vec::new();
@@ -81,53 +97,34 @@ pub fn run_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
             paths.push(item.transcript_path.clone());
         }
     }
-    paths
-}
-
-/// Token + cost summary for a single run.
-pub fn summarize_run(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> UsageSummary {
-    summarize_paths(&run_transcript_paths(store, run_id), pricing)
-}
-
-/// [`run_transcript_paths`] with each path mapped through the run's host
-/// connector (spec §6.3): a run executed by a mirror-backed host (SSH) reads
-/// its transcripts from the coordinator-local cache. A `worker_id` that is
-/// not a registered host (a local session worker, or none) maps nothing.
-pub fn run_transcript_paths_resolved(
-    store: &RunStore,
-    hosts: &crate::host::registry::HostRegistry,
-    run_id: &str,
-) -> Vec<PathBuf> {
-    let paths = run_transcript_paths(store, run_id);
     let Ok(rec) = store.load(run_id) else {
         return paths;
     };
     let Some(worker) = rec.worker_id.as_deref() else {
         return paths;
     };
-    let Ok(conn) = hosts.resolve(worker) else {
-        return paths;
-    };
-    if !conn.serves_runs_from_local_mirror() {
-        return paths;
-    }
+    let global = store
+        .root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| store.root.clone());
     paths
-        .iter()
-        .map(|p| conn.local_transcript_path(p))
+        .into_iter()
+        .map(|p| {
+            if p.exists() {
+                return p;
+            }
+            match crate::host::transcript_paths::cache_path(&global, worker, &p) {
+                Some(c) if c.exists() => c,
+                _ => p,
+            }
+        })
         .collect()
 }
 
-/// [`summarize_run`], host-resolved.
-pub fn summarize_run_resolved(
-    store: &RunStore,
-    hosts: &crate::host::registry::HostRegistry,
-    run_id: &str,
-    pricing: &PricingConfig,
-) -> UsageSummary {
-    summarize_paths(
-        &run_transcript_paths_resolved(store, hosts, run_id),
-        pricing,
-    )
+/// Token + cost summary for a single run.
+pub fn summarize_run(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> UsageSummary {
+    summarize_paths(&run_transcript_paths(store, run_id), pricing)
 }
 
 /// Token usage + turn count + duration for one run.
@@ -841,19 +838,12 @@ mod tests {
         assert_eq!(series[2].label, "step2");
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
 
-#[cfg(test)]
-mod resolved_paths_tests {
-    use super::*;
-    use crate::host::registry::HostRegistry;
-    use std::sync::Arc;
+    // ── `run_transcript_paths`' host-mirror fallback (spec §6.3) ──────────
 
-    #[test]
-    fn paths_of_a_run_owned_by_an_unknown_worker_pass_through_unchanged() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
-        let mirror = crate::node::NodeMirror::new(Arc::clone(&store));
+    fn seed_remote_run(tmp: &std::path::Path) -> (std::sync::Arc<RunStore>, PathBuf) {
+        let store = std::sync::Arc::new(RunStore::new(tmp.join("runs")));
+        let mirror = crate::node::NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "wf".into(),
@@ -862,16 +852,15 @@ mod resolved_paths_tests {
             mode: None,
             target: None,
         };
-        mirror
-            .create_run("run_01USAGE", "host_unknown", &spec)
-            .unwrap();
+        mirror.create_run("run_01USAGE", "host_abc", &spec).unwrap();
+        let recorded = PathBuf::from("/remote/proj/.rupu/transcripts/run_01A.jsonl");
         store
             .append_step_result(
                 "run_01USAGE",
                 &rupu_orchestrator::runs::StepResultRecord {
                     step_id: "a".into(),
                     run_id: "run_01A".into(),
-                    transcript_path: PathBuf::from("/remote/proj/.rupu/transcripts/run_01A.jsonl"),
+                    transcript_path: recorded.clone(),
                     output: String::new(),
                     success: true,
                     skipped: false,
@@ -887,26 +876,105 @@ mod resolved_paths_tests {
                 },
             )
             .unwrap();
-        let local = crate::host::local::LocalHostConnector::new(
-            None,
-            None,
-            None,
-            None,
-            Arc::clone(&store),
-            tmp.path().to_path_buf(),
-        );
-        let hosts = HostRegistry::new(
-            rupu_workspace::HostStore {
-                root: tmp.path().join("hosts"),
-            },
-            Arc::new(local),
-        );
-        let got = run_transcript_paths_resolved(&store, &hosts, "run_01USAGE");
-        assert_eq!(
-            got,
-            vec![PathBuf::from(
-                "/remote/proj/.rupu/transcripts/run_01A.jsonl"
-            )]
-        );
+        (store, recorded)
+    }
+
+    #[test]
+    fn paths_of_a_remote_run_resolve_to_the_cache_when_it_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _recorded) = seed_remote_run(tmp.path());
+        let cache = tmp
+            .path()
+            .join("mirror")
+            .join("host_abc")
+            .join("transcripts")
+            .join("run_01A.jsonl");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "").unwrap();
+
+        let got = run_transcript_paths(&store, "run_01USAGE");
+        assert_eq!(got, vec![cache]);
+    }
+
+    #[test]
+    fn paths_of_a_remote_run_stay_recorded_when_no_cache_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, recorded) = seed_remote_run(tmp.path());
+
+        let got = run_transcript_paths(&store, "run_01USAGE");
+        assert_eq!(got, vec![recorded]);
+    }
+
+    #[test]
+    fn paths_of_a_local_run_are_never_mapped_even_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let recorded = PathBuf::from("/does/not/exist/run_local.jsonl");
+        let record = rupu_orchestrator::runs::RunRecord {
+            id: "run_01LOCAL".into(),
+            workflow_name: "wf".into(),
+            status: rupu_orchestrator::runs::RunStatus::Completed,
+            inputs: Default::default(),
+            event: None,
+            workspace_id: String::new(),
+            workspace_path: PathBuf::from("."),
+            transcript_dir: tmp.path().join("run_01LOCAL"),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            resume_approver: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            final_output: None,
+            loop_progress: Default::default(),
+        };
+        store.create(record, "").unwrap();
+        store
+            .append_step_result(
+                "run_01LOCAL",
+                &rupu_orchestrator::runs::StepResultRecord {
+                    step_id: "a".into(),
+                    run_id: "run_01LOCAL".into(),
+                    transcript_path: recorded.clone(),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: Default::default(),
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
+                    run_outcome: None,
+                },
+            )
+            .unwrap();
+
+        let got = run_transcript_paths(&store, "run_01LOCAL");
+        assert_eq!(got, vec![recorded]);
     }
 }

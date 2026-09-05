@@ -581,7 +581,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     let mut last_runs: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for r in &runs {
-        let paths = crate::usage::run_transcript_paths_resolved(&s.run_store, &s.hosts, &r.id);
+        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
         if paths.is_empty() {
             continue;
         }

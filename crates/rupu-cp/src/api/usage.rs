@@ -427,7 +427,7 @@ fn local_usage(
         .iter()
         .filter(|r| r.started_at >= start && r.started_at <= end)
     {
-        let paths = crate::usage::run_transcript_paths_resolved(&s.run_store, &s.hosts, &r.id);
+        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
         let mut rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
         // Attribute each row to the run it came from: `r` is already in hand
         // for this batch, so this is a free inline join — no re-load, no
@@ -816,7 +816,7 @@ async fn get_usage_timeline(
         .iter()
         .filter(|r| r.started_at >= start && r.started_at <= end)
     {
-        let paths = crate::usage::run_transcript_paths_resolved(&s.run_store, &s.hosts, &r.id);
+        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
         let rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
         runs_with_rows.push((r.started_at, rows));
     }
@@ -899,7 +899,7 @@ async fn get_usage_runs(
                 .as_deref()
                 .is_none_or(|w| r.workspace_id == w)
     }) {
-        let paths = crate::usage::run_transcript_paths_resolved(&s.run_store, &s.hosts, &r.id);
+        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
         let mut rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
         // Same inline attribution `local_usage` does above: `r` is already in
         // hand for this batch, so no re-load/cache/separate join function.
