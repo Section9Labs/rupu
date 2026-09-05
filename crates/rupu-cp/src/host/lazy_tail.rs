@@ -183,6 +183,7 @@ impl LazyTailRegistry {
             finished: finished_tx,
         };
         let cache_owned = cache.to_path_buf();
+        let alive_task = Arc::clone(&alive);
         let task = tokio::spawn(async move {
             // Held for the whole body: its `Drop` is what tells a
             // replacing `subscribe` this task will never write again.
@@ -197,12 +198,17 @@ impl LazyTailRegistry {
                     continue;
                 }
                 if file.is_none() {
-                    // `tail -n +1` replays from byte zero, so this line is the
-                    // start of the authoritative body: truncate the cache IN
-                    // PLACE (same inode — a concurrent terminal write may hold
-                    // this very file open) and reopen for append, so writes
-                    // always land at end-of-file even if someone rewrites the
-                    // body underneath us.
+                    // The cache became complete (terminal pull finished and
+                    // wrote the sidecar) while we waited for the first remote
+                    // line. The pull retired us or raced our spawn — never
+                    // truncate a complete file.
+                    if is_complete(&cache_owned) {
+                        alive_task.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    // Truncate only now, on the first real line, so a feed that
+                    // never yields (host unreachable) leaves previously collected
+                    // content intact; the replay that follows starts from byte zero.
                     if std::fs::File::create(&cache_owned).is_err() {
                         return;
                     }
@@ -281,7 +287,7 @@ impl LazyTailRegistry {
     /// `true`, so later subscribers join the same zombie. Callers that are
     /// about to write `cache` ask this first: `pull_transcript` steps aside
     /// entirely (the feed is already filling the file), and the terminal pull
-    /// writes in place instead of renaming.
+    /// retires the feed (`retire`) before its atomic rename.
     pub(crate) fn has_live_feed(&self, cache: &Path) -> bool {
         let feeds = self.feeds.lock().unwrap();
         feeds

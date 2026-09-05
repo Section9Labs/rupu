@@ -218,9 +218,10 @@ Keyed by cache path. Behaviour:
   keeps polling the file (which stops growing), so the SSE stream stays open
   but quiet; when the client reconnects (existing behaviour on both clients),
   the fresh subscribe replays, truncating on its own first line. No duplicate
-  lines are possible because every replay starts from an empty file — and
-  because the one other writer of a cache file, the terminal pull (§6.1),
-  retires the feed before it writes, so the two never interleave.
+  lines are possible: the on-demand pull (§4.1) steps aside while a feed is
+  live; the terminal pull (§6.1) retires the feed before its atomic rename;
+  a feed that receives its first line only after the cache became complete
+  exits without writing.
 
 The registry lives on `SshHostConnector` next to `pumps`, and is bounded by
 construction: at most one child per distinct file, never for complete files.

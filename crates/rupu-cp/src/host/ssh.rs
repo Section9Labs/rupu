@@ -874,11 +874,9 @@ async fn pump_pull_step_transcripts(
     let files = split_batched_cat(&out.stdout);
     for (remote, cache) in &targets {
         if let Some(body) = files.get(remote) {
-            // Sole-writer handoff: stop the feed (and wait for it to really
-            // stop) before replacing the file it was appending to.
-            if lazy.has_live_feed(cache) {
-                lazy.retire(cache).await;
-            }
+            // Sole-writer handoff: stop any feed and wait for it to really
+            // stop before replacing the file. retire is a no-op on an unknown path.
+            lazy.retire(cache).await;
             if let Err(e) = write_cache_file(cache, body, true) {
                 tracing::warn!(host_id, run_id, cache = %cache.display(), error = %e, "terminal transcript pull: cache write failed");
             }
