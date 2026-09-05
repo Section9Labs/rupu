@@ -137,7 +137,7 @@ struct TranscriptTabContent: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             liveIndicator
-            TranscriptFeed(events: store.transcript, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, unparsedCount: store.transcriptUnparsedCount)
+            TranscriptFeed(events: store.transcript, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, unparsedCount: store.transcriptUnparsedCount, partial: store.transcriptPartial)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(12)

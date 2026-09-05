@@ -75,6 +75,13 @@ public struct TranscriptFeed: View {
     /// `TranscriptTabContent`; `SessionDetailScreen`/`AgentRunDetailScreen`
     /// don't hold an `APITranscriptPage` today, so they keep the default.
     private let unparsedCount: Int
+    /// Spec §4.2: `APITranscriptPage.partial` — the coordinator couldn't
+    /// reach the run's host to finish collecting this transcript. Defaulted
+    /// `false` so no existing call site needed to change to keep compiling.
+    /// Threaded from `RunDetailStore.transcriptPartial` by
+    /// `TranscriptTabContent`; `SessionDetailScreen`/`AgentRunDetailScreen`
+    /// mirror local files and never see this, so they keep the default.
+    private let partial: Bool
     private let computeRows: ([TranscriptEvent]) -> [FeedRow]
 
     /// Perf & interaction arc, Plan 5 Task 3: `rows`/`sawRunComplete` used to
@@ -95,8 +102,8 @@ public struct TranscriptFeed: View {
     @State var rows: [FeedRow]
     @State var sawRunComplete: Bool
 
-    public init(events: [TranscriptEvent], runID: String? = nil, host: String? = nil, sourcePreviewStore: SourcePreviewStore? = nil, unparsedCount: Int = 0) {
-        self.init(events: events, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, unparsedCount: unparsedCount, computeRows: buildFeedRows)
+    public init(events: [TranscriptEvent], runID: String? = nil, host: String? = nil, sourcePreviewStore: SourcePreviewStore? = nil, unparsedCount: Int = 0, partial: Bool = false) {
+        self.init(events: events, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, unparsedCount: unparsedCount, partial: partial, computeRows: buildFeedRows)
     }
 
     /// Test-only seam (default `internal`, reached via `@testable import
@@ -111,6 +118,7 @@ public struct TranscriptFeed: View {
         host: String?,
         sourcePreviewStore: SourcePreviewStore?,
         unparsedCount: Int = 0,
+        partial: Bool = false,
         computeRows: @escaping ([TranscriptEvent]) -> [FeedRow]
     ) {
         self.events = events
@@ -118,6 +126,7 @@ public struct TranscriptFeed: View {
         self.host = host
         self.sourcePreviewStore = sourcePreviewStore
         self.unparsedCount = unparsedCount
+        self.partial = partial
         self.computeRows = computeRows
         self._rows = State(initialValue: computeRows(events))
         self._sawRunComplete = State(initialValue: Self.sawRunComplete(in: events))
@@ -141,6 +150,12 @@ public struct TranscriptFeed: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
+                    if partial {
+                        MetaLineRow(
+                            label: "warning",
+                            detail: "Transcript incomplete — the host could not be reached to collect the rest"
+                        )
+                    }
                     if unparsedCount > 0 {
                         MetaLineRow(
                             label: "warning",

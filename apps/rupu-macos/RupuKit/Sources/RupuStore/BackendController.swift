@@ -315,11 +315,13 @@ public final class BackendController {
     /// (Task 8)'s own independent connection for the step graph's live
     /// pulses, wired to its own `onConnectionChange`, never sharing
     /// `eventStream()`'s single already-claimed callback slot.
-    public func makeRunEventStream(runID: String, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<CPEvent>? {
+    public func makeRunEventStream(runID: String, host: String? = nil, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<CPEvent>? {
         guard let config = activeConfig,
               var components = URLComponents(url: config.baseURL.appendingPathComponent("api/events/stream"), resolvingAgainstBaseURL: false)
         else { return nil }
-        components.queryItems = [URLQueryItem(name: "run", value: runID)]
+        var items = [URLQueryItem(name: "run", value: runID)]
+        if let host, host != "local" { items.append(URLQueryItem(name: "host", value: host)) }
+        components.queryItems = items
         guard let url = components.url else { return nil }
         return JSONEventStream<CPEvent>(url: url, token: config.token, onConnectionChange: onConnectionChange)
     }
@@ -327,12 +329,16 @@ public final class BackendController {
     /// Same shape as `makeRunEventStream` above, for the transcript tail
     /// (`/api/transcript/stream?path=<file>`) — `RunDetailStore.focusStep`
     /// tears this down and rebuilds it against a new `path` every time focus
-    /// switches to a different step.
-    public func makeTranscriptStream(path: String, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<TranscriptEvent>? {
+    /// switches to a different step. `host`/`run` route a remote run's tail
+    /// through the coordinator's lazy SSH mirror.
+    public func makeTranscriptStream(path: String, host: String? = nil, run: String? = nil, onConnectionChange: (@Sendable (Bool) -> Void)? = nil) -> JSONEventStream<TranscriptEvent>? {
         guard let config = activeConfig,
               var components = URLComponents(url: config.baseURL.appendingPathComponent("api/transcript/stream"), resolvingAgainstBaseURL: false)
         else { return nil }
-        components.queryItems = [URLQueryItem(name: "path", value: path)]
+        var items = [URLQueryItem(name: "path", value: path)]
+        if let host, host != "local" { items.append(URLQueryItem(name: "host", value: host)) }
+        if let run { items.append(URLQueryItem(name: "run", value: run)) }
+        components.queryItems = items
         guard let url = components.url else { return nil }
         return JSONEventStream<TranscriptEvent>(url: url, token: config.token, onConnectionChange: onConnectionChange)
     }

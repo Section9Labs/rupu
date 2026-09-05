@@ -328,15 +328,18 @@ public struct APITranscriptPage: Decodable, Sendable {
     /// server that doesn't send it yet — decoded with `decodeIfPresent` so
     /// this client keeps parsing against both.
     public let unparsed: Int?
+    /// Spec §4.2: the coordinator could not collect the rest of this transcript from its host. Absent unless true.
+    public let partial: Bool?
 
-    public init(events: [TranscriptEvent], summary: APIRunSummary?, unparsed: Int? = nil) {
+    public init(events: [TranscriptEvent], summary: APIRunSummary?, unparsed: Int? = nil, partial: Bool? = nil) {
         self.events = events
         self.summary = summary
         self.unparsed = unparsed
+        self.partial = partial
     }
 
     private enum CodingKeys: String, CodingKey {
-        case events, summary, unparsed
+        case events, summary, unparsed, partial
     }
 
     public init(from decoder: Decoder) throws {
@@ -344,5 +347,6 @@ public struct APITranscriptPage: Decodable, Sendable {
         events = try container.decode([TranscriptEvent].self, forKey: .events)
         summary = try container.decodeIfPresent(APIRunSummary.self, forKey: .summary)
         unparsed = try container.decodeIfPresent(Int.self, forKey: .unparsed)
+        partial = try container.decodeIfPresent(Bool.self, forKey: .partial)
     }
 }

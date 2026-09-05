@@ -9,10 +9,14 @@ import RupuAPI
 /// `CPEvent` stream for local runs only), and the focused step's transcript
 /// feed (`transcript`, snapshot-then-tail).
 ///
-/// **Local vs remote**: `isRemote` (`host` present and not `"local"`) turns
-/// off both streams entirely — remote runs are REST-only this phase (Phase 5
-/// brings Fleet streaming); `transcriptTailActive` stays `false` and
-/// `activate()` never opens the run-scoped stream.
+/// **Local vs remote**: `isRemote` (`host` present and not `"local"`) no
+/// longer gates either stream off — a remote run's events and transcript
+/// tail both travel through the coordinator's lazy SSH mirror
+/// (`/api/events/stream?run=&host=`, `/api/transcript/stream?path=&host=&run=`).
+/// `isRemote` now only decides whether `host` is threaded onto those
+/// endpoints; a transcript page fetched for a remote run may additionally
+/// carry `partial: true` (surfaced as `transcriptPartial`) when the
+/// coordinator couldn't reach the host to finish collecting it.
 ///
 /// **Live semantics**: `stepStarted`→`.running`, `stepCompleted`→
 /// `.done(success:)`, `stepAwaitingApproval`→`.gatePending`, `stepSkipped`→
@@ -64,8 +68,9 @@ import RupuAPI
 /// byte-0 replay repopulate it from scratch — fetching the snapshot first
 /// would just leave a duplicate prefix once the replay landed on top of it.
 /// The REST snapshot path is still used for every non-tailing case: a
-/// completed step, or any step on a remote run (remote is REST-only this
-/// phase; see `isRemote` above). The same "clear, don't refetch" contract
+/// completed step, on either a local or remote run — a *running* step on a
+/// remote run is tailed exactly like a local one (see `isRemote` above). The
+/// same "clear, don't refetch" contract
 /// covers `startTail`'s `resnapshot` closure — every tail *reconnect*
 /// replays the whole transcript again, so clearing and letting the replay
 /// repopulate is what avoids duplicating it a second time.
@@ -152,6 +157,13 @@ public final class RunDetailStore {
     /// alongside it, since a live tail carries no page-level unparsed count
     /// of its own to report.
     public private(set) var transcriptUnparsedCount: Int = 0
+    /// Spec §4.2: `APITranscriptPage.partial` — the coordinator could not
+    /// reach the run's host to finish collecting this transcript. Only a
+    /// REST fetch (`focusPath`'s non-tailing branch, `reloadTranscriptSnapshot`)
+    /// can set this to `true`; every place that resets `transcriptUnparsedCount`
+    /// to `0` resets this to `false` alongside it, for the same reason: a
+    /// live tail carries no page-level `partial` flag of its own to report.
+    public private(set) var transcriptPartial: Bool = false
     public private(set) var transcriptTailActive: Bool = false
     public private(set) var focusedTranscriptPath: String?
 
@@ -173,8 +185,8 @@ public final class RunDetailStore {
     /// delivered this activation, oldest first, capped at 500 (drop
     /// oldest — see `apply(_:)`) — the Events tab's raw feed. Cleared on
     /// `activate()`, same "repeatable" contract `didHandleTerminal`'s own
-    /// reset already documents. Never populated for a remote run (no run
-    /// stream at all — see `isRemote`).
+    /// reset already documents. Populated for a remote run too — its run
+    /// stream travels through the mirror (see `isRemote`).
     public private(set) var events: [CPEvent] = []
 
     private static let eventsCap = 500
@@ -285,7 +297,7 @@ public final class RunDetailStore {
             // here.
             fetchNetflow: { try await client.runNetflow(id: runID) },
             fetchFindings: { try await client.runFindings(id: runID) },
-            fetchTranscript: { path in try await client.transcript(path: path, host: host) },
+            fetchTranscript: { path in try await client.transcript(path: path, host: host, run: runID) },
             postApprove: { gate, mode in try await client.approveRun(id: runID, host: host, gate: gate, body: mode.map { ApproveBody(mode: $0) }) },
             postReject: { gate, reason in try await client.rejectRun(id: runID, host: host, gate: gate, body: RejectBody(reason: reason)) },
             postCancel: { reason in try await client.cancelRun(id: runID, host: host, body: reason.map { CancelBody(reason: $0) }) },
@@ -293,8 +305,8 @@ public final class RunDetailStore {
             postResume: { try await client.resumeRun(id: runID, host: host) },
             postArchive: { try await client.archiveRun(id: runID, host: host) },
             postRestore: { try await client.restoreRun(id: runID, host: host) },
-            runSignalsFactory: isRemote ? nil : RunDetailStore.makeRunSignalsFactory(backend: backend, runID: runID),
-            transcriptTailFactory: isRemote ? nil : RunDetailStore.makeTranscriptTailFactory(backend: backend),
+            runSignalsFactory: RunDetailStore.makeRunSignalsFactory(backend: backend, host: host, runID: runID),
+            transcriptTailFactory: RunDetailStore.makeTranscriptTailFactory(backend: backend, host: host, runID: runID),
             pendingActions: backend.pendingActions
         )
     }
@@ -359,15 +371,12 @@ public final class RunDetailStore {
         async let findingsLoad: Void = loadFindings()
         _ = await (detailLoad, graphLoad, netflowLoad, findingsLoad)
 
-        // Review fix: a remote run still gets its initial focus — `GET
-        // /api/transcript?host=` works for remote same as local, and
-        // `focusStep` itself already guards the *tail* on `isRemote` (see
-        // its doc comment above). Only the run-scoped event stream is
-        // local-only; skip that alone rather than the whole tail of
-        // `activate()`.
-        if !isRemote {
-            startRunStream()
-        }
+        // A remote run's events travel through the coordinator's lazy SSH
+        // mirror (`/api/events/stream?run=&host=`), same as local runs go
+        // through the un-mirrored endpoint — so the run-scoped stream starts
+        // unconditionally now; `isRemote` only decides whether `host` rides
+        // along on the query.
+        startRunStream()
 
         // Task 5, seed-once guard: only ever auto-seed the initial focus
         // once per store — a rebuild/refresh that re-runs `activate()` (this
@@ -573,8 +582,9 @@ public final class RunDetailStore {
     }
 
     /// Switches the transcript feed to `stepID`: resolves and loads a fresh
-    /// snapshot, then — local run, and the step currently reads as running —
-    /// starts tailing it. See the type doc comment's "Overlapping calls"
+    /// snapshot, then — the step currently reads as running — starts tailing
+    /// it (local or remote alike; see the type doc comment's "Local vs
+    /// remote" section). See the type doc comment's "Overlapping calls"
     /// section for why this only tears down / applies state once it's
     /// confirmed to still be the most recent call.
     public func focusStep(_ stepID: String) async {
@@ -583,7 +593,7 @@ public final class RunDetailStore {
         // snapshot entirely — `/api/transcript/stream`'s byte-0 replay is
         // already a superset of it (see the type doc comment's "REST
         // snapshot vs. tail" section).
-        let willTail = path != nil && !isRemote && isStepRunning(stepID) && transcriptTailFactory != nil
+        let willTail = path != nil && isStepRunning(stepID) && transcriptTailFactory != nil
         await focusPath(path, tail: willTail)
     }
 
@@ -608,6 +618,7 @@ public final class RunDetailStore {
             focusedTranscriptPath = nil
             transcript = []
             transcriptUnparsedCount = 0
+            transcriptPartial = false
             return
         }
 
@@ -622,10 +633,12 @@ public final class RunDetailStore {
 
         let events: [TranscriptEvent]
         let unparsedCount: Int
+        let partial: Bool
         do {
             let page = try await fetchTranscript(path)
             events = page.events
             unparsedCount = page.unparsed ?? 0
+            partial = page.partial ?? false
         } catch {
             // Cancellation (a rapid re-focus, or the whole screen tearing
             // down) is benign — leave `transcript`/`focusedTranscriptPath`
@@ -644,6 +657,7 @@ public final class RunDetailStore {
             // call is still the current one; see the generation check below.
             events = []
             unparsedCount = 0
+            partial = false
         }
 
         // A newer `focusStep`/`select(stepID:unitIndex:)` call started while
@@ -658,6 +672,7 @@ public final class RunDetailStore {
         focusedTranscriptPath = path
         transcript = events
         transcriptUnparsedCount = unparsedCount
+        transcriptPartial = partial
     }
 
     // MARK: - Selection (Task 4, flows-composition)
@@ -1109,6 +1124,7 @@ public final class RunDetailStore {
         // behind for a *previous* step's focus.
         transcript = []
         transcriptUnparsedCount = 0
+        transcriptPartial = false
         lifecycle.start(
             signals: factory(path),
             resnapshot: { [weak self] in
@@ -1144,6 +1160,7 @@ public final class RunDetailStore {
     private func clearTranscriptForTailReconnect() async {
         transcript = []
         transcriptUnparsedCount = 0
+        transcriptPartial = false
     }
 
     /// REST reload, replacing `transcript` wholesale (never appended) —
@@ -1163,6 +1180,7 @@ public final class RunDetailStore {
         guard generation == tailTeardownGeneration else { return }
         transcript = page.events
         transcriptUnparsedCount = page.unparsed ?? 0
+        transcriptPartial = page.partial ?? false
     }
 
     private func stopTail() {
@@ -1238,6 +1256,7 @@ public final class RunDetailStore {
     /// contract for a stream tied to a screen's visible lifetime.
     private static func makeRunSignalsFactory(
         backend: BackendController,
+        host: String?,
         runID: String
     ) -> @Sendable () -> AsyncStream<StreamSignal<CPEvent>> {
         {
@@ -1245,7 +1264,7 @@ public final class RunDetailStore {
                 StreamLifecycle.makeSignalBridge(CPEvent.self)
             }
             guard let stream = MainActor.assumeIsolated({
-                backend.makeRunEventStream(runID: runID, onConnectionChange: onChange)
+                backend.makeRunEventStream(runID: runID, host: host, onConnectionChange: onChange)
             }) else {
                 continuation.finish()
                 return signals
@@ -1266,14 +1285,16 @@ public final class RunDetailStore {
     /// since `focusStep` rebuilds the tail against a new path every time
     /// focus moves to a different step.
     private static func makeTranscriptTailFactory(
-        backend: BackendController
+        backend: BackendController,
+        host: String?,
+        runID: String
     ) -> @Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>> {
         { path in
             let (onChange, continuation, signals) = MainActor.assumeIsolated {
                 StreamLifecycle.makeSignalBridge(TranscriptEvent.self)
             }
             guard let stream = MainActor.assumeIsolated({
-                backend.makeTranscriptStream(path: path, onConnectionChange: onChange)
+                backend.makeTranscriptStream(path: path, host: host, run: runID, onConnectionChange: onChange)
             }) else {
                 continuation.finish()
                 return signals
