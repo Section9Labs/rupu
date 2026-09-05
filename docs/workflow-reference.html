@@ -1,0 +1,986 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Authoring reference</title>
+<meta name="description" content="The complete rupu workflow authoring reference: every top-level key, every step kind (linear, for_each, parallel, panel, branch, action, approval gate), every field, the connector action catalog, the template vocabulary, and the parse-time validation rules.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item active" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Authoring reference</h1>
+    <p class="intro">The complete workflow schema — every top-level key, every step kind, every field, and the rules the parser enforces before a run ever starts.</p>
+
+    <p>
+      This page is the <strong>reference</strong>. If you want the conceptual tour — what a workflow is, why
+      you would fan out, how runs are launched — start on <a class="link" href="/docs/workflows.html">Workflows</a>
+      and come back here for the exact field names.
+    </p>
+    <p>
+      Everything below is validated at <strong>parse time</strong>. Workflow YAML is parsed strictly: unknown keys
+      inside <code class="inline">trigger:</code>, <code class="inline">inputs:</code>,
+      <code class="inline">panel:</code>, <code class="inline">branch:</code>, <code class="inline">approval:</code>,
+      <code class="inline">distribute:</code>, a step, or the document root are rejected outright rather than
+      silently ignored. A typo is a load error, not a surprise at 3 a.m.
+    </p>
+
+    <h2>Workflow anatomy</h2>
+    <p>
+      A workflow is one YAML document. Only <code class="inline">name</code> and a non-empty
+      <code class="inline">steps</code> array are required; every other key is optional and has a documented
+      default.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>string</td><td>yes</td><td>&mdash;</td><td>Workflow identifier. This is what <code class="inline">rupu workflow run &lt;name&gt;</code> resolves, and what project-local files shadow global ones by.</td></tr>
+        <tr><td><code>description</code></td><td>string</td><td>no</td><td>none</td><td>Human-readable summary. Surfaced in listings; ignored by the runtime.</td></tr>
+        <tr><td><code>trigger</code></td><td>object</td><td>no</td><td><code class="inline">on: manual</code></td><td>How the workflow starts &mdash; <code class="inline">manual</code>, <code class="inline">cron</code>, or <code class="inline">event</code>. See <a class="link" href="/docs/triggers.html">Triggers</a>.</td></tr>
+        <tr><td><code>inputs</code></td><td>map&lt;string, InputDef&gt;</td><td>no</td><td><code class="inline">{}</code></td><td>Typed runtime inputs, validated before the first step dispatches.</td></tr>
+        <tr><td><code>defaults</code></td><td>object</td><td>no</td><td><code class="inline">{}</code></td><td>Per-workflow defaults inherited by every step (<code class="inline">continue_on_error</code>, <code class="inline">workspace</code>).</td></tr>
+        <tr><td><code>steps</code></td><td>array&lt;Step&gt;</td><td>yes</td><td>&mdash;</td><td>The ordered step list. An empty array is a parse error.</td></tr>
+        <tr><td><code>contracts</code></td><td>object</td><td>no</td><td><code class="inline">{}</code></td><td>Named machine-readable workflow outputs under <code class="inline">contracts.outputs.&lt;name&gt;</code>, validated against a stored schema.</td></tr>
+        <tr><td><code>autoflow</code></td><td>object</td><td>no</td><td>none</td><td>Autonomous-ownership metadata consumed by <code class="inline">rupu autoflow</code>. See <a class="link" href="/docs/autoflows.html">Autoflows</a>.</td></tr>
+        <tr><td><code>notifyIssue</code></td><td>bool</td><td>no</td><td><code class="inline">false</code></td><td>When true <em>and</em> the run target resolves to an issue, rupu auto-comments on the issue at run start and at terminal state. Note the camelCase spelling &mdash; it is the literal YAML key.</td></tr>
+        <tr><td><code>concerns</code></td><td>list</td><td>no</td><td>none</td><td>Coverage catalog for the whole run. When present it overrides each step agent's own <code class="inline">concerns:</code> so every step shares one ledger. See <a class="link" href="/docs/coverage.html">Coverage</a>.</td></tr>
+      </tbody>
+    </table>
+
+    <p>The minimal skeleton, with every optional block shown in position:</p>
+    <pre class="code"><span class="k">name</span>: <span class="s">my-workflow</span>
+<span class="k">description</span>: <span class="s">What this pipeline does.</span>
+
+<span class="k">trigger</span>:
+  <span class="k">on</span>: <span class="v">manual</span>              <span class="c"># manual | cron | event</span>
+
+<span class="k">inputs</span>:
+  <span class="k">target</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+
+<span class="k">defaults</span>:
+  <span class="k">continue_on_error</span>: <span class="v">false</span>
+
+<span class="k">contracts</span>:
+  <span class="k">outputs</span>:
+    <span class="k">result</span>:
+      <span class="k">from_step</span>: <span class="v">handoff</span>
+      <span class="k">format</span>: <span class="v">json</span>
+      <span class="k">schema</span>: <span class="v">autoflow_outcome_v1</span>
+
+<span class="k">notifyIssue</span>: <span class="v">false</span>
+
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">handoff</span>
+    <span class="k">agent</span>: <span class="v">writer</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">"Work on &#123;&#123; inputs.target &#125;&#125;."</span></pre>
+
+    <h3>The <code class="inline">trigger:</code> block</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Rule</th></tr></thead>
+      <tbody>
+        <tr><td><code>on</code></td><td><code>manual</code> | <code>cron</code> | <code>event</code></td><td>Defaults to <code class="inline">manual</code>.</td></tr>
+        <tr><td><code>cron</code></td><td>string</td><td><strong>Required</strong> for <code class="inline">on: cron</code>, rejected otherwise. Must be a 5-field expression (<code class="inline">min hour dom mon dow</code>).</td></tr>
+        <tr><td><code>event</code></td><td>string</td><td><strong>Required</strong> for <code class="inline">on: event</code>, rejected otherwise. An event identifier such as <code class="inline">github.issue.opened</code>.</td></tr>
+        <tr><td><code>filter</code></td><td>string</td><td>Only allowed on <code class="inline">on: event</code>. A minijinja expression over the event payload.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The <code class="inline">defaults:</code> block</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>continue_on_error</code></td><td>bool</td><td>Every step inherits this unless it sets its own <code class="inline">continue_on_error</code>.</td></tr>
+        <tr><td><code>workspace</code></td><td><code>sync</code> | <code>none</code></td><td>Default workspace mode for remote steps. A step's own <code class="inline">workspace:</code> wins. Absent means <code class="inline">none</code> (self-contained).</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The <code class="inline">contracts:</code> block</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>outputs.&lt;name&gt;.from_step</code></td><td>string</td><td>yes</td><td>Step id whose output is the canonical value. Must name a step that exists.</td></tr>
+        <tr><td><code>outputs.&lt;name&gt;.format</code></td><td><code>json</code> | <code>yaml</code></td><td>yes</td><td>Serialization expected from that step.</td></tr>
+        <tr><td><code>outputs.&lt;name&gt;.schema</code></td><td>string</td><td>yes</td><td>Contract name resolved to a schema file under <code class="inline">.rupu/contracts/</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      A step may also carry its own <code class="inline">contract: { emits, format }</code> as authoring metadata.
+      If a step's <code class="inline">contract</code> disagrees with the workflow-level declaration that points at
+      it, the workflow is invalid &mdash; the workflow-level entry is the runtime authority.
+    </p>
+
+    <h2>Inputs</h2>
+    <p>
+      Inputs are declared once and supplied at run time with a repeated
+      <code class="inline">--input key=value</code> flag. Each declaration is validated at parse time (the default
+      must coerce to the declared type, and must be a member of the <code class="inline">enum</code> when one is
+      given), and each supplied value is validated before the first step runs.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>type</code></td><td><code>string</code> | <code>int</code> | <code>bool</code></td><td>no</td><td><code class="inline">string</code></td><td>Declared input type. Drives coercion and error messages.</td></tr>
+        <tr><td><code>required</code></td><td>bool</td><td>no</td><td><code class="inline">false</code></td><td>Must be supplied at run time unless a <code class="inline">default</code> exists.</td></tr>
+        <tr><td><code>default</code></td><td>scalar</td><td>no</td><td>none</td><td>Used when the input is not supplied. Must match <code class="inline">type</code>.</td></tr>
+        <tr><td><code>enum</code></td><td>array&lt;string&gt;</td><td>no</td><td><code class="inline">[]</code></td><td>Allowed stringified values. Non-empty means anything else is rejected &mdash; including the declared <code class="inline">default</code>.</td></tr>
+        <tr><td><code>description</code></td><td>string</td><td>no</td><td>none</td><td>Free-form help text surfaced by <code class="inline">rupu workflow show</code>. Ignored by the runtime.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="k">inputs</span>:
+  <span class="k">diff</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+    <span class="k">description</span>: <span class="s">The unified diff under review.</span>
+  <span class="k">retries</span>:
+    <span class="k">type</span>: <span class="v">int</span>
+    <span class="k">default</span>: <span class="v">3</span>
+  <span class="k">severity</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">default</span>: <span class="s">high</span>
+    <span class="k">enum</span>: [<span class="s">low</span>, <span class="s">medium</span>, <span class="s">high</span>, <span class="s">critical</span>]
+  <span class="k">strict</span>:
+    <span class="k">type</span>: <span class="v">bool</span>
+    <span class="k">default</span>: <span class="v">true</span></pre>
+    <pre class="code">rupu workflow run code-review-panel \
+  --input diff=<span class="s">"$(git diff origin/main)"</span> \
+  --input severity=<span class="s">high</span></pre>
+
+    <h2>Step kinds</h2>
+    <p>
+      Every step has a unique <code class="inline">id</code> and <strong>exactly one</strong> execution shape.
+      The shape is inferred from which block is present; the parser rejects any combination of two.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 660 392" role="img" aria-label="The eight step shapes a workflow step can take">
+        <defs>
+          <marker id="arA" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="12" y="170" width="112" height="48" rx="10"></rect>
+        <text class="d-label" x="68" y="192" text-anchor="middle">step</text>
+        <text class="d-sub" x="68" y="208" text-anchor="middle">one shape</text>
+
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="26" marker-end="url(#arA)"></line>
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="74" marker-end="url(#arA)"></line>
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="122" marker-end="url(#arA)"></line>
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="170" marker-end="url(#arA)"></line>
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="218" marker-end="url(#arA)"></line>
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="266" marker-end="url(#arA)"></line>
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="314" marker-end="url(#arA)"></line>
+        <line class="d-edge" x1="124" y1="194" x2="216" y2="362" marker-end="url(#arA)"></line>
+
+        <rect class="d-box" x="222" y="6" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="24" text-anchor="middle">linear</text>
+        <text class="d-sub" x="342" y="38" text-anchor="middle">agent + prompt</text>
+
+        <rect class="d-box" x="222" y="54" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="72" text-anchor="middle">for_each</text>
+        <text class="d-sub" x="342" y="86" text-anchor="middle">one agent over N items</text>
+
+        <rect class="d-box" x="222" y="102" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="120" text-anchor="middle">parallel</text>
+        <text class="d-sub" x="342" y="134" text-anchor="middle">N sub-steps, one subject</text>
+
+        <rect class="d-box" x="222" y="150" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="168" text-anchor="middle">panel</text>
+        <text class="d-sub" x="342" y="182" text-anchor="middle">reviewers + optional gate loop</text>
+
+        <rect class="d-box-accent" x="222" y="198" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="216" text-anchor="middle">branch</text>
+        <text class="d-sub" x="342" y="230" text-anchor="middle">condition &#8594; then / else</text>
+
+        <rect class="d-box-accent" x="222" y="246" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="264" text-anchor="middle">action</text>
+        <text class="d-sub" x="342" y="278" text-anchor="middle">connector call, no agent</text>
+
+        <rect class="d-box-accent" x="222" y="294" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="312" text-anchor="middle">run</text>
+        <text class="d-sub" x="342" y="326" text-anchor="middle">declared command, no agent</text>
+
+        <rect class="d-box-accent" x="222" y="342" width="240" height="40" rx="10"></rect>
+        <text class="d-label" x="342" y="360" text-anchor="middle">approval gate</text>
+        <text class="d-sub" x="342" y="374" text-anchor="middle">a human decides here</text>
+      </svg>
+      <figcaption>Eight shapes. The shape is inferred from the block present on the step &mdash; combining two is a parse error.</figcaption>
+    </figure>
+
+    <table>
+      <thead><tr><th>Shape</th><th>Defining fields</th><th>Runs an agent?</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>linear</code></td><td><code>agent</code> + <code>prompt</code></td><td>yes</td><td>One agent, one prompt. The basic shape.</td></tr>
+        <tr><td><code>for_each</code></td><td><code>for_each</code> + <code>agent</code> + <code>prompt</code></td><td>yes</td><td>The same agent once per rendered list item.</td></tr>
+        <tr><td><code>parallel</code></td><td><code>parallel</code></td><td>yes</td><td>Distinct specialists concurrently, each with its own prompt.</td></tr>
+        <tr><td><code>panel</code></td><td><code>panel</code></td><td>yes</td><td>Reviewer agents emitting structured findings, with an optional fix loop.</td></tr>
+        <tr><td><code>branch</code></td><td><code>branch</code></td><td>no</td><td>Evaluates a condition and skips the steps on the arm it did not take.</td></tr>
+        <tr><td><code>action</code></td><td><code>action</code> (+ <code>with</code>)</td><td>no</td><td>A deterministic connector call through the MCP tool catalog. No tokens spent.</td></tr>
+        <tr><td><code>run</code></td><td><code>run</code> (<code>cmd</code> + <code>args</code>)</td><td>no</td><td>Executes a declared command as an argv vector and binds its stdout. No tokens spent. Opt-in per workspace; composes with <code class="inline">for_each:</code>.</td></tr>
+        <tr><td>approval gate</td><td><code>approval</code> alone</td><td>no</td><td>Pauses the run for a human decision, with notify and reject-cleanup hooks.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Linear step</h3>
+    <p>
+      One agent runs one rendered prompt; its final assistant text becomes
+      <code class="inline">steps.&lt;id&gt;.output</code> for every later step. This is also the only shape that
+      accepts <code class="inline">host:</code>.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>agent</code></td><td>string</td><td>yes</td><td>Agent name to dispatch. Resolved project-local first, then global.</td></tr>
+        <tr><td><code>prompt</code></td><td>string</td><td>yes</td><td>Minijinja template rendered into the agent's user message.</td></tr>
+        <tr><td><code>host</code></td><td>string</td><td>no</td><td>Run this step on a fleet host instead of locally. Must be non-empty.</td></tr>
+        <tr><td><code>contract</code></td><td>object</td><td>no</td><td><code class="inline">{ emits, format }</code> &mdash; authoring metadata for the structured output the step should emit.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Rules.</strong> Both <code class="inline">agent</code> and <code class="inline">prompt</code> are required &mdash; a step with neither a block nor both of these fails to parse. <code class="inline">host:</code> may not be combined with <code class="inline">distribute:</code>.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">investigate</span>
+    <span class="k">agent</span>: <span class="v">fix-bug</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Investigate the bug described by:</span>
+      <span class="s">&#123;&#123; inputs.prompt &#125;&#125;</span>
+
+      <span class="s">Stop without making edits. Report the root cause as text.</span></pre>
+
+    <h3><code class="inline">for_each:</code> &mdash; data fan-out</h3>
+    <p>
+      One agent, one prompt, run once per item of a rendered list. The list source can be a JSON/YAML array or a
+      newline-delimited block; if the rendered value starts with <code class="inline">[</code> it is parsed as an
+      array, otherwise each non-empty line becomes one item.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>for_each</code></td><td>string</td><td>yes</td><td>Minijinja template that renders to the item list.</td></tr>
+        <tr><td><code>agent</code></td><td>string</td><td>yes</td><td>Dispatched once per item.</td></tr>
+        <tr><td><code>prompt</code></td><td>string</td><td>yes</td><td>Rendered per item, with <code class="inline">item</code> and <code class="inline">loop.*</code> bound.</td></tr>
+        <tr><td><code>max_parallel</code></td><td>integer</td><td>no</td><td>In-flight concurrency cap. Absent means 1 (serial, declared order). Must be &#8805; 1.</td></tr>
+        <tr><td><code>distribute</code></td><td>object</td><td>no</td><td><code class="inline">{ hosts: [...] }</code> &mdash; spread the items round-robin across fleet hosts. <code class="inline">for_each</code>-only; <code class="inline">hosts</code> must be non-empty.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Published outputs.</strong> <code class="inline">steps.&lt;id&gt;.results</code> is the list of per-item output strings; <code class="inline">steps.&lt;id&gt;.output</code> is the JSON array of those strings; <code class="inline">steps.&lt;id&gt;.success</code> is true only if every item succeeded.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">review_each</span>
+    <span class="k">agent</span>: <span class="v">code-reviewer</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; read_file('reports/items.json') &#125;&#125;"</span>
+    <span class="k">max_parallel</span>: <span class="v">4</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Review &#123;&#123; item &#125;&#125; (&#123;&#123; loop.index &#125;&#125; of &#123;&#123; loop.length &#125;&#125;).</span></pre>
+
+    <h3><code class="inline">parallel:</code> &mdash; agent fan-out</h3>
+    <p>
+      N distinct sub-steps over the same context, each with its own agent and prompt. The parent step carries no
+      <code class="inline">agent</code> or <code class="inline">prompt</code> of its own.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>parallel</code></td><td>array&lt;SubStep&gt;</td><td>yes</td><td>At least one sub-step.</td></tr>
+        <tr><td><code>parallel[].id</code></td><td>string</td><td>yes</td><td>Unique within this block. Becomes the <code class="inline">sub_results</code> key.</td></tr>
+        <tr><td><code>parallel[].agent</code></td><td>string</td><td>yes</td><td>Agent for this sub-step.</td></tr>
+        <tr><td><code>parallel[].prompt</code></td><td>string</td><td>yes</td><td>Template for this sub-step.</td></tr>
+        <tr><td><code>max_parallel</code></td><td>integer</td><td>no</td><td>Set on the <em>parent</em> step. Absent means 1.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Rules.</strong> A sub-step accepts only <code class="inline">id</code>, <code class="inline">agent</code>, and <code class="inline">prompt</code> &mdash; <code class="inline">actions:</code> and <code class="inline">continue_on_error:</code> belong to the parent and cover the whole block. Duplicate sub-step ids are a parse error, and an empty <code class="inline">parallel:</code> list is a parse error.</p>
+    <p><strong>Published outputs.</strong> <code class="inline">steps.&lt;id&gt;.sub_results.&lt;sub_id&gt;.output</code> and <code class="inline">.success</code> per sub-step, plus the list form <code class="inline">steps.&lt;id&gt;.results</code> in declared order.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">review</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">max_parallel</span>: <span class="v">2</span>
+    <span class="k">parallel</span>:
+      - <span class="k">id</span>: <span class="v">security</span>
+        <span class="k">agent</span>: <span class="v">security-reviewer</span>
+        <span class="k">prompt</span>: <span class="s">"Review for security issues: &#123;&#123; inputs.diff &#125;&#125;"</span>
+      - <span class="k">id</span>: <span class="v">perf</span>
+        <span class="k">agent</span>: <span class="v">performance-reviewer</span>
+        <span class="k">prompt</span>: <span class="s">"Review for performance issues: &#123;&#123; inputs.diff &#125;&#125;"</span></pre>
+
+    <h3><code class="inline">panel:</code> &mdash; structured review</h3>
+    <p>
+      Several reviewer agents run in parallel over one rendered subject and each returns a JSON object containing a
+      <code class="inline">findings</code> array. rupu extracts the first parseable object from each panelist's
+      final message (surrounding prose is tolerated); a panelist that emits malformed JSON contributes zero
+      findings and logs a warning.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>panel.panelists</code></td><td>array&lt;string&gt;</td><td>yes</td><td>Agent names. Must contain at least one.</td></tr>
+        <tr><td><code>panel.subject</code></td><td>string</td><td>yes</td><td>Template rendered once; the thing under review.</td></tr>
+        <tr><td><code>panel.prompt</code></td><td>string</td><td>no</td><td>Optional per-panelist prompt template. Omit it and the rendered subject is sent verbatim as the user message, letting each panelist's own system prompt carry the review instructions.</td></tr>
+        <tr><td><code>panel.max_parallel</code></td><td>integer</td><td>no</td><td>Concurrent panelist cap. Absent means 1.</td></tr>
+        <tr><td><code>panel.gate</code></td><td>object</td><td>no</td><td>Turns the panel into a review/fix loop.</td></tr>
+        <tr><td><code>panel.gate.until_no_findings_at_severity_or_above</code></td><td><code>low</code>|<code>medium</code>|<code>high</code>|<code>critical</code></td><td>yes (in gate)</td><td>Loop while the maximum finding severity is at or above this threshold.</td></tr>
+        <tr><td><code>panel.gate.fix_with</code></td><td>string</td><td>yes (in gate)</td><td>Agent dispatched between passes with the aggregated findings; its final text becomes the next pass's subject.</td></tr>
+        <tr><td><code>panel.gate.max_iterations</code></td><td>integer</td><td>yes (in gate)</td><td>Safety cap, at least 1. No implicit default &mdash; authors must choose one. Exhausting it exits with <code class="inline">resolved = false</code>.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Rules.</strong> <code class="inline">panel:</code> is mutually exclusive with <code class="inline">for_each:</code>, <code class="inline">parallel:</code>, <code class="inline">action:</code>, and the top-level <code class="inline">agent</code>/<code class="inline">prompt</code>. Empty <code class="inline">panelists</code> is a parse error.</p>
+    <p><strong>Published outputs.</strong> <code class="inline">steps.&lt;id&gt;.findings</code> (each entry carries <code class="inline">source</code>, <code class="inline">severity</code>, <code class="inline">title</code>, <code class="inline">body</code>), <code class="inline">.max_severity</code>, <code class="inline">.iterations</code>, <code class="inline">.resolved</code>, and <code class="inline">.output</code> as the JSON findings array.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">panel_review</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">panel</span>:
+      <span class="k">panelists</span>:
+        - <span class="v">security-reviewer</span>
+        - <span class="v">performance-reviewer</span>
+        - <span class="v">maintainability-reviewer</span>
+      <span class="k">subject</span>: <span class="s">"&#123;&#123; inputs.diff &#125;&#125;"</span>
+      <span class="k">max_parallel</span>: <span class="v">3</span>
+      <span class="k">gate</span>:
+        <span class="k">until_no_findings_at_severity_or_above</span>: <span class="v">high</span>
+        <span class="k">fix_with</span>: <span class="v">finding-fixer</span>
+        <span class="k">max_iterations</span>: <span class="v">3</span></pre>
+    <p>
+      The findings JSON each panelist must return:
+    </p>
+    <pre class="code">{
+  <span class="k">"findings"</span>: [
+    {
+      <span class="k">"severity"</span>: <span class="s">"low|medium|high|critical"</span>,
+      <span class="k">"title"</span>: <span class="s">"Short title"</span>,
+      <span class="k">"body"</span>: <span class="s">"One sentence of detail"</span>
+    }
+  ]
+}</pre>
+
+    <h3><code class="inline">branch:</code> &mdash; conditional routing</h3>
+    <p>
+      A branch step dispatches no agent. It renders <code class="inline">condition</code>, records which arm it
+      took, and marks every step id on the <em>other</em> arm as skipped for the rest of the run. Truthiness uses
+      the same rule as <code class="inline">when:</code>.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>branch.condition</code></td><td>string</td><td>yes</td><td>Minijinja template. Truthy takes <code class="inline">then</code>, falsy takes <code class="inline">else</code>. Must not be empty.</td></tr>
+        <tr><td><code>branch.then</code></td><td>array&lt;string&gt;</td><td>no</td><td>Step ids that run when the condition is truthy. Defaults to <code class="inline">[]</code>.</td></tr>
+        <tr><td><code>branch.else</code></td><td>array&lt;string&gt;</td><td>no</td><td>Step ids that run when the condition is falsy. Defaults to <code class="inline">[]</code>.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Rules.</strong></p>
+    <ul>
+      <li>Mutually exclusive with <code class="inline">agent</code>/<code class="inline">prompt</code>, <code class="inline">for_each:</code>, <code class="inline">parallel:</code>, <code class="inline">panel:</code>, and <code class="inline">action:</code>.</li>
+      <li><code class="inline">when:</code> is <strong>not allowed</strong> on a branch step. The runner evaluates <code class="inline">when:</code> before the branch block, so a falsy <code class="inline">when:</code> would skip the branch without its condition ever running &mdash; and then <em>both</em> arms would execute. The parser rejects it outright.</li>
+      <li>Every target must name an existing step, and must appear <strong>strictly after</strong> the branch step in declaration order. Branches route forward only; they are not a loop construct.</li>
+      <li>An id may not appear in both <code class="inline">then</code> and <code class="inline">else</code>, and neither arm may target the branch step itself.</li>
+      <li>Each arm is the <strong>complete, transitive</strong> set of ids in that arm &mdash; including the arm steps of any branch nested inside it. A nested branch on a not-taken arm never gets to populate its own skip-set, so its steps must already be listed in the outer arm.</li>
+    </ul>
+    <p><strong>Published output.</strong> <code class="inline">steps.&lt;id&gt;.output</code> is the literal string <code class="inline">then</code> or <code class="inline">else</code>. Steps skipped by a branch record <code class="inline">skipped = true</code>.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">route</span>
+    <span class="k">branch</span>:
+      <span class="k">condition</span>: <span class="s">"&#123;&#123; steps.panel_review.max_severity in ['low', ''] &#125;&#125;"</span>
+      <span class="k">then</span>: [<span class="v">open_pr</span>]              <span class="c"># clean review — ship it</span>
+      <span class="k">else</span>: [<span class="v">file_issue</span>, <span class="v">escalate</span>]  <span class="c"># complete set of ids on this arm</span></pre>
+
+    <h3><code class="inline">action:</code> &mdash; deterministic connector call</h3>
+    <p>
+      An action step calls one SCM / issue-tracker / CI tool directly through the same in-process MCP tool catalog
+      agents use. <strong>No agent runs, no tokens are spent, and the result is deterministic.</strong> Use it
+      whenever the work is "make this one API call" rather than "reason about something".
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>action</code></td><td>string</td><td>yes</td><td>A tool name from the catalog, e.g. <code class="inline">scm.prs.create</code>. Must be non-empty and must exist.</td></tr>
+        <tr><td><code>with</code></td><td>mapping</td><td>no</td><td>Tool parameters. Keys are validated against the tool's schema at parse time; values are minijinja templates rendered at execution time.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Rules.</strong></p>
+    <ul>
+      <li>Mutually exclusive with <code class="inline">agent</code>/<code class="inline">prompt</code>, <code class="inline">for_each:</code>, <code class="inline">parallel:</code>, <code class="inline">panel:</code>, and <code class="inline">approval:</code>.</li>
+      <li><code class="inline">with:</code> must be a mapping. An unknown parameter key, or a missing <strong>required</strong> parameter, is a parse error &mdash; validated against the static catalog, so linting a workflow needs no credentials.</li>
+      <li>Parameter <em>values</em> are not checked at parse time (they may be templates); they are re-validated after rendering, immediately before dispatch.</li>
+      <li><code class="inline">when:</code> and <code class="inline">continue_on_error:</code> behave exactly as on any other step. A template-render failure in <code class="inline">with:</code> always aborts, even under <code class="inline">continue_on_error</code>, because that is an authoring error rather than a runtime one. There is no built-in retry.</li>
+      <li>The executed call is recorded in the run's audit trail as an action envelope, unified with the agent action protocol.</li>
+    </ul>
+    <p><strong>Published output.</strong> The connector's JSON response, bound to <code class="inline">steps.&lt;id&gt;.output</code>.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">open_pr</span>
+    <span class="k">action</span>: <span class="v">scm.prs.create</span>
+    <span class="k">with</span>:
+      <span class="k">owner</span>: <span class="s">Section9Labs</span>
+      <span class="k">repo</span>: <span class="s">rupu</span>
+      <span class="k">title</span>: <span class="s">"fix: &#123;&#123; inputs.title &#125;&#125;"</span>
+      <span class="k">body</span>: <span class="s">"&#123;&#123; steps.implement.output &#125;&#125;"</span>
+      <span class="k">head</span>: <span class="s">"rupu/issue-&#123;&#123; issue.number &#125;&#125;"</span>
+      <span class="k">base</span>: <span class="s">main</span>
+      <span class="k">draft</span>: <span class="v">false</span></pre>
+
+    <h3><code class="inline">run:</code> &mdash; deterministic command</h3>
+    <p>
+      A <code class="inline">run:</code> step executes a declared command and binds its output. Use it when a step
+      must produce an <strong>exact</strong> value &mdash; scoring, validation, report rendering, a preflight check.
+      <strong>No language model is involved</strong>, so the step is reproducible, instant, and costs no tokens.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>run.cmd</code></td><td>string</td><td>&mdash; (required)</td><td>Executable name or path, rendered as a template. Must be non-empty. Resolved against <code class="inline">PATH</code> when it is a bare name.</td></tr>
+        <tr><td><code>run.args</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td>The argument vector. Each element is rendered as a template <em>independently</em> and becomes exactly one argv element &mdash; a rendered value is never re-split on whitespace.</td></tr>
+        <tr><td><code>run.cwd</code></td><td>string</td><td>the run&rsquo;s workspace root</td><td>Working directory for the child process. Rendered as a template.</td></tr>
+        <tr><td><code>run.env</code></td><td>mapping&lt;string, string&gt;</td><td><code class="inline">{}</code></td><td>Extra environment variables. Values are rendered as templates and merged <em>over</em> the inherited environment.</td></tr>
+        <tr><td><code>run.parse</code></td><td><code>raw</code> | <code>json</code> | <code>lines</code></td><td><code class="inline">raw</code></td><td>How stdout is interpreted when binding the step&rsquo;s structured output. See the table below.</td></tr>
+        <tr><td><code>run.timeout_seconds</code></td><td>integer</td><td>none</td><td>Kill the child after this many seconds. Absent means no timeout.</td></tr>
+        <tr><td><code>run.allow_exit_codes</code></td><td>array&lt;integer&gt;</td><td><code class="inline">[0]</code></td><td>Exit codes treated as success; anything else fails the step. Must list at least one code &mdash; an empty list can never be satisfied and is a parse error.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">score</span>
+    <span class="k">run</span>:
+      <span class="k">cmd</span>: <span class="s">python3</span>
+      <span class="k">args</span>: [<span class="s">"tools/score_fixture.py"</span>, <span class="s">"&#123;&#123; item.fixture &#125;&#125;"</span>, <span class="s">"&#123;&#123; item.candidate &#125;&#125;"</span>]
+      <span class="k">cwd</span>: <span class="s">"&#123;&#123; inputs.cybermark_root &#125;&#125;"</span>
+      <span class="k">env</span>: { <span class="k">CYBERBENCH_RELEASE_KEY</span>: <span class="s">"&#123;&#123; inputs.release_key &#125;&#125;"</span> }
+      <span class="k">parse</span>: <span class="v">json</span>            <span class="c"># json | lines | raw   (default: raw)</span>
+      <span class="k">timeout_seconds</span>: <span class="v">300</span>
+      <span class="k">allow_exit_codes</span>: [<span class="v">0</span>]  <span class="c"># default [0]; anything else fails the step</span></pre>
+
+    <p><strong>There is no shell.</strong></p>
+    <p>
+      <code class="inline">cmd</code> and <code class="inline">args</code> are handed to the OS as an
+      <strong>argv vector</strong>. There are no pipes, no redirection, no globbing, and no word splitting. Because
+      each <code class="inline">args</code> entry becomes exactly one argument, a rendered value containing
+      <code class="inline">;</code>, <code class="inline">&amp;&amp;</code>, or <code class="inline">$(...)</code>
+      arrives at the process as literal argument text rather than executing &mdash; the step kind is
+      injection-safe by construction, not by escaping.
+    </p>
+    <p>
+      If you genuinely need shell features, invoke a shell explicitly &mdash; <code class="inline">cmd: sh</code>
+      with <code class="inline">args: ["-c", "..."]</code>. That is your decision to make, visible in the workflow
+      file, rather than something the engine does to every step behind your back.
+    </p>
+
+    <p><strong>Parse modes.</strong></p>
+    <table>
+      <thead><tr><th><code>parse:</code></th><th>What <code>steps.&lt;id&gt;.json</code> binds</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>raw</code> (default)</td><td>stdout as a JSON string</td><td>No interpretation. <code class="inline">steps.&lt;id&gt;.output</code> is stdout verbatim.</td></tr>
+        <tr><td><code>json</code></td><td>the parsed JSON object or array &mdash; indexable</td><td>Trailing whitespace is trimmed before parsing. stdout that is <strong>not</strong> valid JSON <em>fails the step</em>; it does not fall back to the raw string, because binding garbage as &ldquo;the output&rdquo; would let a broken tool produce a plausible-looking but meaningless downstream result.</td></tr>
+        <tr><td><code>lines</code></td><td>an array of strings, one per non-empty line</td><td>stdout is split on newlines and empty lines are dropped.</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>Published output.</strong></p>
+    <table>
+      <thead><tr><th>Binding</th><th>Type</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr><td><code>steps.&lt;id&gt;.output</code></td><td>string</td><td>stdout under <code class="inline">parse: raw</code>; the parsed value re-serialized as JSON under <code class="inline">json</code>/<code class="inline">lines</code>. It is a <strong>string</strong> in every mode &mdash; <code class="inline">output</code> stays a string for every step kind in the engine, so a step that starts emitting JSON never changes what <code class="inline">&#123;&#123; steps.&lt;id&gt;.output &#125;&#125;</code> renders elsewhere.</td></tr>
+        <tr><td><code>steps.&lt;id&gt;.json</code></td><td>value</td><td>stdout interpreted per <code class="inline">parse:</code> &mdash; <strong>indexable</strong>. Use this, not <code class="inline">output</code>, to reach into structured results: <code class="inline">&#123;&#123; steps.score.json.score &#125;&#125;</code>.</td></tr>
+        <tr><td><code>steps.&lt;id&gt;.stdout</code></td><td>string</td><td>The raw stdout stream, verbatim. Empty for every other step kind.</td></tr>
+        <tr><td><code>steps.&lt;id&gt;.stderr</code></td><td>string</td><td>The raw stderr stream, verbatim. Empty for every other step kind.</td></tr>
+        <tr><td><code>steps.&lt;id&gt;.exit_code</code></td><td>integer</td><td>The process exit code.</td></tr>
+        <tr><td><code>steps.&lt;id&gt;.duration_ms</code></td><td>integer</td><td>Wall-clock duration of the child process.</td></tr>
+        <tr><td><code>steps.&lt;id&gt;.success</code></td><td>bool</td><td>Whether the exit code was in <code class="inline">allow_exit_codes</code>.</td></tr>
+        <tr><td><code>steps.&lt;id&gt;.results</code></td><td>array</td><td>Under <code class="inline">for_each:</code>, the per-unit results in <strong>declared</strong> order regardless of finish order.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">report</span>
+    <span class="k">run</span>:
+      <span class="k">cmd</span>: <span class="s">echo</span>
+      <span class="k">args</span>: [<span class="s">"scored &#123;&#123; steps.score.json.score &#125;&#125; / 100"</span>]</pre>
+
+    <p><strong>Fan-out.</strong></p>
+    <p>
+      <code class="inline">run:</code> composes with <code class="inline">for_each:</code> and
+      <code class="inline">max_parallel:</code> &mdash; that is how you score N items concurrently. With
+      <code class="inline">continue_on_error: true</code>, a failing unit is recorded with
+      <code class="inline">success = false</code> and the remaining units still dispatch, so one bad item never
+      costs you the other 199. Without it, any failing unit fails the step.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">score</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; steps.plan.json.jobs &#125;&#125;"</span>
+    <span class="k">max_parallel</span>: <span class="v">8</span>
+    <span class="k">continue_on_error</span>: <span class="v">true</span>
+    <span class="k">run</span>:
+      <span class="k">cmd</span>: <span class="s">python3</span>
+      <span class="k">args</span>: [<span class="s">"score_job.py"</span>, <span class="s">"--job-id"</span>, <span class="s">"&#123;&#123; item.job_id &#125;&#125;"</span>]
+      <span class="k">parse</span>: <span class="v">json</span></pre>
+
+    <p><strong>Rules.</strong></p>
+    <ul>
+      <li>Mutually exclusive with <code class="inline">agent</code>/<code class="inline">prompt</code>, <code class="inline">parallel:</code>, <code class="inline">panel:</code>, <code class="inline">branch:</code>, <code class="inline">action:</code>, <code class="inline">split:</code>, and <code class="inline">join:</code>. It <em>is</em> compatible with <code class="inline">for_each:</code>, <code class="inline">when:</code>, and <code class="inline">continue_on_error:</code>.</li>
+      <li><code class="inline">run.cmd</code> must not be empty, and <code class="inline">run.allow_exit_codes</code> must list at least one code.</li>
+      <li><code class="inline">distribute:</code> is <strong>not</strong> supported on a <code class="inline">run:</code> step and is rejected at parse time rather than ignored. A <code class="inline">run:</code> step executes on the coordinator, and silently dropping a <code class="inline">distribute:</code> would let you believe work was spread across a fleet when it never left the local host. Remove it, or use an agent step.</li>
+      <li>Each <code class="inline">run:</code> step writes a one-record JSONL transcript (argv, exit code, duration, stdout, stderr) so the control plane and the app have something to render where an agent step would have a conversation.</li>
+    </ul>
+
+    <p><strong>Enabling it: config gate and allowlist.</strong></p>
+    <p>
+      <code class="inline">run:</code> executes commands, so it is <strong>opt-in per workspace</strong> and off by
+      default.
+    </p>
+    <pre class="code">[<span class="k">workflow</span>]
+<span class="k">run_step_enabled</span> = <span class="v">true</span>
+<span class="c"># Optional. Empty (the default) permits any executable.</span>
+<span class="c"># Matched on basename, so "/bin/bash" and "bash" gate alike.</span>
+<span class="k">run_step_allowlist</span> = [<span class="s">"python3"</span>, <span class="s">"make"</span>]</pre>
+    <p>
+      A workflow containing a <code class="inline">run:</code> step <strong>fails</strong> when the toggle is off
+      &mdash; it does not skip the step. A benchmark that quietly omitted its scoring step would report a
+      plausible-looking but meaningless number.
+    </p>
+    <table>
+      <thead><tr><th>Permission mode</th><th>Behaviour</th></tr></thead>
+      <tbody>
+        <tr><td><code>readonly</code></td><td><code class="inline">run:</code> steps are refused &mdash; a command that executes is write-class. Re-run with <code class="inline">--mode ask</code> or <code class="inline">--mode bypass</code>.</td></tr>
+        <tr><td><code>ask</code></td><td>Allowed &mdash; the CLI resolves <code class="inline">ask</code> to <code class="inline">bypass</code> for workflow <code class="inline">run:</code> steps, and announces it with the same warning agent steps print. See the note below.</td></tr>
+        <tr><td><code>bypass</code></td><td>Allowed.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Config is checked before permission mode.</strong> <code class="inline">bypass</code> cannot override
+      a workspace that has not opted in &mdash; bypass is about skipping per-call prompts, not escalating past
+      workspace policy. And <code class="inline">ask</code> allows <code class="inline">run:</code> steps for the
+      same reason it allows agent writes inside a workflow: there is no operator present mid-run to answer a
+      prompt, so a genuinely-prompting <code class="inline">ask</code> would hang every scheduled run. That gap is
+      announced by the same warning agent steps print; the workspace opt-in above is the real control.
+    </div>
+
+    <h3>Approval gate</h3>
+    <p>
+      A step whose <strong>only</strong> block is <code class="inline">approval:</code> &mdash; no
+      <code class="inline">agent</code>, <code class="inline">prompt</code>, <code class="inline">for_each</code>,
+      <code class="inline">parallel</code>, <code class="inline">panel</code>, <code class="inline">branch</code>,
+      or <code class="inline">action</code> &mdash; is a <strong>gate node</strong>: a first-class "a human decides
+      here" step with its own id, its own graph node, and its own recorded decision.
+    </p>
+    <p>
+      The older form &mdash; <code class="inline">approval:</code> sitting alongside an
+      <code class="inline">agent</code>+<code class="inline">prompt</code> step &mdash; is still supported and
+      unchanged. It is called the <strong>legacy inline option</strong> below, and it accepts only
+      <code class="inline">required</code>, <code class="inline">prompt</code>, and
+      <code class="inline">timeout_seconds</code>.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Gate node</th><th>Inline option</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>required</code></td><td>bool</td><td>ignored</td><td>yes</td><td>On the inline option, <code class="inline">true</code> is what makes the step pause. A gate node always pauses, so the field is redundant there.</td></tr>
+        <tr><td><code>prompt</code></td><td>string</td><td>optional</td><td>optional</td><td>What the operator sees. Rendered with the same context as a step prompt. Falls back to a generated "Approve gate <code class="inline">&lt;id&gt;</code>?" line.</td></tr>
+        <tr><td><code>timeout_seconds</code></td><td>integer</td><td>optional</td><td>optional</td><td>How long the gate may sit unanswered before its timeout policy applies.</td></tr>
+        <tr><td><code>auto_approve</code></td><td>string</td><td>optional</td><td><strong>rejected</strong></td><td>Minijinja expression evaluated when the gate is reached. Truthy resolves the gate as approved (<code class="inline">via: auto</code>) without ever pausing.</td></tr>
+        <tr><td><code>on_timeout</code></td><td><code>approve</code>|<code>reject</code>|<code>fail</code></td><td>optional</td><td><strong>rejected</strong></td><td>What a timed-out gate resolves to. Absent means <code class="inline">fail</code>. <strong>Requires <code class="inline">timeout_seconds</code>.</strong></td></tr>
+        <tr><td><code>notify</code></td><td>array&lt;NotifyAction&gt;</td><td>optional</td><td><strong>rejected</strong></td><td>Connector calls fired best-effort when the gate parks. Failures are logged and never block the pause.</td></tr>
+        <tr><td><code>on_reject</code></td><td>array&lt;Step&gt;</td><td>optional</td><td><strong>rejected</strong></td><td>Inline cleanup steps that run after a reject decision, before the run ends <code class="inline">Rejected</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>Gate lifecycle.</strong> <code class="inline">when:</code> is evaluated first &mdash; a skipped step
+      never asks for approval. Then the prompt renders, then <code class="inline">auto_approve</code>. If the gate
+      does not auto-resolve, the <code class="inline">notify</code> hooks fire and the run parks as
+      <code class="inline">awaiting_approval</code>. Resume with
+      <code class="inline">rupu workflow approve &lt;run-id&gt;</code>, or reject with
+      <code class="inline">rupu workflow reject &lt;run-id&gt; --reason "..."</code>, which runs the
+      <code class="inline">on_reject</code> chain and then ends the run.
+    </p>
+    <p>
+      <strong>Notify hooks</strong> take the same shape as an action step &mdash; an
+      <code class="inline">action:</code> name plus <code class="inline">with:</code> params &mdash; and are
+      validated against the tool catalog at parse time, exactly like a real action step.
+    </p>
+    <p>
+      <strong><code class="inline">on_reject</code> entries</strong> are ordinary steps, restricted to plain agent
+      steps and action steps: no nested gates, no <code class="inline">for_each</code>, no
+      <code class="inline">parallel</code>, no <code class="inline">panel</code>, no
+      <code class="inline">branch</code>. They also may not set <code class="inline">host:</code> or
+      <code class="inline">when:</code> &mdash; cleanup runs inline and unconditionally. Each failure is logged and
+      the chain continues; their results are recorded under their own ids.
+    </p>
+    <p>
+      <strong>Published output.</strong> A gate node writes a JSON decision record to
+      <code class="inline">steps.&lt;id&gt;.output</code> &mdash;
+      <code class="inline">{ "decision", "via", "reason", "decided_at" }</code> &mdash; where
+      <code class="inline">decision</code> is <code class="inline">approved</code> or
+      <code class="inline">rejected</code> and <code class="inline">via</code> is
+      <code class="inline">human</code> or <code class="inline">auto</code>. The convenience shortcut
+      <code class="inline">steps.&lt;id&gt;.decision</code> exposes the decision string directly.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">merge_gate</span>
+    <span class="k">approval</span>:
+      <span class="k">prompt</span>: <span class="s">|</span>
+        <span class="s">&#123;&#123; steps.panel_review.findings | length &#125;&#125; findings,</span>
+        <span class="s">max severity &#123;&#123; steps.panel_review.max_severity &#125;&#125;. Approve to open the PR.</span>
+      <span class="k">auto_approve</span>: <span class="s">"&#123;&#123; steps.panel_review.max_severity in ['low', ''] &#125;&#125;"</span>
+      <span class="k">timeout_seconds</span>: <span class="v">86400</span>
+      <span class="k">on_timeout</span>: <span class="v">reject</span>          <span class="c"># approve | reject | fail (default: fail)</span>
+      <span class="k">notify</span>:
+        - <span class="k">action</span>: <span class="v">issues.comment</span>
+          <span class="k">with</span>:
+            <span class="k">project</span>: <span class="s">Section9Labs/rupu</span>
+            <span class="k">number</span>: <span class="s">"&#123;&#123; issue.number &#125;&#125;"</span>
+            <span class="k">body</span>: <span class="s">"Approval needed at merge_gate."</span>
+      <span class="k">on_reject</span>:
+        - <span class="k">id</span>: <span class="v">note_rejection</span>
+          <span class="k">action</span>: <span class="v">issues.comment</span>
+          <span class="k">with</span>:
+            <span class="k">project</span>: <span class="s">Section9Labs/rupu</span>
+            <span class="k">number</span>: <span class="s">"&#123;&#123; issue.number &#125;&#125;"</span>
+            <span class="k">body</span>: <span class="s">"Rejected at merge gate; no PR opened."</span></pre>
+    <p>The legacy inline option, unchanged, for pausing an agent step in place:</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">deploy</span>
+    <span class="k">agent</span>: <span class="v">releaser</span>
+    <span class="k">approval</span>:
+      <span class="k">required</span>: <span class="v">true</span>
+      <span class="k">prompt</span>: <span class="s">"About to deploy &#123;&#123; inputs.tag &#125;&#125;. Approve?"</span>
+      <span class="k">timeout_seconds</span>: <span class="v">3600</span>
+    <span class="k">prompt</span>: <span class="s">"Run the release for &#123;&#123; inputs.tag &#125;&#125;."</span></pre>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 660 250" role="img" aria-label="Control flow through an approval gate into action steps">
+        <defs>
+          <marker id="arB" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box-accent" x="176" y="14" width="150" height="42" rx="10"></rect>
+        <text class="d-label" x="251" y="32" text-anchor="middle">notify</text>
+        <text class="d-sub" x="251" y="47" text-anchor="middle">issues.comment</text>
+
+        <rect class="d-box" x="12" y="104" width="130" height="48" rx="10"></rect>
+        <text class="d-label" x="77" y="126" text-anchor="middle">review</text>
+        <text class="d-sub" x="77" y="142" text-anchor="middle">panel</text>
+
+        <line class="d-edge" x1="142" y1="128" x2="176" y2="128" marker-end="url(#arB)"></line>
+
+        <rect class="d-box-accent" x="176" y="104" width="150" height="48" rx="10"></rect>
+        <text class="d-label" x="251" y="126" text-anchor="middle">merge_gate</text>
+        <text class="d-sub" x="251" y="142" text-anchor="middle">approval gate</text>
+
+        <line class="d-edge" x1="251" y1="104" x2="251" y2="62" marker-end="url(#arB)"></line>
+
+        <line class="d-edge" x1="326" y1="120" x2="400" y2="60" marker-end="url(#arB)"></line>
+        <text class="d-sub" x="360" y="80">approved</text>
+
+        <line class="d-edge" x1="326" y1="138" x2="400" y2="198" marker-end="url(#arB)"></line>
+        <text class="d-sub" x="360" y="186">rejected</text>
+
+        <rect class="d-box-accent" x="400" y="26" width="248" height="48" rx="10"></rect>
+        <text class="d-label" x="524" y="48" text-anchor="middle">open_pr</text>
+        <text class="d-sub" x="524" y="64" text-anchor="middle">action &#183; scm.prs.create</text>
+
+        <rect class="d-box-accent" x="400" y="176" width="248" height="48" rx="10"></rect>
+        <text class="d-label" x="524" y="198" text-anchor="middle">note_rejection</text>
+        <text class="d-sub" x="524" y="214" text-anchor="middle">on_reject &#183; issues.comment</text>
+      </svg>
+      <figcaption>A gate node routes on the human decision: approve continues into the next step, reject runs the inline <code class="inline">on_reject</code> chain and ends the run. <code class="inline">notify</code> fires best-effort as the gate parks.</figcaption>
+    </figure>
+
+    <h2>Common step fields</h2>
+    <p>These apply across shapes, subject to the rule in the last column.</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Applies to</th><th>Meaning &amp; rule</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>string</td><td>all</td><td>Required. Must be unique within the workflow. Referenced as <code class="inline">steps.&lt;id&gt;</code> in templates &mdash; so use identifier-safe characters (letters, digits, underscore); a hyphen truncates the reference.</td></tr>
+        <tr><td><code>when</code></td><td>string</td><td>all except <code>branch</code></td><td>Minijinja expression reduced to truthy/falsy; falsy skips the step and sets <code class="inline">steps.&lt;id&gt;.skipped</code>. Evaluated <em>before</em> approval. Rejected on a <code class="inline">branch:</code> step and on <code class="inline">on_reject</code> cleanup steps.</td></tr>
+        <tr><td><code>continue_on_error</code></td><td>bool</td><td>all</td><td>Tolerate this step's failure and keep going. Inherits <code class="inline">defaults.continue_on_error</code> when unset. On fan-out shapes it applies <em>per unit</em> &mdash; a failed item is recorded with <code class="inline">success = false</code> and the rest still dispatch.</td></tr>
+        <tr><td><code>actions</code></td><td>array&lt;string&gt;</td><td>all</td><td>The action-protocol allowlist &mdash; <strong>not</strong> a tool allowlist. Tool access lives in the agent's own <code class="inline">tools:</code> list. Unless you deliberately use the action protocol, write <code class="inline">actions: []</code>.</td></tr>
+        <tr><td><code>max_parallel</code></td><td>integer</td><td><code>for_each</code>, <code>parallel</code>, <code>panel</code></td><td>Concurrency cap; must be &#8805; 1. Absent means serial in declared order. Ignored on non-fan-out shapes. On <code class="inline">panel</code> it is set inside the <code class="inline">panel:</code> block.</td></tr>
+        <tr><td><code>host</code></td><td>string</td><td>linear only</td><td>Run this step's agent on a named fleet host. Rejected on <code class="inline">for_each</code>/<code class="inline">parallel</code>/<code class="inline">panel</code>/<code class="inline">branch</code>/<code class="inline">action</code>/gate nodes, alongside <code class="inline">distribute:</code>, and when empty.</td></tr>
+        <tr><td><code>distribute</code></td><td>object</td><td><code>for_each</code> only</td><td><code class="inline">{ hosts: [...] }</code>, spread round-robin. Rejected without <code class="inline">for_each:</code>, rejected outright on a <code class="inline">run:</code> step (which executes on the coordinator), and <code class="inline">hosts</code> must be non-empty.</td></tr>
+        <tr><td><code>workspace</code></td><td><code>sync</code> | <code>none</code></td><td>remote steps</td><td>Ship the coordinator's workspace to the host and bring changed files back. <code class="inline">sync</code> is rejected on a purely local step &mdash; it requires <code class="inline">host:</code> or <code class="inline">distribute:</code>. Overrides <code class="inline">defaults.workspace</code>.</td></tr>
+        <tr><td><code>approval</code></td><td>object</td><td>all</td><td>Alone on a step it is a gate node; alongside <code class="inline">agent</code>+<code class="inline">prompt</code> it is the legacy inline pause. See above.</td></tr>
+        <tr><td><code>contract</code></td><td>object</td><td>agent steps</td><td><code class="inline">{ emits: &lt;schema-name&gt;, format: json|yaml }</code>. Authoring metadata; must agree with any workflow-level <code class="inline">contracts.outputs</code> entry pointing at this step.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>The action catalog</h2>
+    <p>
+      These are the tools an <code class="inline">action:</code> step (or a gate's
+      <code class="inline">notify:</code>/<code class="inline">on_reject:</code> entry) may name. It is the same
+      catalog the embedded <a class="link" href="/docs/mcp.html">MCP server</a> exposes to agents &mdash; one
+      catalog, one permission model.
+    </p>
+    <table>
+      <thead><tr><th>Tool</th><th>Class</th><th>Required <code>with:</code> keys</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>scm.repos.list</code></td><td>read</td><td>&mdash;</td><td>List repositories the authenticated user can access on a platform.</td></tr>
+        <tr><td><code>scm.repos.get</code></td><td>read</td><td><code>owner</code>, <code>repo</code></td><td>Fetch one repository: default branch, clone URLs, visibility, description.</td></tr>
+        <tr><td><code>scm.branches.list</code></td><td>read</td><td><code>owner</code>, <code>repo</code></td><td>List branches with name, sha, and protected flag.</td></tr>
+        <tr><td><code>scm.branches.create</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>name</code>, <code>from_sha</code></td><td>Create a branch from a given SHA.</td></tr>
+        <tr><td><code>scm.files.read</code></td><td>read</td><td><code>owner</code>, <code>repo</code>, <code>path</code></td><td>Read a single file at an optional <code class="inline">ref</code>. Returns path, ref, content, encoding.</td></tr>
+        <tr><td><code>scm.prs.list</code></td><td>read</td><td><code>owner</code>, <code>repo</code></td><td>List pull/merge requests. Optional <code class="inline">state</code>, <code class="inline">author</code>, <code class="inline">limit</code>.</td></tr>
+        <tr><td><code>scm.prs.get</code></td><td>read</td><td><code>owner</code>, <code>repo</code>, <code>number</code></td><td>Fetch one pull/merge request: title, body, state, head/base, author, timestamps.</td></tr>
+        <tr><td><code>scm.prs.diff</code></td><td>read</td><td><code>owner</code>, <code>repo</code>, <code>number</code></td><td>Fetch the unified-diff patch plus per-file change counts.</td></tr>
+        <tr><td><code>scm.prs.comment</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>number</code>, <code>body</code></td><td>Post a top-level comment on a pull/merge request.</td></tr>
+        <tr><td><code>scm.prs.create</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>title</code>, <code>body</code>, <code>head</code>, <code>base</code></td><td>Open a pull/merge request. Optional <code class="inline">draft</code>.</td></tr>
+        <tr><td><code>issues.list</code></td><td>read</td><td><code>project</code></td><td>List issues. Optional <code class="inline">state</code>, <code class="inline">labels</code>, <code class="inline">author</code>, <code class="inline">limit</code>.</td></tr>
+        <tr><td><code>issues.get</code></td><td>read</td><td><code>project</code>, <code>number</code></td><td>Fetch one issue: title, body, state, labels, author, timestamps.</td></tr>
+        <tr><td><code>issues.comment</code></td><td>write</td><td><code>project</code>, <code>number</code>, <code>body</code></td><td>Post a comment on an issue.</td></tr>
+        <tr><td><code>issues.create</code></td><td>write</td><td><code>project</code>, <code>title</code>, <code>body</code></td><td>Open a new issue. Optional <code class="inline">labels</code>.</td></tr>
+        <tr><td><code>issues.update_state</code></td><td>write</td><td><code>project</code>, <code>number</code>, <code>state</code></td><td>Transition an issue to <code class="inline">open</code> or <code class="inline">closed</code>.</td></tr>
+        <tr><td><code>github.workflows_dispatch</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>workflow</code>, <code>ref</code></td><td>Trigger a GitHub Actions run. The workflow file must declare <code class="inline">on: workflow_dispatch:</code>. Optional <code class="inline">inputs</code>.</td></tr>
+        <tr><td><code>gitlab.pipeline_trigger</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>ref</code></td><td>Trigger a GitLab CI pipeline against a branch or tag. Optional <code class="inline">variables</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>Three things to know about <code class="inline">with:</code>:</p>
+    <ul>
+      <li><strong>Parse-time validation.</strong> Keys are checked against the tool's schema when the workflow loads. An unknown key or a missing required key is a load error, not a runtime surprise &mdash; and the check needs no credentials.</li>
+      <li><strong>Platform defaults.</strong> Every SCM tool takes an optional <code class="inline">platform</code> key and every issue tool an optional <code class="inline">tracker</code> key. Omit them and rupu falls back to <code class="inline">[scm.default]</code> / <code class="inline">[issues.default]</code> from your config, exactly as the MCP tools do.</li>
+      <li><strong>Permission mode.</strong> Action steps run under the same mode as the rest of the run. In <code class="inline">readonly</code> mode a write-class action fails with an explicit permission error before the connector is ever called. <code class="inline">ask</code> mode does not prompt per action step &mdash; the workflow author declared the call deliberately.</li>
+    </ul>
+    <div class="callout">
+      <strong>Prefer an action step over a prompt.</strong> "Comment on the issue" through an agent costs a model
+      round-trip and can be phrased wrong. As an <code class="inline">action:</code> step it is one typed API call,
+      validated at load time, recorded in the audit trail, and free.
+    </div>
+
+    <h2>Template expressions</h2>
+    <p>
+      Prompts, <code class="inline">when:</code> conditions, <code class="inline">branch.condition</code>,
+      <code class="inline">for_each:</code> lists, <code class="inline">panel.subject</code>,
+      <code class="inline">approval.prompt</code>, <code class="inline">auto_approve</code>, and every value inside
+      <code class="inline">with:</code> are rendered with minijinja. Missing variables render as empty strings
+      (autoflow runs render strictly &mdash; a missing variable is an error there).
+    </p>
+    <table>
+      <thead><tr><th>Expression</th><th>Resolves to</th></tr></thead>
+      <tbody>
+        <tr><td><code>&#123;&#123; inputs.&lt;name&gt; &#125;&#125;</code></td><td>A runtime input value, after type coercion.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.output &#125;&#125;</code></td><td>An earlier step's final output string (JSON array for fan-out steps; the decision JSON for a gate; <code class="inline">then</code>/<code class="inline">else</code> for a branch).</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.success &#125;&#125;</code></td><td>Whether that step completed successfully. For fan-out, true only if every unit succeeded.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.skipped &#125;&#125;</code></td><td>Whether that step was skipped by <code class="inline">when:</code> or by a branch arm.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.results &#125;&#125;</code></td><td>Per-item (<code class="inline">for_each</code>) or per-sub-step (<code class="inline">parallel</code>) output list, in declared order.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.sub_results.&lt;sub_id&gt;.output &#125;&#125;</code></td><td>A named <code class="inline">parallel:</code> sub-step output. Also <code class="inline">.success</code>.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.findings &#125;&#125;</code></td><td>Aggregated panel findings; each entry has <code class="inline">source</code>, <code class="inline">severity</code>, <code class="inline">title</code>, <code class="inline">body</code>.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.max_severity &#125;&#125;</code></td><td>Highest panel severity as a string, or empty when there were no findings.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.iterations &#125;&#125;</code></td><td>Number of panel passes executed.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.resolved &#125;&#125;</code></td><td>Whether the panel gate cleared before <code class="inline">max_iterations</code>.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.decision &#125;&#125;</code></td><td>An approval gate's decision string: <code class="inline">approved</code> or <code class="inline">rejected</code>.</td></tr>
+        <tr><td><code>&#123;&#123; item &#125;&#125;</code></td><td>The current item inside a <code class="inline">for_each:</code> step.</td></tr>
+        <tr><td><code>&#123;&#123; loop.index &#125;&#125;</code></td><td>1-based position. Also <code class="inline">loop.index0</code>, <code class="inline">loop.length</code>, <code class="inline">loop.first</code>, <code class="inline">loop.last</code>.</td></tr>
+        <tr><td><code>&#123;&#123; issue.number &#125;&#125;</code></td><td>Issue-target context. Also <code class="inline">issue.title</code>, <code class="inline">issue.body</code>, <code class="inline">issue.labels</code>, <code class="inline">issue.author</code>, <code class="inline">issue.state</code>, <code class="inline">issue.r.project</code>.</td></tr>
+        <tr><td><code>&#123;&#123; event.* &#125;&#125;</code></td><td>The payload of the event that triggered the run, for <code class="inline">on: event</code> workflows.</td></tr>
+        <tr><td><code>read_file('&lt;path&gt;')</code></td><td>The contents of a file a prior step wrote, resolved against the run's working directory. Fails loudly when missing.</td></tr>
+        <tr><td><code>&#123;&#37; for x in … &#37;&#125;</code> &#183; <code>&#123;&#37; if … &#37;&#125;</code></td><td>Standard minijinja control blocks; useful for folding <code class="inline">results</code> or <code class="inline">findings</code> into one prompt.</td></tr>
+        <tr><td><code>| length</code> &#183; <code>| join(', ')</code> &#183; <code>| upper</code> &#183; <code>| default('&#8230;')</code> &#183; <code>| tojson</code></td><td>Common minijinja filters. <code class="inline">| length</code> on <code class="inline">findings</code> and <code class="inline">| tojson</code> for embedding structured data are the two you will reach for most.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>The truthiness rule.</strong> <code class="inline">when:</code>,
+      <code class="inline">branch.condition</code>, and <code class="inline">auto_approve</code> all render to a
+      string and then reduce to a boolean. Falsy, case-insensitively, is exactly:
+      the empty string, <code class="inline">false</code>, <code class="inline">0</code>,
+      <code class="inline">no</code>, <code class="inline">off</code>. Everything else is truthy &mdash; including
+      the string <code class="inline">"None"</code>, so guard optional values explicitly.
+    </p>
+    <div class="callout">
+      <strong>Deterministic fan-out.</strong> Because <code class="inline">for_each:</code> parses any rendered
+      value starting with <code class="inline">[</code> as an array, have an upstream step write a clean JSON array
+      to a file and feed it with
+      <code class="inline">for_each: "&#123;&#123; read_file('reports/items.json') &#125;&#125;"</code>. Control
+      flow then depends on a file, not on how terse the agent happened to be in chat.
+    </div>
+
+    <h2>Validation rules</h2>
+    <p>
+      All of these are checked when the workflow file loads &mdash; before any provider is contacted and before any
+      token is spent.
+    </p>
+    <p><strong>Document level</strong></p>
+    <ul>
+      <li><code class="inline">steps:</code> must be present and non-empty.</li>
+      <li>Step ids must be unique across the workflow.</li>
+      <li>Unknown keys anywhere in the document are rejected &mdash; typos fail loudly instead of being ignored.</li>
+    </ul>
+    <p><strong>Inputs and triggers</strong></p>
+    <ul>
+      <li>An input's <code class="inline">default</code> must coerce to its declared <code class="inline">type</code>, and must be a member of its <code class="inline">enum</code> when one is declared.</li>
+      <li><code class="inline">on: cron</code> requires a non-empty, well-formed 5-field <code class="inline">cron:</code>; <code class="inline">on: event</code> requires a non-empty <code class="inline">event:</code>.</li>
+      <li>Cross-field leftovers are rejected: no <code class="inline">cron:</code>/<code class="inline">event:</code>/<code class="inline">filter:</code> on a manual trigger, no <code class="inline">event:</code>/<code class="inline">filter:</code> on a cron trigger, no <code class="inline">cron:</code> on an event trigger.</li>
+    </ul>
+    <p><strong>Step shape</strong></p>
+    <ul>
+      <li>The shape blocks are mutually exclusive. <code class="inline">branch:</code>, <code class="inline">panel:</code>, <code class="inline">parallel:</code>, <code class="inline">action:</code>, and <code class="inline">run:</code> each reject the top-level <code class="inline">agent</code>/<code class="inline">prompt</code> and each other.</li>
+      <li>A step that is none of those must supply both <code class="inline">agent:</code> and <code class="inline">prompt:</code>.</li>
+      <li><code class="inline">max_parallel</code> must be &#8805; 1; <code class="inline">panel.gate.max_iterations</code> must be &#8805; 1.</li>
+      <li><code class="inline">panel.panelists</code> must be non-empty; a <code class="inline">parallel:</code> block must be non-empty and free of duplicate sub-step ids.</li>
+      <li><code class="inline">host:</code> is valid only on a linear step, must be non-empty, and may not be combined with <code class="inline">distribute:</code>.</li>
+      <li><code class="inline">distribute:</code> is valid only on a <code class="inline">for_each:</code> step, and its <code class="inline">hosts</code> list must be non-empty.</li>
+      <li><code class="inline">distribute:</code> is <strong>rejected on a <code class="inline">run:</code> step</strong> &mdash; a <code class="inline">run:</code> step executes locally on the coordinator, so a <code class="inline">distribute:</code> is refused at parse time rather than silently ignored. Remove it or use an agent step.</li>
+      <li><code class="inline">workspace: sync</code> is valid only on a remote step (one with <code class="inline">host:</code> or <code class="inline">distribute:</code>).</li>
+    </ul>
+    <p><strong>Run steps</strong></p>
+    <ul>
+      <li><code class="inline">run:</code> is mutually exclusive with <code class="inline">agent</code>/<code class="inline">prompt</code>, <code class="inline">parallel:</code>, <code class="inline">panel:</code>, <code class="inline">branch:</code>, <code class="inline">action:</code>, <code class="inline">split:</code>, and <code class="inline">join:</code>. It <em>is</em> compatible with <code class="inline">for_each:</code>, <code class="inline">when:</code>, and <code class="inline">continue_on_error:</code>.</li>
+      <li><code class="inline">run.cmd</code> must not be empty.</li>
+      <li><code class="inline">run.allow_exit_codes</code> must list at least one exit code &mdash; an empty list can never be satisfied.</li>
+      <li>Execution is additionally gated at run time by <code class="inline">[workflow] run_step_enabled</code> and <code class="inline">run_step_allowlist</code>, and refused entirely under <code class="inline">--mode readonly</code>. A workflow with a <code class="inline">run:</code> step <em>fails</em> when the toggle is off; it is never skipped.</li>
+    </ul>
+    <p><strong>Branch</strong></p>
+    <ul>
+      <li><code class="inline">condition</code> must be non-empty; <code class="inline">when:</code> is rejected on a branch step.</li>
+      <li>Every <code class="inline">then</code>/<code class="inline">else</code> target must name an existing step, and must run strictly <em>after</em> the branch step.</li>
+      <li>An id may not appear in both arms, and neither arm may name the branch step itself.</li>
+    </ul>
+    <p><strong>Approval gates and actions</strong></p>
+    <ul>
+      <li><code class="inline">on_timeout</code> requires <code class="inline">timeout_seconds</code>.</li>
+      <li><code class="inline">auto_approve</code>, <code class="inline">on_timeout</code>, <code class="inline">notify</code>, and <code class="inline">on_reject</code> are rejected on the legacy inline approval option &mdash; drop the <code class="inline">agent</code>/<code class="inline">prompt</code> to make it a gate node.</li>
+      <li><code class="inline">on_reject</code> entries must be plain agent or action steps &mdash; no nested gate, fan-out, panel, or branch &mdash; and may not set <code class="inline">host:</code> or <code class="inline">when:</code>.</li>
+      <li><code class="inline">action:</code> must name a tool that exists in the catalog; <code class="inline">with:</code> must be a mapping whose keys are all schema properties, with every required property present. Gate <code class="inline">notify</code> entries are validated by the same rules.</li>
+    </ul>
+    <p><strong>Templates and contracts</strong></p>
+    <ul>
+      <li>A <code class="inline">steps.&lt;id&gt;</code> reference to a step that does not exist is an error.</li>
+      <li>A reference to a step that runs <em>later</em> is a forward reference and is rejected &mdash; its value is not bound yet.</li>
+      <li>A <code class="inline">steps.&lt;id&gt;.&lt;field&gt;</code> reference must use a known field: <code class="inline">output</code>, <code class="inline">success</code>, <code class="inline">skipped</code>, <code class="inline">results</code>, <code class="inline">sub_results</code>, <code class="inline">findings</code>, <code class="inline">max_severity</code>, <code class="inline">iterations</code>, <code class="inline">resolved</code>, <code class="inline">decision</code>, and the <code class="inline">run:</code> step fields <code class="inline">json</code>, <code class="inline">stdout</code>, <code class="inline">stderr</code>, <code class="inline">exit_code</code>, <code class="inline">duration_ms</code>.</li>
+      <li><code class="inline">contracts.outputs.*.from_step</code> must name an existing step, and must agree with that step's own <code class="inline">contract:</code> on both <code class="inline">schema</code> and <code class="inline">format</code>.</li>
+      <li><code class="inline">autoflow.outcome.output</code> must name a declared workflow output; autoflow durations must look like <code class="inline">&lt;int&gt;&lt;s|m|h|d&gt;</code>.</li>
+    </ul>
+
+    <h2>A complete annotated example</h2>
+    <p>
+      One workflow using five shapes together: a linear investigation, a review panel with a fix loop, an approval
+      gate with notify and reject-cleanup hooks, a branch that routes on the outcome, and two deterministic action
+      steps on either arm.
+    </p>
+    <pre class="code"><span class="k">name</span>: <span class="s">review-and-ship</span>
+<span class="k">description</span>: <span class="s">Investigate, panel-review, gate on a human, then open a PR or file an issue.</span>
+
+<span class="k">inputs</span>:
+  <span class="k">title</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+    <span class="k">description</span>: <span class="s">Short summary of the change under review.</span>
+  <span class="k">diff</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+
+<span class="k">defaults</span>:
+  <span class="k">continue_on_error</span>: <span class="v">false</span>   <span class="c"># a failed step aborts the run unless it opts out</span>
+
+<span class="k">steps</span>:
+  <span class="c"># 1. Linear step — one agent, one prompt. Output lands in steps.investigate.output.</span>
+  - <span class="k">id</span>: <span class="v">investigate</span>
+    <span class="k">agent</span>: <span class="v">fix-bug</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Summarize what this change does and what could break:</span>
+      <span class="s">&#123;&#123; inputs.diff &#125;&#125;</span>
+
+  <span class="c"># 2. Panel — three reviewers in parallel, then a fix loop until nothing</span>
+  <span class="c">#    high-or-worse remains (or three passes, whichever comes first).</span>
+  - <span class="k">id</span>: <span class="v">panel_review</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">panel</span>:
+      <span class="k">panelists</span>: [<span class="v">security-reviewer</span>, <span class="v">performance-reviewer</span>, <span class="v">maintainability-reviewer</span>]
+      <span class="k">subject</span>: <span class="s">"&#123;&#123; inputs.diff &#125;&#125;\n\nContext: &#123;&#123; steps.investigate.output &#125;&#125;"</span>
+      <span class="k">max_parallel</span>: <span class="v">3</span>
+      <span class="k">gate</span>:
+        <span class="k">until_no_findings_at_severity_or_above</span>: <span class="v">high</span>
+        <span class="k">fix_with</span>: <span class="v">finding-fixer</span>
+        <span class="k">max_iterations</span>: <span class="v">3</span>
+
+  <span class="c"># 3. Approval GATE NODE — no agent, no prompt: just a human decision.</span>
+  <span class="c">#    A clean panel auto-approves; otherwise the run parks and pings the issue.</span>
+  - <span class="k">id</span>: <span class="v">merge_gate</span>
+    <span class="k">approval</span>:
+      <span class="k">prompt</span>: <span class="s">|</span>
+        <span class="s">&#123;&#123; steps.panel_review.findings | length &#125;&#125; findings</span>
+        <span class="s">(max severity: &#123;&#123; steps.panel_review.max_severity &#125;&#125;). Ship it?</span>
+      <span class="k">auto_approve</span>: <span class="s">"&#123;&#123; steps.panel_review.max_severity in ['low', ''] &#125;&#125;"</span>
+      <span class="k">timeout_seconds</span>: <span class="v">86400</span>
+      <span class="k">on_timeout</span>: <span class="v">reject</span>
+      <span class="k">notify</span>:
+        - <span class="k">action</span>: <span class="v">issues.comment</span>
+          <span class="k">with</span>:
+            <span class="k">project</span>: <span class="s">Section9Labs/rupu</span>
+            <span class="k">number</span>: <span class="s">"&#123;&#123; issue.number &#125;&#125;"</span>
+            <span class="k">body</span>: <span class="s">"Waiting on approval at merge_gate."</span>
+      <span class="k">on_reject</span>:
+        - <span class="k">id</span>: <span class="v">note_rejection</span>
+          <span class="k">action</span>: <span class="v">issues.comment</span>
+          <span class="k">with</span>:
+            <span class="k">project</span>: <span class="s">Section9Labs/rupu</span>
+            <span class="k">number</span>: <span class="s">"&#123;&#123; issue.number &#125;&#125;"</span>
+            <span class="k">body</span>: <span class="s">"Rejected at merge gate — nothing was opened."</span>
+
+  <span class="c"># 4. Branch — routes forward only. Each arm lists EVERY id on that arm.</span>
+  <span class="c">#    No `when:` allowed here; the condition is the gate.</span>
+  - <span class="k">id</span>: <span class="v">route</span>
+    <span class="k">branch</span>:
+      <span class="k">condition</span>: <span class="s">"&#123;&#123; steps.panel_review.resolved &#125;&#125;"</span>
+      <span class="k">then</span>: [<span class="v">open_pr</span>]
+      <span class="k">else</span>: [<span class="v">file_followup</span>]
+
+  <span class="c"># 5a. Action step — a typed API call. No agent, no tokens, no ambiguity.</span>
+  - <span class="k">id</span>: <span class="v">open_pr</span>
+    <span class="k">action</span>: <span class="v">scm.prs.create</span>
+    <span class="k">with</span>:
+      <span class="k">owner</span>: <span class="s">Section9Labs</span>
+      <span class="k">repo</span>: <span class="s">rupu</span>
+      <span class="k">title</span>: <span class="s">"fix: &#123;&#123; inputs.title &#125;&#125;"</span>
+      <span class="k">body</span>: <span class="s">"&#123;&#123; steps.investigate.output &#125;&#125;"</span>
+      <span class="k">head</span>: <span class="s">"rupu/&#123;&#123; inputs.title &#125;&#125;"</span>
+      <span class="k">base</span>: <span class="s">main</span>
+
+  <span class="c"># 5b. The other arm. continue_on_error keeps a tracker outage from</span>
+  <span class="c">#     failing an otherwise-successful run.</span>
+  - <span class="k">id</span>: <span class="v">file_followup</span>
+    <span class="k">action</span>: <span class="v">issues.create</span>
+    <span class="k">continue_on_error</span>: <span class="v">true</span>
+    <span class="k">with</span>:
+      <span class="k">project</span>: <span class="s">Section9Labs/rupu</span>
+      <span class="k">title</span>: <span class="s">"Unresolved review findings: &#123;&#123; inputs.title &#125;&#125;"</span>
+      <span class="k">body</span>: <span class="s">|</span>
+        <span class="s">The panel did not clear after &#123;&#123; steps.panel_review.iterations &#125;&#125; passes.</span>
+        <span class="v">&#123;% for f in steps.panel_review.findings %&#125;</span>
+        <span class="s">- [&#123;&#123; f.severity &#125;&#125;] &#123;&#123; f.title &#125;&#125; (&#123;&#123; f.source &#125;&#125;): &#123;&#123; f.body &#125;&#125;</span>
+        <span class="v">&#123;% endfor %&#125;</span>
+      <span class="k">labels</span>: [<span class="s">review</span>, <span class="s">needs-triage</span>]</pre>
+    <p>
+      Validate it before you run it &mdash; <code class="inline">rupu workflow show &lt;name&gt;</code> resolves and
+      parses the file, so every rule on this page fires there first:
+    </p>
+    <pre class="code">rupu workflow list
+rupu workflow show review-and-ship
+rupu workflow run review-and-ship \
+  --input title=<span class="s">"empty-cart NPE"</span> \
+  --input diff=<span class="s">"$(git diff origin/main)"</span></pre>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/workflows.html">&#8592; Workflows</a>
+      <a href="/docs/autoflows.html">Autoflows &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
