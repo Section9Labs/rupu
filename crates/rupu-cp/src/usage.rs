@@ -89,6 +89,47 @@ pub fn summarize_run(store: &RunStore, run_id: &str, pricing: &PricingConfig) ->
     summarize_paths(&run_transcript_paths(store, run_id), pricing)
 }
 
+/// [`run_transcript_paths`] with each path mapped through the run's host
+/// connector (spec §6.3): a run executed by a mirror-backed host (SSH) reads
+/// its transcripts from the coordinator-local cache. A `worker_id` that is
+/// not a registered host (a local session worker, or none) maps nothing.
+pub fn run_transcript_paths_resolved(
+    store: &RunStore,
+    hosts: &crate::host::registry::HostRegistry,
+    run_id: &str,
+) -> Vec<PathBuf> {
+    let paths = run_transcript_paths(store, run_id);
+    let Ok(rec) = store.load(run_id) else {
+        return paths;
+    };
+    let Some(worker) = rec.worker_id.as_deref() else {
+        return paths;
+    };
+    let Ok(conn) = hosts.resolve(worker) else {
+        return paths;
+    };
+    if !conn.serves_runs_from_local_mirror() {
+        return paths;
+    }
+    paths
+        .iter()
+        .map(|p| conn.local_transcript_path(p))
+        .collect()
+}
+
+/// [`summarize_run`], host-resolved.
+pub fn summarize_run_resolved(
+    store: &RunStore,
+    hosts: &crate::host::registry::HostRegistry,
+    run_id: &str,
+    pricing: &PricingConfig,
+) -> UsageSummary {
+    summarize_paths(
+        &run_transcript_paths_resolved(store, hosts, run_id),
+        pricing,
+    )
+}
+
 /// Token usage + turn count + duration for one run.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RunMetrics {
@@ -655,7 +696,8 @@ mod tests {
     #[test]
     fn run_metrics_paths_usage_matches_old_two_pass_shape_across_transcripts() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("rupu-cp-metrics-multi-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rupu-cp-metrics-multi-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let p1 = dir.join("t1.jsonl");
@@ -798,5 +840,73 @@ mod tests {
         assert_eq!(series[2].turn, 3);
         assert_eq!(series[2].label, "step2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod resolved_paths_tests {
+    use super::*;
+    use crate::host::registry::HostRegistry;
+    use std::sync::Arc;
+
+    #[test]
+    fn paths_of_a_run_owned_by_an_unknown_worker_pass_through_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let mirror = crate::node::NodeMirror::new(Arc::clone(&store));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Workflow,
+            name: "wf".into(),
+            inputs: Default::default(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        mirror
+            .create_run("run_01USAGE", "host_unknown", &spec)
+            .unwrap();
+        store
+            .append_step_result(
+                "run_01USAGE",
+                &rupu_orchestrator::runs::StepResultRecord {
+                    step_id: "a".into(),
+                    run_id: "run_01A".into(),
+                    transcript_path: PathBuf::from("/remote/proj/.rupu/transcripts/run_01A.jsonl"),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: Default::default(),
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
+                    run_outcome: None,
+                },
+            )
+            .unwrap();
+        let local = crate::host::local::LocalHostConnector::new(
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&store),
+            tmp.path().to_path_buf(),
+        );
+        let hosts = HostRegistry::new(
+            rupu_workspace::HostStore {
+                root: tmp.path().join("hosts"),
+            },
+            Arc::new(local),
+        );
+        let got = run_transcript_paths_resolved(&store, &hosts, "run_01USAGE");
+        assert_eq!(
+            got,
+            vec![PathBuf::from(
+                "/remote/proj/.rupu/transcripts/run_01A.jsonl"
+            )]
+        );
     }
 }

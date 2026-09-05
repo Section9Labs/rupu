@@ -918,11 +918,9 @@ async fn list_autoflow_runs(
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
         for row in &mut page_rows {
             row.host_id = Some("local".to_string());
-            row.usage = crate::usage::rollup(
-                row.run_ids
-                    .iter()
-                    .map(|id| crate::usage::summarize_run(&s.run_store, id, &s.pricing)),
-            );
+            row.usage = crate::usage::rollup(row.run_ids.iter().map(|id| {
+                crate::usage::summarize_run_resolved(&s.run_store, &s.hosts, id, &s.pricing)
+            }));
         }
         return Ok(Json(
             page_rows
@@ -965,11 +963,9 @@ async fn list_autoflow_runs(
                         .collect()
                 })
                 .unwrap_or_default();
-            row["usage"] = serde_json::to_value(crate::usage::rollup(
-                run_ids
-                    .iter()
-                    .map(|id| crate::usage::summarize_run(&s.run_store, id, &s.pricing)),
-            ))
+            row["usage"] = serde_json::to_value(crate::usage::rollup(run_ids.iter().map(|id| {
+                crate::usage::summarize_run_resolved(&s.run_store, &s.hosts, id, &s.pricing)
+            })))
             .unwrap();
         }
     }
@@ -2405,6 +2401,9 @@ mod tests {
         .expect("ok");
 
         assert_eq!(rows.len(), 1, "only the Aug 10 cycle falls in range");
-        assert_eq!(rows[0]["started_at"], serde_json::json!(day(10).to_rfc3339()));
+        assert_eq!(
+            rows[0]["started_at"],
+            serde_json::json!(day(10).to_rfc3339())
+        );
     }
 }

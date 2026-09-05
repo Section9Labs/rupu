@@ -43,7 +43,7 @@ async fn run_graph_from_host(
     // used to 500 the whole run-detail page with "invalid: proxy_get_json
     // is not supported for ssh hosts".
     if conn.serves_runs_from_local_mirror() {
-        return build_run_graph_json(&s.run_store, &s.pricing, id);
+        return build_run_graph_json(&s.run_store, &s.pricing, &s.hosts, id);
     }
     conn.proxy_get_json(&format!("/api/runs/{id}/graph"))
         .await
@@ -62,6 +62,7 @@ async fn run_graph_from_host(
 fn build_run_graph_json(
     store: &RunStore,
     pricing: &rupu_config::PricingConfig,
+    hosts: &crate::host::registry::HostRegistry,
     id: &str,
 ) -> ApiResult<serde_json::Value> {
     // 1. Verify the run exists (gives us the RunRecord too).
@@ -109,7 +110,7 @@ fn build_run_graph_json(
     let units = merge_event_units(id, store, checkpoints);
 
     // 6. Token/cost rollup for the run-detail header breakdown.
-    let usage = crate::usage::summarize_run(store, id, pricing);
+    let usage = crate::usage::summarize_run_resolved(store, hosts, id, pricing);
 
     Ok(serde_json::json!({
         "run": run,
@@ -139,10 +140,12 @@ async fn run_graph(
     }
 
     match resolve_run_location(&s, &id).await {
-        RunLocation::Global => build_run_graph_json(&s.run_store, &s.pricing, &id).map(Json),
+        RunLocation::Global => {
+            build_run_graph_json(&s.run_store, &s.pricing, &s.hosts, &id).map(Json)
+        }
         RunLocation::ProjectLocal { path } => {
             let store = RunStore::new(path.join(".rupu").join("runs"));
-            build_run_graph_json(&store, &s.pricing, &id).map(Json)
+            build_run_graph_json(&store, &s.pricing, &s.hosts, &id).map(Json)
         }
         RunLocation::Host { host_id } => run_graph_from_host(&s, &host_id, &id).await.map(Json),
         RunLocation::Unpersisted {
