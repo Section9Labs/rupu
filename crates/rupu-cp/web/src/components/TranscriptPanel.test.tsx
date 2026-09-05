@@ -12,7 +12,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { TranscriptResponse } from '../lib/transcript';
@@ -92,5 +92,35 @@ describe('TranscriptPanel embedded mode', () => {
 
     expect((await screen.findAllByText('reviewer-agent'))[0]).toBeInTheDocument();
     expect(screen.queryByText(/unparsed/)).not.toBeInTheDocument();
+  });
+});
+
+describe('TranscriptPanel remote reads', () => {
+  it('forwards host and run id to the fetch and the stream', async () => {
+    const getTranscript = vi.spyOn(api, 'getTranscript').mockResolvedValue({ events: [], summary: null });
+    const subscribeTranscript = vi.spyOn(api, 'subscribeTranscript').mockReturnValue(() => {});
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/remote/.rupu/transcripts/run_01A.jsonl" live host="host_abc" runId="run_01PARENT" />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(getTranscript).toHaveBeenCalled());
+    expect(getTranscript).toHaveBeenCalledWith('/remote/.rupu/transcripts/run_01A.jsonl', { host: 'host_abc', run: 'run_01PARENT' });
+    expect(subscribeTranscript).toHaveBeenCalledWith(
+      '/remote/.rupu/transcripts/run_01A.jsonl',
+      expect.any(Function),
+      expect.any(Function),
+      { host: 'host_abc', run: 'run_01PARENT' },
+    );
+  });
+
+  it('shows the partial badge when the server could not collect the whole transcript', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue({ events: [], summary: null, partial: true });
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/t/run-1.jsonl" live={false} host="host_abc" runId="run_01P" />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(/incomplete/i)).toBeInTheDocument();
   });
 });

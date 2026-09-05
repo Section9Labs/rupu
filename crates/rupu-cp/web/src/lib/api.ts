@@ -2632,9 +2632,10 @@ export const api = {
 
   // --- Transcripts ---
 
-  getTranscript(path: string, opts?: { host?: string }): Promise<TranscriptResponse> {
+  getTranscript(path: string, opts?: { host?: string; run?: string }): Promise<TranscriptResponse> {
     let url = `/api/transcript?path=${encodeURIComponent(path)}`;
     if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
+    if (opts?.run) url += `&run=${encodeURIComponent(opts.run)}`;
     return request<TranscriptResponse>(url);
   },
 
@@ -2648,10 +2649,11 @@ export const api = {
     path: string,
     onEvent: (e: TranscriptEvent) => void,
     onError?: (e: Event) => void,
-    opts?: { host?: string },
+    opts?: { host?: string; run?: string },
   ): () => void {
     let url = `/api/transcript/stream?path=${encodeURIComponent(path)}`;
     if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
+    if (opts?.run) url += `&run=${encodeURIComponent(opts.run)}`;
     const es = new EventSource(url);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as TranscriptEvent);
     if (onError) es.onerror = onError;
