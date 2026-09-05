@@ -71,8 +71,16 @@ export default function TranscriptPanel({
   // Open a sub-run transcript in the same transcript route (reuses the existing
   // `/transcript?path=…` page — no new global state). Sub-runs are completed
   // recordings, so `live=0`.
+  //
+  // `host` and `run` travel with it: a sub-run of a REMOTE run is itself a
+  // remote path, and the backend needs both to resolve it (`run` is what
+  // authorizes a not-yet-mirrored path against the run that claims it).
+  // Dropping them here is what made remote sub-run links 400.
   function openTranscript(p: string) {
-    navigate(`/transcript?path=${encodeURIComponent(p)}&live=0`);
+    let url = `/transcript?path=${encodeURIComponent(p)}&live=0`;
+    if (host !== undefined) url += `&host=${encodeURIComponent(host)}`;
+    if (runId !== undefined) url += `&run=${encodeURIComponent(runId)}`;
+    navigate(url);
   }
 
   // Fetch on mount + whenever `path` changes; reset state on path change.
