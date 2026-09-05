@@ -218,7 +218,9 @@ Keyed by cache path. Behaviour:
   keeps polling the file (which stops growing), so the SSE stream stays open
   but quiet; when the client reconnects (existing behaviour on both clients),
   the fresh subscribe replays, truncating on its own first line. No duplicate
-  lines are possible because every replay starts from an empty file.
+  lines are possible because every replay starts from an empty file — and
+  because the one other writer of a cache file, the terminal pull (§6.1),
+  retires the feed before it writes, so the two never interleave.
 
 The registry lives on `SshHostConnector` next to `pumps`, and is bounded by
 construction: at most one child per distinct file, never for complete files.
@@ -252,10 +254,27 @@ before `mirror.finish`, the pump:
    switches the destination file. One round trip regardless of step count —
    the connection-burst rule from `feedback_ssh_connection_burst` applies here
    as much as to probes.
-4. Each file is written to `<cache>.tmp`, renamed into place, then its
-   `.complete` sidecar is written. A file that is absent on the remote (`cat`
-   prints to stderr, which is discarded) produces an empty cache file and a
-   sidecar: "this step legitimately has no transcript" is a complete answer.
+4. Any lazy tail feeding that cache file is **retired first**
+   (`LazyTailRegistry::retire`): the feed is marked dead, its task aborted, its
+   registry entry removed, and the pump waits (bounded) for the task's
+   `FeedDone` guard, because `abort()` is cooperative. The pull is then the
+   file's only writer. This matters because step 5's result is marked
+   `.complete`, after which §4 serves the cache verbatim and §5.1 refuses to
+   tail it — a wrong byte written here is never repaired, so the feed and the
+   pull must never share the file.
+5. Each file is written to a unique `<cache>.<ULID>.tmp`, renamed into place,
+   then its `.complete` sidecar is written. The tmp name is per-write because
+   pulls are per REQUEST: a fixed `<cache>.tmp` is shared by two viewers of one
+   transcript, and the spliced result would be renamed in. The rename is what
+   makes the sidecar safe — it is only ever written over an atomically
+   replaced file. A file that is absent on the remote (`cat` prints to stderr,
+   which is discarded) produces an empty cache file and a sidecar: "this step
+   legitimately has no transcript" is a complete answer.
+
+Retiring a feed does not disconnect its viewers. They keep their `FeedGuard`,
+and their `TranscriptTail` reads the cache **by path** at a byte offset, so
+after the rename they read on into the authoritative body — a strict superset
+of the replay bytes already delivered.
 
 `finish` runs afterwards exactly as today.
 
@@ -269,13 +288,26 @@ the `partial` flag on read.
 
 ### 6.3 Usage rollup
 
-`usage::run_transcript_paths` (and `summarize_run`) gain host awareness: when
-the run record's `worker_id` names a registered host whose connector serves
-runs from the local mirror, each recorded path is mapped through
-`HostConnector::local_transcript_path(remote_path)` (default: identity) to its
-cache path before reading. After the terminal pull, SSH workflow runs get real
-token and cost numbers; before it, they get what has been pulled so far, which
-is the honest answer for a running run.
+`usage::run_transcript_paths` (and `summarize_run` through it) gain host
+awareness by CACHE LAYOUT, not by a registry lookup. For a run whose record
+carries a `worker_id`, each recorded path that does not exist locally is
+retried at
+`transcript_paths::cache_path(&transcript_paths::global_dir_of(store), worker_id, path)`,
+and used when that cache file exists; otherwise the recorded path stands. A
+local run, or a `worker_id` this coordinator has no mirror for, is untouched.
+
+The layout rule rather than a `HostRegistry` lookup, because
+`RunListRow::with_usage`, `query_run_rows` and `query_run_detail` are `pub` and
+are called from `rupu-cli` and `LocalHostConnector` with no registry in hand —
+and mirrored SSH runs are listed and served through exactly those paths, since
+`NodeMirror` writes them into the coordinator's own store. A registry-only
+variant would leave list and detail cost blank. The cost of the rule is that a
+future host type whose cache layout differs must also teach `cache_path`,
+which is consistent with §3.1's host-neutral layout.
+
+After the terminal pull, SSH workflow runs get real token and cost numbers;
+before it, they get what has been pulled so far, which is the honest answer for
+a running run.
 
 ## 7. Placed steps and fan-out units in a local workflow
 
@@ -402,10 +434,12 @@ Unit, at the seams:
   non-transcript paths, relative paths, `..`, non-`.jsonl`.
 - Allowlist: path not in the run → 400; run owned by another host → 400;
   local-mirror short-circuit needs no `run`.
-- `LazyTailRegistry` with the existing `FakeExec`: truncate on first
-  subscribe; one child for two subscribers; kill on last drop; refusal on
+- `LazyTailRegistry` with the existing `FakeExec`: truncate on first LINE (not
+  on subscribe — a feed that never yields must leave already-collected content
+  intact); one child for two subscribers; kill on last drop; refusal on
   `.complete`; child death leaves the file and the entry dead; re-subscribe
-  replays from empty.
+  replays from empty; `retire` stops a feed its subscribers still hold and
+  removes the entry, and is a no-op on an unknown path.
 - Terminal pull: multi-file `==>` stream parsing into separate cache files;
   absent remote file → empty file + sidecar; stream ending mid-file → no
   sidecar for that file, run still finishes.
