@@ -275,6 +275,7 @@ fn seed_step(run_id: &str, transcript_path: PathBuf) -> StepResultRecord {
         resolved: true,
         finished_at: Utc::now(),
         loop_iteration: None,
+        host: None,
     }
 }
 

@@ -689,6 +689,7 @@ fn run_detail_fixture_is_current() {
         finished_at: t,
         loop_iteration: None,
         run_outcome: None,
+        host: None,
     };
     let step_panel = StepResultRecord {
         step_id: "review".into(),
@@ -711,6 +712,7 @@ fn run_detail_fixture_is_current() {
         finished_at: t,
         loop_iteration: None,
         run_outcome: None,
+        host: None,
     };
 
     let usage = UsageSummary {
@@ -858,6 +860,7 @@ fn run_graph_fixture_is_current() {
         finished_at: t,
         loop_iteration: None,
         run_outcome: None,
+        host: None,
     };
 
     // One durable checkpoint (`success: true`) plus one events-only

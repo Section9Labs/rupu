@@ -602,6 +602,10 @@ pub struct StepResultRecord {
     /// other kind and for records written before `run:` existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_outcome: Option<RunOutcome>,
+    /// Host that executed this step. Absent for local steps and for every
+    /// record written before the field existed (mirrors `UnitCheckpoint::host`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 /// Captured process outcome for a `run:` step. `None` for every other
@@ -727,6 +731,7 @@ impl From<&StepResult> for StepResultRecord {
             resolved: sr.resolved,
             finished_at: Utc::now(),
             loop_iteration: sr.loop_iteration,
+            host: sr.host.clone(),
         }
     }
 }
@@ -773,6 +778,7 @@ impl From<&StepResultRecord> for StepResult {
             iterations: rec.iterations,
             resolved: rec.resolved,
             loop_iteration: rec.loop_iteration,
+            host: rec.host.clone(),
         }
     }
 }
@@ -2860,6 +2866,7 @@ mod tests {
             resolved: true,
             finished_at: Utc::now(),
             loop_iteration: None,
+            host: None,
         }
     }
 
@@ -5252,6 +5259,20 @@ mod tests {
         let back_local: UnitCheckpoint =
             serde_json::from_value(val_local).expect("deserialize local");
         assert_eq!(back_local.host, None);
+    }
+
+    #[test]
+    fn step_result_record_host_round_trips_and_defaults_absent() {
+        let legacy = r#"{"step_id":"s","run_id":"r","transcript_path":"/t.jsonl","output":"","success":true,"skipped":false,"rendered_prompt":"","finished_at":"2026-09-04T00:00:00Z"}"#;
+        let rec: StepResultRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.host, None);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("\"host\""), "absent, not null: {json}");
+        let mut placed = rec.clone();
+        placed.host = Some("h1".into());
+        let back: StepResultRecord =
+            serde_json::from_str(&serde_json::to_string(&placed).unwrap()).unwrap();
+        assert_eq!(back.host.as_deref(), Some("h1"));
     }
 
     #[test]

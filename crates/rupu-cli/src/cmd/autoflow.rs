@@ -13900,6 +13900,7 @@ steps:
                     resolved: true,
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();
@@ -14054,6 +14055,7 @@ steps:
                     resolved: true,
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();
@@ -14208,6 +14210,7 @@ steps:
                     resolved: true,
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();
@@ -14347,6 +14350,7 @@ steps:
                     resolved: true,
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();
@@ -14491,6 +14495,7 @@ steps:
                     resolved: true,
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();
@@ -14954,6 +14959,7 @@ steps:
                     resolved: true,
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();

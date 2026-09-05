@@ -123,6 +123,10 @@ pub struct UnitDispatch {
     pub agent: String,
     pub rendered_prompt: String,
     pub index: usize,
+    /// The run id this unit executes under on the remote host — minted by the
+    /// runner per unit (`run_<ULID>`), so the coordinator knows the child
+    /// run's id (and therefore its mirrored transcript path, see
+    /// [`UnitDispatcher::unit_transcript_path`]) before dispatch.
     pub run_id: String,
     /// The packed coordinator workspace when this unit's effective workspace
     /// mode is `Sync`. `None` ⇒ self-contained (unchanged).
@@ -179,6 +183,14 @@ pub trait UnitDispatcher: Send + Sync {
              UnitDispatcher::prepare_workspace; this one does not"
                 .into(),
         ))
+    }
+
+    /// Where `unit_run_id`'s transcript will be readable on the coordinator
+    /// once the unit runs on `host` — known before dispatch because the
+    /// runner mints the id. `None` (the default) means "unknown": the runner
+    /// falls back to its local `transcript_dir` path.
+    fn unit_transcript_path(&self, _host: &str, _unit_run_id: &str) -> Option<PathBuf> {
+        None
     }
 
     /// Apply collected unit workspace deltas to the coordinator workspace at
@@ -518,6 +530,9 @@ pub struct StepResult {
     /// `step_results.jsonl` for a loop-free workflow is byte-identical
     /// to before this field existed).
     pub loop_iteration: Option<u32>,
+    /// Host that executed this step. `None` = local. `Some(id)` = a remote
+    /// fleet host (a placed step).
+    pub host: Option<String>,
 }
 
 /// Runtime form of one finding emitted by a panelist. Aggregated
@@ -552,6 +567,7 @@ impl Default for StepResult {
             // decide.
             resolved: true,
             loop_iteration: None,
+            host: None,
         }
     }
 }
@@ -6103,7 +6119,12 @@ async fn run_linear_step(
             }
         })?;
     let run_id = format!("run_{}", Ulid::new());
-    let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+    let transcript_path = step
+        .host
+        .as_deref()
+        .zip(opts.unit_dispatcher.as_ref())
+        .and_then(|(host, d)| d.unit_transcript_path(host, &run_id))
+        .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
     // Announce the running step's transcript path on the live event stream.
     // A linear step generates this path lazily (after the outer-loop
@@ -6237,6 +6258,7 @@ async fn run_linear_step(
         success,
         skipped: false,
         items: Vec::new(),
+        host: step.host.clone(),
         ..Default::default()
     }))
 }
@@ -6547,6 +6569,11 @@ async fn run_fanout_step(
         }
     }
 
+    // Pre-extract distribute hosts (if any) so we can compute per-unit
+    // placement — both for the transcript path below and for the fallback
+    // host used before entering each spawned task.
+    let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
+
     // Render each item's prompt up front so a per-item template
     // error is reported before any agent dispatches. Each item gets
     // its own clone of the parent context with `item` + `loop` bound.
@@ -6578,7 +6605,13 @@ async fn run_fanout_step(
                     source: e,
                 })?;
         let run_id = format!("run_{}", Ulid::new());
-        let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+        let placed_on: Option<&str> = distribute_hosts
+            .as_ref()
+            .map(|hosts| hosts[idx % hosts.len()].as_str());
+        let transcript_path = placed_on
+            .zip(opts.unit_dispatcher.as_ref())
+            .and_then(|(host, d)| d.unit_transcript_path(host, &run_id))
+            .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
         prepared.push((idx, item.clone(), rendered, run_id, transcript_path));
     }
 
@@ -6590,9 +6623,6 @@ async fn run_fanout_step(
         .as_deref()
         .expect("validate_step_shape guarantees agent for for_each steps")
         .to_string();
-    // Pre-extract distribute hosts (if any) so we can compute per-unit
-    // placement and fallback host before entering each spawned task.
-    let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
     // Clone the dispatcher Arc once; each spawned task gets its own ref.
     let unit_dispatcher = opts.unit_dispatcher.clone();
 
@@ -7845,6 +7875,7 @@ impl PanelPass {
             iterations,
             resolved,
             loop_iteration: None,
+            host: None,
         }
     }
 }
@@ -8549,6 +8580,157 @@ steps:
         assert_eq!(
             result.step_results[1].rendered_prompt,
             "summarize out-0-on-worker-1"
+        );
+    }
+
+    /// A dispatcher that knows where a unit's transcript will be mirrored
+    /// BEFORE dispatch — the fleet dispatcher's contract after this arc.
+    struct PathDispatcher {
+        seen_run_ids: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl UnitDispatcher for PathDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            self.seen_run_ids.lock().unwrap().push(unit.run_id.clone());
+            Ok(UnitOutcome {
+                output: format!("out-{}-on-{host}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            })
+        }
+        fn unit_transcript_path(&self, host: &str, unit_run_id: &str) -> Option<PathBuf> {
+            Some(PathBuf::from(format!("/mirror/{host}/{unit_run_id}.jsonl")))
+        }
+    }
+
+    /// Records every transcript path announced on the live stream.
+    struct PathSink {
+        working: Mutex<Vec<PathBuf>>,
+        started: Mutex<Vec<PathBuf>>,
+    }
+
+    impl crate::executor::EventSink for PathSink {
+        fn emit(&self, _run_id: &str, ev: &crate::executor::Event) {
+            match ev {
+                crate::executor::Event::StepWorking {
+                    transcript_path: Some(p),
+                    ..
+                } => self.working.lock().unwrap().push(p.clone()),
+                crate::executor::Event::UnitStarted {
+                    transcript_path, ..
+                } => self.started.lock().unwrap().push(transcript_path.clone()),
+                _ => {}
+            }
+        }
+    }
+
+    /// The runner must record and announce the dispatcher's path, not a
+    /// coordinator-local one that is never written.
+    #[tokio::test]
+    async fn placed_step_records_the_dispatcher_transcript_path_and_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(PathDispatcher {
+            seen_run_ids: Mutex::new(Vec::new()),
+        });
+        let sink = Arc::new(PathSink {
+            working: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
+        });
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+        opts.inputs.insert("what".into(), "rupu".into());
+        opts.event_sink = Some(sink.clone());
+
+        let result = run_workflow(opts).await.expect("run ok");
+
+        let sr = &result.step_results[0];
+        assert_eq!(sr.step_id, "build");
+        assert_eq!(sr.host.as_deref(), Some("worker-1"));
+        assert!(
+            sr.transcript_path
+                .to_string_lossy()
+                .starts_with("/mirror/worker-1/run_"),
+            "{:?}",
+            sr.transcript_path
+        );
+        assert_eq!(
+            sr.transcript_path,
+            PathBuf::from(format!("/mirror/worker-1/{}.jsonl", sr.run_id)),
+            "the path is keyed by the SAME run id the unit was dispatched under"
+        );
+        assert_eq!(
+            dispatcher.seen_run_ids.lock().unwrap().as_slice(),
+            std::slice::from_ref(&sr.run_id)
+        );
+        assert_eq!(
+            sink.working.lock().unwrap().as_slice(),
+            std::slice::from_ref(&sr.transcript_path)
+        );
+    }
+
+    /// Each placed step records ITS OWN host and a path keyed by that host
+    /// (both steps placed so the section's `PanicFactory` is never hit).
+    #[tokio::test]
+    async fn each_placed_step_records_its_own_host_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(PathDispatcher {
+            seen_run_ids: Mutex::new(Vec::new()),
+        });
+        let yaml = "name: two-hosts\nsteps:\n  - id: build\n    agent: builder\n    prompt: \"build it\"\n    host: worker-1\n  - id: report\n    agent: reporter\n    prompt: \"x\"\n    host: worker-2\n";
+        let wf = Workflow::parse(yaml).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        let result = run_workflow(opts).await.expect("run ok");
+        assert_eq!(result.step_results[0].host.as_deref(), Some("worker-1"));
+        assert_eq!(result.step_results[1].host.as_deref(), Some("worker-2"));
+        assert!(result.step_results[1]
+            .transcript_path
+            .to_string_lossy()
+            .starts_with("/mirror/worker-2/run_"));
+    }
+
+    #[tokio::test]
+    async fn distributed_units_record_the_dispatcher_transcript_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(PathDispatcher {
+            seen_run_ids: Mutex::new(Vec::new()),
+        });
+        let sink = Arc::new(PathSink {
+            working: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
+        });
+        let wf = Workflow::parse(WF_DISTRIBUTED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+        opts.event_sink = Some(sink.clone());
+
+        let result = run_workflow(opts).await.expect("run ok");
+
+        let step = &result.step_results[0];
+        assert_eq!(step.items.len(), 4);
+        for (i, item) in step.items.iter().enumerate() {
+            let host = if i % 2 == 0 { "h1" } else { "h2" };
+            assert_eq!(
+                item.transcript_path,
+                PathBuf::from(format!("/mirror/{host}/{}.jsonl", item.run_id)),
+                "unit {i}"
+            );
+        }
+        let mut started = sink.started.lock().unwrap().clone();
+        started.sort();
+        let mut want: Vec<PathBuf> = step
+            .items
+            .iter()
+            .map(|i| i.transcript_path.clone())
+            .collect();
+        want.sort();
+        assert_eq!(
+            started, want,
+            "UnitStarted announced the mirror path for every unit"
         );
     }
 

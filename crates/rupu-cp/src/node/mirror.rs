@@ -413,6 +413,7 @@ impl NodeMirror {
             finished_at: record.finished_at.unwrap_or_else(Utc::now),
             loop_iteration: None,
             run_outcome: None,
+            host: None,
         };
         if let Err(e) = self.run_store.append_step_result(&record.id, &row) {
             tracing::warn!(

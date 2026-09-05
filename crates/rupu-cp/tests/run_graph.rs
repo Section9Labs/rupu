@@ -105,6 +105,7 @@ fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
         resolved: true,
         finished_at: Utc::now(),
         loop_iteration: None,
+        host: None,
     }
 }
 
