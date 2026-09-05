@@ -571,9 +571,15 @@ impl UnitDispatcher for FleetUnitDispatcher {
         }
     }
 
+    /// The path is only truthful when the host will actually EXECUTE the unit
+    /// under `unit_run_id` — otherwise the mirror lands at the id the
+    /// connector minted for itself and this path names a file that never
+    /// exists. `serves_runs_from_local_mirror` is the wrong question: it is
+    /// also true for the tunnel and bucket transports, and neither honours
+    /// `AgentLaunchRequest.run_id`.
     fn unit_transcript_path(&self, host: &str, unit_run_id: &str) -> Option<PathBuf> {
         let conn = self.resolver.resolve(host).ok()?;
-        if !conn.serves_runs_from_local_mirror() {
+        if !conn.honours_supplied_run_id() {
             return None;
         }
         Some(rupu_cp::host::transcript_paths::agent_mirror_path(
@@ -833,6 +839,13 @@ mod tests {
             // Models the SSH connector: its runs are mirrored into the CP
             // global dir, so the dispatcher can hand the runner a transcript
             // path before the run even exists on disk.
+            true
+        }
+        fn honours_supplied_run_id(&self) -> bool {
+            // …and, also like SSH, it launches under the run id the caller
+            // supplied (asserted by
+            // `dispatch_unit_launches_under_the_coordinator_minted_run_id`),
+            // which is what makes that announced path truthful.
             true
         }
         // `pause_run`/`resume_run` are intentionally NOT overridden on any
@@ -2097,8 +2110,8 @@ steps:
     }
 
     #[test]
-    fn unit_transcript_path_is_the_mirror_layout_for_mirror_backed_hosts() {
-        let conn = Arc::new(FakeConnector::completed()); // serves_runs_from_local_mirror → true below
+    fn unit_transcript_path_is_the_mirror_layout_for_hosts_that_honour_the_run_id() {
+        let conn = Arc::new(FakeConnector::completed()); // honours_supplied_run_id → true
         let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         assert_eq!(
             d.unit_transcript_path("h1", "run_01X"),
@@ -2107,9 +2120,13 @@ steps:
     }
 
     #[test]
-    fn unit_transcript_path_is_unknown_for_wire_only_hosts() {
+    fn unit_transcript_path_is_unknown_for_hosts_that_mint_their_own_run_id() {
         // `UnreachableConnector` is a unit struct that keeps the trait's
-        // `serves_runs_from_local_mirror` default (false).
+        // `honours_supplied_run_id` default (false) — the same answer the
+        // tunnel and bucket connectors give, both of which mint their own id
+        // in `launch_agent` even though they ARE mirror-backed. Gating on
+        // `serves_runs_from_local_mirror` would announce a path for them that
+        // no file ever occupies.
         let conn = Arc::new(UnreachableConnector);
         let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         assert_eq!(d.unit_transcript_path("h1", "run_01X"), None);

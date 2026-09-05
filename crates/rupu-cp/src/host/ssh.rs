@@ -2358,6 +2358,15 @@ impl HostConnector for SshHostConnector {
         true
     }
 
+    /// SSH's `launch_agent` passes `AgentLaunchRequest.run_id` through to the
+    /// remote as `rupu run --run-id <id>`, so a coordinator-minted id is the
+    /// id the run actually executes under. The tunnel and bucket connectors
+    /// mint their own, which is why this is separate from
+    /// `serves_runs_from_local_mirror`.
+    fn honours_supplied_run_id(&self) -> bool {
+        true
+    }
+
     async fn proxy_get_json(
         &self,
         _path_and_query: &str,

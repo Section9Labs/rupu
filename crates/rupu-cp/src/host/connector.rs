@@ -363,6 +363,22 @@ pub trait HostConnector: Send + Sync {
         false
     }
 
+    /// Whether this transport executes an [`AgentLaunchRequest`] under the
+    /// `run_id` the CALLER supplied, rather than minting its own.
+    ///
+    /// A placed fan-out unit's coordinator mints the id up front so it can
+    /// announce the unit's mirrored transcript path before the run exists
+    /// (`UnitDispatcher::unit_transcript_path`). That announcement is only
+    /// truthful for connectors that actually honour the supplied id — today
+    /// SSH alone. It is deliberately NOT the same question as
+    /// [`Self::serves_runs_from_local_mirror`], which is also `true` for the
+    /// tunnel and bucket transports even though both mint their own ids.
+    ///
+    /// [`AgentLaunchRequest`]: crate::agent_launcher::AgentLaunchRequest
+    fn honours_supplied_run_id(&self) -> bool {
+        false
+    }
+
     /// List sessions on this host, optionally filtered by `scope`
     /// (`"active"` | `"archived"`). The structured counterpart to
     /// `proxy_get_json("/api/sessions")`, so non-HTTP transports (SSH) can
