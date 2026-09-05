@@ -12,15 +12,24 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { TranscriptResponse } from '../lib/transcript';
 import TranscriptPanel from './TranscriptPanel';
 
+// `useNavigate` is what `openTranscript` reaches for; spy on it so the
+// sub-run URL it builds can be asserted directly.
+const { navigateSpy } = vi.hoisted(() => ({ navigateSpy: vi.fn() }));
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual<typeof import('react-router-dom')>('react-router-dom');
+  return { ...actual, useNavigate: () => navigateSpy };
+});
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  navigateSpy.mockClear();
 });
 
 // A run_start (→ header) + an assistant_message (→ turn body) + a run_complete
@@ -92,5 +101,82 @@ describe('TranscriptPanel embedded mode', () => {
 
     expect((await screen.findAllByText('reviewer-agent'))[0]).toBeInTheDocument();
     expect(screen.queryByText(/unparsed/)).not.toBeInTheDocument();
+  });
+});
+
+describe('TranscriptPanel remote reads', () => {
+  it('forwards host and run id to the fetch and the stream', async () => {
+    const getTranscript = vi.spyOn(api, 'getTranscript').mockResolvedValue({ events: [], summary: null });
+    const subscribeTranscript = vi.spyOn(api, 'subscribeTranscript').mockReturnValue(() => {});
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/remote/.rupu/transcripts/run_01A.jsonl" live host="host_abc" runId="run_01PARENT" />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(getTranscript).toHaveBeenCalled());
+    expect(getTranscript).toHaveBeenCalledWith('/remote/.rupu/transcripts/run_01A.jsonl', { host: 'host_abc', run: 'run_01PARENT' });
+    expect(subscribeTranscript).toHaveBeenCalledWith(
+      '/remote/.rupu/transcripts/run_01A.jsonl',
+      expect.any(Function),
+      expect.any(Function),
+      { host: 'host_abc', run: 'run_01PARENT' },
+    );
+  });
+
+  it('shows the partial badge when the server could not collect the whole transcript', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue({ events: [], summary: null, partial: true });
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/t/run-1.jsonl" live={false} host="host_abc" runId="run_01P" />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText(/incomplete/i)).toBeInTheDocument();
+  });
+});
+
+describe('TranscriptPanel sub-run links', () => {
+  // A `seed` event with a `source_transcript` renders the "view source
+  // transcript" button, which is the only route into `openTranscript`.
+  const SEEDED: TranscriptResponse = {
+    events: [
+      {
+        type: 'seed',
+        data: {
+          message_count: 3,
+          source_transcript: '/home/ci/.rupu/runs/run_01P/sub/sub_01X/transcript.jsonl',
+        },
+      },
+    ],
+    summary: null,
+  };
+
+  it('carries host and run into the sub-run URL', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(SEEDED);
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/t/run-1.jsonl" live={false} host="host_abc" runId="run_01P" />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByText('view source transcript'));
+    expect(navigateSpy).toHaveBeenCalledWith(
+      '/transcript?path=' +
+        encodeURIComponent('/home/ci/.rupu/runs/run_01P/sub/sub_01X/transcript.jsonl') +
+        '&live=0&host=host_abc&run=run_01P',
+    );
+  });
+
+  it('omits both when the panel has neither', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(SEEDED);
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/t/run-1.jsonl" live={false} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByText('view source transcript'));
+    expect(navigateSpy).toHaveBeenCalledWith(
+      '/transcript?path=' +
+        encodeURIComponent('/home/ci/.rupu/runs/run_01P/sub/sub_01X/transcript.jsonl') +
+        '&live=0',
+    );
   });
 });

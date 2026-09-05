@@ -1,6 +1,11 @@
 // Transcript-only page — renders a TranscriptPanel for agent/session/standalone
-// runs that have no workflow DAG. Path and live flag come from query params:
-//   /transcript?path=<encoded-path>&live=<0|1>
+// runs that have no workflow DAG. Path, live flag, host and run come from query
+// params:
+//   /transcript?path=<encoded-path>&live=<0|1>[&host=<id>&run=<id>]
+//
+// `host` and `run` are what let a REMOTE transcript resolve at all: the backend
+// needs `run` to authorize a not-yet-mirrored path against the run that claims
+// it (spec §3.3). Without it a sub-run opened from a remote run's panel 400s.
 //
 // Route: /transcript (registered in App.tsx)
 
@@ -16,6 +21,7 @@ export default function RunTranscript() {
   const liveParam = searchParams.get('live') ?? '0';
   const live = liveParam === '1' || liveParam === 'true';
   const host = searchParams.get('host') ?? undefined;
+  const run = searchParams.get('run') ?? undefined;
 
   if (!path) {
     return (
@@ -45,7 +51,7 @@ export default function RunTranscript() {
 
       {/* TranscriptPanel fills the remaining page height and handles its own scroll */}
       <div className="flex-1 min-h-0">
-        <TranscriptPanel path={path} live={live} host={host} />
+        <TranscriptPanel path={path} live={live} host={host} runId={run} />
       </div>
     </div>
   );

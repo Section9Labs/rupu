@@ -220,6 +220,7 @@ fn sample_step_result(run_id: &str, transcript_path: &Path) -> StepResultRecord 
         resolved: true,
         finished_at: Utc::now(),
         loop_iteration: None,
+        host: None,
     }
 }
 

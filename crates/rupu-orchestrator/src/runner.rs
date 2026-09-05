@@ -123,6 +123,10 @@ pub struct UnitDispatch {
     pub agent: String,
     pub rendered_prompt: String,
     pub index: usize,
+    /// The run id this unit executes under on the remote host — minted by the
+    /// runner per unit (`run_<ULID>`), so the coordinator knows the child
+    /// run's id (and therefore its mirrored transcript path, see
+    /// [`UnitDispatcher::unit_transcript_path`]) before dispatch.
     pub run_id: String,
     /// The packed coordinator workspace when this unit's effective workspace
     /// mode is `Sync`. `None` ⇒ self-contained (unchanged).
@@ -179,6 +183,14 @@ pub trait UnitDispatcher: Send + Sync {
              UnitDispatcher::prepare_workspace; this one does not"
                 .into(),
         ))
+    }
+
+    /// Where `unit_run_id`'s transcript will be readable on the coordinator
+    /// once the unit runs on `host` — known before dispatch because the
+    /// runner mints the id. `None` (the default) means "unknown": the runner
+    /// falls back to its local `transcript_dir` path.
+    fn unit_transcript_path(&self, _host: &str, _unit_run_id: &str) -> Option<PathBuf> {
+        None
     }
 
     /// Apply collected unit workspace deltas to the coordinator workspace at
@@ -518,6 +530,9 @@ pub struct StepResult {
     /// `step_results.jsonl` for a loop-free workflow is byte-identical
     /// to before this field existed).
     pub loop_iteration: Option<u32>,
+    /// Host that executed this step. `None` = local. `Some(id)` = a remote
+    /// fleet host (a placed step).
+    pub host: Option<String>,
 }
 
 /// Runtime form of one finding emitted by a panelist. Aggregated
@@ -552,6 +567,7 @@ impl Default for StepResult {
             // decide.
             resolved: true,
             loop_iteration: None,
+            host: None,
         }
     }
 }
@@ -6103,7 +6119,12 @@ async fn run_linear_step(
             }
         })?;
     let run_id = format!("run_{}", Ulid::new());
-    let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+    let transcript_path = step
+        .host
+        .as_deref()
+        .zip(opts.unit_dispatcher.as_ref())
+        .and_then(|(host, d)| d.unit_transcript_path(host, &run_id))
+        .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
     // Announce the running step's transcript path on the live event stream.
     // A linear step generates this path lazily (after the outer-loop
@@ -6237,6 +6258,7 @@ async fn run_linear_step(
         success,
         skipped: false,
         items: Vec::new(),
+        host: step.host.clone(),
         ..Default::default()
     }))
 }
@@ -6547,6 +6569,11 @@ async fn run_fanout_step(
         }
     }
 
+    // Pre-extract distribute hosts (if any) so we can compute per-unit
+    // placement — both for the transcript path below and for the fallback
+    // host used before entering each spawned task.
+    let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
+
     // Render each item's prompt up front so a per-item template
     // error is reported before any agent dispatches. Each item gets
     // its own clone of the parent context with `item` + `loop` bound.
@@ -6578,7 +6605,13 @@ async fn run_fanout_step(
                     source: e,
                 })?;
         let run_id = format!("run_{}", Ulid::new());
-        let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+        let placed_on: Option<&str> = distribute_hosts
+            .as_ref()
+            .map(|hosts| hosts[idx % hosts.len()].as_str());
+        let transcript_path = placed_on
+            .zip(opts.unit_dispatcher.as_ref())
+            .and_then(|(host, d)| d.unit_transcript_path(host, &run_id))
+            .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
         prepared.push((idx, item.clone(), rendered, run_id, transcript_path));
     }
 
@@ -6590,9 +6623,6 @@ async fn run_fanout_step(
         .as_deref()
         .expect("validate_step_shape guarantees agent for for_each steps")
         .to_string();
-    // Pre-extract distribute hosts (if any) so we can compute per-unit
-    // placement and fallback host before entering each spawned task.
-    let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
     // Clone the dispatcher Arc once; each spawned task gets its own ref.
     let unit_dispatcher = opts.unit_dispatcher.clone();
 
@@ -6651,6 +6681,7 @@ async fn run_fanout_step(
         let agent_name = agent_name_root.clone();
         let workspace_id = opts.workspace_id.clone();
         let workspace_path = opts.workspace_path.clone();
+        let transcript_dir_for_task = opts.transcript_dir.clone();
         let rendered_clone = rendered.clone();
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
@@ -6680,7 +6711,9 @@ async fn run_fanout_step(
             // Save placement before the `if let Some(host) = placement`
             // branch consumes it, so both events and FanoutItemOutcome
             // carry the same host attribution.
-            let placement_host = placement.clone();
+            let mut run_id = run_id;
+            let mut transcript_path = transcript_path;
+            let mut placement_host = placement.clone();
 
             // Cooperative pause, checked the instant this unit's semaphore
             // permit is granted — i.e. BEFORE any work (local or remote) is
@@ -6796,6 +6829,28 @@ async fn run_fanout_step(
                                     Err(first_err) => {
                                         // Reassign once to the next host and retry.
                                         let retry_host = fallback_host.as_deref().unwrap_or(&host);
+                                        // Task 9: the SSH connector launches the
+                                        // child run under `UnitDispatch.run_id` and
+                                        // creates its mirror record with that id —
+                                        // a failed primary launch can leave a
+                                        // mirror record for the primary run id
+                                        // (finished as failed), so reusing it on
+                                        // the fallback host would collide with
+                                        // `RunStore::create`'s `AlreadyExists`.
+                                        // Mint a fresh id for the retry, and with
+                                        // it a fresh transcript path — the
+                                        // fallback host's mirror, not the primary
+                                        // host's (which never got written to).
+                                        let retry_run_id = format!("run_{}", Ulid::new());
+                                        let retry_path = dispatcher
+                                            .unit_transcript_path(retry_host, &retry_run_id)
+                                            .unwrap_or_else(|| {
+                                                transcript_dir_for_task
+                                                    .join(format!("{retry_run_id}.jsonl"))
+                                            });
+                                        run_id = retry_run_id.clone();
+                                        transcript_path = retry_path.clone();
+                                        placement_host = Some(retry_host.to_string());
                                         // The retry stages the SAME packed
                                         // payload on the fallback host — one more
                                         // reason the pack belongs to the step and
@@ -6805,7 +6860,7 @@ async fn run_fanout_step(
                                             agent: agent_name.clone(),
                                             rendered_prompt: rendered_clone.clone(),
                                             index: idx,
-                                            run_id: run_id_clone.clone(),
+                                            run_id: retry_run_id,
                                             workspace: unit_ws.clone(),
                                         };
                                         warn!(
@@ -6816,6 +6871,26 @@ async fn run_fanout_step(
                                             error = %first_err,
                                             "unit dispatch failed; retrying on next host"
                                         );
+                                        // Announce the fallback host's mirror path
+                                        // on the live stream. Both frontends
+                                        // overwrite the unit's live entry on
+                                        // `UnitStarted`, so this second event for
+                                        // the same (step_id, idx) simply replaces
+                                        // the primary host's now-stale path.
+                                        if let Some(sink) = event_sink.as_ref() {
+                                            sink.emit(
+                                                &workflow_run_id,
+                                                &crate::executor::Event::UnitStarted {
+                                                    run_id: workflow_run_id.clone(),
+                                                    step_id: step_id.clone(),
+                                                    index: idx,
+                                                    unit_key: unit_key.clone(),
+                                                    agent: Some(unit_agent.clone()),
+                                                    transcript_path: transcript_path.clone(),
+                                                    host: placement_host.clone(),
+                                                },
+                                            );
+                                        }
                                         match dispatcher.dispatch_unit(retry_unit, retry_host).await
                                         {
                                             Ok(outcome) => {
@@ -7845,6 +7920,7 @@ impl PanelPass {
             iterations,
             resolved,
             loop_iteration: None,
+            host: None,
         }
     }
 }
@@ -8550,6 +8626,273 @@ steps:
             result.step_results[1].rendered_prompt,
             "summarize out-0-on-worker-1"
         );
+    }
+
+    /// A dispatcher that knows where a unit's transcript will be mirrored
+    /// BEFORE dispatch — the fleet dispatcher's contract after this arc.
+    /// `fail_first_host`, when set, fails every dispatch attempt routed to
+    /// that host (mirrors `FakeUnitDispatcher::with_failing_host`) so a
+    /// retry-to-fallback path can be exercised alongside path recording.
+    struct PathDispatcher {
+        seen_run_ids: Mutex<Vec<String>>,
+        fail_first_host: Option<String>,
+    }
+
+    impl PathDispatcher {
+        fn new() -> Self {
+            Self {
+                seen_run_ids: Mutex::new(Vec::new()),
+                fail_first_host: None,
+            }
+        }
+
+        fn with_failing_host(host: impl Into<String>) -> Self {
+            Self {
+                seen_run_ids: Mutex::new(Vec::new()),
+                fail_first_host: Some(host.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl UnitDispatcher for PathDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            self.seen_run_ids.lock().unwrap().push(unit.run_id.clone());
+            if self.fail_first_host.as_deref() == Some(host) {
+                return Err(RunError::Provider("host down".into()));
+            }
+            Ok(UnitOutcome {
+                output: format!("out-{}-on-{host}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            })
+        }
+        fn unit_transcript_path(&self, host: &str, unit_run_id: &str) -> Option<PathBuf> {
+            Some(PathBuf::from(format!("/mirror/{host}/{unit_run_id}.jsonl")))
+        }
+    }
+
+    /// Records every transcript path announced on the live stream, plus
+    /// (index, host, transcript_path) for every `UnitStarted` — a unit
+    /// retried onto a fallback host announces `UnitStarted` TWICE for the
+    /// same index, so `started_detail` lets a test see both attempts.
+    struct PathSink {
+        working: Mutex<Vec<PathBuf>>,
+        started: Mutex<Vec<PathBuf>>,
+        started_detail: Mutex<Vec<(usize, Option<String>, PathBuf)>>,
+    }
+
+    impl PathSink {
+        fn new() -> Self {
+            Self {
+                working: Mutex::new(Vec::new()),
+                started: Mutex::new(Vec::new()),
+                started_detail: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::executor::EventSink for PathSink {
+        fn emit(&self, _run_id: &str, ev: &crate::executor::Event) {
+            match ev {
+                crate::executor::Event::StepWorking {
+                    transcript_path: Some(p),
+                    ..
+                } => self.working.lock().unwrap().push(p.clone()),
+                crate::executor::Event::UnitStarted {
+                    index,
+                    transcript_path,
+                    host,
+                    ..
+                } => {
+                    self.started.lock().unwrap().push(transcript_path.clone());
+                    self.started_detail.lock().unwrap().push((
+                        *index,
+                        host.clone(),
+                        transcript_path.clone(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The runner must record and announce the dispatcher's path, not a
+    /// coordinator-local one that is never written.
+    #[tokio::test]
+    async fn placed_step_records_the_dispatcher_transcript_path_and_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(PathDispatcher::new());
+        let sink = Arc::new(PathSink::new());
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+        opts.inputs.insert("what".into(), "rupu".into());
+        opts.event_sink = Some(sink.clone());
+
+        let result = run_workflow(opts).await.expect("run ok");
+
+        let sr = &result.step_results[0];
+        assert_eq!(sr.step_id, "build");
+        assert_eq!(sr.host.as_deref(), Some("worker-1"));
+        assert!(
+            sr.transcript_path
+                .to_string_lossy()
+                .starts_with("/mirror/worker-1/run_"),
+            "{:?}",
+            sr.transcript_path
+        );
+        assert_eq!(
+            sr.transcript_path,
+            PathBuf::from(format!("/mirror/worker-1/{}.jsonl", sr.run_id)),
+            "the path is keyed by the SAME run id the unit was dispatched under"
+        );
+        assert_eq!(
+            dispatcher.seen_run_ids.lock().unwrap().as_slice(),
+            std::slice::from_ref(&sr.run_id)
+        );
+        assert_eq!(
+            sink.working.lock().unwrap().as_slice(),
+            std::slice::from_ref(&sr.transcript_path)
+        );
+    }
+
+    /// Each placed step records ITS OWN host and a path keyed by that host
+    /// (both steps placed so the section's `PanicFactory` is never hit).
+    #[tokio::test]
+    async fn each_placed_step_records_its_own_host_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(PathDispatcher::new());
+        let yaml = "name: two-hosts\nsteps:\n  - id: build\n    agent: builder\n    prompt: \"build it\"\n    host: worker-1\n  - id: report\n    agent: reporter\n    prompt: \"x\"\n    host: worker-2\n";
+        let wf = Workflow::parse(yaml).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        let result = run_workflow(opts).await.expect("run ok");
+        assert_eq!(result.step_results[0].host.as_deref(), Some("worker-1"));
+        assert_eq!(result.step_results[1].host.as_deref(), Some("worker-2"));
+        assert!(result.step_results[1]
+            .transcript_path
+            .to_string_lossy()
+            .starts_with("/mirror/worker-2/run_"));
+    }
+
+    #[tokio::test]
+    async fn distributed_units_record_the_dispatcher_transcript_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(PathDispatcher::new());
+        let sink = Arc::new(PathSink::new());
+        let wf = Workflow::parse(WF_DISTRIBUTED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+        opts.event_sink = Some(sink.clone());
+
+        let result = run_workflow(opts).await.expect("run ok");
+
+        let step = &result.step_results[0];
+        assert_eq!(step.items.len(), 4);
+        for (i, item) in step.items.iter().enumerate() {
+            let host = if i % 2 == 0 { "h1" } else { "h2" };
+            assert_eq!(
+                item.transcript_path,
+                PathBuf::from(format!("/mirror/{host}/{}.jsonl", item.run_id)),
+                "unit {i}"
+            );
+        }
+        let mut started = sink.started.lock().unwrap().clone();
+        started.sort();
+        let mut want: Vec<PathBuf> = step
+            .items
+            .iter()
+            .map(|i| i.transcript_path.clone())
+            .collect();
+        want.sort();
+        assert_eq!(
+            started, want,
+            "UnitStarted announced the mirror path for every unit"
+        );
+    }
+
+    /// A unit whose primary host always fails must retry onto the fallback
+    /// host with a FRESH run id — not the primary's id — because Task 9's
+    /// SSH connector creates a mirror record keyed by `UnitDispatch.run_id`
+    /// on launch; reusing the primary's id on the fallback host would
+    /// collide with that record (`RunStore::create`'s `AlreadyExists`). The
+    /// final `ItemResult` and every `UnitStarted` announcement must reflect
+    /// whichever host actually ran the unit, not the one it was originally
+    /// placed on.
+    #[tokio::test]
+    async fn distributed_unit_retried_on_fallback_records_the_fallback_path_and_fresh_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(PathDispatcher::with_failing_host("h1"));
+        let sink = Arc::new(PathSink::new());
+        let wf = Workflow::parse(WF_DISTRIBUTED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+        opts.event_sink = Some(sink.clone());
+
+        let result = run_workflow(opts)
+            .await
+            .expect("run ok — h1 units retry onto h2 and succeed there");
+
+        let step = &result.step_results[0];
+        assert_eq!(step.items.len(), 4);
+
+        for (i, item) in step.items.iter().enumerate() {
+            let detail: Vec<(usize, Option<String>, PathBuf)> = sink
+                .started_detail
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(idx, _, _)| *idx == i)
+                .cloned()
+                .collect();
+
+            // Every item — retried or not — ends up on h2, since h1 never
+            // succeeds and h2 is both the retry target for even indices and
+            // the primary (working) placement for odd ones.
+            assert_eq!(
+                item.transcript_path,
+                PathBuf::from(format!("/mirror/h2/{}.jsonl", item.run_id)),
+                "unit {i} must record wherever it ACTUALLY ran, not where it was placed"
+            );
+
+            if i % 2 == 0 {
+                // Primary placement was h1 (always fails) → retried onto h2.
+                assert_eq!(
+                    detail.len(),
+                    2,
+                    "unit {i} must announce UnitStarted once per attempt; got {detail:?}"
+                );
+                assert_eq!(
+                    detail[0].1.as_deref(),
+                    Some("h1"),
+                    "unit {i}'s first UnitStarted names the primary host"
+                );
+                assert_eq!(
+                    detail[1].1.as_deref(),
+                    Some("h2"),
+                    "unit {i}'s second UnitStarted names the fallback host"
+                );
+                assert_eq!(
+                    detail[1].2, item.transcript_path,
+                    "unit {i}'s second UnitStarted carries the path the item ends up with"
+                );
+                assert_ne!(
+                    detail[0].2, detail[1].2,
+                    "unit {i}'s two attempts must carry DIFFERENT run ids (different mirror paths)"
+                );
+            } else {
+                // Primary placement was h2 (never fails) → a single attempt.
+                assert_eq!(
+                    detail.len(),
+                    1,
+                    "unit {i} (primary h2) must announce UnitStarted exactly once; got {detail:?}"
+                );
+                assert_eq!(detail[0].1.as_deref(), Some("h2"));
+                assert_eq!(detail[0].2, item.transcript_path);
+            }
+        }
     }
 
     #[tokio::test]

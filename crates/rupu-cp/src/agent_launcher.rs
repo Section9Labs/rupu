@@ -8,6 +8,14 @@ pub struct AgentLaunchRequest {
     /// Working directory for the run (project/dir target). When `None` the
     /// run executes in the cp-serve process's cwd.
     pub working_dir: Option<String>,
+    /// Run id to execute under, when the caller already minted one (a
+    /// placed unit's coordinator, see `UnitDispatch::run_id`). This arc, SSH
+    /// is the ONLY connector that honours it — it passes the id through as
+    /// `rupu run --run-id <id>`. Every other connector (local, HTTP, tunnel,
+    /// bucket) ignores it and mints its own, which is what
+    /// `HostConnector::honours_supplied_run_id` reports. `None` → the
+    /// connector mints.
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

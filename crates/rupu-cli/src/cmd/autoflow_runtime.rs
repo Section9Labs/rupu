@@ -1522,6 +1522,7 @@ mod tests {
                     resolved: true,
                     finished_at: Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();

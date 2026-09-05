@@ -4,7 +4,10 @@
 
 #![deny(clippy::all)]
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use rupu_agent::RunError;
@@ -204,25 +207,32 @@ impl Resolver {
 
 /// Dispatches remote fan-out units through the [`HostRegistry`].
 ///
-/// Production path: `new(registry)` — resolves the connector from the registry
-/// on every `dispatch_unit` call.
-/// Test/seam path: `from_connector(conn)` — bypasses registry resolution.
+/// Production path: `new(registry, global)` — resolves the connector from the
+/// registry on every `dispatch_unit` call.
+/// Test/seam path: `from_connector(conn, global)` — bypasses registry
+/// resolution.
 pub struct FleetUnitDispatcher {
     resolver: Resolver,
+    /// The CP global dir: `NodeMirror` mirrors a placed unit's transcript to
+    /// `<global>/transcripts/<run_id>.jsonl` (PR #646), which is what
+    /// `unit_transcript_path` hands the runner.
+    global: PathBuf,
 }
 
 impl FleetUnitDispatcher {
     /// Production constructor: resolves the connector via `registry` per call.
-    pub fn new(registry: Arc<HostRegistry>) -> Self {
+    pub fn new(registry: Arc<HostRegistry>, global: PathBuf) -> Self {
         Self {
             resolver: Resolver::Registry(registry),
+            global,
         }
     }
 
     /// Seam constructor for tests: always uses `conn`, skipping registry lookup.
-    pub fn from_connector(conn: Arc<dyn HostConnector>) -> Self {
+    pub fn from_connector(conn: Arc<dyn HostConnector>, global: PathBuf) -> Self {
         Self {
             resolver: Resolver::Fixed(conn),
+            global,
         }
     }
 }
@@ -259,6 +269,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
 
     async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
         let conn = self.resolver.resolve(host)?;
+        let unit_run_id = unit.run_id.clone();
 
         // When the unit runs in `Sync` mode, stage the step's ALREADY-PACKED
         // workspace on the host BEFORE launching, so the agent runs against
@@ -285,6 +296,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 mode: None,
                 target: None,
                 working_dir: working_dir.clone(),
+                run_id: Some(unit_run_id.clone()),
             })
             .await
         {
@@ -558,6 +570,23 @@ impl UnitDispatcher for FleetUnitDispatcher {
             Err(e) => Err(WorkspaceConflict(vec![e.to_string()])),
         }
     }
+
+    /// The path is only truthful when the host will actually EXECUTE the unit
+    /// under `unit_run_id` — otherwise the mirror lands at the id the
+    /// connector minted for itself and this path names a file that never
+    /// exists. `serves_runs_from_local_mirror` is the wrong question: it is
+    /// also true for the tunnel and bucket transports, and neither honours
+    /// `AgentLaunchRequest.run_id`.
+    fn unit_transcript_path(&self, host: &str, unit_run_id: &str) -> Option<PathBuf> {
+        let conn = self.resolver.resolve(host).ok()?;
+        if !conn.honours_supplied_run_id() {
+            return None;
+        }
+        Some(rupu_cp::host::transcript_paths::agent_mirror_path(
+            &self.global,
+            unit_run_id,
+        ))
+    }
 }
 
 // ── Registry builder ──────────────────────────────────────────────────────────
@@ -603,7 +632,10 @@ pub fn build_dispatcher_if_needed(
         pricing,
     );
 
-    Some(Arc::new(FleetUnitDispatcher::new(Arc::new(registry))))
+    Some(Arc::new(FleetUnitDispatcher::new(
+        Arc::new(registry),
+        global.to_path_buf(),
+    )))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -648,6 +680,9 @@ mod tests {
         /// trait default, a transport with no probe) is exercised
         /// explicitly by its own test.
         start_evidence: RunStartEvidence,
+        /// The `run_id` the most recent `launch_agent` call received, so
+        /// tests can assert the dispatcher forwarded the unit's minted id.
+        launched_run_id: std::sync::Mutex<Option<String>>,
     }
 
     impl FakeConnector {
@@ -666,6 +701,7 @@ mod tests {
                 calls: Default::default(),
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
                 start_evidence: RunStartEvidence::NoTrace,
+                launched_run_id: Default::default(),
             }
         }
 
@@ -699,6 +735,7 @@ mod tests {
                 calls: Default::default(),
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
                 start_evidence: RunStartEvidence::NoTrace,
+                launched_run_id: Default::default(),
             }
         }
 
@@ -731,8 +768,9 @@ mod tests {
         }
         async fn launch_agent(
             &self,
-            _req: AgentLaunchRequest,
+            req: AgentLaunchRequest,
         ) -> Result<String, HostConnectorError> {
+            *self.launched_run_id.lock().unwrap() = req.run_id.clone();
             Ok(self.run_id.to_string())
         }
         async fn start_session(
@@ -796,6 +834,19 @@ mod tests {
         async fn run_start_evidence(&self, _run_id: &str) -> RunStartEvidence {
             self.calls.lock().unwrap().push("run_start_evidence");
             self.start_evidence
+        }
+        fn serves_runs_from_local_mirror(&self) -> bool {
+            // Models the SSH connector: its runs are mirrored into the CP
+            // global dir, so the dispatcher can hand the runner a transcript
+            // path before the run even exists on disk.
+            true
+        }
+        fn honours_supplied_run_id(&self) -> bool {
+            // …and, also like SSH, it launches under the run id the caller
+            // supplied (asserted by
+            // `dispatch_unit_launches_under_the_coordinator_minted_run_id`),
+            // which is what makes that announced path truthful.
+            true
         }
         // `pause_run`/`resume_run` are intentionally NOT overridden on any
         // fake `HostConnector` in this module — the real fleet dispatch path
@@ -947,7 +998,7 @@ mod tests {
         // Enough polls to fail the old code (which aborted on the very first
         // error) without making the test itself slow.
         let conn = Arc::new(FakeConnector::completed_after_startup_delay(5));
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(
             out.success,
@@ -959,7 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_dispatch_reads_final_output_from_mirror() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert_eq!(out.output, "fake-out");
         assert!(out.success);
@@ -975,7 +1026,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_joins_mirror_after_terminal_and_before_returning() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(out.success);
 
@@ -1000,7 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_dispatch_failed_run_surfaces_error_message() {
         let conn = Arc::new(FakeConnector::failed());
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(!out.success);
         let err = out.error.expect("failed run must have an error field");
@@ -1031,7 +1085,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_dispatch_unreachable_host_errors() {
         let conn = Arc::new(UnreachableConnector);
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let result = d.dispatch_unit(make_unit(), "h1").await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -1262,7 +1316,10 @@ steps:
     #[tokio::test]
     async fn units_share_one_pack_but_never_a_staged_directory() {
         let conn = Arc::new(StagingRecorder::new());
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         // ONE pack for the whole step — exactly what `run_fanout_step` does.
         let ws = tempfile::tempdir().unwrap();
@@ -1329,7 +1386,10 @@ steps:
     #[tokio::test]
     async fn workspace_none_unit_launches_with_no_working_dir() {
         let conn = Arc::new(StagingRecorder::new());
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(out.success);
@@ -1359,7 +1419,7 @@ steps:
     async fn workspace_sync_on_unsupported_transport_errors() {
         // UnreachableConnector inherits the default stage_workspace = Unsupported.
         let conn = Arc::new(UnreachableConnector);
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let mut unit = make_unit();
         // Use a real dir so `pack` succeeds and `stage_workspace` (the default
         // Unsupported impl) is the genuine failure point.
@@ -1383,7 +1443,7 @@ steps:
     #[tokio::test]
     async fn apply_bridges_to_workspace_codec() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let ws = tempfile::tempdir().unwrap();
         // Build two disjoint tar-mode orchestrator deltas via the same encode
         // path the dispatcher uses (payload = wire-encoded one-file tar delta).
@@ -1408,7 +1468,7 @@ steps:
     #[tokio::test]
     async fn apply_workspace_deltas_conflict_on_overlapping_paths() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let ws = tempfile::tempdir().unwrap();
         // Two deltas that both claim to change "shared.txt".
         let a = rupu_orchestrator::runner::WorkspaceDelta {
@@ -1550,7 +1610,10 @@ steps:
         let conn = Arc::new(StageOkLaunchFailsConnector::new(
             "/cache/workspace-sync/leak-1/work",
         ));
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         let mut unit = make_unit();
         let ws = tempfile::tempdir().unwrap();
@@ -1687,7 +1750,7 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn placed_run_outliving_the_old_poll_budget_still_completes() {
         let conn = Arc::new(FakeConnector::completed_after_non_terminal_polls(400));
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(
             out.success,
@@ -1701,7 +1764,10 @@ steps:
         let conn = Arc::new(StageOkPollNeverTerminalConnector::new(
             "/cache/workspace-sync/leak-2/work",
         ));
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         let mut unit = make_unit();
         let ws = tempfile::tempdir().unwrap();
@@ -1731,7 +1797,10 @@ steps:
         let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
         fake.launch_stderr = Some("Error: agent `a` not found under ~/.rupu/agents");
         let conn = Arc::new(fake);
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         let err = d
             .dispatch_unit(make_unit(), "h1")
@@ -1779,7 +1848,10 @@ steps:
         let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
         fake.launch_stderr = Some("[error] save worker record: io rename ...: No such file");
         let conn = Arc::new(fake);
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         let t0 = tokio::time::Instant::now();
         let err = d
@@ -1834,7 +1906,7 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn run_observed_after_a_realistic_startup_delay_still_completes() {
         let conn = Arc::new(FakeConnector::completed_after_startup_delay(66));
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
 
         let t0 = tokio::time::Instant::now();
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
@@ -1865,7 +1937,7 @@ steps:
         let mut fake = FakeConnector::completed_after_startup_delay(5);
         fake.non_terminal_polls = std::sync::atomic::AtomicU32::new(400);
         let conn = Arc::new(fake);
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
 
         let t0 = tokio::time::Instant::now();
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
@@ -1913,7 +1985,10 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn alive_run_that_get_run_cannot_see_is_not_abandoned_at_the_startup_deadline() {
         let conn = Arc::new(FakeConnector::alive_but_unobservable_for(300));
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         let t0 = tokio::time::Instant::now();
         let out = d
@@ -1947,7 +2022,7 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn transport_with_no_start_probe_still_fails_at_the_startup_deadline() {
         let conn = Arc::new(FakeConnector::with_unknown_evidence(u32::MAX));
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
 
         let t0 = tokio::time::Instant::now();
         let err = d
@@ -1983,7 +2058,7 @@ steps:
         let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
         fake.launch_stderr = Some("[error] save worker record: io rename ...: No such file");
         let conn = Arc::new(fake);
-        let d = FleetUnitDispatcher::from_connector(conn);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
 
         let err = d
             .dispatch_unit(make_unit(), "h1")
@@ -2003,7 +2078,10 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn a_promptly_registered_run_is_never_probed() {
         let conn = Arc::new(FakeConnector::completed_after_startup_delay(5));
-        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
 
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(out.success);
@@ -2013,5 +2091,44 @@ steps:
             "a run that registers inside the first probe interval must not \
              cost an extra round trip: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_the_units_run_id_to_launch_agent() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
+        let mut unit = make_unit();
+        unit.run_id = "run_01UNITID".into();
+        d.dispatch_unit(unit, "h1").await.unwrap();
+        assert_eq!(
+            conn.launched_run_id.lock().unwrap().as_deref(),
+            Some("run_01UNITID")
+        );
+    }
+
+    #[test]
+    fn unit_transcript_path_is_the_mirror_layout_for_hosts_that_honour_the_run_id() {
+        let conn = Arc::new(FakeConnector::completed()); // honours_supplied_run_id → true
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        assert_eq!(
+            d.unit_transcript_path("h1", "run_01X"),
+            Some(PathBuf::from("/g/transcripts/run_01X.jsonl"))
+        );
+    }
+
+    #[test]
+    fn unit_transcript_path_is_unknown_for_hosts_that_mint_their_own_run_id() {
+        // `UnreachableConnector` is a unit struct that keeps the trait's
+        // `honours_supplied_run_id` default (false) — the same answer the
+        // tunnel and bucket connectors give, both of which mint their own id
+        // in `launch_agent` even though they ARE mirror-backed. Gating on
+        // `serves_runs_from_local_mirror` would announce a path for them that
+        // no file ever occupies.
+        let conn = Arc::new(UnreachableConnector);
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        assert_eq!(d.unit_transcript_path("h1", "run_01X"), None);
     }
 }

@@ -3108,6 +3108,7 @@ mod tests {
                     resolved: true,
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
+                    host: None,
                 },
             )
             .unwrap();

@@ -160,6 +160,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
                 resolved: true,
                 finished_at: chrono::Utc::now(),
                 loop_iteration: None,
+                host: None,
             },
         )
         .unwrap();
@@ -286,6 +287,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 resolved: true,
                 finished_at: chrono::Utc::now(),
                 loop_iteration: None,
+                host: None,
             },
         )
         .unwrap();
@@ -634,6 +636,7 @@ fn seed_run_with_usage(
                 resolved: true,
                 finished_at: chrono::Utc::now(),
                 loop_iteration: None,
+                host: None,
             },
         )
         .unwrap();

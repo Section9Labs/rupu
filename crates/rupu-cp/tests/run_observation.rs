@@ -531,6 +531,54 @@ async fn get_transcript_proxies_to_remote_host() {
     );
 }
 
+/// The same proxy behaviour holds when the caller also sends `&run=<id>`
+/// (Tasks 10/11's web/macOS clients send `run` on every remote transcript
+/// read, unconditionally). An `HttpHostConnector` doesn't implement the lazy
+/// cache (`pull_transcript`'s trait default is `Unsupported`), so the handler
+/// must fall back to the connector's own `get_transcript` proxy rather than
+/// 400ing — this is the regression the pre-review fix closed.
+#[tokio::test]
+async fn get_transcript_proxies_to_remote_host_with_run_param() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let transcript_body = serde_json::json!({
+        "events": [{"type": "assistant_message", "content": "hello"}],
+        "summary": null
+    });
+
+    let mock_server = httpmock::MockServer::start_async().await;
+    let _m = mock_server.mock(|when, then| {
+        when.method("GET")
+            .path("/api/transcript")
+            .query_param("path", "/remote/run.jsonl");
+        then.status(200).json_body(transcript_body.clone());
+    });
+
+    let (addr, host_id) =
+        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/transcript?path=/remote/run.jsonl&host={host_id}&run=run_FAKE"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an Unsupported pull_transcript must fall back to the connector's own \
+         get_transcript proxy, not 400"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["events"].is_array(),
+        "proxied transcript response should have events array"
+    );
+}
+
 /// `GET /api/transcript?path=<p>&host=<unknown>` → 404.
 #[tokio::test]
 async fn get_transcript_unknown_host_returns_404() {
@@ -563,6 +611,110 @@ async fn get_transcript_local_no_host_param_unchanged() {
         resp.status(),
         StatusCode::BAD_REQUEST,
         "local path outside allowed roots should be 400"
+    );
+}
+
+// ── GET /api/transcript/stream?host= ──────────────────────────────────────────
+
+/// A remote host whose connector doesn't implement the lazy cache (the trait
+/// default `Unsupported` — every `HttpHostConnector` today) falls back to
+/// the SAME local-only validate+tail `stream_transcript` has always run for
+/// `?host=local`: a genuinely remote-only path is never found under the
+/// local allowed roots, so this is a 400, exactly today's behaviour. This
+/// pins the `Unsupported` fallback added by the pre-review fix — before that
+/// fix, `?host=` was ignored entirely by `stream_transcript` (a different,
+/// also-400 outcome, but for the wrong reason: no host-aware branch ran at
+/// all).
+#[tokio::test]
+async fn stream_transcript_with_remote_host_falls_back_to_local_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock_server = httpmock::MockServer::start_async().await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/transcript/stream?path=/remote/only/.rupu/transcripts/run_01X.jsonl&host={host_id}&run=run_01R"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an Unsupported ensure_transcript_feed must fall back to local-only \
+         validation, which 400s a genuinely remote-only path — not error out \
+         some other way"
+    );
+
+    // NOTE: `stream_transcript_with_remote_host_requires_run_for_an_unmirrored_path`
+    // is not reachable for an HTTP host and is intentionally not written:
+    // `ensure_transcript_feed` short-circuits to `Unsupported` (checked above)
+    // before `run`'s presence/absence is ever examined for that arm — the
+    // `run`-required 400 only fires for a connector (SSH) that actually
+    // implements the lazy cache.
+}
+
+/// A remote-host request for a path that's already the PR #646 local
+/// agent-run mirror serves it directly, live — no `run` needed, and no
+/// connector call at all, even though `?host=` names a remote.
+#[tokio::test]
+async fn stream_transcript_with_remote_host_serves_a_local_mirror_file() {
+    use futures_util::TryStreamExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tpath = tmp.path().join("transcripts").join("run_01M.jsonl");
+    std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
+    std::fs::write(&tpath, "{\"type\":\"turn_start\",\"data\":{\"turn_idx\":0}}\n").unwrap();
+    let canon = std::fs::canonicalize(&tpath).unwrap();
+
+    let mock_server = httpmock::MockServer::start_async().await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/transcript/stream?path={}&host={host_id}",
+            canon.to_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("text/event-stream"),
+        "must be text/event-stream; got {ct:?}"
+    );
+
+    let stream = resp.bytes_stream().map_err(std::io::Error::other);
+    let async_reader = tokio_util::io::StreamReader::new(stream);
+    let mut lines = tokio::io::BufReader::new(async_reader).lines();
+
+    let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if v["type"] == "turn_start" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for the first SSE data: line");
+
+    assert!(
+        found,
+        "a remote-host stream request for an already-local mirror file must \
+         serve that file's event, not error or hang"
     );
 }
 

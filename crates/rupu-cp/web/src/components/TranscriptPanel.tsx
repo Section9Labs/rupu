@@ -62,13 +62,25 @@ export default function TranscriptPanel({
   // same event list but don't affect this count — the badge covers the
   // snapshot only; torn tails are excluded server-side.
   const [unparsed, setUnparsed] = useState<number | undefined>(undefined);
+  // The coordinator could not collect the rest of this transcript from its
+  // host (spec §4.2). Snapshot-only, like `unparsed` — live-tail SSE events
+  // don't affect it.
+  const [partial, setPartial] = useState(false);
   const navigate = useNavigate();
 
   // Open a sub-run transcript in the same transcript route (reuses the existing
   // `/transcript?path=…` page — no new global state). Sub-runs are completed
   // recordings, so `live=0`.
+  //
+  // `host` and `run` travel with it: a sub-run of a REMOTE run is itself a
+  // remote path, and the backend needs both to resolve it (`run` is what
+  // authorizes a not-yet-mirrored path against the run that claims it).
+  // Dropping them here is what made remote sub-run links 400.
   function openTranscript(p: string) {
-    navigate(`/transcript?path=${encodeURIComponent(p)}&live=0`);
+    let url = `/transcript?path=${encodeURIComponent(p)}&live=0`;
+    if (host !== undefined) url += `&host=${encodeURIComponent(host)}`;
+    if (runId !== undefined) url += `&run=${encodeURIComponent(runId)}`;
+    navigate(url);
   }
 
   // Fetch on mount + whenever `path` changes; reset state on path change.
@@ -78,13 +90,15 @@ export default function TranscriptPanel({
     setEvents([]);
     setConnected(false);
     setUnparsed(undefined);
+    setPartial(false);
 
     api
-      .getTranscript(path, { host })
+      .getTranscript(path, { host, run: runId })
       .then((res) => {
         if (cancelled) return;
         setEvents(res.events);
         setUnparsed(res.unparsed);
+        setPartial(res.partial === true);
         setState('ready');
       })
       .catch((err: unknown) => {
@@ -96,7 +110,7 @@ export default function TranscriptPanel({
     return () => {
       cancelled = true;
     };
-  }, [path, host]);
+  }, [path, host, runId]);
 
   // Live tail: append new events; close on unmount / path change. Kept in a ref
   // so the cleanup always closes the EventSource we actually opened.
@@ -126,14 +140,14 @@ export default function TranscriptPanel({
         }
       },
       () => setConnected(false),
-      { host },
+      { host, run: runId },
     );
     unsubRef.current = unsub;
     return () => {
       unsub();
       unsubRef.current = null;
     };
-  }, [path, live, host]);
+  }, [path, live, host, runId]);
 
   const view = buildTranscriptView(events);
 
@@ -165,12 +179,18 @@ export default function TranscriptPanel({
 
   return (
     <div className="flex flex-col rounded-xl border border-border bg-bg p-3 text-note">
-      {/* Header: agent · provider · model · live · status / tokens */}
-      {!embedded && view.header && (
+      {/* Header: agent · provider · model · live · status / tokens. Renders
+          even without a `run_start` header (headerless snapshots) when the
+          unparsed/partial data-quality badges have something to show. */}
+      {!embedded && (view.header || (typeof unparsed === 'number' && unparsed > 0) || partial) && (
         <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-border pb-1.5 text-note text-ink-dim">
-          <b className="text-ink">{view.header.agent || 'agent'}</b>
-          {view.header.provider && <span>· {view.header.provider}</span>}
-          {view.header.model && <span>· {view.header.model}</span>}
+          {view.header && (
+            <>
+              <b className="text-ink">{view.header.agent || 'agent'}</b>
+              {view.header.provider && <span>· {view.header.provider}</span>}
+              {view.header.model && <span>· {view.header.model}</span>}
+            </>
+          )}
           {live && (
             <span
               className={cn(
@@ -190,6 +210,15 @@ export default function TranscriptPanel({
           {typeof unparsed === 'number' && unparsed > 0 && (
             <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ring-1 ring-inset bg-warn-bg text-warn ring-warn/30">
               {unparsed} unparsed {unparsed === 1 ? 'line' : 'lines'}
+            </span>
+          )}
+          {partial && (
+            <span
+              className="inline-flex items-center gap-1 rounded-md border border-warn/30 bg-warn-bg px-1.5 py-0.5 text-[11px] text-warn"
+              title="The coordinator could not reach the host to collect the rest of this transcript"
+            >
+              <AlertTriangle className="h-3 w-3" />
+              incomplete
             </span>
           )}
           {view.footer?.totalTokens != null && (

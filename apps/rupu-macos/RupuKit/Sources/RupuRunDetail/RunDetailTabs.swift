@@ -137,7 +137,7 @@ struct TranscriptTabContent: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             liveIndicator
-            TranscriptFeed(events: store.transcript, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, unparsedCount: store.transcriptUnparsedCount)
+            TranscriptFeed(events: store.transcript, runID: runID, host: host, sourcePreviewStore: sourcePreviewStore, unparsedCount: store.transcriptUnparsedCount, partial: store.transcriptPartial)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(12)
@@ -146,11 +146,7 @@ struct TranscriptTabContent: View {
 
     @ViewBuilder
     private var liveIndicator: some View {
-        if store.isRemote {
-            Text("Remote streaming lands with Fleet (Phase 5)")
-                .font(.metaText)
-                .foregroundStyle(Color.rupuMute)
-        } else if store.transcriptTailActive {
+        if store.transcriptTailActive {
             HStack(spacing: 6) {
                 Circle().fill(Color.status(.running)).frame(width: 6, height: 6)
                 Text("Live")
@@ -164,36 +160,29 @@ struct TranscriptTabContent: View {
 // MARK: - Events tab
 
 /// Raw `CPEvent` feed, filtered to the selected step (or unfiltered when
-/// nothing is selected) via `store.eventsForSelection()`. Remote runs never
-/// open a run stream at all (`isRemote`, see `RunDetailStore`'s type doc
-/// comment) — same "Fleet (Phase 5)" note the Transcript tab already shows,
-/// rather than a permanently-empty feed with no explanation.
+/// nothing is selected) via `store.eventsForSelection()`. Populated for a
+/// remote run exactly like a local one — its run stream travels through the
+/// coordinator's lazy SSH mirror (see `RunDetailStore`'s type doc comment's
+/// "Local vs remote" section).
 struct EventsTabContent: View {
     let store: RunDetailStore
 
     var body: some View {
         Group {
-            if store.isRemote {
-                Text("Remote streaming lands with Fleet (Phase 5)")
-                    .font(.metaText)
+            let events = store.eventsForSelection()
+            if events.isEmpty {
+                Text("No events yet")
+                    .font(.noteText)
                     .foregroundStyle(Color.rupuMute)
                     .padding(12)
             } else {
-                let events = store.eventsForSelection()
-                if events.isEmpty {
-                    Text("No events yet")
-                        .font(.noteText)
-                        .foregroundStyle(Color.rupuMute)
-                        .padding(12)
-                } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 6) {
-                            ForEach(Array(events.enumerated()), id: \.offset) { _, event in
-                                eventRow(event)
-                            }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(events.enumerated()), id: \.offset) { _, event in
+                            eventRow(event)
                         }
-                        .padding(12)
                     }
+                    .padding(12)
                 }
             }
         }

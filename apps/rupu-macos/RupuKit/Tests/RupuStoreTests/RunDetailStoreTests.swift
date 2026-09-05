@@ -930,36 +930,58 @@ private func makeStore(
     tailBox.latest.finish()
 }
 
-// MARK: - (f) remote store never opens a stream
+// MARK: - (f) remote store streams and tails like a local one (SSH lazy mirror)
 
-@MainActor @Test func remoteStoreNeverInvokesStreamFactoriesEvenWhenSupplied() async {
-    let invoked = FlagBox()
-    let store = RunDetailStore(
-        runID: "run-1",
-        host: "remote-1",
+@MainActor @Test func remoteStoreStartsTheRunStreamAndTailsItsRunningStep() async {
+    let runBox = RunStreamBox()
+    let tailBox = TailStreamBox()
+    let store = makeStore(
         isRemote: true,
-        fetchDetail: { detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl")) },
-        fetchGraph: { graph(run: runRecord()) },
-        fetchNetflow: { netflow() },
-        fetchFindings: { findings() },
-        fetchTranscript: { _ in APITranscriptPage(events: [], summary: nil) },
-        runSignalsFactory: {
-            invoked.value = true
-            return AsyncStream { _ in }
+        detailResult: {
+            detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl"), steps: [])
         },
-        transcriptTailFactory: { _ in
-            invoked.value = true
-            return AsyncStream { _ in }
-        }
+        runStreamBox: runBox,
+        tailStreamBox: tailBox
     )
 
     await store.activate()
 
-    #expect(invoked.value == false)
-    #expect(store.transcriptTailActive == false)
     #expect(store.isRemote == true)
-    // REST blocks still populate normally for a remote run.
+    #expect(runBox.callCount == 1, "the run event stream is opened for a remote run")
+    #expect(tailBox.callCount == 1, "a running remote step is tailed, not snapshotted")
+    #expect(tailBox.latestPath == "t/build.jsonl")
+    #expect(store.transcriptTailActive == true)
     #expect(store.detail.value != nil)
+
+    // Review fix: a remote run's `events` surface (the Events tab feed) must
+    // populate exactly like a local run's — `RunDetailTabs.EventsTabContent`
+    // no longer special-cases `isRemote` at all, so this is what actually
+    // proves the tab renders real content instead of the old placeholder.
+    let event = CPEvent.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: nil, host: "remote-1")
+    runBox.latest.yield(.event(event))
+    let settled = await pollUntil { !store.eventsForSelection().isEmpty }
+    #expect(settled, "expected a remote run's event stream to populate eventsForSelection()")
+    #expect(store.eventsForSelection().contains(event))
+
+    store.deactivate()
+    tailBox.latest.finish()
+    runBox.latest.finish()
+}
+
+@MainActor @Test func focusPathSurfacesThePartialFlagFromTheSnapshot() async {
+    // No tail box → REST snapshot path.
+    let store = makeStore(
+        isRemote: true,
+        detailResult: {
+            detail(run: runRecord(activeStepID: "build", activeStepTranscriptPath: "t/build.jsonl"), steps: [])
+        },
+        transcriptResult: { _ in APITranscriptPage(events: [], summary: nil, unparsed: nil, partial: true) }
+    )
+
+    await store.activate()
+
+    #expect(store.focusedTranscriptPath == "t/build.jsonl")
+    #expect(store.transcriptPartial == true)
 
     store.deactivate()
 }

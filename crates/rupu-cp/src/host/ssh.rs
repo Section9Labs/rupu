@@ -5,7 +5,7 @@
 //! shell-escaped before being joined into the remote command, because `ssh`
 //! re-parses remote args through the remote login shell.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -18,9 +18,9 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_stream_run_events, read_transcript_file, EventByteStream, HostCapabilities,
-        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, RunStartEvidence,
-        MAX_WORKSPACE_BYTES,
+        mirror_stream_run_events, read_transcript_file, EventByteStream, FeedGuard,
+        HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
+        RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -271,6 +271,54 @@ pub(crate) fn parse_tail_marker(line: &str) -> Option<&str> {
     } else {
         Some(inner)
     }
+}
+
+/// Sentinel the remote prints instead of a body when the file is absent, so
+/// "no such file" (a complete, empty answer once the run is terminal) is
+/// distinguishable from "ssh never reached the host" (no stdout at all).
+pub(crate) const NO_FILE_SENTINEL: &str = "__RUPU_NO_FILE__";
+
+/// One-shot read of a remote transcript. Single-quoted path; stderr dropped.
+pub(crate) fn single_cat_command(remote: &str) -> String {
+    format!(
+        "cat {} 2>/dev/null || printf '{NO_FILE_SENTINEL}\\n'",
+        shell_escape(remote)
+    )
+}
+
+fn cache_io_err(e: std::io::Error) -> HostConnectorError {
+    HostConnectorError::Invalid(format!("transcript cache io: {e}"))
+}
+
+/// Write `body` to `cache` atomically (tmp + rename), then the `.complete`
+/// sidecar when `complete` (spec §6.1 step 4).
+///
+/// The tmp name carries a fresh ULID. A fixed `{cache}.tmp` is shared by every
+/// concurrent pull of the same path — and pulls are PER REQUEST, so two
+/// viewers opening the same transcript are enough: both `write` the same tmp
+/// (truncating each other), and the spliced result gets renamed in — marked
+/// `.complete`, and so authoritative forever, when the pull was terminal.
+///
+/// The rename also means this must be the file's ONLY writer: a lazy tail
+/// feeding `cache` is retired (`LazyTailRegistry::retire`) before the
+/// authoritative pull calls this, so the sidecar is only ever written over an
+/// atomically-replaced file. See `pump_pull_step_transcripts`.
+pub(crate) fn write_cache_file(
+    cache: &Path,
+    body: &str,
+    complete: bool,
+) -> Result<(), HostConnectorError> {
+    let io = cache_io_err;
+    if let Some(dir) = cache.parent() {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    let tmp = PathBuf::from(format!("{}.{}.tmp", cache.display(), Ulid::new()));
+    std::fs::write(&tmp, body).map_err(io)?;
+    std::fs::rename(&tmp, cache).map_err(io)?;
+    if complete {
+        std::fs::write(crate::host::transcript_paths::complete_marker(cache), b"").map_err(io)?;
+    }
+    Ok(())
 }
 
 // ── Remote-CLI → CP wire-row reshaping ─────────────────────────────────────────
@@ -723,6 +771,126 @@ async fn pump_catch_up_transcript(
     }
 }
 
+/// Spec §6.1 step 3: one ssh invocation that prints the pump's own
+/// `==> <path> <==` header, the file, then a synthetic newline + `==> end <==`
+/// for every path. The synthetic newline guarantees the end marker starts a
+/// fresh line even when the file's last line is torn; `split_batched_cat`
+/// removes it again.
+pub(crate) fn batch_cat_command(paths: &[String]) -> String {
+    let mut cmd = String::from("for p in");
+    for p in paths {
+        cmd.push(' ');
+        cmd.push_str(&shell_escape(p));
+    }
+    cmd.push_str(
+        "; do printf '==> %s <==\\n' \"$p\"; cat \"$p\" 2>/dev/null; printf '\\n==> end <==\\n'; done",
+    );
+    cmd
+}
+
+/// Inverse of [`batch_cat_command`]: `path → body` for every file whose end
+/// marker arrived. A file cut off mid-stream is absent from the map, so the
+/// caller leaves its cache untouched and unmarked (§6.2).
+pub(crate) fn split_batched_cat(stdout: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in stdout.split('\n') {
+        match parse_tail_marker(line) {
+            Some("end") => {
+                if let Some((path, mut lines)) = current.take() {
+                    // Drop the ONE synthetic empty line the command appended.
+                    if lines.last() == Some(&"") {
+                        lines.pop();
+                    }
+                    let mut body = lines.join("\n");
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    out.insert(path, body);
+                }
+            }
+            Some(path) => current = Some((path.to_string(), Vec::new())),
+            None => {
+                if let Some((_, lines)) = current.as_mut() {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Spec §6: pull every step transcript the run's artifacts recorded into the
+/// host's cache, in one ssh round trip, marking each complete. Best-effort:
+/// a failure leaves files unmarked for the on-demand retry (§4.2).
+///
+/// This pull is AUTHORITATIVE and always wins — including over a viewer's live
+/// tail on the same file. Because its result is marked `.complete`, after
+/// which the read path serves the cache verbatim and `subscribe` refuses to
+/// tail it, a wrong byte written here is never repaired. So the feed is
+/// RETIRED first (`LazyTailRegistry::retire`) and this becomes the file's only
+/// writer; the write itself is then the ordinary atomic tmp+rename. Sharing
+/// the file with a live feed instead — whichever way round — lets its
+/// in-flight lines land after the authoritative body, or its first-line
+/// truncate land on top of it.
+///
+/// Retiring does not disconnect the viewers: their `TranscriptTail` reads the
+/// cache by PATH at a byte offset, and after the rename that path holds the
+/// authoritative body — a superset of the replay they already received.
+async fn pump_pull_step_transcripts(
+    exec: &dyn RemoteExec,
+    mirror: &NodeMirror,
+    lazy: &crate::host::lazy_tail::LazyTailRegistry,
+    run_id: &str,
+    host_id: &str,
+) {
+    let global = mirror.global_dir();
+    let agent_mirror = mirror.transcript_mirror_path(run_id);
+    let mut targets: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for recorded in
+        crate::host::transcript_paths::recorded_transcript_paths(mirror.run_store(), run_id)
+    {
+        if recorded == agent_mirror {
+            continue; // handled by pump_catch_up_transcript
+        }
+        let Some(cache) = crate::host::transcript_paths::cache_path(&global, host_id, &recorded)
+        else {
+            continue;
+        };
+        if crate::host::transcript_paths::is_complete(&cache) {
+            continue;
+        }
+        if let Some(remote) = recorded.to_str() {
+            targets.push((remote.to_string(), cache));
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let remotes: Vec<String> = targets.iter().map(|(r, _)| r.clone()).collect();
+    let Ok(out) = exec.run(&batch_cat_command(&remotes)).await else {
+        return;
+    };
+    let files = split_batched_cat(&out.stdout);
+    for (remote, cache) in &targets {
+        if let Some(body) = files.get(remote) {
+            // Sole-writer handoff: stop any feed and wait for it to really
+            // stop before replacing the file. retire is a no-op on an unknown path.
+            lazy.retire(cache).await;
+            if let Err(e) = write_cache_file(cache, body, true) {
+                tracing::warn!(host_id, run_id, cache = %cache.display(), error = %e, "terminal transcript pull: cache write failed");
+            }
+        } else {
+            tracing::warn!(
+                host_id,
+                run_id,
+                remote,
+                "terminal transcript pull did not deliver this file; left for on-demand retry"
+            );
+        }
+    }
+}
+
 /// What one [`pump_finalize_if_terminal`] probe learned about the run.
 ///
 /// The pump needs BOTH bits this carries. `Finalized` is its exit condition;
@@ -749,6 +917,7 @@ enum PumpProbe {
 async fn pump_finalize_if_terminal(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
+    lazy: &crate::host::lazy_tail::LazyTailRegistry,
     run_id: &str,
     host_id: &str,
     cat_cmd: &str,
@@ -768,8 +937,10 @@ async fn pump_finalize_if_terminal(
         return PumpProbe::Absent;
     };
     if !is_terminal_status(status) {
-        // The host HAS a record for this run — it is simply not done. That is
-        // the signal that clears the startup deadline.
+        // The host HAS a record for this run — it is simply not done. Mirror
+        // it (spec §5.2) so the local record carries the live active step,
+        // then clear the startup deadline.
+        let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
         return PumpProbe::Alive;
     }
     let status = status.to_string();
@@ -777,6 +948,7 @@ async fn pump_finalize_if_terminal(
     // Before `finish`, so the synthesized step-result row sees the complete
     // transcript on disk.
     pump_catch_up_transcript(exec, mirror, run_id, host_id, cat_transcript_cmd).await;
+    pump_pull_step_transcripts(exec, mirror, lazy, run_id, host_id).await;
     let _ = mirror.finish(run_id, host_id, &status);
     PumpProbe::Finalized
 }
@@ -848,6 +1020,9 @@ pub(crate) struct SshHostConnector {
     /// by `spawn_tail_pump` and removed by the pump task itself when its
     /// terminal work is done, so an absent entry means "nothing to wait for".
     pumps: Arc<std::sync::Mutex<std::collections::HashMap<String, PumpHandle>>>,
+    /// Shared registry of live `tail -F` feeds into the transcript cache
+    /// (spec §5.1) — see [`ensure_transcript_feed`].
+    lazy: Arc<crate::host::lazy_tail::LazyTailRegistry>,
 }
 
 /// The dispatcher-facing side of one tail pump.
@@ -912,12 +1087,16 @@ impl SshHostConnector {
         mirror: Arc<NodeMirror>,
         run_store: Arc<RunStore>,
     ) -> Self {
+        let lazy = Arc::new(crate::host::lazy_tail::LazyTailRegistry::new(Arc::clone(
+            &exec,
+        )));
         Self {
             host_id: host_id.into(),
             exec,
             mirror,
             run_store,
             pumps: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            lazy,
         }
     }
 
@@ -966,6 +1145,50 @@ impl SshHostConnector {
             a.push("--tmp".into());
         }
         a
+    }
+
+    /// The CP global dir, derived exactly as `NodeMirror::transcript_mirror_path`
+    /// derives it: the run store root is `<global>/runs`.
+    fn global_dir(&self) -> PathBuf {
+        crate::host::transcript_paths::global_dir_of(&self.run_store)
+    }
+
+    /// Spec §3.3: a remote read is scoped to a run. `run_id` must be a run
+    /// this host executed (`worker_id`), and `recorded` must be a path that
+    /// run's own artifacts claim. Returns the cache path the file serves
+    /// from. Never touches the remote.
+    pub(crate) fn authorize_remote_transcript(
+        &self,
+        run_id: &str,
+        recorded: &Path,
+    ) -> Result<PathBuf, HostConnectorError> {
+        let cache =
+            crate::host::transcript_paths::cache_path(&self.global_dir(), &self.host_id, recorded)
+                .ok_or_else(|| {
+                    HostConnectorError::Invalid(format!(
+                        "not a transcript path: {}",
+                        recorded.display()
+                    ))
+                })?;
+        let rec = self
+            .run_store
+            .load(run_id)
+            .map_err(|_| HostConnectorError::NotFound(run_id.to_string()))?;
+        if rec.worker_id.as_deref() != Some(self.host_id.as_str()) {
+            return Err(HostConnectorError::Invalid(format!(
+                "run {run_id} does not belong to host {}",
+                self.host_id
+            )));
+        }
+        let claimed =
+            crate::host::transcript_paths::recorded_transcript_paths(&self.run_store, run_id);
+        if !claimed.iter().any(|p| p == recorded) {
+            return Err(HostConnectorError::Invalid(format!(
+                "run {run_id} did not record transcript {}",
+                recorded.display()
+            )));
+        }
+        Ok(cache)
     }
 
     /// Wrap a shell-escaped remote control command (`rupu workflow resume`)
@@ -1076,6 +1299,10 @@ impl SshHostConnector {
     fn spawn_tail_pump(&self, run_id: String) {
         let exec = Arc::clone(&self.exec);
         let mirror = Arc::clone(&self.mirror);
+        // The pump's terminal pull needs to know which cache files a viewer is
+        // currently tailing, so it can rewrite those in place instead of
+        // renaming a fresh file over the inode the feed holds open.
+        let lazy = Arc::clone(&self.lazy);
         let host_id = self.host_id.clone();
 
         // $HOME must expand on the remote shell — build as raw command strings
@@ -1183,6 +1410,8 @@ impl SshHostConnector {
                                                     // declaration).
                                                     let _ = mirror
                                                         .reset_transcript(&run_id, &host_id);
+                                                    let _ = mirror
+                                                        .note_transcript_started(&run_id, &host_id);
                                                 }
                                                 Some(ArtifactFile::Transcript)
                                             } else {
@@ -1207,7 +1436,7 @@ impl SshHostConnector {
                             }
                             _ = interval.tick() => {
                                 match pump_finalize_if_terminal(
-                                    exec.as_ref(), &mirror, &run_id, &host_id,
+                                    exec.as_ref(), &mirror, &lazy, &run_id, &host_id,
                                     &cat_cmd, &cat_transcript_cmd,
                                 ).await {
                                     PumpProbe::Finalized => {
@@ -1290,7 +1519,7 @@ impl SshHostConnector {
                                 // its own `get_run` poll and is waiting on us:
                                 // probe now rather than at the next interval tick.
                                 match pump_finalize_if_terminal(
-                                    exec.as_ref(), &mirror, &run_id, &host_id,
+                                    exec.as_ref(), &mirror, &lazy, &run_id, &host_id,
                                     &cat_cmd, &cat_transcript_cmd,
                                 ).await {
                                     PumpProbe::Finalized => {
@@ -1311,6 +1540,34 @@ impl SshHostConnector {
                 // drop, spawn failure, etc.), do a best-effort final cat + finish
                 // so the run is never stuck in Running.
                 if !terminal_seen {
+                    // Ordering matches the happy path (`pump_finalize_if_terminal`):
+                    // mirror the final `run.json` FIRST, then catch the transcript
+                    // up, then pull the step transcripts, then finish. Running the
+                    // transcript work first left the mirrored record stale for the
+                    // whole (possibly slow) pull.
+                    //
+                    // Use the observed status only if it is terminal; a
+                    // non-terminal status (e.g. "running") would be wrong to
+                    // persist as final since the executor may still be alive.
+                    // Finish as "failed" in that case — and when the cat fails
+                    // outright — so the run is never stuck in Running.
+                    let finish_status = match exec.run(&cat_cmd).await {
+                        Ok(out) if out.success && !out.stdout.trim().is_empty() => {
+                            let trimmed = out.stdout.trim().to_string();
+                            let _ =
+                                mirror.append(&run_id, &host_id, ArtifactFile::RunJson, &trimmed);
+                            serde_json::from_str::<serde_json::Value>(&trimmed)
+                                .ok()
+                                .and_then(|rec| {
+                                    rec.get("status")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string)
+                                })
+                                .filter(|s| is_terminal_status(s))
+                                .unwrap_or_else(|| "failed".to_string())
+                        }
+                        _ => "failed".to_string(),
+                    };
                     // Same terminal transcript catch-up as the interval arm above:
                     // the stream ended without a clean terminal detection, so any
                     // buffered-but-undelivered transcript lines are gone. Replace
@@ -1324,37 +1581,11 @@ impl SshHostConnector {
                         &cat_transcript_cmd,
                     )
                     .await;
-                    if let Ok(out) = exec.run(&cat_cmd).await {
-                        if out.success && !out.stdout.trim().is_empty() {
-                            let trimmed = out.stdout.trim().to_string();
-                            let _ =
-                                mirror.append(&run_id, &host_id, ArtifactFile::RunJson, &trimmed);
-                            // Use the observed status only if it is terminal; a
-                            // non-terminal status (e.g. "running") would be wrong to
-                            // persist as final since the executor may still be alive.
-                            // Finish as "failed" in that case — it is better to surface
-                            // a definite failure than to leave the run in Running forever.
-                            let finish_status = if let Ok(rec) =
-                                serde_json::from_str::<serde_json::Value>(&trimmed)
-                            {
-                                if let Some(s) = rec.get("status").and_then(|v| v.as_str()) {
-                                    if is_terminal_status(s) {
-                                        s.to_string()
-                                    } else {
-                                        "failed".to_string()
-                                    }
-                                } else {
-                                    "failed".to_string()
-                                }
-                            } else {
-                                "failed".to_string()
-                            };
-                            let _ = mirror.finish(&run_id, &host_id, &finish_status);
-                            return;
-                        }
-                    }
-                    // cat failed entirely — mark failed so the run is not stuck.
-                    let _ = mirror.finish(&run_id, &host_id, "failed");
+                    // The host is still reachable here too — pull every
+                    // recorded step transcript before finishing the run.
+                    pump_pull_step_transcripts(exec.as_ref(), &mirror, &lazy, &run_id, &host_id)
+                        .await;
+                    let _ = mirror.finish(&run_id, &host_id, &finish_status);
                 }
             };
             pump.await;
@@ -1612,7 +1843,25 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
-        let run_id = format!("run_{}", Ulid::new());
+        // A coordinator dispatching a placed unit already minted this run's
+        // id (see `UnitDispatch::run_id`) so it can know the child run's
+        // mirrored transcript path before dispatch — validate it BEFORE
+        // touching `build_remote_command`/`detach_launch` (nothing shells
+        // for a bad id) and before `create_run` (no mirror record left
+        // behind). `None` ⇒ this connector mints one, as before.
+        let run_id = match req.run_id.as_deref() {
+            Some(id) => {
+                let ok = id.starts_with("run_")
+                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ok {
+                    return Err(HostConnectorError::Invalid(format!(
+                        "supplied run id {id:?} is not a valid run id"
+                    )));
+                }
+                id.to_string()
+            }
+            None => format!("run_{}", Ulid::new()),
+        };
 
         let spec = RunSpec {
             kind: RunSpecKind::Agent,
@@ -1998,10 +2247,92 @@ impl HostConnector for SshHostConnector {
         read_transcript_file(path)
     }
 
+    fn local_transcript_path(&self, recorded: &Path) -> PathBuf {
+        crate::host::transcript_paths::cache_path(&self.global_dir(), &self.host_id, recorded)
+            .unwrap_or_else(|| recorded.to_path_buf())
+    }
+
+    async fn pull_transcript(
+        &self,
+        run_id: &str,
+        recorded: &Path,
+        terminal: bool,
+    ) -> Result<(), HostConnectorError> {
+        let cache = self.authorize_remote_transcript(run_id, recorded)?;
+        // A live tail is already filling this cache from byte zero, and holds
+        // an append handle on its inode. Pulling would `rename` a fresh file
+        // over that dentry, stranding the feed on an unlinked inode: the SSE
+        // stream goes permanently quiet, and because `alive()` stays true,
+        // every later subscriber joins the same zombie. The web panel mounts a
+        // GET and a stream for the same path, so this is the common case, not
+        // an edge one. Step aside — the handler serves the file the feed fills.
+        if self.lazy.has_live_feed(&cache) {
+            return Ok(());
+        }
+        let remote = recorded
+            .to_str()
+            .ok_or_else(|| HostConnectorError::Invalid("non-UTF-8 transcript path".into()))?;
+        if remote.contains('\0') {
+            return Err(HostConnectorError::Invalid(
+                "transcript path contains NUL".into(),
+            ));
+        }
+        let out = self
+            .exec
+            .run(&single_cat_command(remote))
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success && out.stdout.is_empty() {
+            return Err(HostConnectorError::Unreachable(format!(
+                "host {} did not answer: {}",
+                self.host_id,
+                out.stderr.trim()
+            )));
+        }
+        let body = if out.stdout.trim_end() == NO_FILE_SENTINEL {
+            String::new()
+        } else {
+            out.stdout
+        };
+        write_cache_file(&cache, &body, terminal)
+    }
+
+    async fn ensure_transcript_feed(
+        &self,
+        run_id: &str,
+        recorded: &Path,
+    ) -> Result<FeedGuard, HostConnectorError> {
+        let cache = self.authorize_remote_transcript(run_id, recorded)?;
+        let remote = recorded
+            .to_str()
+            .ok_or_else(|| HostConnectorError::Invalid("non-UTF-8 transcript path".into()))?;
+        // Same guard `pull_transcript` applies: a NUL truncates the path in
+        // the shell command we are about to build.
+        if remote.contains('\0') {
+            return Err(HostConnectorError::Invalid(
+                "transcript path contains NUL".into(),
+            ));
+        }
+        match self.lazy.subscribe(remote, &cache).await {
+            Ok(Some(handle)) => Ok(FeedGuard::holding(Box::new(handle))),
+            Ok(None) => Ok(FeedGuard::noop()),
+            Err(e) => Err(HostConnectorError::Unreachable(e.to_string())),
+        }
+    }
+
     /// SSH/Tunnel/Bucket runs are created in, and tailed into, the
     /// coordinator's own `RunStore` by `NodeMirror`, so run-scoped detail
     /// endpoints read that mirror instead of the wire.
     fn serves_runs_from_local_mirror(&self) -> bool {
+        true
+    }
+
+    /// SSH's `launch_agent` passes `AgentLaunchRequest.run_id` through to the
+    /// remote as `rupu run --run-id <id>`, so a coordinator-minted id is the
+    /// id the run actually executes under. The tunnel and bucket connectors
+    /// mint their own, which is why this is separate from
+    /// `serves_runs_from_local_mirror`.
+    fn honours_supplied_run_id(&self) -> bool {
         true
     }
 
@@ -2713,6 +3044,9 @@ mod tests {
         /// If set, the transcript `cat` sleeps this long before answering —
         /// a slow remote, so a teardown test can catch the pump mid-`cat`.
         cat_transcript_delay: Option<std::time::Duration>,
+        /// If set, returned as stdout for the pump's batched terminal pull
+        /// (`for p in …; do printf '==> %s <==' …; cat …; done`, Task 6).
+        batch_cat_stdout: Option<String>,
         /// If set, returned as stdout for a `rupu … run show <id>` command
         /// (`get_run`), so a test can drive the dispatcher's poll sequence.
         show_stdout: Option<String>,
@@ -2740,6 +3074,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2757,6 +3092,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2776,6 +3112,7 @@ mod tests {
                 cat_stdout: Some(cat_stdout.into()),
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2795,6 +3132,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2813,6 +3151,7 @@ mod tests {
                 cat_stdout: None,
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
+                batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
                 evidence_stdout: None,
@@ -2840,6 +3179,8 @@ mod tests {
                     self.evidence_stdout.clone().unwrap_or_default()
                 } else if remote.contains("'show'") {
                     self.show_stdout.clone().unwrap_or_default()
+                } else if remote.starts_with("for p in ") {
+                    self.batch_cat_stdout.clone().unwrap_or_default()
                 } else if remote.starts_with("cat ") {
                     if remote.contains("/launch.log") {
                         self.launch_log_stdout.clone().unwrap_or_default()
@@ -4019,6 +4360,411 @@ mod tests {
         );
     }
 
+    /// Seed a mirrored run owned by `host_abc` whose step_results claim
+    /// `remote` — the shape every allowlist test starts from.
+    fn seed_claimed_run(
+        conn: &SshHostConnector,
+        run_store: &rupu_orchestrator::RunStore,
+        run_id: &str,
+        remote: &str,
+        terminal: bool,
+    ) {
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Workflow,
+            name: "wf".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+        run_store
+            .append_step_result(
+                run_id,
+                &rupu_orchestrator::runs::StepResultRecord {
+                    step_id: "build".into(),
+                    run_id: "run_01STEPX".into(),
+                    transcript_path: std::path::PathBuf::from(remote),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: Default::default(),
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
+                    run_outcome: None,
+                    host: None,
+                },
+            )
+            .unwrap();
+        if terminal {
+            conn.mirror
+                .finish(run_id, &conn.host_id, "completed")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn ssh_local_transcript_path_maps_into_the_host_cache() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let recorded = std::path::Path::new("/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl");
+        assert_eq!(
+            conn.local_transcript_path(recorded),
+            tmp.path()
+                .join("mirror/host_abc/transcripts/run_01STEP.jsonl")
+        );
+        // A non-transcript path maps to itself, so the handler's "is it a
+        // local file" check fails and the request falls to the run-scoped
+        // branch, which rejects it.
+        let odd = std::path::Path::new("/etc/passwd");
+        assert_eq!(conn.local_transcript_path(odd), odd.to_path_buf());
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_requires_the_run_to_claim_the_path() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01OWNED", claimed, false);
+
+        let other = std::path::Path::new("/home/ci/proj/.rupu/transcripts/run_01OTHER.jsonl");
+        let err = conn
+            .pull_transcript("run_01OWNED", other, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Invalid(ref m) if m.contains("did not record")),
+            "{err}"
+        );
+
+        let err = conn
+            .pull_transcript("run_01MISSING", std::path::Path::new(claimed), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::NotFound(_)), "{err}");
+
+        // Nothing was shelled for a refused pull.
+        assert!(fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !c.starts_with("cat ")));
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_rejects_a_run_owned_by_another_host() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01FOREIGN", claimed, false);
+        let mut rec = run_store.load("run_01FOREIGN").unwrap();
+        rec.worker_id = Some("host_other".into());
+        run_store.update(&rec).unwrap();
+
+        let err = conn
+            .pull_transcript("run_01FOREIGN", std::path::Path::new(claimed), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Invalid(ref m) if m.contains("does not belong")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_writes_cache_and_marks_complete_only_when_terminal() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.cat_transcript_stdout =
+            Some("{\"type\":\"run_start\"}\n{\"type\":\"turn_start\"}\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01STEP.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01PULL", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01STEP.jsonl");
+
+        conn.pull_transcript("run_01PULL", std::path::Path::new(claimed), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n{\"type\":\"turn_start\"}\n"
+        );
+        assert!(
+            !crate::host::transcript_paths::is_complete(&cache),
+            "non-terminal pull is a snapshot"
+        );
+
+        conn.pull_transcript("run_01PULL", std::path::Path::new(claimed), true)
+            .await
+            .unwrap();
+        assert!(crate::host::transcript_paths::is_complete(&cache));
+        // Two sequential pulls, two distinct (ULID-named) tmp files, both
+        // renamed away — a fixed `{cache}.tmp` would be shared by concurrent
+        // pulls and could splice two bodies into one renamed-in file.
+        let strays: Vec<_> = std::fs::read_dir(cache.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "stray tmp files left behind: {strays:?}");
+
+        let cmds = fake.commands.lock().unwrap();
+        let cat = cmds
+            .iter()
+            .find(|c| c.starts_with("cat "))
+            .expect("a cat was issued");
+        assert!(
+            cat.contains(&format!("'{claimed}'")),
+            "path must be single-quoted: {cat}"
+        );
+        assert!(
+            cat.contains("__RUPU_NO_FILE__"),
+            "absent-file sentinel present: {cat}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_absent_remote_file_is_an_empty_complete_answer() {
+        let mut fake = FakeExec::ok(vec![]);
+        fake.cat_transcript_stdout = Some("__RUPU_NO_FILE__\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01NONE.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01ABSENT", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01NONE.jsonl");
+
+        conn.pull_transcript("run_01ABSENT", std::path::Path::new(claimed), true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), "");
+        assert!(crate::host::transcript_paths::is_complete(&cache));
+    }
+
+    #[tokio::test]
+    async fn ssh_pull_transcript_offline_is_unreachable_and_leaves_no_cache() {
+        let fake = std::sync::Arc::new(FakeExec::offline(
+            "ssh: connect to host mini port 22: No route",
+        ));
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01OFF.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01OFFLINE", claimed, false);
+
+        let err = conn
+            .pull_transcript("run_01OFFLINE", std::path::Path::new(claimed), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err}");
+        assert!(!tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01OFF.jsonl")
+            .exists());
+    }
+
+    /// Poll a cache file until `needle` shows up (or give up after ~1s).
+    async fn wait_for_cache(cache: &std::path::Path, needle: &str) {
+        for _ in 0..100 {
+            if std::fs::read_to_string(cache)
+                .map(|s| s.contains(needle))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{needle:?} never appeared in {}", cache.display());
+    }
+
+    #[tokio::test]
+    async fn ssh_ensure_transcript_feed_tails_the_claimed_path_into_the_cache() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![r#"{"type":"run_start"}"#.into()]));
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01FEED.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01FEEDRUN", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01FEED.jsonl");
+
+        let guard = conn
+            .ensure_transcript_feed("run_01FEEDRUN", std::path::Path::new(claimed))
+            .await
+            .unwrap();
+        wait_for_cache(&cache, "run_start").await;
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n"
+        );
+        {
+            let cmds = fake.commands.lock().unwrap();
+            assert!(
+                cmds.iter()
+                    .any(|c| c == &format!("tail -n +1 -F '{claimed}'")),
+                "{cmds:?}"
+            );
+        }
+        drop(guard);
+
+        let err = match conn
+            .ensure_transcript_feed(
+                "run_01FEEDRUN",
+                std::path::Path::new("/home/ci/proj/.rupu/transcripts/run_01X.jsonl"),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected an Invalid error for an unclaimed path"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    /// C1: the web transcript panel mounts a GET and an SSE stream for the
+    /// same path. The stream's feed holds an append handle on the cache's
+    /// inode; the GET's `pull_transcript` used to `rename` a freshly written
+    /// file over that dentry, stranding the feed on an unlinked inode — the
+    /// stream went permanently quiet and, because `alive()` stayed true, every
+    /// later subscriber joined the same zombie. A pull now steps aside.
+    #[tokio::test]
+    async fn ssh_pull_transcript_steps_aside_for_a_live_feed() {
+        let mut fake = FakeExec::ok(vec![r#"{"type":"run_start"}"#.into()]);
+        fake.cat_transcript_stdout = Some("THIS MUST NEVER REACH THE CACHE\n".into());
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01LIVE.jsonl";
+        seed_claimed_run(&conn, &run_store, "run_01LIVERUN", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01LIVE.jsonl");
+
+        let _guard = conn
+            .ensure_transcript_feed("run_01LIVERUN", std::path::Path::new(claimed))
+            .await
+            .unwrap();
+        wait_for_cache(&cache, "run_start").await;
+        let before = std::fs::read_to_string(&cache).unwrap();
+        let cats_before = fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("cat "))
+            .count();
+
+        // Ok(()) — the handler then serves the file the feed is filling.
+        conn.pull_transcript("run_01LIVERUN", std::path::Path::new(claimed), false)
+            .await
+            .unwrap();
+
+        let cats_after = fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("cat "))
+            .count();
+        assert_eq!(cats_before, cats_after, "no new `cat` was shelled");
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            before,
+            "the feed's cache was left untouched"
+        );
+        assert!(
+            !crate::host::transcript_paths::is_complete(&cache),
+            "stepping aside never marks the cache authoritative"
+        );
+    }
+
+    /// C1, other half: the TERMINAL pull is authoritative and must still win
+    /// over a live feed — by RETIRING it first and then doing the ordinary
+    /// atomic tmp+rename, so the pull is the file's only writer.
+    ///
+    /// Sharing the file with the feed (either writer going second) is what
+    /// makes a wrong `.complete` body possible, and a `.complete` body is
+    /// never repaired: the read path serves it verbatim and `subscribe`
+    /// refuses to tail it.
+    #[tokio::test]
+    async fn terminal_pull_retires_the_live_feed_then_writes_atomically() {
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01RETIRE.jsonl";
+        // The feed's replay and the authoritative body deliberately differ:
+        // if the retired feed ever appended again, or truncated on top, the
+        // exact-bytes assertion below would catch it.
+        let mut fake = FakeExec::ok(vec![r#"{"type":"run_start"}"#.into()]);
+        fake.batch_cat_stdout = Some(format!(
+            "==> {claimed} <==\n{{\"type\":\"run_start\"}}\n{{\"type\":\"run_complete\"}}\n\n==> end <==\n"
+        ));
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        seed_claimed_run(&conn, &run_store, "run_01RETIRERUN", claimed, false);
+        let cache = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01RETIRE.jsonl");
+
+        let _guard = conn
+            .ensure_transcript_feed("run_01RETIRERUN", std::path::Path::new(claimed))
+            .await
+            .unwrap();
+        wait_for_cache(&cache, "run_start").await;
+        // The registry hands out ONE handle per file, so subscribing again
+        // returns the very handle the guard holds — the way to observe its
+        // liveness (a `FeedGuard` is opaque).
+        let handle = conn
+            .lazy
+            .subscribe(claimed, &cache)
+            .await
+            .unwrap()
+            .expect("a live feed is shared, not refused");
+        assert!(handle.alive());
+        assert!(conn.lazy.has_live_feed(&cache));
+
+        pump_pull_step_transcripts(
+            fake.as_ref(),
+            &conn.mirror,
+            &conn.lazy,
+            "run_01RETIRERUN",
+            "host_abc",
+        )
+        .await;
+
+        assert!(
+            !handle.alive(),
+            "the feed must be stopped before the authoritative write"
+        );
+        assert!(!conn.lazy.has_live_feed(&cache));
+        assert_eq!(
+            conn.lazy.live_feeds(),
+            0,
+            "the registry entry is gone, so the ssh child is released"
+        );
+        assert!(
+            crate::host::transcript_paths::is_complete(&cache),
+            "the pull's result is authoritative"
+        );
+        // Settle, then assert the bytes are EXACTLY the batched body: a
+        // retired feed never appends again, and never truncates on top.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n{\"type\":\"run_complete\"}\n"
+        );
+        // Atomic write ⇒ no tmp survives.
+        let strays: Vec<_> = std::fs::read_dir(cache.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "stray tmp files left behind: {strays:?}");
+    }
+
     #[tokio::test]
     async fn cancel_approve_reject_issue_remote_commands() {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
@@ -5013,6 +5759,7 @@ mod tests {
                     mode: None,
                     target: None,
                     working_dir: None,
+                    run_id: None,
                 })
                 .await
                 .expect("launch_agent");
@@ -5193,6 +5940,7 @@ mod tests {
                 mode: None,
                 target: None,
                 working_dir: Some(STAGED_WD.into()),
+                run_id: None,
             })
             .await
             .unwrap();
@@ -5212,6 +5960,53 @@ mod tests {
             launch.contains(&format!("2>>$HOME/.rupu/runs/{run_id}/launch.log")),
             "agent launch must keep its stderr: {launch}"
         );
+    }
+
+    #[tokio::test]
+    async fn launch_agent_honours_a_coordinator_minted_run_id() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let id = conn
+            .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "reviewer".into(),
+                prompt: Some("go".into()),
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some("run_01MINTEDBYCOORD".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(id, "run_01MINTEDBYCOORD");
+        assert_eq!(
+            run_store.load(&id).unwrap().worker_id.as_deref(),
+            Some("host_abc")
+        );
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("'--run-id' 'run_01MINTEDBYCOORD'")),
+            "{cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_agent_rejects_a_malformed_supplied_run_id_without_dispatching() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let err = conn
+            .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "reviewer".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some("../evil".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err}");
+        assert!(fake.commands.lock().unwrap().is_empty(), "nothing shelled");
     }
 
     #[tokio::test]
@@ -5470,6 +6265,279 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HostConnectorError::Remote(3, _)), "{err:?}");
+    }
+
+    // ── Task 6: run.json-while-alive, live active step, terminal batch pull ──
+
+    fn agent_spec() -> crate::node::protocol::RunSpec {
+        crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "reviewer".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        }
+    }
+
+    fn workflow_spec() -> crate::node::protocol::RunSpec {
+        crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Workflow,
+            name: "wf".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        }
+    }
+
+    #[test]
+    fn note_transcript_started_sets_the_live_active_step_and_finish_clears_it() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run("run_01LIVE", "host_abc", &agent_spec())
+            .unwrap();
+
+        conn.mirror
+            .note_transcript_started("run_01LIVE", "host_abc")
+            .unwrap();
+        let rec = run_store.load("run_01LIVE").unwrap();
+        assert_eq!(rec.active_step_id.as_deref(), Some("agent"));
+        assert_eq!(
+            rec.active_step_transcript_path,
+            Some(conn.mirror.transcript_mirror_path("run_01LIVE"))
+        );
+        assert!(matches!(
+            conn.mirror
+                .note_transcript_started("run_01LIVE", "host_other"),
+            Err(crate::node::MirrorError::WrongNode(_))
+        ));
+
+        conn.mirror
+            .finish("run_01LIVE", "host_abc", "completed")
+            .unwrap();
+        let rec = run_store.load("run_01LIVE").unwrap();
+        assert_eq!(rec.active_step_id, None);
+        assert_eq!(rec.active_step_transcript_path, None);
+    }
+
+    #[test]
+    fn batch_cat_command_quotes_each_path_and_brackets_each_file() {
+        let cmd = batch_cat_command(&["/a/run_01A.jsonl".into(), "/b/it's.jsonl".into()]);
+        assert_eq!(
+            cmd,
+            "for p in '/a/run_01A.jsonl' '/b/it'\\''s.jsonl'; do printf '==> %s <==\\n' \"$p\"; cat \"$p\" 2>/dev/null; printf '\\n==> end <==\\n'; done"
+        );
+    }
+
+    #[test]
+    fn split_batched_cat_separates_files_and_drops_the_synthetic_trailing_newline() {
+        let stdout = "==> /a/one.jsonl <==\n{\"a\":1}\n{\"a\":2}\n\n==> end <==\n\
+                      ==> /a/absent.jsonl <==\n\n==> end <==\n\
+                      ==> /a/torn.jsonl <==\n{\"t\":1}\n{\"t\":\n==> end <==\n";
+        let files = split_batched_cat(stdout);
+        assert_eq!(files["/a/one.jsonl"], "{\"a\":1}\n{\"a\":2}\n");
+        assert_eq!(files["/a/absent.jsonl"], "");
+        assert_eq!(
+            files["/a/torn.jsonl"], "{\"t\":1}\n{\"t\":\n",
+            "a torn last line is kept"
+        );
+        assert_eq!(files.len(), 3);
+        // A stream cut mid-file never yields that file at all.
+        let cut = "==> /a/one.jsonl <==\n{\"a\":1}\n";
+        assert!(split_batched_cat(cut).is_empty());
+    }
+
+    /// Build the remote's `run.json` body from a REAL `RunRecord` so the
+    /// mirror's `RunJson` parse cannot silently fail on a hand-written shape.
+    fn remote_run_json(
+        run_store: &rupu_orchestrator::RunStore,
+        run_id: &str,
+        status: rupu_orchestrator::RunStatus,
+        active: Option<(&str, &str)>,
+    ) -> String {
+        let mut rec = run_store.load(run_id).unwrap();
+        rec.status = status;
+        rec.worker_id = None; // the remote does not know it is a mirror
+        rec.active_step_id = active.map(|(id, _)| id.to_string());
+        rec.active_step_transcript_path = active.map(|(_, p)| std::path::PathBuf::from(p));
+        serde_json::to_string(&rec).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tail_pump_mirrors_run_json_while_the_run_is_still_alive() {
+        let run_id = "run_01ALIVE";
+        // Two-phase construction: the mirror record must exist before the
+        // remote run.json body can be derived from it.
+        let fake_probe = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn0, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake_probe));
+        conn0
+            .mirror
+            .create_run(run_id, &conn0.host_id, &workflow_spec())
+            .unwrap();
+        let alive_json = remote_run_json(
+            &run_store,
+            run_id,
+            rupu_orchestrator::RunStatus::Running,
+            Some(("build", "/remote/proj/.rupu/transcripts/run_01BUILD.jsonl")),
+        );
+        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(vec![], alive_json));
+        let mirror = std::sync::Arc::clone(&conn0.mirror);
+        let exec: std::sync::Arc<dyn RemoteExec> = fake;
+        let conn =
+            SshHostConnector::new("host_abc", exec, mirror, std::sync::Arc::clone(&run_store));
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.active_step_id.as_deref() == Some("build") {
+                assert_eq!(
+                    rec.active_step_transcript_path,
+                    Some(std::path::PathBuf::from(
+                        "/remote/proj/.rupu/transcripts/run_01BUILD.jsonl"
+                    ))
+                );
+                assert_eq!(rec.status, rupu_orchestrator::RunStatus::Running);
+                assert_eq!(
+                    rec.worker_id.as_deref(),
+                    Some("host_abc"),
+                    "identity re-pinned"
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("non-terminal run.json was never mirrored");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_pump_first_transcript_header_marks_the_agent_step_live() {
+        let run_id = "run_01LIVEHDR";
+        let tail_lines = vec![
+            format!("==> /home/ci/.rupu/transcripts/{run_id}.jsonl <=="),
+            r#"{"type":"run_start","agent":"reviewer"}"#.to_string(),
+        ];
+        // No run.json yet (an agent run writes it only at the end) → the
+        // interval probe answers Absent and the pump stays open.
+        let fake = std::sync::Arc::new(FakeExec::ok(tail_lines));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &agent_spec())
+            .unwrap();
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.active_step_id.as_deref() == Some("agent") {
+                assert_eq!(
+                    rec.active_step_transcript_path,
+                    Some(conn.mirror.transcript_mirror_path(run_id))
+                );
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("active step never set from the transcript header");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_pump_terminal_pulls_every_recorded_step_transcript_into_the_cache() {
+        let run_id = "run_01PULLALL";
+        let step_a = "/home/ci/proj/.rupu/transcripts/run_01STEPA.jsonl";
+        let step_b = "/home/ci/proj/.rupu/transcripts/run_01STEPB.jsonl";
+        // The pump's `select!` is unbiased, so the terminal probe can win
+        // before any tailed line is consumed. Pre-seed the LOCAL mirror with
+        // the artifacts the tail would have delivered (that is what
+        // `recorded_transcript_paths` reads), and feed no tail lines.
+        let fake_probe = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn0, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake_probe));
+        conn0
+            .mirror
+            .create_run(run_id, &conn0.host_id, &workflow_spec())
+            .unwrap();
+        conn0
+            .mirror
+            .append(
+                run_id,
+                "host_abc",
+                ArtifactFile::StepResults,
+                &format!(r#"{{"step_id":"a","run_id":"run_01STEPA","transcript_path":"{step_a}","output":"","success":true,"skipped":false,"rendered_prompt":"","finished_at":"2026-09-04T00:00:00Z"}}"#),
+            )
+            .unwrap();
+        conn0
+            .mirror
+            .append(
+                run_id,
+                "host_abc",
+                ArtifactFile::Events,
+                &format!(r#"{{"type":"step_working","run_id":"{run_id}","step_id":"b","transcript_path":"{step_b}"}}"#),
+            )
+            .unwrap();
+        let run_json = remote_run_json(
+            &run_store,
+            run_id,
+            rupu_orchestrator::RunStatus::Completed,
+            None,
+        );
+        let mut fake = FakeExec::with_cat_stdout(vec![], run_json);
+        fake.batch_cat_stdout = Some(format!(
+            "==> {step_a} <==\n{{\"type\":\"run_start\"}}\n\n==> end <==\n==> {step_b} <==\n\n==> end <==\n"
+        ));
+        let fake = std::sync::Arc::new(fake);
+        let mirror = std::sync::Arc::clone(&conn0.mirror);
+        let exec: std::sync::Arc<dyn RemoteExec> = std::sync::Arc::clone(&fake) as _;
+        let conn =
+            SshHostConnector::new("host_abc", exec, mirror, std::sync::Arc::clone(&run_store));
+        conn.spawn_tail_pump(run_id.to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if run_store.load(run_id).unwrap().status != rupu_orchestrator::RunStatus::Running {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("pump never finalized");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Join the pump's terminal work the way the dispatcher does.
+        conn.await_run_mirror(run_id).await;
+
+        let cache_a = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01STEPA.jsonl");
+        let cache_b = tmp
+            .path()
+            .join("mirror/host_abc/transcripts/run_01STEPB.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&cache_a).unwrap(),
+            "{\"type\":\"run_start\"}\n"
+        );
+        assert!(crate::host::transcript_paths::is_complete(&cache_a));
+        assert_eq!(
+            std::fs::read_to_string(&cache_b).unwrap(),
+            "",
+            "absent remote file → empty complete answer"
+        );
+        assert!(crate::host::transcript_paths::is_complete(&cache_b));
+
+        let cmds = fake.commands.lock().unwrap();
+        let batch: Vec<_> = cmds.iter().filter(|c| c.starts_with("for p in ")).collect();
+        assert_eq!(
+            batch.len(),
+            1,
+            "exactly one ssh invocation for all files: {cmds:?}"
+        );
+        assert!(
+            batch[0].contains(&format!("'{step_a}'")) && batch[0].contains(&format!("'{step_b}'"))
+        );
     }
 
     // ── End-to-end SSH workspace-sync parity (ssh-ws T5) ─────────────────────

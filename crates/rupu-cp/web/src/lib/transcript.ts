@@ -54,4 +54,7 @@ export interface TranscriptResponse {
   summary: TranscriptSummary | null;
   /** Lines the server could not parse (absent on older servers). */
   unparsed?: number;
+  /** The coordinator could not collect the rest of this transcript from
+   *  its host (spec §4.2). Absent unless true. */
+  partial?: boolean;
 }

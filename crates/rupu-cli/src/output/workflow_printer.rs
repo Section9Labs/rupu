@@ -4367,6 +4367,7 @@ mod tests {
             resolved: true,
             finished_at: Utc::now(),
             loop_iteration: None,
+            host: None,
         };
         std::fs::write(
             &step_results,
@@ -4740,6 +4741,7 @@ mod tests {
             resolved: true,
             finished_at: Utc::now(),
             loop_iteration: None,
+            host: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),

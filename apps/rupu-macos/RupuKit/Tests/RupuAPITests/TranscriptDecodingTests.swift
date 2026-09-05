@@ -103,3 +103,10 @@ import Foundation
     let event = try JSONDecoder().decode(TranscriptEvent.self, from: data)
     #expect(event == .assistantMessage(content: "hi", thinking: nil))
 }
+
+@Test func transcriptPageDecodesPartialWhenPresentAndNilOtherwise() throws {
+    let with = try JSONDecoder().decode(APITranscriptPage.self, from: Data(#"{"events":[],"summary":null,"partial":true}"#.utf8))
+    #expect(with.partial == true)
+    let without = try JSONDecoder().decode(APITranscriptPage.self, from: Data(#"{"events":[],"summary":null}"#.utf8))
+    #expect(without.partial == nil)
+}

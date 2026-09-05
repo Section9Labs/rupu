@@ -149,9 +149,10 @@ public actor CPClient {
     /// `path` is the transcript file's full path (from a step result / run
     /// record / unit row / agent-run row), sent as a query parameter —
     /// `/api/transcript`, never a URL path segment.
-    public func transcript(path: String, host: String? = nil) async throws -> APITranscriptPage {
+    public func transcript(path: String, host: String? = nil, run: String? = nil) async throws -> APITranscriptPage {
         var query = [URLQueryItem(name: "path", value: path)]
         query.append(contentsOf: hostQuery(host))
+        if let run { query.append(URLQueryItem(name: "run", value: run)) }
         return try await get("api/transcript", query: query)
     }
 
