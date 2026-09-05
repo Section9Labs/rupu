@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
     extract::Request,
-    http::{header::AUTHORIZATION, StatusCode},
+    http::{header::AUTHORIZATION, HeaderName, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::Response,
     routing::get,
@@ -11,8 +11,24 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
-async fn healthz() -> &'static str {
-    "ok"
+/// Liveness probe. The body stays the bare `ok` every existing consumer
+/// compares against; the serving PID and crate version ride along as
+/// response headers so a second `rupu cp serve` that loses the bind race
+/// can report which process already owns the port (`rupu_cp::bind`).
+async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
+    (
+        [
+            (
+                HeaderName::from_static(crate::HEALTHZ_PID_HEADER),
+                std::process::id().to_string(),
+            ),
+            (
+                HeaderName::from_static(crate::HEALTHZ_VERSION_HEADER),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+        ],
+        "ok",
+    )
 }
 
 /// Bearer-token guard for the `/api/*` surface.

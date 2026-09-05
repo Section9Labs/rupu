@@ -22,6 +22,9 @@ pub enum Action {
     /// runs with a dead `runner_pid`). Each loop is gated by a `[cp]` config
     /// key and defaults to enabled at a 60s interval: `autoflow_reconcile_enabled`,
     /// `cron_tick_enabled`, `gate_sweep_enabled` (see `rupu-config`'s `CpConfig`).
+    ///
+    /// Exits non-zero immediately if the bind address is already taken; when
+    /// the occupant is another rupu control plane, the error names its PID.
     Serve {
         /// Address to bind. Defaults to 127.0.0.1:7878.
         #[arg(long, default_value = "127.0.0.1:7878")]
@@ -48,6 +51,25 @@ pub async fn handle(action: Action) -> ExitCode {
         } => {
             let global_dir = match paths::global_dir() {
                 Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            // Take the bind address BEFORE any background loop exists.
+            // Every loop below is joined on the way out, and a loop that
+            // is mid-tick (the fleet-inventory SCM refresh fires at spawn
+            // and makes one GitHub call per repo) cannot see the shutdown
+            // signal until its tick returns — so binding last meant a
+            // taken port produced a process that sat for minutes with no
+            // listener, an open connection to GitHub, and no error
+            // printed (observed 2026-09-04; an operator's "restart" that
+            // never stopped the old daemon looked like it had worked).
+            // `rupu_cp::bind` also names the daemon that still owns the
+            // port when one answers `/healthz` there.
+            let listener = match rupu_cp::bind(bind).await {
+                Ok(l) => l,
                 Err(e) => {
                     eprintln!("error: {e:#}");
                     return ExitCode::FAILURE;
@@ -415,21 +437,24 @@ pub async fn handle(action: Action) -> ExitCode {
                 })
             };
 
-            let serve_result = rupu_cp::serve(rupu_cp::ServeOpts {
-                bind,
-                token,
-                global_dir,
-                open_browser: !no_open,
-                launcher: Some(launcher),
-                session_sender: Some(session_sender),
-                repos,
-                agent_launcher,
-                session_starter,
-                generator,
-                session_mutator,
-                transcript_mutator,
-                inventory: Some(inventory),
-            })
+            let serve_result = rupu_cp::serve_on(
+                listener,
+                rupu_cp::ServeOpts {
+                    bind,
+                    token,
+                    global_dir,
+                    open_browser: !no_open,
+                    launcher: Some(launcher),
+                    session_sender: Some(session_sender),
+                    repos,
+                    agent_launcher,
+                    session_starter,
+                    generator,
+                    session_mutator,
+                    transcript_mutator,
+                    inventory: Some(inventory),
+                },
+            )
             .await;
 
             // Signal every background loop to stop and wait for them to drain.
