@@ -299,9 +299,10 @@ fn cache_io_err(e: std::io::Error) -> HostConnectorError {
 /// (truncating each other), and the spliced result gets renamed in — marked
 /// `.complete`, and so authoritative forever, when the pull was terminal.
 ///
-/// Do not use this while a lazy tail is feeding `cache`: `rename` swaps the
-/// dentry, leaving the feed appending to an unlinked inode. Use
-/// [`write_cache_file_inplace`] there instead.
+/// The rename also means this must be the file's ONLY writer: a lazy tail
+/// feeding `cache` is retired (`LazyTailRegistry::retire`) before the
+/// authoritative pull calls this, so the sidecar is only ever written over an
+/// atomically-replaced file. See `pump_pull_step_transcripts`.
 pub(crate) fn write_cache_file(
     cache: &Path,
     body: &str,
@@ -314,43 +315,6 @@ pub(crate) fn write_cache_file(
     let tmp = PathBuf::from(format!("{}.{}.tmp", cache.display(), Ulid::new()));
     std::fs::write(&tmp, body).map_err(io)?;
     std::fs::rename(&tmp, cache).map_err(io)?;
-    if complete {
-        std::fs::write(crate::host::transcript_paths::complete_marker(cache), b"").map_err(io)?;
-    }
-    Ok(())
-}
-
-/// Same result as [`write_cache_file`], but rewrites the file IN PLACE
-/// (`O_TRUNC` on the existing inode) instead of renaming a new one over it.
-///
-/// Used only when a lazy tail is live on `cache`. The feed holds an append
-/// handle on that inode; a `rename` would leave it writing into an unlinked
-/// file while every reader opens the new one, so the SSE stream goes
-/// permanently quiet — and `alive()` stays true, so later subscribers join the
-/// same zombie feed. Truncating the same inode keeps the feed's fd valid: it
-/// is in append mode, so its next write lands after the authoritative body,
-/// and what it delivers is the same `tail -n +1` replay of the same bytes.
-///
-/// Not atomic — a reader can observe a partially written file — which is why
-/// the non-feed path still prefers the rename.
-pub(crate) fn write_cache_file_inplace(
-    cache: &Path,
-    body: &str,
-    complete: bool,
-) -> Result<(), HostConnectorError> {
-    use std::io::Write as _;
-    let io = cache_io_err;
-    if let Some(dir) = cache.parent() {
-        std::fs::create_dir_all(dir).map_err(io)?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(cache)
-        .map_err(io)?;
-    f.write_all(body.as_bytes()).map_err(io)?;
-    f.flush().map_err(io)?;
     if complete {
         std::fs::write(crate::host::transcript_paths::complete_marker(cache), b"").map_err(io)?;
     }
@@ -861,11 +825,18 @@ pub(crate) fn split_batched_cat(stdout: &str) -> std::collections::HashMap<Strin
 /// a failure leaves files unmarked for the on-demand retry (§4.2).
 ///
 /// This pull is AUTHORITATIVE and always wins — including over a viewer's live
-/// tail on the same file. What it must not do is win by `rename`: a live feed
-/// holds an append handle on the cache's inode, and swapping the dentry would
-/// strand it on an unlinked file. `lazy` is consulted per target so those get
-/// [`write_cache_file_inplace`] instead, which keeps the feed's fd pointing at
-/// the file readers see.
+/// tail on the same file. Because its result is marked `.complete`, after
+/// which the read path serves the cache verbatim and `subscribe` refuses to
+/// tail it, a wrong byte written here is never repaired. So the feed is
+/// RETIRED first (`LazyTailRegistry::retire`) and this becomes the file's only
+/// writer; the write itself is then the ordinary atomic tmp+rename. Sharing
+/// the file with a live feed instead — whichever way round — lets its
+/// in-flight lines land after the authoritative body, or its first-line
+/// truncate land on top of it.
+///
+/// Retiring does not disconnect the viewers: their `TranscriptTail` reads the
+/// cache by PATH at a byte offset, and after the rename that path holds the
+/// authoritative body — a superset of the replay they already received.
 async fn pump_pull_step_transcripts(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
@@ -903,12 +874,12 @@ async fn pump_pull_step_transcripts(
     let files = split_batched_cat(&out.stdout);
     for (remote, cache) in &targets {
         if let Some(body) = files.get(remote) {
-            let write = if lazy.has_live_feed(cache) {
-                write_cache_file_inplace
-            } else {
-                write_cache_file
-            };
-            if let Err(e) = write(cache, body, true) {
+            // Sole-writer handoff: stop the feed (and wait for it to really
+            // stop) before replacing the file it was appending to.
+            if lazy.has_live_feed(cache) {
+                lazy.retire(cache).await;
+            }
+            if let Err(e) = write_cache_file(cache, body, true) {
                 tracing::warn!(host_id, run_id, cache = %cache.display(), error = %e, "terminal transcript pull: cache write failed");
             }
         } else {
@@ -4716,55 +4687,84 @@ mod tests {
     }
 
     /// C1, other half: the TERMINAL pull is authoritative and must still win
-    /// over a live feed — but by rewriting the SAME inode rather than renaming
-    /// a new file over it, so the feed's append handle stays valid.
+    /// over a live feed — by RETIRING it first and then doing the ordinary
+    /// atomic tmp+rename, so the pull is the file's only writer.
+    ///
+    /// Sharing the file with the feed (either writer going second) is what
+    /// makes a wrong `.complete` body possible, and a `.complete` body is
+    /// never repaired: the read path serves it verbatim and `subscribe`
+    /// refuses to tail it.
     #[tokio::test]
-    async fn terminal_pull_rewrites_a_live_feeds_cache_in_place() {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let claimed = "/home/ci/proj/.rupu/transcripts/run_01INPLACE.jsonl";
+    async fn terminal_pull_retires_the_live_feed_then_writes_atomically() {
+        let claimed = "/home/ci/proj/.rupu/transcripts/run_01RETIRE.jsonl";
+        // The feed's replay and the authoritative body deliberately differ:
+        // if the retired feed ever appended again, or truncated on top, the
+        // exact-bytes assertion below would catch it.
         let mut fake = FakeExec::ok(vec![r#"{"type":"run_start"}"#.into()]);
         fake.batch_cat_stdout = Some(format!(
             "==> {claimed} <==\n{{\"type\":\"run_start\"}}\n{{\"type\":\"run_complete\"}}\n\n==> end <==\n"
         ));
         let fake = std::sync::Arc::new(fake);
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
-        seed_claimed_run(&conn, &run_store, "run_01INPLACERUN", claimed, false);
+        seed_claimed_run(&conn, &run_store, "run_01RETIRERUN", claimed, false);
         let cache = tmp
             .path()
-            .join("mirror/host_abc/transcripts/run_01INPLACE.jsonl");
+            .join("mirror/host_abc/transcripts/run_01RETIRE.jsonl");
 
         let _guard = conn
-            .ensure_transcript_feed("run_01INPLACERUN", std::path::Path::new(claimed))
+            .ensure_transcript_feed("run_01RETIRERUN", std::path::Path::new(claimed))
             .await
             .unwrap();
         wait_for_cache(&cache, "run_start").await;
-        let inode_before = std::fs::metadata(&cache).unwrap().ino();
+        // The registry hands out ONE handle per file, so subscribing again
+        // returns the very handle the guard holds — the way to observe its
+        // liveness (a `FeedGuard` is opaque).
+        let handle = conn
+            .lazy
+            .subscribe(claimed, &cache)
+            .await
+            .unwrap()
+            .expect("a live feed is shared, not refused");
+        assert!(handle.alive());
+        assert!(conn.lazy.has_live_feed(&cache));
 
         pump_pull_step_transcripts(
             fake.as_ref(),
             &conn.mirror,
             &conn.lazy,
-            "run_01INPLACERUN",
+            "run_01RETIRERUN",
             "host_abc",
         )
         .await;
 
+        assert!(
+            !handle.alive(),
+            "the feed must be stopped before the authoritative write"
+        );
+        assert!(!conn.lazy.has_live_feed(&cache));
         assert_eq!(
-            std::fs::read_to_string(&cache).unwrap(),
-            "{\"type\":\"run_start\"}\n{\"type\":\"run_complete\"}\n",
-            "the authoritative body wins"
+            conn.lazy.live_feeds(),
+            0,
+            "the registry entry is gone, so the ssh child is released"
         );
         assert!(
             crate::host::transcript_paths::is_complete(&cache),
-            "and is marked complete"
+            "the pull's result is authoritative"
         );
+        // Settle, then assert the bytes are EXACTLY the batched body: a
+        // retired feed never appends again, and never truncates on top.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
-            std::fs::metadata(&cache).unwrap().ino(),
-            inode_before,
-            "same inode: the live feed's append fd still points at the file \
-             readers open"
+            std::fs::read_to_string(&cache).unwrap(),
+            "{\"type\":\"run_start\"}\n{\"type\":\"run_complete\"}\n"
         );
+        // Atomic write ⇒ no tmp survives.
+        let strays: Vec<_> = std::fs::read_dir(cache.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "stray tmp files left behind: {strays:?}");
     }
 
     #[tokio::test]

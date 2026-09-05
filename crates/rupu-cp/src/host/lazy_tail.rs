@@ -70,13 +70,21 @@ impl Drop for FeedDone {
 }
 
 /// One registry entry: a weak handle so the registry itself never keeps a
-/// feed alive, plus a `finished` receiver kept independently of the
-/// `Weak` — once the last `Arc<FeedHandle>` is dropped the `Weak` can no
-/// longer be upgraded, so this is the only way `subscribe` can still learn
-/// when that feed's task has actually stopped.
+/// feed alive, plus three things kept independently of the `Weak` — once the
+/// last `Arc<FeedHandle>` is dropped the `Weak` can no longer be upgraded, so
+/// these are the only way the registry can still act on that feed:
+///
+/// * `finished` — how `subscribe` learns the task has actually stopped;
+/// * `abort` / `alive` — how [`LazyTailRegistry::retire`] stops a feed the
+///   registry does not hold a strong handle to. `FeedHandle::drop` aborts on
+///   the LAST subscriber's drop, which is the wrong moment for a terminal
+///   pull: viewers are still attached, and their feed must stop writing
+///   before the authoritative body is put in place.
 struct FeedEntry {
     handle: Weak<FeedHandle>,
     finished: watch::Receiver<bool>,
+    abort: tokio::task::AbortHandle,
+    alive: Arc<AtomicBool>,
 }
 
 pub(crate) struct LazyTailRegistry {
@@ -210,15 +218,58 @@ impl LazyTailRegistry {
                 }
             }
         });
-        let handle = Arc::new(FeedHandle { task, alive });
+        let abort = task.abort_handle();
+        let handle = Arc::new(FeedHandle {
+            task,
+            alive: Arc::clone(&alive),
+        });
         feeds.insert(
             cache.to_path_buf(),
             FeedEntry {
                 handle: Arc::downgrade(&handle),
                 finished: finished_rx,
+                abort,
+                alive,
             },
         );
         Ok(Some(handle))
+    }
+
+    /// Stop any feed tailing into `cache` and forget it, so the caller can
+    /// rewrite the file as its sole writer.
+    ///
+    /// The terminal pull is authoritative and its result is marked
+    /// `.complete`, after which the read path serves the cache verbatim and
+    /// `subscribe` refuses to tail it — so a wrong byte written at that moment
+    /// is never repaired. Letting the feed and the pull share the file is what
+    /// makes wrong bytes possible: the feed's in-flight lines land after the
+    /// authoritative body, or its first-line truncate lands on top of it, or a
+    /// truncate inside the pull's `write_all` leaves a NUL hole. Retiring the
+    /// feed first removes the second writer entirely; the pull then does its
+    /// ordinary atomic tmp+rename.
+    ///
+    /// Existing subscribers keep their `Arc<FeedHandle>` (it just reports
+    /// `alive() == false`) and their `TranscriptTail` keeps reading the cache
+    /// BY PATH at a byte offset. After the pull's rename that path is the
+    /// authoritative file, a strict superset of the replay bytes already
+    /// delivered, so the stream continues cleanly rather than breaking.
+    ///
+    /// Idempotent: retiring a path with no feed does nothing.
+    pub(crate) async fn retire(&self, cache: &Path) {
+        let entry = {
+            let mut feeds = self.feeds.lock().unwrap();
+            feeds.remove(cache)
+        };
+        let Some(entry) = entry else { return };
+        // Before the abort lands, so `has_live_feed` and `subscribe`'s
+        // liveness checks stop reporting this feed immediately.
+        entry.alive.store(false, Ordering::SeqCst);
+        entry.abort.abort();
+        // `abort()` is cooperative — a task mid-`writeln!` finishes that write
+        // first. Wait for its `FeedDone` guard, exactly as the replace path
+        // does, so the caller really is the only writer when this returns.
+        let mut rx = entry.finished;
+        let _ = tokio::time::timeout(REPLACE_WAIT_TIMEOUT, rx.wait_for(|done| *done)).await;
     }
 
     /// Is a feed currently tailing into `cache` AND still alive?
@@ -370,6 +421,47 @@ mod tests {
             "nothing arrived from the remote, so the already-collected \
              content must still be on disk"
         );
+    }
+
+    /// `retire` is the sole-writer handoff the terminal pull needs: the feed
+    /// must be stopped, and confirmed stopped, before the authoritative body
+    /// replaces the file — `FeedHandle::drop` only fires on the LAST
+    /// subscriber's drop, which is the wrong moment (viewers are still
+    /// attached).
+    #[tokio::test]
+    async fn retire_aborts_the_feed_and_removes_the_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("run_01RETIRE.jsonl");
+        let ex = exec(&[r#"{"type":"run_start"}"#], true);
+        let reg = LazyTailRegistry::new(ex.clone());
+
+        // Retiring a path with no feed is a no-op, not a panic.
+        reg.retire(&cache).await;
+
+        // The subscriber keeps holding its guard across the retire — that is
+        // the whole point: viewers stay attached and keep reading the path.
+        let guard = reg
+            .subscribe("/r/run_01RETIRE.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_content(&cache, "run_start").await;
+        assert!(guard.alive());
+        assert_eq!(reg.live_feeds(), 1);
+
+        reg.retire(&cache).await;
+        assert!(!guard.alive(), "the still-held handle reports dead");
+        assert!(!reg.has_live_feed(&cache));
+        assert_eq!(reg.live_feeds(), 0, "the entry is gone");
+
+        // …and the registry is clean enough to tail the file again.
+        let second = reg
+            .subscribe("/r/run_01RETIRE.jsonl", &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&guard, &second));
+        assert_eq!(ex.spawns.lock().unwrap().len(), 2);
     }
 
     /// C1: `has_live_feed` is what a would-be writer of the cache asks before
