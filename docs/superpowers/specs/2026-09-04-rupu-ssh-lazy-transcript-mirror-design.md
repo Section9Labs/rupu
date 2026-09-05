@@ -71,9 +71,12 @@ the pump lands in a lazy cache under the CP global dir:
 
 - `…/.rupu/transcripts/<name>.jsonl` → `<name>` (a ULID-bearing step / unit /
   standalone-run id; unique by construction).
-- `…/.rupu/runs/<parent>/sub_runs/<sub>/transcript.jsonl` →
-  `<parent>__sub_runs__<sub>` (sub-run transcripts are all literally named
-  `transcript.jsonl`, so the key carries the disambiguating components).
+- `…/.rupu/runs/<parent>/sub/<sub>/transcript.jsonl` →
+  `<parent>__sub__<sub>` (sub-run transcripts are all literally named
+  `transcript.jsonl`, so the key carries the disambiguating components). The
+  directory component is `sub`, which is what `RunStore::sub_dir` writes —
+  an earlier draft of this section said `sub_runs`, a layout that has never
+  existed.
 - Anything else is not a transcript this design serves; the allowlist in §3.3
   rejects it before mapping is attempted.
 
@@ -130,10 +133,13 @@ every transcript path a mirrored run's own artifacts claim, deduplicated:
 
 - `step_results.jsonl` rows → `transcript_path`
 - `unit_checkpoints.jsonl` rows → `transcript_path`
-- `events.jsonl` → `transcript_path` on `StepWorking` and `UnitStarted`
-  (the only way a *running* step's path is known before its result row exists)
+- `events.jsonl` → `transcript_path` on `StepWorking`, `UnitStarted`, and
+  `DispatchStarted` (the only way a *running* step's path is known before its
+  result row exists)
 - `run.json` → `active_step_transcript_path`
-- sub-run transcripts referenced by the run's `sub_runs` layout, when present
+- sub-run transcripts (`<runs>/<parent>/sub/<sub>/transcript.jsonl`), which
+  reach this function only through `DispatchStarted` — a dispatched sub-agent
+  never produces a step-result row or a unit checkpoint of its own
 
 The allowlist (§3.3) and the terminal pull (§6) both call this function, so
 they cannot disagree about what a run owns.
@@ -384,7 +390,8 @@ already does for the agent transcript. No changes above the connector.
 Unit, at the seams:
 
 - `host/transcript_paths.rs`: `recorded_transcript_paths` against real mirrored
-  artifact rows (step results, checkpoints, `StepWorking`/`UnitStarted` events,
+  artifact rows (step results, checkpoints, `StepWorking` / `UnitStarted` /
+  `DispatchStarted` events,
   active step, sub-runs); dedup; empty run.
 - Cache key mapping: step/unit/standalone/sub-run shapes; rejection of
   non-transcript paths, relative paths, `..`, non-`.jsonl`.

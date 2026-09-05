@@ -11,8 +11,9 @@ use rupu_orchestrator::{executor::Event, runs::RunStore};
 
 /// Every transcript path a mirrored run's own artifacts claim (§3.4):
 /// step-result rows and their items, unit checkpoints, `StepWorking` /
-/// `UnitStarted` events, and the record's active-step path. Deduplicated,
-/// sorted, empty paths dropped. Missing artifacts contribute nothing.
+/// `UnitStarted` / `DispatchStarted` events, and the record's active-step
+/// path. Deduplicated, sorted, empty paths dropped. Missing artifacts
+/// contribute nothing.
 pub fn recorded_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     if let Ok(rec) = store.load(run_id) {
@@ -41,7 +42,14 @@ pub fn recorded_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf>
                 }) => {
                     out.insert(p);
                 }
+                // A dispatched sub-agent's transcript is announced ONLY here
+                // (`<runs>/<parent>/sub/<sub>/transcript.jsonl`) — it never
+                // reaches a step-result row or a unit checkpoint, so without
+                // this arm a sub-run path could never enter the allowlist.
                 Ok(Event::UnitStarted {
+                    transcript_path, ..
+                })
+                | Ok(Event::DispatchStarted {
                     transcript_path, ..
                 }) => {
                     out.insert(transcript_path);
@@ -63,7 +71,10 @@ fn safe_component(s: &str) -> bool {
 }
 
 /// §3.1: `…/transcripts/<name>.jsonl` → `<name>`;
-/// `…/runs/<parent>/sub_runs/<sub>/transcript.jsonl` → `<parent>__sub_runs__<sub>`.
+/// `…/runs/<parent>/sub/<sub>/transcript.jsonl` → `<parent>__sub__<sub>`.
+/// The `sub` component is the one `RunStore::sub_dir` actually writes (see
+/// `rupu_orchestrator::runs`) — an earlier `sub_runs` here matched a layout
+/// that has never existed, so no sub-run path could map at all.
 /// `None` for anything else — relative paths, `..`, non-`.jsonl`, or a
 /// directory shape this design does not serve.
 pub fn cache_key(recorded: &Path) -> Option<String> {
@@ -91,10 +102,10 @@ pub fn cache_key(recorded: &Path) -> Option<String> {
         let stem = recorded.file_stem()?.to_str()?;
         return safe_component(stem).then(|| stem.to_string());
     }
-    if n >= 4 && comps[n - 1] == "transcript.jsonl" && comps[n - 3] == "sub_runs" {
+    if n >= 4 && comps[n - 1] == "transcript.jsonl" && comps[n - 3] == "sub" {
         let (parent, sub) = (comps[n - 4], comps[n - 2]);
         if safe_component(parent) && safe_component(sub) {
-            return Some(format!("{parent}__sub_runs__{sub}"));
+            return Some(format!("{parent}__sub__{sub}"));
         }
     }
     None
@@ -262,7 +273,12 @@ mod tests {
                 },
             )
             .unwrap();
+        // The sub-run path is whatever `RunStore` really writes — derived from
+        // the store, never a literal, so a layout change fails this test
+        // instead of silently un-claiming every sub-run transcript.
+        let (_sub_id, sub_transcript) = store.create_sub_run(id, "reviewer").unwrap();
         // events.jsonl: a StepWorking with a path, one without, a UnitStarted,
+        // a DispatchStarted (the only announcement a sub-run path ever gets),
         // and a duplicate of the step-result path.
         let mut f = std::fs::File::create(store.events_path(id)).unwrap();
         for ev in [
@@ -286,10 +302,14 @@ mod tests {
                 index: 0,
                 unit_key: "a".into(),
                 agent: None,
-                transcript_path: PathBuf::from(
-                    "/remote/.rupu/runs/run_01RECORDED/sub_runs/sub_01P/transcript.jsonl",
-                ),
+                transcript_path: PathBuf::from("/remote/proj/.rupu/transcripts/run_01UNIT.jsonl"),
                 host: None,
+            },
+            Event::DispatchStarted {
+                run_id: id.into(),
+                sub_run_id: _sub_id.clone(),
+                agent: Some("reviewer".into()),
+                transcript_path: sub_transcript.clone(),
             },
             Event::StepWorking {
                 run_id: id.into(),
@@ -304,18 +324,33 @@ mod tests {
         }
 
         let got = recorded_transcript_paths(&store, id);
+        // Sorted through the same `BTreeSet` ordering the function uses — the
+        // sub-run path is under a tempdir, so its position isn't fixed.
         let want: Vec<PathBuf> = [
-            "/remote/.rupu/runs/run_01RECORDED/sub_runs/sub_01P/transcript.jsonl",
             "/remote/proj/.rupu/transcripts/run_01ACTIVE.jsonl",
             "/remote/proj/.rupu/transcripts/run_01CKPT.jsonl",
             "/remote/proj/.rupu/transcripts/run_01ITEM.jsonl",
             "/remote/proj/.rupu/transcripts/run_01PLAN.jsonl",
+            "/remote/proj/.rupu/transcripts/run_01UNIT.jsonl",
             "/remote/proj/.rupu/transcripts/run_01WORK.jsonl",
         ]
         .iter()
         .map(PathBuf::from)
+        .chain(std::iter::once(sub_transcript.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
         assert_eq!(got, want);
+        assert!(
+            got.contains(&sub_transcript),
+            "a DispatchStarted sub-run transcript must enter the allowlist"
+        );
+        // …and the path it announces must actually map to a cache key.
+        assert!(
+            cache_key(&sub_transcript).is_some(),
+            "sub-run path {} must map to a cache key",
+            sub_transcript.display()
+        );
     }
 
     #[test]
@@ -344,12 +379,16 @@ mod tests {
             cache_key(Path::new("/home/ci/.rupu/transcripts/run_01AGENT.jsonl")).as_deref(),
             Some("run_01AGENT")
         );
+        // The sub-run shape is taken from the real writer, not a literal:
+        // `RunStore::create_sub_run` is what defines the directory layout, and
+        // an earlier hard-coded `sub_runs` here matched a layout that never
+        // existed.
+        let (store, _tmp) = store();
+        store.create(record("run_01P"), "").unwrap();
+        let (sub_id, transcript) = store.create_sub_run("run_01P", "reviewer").unwrap();
         assert_eq!(
-            cache_key(Path::new(
-                "/home/ci/.rupu/runs/run_01P/sub_runs/sub_01X/transcript.jsonl"
-            ))
-            .as_deref(),
-            Some("run_01P__sub_runs__sub_01X")
+            cache_key(&transcript).as_deref(),
+            Some(format!("run_01P__sub__{sub_id}").as_str())
         );
     }
 
@@ -362,7 +401,7 @@ mod tests {
             "/home/ci/.rupu/transcripts/../secrets/run_01A.jsonl",
             "/home/ci/notes/run_01A.jsonl",
             "/home/ci/.rupu/transcripts/we ird.jsonl",
-            "/home/ci/.rupu/runs/run_01P/sub_runs/transcript.jsonl",
+            "/home/ci/.rupu/runs/run_01P/sub/transcript.jsonl",
         ] {
             assert_eq!(cache_key(Path::new(bad)), None, "{bad} must not map");
         }
