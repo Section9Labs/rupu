@@ -953,6 +953,16 @@ private func makeStore(
     #expect(store.transcriptTailActive == true)
     #expect(store.detail.value != nil)
 
+    // Review fix: a remote run's `events` surface (the Events tab feed) must
+    // populate exactly like a local run's — `RunDetailTabs.EventsTabContent`
+    // no longer special-cases `isRemote` at all, so this is what actually
+    // proves the tab renders real content instead of the old placeholder.
+    let event = CPEvent.stepStarted(runID: "run-1", stepID: "build", kind: "step", agent: nil, host: "remote-1")
+    runBox.latest.yield(.event(event))
+    let settled = await pollUntil { !store.eventsForSelection().isEmpty }
+    #expect(settled, "expected a remote run's event stream to populate eventsForSelection()")
+    #expect(store.eventsForSelection().contains(event))
+
     store.deactivate()
     tailBox.latest.finish()
     runBox.latest.finish()

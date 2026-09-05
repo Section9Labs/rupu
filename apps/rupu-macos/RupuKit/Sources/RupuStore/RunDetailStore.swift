@@ -6,8 +6,9 @@ import RupuAPI
 /// REST-backed `BlockState`s (`detail`/`graph`/`netflow`/`findings` — one
 /// failing never blanks the others, same contract as every other block on
 /// this screen), the step graph's live `liveStates` (driven by a run-scoped
-/// `CPEvent` stream for local runs only), and the focused step's transcript
-/// feed (`transcript`, snapshot-then-tail).
+/// `CPEvent` stream for both local and remote runs alike — see "Local vs
+/// remote" below), and the focused step's transcript feed (`transcript`,
+/// snapshot-then-tail).
 ///
 /// **Local vs remote**: `isRemote` (`host` present and not `"local"`) no
 /// longer gates either stream off — a remote run's events and transcript
@@ -238,8 +239,11 @@ public final class RunDetailStore {
     private let postArchive: @Sendable () async throws -> RunControlResponse
     private let postRestore: @Sendable () async throws -> RunControlResponse
 
-    /// `nil` for a remote store (never called) or when `backend` has no live
-    /// connection configured yet — both cases leave the run stream off.
+    /// Built unconditionally by the production convenience init for both
+    /// local and remote stores alike (see the type doc comment's "Local vs
+    /// remote" section) — `nil` only for a test store that passes no boxes,
+    /// or when the underlying `BackendController.makeRunEventStream` call
+    /// itself returns `nil` (no live connection configured yet).
     private let runSignalsFactory: (@Sendable () -> AsyncStream<StreamSignal<CPEvent>>)?
     private let transcriptTailFactory: (@Sendable (String) -> AsyncStream<StreamSignal<TranscriptEvent>>)?
 
@@ -280,8 +284,9 @@ public final class RunDetailStore {
 
     /// Production entry point — `RunDetailScreen` calls this. `isRemote` is
     /// derived once, here, from `host` (`nil` or `"local"` means the
-    /// embedded/attached local backend; anything else is a Fleet node, REST
-    /// only this phase — see api-facts.md's `host_id` convention, the same
+    /// embedded/attached local backend; anything else is a Fleet node,
+    /// streamed and tailed through the coordinator's lazy SSH mirror same
+    /// as a local run — see api-facts.md's `host_id` convention, the same
     /// one `ActivityRow.localHost` already codifies).
     public convenience init(runID: String, host: String?, client: CPClient, backend: BackendController) {
         let isRemote = host != nil && host != "local"
@@ -755,9 +760,12 @@ public final class RunDetailStore {
             // mutation's own post-POST refresh, or just a screen
             // re-appearing) re-checks every currently-`.pending` key for
             // this run against the REST-observed status, so a marker verb
-            // (approve/resume) still confirms even for a remote run (no
-            // live stream at all) or if the live event that should have
-            // confirmed it faster never arrived.
+            // (approve/resume) still confirms even for a store with no run
+            // stream configured at all (a test double, or a production
+            // store whose `BackendController` had no live connection when
+            // it built the factory) or if the live event that should have
+            // confirmed it faster never arrived — local and remote runs
+            // alike.
             pendingActions.resolve(runID: runID, observedStatus: .normalize(d.run.status))
         } catch {
             // Cancellation (e.g. `RunDetailScreen`'s `.task(id: runID)`
@@ -845,10 +853,11 @@ public final class RunDetailStore {
     /// store since `graphVM` is the only consumer): `liveStates` wins
     /// outright per step; a gate the run is *currently* parked on
     /// (`detail.run.awaiting`) fills in `.gatePending` for any step with no
-    /// live entry at all — the remote case (no stream, so `liveStates`
-    /// never gets anything) and a local run whose gate was already parked
-    /// before this screen was ever opened (no live `stepAwaitingApproval`
-    /// event to replay). Never overrides an existing live entry.
+    /// live entry at all — a run (local or remote alike) whose gate was
+    /// already parked before this screen was ever opened, so there was no
+    /// live `stepAwaitingApproval` event to replay, plus any store with no
+    /// run stream configured at all (a test double, or before any live
+    /// event has arrived). Never overrides an existing live entry.
     private func effectiveLiveStates() -> [String: NodeState] {
         var states = liveStates
         guard case .content(let d) = detail else { return states }
