@@ -1810,7 +1810,25 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
-        let run_id = format!("run_{}", Ulid::new());
+        // A coordinator dispatching a placed unit already minted this run's
+        // id (see `UnitDispatch::run_id`) so it can know the child run's
+        // mirrored transcript path before dispatch — validate it BEFORE
+        // touching `build_remote_command`/`detach_launch` (nothing shells
+        // for a bad id) and before `create_run` (no mirror record left
+        // behind). `None` ⇒ this connector mints one, as before.
+        let run_id = match req.run_id.as_deref() {
+            Some(id) => {
+                let ok = id.starts_with("run_")
+                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ok {
+                    return Err(HostConnectorError::Invalid(format!(
+                        "supplied run id {id:?} is not a valid run id"
+                    )));
+                }
+                id.to_string()
+            }
+            None => format!("run_{}", Ulid::new()),
+        };
 
         let spec = RunSpec {
             kind: RunSpecKind::Agent,
@@ -5534,6 +5552,7 @@ mod tests {
                     mode: None,
                     target: None,
                     working_dir: None,
+                    run_id: None,
                 })
                 .await
                 .expect("launch_agent");
@@ -5714,6 +5733,7 @@ mod tests {
                 mode: None,
                 target: None,
                 working_dir: Some(STAGED_WD.into()),
+                run_id: None,
             })
             .await
             .unwrap();
@@ -5733,6 +5753,53 @@ mod tests {
             launch.contains(&format!("2>>$HOME/.rupu/runs/{run_id}/launch.log")),
             "agent launch must keep its stderr: {launch}"
         );
+    }
+
+    #[tokio::test]
+    async fn launch_agent_honours_a_coordinator_minted_run_id() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let id = conn
+            .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "reviewer".into(),
+                prompt: Some("go".into()),
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some("run_01MINTEDBYCOORD".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(id, "run_01MINTEDBYCOORD");
+        assert_eq!(
+            run_store.load(&id).unwrap().worker_id.as_deref(),
+            Some("host_abc")
+        );
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("'--run-id' 'run_01MINTEDBYCOORD'")),
+            "{cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_agent_rejects_a_malformed_supplied_run_id_without_dispatching() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let err = conn
+            .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "reviewer".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some("../evil".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err}");
+        assert!(fake.commands.lock().unwrap().is_empty(), "nothing shelled");
     }
 
     #[tokio::test]

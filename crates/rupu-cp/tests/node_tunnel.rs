@@ -960,6 +960,7 @@ mod tunnel_connector {
             mode: None,
             target: None,
             working_dir: None,
+            run_id: None,
         }
     }
 

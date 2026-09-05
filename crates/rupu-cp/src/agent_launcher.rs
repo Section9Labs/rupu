@@ -8,6 +8,11 @@ pub struct AgentLaunchRequest {
     /// Working directory for the run (project/dir target). When `None` the
     /// run executes in the cp-serve process's cwd.
     pub working_dir: Option<String>,
+    /// Run id to execute under, when the caller already minted one (a
+    /// placed unit's coordinator, see `UnitDispatch::run_id`). Honoured by
+    /// connectors that mint ids themselves (SSH); the local and HTTP
+    /// connectors ignore it this arc. `None` → the connector mints.
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

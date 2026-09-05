@@ -820,6 +820,7 @@ async fn run_agent_with(
         mode: body.mode,
         target: body.target,
         working_dir: body.working_dir,
+        run_id: None,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -957,6 +958,7 @@ async fn run_agent(
             mode: b.mode,
             target: b.target,
             working_dir: b.working_dir,
+            run_id: None,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),

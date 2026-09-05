@@ -74,6 +74,7 @@ mod tests {
             mode: Some("bypass".into()),
             target: Some("github:o/r".into()),
             working_dir: None,
+            run_id: None,
         };
         let argv = build_agent_argv(&req, "run_X");
         assert_eq!(
@@ -101,6 +102,7 @@ mod tests {
             mode: None,
             target: None,
             working_dir: None,
+            run_id: None,
         };
         assert_eq!(
             build_agent_argv(&req, "run_X"),
@@ -116,6 +118,7 @@ mod tests {
             mode: None,
             target: None,
             working_dir: None,
+            run_id: None,
         };
         assert_eq!(
             build_agent_argv(&req, "run_X"),

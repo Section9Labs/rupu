@@ -364,6 +364,7 @@ mod tests {
                 mode: None,
                 target: None,
                 working_dir: None,
+                run_id: None,
             })
             .await
             .unwrap();
