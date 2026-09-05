@@ -173,6 +173,7 @@ decoders are unaffected.
 | Condition | Response |
 |-----------|----------|
 | Unknown `host` | 404 |
+| Unknown `run` (no such run in the coordinator's store) | 404 |
 | `host` is remote, path is not local, `run` missing | 400 |
 | Run not owned by host, or path not in `recorded_transcript_paths` | 400 |
 | Host unreachable on a cache miss with nothing on disk | 502, message names the host |
@@ -194,11 +195,15 @@ same SSE contract as local ones; there is no second streaming protocol.
 
 Keyed by cache path. Behaviour:
 
-- **First subscriber:** truncate the cache file (create empty), spawn
-  `tail -n +1 -F '<remote path>'` via `RemoteExec::spawn_lines`, and append
-  each received line to the cache file. `tail -n +1` replays from byte zero,
-  which is why truncation is both safe and what makes a re-subscribe
-  idempotent — the same pattern the pump uses for the agent transcript
+- **First subscriber:** spawn `tail -n +1 -F '<remote path>'` via
+  `RemoteExec::spawn_lines` and append each received line to the cache file.
+  The cache is truncated by the feeding task when its FIRST line arrives, not
+  by `subscribe`: `tail -n +1` replays from byte zero, so that line is exactly
+  the point at which the old content becomes redundant, and deferring the
+  truncate means a spawn that fails — or a host that never answers — leaves
+  already-collected content intact instead of handing the viewer an empty page.
+  The byte-zero replay is what makes a re-subscribe idempotent — the same
+  pattern the pump uses for the agent transcript
   (`NodeMirror::reset_transcript`).
 - **Additional subscribers:** share the running child; the refcount
   increments. Two viewers of one step (web + Mac) cost one ssh session.
@@ -212,8 +217,8 @@ Keyed by cache path. Behaviour:
   registry marks the entry dead and stops appending. The `TranscriptTail`
   keeps polling the file (which stops growing), so the SSE stream stays open
   but quiet; when the client reconnects (existing behaviour on both clients),
-  the fresh subscribe truncates and replays. No duplicate lines are possible
-  because every replay starts from an empty file.
+  the fresh subscribe replays, truncating on its own first line. No duplicate
+  lines are possible because every replay starts from an empty file.
 
 The registry lives on `SshHostConnector` next to `pumps`, and is bounded by
 construction: at most one child per distinct file, never for complete files.
