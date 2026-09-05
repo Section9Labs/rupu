@@ -100,6 +100,30 @@ pub fn cache_key(recorded: &Path) -> Option<String> {
     None
 }
 
+/// The CP global dir a run store belongs to: the store root is
+/// `<global>/runs`, so the global dir is its parent (a root with no parent —
+/// only possible for a filesystem root — degrades to the root itself).
+///
+/// The single definition of a derivation four call sites used to spell out
+/// independently (`NodeMirror::global_dir`, `SshHostConnector::global_dir`,
+/// `usage::run_transcript_paths`, and the CLI's fleet unit dispatcher), so a
+/// future layout change can't drift them apart.
+pub fn global_dir_of(store: &RunStore) -> PathBuf {
+    store
+        .root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| store.root.clone())
+}
+
+/// Where a run's own agent transcript is mirrored:
+/// `<global>/transcripts/<run_id>.jsonl` — the exact path a locally-run
+/// agent's transcript occupies, so it falls inside `/api/transcript`'s
+/// allowed roots. Callers validate `run_id` before using this for I/O.
+pub fn agent_mirror_path(global: &Path, run_id: &str) -> PathBuf {
+    global.join("transcripts").join(format!("{run_id}.jsonl"))
+}
+
 /// `<global>/mirror/<host_id>/transcripts/<key>.jsonl`.
 pub fn cache_path(global: &Path, host_id: &str, recorded: &Path) -> Option<PathBuf> {
     let key = cache_key(recorded)?;
@@ -342,6 +366,19 @@ mod tests {
         ] {
             assert_eq!(cache_key(Path::new(bad)), None, "{bad} must not map");
         }
+    }
+
+    #[test]
+    fn global_dir_and_agent_mirror_path_layout() {
+        let (store, tmp) = store();
+        assert_eq!(global_dir_of(&store), tmp.path());
+        assert_eq!(
+            agent_mirror_path(&global_dir_of(&store), "run_01AGENT"),
+            tmp.path().join("transcripts/run_01AGENT.jsonl")
+        );
+        // A store root with no parent degrades to the root itself.
+        let rootish = RunStore::new(PathBuf::from("/"));
+        assert_eq!(global_dir_of(&rootish), PathBuf::from("/"));
     }
 
     #[test]

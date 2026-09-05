@@ -13,7 +13,7 @@ use rupu_transcript::UsageRow;
 use rupu_transcript::{Event, JsonlReader};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Token + cost summary for a run, or any rollup of runs.
 ///
@@ -103,11 +103,7 @@ pub fn run_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
     let Some(worker) = rec.worker_id.as_deref() else {
         return paths;
     };
-    let global = store
-        .root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| store.root.clone());
+    let global = crate::host::transcript_paths::global_dir_of(store);
     paths
         .into_iter()
         .map(|p| {

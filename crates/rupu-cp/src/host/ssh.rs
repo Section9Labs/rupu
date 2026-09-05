@@ -1116,11 +1116,7 @@ impl SshHostConnector {
     /// The CP global dir, derived exactly as `NodeMirror::transcript_mirror_path`
     /// derives it: the run store root is `<global>/runs`.
     fn global_dir(&self) -> PathBuf {
-        self.run_store
-            .root
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.run_store.root.clone())
+        crate::host::transcript_paths::global_dir_of(&self.run_store)
     }
 
     /// Spec §3.3: a remote read is scoped to a run. `run_id` must be a run

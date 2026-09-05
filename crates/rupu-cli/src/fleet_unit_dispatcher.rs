@@ -576,11 +576,10 @@ impl UnitDispatcher for FleetUnitDispatcher {
         if !conn.serves_runs_from_local_mirror() {
             return None;
         }
-        Some(
-            self.global
-                .join("transcripts")
-                .join(format!("{unit_run_id}.jsonl")),
-        )
+        Some(rupu_cp::host::transcript_paths::agent_mirror_path(
+            &self.global,
+            unit_run_id,
+        ))
     }
 }
 

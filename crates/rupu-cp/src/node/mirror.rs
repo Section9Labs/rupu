@@ -244,8 +244,7 @@ impl NodeMirror {
     /// roots (the CP global dir). `run_id` is validated by every caller
     /// before this is used for I/O.
     pub fn transcript_mirror_path(&self, run_id: &str) -> PathBuf {
-        let global = self.run_store.root.parent().unwrap_or(&self.run_store.root);
-        global.join("transcripts").join(format!("{run_id}.jsonl"))
+        crate::host::transcript_paths::agent_mirror_path(&self.global_dir(), run_id)
     }
 
     /// Truncate (or create empty) the mirrored transcript for `run_id`.
@@ -333,11 +332,7 @@ impl NodeMirror {
 
     /// The CP global dir (`<global>/runs` is the store root).
     pub fn global_dir(&self) -> PathBuf {
-        self.run_store
-            .root
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| self.run_store.root.clone())
+        crate::host::transcript_paths::global_dir_of(&self.run_store)
     }
 
     /// Spec §8: the pump saw the agent transcript's first line. Point the
