@@ -88,6 +88,29 @@ fn remote_launch_log(run_id: &str) -> String {
     format!("{}/launch.log", remote_run_dir(run_id))
 }
 
+/// Build the branch that backgrounds `remote_cmd`, detached from the SSH
+/// session, via `setsid` when the remote shell has it or `nohup` otherwise.
+///
+/// `setsid` is not installed on macOS, so a fleet host running macOS killed
+/// every detached launch instantly with `command not found: setsid` — the
+/// Linux fleet never noticed because `setsid` ships there by default. The
+/// surrounding subshell (in [`SshHostConnector::detach_launch`]) plus `&`
+/// already double-forks, and stdin/stdout are already redirected, so `nohup`
+/// is sufficient for the process to survive the ssh session closing; the
+/// existing `>/dev/null` redirects mean it never gets the chance to write a
+/// `nohup.out`.
+///
+/// `stderr_redirect` is the trailing redirect (e.g. `2>&1` or `2>>{log}`),
+/// shared verbatim between both branches so the two callers
+/// ([`SshHostConnector::detach`] and [`SshHostConnector::detach_launch`])
+/// cannot drift on it. The returned fragment is NOT parenthesised — callers
+/// that need the whole thing backgrounded as one unit wrap it themselves.
+fn detach_fragment(remote_cmd: &str, stderr_redirect: &str) -> String {
+    format!(
+        "if command -v setsid >/dev/null 2>&1; then setsid {remote_cmd} </dev/null >/dev/null {stderr_redirect} & else nohup {remote_cmd} </dev/null >/dev/null {stderr_redirect} & fi"
+    )
+}
+
 /// Token the run-start evidence probe prints when the host DOES show the run
 /// started, and the one it prints when it does not. The probe always exits 0
 /// and answers on stdout so a transport failure (ssh exit 255, no output) is
@@ -1005,9 +1028,10 @@ fn classify_remote_cli_failure(stderr: &str) -> HostConnectorError {
 ///
 /// Dispatches workflow/agent runs as detached remote processes (see
 /// [`Self::detach_launch`] for the exact wrapper: `cd` into the staged
-/// working dir when there is one, `setsid`, stdin/stdout to `/dev/null`,
-/// stderr to a per-run `launch.log`), mirrors their artifact files via an
-/// `ssh tail -f` pump that routes `==>` file headers to the right
+/// working dir when there is one, `setsid` when the remote host has it or
+/// `nohup` otherwise (macOS fleet hosts ship no `setsid`), stdin/stdout to
+/// `/dev/null`, stderr to a per-run `launch.log`), mirrors their artifact
+/// files via an `ssh tail -f` pump that routes `==>` file headers to the right
 /// [`ArtifactFile`] variant, and issues control operations as one-shot
 /// remote `rupu workflow` commands.  Auth is entirely delegated to the
 /// system `ssh`; rupu stores no key material.
@@ -1195,8 +1219,12 @@ impl SshHostConnector {
     /// so it is detached and survives the SSH session closing. Plain
     /// wrapper: no cwd, no log — the run it resumes already has its
     /// lifecycle on the host. Launches use [`Self::detach_launch`].
+    ///
+    /// Detaches via `setsid` when the remote shell has it, else falls back
+    /// to `nohup` (macOS fleet hosts ship no `setsid`) — see
+    /// [`detach_fragment`].
     fn detach(remote_cmd: &str) -> String {
-        format!("setsid {remote_cmd} </dev/null >/dev/null 2>&1 &")
+        detach_fragment(remote_cmd, "2>&1")
     }
 
     /// Wrap a shell-escaped remote launch (`rupu run …` / `rupu workflow run
@@ -1208,7 +1236,11 @@ impl SshHostConnector {
     ///
     /// ```text
     /// mkdir -p $HOME/.rupu/runs/<run_id> && (umask 077; : > <log>) && \
-    ///   cd '<working_dir>' && (setsid <remote_cmd> </dev/null >/dev/null 2>><log> &)
+    ///   cd '<working_dir>' && (if command -v setsid >/dev/null 2>&1; then \
+    ///     setsid <remote_cmd> </dev/null >/dev/null 2>><log> & \
+    ///   else \
+    ///     nohup <remote_cmd> </dev/null >/dev/null 2>><log> & \
+    ///   fi)
     /// ```
     ///
     /// with the `cd '<working_dir>' &&` segment present only when
@@ -1220,7 +1252,13 @@ impl SshHostConnector {
     ///   its tree and then runs the agent in the login `$HOME` — the delta is
     ///   collected from a directory the agent never touched. `None` keeps
     ///   the self-contained path's cwd exactly as before.
-    /// - **Only the `setsid` is backgrounded** — the `mkdir`/log-create/`cd`
+    /// - **`setsid` when present, `nohup` otherwise** ([`detach_fragment`]).
+    ///   macOS ships no `setsid`, so an unconditional `setsid` killed every
+    ///   launch onto a macOS fleet host instantly with `command not found`;
+    ///   the surrounding subshell + `&` already double-forks and stdin/stdout
+    ///   are already redirected, so `nohup` alone is enough to survive the
+    ///   ssh session closing.
+    /// - **Only that branch is backgrounded** — the `mkdir`/log-create/`cd`
     ///   run in the ssh session's foreground, so a failure there (staged dir
     ///   vanished, unwritable `$HOME`) is a non-zero ssh exit that the
     ///   launch reports, instead of a "successful" detach with no process
@@ -1263,7 +1301,8 @@ impl SshHostConnector {
             cmd.push_str(&format!("cd {} && ", shell_escape(wd)));
         }
         cmd.push_str(&format!(
-            "(setsid {remote_cmd} </dev/null >/dev/null 2>>{log} &)"
+            "({})",
+            detach_fragment(remote_cmd, &format!("2>>{log}"))
         ));
         Ok(cmd)
     }
@@ -5827,13 +5866,21 @@ mod tests {
     fn detach_launch_cds_into_working_dir_before_setsid() {
         let cmd = SshHostConnector::detach_launch("'rupu' 'run' 'a'", "run_01X", Some(STAGED_WD))
             .unwrap();
+        assert!(
+            cmd.contains("command -v setsid"),
+            "launch must probe for setsid before choosing a detach method: {cmd}"
+        );
         let cd = cmd
             .find(&format!("cd '{STAGED_WD}' && "))
             .unwrap_or_else(|| panic!("launch must cd into the staged dir: {cmd}"));
         let setsid = cmd
             .find("setsid 'rupu' 'run' 'a'")
-            .unwrap_or_else(|| panic!("launch must still be detached via setsid: {cmd}"));
+            .unwrap_or_else(|| panic!("launch must still offer detach via setsid: {cmd}"));
+        let nohup = cmd.find("nohup 'rupu' 'run' 'a'").unwrap_or_else(|| {
+            panic!("launch must fall back to nohup when setsid is absent (macOS): {cmd}")
+        });
         assert!(cd < setsid, "cd must precede the launch: {cmd}");
+        assert!(cd < nohup, "cd must precede the launch: {cmd}");
     }
 
     #[test]
@@ -5844,8 +5891,16 @@ mod tests {
             "self-contained launch must keep the login cwd: {cmd}"
         );
         assert!(
+            cmd.contains("command -v setsid"),
+            "launch must probe for setsid before choosing a detach method: {cmd}"
+        );
+        assert!(
             cmd.contains("setsid 'rupu' 'run' 'a' </dev/null >/dev/null"),
-            "detach shape must be unchanged: {cmd}"
+            "setsid branch shape must be present: {cmd}"
+        );
+        assert!(
+            cmd.contains("nohup 'rupu' 'run' 'a' </dev/null >/dev/null"),
+            "nohup fallback branch must be present (macOS has no setsid): {cmd}"
         );
     }
 
@@ -5866,7 +5921,7 @@ mod tests {
         // nothing of the value leaks past the closing quote.
         let after_cd = &cmd[cmd.find("cd ").unwrap() + 3..];
         let end = after_cd
-            .find(" && (setsid")
+            .find(" && (if command -v setsid")
             .unwrap_or_else(|| panic!("launch must follow the cd: {cmd}"));
         assert_eq!(&after_cd[..end], quoted);
         // Remove the one quoted literal; no hostile fragment may survive
@@ -5902,13 +5957,21 @@ mod tests {
     fn detach_launch_captures_stderr_in_per_run_log_not_dev_null() {
         let cmd = SshHostConnector::detach_launch("'rupu' 'run' 'a'", "run_01X", None).unwrap();
         let log = "$HOME/.rupu/runs/run_01X/launch.log";
-        assert!(
-            cmd.contains(&format!("2>>{log} &)")),
-            "stderr must append to the per-run log: {cmd}"
+        // Both the setsid and the nohup branch append the launched process's
+        // stderr to the per-run log — whichever branch the remote shell
+        // actually takes.
+        assert_eq!(
+            cmd.matches(&format!("2>>{log} &")).count(),
+            2,
+            "stderr must append to the per-run log in both branches: {cmd}"
         );
+        // The `2>&1` here belongs to the `command -v setsid` existence probe,
+        // not the launched process's own redirect — that one must still land
+        // on the per-run log, never `/dev/null` or the ssh channel's stderr.
         assert!(
-            !cmd.contains("2>&1") && !cmd.contains("2>/dev/null"),
-            "stderr must not be discarded: {cmd}"
+            !cmd.contains("</dev/null >/dev/null 2>&1")
+                && !cmd.contains("</dev/null >/dev/null 2>/dev/null"),
+            "launched process's stderr must not be discarded: {cmd}"
         );
         assert!(
             cmd.starts_with("mkdir -p $HOME/.rupu/runs/run_01X && "),
@@ -5920,12 +5983,99 @@ mod tests {
         );
         // stdin/stdout exactly as before.
         assert!(cmd.contains("</dev/null >/dev/null"), "{cmd}");
-        // Only the setsid is backgrounded: the `&` closes the subshell and the
-        // mkdir / log-create run in the ssh session's foreground, so their
-        // failure is a non-zero ssh exit rather than a silent "success".
-        assert!(cmd.ends_with(" &)"), "{cmd}");
+        // Only the setsid-or-nohup branch is backgrounded: the outer `&)`
+        // closes the subshell and the mkdir / log-create run in the ssh
+        // session's foreground, so their failure is a non-zero ssh exit
+        // rather than a silent "success".
+        assert!(cmd.ends_with(" fi)"), "{cmd}");
+        // Three lone `&` outside `&&` pairs: the `command -v setsid`
+        // probe's `2>&1`, plus one backgrounding `&` per branch — only one
+        // of which actually runs on the remote shell.
         let single_amps = cmd.matches('&').count() - 2 * cmd.matches("&&").count();
-        assert_eq!(single_amps, 1, "exactly one backgrounding `&`: {cmd}");
+        assert_eq!(single_amps, 3, "probe redirect + one `&` per branch: {cmd}");
+    }
+
+    #[test]
+    fn detach_fragment_falls_back_to_nohup_when_setsid_is_absent() {
+        let fragment = detach_fragment("'sh' '-c' 'x'", "2>&1");
+        assert_eq!(
+            fragment,
+            "if command -v setsid >/dev/null 2>&1; then setsid 'sh' '-c' 'x' </dev/null >/dev/null 2>&1 & else nohup 'sh' '-c' 'x' </dev/null >/dev/null 2>&1 & fi"
+        );
+    }
+
+    /// End-to-end proof, not just a string assertion: run the `detach_launch`
+    /// output through a REAL shell whose `PATH` has no `setsid` at all — the
+    /// exact condition that broke every macOS fleet-host launch — and check
+    /// the nohup-backed process actually starts and writes its output.
+    #[test]
+    fn detach_launch_survives_without_setsid_via_nohup() {
+        fn resolve(name: &str) -> Option<std::path::PathBuf> {
+            let out = std::process::Command::new("which")
+                .arg(name)
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+        }
+
+        let Some(nohup) = resolve("nohup") else {
+            eprintln!(
+                "skipping detach_launch_survives_without_setsid_via_nohup: no nohup on this system"
+            );
+            return;
+        };
+
+        // A PATH containing only symlinks to the handful of tools the
+        // detached launch shells out to — deliberately no `setsid`, so the
+        // fallback branch is what actually executes here.
+        let path_dir = tempfile::tempdir().unwrap();
+        for tool in ["sh", "mkdir", "touch", "cat"] {
+            let Some(real) = resolve(tool) else {
+                eprintln!(
+                    "skipping detach_launch_survives_without_setsid_via_nohup: no {tool} on this system"
+                );
+                return;
+            };
+            std::os::unix::fs::symlink(&real, path_dir.path().join(tool)).unwrap();
+        }
+        std::os::unix::fs::symlink(&nohup, path_dir.path().join("nohup")).unwrap();
+
+        let fake_home = tempfile::tempdir().unwrap();
+        let tmpfile = fake_home.path().join("started.txt");
+        let remote_cmd = build_remote_command(&[
+            "sh".into(),
+            "-c".into(),
+            format!("echo started > {}", tmpfile.display()),
+        ]);
+        let cmd = SshHostConnector::detach_launch(&remote_cmd, "run_01E2ENOSETSID", None).unwrap();
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("HOME", fake_home.path())
+            .env("PATH", path_dir.path())
+            .status()
+            .expect("the launcher shell itself must run");
+        assert!(status.success(), "launcher shell must exit 0: {cmd}");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&tmpfile) {
+                assert_eq!(contents, "started\n", "unexpected output: {contents:?}");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "nohup-launched process on a setsid-less PATH never wrote {}: {cmd}",
+                    tmpfile.display()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[tokio::test]
@@ -5952,7 +6102,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no detached launch in {cmds:?}"));
         assert!(
             launch.contains(&format!(
-                "cd '{STAGED_WD}' && (setsid 'rupu' 'run' 'reviewer'"
+                "cd '{STAGED_WD}' && (if command -v setsid >/dev/null 2>&1; then setsid 'rupu' 'run' 'reviewer'"
             )),
             "agent launch must run in the staged dir: {launch}"
         );
@@ -6031,7 +6181,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no detached launch in {cmds:?}"));
         assert!(
             launch.contains(&format!(
-                "cd '{STAGED_WD}' && (setsid 'rupu' 'workflow' 'run' 'deploy'"
+                "cd '{STAGED_WD}' && (if command -v setsid >/dev/null 2>&1; then setsid 'rupu' 'workflow' 'run' 'deploy'"
             )),
             "workflow launch must run in the working dir: {launch}"
         );
