@@ -836,11 +836,27 @@ fn host_connector_err(id: &str, host_id: &str, e: HostConnectorError) -> ApiErro
 
 /// Proxy `GET /api/runs/:id` to a resolved host. Shared by the explicit
 /// `?host=` branch and the resolver's [`RunLocation::Host`] branch.
+///
+/// Remote-first: the remote's own answer is richer while it is reachable, so
+/// it is always tried before anything else. Only on error, and only for a
+/// transport whose runs are mirrored into our own `RunStore`
+/// ([`HostConnector::serves_runs_from_local_mirror`]), do we fall back to
+/// that local mirror — this is what keeps a freshly-launched SSH run from
+/// 404ing on "does not support `rupu run show`" for the first few seconds
+/// before the remote has written its own record, and keeps working against
+/// hosts whose `rupu` predates the `run show` command entirely.
 async fn get_run_from_host(s: &AppState, host_id: &str, id: &str) -> ApiResult<serde_json::Value> {
     let conn = resolve_host(s, host_id)?;
-    conn.get_run(id)
-        .await
-        .map_err(|e| host_connector_err(id, host_id, e))
+    match conn.get_run(id).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if conn.serves_runs_from_local_mirror() && s.run_store.load(id).is_ok() {
+                return query_run_detail(&s.run_store, id, &s.pricing)
+                    .map_err(|e| run_not_found_or_internal(id, e));
+            }
+            Err(host_connector_err(id, host_id, e))
+        }
+    }
 }
 
 /// Build a `RunRecord`-shaped JSON value (plus a sibling `cycle_id`) for a
@@ -1435,7 +1451,10 @@ mod tests {
         let resp = approve_run(
             State(s.clone()),
             Path("run_app".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             None,
         )
         .await
@@ -1471,7 +1490,10 @@ mod tests {
         let resp = reject_run(
             State(s.clone()),
             Path("run_rej".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             Json(body),
         )
         .await
@@ -1497,7 +1519,10 @@ mod tests {
         let err = approve_run(
             State(s),
             Path("run_done".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             None,
         )
         .await
@@ -1512,7 +1537,10 @@ mod tests {
         let err = reject_run(
             State(s),
             Path("nope".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             Json(RejectBody { reason: None }),
         )
         .await
@@ -1534,7 +1562,10 @@ mod tests {
         let _ = approve_run(
             State(s.clone()),
             Path("run_mode".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             Some(Json(body)),
         )
         .await
@@ -1557,7 +1588,10 @@ mod tests {
         let _ = approve_run(
             State(s.clone()),
             Path("run_nobody".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             None,
         )
         .await
@@ -1600,7 +1634,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(multi_gate_awaiting_record("run_multi_approve_b"), "name: x\n")
+            .create(
+                multi_gate_awaiting_record("run_multi_approve_b"),
+                "name: x\n",
+            )
             .unwrap();
 
         let resp = approve_run(
@@ -1651,7 +1688,10 @@ mod tests {
         let err = approve_run(
             State(s.clone()),
             Path("run_multi_ambig".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             None,
         )
         .await
@@ -1673,7 +1713,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(multi_gate_awaiting_record("run_multi_unknown_gate"), "name: x\n")
+            .create(
+                multi_gate_awaiting_record("run_multi_unknown_gate"),
+                "name: x\n",
+            )
             .unwrap();
 
         let err = approve_run(
@@ -1698,7 +1741,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(multi_gate_awaiting_record("run_multi_reject_a"), "name: x\n")
+            .create(
+                multi_gate_awaiting_record("run_multi_reject_a"),
+                "name: x\n",
+            )
             .unwrap();
 
         let resp = reject_run(
@@ -1731,7 +1777,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
-            .create(multi_gate_awaiting_record("run_multi_reject_both"), "name: x\n")
+            .create(
+                multi_gate_awaiting_record("run_multi_reject_both"),
+                "name: x\n",
+            )
             .unwrap();
 
         let _ = reject_run(
@@ -1816,7 +1865,10 @@ mod tests {
         let resp = cancel_run(
             State(s.clone()),
             Path("run_cancel".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             None,
         )
         .await
@@ -1848,7 +1900,10 @@ mod tests {
         let err = cancel_run(
             State(s),
             Path("run_term".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             Some(Json(body)),
         )
         .await
@@ -1863,7 +1918,10 @@ mod tests {
         let err = cancel_run(
             State(s),
             Path("ghost".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
             None,
         )
         .await
@@ -1922,7 +1980,10 @@ mod tests {
         let resp = pause_run(
             State(s.clone()),
             Path("run_pause".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect("pause should succeed");
@@ -1948,7 +2009,10 @@ mod tests {
         let err = pause_run(
             State(s),
             Path("run_pause_done".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect_err("pausing a completed run should fail");
@@ -1967,7 +2031,10 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("run_resume_nolauncher".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect_err("resume without a launcher should be unavailable");
@@ -1985,7 +2052,10 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("run_resume_running".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect_err("resuming a running (non-paused) run should conflict");
@@ -2009,7 +2079,10 @@ mod tests {
         let resp = resume_run(
             State(s.clone()),
             Path("run_resume_ok".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect("resume should succeed");
@@ -2035,7 +2108,10 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("ghost".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect_err("resume on missing run should 404");
@@ -2065,7 +2141,10 @@ mod tests {
         let _ = archive_run(
             State(s.clone()),
             Path(id.clone()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect("archive ok");
@@ -2076,14 +2155,20 @@ mod tests {
         let _ = delete_run(
             State(s.clone()),
             Path(id.clone()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect("delete ok");
         let err = delete_run(
             State(s.clone()),
             Path(id.clone()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .unwrap_err();
@@ -2152,7 +2237,10 @@ mod tests {
         let err = archive_run(
             State(s.clone()),
             Path("../../etc".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .unwrap_err();
@@ -2168,7 +2256,10 @@ mod tests {
         let err = restore_run(
             State(s),
             Path("../../etc".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .unwrap_err();
@@ -2182,7 +2273,10 @@ mod tests {
         let err = delete_run(
             State(s),
             Path("../../etc".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .unwrap_err();
@@ -2200,7 +2294,10 @@ mod tests {
         let err = archive_run(
             State(s.clone()),
             Path(id),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .unwrap_err();
@@ -2225,7 +2322,10 @@ mod tests {
         let absent = archive_run(
             State(s.clone()),
             Path("run_01ABSENT".into()),
-            Query(RunControlQuery { host: None, gate: None }),
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            }),
         )
         .await
         .expect("absent host should archive locally")
@@ -2686,6 +2786,198 @@ mod tests {
         assert_eq!(resp.0, fake_run_json);
     }
 
+    /// Fake `HostConnector` that mimics an SSH host whose remote `rupu`
+    /// cannot answer `get_run` yet (no `rupu run show` support, or the
+    /// remote record isn't written yet) but whose runs are mirrored into
+    /// the coordinator's own `RunStore` — the seam Fix A exercises.
+    struct MirrorOnlyHostConnector;
+
+    #[async_trait::async_trait]
+    impl crate::host::connector::HostConnector for MirrorOnlyHostConnector {
+        async fn info(&self) -> Result<crate::host::connector::HostInfo, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_run(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_agent(
+            &self,
+            _req: crate::agent_launcher::AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn start_session(
+            &self,
+            _req: crate::session_starter::SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn send_session_turn(
+            &self,
+            _req: crate::session_sender::SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn list_runs(
+            &self,
+            _params: RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("no run show".into()))
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::EventByteStream, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        fn serves_runs_from_local_mirror(&self) -> bool {
+            true
+        }
+    }
+
+    /// Register `MirrorOnlyHostConnector` under host id `host_mirror` in a
+    /// fresh `HostRegistry`, mirroring the injection seam
+    /// `get_run_host_proxies` uses for `FakeHostConnector`.
+    fn mirror_only_registry(tmp: &tempfile::TempDir) -> Arc<crate::host::registry::HostRegistry> {
+        let conn: Arc<dyn crate::host::connector::HostConnector> =
+            Arc::new(MirrorOnlyHostConnector);
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: "host_mirror".into(),
+                name: "mirror".into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        Arc::new(crate::host::registry::HostRegistry::new(host_store, conn))
+    }
+
+    /// A `RunRecord` shaped like `NodeMirror::create_run`'s mirror record
+    /// (see `crates/rupu-cp/src/node/mirror.rs`) for a run mirrored from
+    /// `host_mirror`.
+    fn mirrored_record(id: &str) -> RunRecord {
+        RunRecord {
+            id: id.into(),
+            workflow_name: "wf".into(),
+            status: RunStatus::Running,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: String::new(),
+            workspace_path: PathBuf::from("."),
+            transcript_dir: PathBuf::from("/tmp/mirrored"),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: Some("host_mirror".into()),
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            resume_approver: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            final_output: None,
+            loop_progress: Default::default(),
+        }
+    }
+
+    /// Fix A: when the remote can't answer `get_run` (e.g. an SSH host that
+    /// doesn't support `rupu run show`, or hasn't written the record yet)
+    /// but the run is mirrored locally, `get_run_from_host` must serve the
+    /// mirrored record instead of surfacing the connector error.
+    #[tokio::test]
+    async fn get_run_host_falls_back_to_local_mirror_on_connector_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp).with_hosts(mirror_only_registry(&tmp));
+        s.run_store
+            .create(mirrored_record("run_01MIRRORED"), "")
+            .unwrap();
+
+        let resp = get_run(
+            State(s),
+            Path("run_01MIRRORED".into()),
+            Query(RunDetailQuery {
+                host: Some("host_mirror".into()),
+            }),
+        )
+        .await
+        .expect("a mirrored run must be served from the local mirror when the remote errors");
+        assert_eq!(resp.0["run"]["id"], serde_json::json!("run_01MIRRORED"));
+    }
+
+    /// Sibling of the above: when the run is NOT in the local mirror either,
+    /// the connector error must still surface (same status mapping as
+    /// today) rather than being swallowed into a misleading success.
+    #[tokio::test]
+    async fn get_run_host_surfaces_connector_error_when_not_mirrored_locally() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp).with_hosts(mirror_only_registry(&tmp));
+
+        let err = get_run(
+            State(s),
+            Path("run_never_mirrored".into()),
+            Query(RunDetailQuery {
+                host: Some("host_mirror".into()),
+            }),
+        )
+        .await
+        .expect_err("no local mirror record exists, so the connector error must surface");
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn autoflow_endpoint_returns_context() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2826,7 +3118,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
 
-        let d = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
+        let d = |day: u32| {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 8, day, 12, 0, 0)
+                .unwrap()
+        };
         s.run_store
             .create(record_started_at("run_aug_01", d(1)), "name: x\n")
             .unwrap();
@@ -2848,8 +3144,17 @@ mod tests {
 
         // No bounds at all → every run passes, same as before this task.
         let unbounded = crate::pagination::DateRangeQuery::default();
-        let rows = query_run_rows(&s.run_store, 0, 20, None, false, None, &s.pricing, &unbounded)
-            .expect("query_run_rows ok");
+        let rows = query_run_rows(
+            &s.run_store,
+            0,
+            20,
+            None,
+            false,
+            None,
+            &s.pricing,
+            &unbounded,
+        )
+        .expect("query_run_rows ok");
         assert_eq!(rows.len(), 3);
     }
 
@@ -2858,7 +3163,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
 
-        let d = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 8, day, 12, 0, 0).unwrap();
+        let d = |day: u32| {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 8, day, 12, 0, 0)
+                .unwrap()
+        };
         s.run_store
             .create(record_started_at("run_early", d(1)), "name: x\n")
             .unwrap();

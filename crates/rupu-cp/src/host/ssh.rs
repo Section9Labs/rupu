@@ -1774,18 +1774,19 @@ impl HostConnector for SshHostConnector {
         // itself exits nonzero on a connection failure.)
         let probe = build_remote_command(&["true".to_string()]);
         let reachable = matches!(self.exec.run(&probe).await, Ok(o) if o.success);
-        // Version: best-effort `rupu --version` (prints e.g. "rupu 0.35.2"),
-        // taking the trailing version token to match the bare-semver format the
-        // local/HTTP connectors report. Only attempted when reachable.
+        // Version: best-effort `rupu --version` (prints e.g. "rupu 0.35.2",
+        // or "rupu 0.77.0-beta.13 (beta)" on a beta build), taking the first
+        // whitespace-separated token that starts with an ASCII digit — the
+        // trailing token would instead grab the "(beta)" suffix on a beta
+        // build. Only attempted when reachable.
         let version = if reachable {
             let vc = build_remote_command(&["rupu".to_string(), "--version".to_string()]);
             match self.exec.run(&vc).await {
                 Ok(o) if o.success => o
                     .stdout
                     .split_whitespace()
-                    .last()
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty()),
+                    .find(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+                    .map(str::to_string),
                 _ => None,
             }
         } else {
@@ -4285,6 +4286,44 @@ mod tests {
         let info = conn.info().await.unwrap();
         assert!(info.reachable);
         assert_eq!(info.version.as_deref(), Some("0.35.2"));
+    }
+
+    /// A beta build prints a trailing `(beta)` marker after the version
+    /// (`rupu 0.77.0-beta.13 (beta)`) — the trailing-token approach would
+    /// grab `"(beta)"` itself; `info` must instead take the first token that
+    /// starts with a digit, so the reported version is the semver token.
+    #[tokio::test]
+    async fn info_reports_remote_rupu_version_on_beta_build() {
+        struct BetaVerExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for BetaVerExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                let stdout = if remote.contains("--version") {
+                    "rupu 0.77.0-beta.13 (beta)\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(BetaVerExec));
+        let info = conn.info().await.unwrap();
+        assert!(info.reachable);
+        assert_eq!(info.version.as_deref(), Some("0.77.0-beta.13"));
     }
 
     #[tokio::test]
