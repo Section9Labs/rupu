@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Getting started</title>
+<meta name="description" content="rupu documentation: install rupu and learn to build agents, workflows, autoflows, and sessions.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item active" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>rupu documentation</h1>
+    <p class="intro">rupu is an agentic code-development platform. You describe the work; agents and workflows do it — from the terminal, autonomously on triggers, or from a visual control plane.</p>
+
+    <div class="callout"><strong>Don't code it, rupu it.</strong> Define agents as plain Markdown, compose them into workflows, run them by hand or on triggers, and review everything with full transcripts and approvals.</div>
+
+    <h2>Install</h2>
+    <p>rupu is open source and no longer macOS-only. Every release ships prebuilt binaries for <strong>macOS (Apple Silicon)</strong> and <strong>Linux (x86_64 and aarch64)</strong>, native <code class="inline">.deb</code> and <code class="inline">.rpm</code> packages, community packages (AUR, Homebrew, Nix), and a from-source build with Cargo on any platform with a Rust toolchain.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Platform</th><th>Command / asset</th></tr></thead>
+      <tbody>
+        <tr><td>Homebrew</td><td>macOS &middot; Linux</td><td><code>brew install section9labs/tap/rupu</code></td></tr>
+        <tr><td>AUR</td><td>Arch Linux</td><td><code>yay -S rupu-bin</code> (or <code>paru -S rupu-bin</code>)</td></tr>
+        <tr><td>Nix</td><td>Linux &middot; macOS</td><td><code>nix run github:Section9Labs/rupu</code></td></tr>
+        <tr><td><code>.deb</code></td><td>Debian &middot; Ubuntu</td><td><code>rupu_&lt;version&gt;_amd64.deb</code> &middot; <code>rupu_&lt;version&gt;_arm64.deb</code></td></tr>
+        <tr><td><code>.rpm</code></td><td>Fedora &middot; RHEL</td><td><code>rupu-&lt;version&gt;-1.x86_64.rpm</code> &middot; <code>rupu-&lt;version&gt;-1.aarch64.rpm</code></td></tr>
+        <tr><td>APT / YUM repo</td><td>Debian &middot; Ubuntu &middot; Fedora &middot; RHEL</td><td><code>https://rupu.sh/apt</code> &middot; <code>https://rupu.sh/yum/stable</code></td></tr>
+        <tr><td>Binary</td><td>macOS, Apple Silicon</td><td><code>rupu-darwin-arm64</code> — signed + notarized</td></tr>
+        <tr><td>Binary</td><td>Linux x86_64</td><td><code>rupu-linux-x64</code> — static musl</td></tr>
+        <tr><td>Binary</td><td>Linux aarch64</td><td><code>rupu-linux-arm64</code> — static musl</td></tr>
+        <tr><td>Cargo</td><td>any (Rust 1.95+)</td><td><code>cargo install --git https://github.com/Section9Labs/rupu</code></td></tr>
+      </tbody>
+    </table>
+    <p>Every bare binary ships with a matching <code class="inline">.sha256</code> sidecar on the <a class="link" href="https://github.com/Section9Labs/rupu/releases/latest" target="_blank" rel="noopener">latest release</a> (also linked from the <a class="link" href="/#download">Download</a> section). rupu shells out to <code class="inline">ripgrep</code>, so every package declares it as a dependency — install <code class="inline">rg</code> yourself if you take the bare binary.</p>
+
+    <div class="callout"><strong>Community packages.</strong> The AUR, Homebrew, and Nix paths are published from the stable release pipeline and are documented as becoming available with the first stable release after they landed. If one isn't resolving yet, use the prebuilt binary or the <code class="inline">.deb</code> / <code class="inline">.rpm</code> — check the <a class="link" href="https://github.com/Section9Labs/rupu#install" target="_blank" rel="noopener">README's Install section</a> for the current status.</div>
+
+    <h3>Homebrew (macOS or Linux)</h3>
+    <pre class="code">brew install section9labs/tap/rupu</pre>
+
+    <h3>Arch Linux (AUR)</h3>
+    <p><code class="inline">rupu-bin</code> installs the published release binary (not a from-source build) and declares <code class="inline">ripgrep</code> as a dependency, matching the <code class="inline">.deb</code> / <code class="inline">.rpm</code> packages.</p>
+    <pre class="code">yay -S rupu-bin
+<span class="c"># or</span>
+paru -S rupu-bin</pre>
+
+    <h3>Nix</h3>
+    <pre class="code"><span class="c"># run it without installing</span>
+nix run github:Section9Labs/rupu
+
+<span class="c"># or install into a profile</span>
+nix profile install github:Section9Labs/rupu</pre>
+
+    <h3>Direct binary (macOS or Linux)</h3>
+    <p>Pick the asset for your platform — <code class="inline">rupu-darwin-arm64</code>, <code class="inline">rupu-linux-x64</code>, or <code class="inline">rupu-linux-arm64</code> — then make it executable and put it on your <code class="inline">PATH</code>:</p>
+    <pre class="code"><span class="c"># macOS, Apple Silicon</span>
+chmod +x rupu-darwin-arm64
+sudo mv rupu-darwin-arm64 /usr/local/bin/rupu
+
+<span class="c"># Linux x86_64 (use rupu-linux-arm64 on aarch64)</span>
+chmod +x rupu-linux-x64
+sudo mv rupu-linux-x64 /usr/local/bin/rupu
+
+rupu --version</pre>
+
+    <h3>Linux packages (.deb / .rpm)</h3>
+    <p>The packages declare their own dependencies and install shell completions (bash / zsh / fish) plus a man page (<code class="inline">man rupu</code>) alongside the binary — that's the reason to prefer them over the bare binary. Download the one matching your distro and architecture from the release page:</p>
+    <pre class="code"><span class="c"># Debian / Ubuntu</span>
+sudo apt install ./rupu_&lt;version&gt;_amd64.deb
+<span class="c"># or, without apt's dependency resolution</span>
+sudo dpkg -i rupu_&lt;version&gt;_amd64.deb
+
+<span class="c"># Fedora / RHEL</span>
+sudo dnf install ./rupu-&lt;version&gt;-1.x86_64.rpm
+<span class="c"># or</span>
+sudo rpm -i rupu-&lt;version&gt;-1.x86_64.rpm</pre>
+    <p>Any install can render the man page on demand — <code class="inline">rupu man</code> writes it to stdout, generated from the binary's own command tree, so it can never describe a CLI surface this build doesn't have.</p>
+
+    <h3>Hosted APT / YUM repositories</h3>
+    <p>rupu publishes signed APT and YUM repositories with every release, so you can install once and then upgrade in place with <code class="inline">apt upgrade</code> / <code class="inline">dnf upgrade</code>. Everything is signed with the key served from <code class="inline">https://rupu.sh/rupu-archive-keyring.asc</code>.</p>
+    <pre class="code"><span class="c"># Debian / Ubuntu — stable channel</span>
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc https://rupu.sh/rupu-archive-keyring.asc
+sudo chmod 644 /etc/apt/keyrings/rupu.asc
+echo "deb [signed-by=/etc/apt/keyrings/rupu.asc] https://rupu.sh/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/rupu.list
+sudo apt update &amp;&amp; sudo apt install rupu</pre>
+    <pre class="code"><span class="c"># Fedora / RHEL — stable channel</span>
+sudo rpm --import https://rupu.sh/rupu-archive-keyring.asc
+sudo tee /etc/yum.repos.d/rupu.repo &gt; /dev/null &lt;&lt;'EOF'
+<span class="k">[rupu]</span>
+name=rupu
+baseurl=https://rupu.sh/yum/stable
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://rupu.sh/rupu-archive-keyring.asc
+EOF
+sudo dnf install rupu</pre>
+    <p>A <code class="inline">beta</code> channel is hosted at the same URLs (<code class="inline">Suites: beta</code> / <code class="inline">baseurl=https://rupu.sh/yum/beta</code>). <strong>Don't enable both channels without pinning:</strong> a version string like <code class="inline">0.70.4.beta</code> sorts <em>higher</em> than <code class="inline">0.70.4</code> under both dpkg's and rpm's comparison, so an unpinned upgrade silently moves you onto beta and keeps you there. Each channel's index carries only the current release, so pinning an older version means downloading that release's package by hand. The full pinning recipes are in the <a class="link" href="https://github.com/Section9Labs/rupu#install" target="_blank" rel="noopener">README</a>.</p>
+
+    <h3>From source</h3>
+    <p>Requires Rust 1.95 or newer.</p>
+    <pre class="code">cargo install --git https://github.com/Section9Labs/rupu</pre>
+
+    <h2>Keeping rupu up to date</h2>
+    <p>A <strong>direct-binary</strong> install updates itself. <code class="inline">rupu update</code> fetches the latest build for your release channel, verifies its integrity against the published <code class="inline">.sha256</code>, swaps it in place, and keeps a backup of the previous binary so you can <code class="inline">--rollback</code> if anything looks wrong.</p>
+    <div class="callout"><strong>Packaged installs don't self-update.</strong> A binary that came from a native package (<code class="inline">.deb</code> / <code class="inline">.rpm</code>, including the APT/YUM repos) carries a build marker, and <code class="inline">rupu update</code> deliberately refuses to write over itself — the next <code class="inline">apt upgrade</code> / <code class="inline">dnf upgrade</code> would overwrite whatever it wrote, silently walking your version backwards. It tells you to run <code class="inline">sudo apt upgrade rupu</code> / <code class="inline">sudo dnf upgrade rupu</code> instead (it reads <code class="inline">/etc/os-release</code> to name the right one, and falls back to naming no command at all rather than the wrong one). <code class="inline">rupu update --check</code> still works everywhere, so you can always learn you're behind. The same rule of thumb applies to AUR, Homebrew, and Nix: upgrade through the manager that installed it — <code class="inline">yay -Syu rupu-bin</code>, <code class="inline">brew upgrade rupu</code>, <code class="inline">nix profile upgrade</code>.</div>
+    <pre class="code"><span class="c"># update to the latest release on your channel</span>
+rupu update
+
+<span class="c"># report only — exits 10 if an update is available (handy in CI)</span>
+rupu update --check
+
+<span class="c"># restore the previous binary from the last backup</span>
+rupu update --rollback</pre>
+    <p>Other flags: <code class="inline">--force</code> reinstalls (or downgrades) to the channel's latest, and <code class="inline">--channel beta|stable</code> overrides the channel for a single run.</p>
+
+    <h3>Release channels</h3>
+    <p>Every release flows through two channels. A <code class="inline">vX.Y.Z-beta</code> prerelease is cut first, then promoted to a <code class="inline">vX.Y.Z</code> stable release.</p>
+    <table>
+      <thead><tr><th>Channel</th><th>What you get</th></tr></thead>
+      <tbody>
+        <tr><td><code>stable</code></td><td>Full releases. The default — pick this unless you want to help test.</td></tr>
+        <tr><td><code>beta</code></td><td>Prereleases. Early access to features before they're promoted to stable.</td></tr>
+      </tbody>
+    </table>
+    <p>Choose a channel for a single run with the flag, or set it once in your config. Channel precedence is <code class="inline">--channel</code> flag &gt; <code class="inline">[update] channel</code> config &gt; <code class="inline">stable</code> (the default).</p>
+    <pre class="code"><span class="c"># one-off: pull the latest beta</span>
+rupu update --channel beta</pre>
+    <pre class="code"><span class="c"># config.toml — track the beta channel by default</span>
+<span class="k">[update]</span>
+channel = <span class="s">"beta"</span>
+<span class="c"># passive "update available" notice on normal commands (default: on)</span>
+check = <span class="v">true</span></pre>
+    <p>Normal commands also surface a passive <strong>update available</strong> notice when you're behind; set <code class="inline">check = false</code> in the <code class="inline">[update]</code> section to silence it.</p>
+
+    <h2>Your first run</h2>
+    <p>Initialize rupu in a repo, authenticate a provider, then run an agent:</p>
+    <pre class="code"><span class="c"># scaffold .rupu/ (agents + workflows) in the current repo</span>
+rupu init
+
+<span class="c"># connect a model provider (Anthropic, OpenAI, Gemini, Copilot…)</span>
+rupu auth login
+
+<span class="c"># run a one-off agent against a prompt</span>
+rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
+    <p>Everything rupu does is recorded as a JSONL transcript you can inspect with <code class="inline">rupu transcript</code>.</p>
+
+    <h2>The four building blocks</h2>
+    <p>Read these in order — each builds on the last.</p>
+    <div class="doc-grid">
+      <a class="card" href="/docs/agents.html">
+        <div class="ic" aria-hidden="true">&#9673;</div>
+        <h3>Agents &#8594;</h3>
+        <p>A single AI worker defined in Markdown + YAML: provider, model, tools, permissions, and a system prompt.</p>
+      </a>
+      <a class="card" href="/docs/workflows.html">
+        <div class="ic" aria-hidden="true">&#9783;</div>
+        <h3>Workflows &#8594;</h3>
+        <p>Multiple agents composed into steps — sequential, fan-out, parallel panels, gated review loops, approvals.</p>
+      </a>
+      <a class="card" href="/docs/autoflows.html">
+        <div class="ic" aria-hidden="true">&#8635;</div>
+        <h3>Autoflows &#8594;</h3>
+        <p>Workflows that run themselves — fired by cron or SCM events, claiming issues and opening PRs autonomously.</p>
+      </a>
+      <a class="card" href="/docs/sessions.html">
+        <div class="ic" aria-hidden="true">&#9636;</div>
+        <h3>Sessions &#8594;</h3>
+        <p>Long-lived, interactive agent conversations — in the terminal or live in the web control plane.</p>
+      </a>
+    </div>
+
+    <h2>Then go further</h2>
+    <ul>
+      <li><a class="link" href="/docs/examples/">Examples</a> — complete, real-world scenarios you can copy.</li>
+      <li><a class="link" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">Source &amp; issues on GitHub</a>.</li>
+    </ul>
+
+    <div class="doc-nav">
+      <span></span>
+      <a href="/docs/quickstart.html">Quickstart &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
