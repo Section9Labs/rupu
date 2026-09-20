@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Netflow</title>
+<meta name="description" content="Netflow is rupu's network-egress observability subsystem: every outbound HTTP call rupu itself makes is captured as a flow, written to an append-only ledger, enriched with ASN/org at read time, and visualized as a bipartite topology in the Control Plane.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item active" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Netflow</h1>
+    <p class="intro">rupu records <em>where it reaches out to</em>, not just what an agent does — every outbound HTTP call rupu itself makes becomes a flow, written to an append-only ledger, enriched with ASN and org, and rendered as a topology in the Control Plane.</p>
+
+    <h2>What it is</h2>
+    <p>
+      rupu already has deep observability for what an agent <em>does</em> —
+      tool calls, command runs, tool audits,
+      <a class="link" href="/docs/coverage.html">coverage</a> ledgers, findings,
+      usage accounting. Netflow closes the other half: <strong>where an agent
+      reaches</strong>. Every request rupu's own HTTP clients send —
+      <strong>model provider APIs</strong> and <strong>SCM / issue
+      connectors</strong>, plus the control plane's own <strong>fleet
+      traffic</strong> and its <strong>auth / system</strong> calls — is
+      captured as a <code class="inline">FlowRecord</code>: method, host, port,
+      query-stripped path, peer IP, status, byte counts and timings, tagged
+      with the run, step and agent that produced it.
+    </p>
+    <p>
+      Those records land in an <strong>append-only JSONL ledger</strong> next to
+      the run store, and — for flows observed during a run — as
+      <code class="inline">Event::NetFlow</code> lines in that run's transcript.
+      At read time the control plane resolves each peer IP to an
+      <strong>ASN and org</strong> and paints a <strong>bipartite topology
+      graph</strong>, a sortable flow table, and a per-host rollup.
+    </p>
+    <p>
+      The whole subsystem exists to let a viewer tell <em>"we could not observe
+      this"</em> apart from <em>"it was zero"</em>. That distinction is enforced
+      end to end: an unknown byte count is never summed as <code class="inline">0</code>,
+      an unmeasured percentile is never rendered as <code class="inline">0 ms</code>,
+      a dropped record is never silently absorbed, and every row carries a
+      <strong>fidelity badge</strong> saying how much of it is actually known.
+    </p>
+
+    <div class="callout">
+      <strong>&#9888; Scope: rupu's own HTTP egress only.</strong> Netflow does
+      <strong>not</strong> capture what an agent's <code class="inline">bash</code>
+      subprocesses do. A <code class="inline">curl</code>, a
+      <code class="inline">cargo build</code> contacting crates.io, or an
+      <code class="inline">npm install</code> postinstall script phoning home
+      inside a tool call is <strong>not recorded</strong> — the
+      <a class="link" href="/docs/mcp.html">bash tool</a> locks cwd and scrubs
+      the environment, but the subprocess still has unrestricted network access.
+      Netflow also cannot see <strong>non-HTTP egress</strong>: git2 clones
+      (often a run's largest byte volume by far), object-store bucket traffic,
+      and the <a class="link" href="/docs/multi-host.html">tunnel node</a>
+      WebSocket are all invisible here. A full-fidelity backend (frame-level
+      capture in a microVM) is <strong>designed for but not built</strong> — the
+      record schema, ledger format and API contract are fixed so it can slot in,
+      and until it does the views say so. The CP restates this limit on every
+      Network surface rather than letting a full-looking table imply completeness.
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 720 320" role="img" aria-label="rupu's subsystems funnel through a single instrumented HTTP client, which fans each flow out to the append-only ledger and the run transcript; the control plane reads both to render its Network views.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+
+        <!-- sources -->
+        <rect class="d-box" x="8" y="16" width="126" height="44" rx="10"></rect>
+        <text class="d-label" x="71" y="36" text-anchor="middle">providers</text>
+        <text class="d-sub" x="71" y="52" text-anchor="middle">LLM APIs</text>
+
+        <rect class="d-box" x="8" y="76" width="126" height="44" rx="10"></rect>
+        <text class="d-label" x="71" y="96" text-anchor="middle">SCM</text>
+        <text class="d-sub" x="71" y="112" text-anchor="middle">github, gitlab</text>
+
+        <rect class="d-box" x="8" y="136" width="126" height="44" rx="10"></rect>
+        <text class="d-label" x="71" y="156" text-anchor="middle">cp serve</text>
+        <text class="d-sub" x="71" y="172" text-anchor="middle">fleet HTTP</text>
+
+        <rect class="d-box" x="8" y="196" width="126" height="44" rx="10"></rect>
+        <text class="d-label" x="71" y="216" text-anchor="middle">auth / system</text>
+        <text class="d-sub" x="71" y="232" text-anchor="middle">tokens, ASN</text>
+
+        <line class="d-edge" x1="136" y1="38" x2="170" y2="122" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="136" y1="98" x2="170" y2="132" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="136" y1="158" x2="170" y2="146" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="136" y1="218" x2="170" y2="156" marker-end="url(#ar)"></line>
+
+        <!-- choke point -->
+        <rect class="d-box-accent" x="176" y="96" width="140" height="84" rx="12"></rect>
+        <text class="d-label" x="246" y="126" text-anchor="middle">netflow client</text>
+        <text class="d-sub" x="246" y="145" text-anchor="middle">the one HTTP door</text>
+        <text class="d-sub" x="246" y="162" text-anchor="middle">reqwest middleware</text>
+
+        <line class="d-edge" x1="318" y1="124" x2="350" y2="90" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="318" y1="152" x2="350" y2="190" marker-end="url(#ar)"></line>
+
+        <!-- sinks -->
+        <rect class="d-box" x="356" y="56" width="170" height="58" rx="10"></rect>
+        <text class="d-label" x="441" y="80" text-anchor="middle">ledger</text>
+        <text class="d-sub" x="441" y="98" text-anchor="middle">flows.jsonl</text>
+
+        <rect class="d-box" x="356" y="166" width="170" height="58" rx="10"></rect>
+        <text class="d-label" x="441" y="190" text-anchor="middle">transcript</text>
+        <text class="d-sub" x="441" y="208" text-anchor="middle">Event::NetFlow</text>
+
+        <line class="d-edge" x1="528" y1="86" x2="568" y2="124" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="528" y1="194" x2="568" y2="152" marker-end="url(#ar)"></line>
+
+        <!-- CP -->
+        <rect class="d-box-accent" x="574" y="96" width="138" height="84" rx="12"></rect>
+        <text class="d-label" x="643" y="128" text-anchor="middle">control plane</text>
+        <text class="d-sub" x="643" y="147" text-anchor="middle">graph · table</text>
+        <text class="d-sub" x="643" y="163" text-anchor="middle">· summary</text>
+      </svg>
+      <figcaption>Every rupu subsystem that speaks HTTP goes through one instrumented client. The middleware fans each record out to the append-only ledger and (when a run is active) the run transcript; the control plane reads both back and enriches them with ASN at render time.</figcaption>
+    </figure>
+
+    <h2>The choke point</h2>
+    <p>
+      Capture only works if there is exactly one door. Before netflow there
+      wasn't one — roughly thirty
+      <code class="inline">reqwest::Client::new()</code> /
+      <code class="inline">Client::builder()</code> sites were scattered across
+      six crates. Netflow created the choke point and then <strong>nailed it
+      shut</strong>: a <code class="inline">clippy.toml</code> lint denies
+      <code class="inline">reqwest::Client::new</code>,
+      <code class="inline">Client::default</code>,
+      <code class="inline">ClientBuilder::new</code>,
+      <code class="inline">ClientBuilder::default</code> and — the actual bypass
+      point — <code class="inline">ClientBuilder::build</code> everywhere except
+      inside the netflow crate itself, backed by a repo-level test. A regression
+      is a <strong>build failure</strong>, not a review miss.
+    </p>
+    <p>
+      Attribution is bound when a <strong>client is constructed</strong>, not
+      discovered at request time. Task-locals and tracing spans both lose context
+      across a <code class="inline">tokio::spawn</code>, which would produce flows
+      with silently missing attribution — worse than none. Provider and SCM
+      clients are already built per run, so binding the context there costs no new
+      plumbing. Process-global clients (the control plane's host registry, the ASN
+      refresh) simply carry <strong>no run id</strong> — that is the honest shape
+      of the data, and precisely why the ledger exists alongside the transcript
+      events rather than being a convenience index.
+    </p>
+    <div class="callout">
+      <strong>Capture must never break a request.</strong> That is
+      non-negotiable. The ledger sink writes through a <strong>bounded</strong>
+      channel to a background task; on overflow it drops the record and
+      increments a counter the UI surfaces as <em>"N flows dropped"</em> —
+      <strong>visible loss, not silent loss</strong>. Sink and write failures log
+      once and continue, ASN lookup degrades to "unknown" and is never fallible in
+      a way a caller must handle, and a failure to open the ledger degrades to
+      transcript-only capture rather than failing the run.
+    </div>
+
+    <h2>What a flow records</h2>
+    <p>
+      One <code class="inline">FlowRecord</code> is one outbound request. Fields
+      typed as optional are <strong>genuinely unknown when absent</strong> — they
+      are never defaulted to zero:
+    </p>
+    <table>
+      <thead>
+        <tr><th>Field</th><th>What it holds</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>ULID for this flow. Minted by the caller for streamed bodies so a later completion line can find it.</td></tr>
+        <tr><td><code>ts</code></td><td>UTC timestamp, taken when the record is emitted.</td></tr>
+        <tr><td><code>ctx</code></td><td>Attribution: <code>run_id</code>, <code>step_id</code>, <code>agent</code>, <code>workspace_id</code> (each optional) and <code>origin</code>.</td></tr>
+        <tr><td><code>ctx.origin</code></td><td>Which subsystem opened the connection — <code>provider</code>&nbsp;/&nbsp;<code>scm</code>&nbsp;/&nbsp;<code>mcp</code> carry a name; <code>webhook</code>, <code>update</code>, <code>cp</code>, <code>system</code> are bare.</td></tr>
+        <tr><td><code>fidelity</code></td><td><code>coarse</code> | <code>http</code> | <code>full</code> — how much of this record is actually known. See below.</td></tr>
+        <tr><td><code>method</code></td><td>HTTP method.</td></tr>
+        <tr><td><code>scheme</code></td><td><code>https</code> / <code>http</code>.</td></tr>
+        <tr><td><code>host</code></td><td>Endpoint hostname.</td></tr>
+        <tr><td><code>port</code></td><td>Endpoint port. <code>host:port</code> is the endpoint identity used by the rollup and the graph.</td></tr>
+        <tr><td><code>path</code></td><td>Request path, <strong>query-stripped</strong> — never contains a <code>?</code>.</td></tr>
+        <tr><td><code>peer_ip</code></td><td>The peer actually connected to. Absent at <code>coarse</code> fidelity. This is the field ASN enrichment keys on.</td></tr>
+        <tr><td><code>resolved_ips</code></td><td>Every A/AAAA answer the custom DNS resolver saw for the host — strictly more than the one peer used.</td></tr>
+        <tr><td><code>http_version</code></td><td>Negotiated HTTP version, when known.</td></tr>
+        <tr><td><code>status</code></td><td>Response status code, when a response was received.</td></tr>
+        <tr><td><code>outcome</code></td><td><code>ok</code> | <code>http_error</code> | <code>transport_error</code> | <code>timeout</code>.</td></tr>
+        <tr><td><code>error</code></td><td>Error text for a failed flow. URLs and query strings are kept out of it.</td></tr>
+        <tr><td><code>bytes_out</code></td><td>Request bytes, when observable.</td></tr>
+        <tr><td><code>bytes_in</code></td><td>Response bytes. <strong>Declared</strong> (from <code>Content-Length</code>) at emit time; <strong>observed</strong> once a completion line finalizes it.</td></tr>
+        <tr><td><code>body_complete</code></td><td><code>false</code> while a streamed body is still draining; flipped by the completion line folded in at read time.</td></tr>
+        <tr><td><code>ttfb_ms</code></td><td>Time to first byte.</td></tr>
+        <tr><td><code>duration_ms</code></td><td>Total duration. Absent for a flow still in flight.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Read back through the control plane, each flow gains one more field —
+      <code class="inline">asn</code> — resolved at render time rather than
+      stamped at write time (see <em>ASN enrichment</em> below).
+    </p>
+
+    <h3>Deliberate omissions</h3>
+    <ul>
+      <li>
+        <strong>Query strings and headers are never stored.</strong> They
+        routinely carry tokens. The path is stored query-stripped, and there is
+        no opt-out.
+      </li>
+      <li>
+        <strong>No TLS version or cipher.</strong> The HTTP layer doesn't expose
+        it — a field that could only ever be empty doesn't belong in the schema.
+      </li>
+      <li>
+        <strong>No ASN on the record.</strong> Stamping it at write time would
+        freeze history against whatever dataset happened to be on disk that day.
+      </li>
+    </ul>
+
+    <h3>Fidelity — the honesty field</h3>
+    <p>
+      Every flow declares how much of itself is real, and every CP view renders
+      the badge. The subsystem never claims coverage it does not have.
+    </p>
+    <table>
+      <thead>
+        <tr><th>Fidelity</th><th>Source</th><th>What is true</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>http</code></td>
+          <td>The instrumented client</td>
+          <td>Exact request and response metadata, including peer IP and byte counts.</td>
+        </tr>
+        <tr>
+          <td><code>coarse</code></td>
+          <td>A connector whose HTTP stack rupu does not own (the GitHub client)</td>
+          <td>Host, outcome and timing are real; <strong>byte counts and peer IP were not observable</strong>. Such a flow gets no ASN, and its bytes render as a dash, never <code>0 B</code>.</td>
+        </tr>
+        <tr>
+          <td><code>full</code></td>
+          <td>Frame-level capture from the isolated runtime</td>
+          <td><strong>Reserved — not emitted today.</strong> When that backend lands, the same views begin showing <code>full</code> with no schema change.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Streaming bodies</h3>
+    <p>
+      Every provider chat path is a streamed response, where
+      <code class="inline">Content-Length</code> doesn't exist. Netflow does not
+      estimate. The middleware emits the record at <strong>response-header
+      time</strong> with an unknown <code class="inline">bytes_in</code> and
+      <code class="inline">body_complete: false</code>; the stream-consuming loop
+      — which already counts bytes — later calls
+      <code class="inline">complete(flow_id, bytes_in, duration_ms)</code> to
+      finalize it. The caller minted the flow id and attached it to the request,
+      so it knows exactly which record to close: explicit, no ambient magic.
+    </p>
+
+    <h2>The ledger</h2>
+    <p>
+      Flows are written to an append-only JSONL ledger. There are two, and which
+      one a flow lands in depends on who produced it:
+    </p>
+    <table>
+      <thead>
+        <tr><th>Path</th><th>Holds</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>&lt;project&gt;/.rupu/netflow/flows.jsonl</code></td>
+          <td>Every flow a <code class="inline">rupu run</code> in that project produced — provider and SCM calls with a run id, plus that process's unattributed system egress. Rooted at the <strong>project root</strong>, so invoking rupu from a nested directory doesn't fragment the ledger.</td>
+        </tr>
+        <tr>
+          <td><code>~/.rupu/netflow/flows.jsonl</code></td>
+          <td>The <code class="inline">rupu cp serve</code> daemon's own ledger. A daemon has no single project to anchor to, so its fleet HTTP traffic and its ASN-refresh downloads land here. Honors <code class="inline">$RUPU_HOME</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      The ledger is <strong>strictly append-only</strong> — a record written at
+      header time is never rewritten. Each line is one of three envelopes:
+    </p>
+    <table>
+      <thead>
+        <tr><th>Line</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>flow</code></td><td>A full <code>FlowRecord</code>.</td></tr>
+        <tr><td><code>complete</code></td><td>Finalizes a streamed body written earlier — carries the flow id, observed <code>bytes_in</code>, and <code>duration_ms</code>. Folded into its flow at <em>read</em> time.</td></tr>
+        <tr><td><code>dropped</code></td><td>Records visible loss when the writer channel overflowed, with a count and a timestamp.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Reads tolerate damage: a missing file is an empty ledger, not an error, and
+      a malformed line is skipped so a torn write at the tail can't lose the whole
+      history.
+    </p>
+    <div class="callout">
+      <strong>The ledger directory ignores itself.</strong> It holds every host,
+      IP, path and timing rupu contacted during a run, so
+      <code class="inline">.rupu/netflow/</code> gets its own
+      <code class="inline">.gitignore</code> containing a bare
+      <code class="inline">*</code> — written when the directory is created, so
+      the protection travels with the directory rather than depending on a
+      project-level entry that older projects never got. An existing
+      <code class="inline">.gitignore</code> there is never clobbered.
+    </div>
+
+    <h3>How flows tie back to runs</h3>
+    <p>
+      For flows observed while a run is active, netflow also appends an
+      <code class="inline">Event::NetFlow</code> line to that
+      <a class="link" href="/docs/workflows.html">run's</a> transcript JSONL — so
+      they appear live wherever transcripts are already tailed, with no new
+      plumbing. That's not redundancy with the ledger; it's what makes run scope
+      correct. Only <em>provider</em> flows carry a run id: SCM, auth, system and
+      update flows are run-less by design, so filtering the ledger by run id alone
+      would silently drop every connector call the process made <em>while the run
+      was active</em>. The run's Network tab therefore merges both sources.
+    </p>
+    <p>
+      Flows are transcript events, <strong>not</strong> workflow-executor events —
+      they do not appear in <code class="inline">events.jsonl</code>, which is a
+      step-level lifecycle log where a per-request record has no business.
+    </p>
+
+    <h2>In the Control Plane</h2>
+    <p>
+      Netflow follows the same placement rule as findings: <strong>a tab on a
+      run, a tab on a project, and a global page — never on a workflow
+      definition</strong>. A flow belongs to a run, not to a workflow.
+    </p>
+    <table>
+      <thead>
+        <tr><th>Surface</th><th>Scope</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Run &#8594; Network</strong></td>
+          <td>This run's flows: its slice of the project ledger merged with its transcript's <code class="inline">NetFlow</code> events, so run-less connector calls made during the run aren't lost.</td>
+        </tr>
+        <tr>
+          <td><strong>Project &#8594; Network</strong></td>
+          <td>The whole workspace ledger with no run filter — including system egress that has no run to attach to.</td>
+        </tr>
+        <tr>
+          <td><strong>Network</strong> (global)</td>
+          <td>The union across every registered workspace, <em>plus</em> the CP daemon's own ledger. This is the only scope where CP fleet traffic and ASN-refresh downloads appear — they belong to the daemon, not to any one project.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>Behind those surfaces sit four read-only endpoints:</p>
+    <pre class="code"><span class="c"># run, project, and global scopes</span>
+GET <span class="s">/api/runs/:id/netflow</span>
+GET <span class="s">/api/projects/:id/netflow</span>
+GET <span class="s">/api/netflow</span>
+
+<span class="c"># precomputed topology; scope is run:&lt;id&gt;, project:&lt;id&gt;, or absent for global</span>
+GET <span class="s">/api/netflow/graph?scope=run:01J9Z4W7Q0X8Y6V5K3M2N1P0R8</span></pre>
+
+    <h3>The topology graph</h3>
+    <p>
+      The primary visualization is a <strong>bipartite topology graph</strong>:
+      <strong>sources</strong> on the left — one node per run, plus a
+      <code class="inline">system</code> node for unattributed process-global
+      egress — and <strong>endpoints</strong> on the right, one per
+      <code class="inline">host:port</code>. Edges connect who reached what,
+      thickness scaled by <strong>call count</strong>, and an edge that carried
+      any failure is drawn in the same red the run graph uses to mark a problem.
+    </p>
+    <div class="callout">
+      <strong>Why not a world map.</strong> A geographic map was considered and
+      <strong>rejected</strong>: nearly every endpoint resolves to a CDN edge, so
+      a country pin shows a point of presence rather than who was actually
+      contacted — visually striking, <strong>forensically false</strong>. A
+      topology answers the real question without pretending to know something it
+      doesn't; <strong>ASN/org is the honest form of "where did this go."</strong>
+      Edge weight is a visual scale, never a reported total — a
+      <code class="inline">coarse</code> flow contributes nothing to it and simply
+      renders thin, which is why byte counts are never labelled on the graph.
+    </div>
+
+    <h3>The flow table</h3>
+    <p>
+      A sortable, per-flow list — time, origin, host, path, network (ASN and org),
+      outcome, bytes and timings — with a <strong>fidelity badge on every
+      row</strong>, so a coarse row never <em>looks</em> as complete as an
+      instrumented one. Three states are called out rather than glossed:
+    </p>
+    <ul>
+      <li>
+        <strong>Dropped records</strong> get a loud banner — <em>"N flows dropped
+        — the capture buffer overflowed, so this list is incomplete."</em> It
+        renders <em>even when the table is empty</em>, because a scope where
+        everything was dropped is exactly where silent incompleteness does the
+        most damage.
+      </li>
+      <li>
+        <strong>Unavailable ASN enrichment</strong> gets its own note, so a blank
+        Network column reads as "we couldn't look it up" rather than "this peer
+        has no ASN."
+      </li>
+      <li>
+        <strong>An empty table</strong> restates netflow's scope limit, so "no
+        rows" never implies "no network activity happened."
+      </li>
+    </ul>
+
+    <h3>The summary</h3>
+    <p>
+      A per-endpoint rollup — one row per <code class="inline">host:port</code>
+      with <strong>calls, errors, bytes in / out, p50 and p95 latency</strong> —
+      computed <strong>server-side</strong> so the percentile and unknown-bytes
+      rules have exactly one implementation. Both rules are strict: if
+      <em>any</em> contributing flow had an unobservable byte count, that total
+      collapses to unknown rather than under-reporting (and in/out are tracked
+      independently, so an in-flight stream doesn't blank a known request total).
+      If no flow had a known duration, the percentile is unknown — because a
+      displayed <code class="inline">0 ms</code> can't be told apart from a genuine
+      sub-millisecond p50.
+    </p>
+
+    <h3>The fidelity badge and the scope disclosure</h3>
+    <p>
+      Two small components carry most of netflow's integrity. The
+      <strong>fidelity badge</strong> is rendered next to every flow and explains
+      itself on hover — <em>coarse</em> means host, outcome and timing are real
+      but bytes and peer IP were not observable for that connector. The
+      <strong>scope disclosure</strong> is a single authored sentence, rendered on
+      <em>all three</em> Network surfaces, naming exactly what netflow covers at
+      that scope and what it cannot see. It is scope-aware on purpose: CP fleet
+      traffic is only claimed on the global page, because that's the only place it
+      can actually appear. Every scope-limit sentence in the CP — including the
+      table's and the graph's empty states — draws from that one source, so the
+      wording can't drift apart into claims the code doesn't back.
+    </p>
+
+    <h2>ASN enrichment</h2>
+    <p>
+      A peer IP on its own is nearly unreadable. Netflow resolves it to an
+      <strong>autonomous system number and org</strong> — so a flow reads
+      <code class="inline">AS13335 Cloudflare</code> rather than a bare address —
+      and that is the enrichment the flow table's Network column shows.
+    </p>
+    <p>
+      <strong>The operator never runs a command for this.</strong> The dataset is
+      acquired and refreshed automatically from a combined IPv4+IPv6
+      prefix&#8594;ASN table, compacted on ingest into a sorted binary range table
+      at <code class="inline">~/.rupu/netflow/asn.db</code> (v4 and v6 held
+      separately, binary-searched; unrouted rows skipped). It isn't bundled with
+      the binary — compacted it's meaningful bloat on a binary that already embeds
+      the CP's web assets. Two triggers keep it current:
+    </p>
+    <ul>
+      <li>
+        <strong>The <code class="inline">rupu cp serve</code> sweep loop</strong>
+        gains an ASN freshness tick, alongside the gate sweep and the cron tick.
+      </li>
+      <li>
+        <strong>Any netflow read</strong> that finds the table missing or stale
+        spawns a detached background fetch — so operators who never run
+        <code class="inline">cp serve</code> still get enrichment. A burst of
+        requests collapses to a single download via a process-wide single-flight
+        guard.
+      </li>
+    </ul>
+    <p>
+      Enrichment is resolved <strong>at read time</strong>, never stamped onto the
+      record. Three consequences fall out of that, and they're the reason for the
+      design:
+    </p>
+    <ul>
+      <li>A dataset that arrives late automatically improves <strong>every historical record</strong>. No backfill job exists, or is needed.</li>
+      <li>The write path never blocks on a file that may not be there.</li>
+      <li>Offline and air-gapped installs degrade to "ASN data not loaded" while every other view works unchanged.</li>
+    </ul>
+    <p>
+      Refresh is best-effort and fails safe: on any failure the existing table is
+      left untouched, and a download that parses to an <em>empty</em> table (a
+      gzipped error page, say) is <strong>refused</strong> rather than allowed to
+      destroy working enrichment. The parsed table is cached in-process and keyed
+      on the file's mtime, so three Network tabs opening at once don't reparse
+      hundreds of thousands of ranges three times. And the refresh request is
+      itself recorded as a system flow — the subsystem stays honest about its own
+      egress.
+    </p>
+
+    <h2>Configuration</h2>
+    <p>
+      Netflow capture itself needs no configuration — it's on wherever a sink is
+      installed. The <code class="inline">[netflow]</code> section governs one
+      thing: automatic acquisition and refresh of the ASN table.
+    </p>
+    <table>
+      <thead>
+        <tr><th>Key</th><th>Type</th><th>Default</th><th>What it does</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>asn_auto_refresh</code></td>
+          <td>bool</td>
+          <td><code>true</code></td>
+          <td>Acquire and refresh the ASN table automatically. Defaults on so enrichment works without an operator running anything. Set <code>false</code> for an air-gapped install — flows are still captured and every other view works; the Network column just reports enrichment unavailable.</td>
+        </tr>
+        <tr>
+          <td><code>asn_refresh_interval_days</code></td>
+          <td>integer (days)</td>
+          <td><code>7</code></td>
+          <td>Refresh cadence. BGP prefixes move slowly, so weekly is ample. A table older than this counts as stale; <code>0</code> means always refresh.</td>
+        </tr>
+        <tr>
+          <td><code>asn_source_url</code></td>
+          <td>string</td>
+          <td><code>https://iptoasn.com/data/ip2asn-combined.tsv.gz</code></td>
+          <td>Source for the combined IPv4+IPv6 prefix&#8594;ASN table. Point it at an internal mirror if outbound access to the public dataset isn't available.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Unknown keys in this section are rejected, and any key you leave out takes
+      its default:
+    </p>
+    <pre class="code"><span class="c"># ~/.rupu/config.toml — every [netflow] key, at its default</span>
+[<span class="k">netflow</span>]
+<span class="k">asn_auto_refresh</span> = <span class="v">true</span>
+<span class="k">asn_refresh_interval_days</span> = <span class="v">7</span>
+<span class="k">asn_source_url</span> = <span class="s">"https://iptoasn.com/data/ip2asn-combined.tsv.gz"</span></pre>
+    <pre class="code"><span class="c"># air-gapped: keep capture, skip the download entirely</span>
+[<span class="k">netflow</span>]
+<span class="k">asn_auto_refresh</span> = <span class="v">false</span></pre>
+
+    <h2>Telemetry only</h2>
+    <p>
+      Netflow is <strong>pure telemetry</strong>. A flow carries <strong>no
+      severity</strong>, <strong>no triage state</strong>, and <strong>no coupling
+      to the findings subsystem</strong>. Anomalous egress does not become a
+      finding, and nothing in netflow decides what "anomalous" means.
+    </p>
+    <p>
+      That's a deliberate decision, not an omission. Judgement baked into a
+      recording layer is judgement you can't revise without rewriting history —
+      and a record that carries a verdict stops being evidence. Keeping the data
+      inert means the flows stay exactly as trustworthy as their fidelity field
+      claims, and nothing more. Should anomaly surfacing be wanted later, it lands
+      as an <strong>additive detector sitting on top of this data</strong>, reading
+      the same ledger and emitting findings of its own — not as a change to what a
+      flow is.
+    </p>
+    <p>
+      The same restraint applies to enforcement: netflow <strong>observes</strong>
+      egress, it does not block it. Deny-by-default egress policy needs the
+      isolated-runtime substrate that the full-fidelity backend would bring, and is
+      out of scope until then.
+    </p>
+
+    <h2>Still coming</h2>
+    <p>
+      Everything above ships today. What follows genuinely does not, and the page
+      says so rather than implying otherwise:
+    </p>
+    <table>
+      <thead>
+        <tr><th>Coming later</th><th>What it adds</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Full-fidelity capture</td>
+          <td>Frame-level capture inside a <strong>microVM</strong> — the only mechanism that behaves identically on macOS and Linux. Attribution becomes definitional rather than correlated (the VM <em>is</em> the run), and it finally covers <strong>the agent's <code class="inline">bash</code> subprocesses</strong>, every port and protocol, and DNS lookups that resolve and never connect. It feeds the existing record schema, ledger format and API contract unchanged — the views simply start reporting <code class="inline">full</code>.</td>
+        </tr>
+        <tr>
+          <td>Non-HTTP egress</td>
+          <td>git2 clones, object-store bucket traffic and the tunnel-node WebSocket are invisible to an HTTP-layer capture. They arrive with the frame-level backend, not before.</td>
+        </tr>
+        <tr>
+          <td>Lifting <code class="inline">coarse</code> to <code class="inline">http</code></td>
+          <td>The GitHub connector brings its own HTTP stack, so its flows are coarse. It exposes a service layer that a middleware could hook, which would give it exact bytes and peer IP.</td>
+        </tr>
+        <tr>
+          <td>Egress enforcement</td>
+          <td>Netflow records; it does not block. Deny-by-default policy needs the isolated runtime as its substrate.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/multi-host.html">&#8592; Multi-host</a>
+      <a href="/docs/coverage.html">Coverage &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
