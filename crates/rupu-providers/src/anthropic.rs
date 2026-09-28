@@ -15,6 +15,67 @@ use crate::provider_id::ProviderId;
 use crate::sse::SseParser;
 use crate::types::*;
 
+/// JSON Schema keywords that Anthropic's structured-outputs subset rejects
+/// on numeric (`integer`/`number`) nodes. Present on such a node, the API
+/// 400s (e.g. "output_config.format.schema: For 'integer' type, property
+/// 'minimum' is not supported"). These are the numeric range/step
+/// constraints; extend the list only when a keyword is *confirmed*
+/// unsupported, so we never silently weaken a schema Anthropic accepts.
+const ANTHROPIC_UNSUPPORTED_NUMERIC_KEYWORDS: &[&str] = &[
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+];
+
+/// Down-convert an agent's `outputSchema` to Anthropic's structured-outputs
+/// subset in place, returning how many keywords were removed.
+///
+/// Walks the schema recursively and strips
+/// [`ANTHROPIC_UNSUPPORTED_NUMERIC_KEYWORDS`] from any node typed
+/// `integer`/`number`. The strip is gated on the node's own `type` so a
+/// property *named* `minimum` (a key in a `properties` map) is preserved —
+/// only the constraint *keyword* is removed. Non-numeric nodes are left
+/// untouched, since that is the exact surface the API rejects.
+fn sanitize_output_schema_for_anthropic(value: &mut serde_json::Value) -> usize {
+    let mut removed = 0;
+    match value {
+        serde_json::Value::Object(map) => {
+            if schema_node_is_numeric(map) {
+                for kw in ANTHROPIC_UNSUPPORTED_NUMERIC_KEYWORDS {
+                    if map.remove(*kw).is_some() {
+                        removed += 1;
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                removed += sanitize_output_schema_for_anthropic(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items.iter_mut() {
+                removed += sanitize_output_schema_for_anthropic(child);
+            }
+        }
+        _ => {}
+    }
+    removed
+}
+
+/// Does this schema node declare a numeric `type` (`integer`/`number`),
+/// including the `type: [..]` union form?
+fn schema_node_is_numeric(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match map.get("type") {
+        Some(serde_json::Value::String(t)) => matches!(t.as_str(), "integer" | "number"),
+        Some(serde_json::Value::Array(types)) => types.iter().any(|t| {
+            t.as_str()
+                .is_some_and(|s| matches!(s, "integer" | "number"))
+        }),
+        _ => false,
+    }
+}
+
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
 /// Canonical provider tag stamped on Reasoning blocks and used as the echo gate.
@@ -1801,6 +1862,24 @@ impl AnthropicClient {
             );
         }
         if let Some(schema) = &request.output_schema {
+            // Anthropic's structured-outputs schema is a strict subset of
+            // JSON Schema and rejects numeric bounds (`minimum`/`maximum`/…)
+            // on `integer`/`number` nodes — a schema that is otherwise valid
+            // (and accepted verbatim by OpenAI) 400s here. Down-convert to
+            // the supported subset so the same `outputSchema` is portable
+            // across providers rather than making authors hand-tune per
+            // provider. See `sanitize_output_schema_for_anthropic`.
+            let mut schema = schema.clone();
+            let removed = sanitize_output_schema_for_anthropic(&mut schema);
+            if removed > 0 {
+                warn!(
+                    removed,
+                    "stripped {removed} Anthropic-unsupported numeric-constraint keyword(s) \
+                     (minimum/maximum/exclusiveMinimum/exclusiveMaximum/multipleOf) from \
+                     outputSchema before sending; Anthropic structured outputs does not accept \
+                     numeric bounds on integer/number nodes"
+                );
+            }
             output_config.insert(
                 "format".to_string(),
                 serde_json::json!({ "type": "json_schema", "schema": schema }),
@@ -3677,6 +3756,108 @@ mod tests {
             body["output_config"]["format"],
             serde_json::json!({ "type": "json_schema", "schema": schema })
         );
+    }
+
+    #[test]
+    fn build_body_strips_anthropic_unsupported_numeric_bounds_from_output_schema() {
+        // Anthropic structured outputs reject numeric bounds like
+        // `minimum` on an `integer`/`number` node — the API 400s with
+        // "output_config.format.schema: For 'integer' type, property
+        // 'minimum' is not supported". A schema that is valid JSON Schema
+        // (and accepted by OpenAI's structured outputs, which DOES support
+        // `minimum`) must still go through, so the provider strips the
+        // unsupported keywords from numeric nodes before sending.
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["findings"],
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "line": { "type": "integer", "minimum": 1 },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 100,
+                                "exclusiveMinimum": 0
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_schema: Some(schema),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        let sent = &body["output_config"]["format"]["schema"];
+        let props = &sent["properties"]["findings"]["items"]["properties"];
+        // The unsupported numeric bounds are gone …
+        assert!(
+            props["line"].get("minimum").is_none(),
+            "line.minimum survived"
+        );
+        assert!(props["confidence"].get("minimum").is_none());
+        assert!(props["confidence"].get("maximum").is_none());
+        assert!(props["confidence"].get("exclusiveMinimum").is_none());
+        // … but the rest of the schema is intact.
+        assert_eq!(props["line"]["type"], "integer");
+        assert_eq!(props["confidence"]["type"], "number");
+        assert_eq!(sent["required"], serde_json::json!(["findings"]));
+        assert_eq!(sent["additionalProperties"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn sanitize_schema_preserves_property_literally_named_minimum() {
+        // A property KEY named "minimum" must survive; only the `minimum`
+        // *keyword* on a numeric node is stripped.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": { "minimum": { "type": "integer", "minimum": 3 } }
+        });
+        let removed = sanitize_output_schema_for_anthropic(&mut schema);
+        assert_eq!(removed, 1);
+        assert!(
+            schema["properties"].get("minimum").is_some(),
+            "property named `minimum` was dropped"
+        );
+        assert!(schema["properties"]["minimum"].get("minimum").is_none());
+        assert_eq!(schema["properties"]["minimum"]["type"], "integer");
+    }
+
+    #[test]
+    fn sanitize_schema_leaves_bounds_on_non_numeric_nodes() {
+        // Only integer/number nodes are touched — the exact surface
+        // Anthropic rejects. A (nonsensical) bound on a non-numeric node
+        // is left alone rather than guessed at.
+        let mut schema = serde_json::json!({ "type": "string", "minimum": 1 });
+        let removed = sanitize_output_schema_for_anthropic(&mut schema);
+        assert_eq!(removed, 0);
+        assert_eq!(schema["minimum"], 1);
+    }
+
+    #[test]
+    fn sanitize_schema_recurses_into_combinators_and_defs() {
+        let mut schema = serde_json::json!({
+            "$defs": { "n": { "type": "integer", "minimum": 0 } },
+            "anyOf": [
+                { "type": "number", "maximum": 5, "multipleOf": 2 },
+                { "type": "string" }
+            ]
+        });
+        let removed = sanitize_output_schema_for_anthropic(&mut schema);
+        assert_eq!(removed, 3);
+        assert!(schema["$defs"]["n"].get("minimum").is_none());
+        assert!(schema["anyOf"][0].get("maximum").is_none());
+        assert!(schema["anyOf"][0].get("multipleOf").is_none());
     }
 
     #[test]
