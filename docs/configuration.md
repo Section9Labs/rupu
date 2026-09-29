@@ -186,6 +186,14 @@ schema — passing reasoning tokens again here would double-bill them.
 
 ---
 
+## `[runtime]`
+
+| Key              | Type    | Default | Notes |
+|------------------|---------|---------|-------|
+| `max_open_files` | integer | unset   | Soft open-file limit rupu raises itself to at startup, and the cap for automatic growth when a fan-out runs near the limit. Unset: raise to 10240 (capped at the hard limit) and grow on demand up to the hard limit / macOS `kern.maxfilesperproc`. Values above that cap are clamped with a warning (raising it needs root). Overridden by `--max-open-files` / `RUPU_MAX_OPEN_FILES`. Past the cap, new agent runs are paced (delayed, logged) until running ones release descriptors, instead of failing with "Too many open files". |
+
+---
+
 ## `[policy]`
 
 | Key    | Type            | Default | Notes |

@@ -400,3 +400,110 @@ async fn two_clients_with_different_sinks_do_not_cross_contaminate() {
         Origin::Provider("b".to_string())
     );
 }
+
+/// Minimal keep-alive HTTP/1.1 server that counts accepted TCP connections.
+async fn counting_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        buf.drain(..end + 4);
+                        if sock
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/x"), accepted)
+}
+
+fn run_ctx(run: &str) -> FlowCtx {
+    FlowCtx {
+        run_id: Some(run.into()),
+        step_id: None,
+        agent: None,
+        workspace_id: None,
+        origin: Origin::Provider("anthropic".into()),
+    }
+}
+
+#[tokio::test]
+async fn shared_clients_reuse_one_connection_but_attribute_per_sink() {
+    let (url, accepted) = counting_server().await;
+    // A timeout unique to this test keeps its pool entry private to it.
+    let transport = rupu_netflow::http::Transport {
+        http1_only: true,
+        timeout: Some(std::time::Duration::from_millis(31_337)),
+    };
+    let sink_a = Arc::new(MemorySink::default());
+    let sink_b = Arc::new(MemorySink::default());
+    let a = rupu_netflow::http::shared_client(run_ctx("run-a"), transport, sink_a.clone()).unwrap();
+    let b = rupu_netflow::http::shared_client(run_ctx("run-b"), transport, sink_b.clone()).unwrap();
+
+    a.get(&url).send().await.unwrap().text().await.unwrap();
+    b.get(&url).send().await.unwrap().text().await.unwrap();
+    a.get(&url).send().await.unwrap().text().await.unwrap();
+
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "sequential requests from two shared clients must reuse one pooled connection"
+    );
+    // Give the middleware's spawned record tasks a moment to land.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let runs = |s: &MemorySink| {
+        s.records()
+            .iter()
+            .map(|r| r.ctx.run_id.clone().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(runs(&sink_a), vec!["run-a", "run-a"]);
+    assert_eq!(runs(&sink_b), vec!["run-b"]);
+}
+
+#[tokio::test]
+async fn private_clients_each_open_their_own_connection() {
+    // The pre-fix shape: one private client per agent run means one
+    // connection (descriptor) per run, held until the client drops.
+    let (url, accepted) = counting_server().await;
+    let a = rupu_netflow::http::client_with(
+        run_ctx("run-a"),
+        reqwest::Client::builder(),
+        Arc::new(MemorySink::default()),
+    )
+    .unwrap();
+    let b = rupu_netflow::http::client_with(
+        run_ctx("run-b"),
+        reqwest::Client::builder(),
+        Arc::new(MemorySink::default()),
+    )
+    .unwrap();
+    a.get(&url).send().await.unwrap().text().await.unwrap();
+    b.get(&url).send().await.unwrap().text().await.unwrap();
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

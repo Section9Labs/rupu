@@ -50,7 +50,7 @@ impl OpenAiCompatibleClient {
             "openai_compatible".into(),
         ));
         if let Ok(client) =
-            rupu_netflow::http::client_with(ctx, tuning.http_client_builder(), self.sink.clone())
+            rupu_netflow::http::shared_client(ctx, tuning.transport(), self.sink.clone())
         {
             self.client = client;
         }
@@ -79,7 +79,7 @@ impl OpenAiCompatibleClient {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(
             "openai_compatible".into(),
         ));
-        let client = rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink.clone())
+        let client = rupu_netflow::http::shared_client(ctx, rupu_netflow::http::Transport::default(), sink.clone())
             .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
             base_url: root.to_string(),
