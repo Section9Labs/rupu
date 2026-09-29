@@ -11,6 +11,8 @@
 
 // Task 18: coverage tool wrappers (injected when concerns: is present)
 pub mod coverage_tools;
+// Open-file limit management + agent-run admission pacing.
+pub mod fd_budget;
 // implemented in Task 3
 pub mod loader;
 // Tasks 17+18: MCP tool adapter + runner wiring
@@ -28,6 +30,7 @@ pub mod spec;
 // implemented in Task 6
 pub mod tool_registry;
 
+pub use fd_budget::load_agent_admitted;
 pub use loader::{load_agent, load_agents, AgentLoadError};
 pub use permission::{parse_mode, resolve_mode, PermissionDecision, PermissionPrompt};
 pub use runner::{

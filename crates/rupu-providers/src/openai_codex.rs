@@ -31,9 +31,9 @@ fn codex_http_client(
     sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<ClientWithMiddleware, ProviderError> {
     let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("openai".into()));
-    Ok(rupu_netflow::http::client_with(
+    Ok(rupu_netflow::http::shared_client(
         ctx,
-        reqwest::Client::builder(),
+        rupu_netflow::http::Transport::default(),
         sink,
     )?)
 }
@@ -265,7 +265,7 @@ impl OpenAiCodexClient {
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("openai".into()));
         if let Ok(client) =
-            rupu_netflow::http::client_with(ctx, tuning.http_client_builder(), self.sink.clone())
+            rupu_netflow::http::shared_client(ctx, tuning.transport(), self.sink.clone())
         {
             self.client = client;
         }

@@ -18,7 +18,6 @@ pub mod cp_session_sender;
 pub mod cp_session_starter;
 pub mod cp_transcript_mutator;
 pub mod crash;
-pub mod fd_limit;
 pub mod fleet_unit_dispatcher;
 pub mod logging;
 pub mod netflow_sink;
@@ -75,6 +74,12 @@ pub struct Cli {
     /// actually displayed, so a filtered listing may show fewer columns.
     #[arg(long, global = true)]
     pub all_columns: bool,
+    /// Raise this process's open-file limit (RLIMIT_NOFILE) to N and cap
+    /// automatic growth there. Overrides `RUPU_MAX_OPEN_FILES` and
+    /// `[runtime].max_open_files`. Wide fan-outs hold several descriptors
+    /// per concurrent agent.
+    #[arg(long, global = true, value_name = "N")]
+    pub max_open_files: Option<u64>,
     #[command(subcommand)]
     pub command: Cmd,
 }
@@ -282,6 +287,27 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     } else {
         logging::init(cfg_log_level);
     }
+
+    // Raise the open-file limit before any work (macOS gives GUI/launchd
+    // spawned processes a soft limit of 256, which a fan-out of concurrent
+    // agents exhausts). Children — detached runs, sub-agents — inherit it.
+    // Fan-out admission (`rupu_agent::fd_budget`) grows it further on
+    // demand, up to this value when set.
+    let env_max_open_files = std::env::var("RUPU_MAX_OPEN_FILES")
+        .ok()
+        .and_then(|v| match v.trim().parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(value = %v, "ignoring RUPU_MAX_OPEN_FILES: not a positive integer");
+                None
+            }
+        });
+    let fd_report = rupu_agent::fd_budget::configure(
+        cli.max_open_files
+            .or(env_max_open_files)
+            .or(cli_cfg.runtime.max_open_files),
+    );
+    tracing::debug!(?fd_report, "open-file limit configured");
 
     // Passive "update available" notice: interactive, non-structured
     // invocations only, and never for `rupu update`/`rupu

@@ -40,7 +40,7 @@ impl LocalModelProvider {
         // `FlowCtx::system(Origin::Provider("local"))`. Plan 2 threads
         // the real run id through once the provider factory is touched.
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("local".into()));
-        let client = rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink)
+        let client = rupu_netflow::http::shared_client(ctx, rupu_netflow::http::Transport::default(), sink)
             .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),

@@ -22,6 +22,7 @@ pub mod pricing;
 pub mod pricing_config;
 
 pub mod resolve;
+pub mod runtime_config;
 
 pub mod provider_config;
 
@@ -40,6 +41,7 @@ pub use policy_config::{CpConfig, PolicyConfig};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use resolve::{resolve, KeyProvenance, KeySource, Resolved};
+pub use runtime_config::RuntimeConfig;
 pub use scm_config::{
     IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmRule, ScmSection,
 };

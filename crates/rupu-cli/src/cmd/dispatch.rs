@@ -202,11 +202,24 @@ impl AgentDispatcher for CliAgentDispatcher {
         );
 
         let project_agents_parent = self.project_root.as_ref().map(|p| p.join(".rupu"));
-        let spec =
-            rupu_agent::load_agent(&self.global, project_agents_parent.as_deref(), agent_name)
-                .map_err(|_| DispatchError::AgentNotFound {
-                    agent: agent_name.to_string(),
-                })?;
+        // Admission-paced (see `rupu_agent::fd_budget`): a parallel dispatch
+        // near the open-file limit grows it or waits instead of failing.
+        let spec = rupu_agent::load_agent_admitted(
+            &self.global,
+            project_agents_parent.as_deref(),
+            agent_name,
+        )
+        .await
+        .map_err(|e| match e {
+            rupu_agent::AgentLoadError::NotFound(_) => DispatchError::AgentNotFound {
+                agent: agent_name.to_string(),
+            },
+            // Surface the real cause (e.g. fd exhaustion, bad frontmatter)
+            // instead of a misleading "not found".
+            other => DispatchError::Io(std::io::Error::other(format!(
+                "load agent `{agent_name}`: {other}"
+            ))),
+        })?;
 
         let (sub_run_id, transcript_path) = self
             .run_store

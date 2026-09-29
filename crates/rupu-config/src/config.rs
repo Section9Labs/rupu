@@ -70,6 +70,8 @@ pub struct Config {
     pub update: crate::update_config::UpdateConfig,
     #[serde(default)]
     pub workflow: crate::policy_config::WorkflowConfig,
+    #[serde(default)]
+    pub runtime: crate::runtime_config::RuntimeConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

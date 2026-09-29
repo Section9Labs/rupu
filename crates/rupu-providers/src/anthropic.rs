@@ -363,12 +363,15 @@ fn build_http_client_with_timeout(
     timeout: Option<std::time::Duration>,
     sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
-    let mut builder = reqwest::Client::builder().http1_only();
-    if let Some(t) = timeout {
-        builder = builder.connect_timeout(t).read_timeout(t);
-    }
+    // Shared pool (see `rupu_netflow::http::shared_client`): one connection
+    // pool per transport shape process-wide, so concurrent agent runs don't
+    // each hold their own idle sockets.
+    let transport = rupu_netflow::http::Transport {
+        http1_only: true,
+        timeout,
+    };
     let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
-    let client = rupu_netflow::http::client_with(ctx, builder, sink.clone())
+    let client = rupu_netflow::http::shared_client(ctx, transport, sink.clone())
         .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
     (client, sink)
 }

@@ -97,6 +97,16 @@ impl ProviderTuning {
     /// sanctioned pattern, not a bypass. `Client::builder()` itself is
     /// not clippy-disallowed (see Task 11's `clippy.toml`) — only
     /// `ClientBuilder::build()` is, and this function never calls it.
+    /// The shared-pool transport shape for this tuning (see
+    /// `rupu_netflow::http::shared_client`) — same timeouts as
+    /// [`Self::http_client_builder`].
+    pub fn transport(&self) -> rupu_netflow::http::Transport {
+        rupu_netflow::http::Transport {
+            http1_only: false,
+            timeout: Some(self.timeout),
+        }
+    }
+
     pub fn http_client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .connect_timeout(self.timeout)

@@ -270,9 +270,16 @@ impl StepFactory for DefaultStepFactory {
         // project layer that's `<project>/.rupu`; the global layer is
         // `<global>` directly (which already contains `agents/`).
         let project_agents_parent = self.project_root.as_ref().map(|p| p.join(".rupu"));
-        let load =
-            rupu_agent::load_agent(&self.global, project_agents_parent.as_deref(), agent_name)
-                .map_err(|e| e.to_string());
+        // Admission-paced: under fd pressure (a wide fan-out) this grows the
+        // open-file limit or waits for running agents to release descriptors
+        // instead of failing with EMFILE. See `rupu_agent::fd_budget`.
+        let load = rupu_agent::load_agent_admitted(
+            &self.global,
+            project_agents_parent.as_deref(),
+            agent_name,
+        )
+        .await
+        .map_err(|e| e.to_string());
         let (spec, load_err) = resolve_step_agent_spec(load, agent_name, &rendered_prompt);
 
         // A missing or unparseable agent file is a hard error: fail loudly via
