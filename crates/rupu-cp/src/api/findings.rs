@@ -5,9 +5,11 @@ use axum::{
     Json, Router,
 };
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
+use rupu_orchestrator::{executor::Event, runs::RunStore};
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/api/findings", get(list_findings))
@@ -226,6 +228,82 @@ pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingO
     out
 }
 
+/// The set of run ids a finding may be attributed to, for a Findings-tab query
+/// scoped to `parent`. A `for_each` / `panel` unit runs as its own sub-run, so
+/// its findings carry the UNIT's run id (`declared_by.run_id`), not `parent` —
+/// a bare parent match drops them.
+///
+/// The set is `parent` unioned with every sub-run id we can resolve, from TWO
+/// sources so a **running** run is covered, not just a finished one:
+///   1. unit checkpoints — durable, but written only when a unit COMPLETES;
+///   2. the parent's `events.jsonl` — written LIVE: each `UnitStarted` /
+///      `StepWorking` carries the unit's `transcript_path`, whose file stem is
+///      the unit's run id. This is what catches in-flight units (and panel
+///      units, which are never checkpointed at all — see `graph.rs`).
+///
+/// Without (2), the Findings tab shows nothing for an in-progress run even
+/// though the findings are already on disk.
+fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    set.insert(parent.to_string());
+    for cp in store.read_unit_checkpoints(parent).unwrap_or_default() {
+        set.insert(cp.run_id);
+    }
+    for id in sub_run_ids_from_events(store, parent) {
+        set.insert(id);
+    }
+    set
+}
+
+/// Sub-run ids recovered from the parent's `events.jsonl` (written live). Each
+/// `UnitStarted` (and `StepWorking`) carries the unit's `transcript_path`; its
+/// file stem is the unit's run id — the id a finding declared by that unit
+/// agent is attributed to. A transcript stored under the nested sub-run layout
+/// (`.../<sub_id>/transcript.jsonl`) has a generic `transcript` stem, so fall
+/// back to the parent directory name there. Missing/garbled file → empty.
+fn sub_run_ids_from_events(store: &RunStore, parent: &str) -> Vec<String> {
+    let path = store.events_path(parent);
+    let Ok(file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&line) else {
+            continue;
+        };
+        let tp = match event {
+            Event::UnitStarted {
+                transcript_path, ..
+            } => Some(transcript_path),
+            Event::StepWorking {
+                transcript_path: Some(p),
+                ..
+            } => Some(p),
+            _ => None,
+        };
+        if let Some(tp) = tp {
+            let id = match tp.file_stem().and_then(|s| s.to_str()) {
+                // Nested sub-run layout: `<parent>/sub/<sub_id>/transcript.jsonl`.
+                Some("transcript") => tp
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string),
+                Some(stem) => Some(stem.to_string()),
+                None => None,
+            };
+            if let Some(id) = id {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
 /// `GET /api/findings` — every finding across every registered workspace's
 /// coverage targets, tagged with provenance, plus a per-severity summary.
 ///
@@ -255,25 +333,16 @@ async fn list_findings(
         f.workflow_name = wf_by_run.get(&f.record.declared_by.run_id).cloned();
     }
 
-    // Resolve the run-id match SET when filtering by run. A `for_each` step's
-    // fan-out findings are attributed to the UNIT's sub-run id (each unit is its
-    // own sub-run), NOT the parent run id, so a bare parent-id match would drop
-    // them. The set is the parent id UNIONED with every unit-checkpoint sub-run
-    // id for that parent (read the same way `graph.rs` does; missing file →
-    // empty). NOTE: only ONE level of fan-out is resolved here — a unit that
-    // itself fans out is not followed. Acceptable for now.
-    let run_ids: Option<HashSet<String>> = q.run_id.as_ref().map(|parent| {
-        let mut set = HashSet::new();
-        set.insert(parent.clone());
-        for cp in s
-            .run_store
-            .read_unit_checkpoints(parent)
-            .unwrap_or_default()
-        {
-            set.insert(cp.run_id);
-        }
-        set
-    });
+    // Resolve the run-id match SET when filtering by run: the parent unioned
+    // with its sub-runs (each `for_each`/`panel` unit is its own sub-run, and
+    // its findings carry the UNIT's run id). See [`resolve_run_scope`] — it
+    // draws sub-run ids from checkpoints AND the live event stream, so a
+    // RUNNING run's in-flight/panel findings aren't dropped. Only one level of
+    // fan-out is resolved (a unit that itself fans out isn't followed).
+    let run_ids: Option<HashSet<String>> = q
+        .run_id
+        .as_ref()
+        .map(|parent| resolve_run_scope(&s.run_store, parent));
 
     Ok(Json(scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow)))
 }
@@ -649,6 +718,77 @@ mod tests {
         assert_eq!(resp.summary.high, 1);
         assert_eq!(resp.summary.medium, 1);
         assert_eq!(resp.summary.low, 0);
+    }
+
+    /// The running-run fix: `resolve_run_scope` recovers an IN-FLIGHT unit's
+    /// sub-run id from the parent's live `events.jsonl` (a `UnitStarted` whose
+    /// transcript stem is the unit run id), even with NO checkpoint written yet
+    /// — which is why the Findings tab used to look empty mid-run.
+    #[test]
+    fn resolve_run_scope_picks_up_inflight_units_from_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let parent = "run_parent";
+        let ev_path = store.events_path(parent);
+        std::fs::create_dir_all(ev_path.parent().unwrap()).unwrap();
+        let events = [
+            Event::UnitStarted {
+                run_id: parent.into(),
+                step_id: "assess".into(),
+                index: 0,
+                unit_key: "crates/db".into(),
+                agent: Some("oracle".into()),
+                transcript_path: tmp.path().join("transcripts/run_unit0.jsonl"),
+                host: None,
+            },
+            Event::StepWorking {
+                run_id: parent.into(),
+                step_id: "recon".into(),
+                note: Some("scanning".into()),
+                transcript_path: Some(tmp.path().join("transcripts/run_recon.jsonl")),
+            },
+        ];
+        let body: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(&ev_path, body).unwrap();
+
+        let scope = resolve_run_scope(&store, parent);
+        assert!(scope.contains("run_parent"), "parent always in scope");
+        assert!(
+            scope.contains("run_unit0"),
+            "in-flight unit sub-run id must be recovered from events (was: {scope:?})"
+        );
+        assert!(scope.contains("run_recon"));
+    }
+
+    /// Nested sub-run transcript layout (`.../<sub_id>/transcript.jsonl`)
+    /// resolves to the directory name, not the generic `transcript` stem.
+    #[test]
+    fn resolve_run_scope_handles_nested_sub_run_transcript_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let parent = "run_parent";
+        let ev_path = store.events_path(parent);
+        std::fs::create_dir_all(ev_path.parent().unwrap()).unwrap();
+        let ev = Event::UnitStarted {
+            run_id: parent.into(),
+            step_id: "s".into(),
+            index: 0,
+            unit_key: "u".into(),
+            agent: None,
+            transcript_path: tmp
+                .path()
+                .join("runs/run_parent/sub/sub_child/transcript.jsonl"),
+            host: None,
+        };
+        std::fs::write(&ev_path, serde_json::to_string(&ev).unwrap() + "\n").unwrap();
+        let scope = resolve_run_scope(&store, parent);
+        assert!(
+            scope.contains("sub_child"),
+            "nested layout → dir name (was: {scope:?})"
+        );
     }
 
     #[test]
