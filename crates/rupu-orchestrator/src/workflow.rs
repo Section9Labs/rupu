@@ -2453,7 +2453,7 @@ fn declaration_order_is_topological(wf: &Workflow) -> bool {
 /// `depends_on:`. Legacy edge-free workflows keep running only the
 /// pre-existing forward-only `validate_branch_targets` /
 /// `validate_template_refs` checks — `validate_graph` never runs for them.
-pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
+pub fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
     !wf.loops.is_empty()
         || wf.steps.iter().any(|s| {
             !s.next.is_empty() || s.split.is_some() || s.join.is_some() || !s.depends_on.is_empty()

@@ -363,7 +363,17 @@ export interface RunListRow {
 /** Step-DAG node from /api/runs/:id/graph .workflow.steps */
 export interface StepNodeDto {
   id: string;
-  kind: 'step' | 'for_each' | 'parallel' | 'panel' | 'action' | 'gate' | 'run';
+  kind:
+    | 'step'
+    | 'for_each'
+    | 'parallel'
+    | 'panel'
+    | 'action'
+    | 'gate'
+    | 'run'
+    | 'split'
+    | 'join'
+    | 'branch';
   agent?: string | null;
   for_each?: string | null;
   parallel?: { id: string; agent: string }[] | null;
@@ -402,7 +412,11 @@ export interface UnitCheckpoint {
 
 export interface RunGraphResponse {
   run: RunRecord;
-  workflow: { steps: StepNodeDto[] };
+  /** `edges` is the workflow's real DAG (split/join/branch/next/depends_on, or
+   *  the legacy linear chain), so the run graph forks where the workflow does.
+   *  Optional for backward-compat: an older backend omits it and the model
+   *  falls back to a linear chain. */
+  workflow: { steps: StepNodeDto[]; edges?: { from: string; to: string }[] };
   step_results: StepResultRecord[];
   units: UnitCheckpoint[];
   usage?: UsageSummary;
