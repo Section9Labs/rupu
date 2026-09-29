@@ -20,6 +20,7 @@ clap_mangen.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 rustls = { workspace = true }
+rustix.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true

@@ -14,6 +14,10 @@ async fn main() -> ExitCode {
     // already installed, which is harmless here.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    // macOS gives GUI/launchd-spawned processes a 256 soft fd limit;
+    // concurrent fan-out units exhaust it (EMFILE). Children inherit this.
+    rupu_cli::fd_limit::raise_nofile_limit();
+
     let args = std::env::args().collect::<Vec<_>>();
     rupu_cli::run(args).await
 }
