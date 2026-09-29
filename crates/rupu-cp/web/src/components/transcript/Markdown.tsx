@@ -5,10 +5,11 @@
  * code blocks, styled by the shared theme-aware `codeHighlight.css` so blocks
  * track the CP's light/dark theme and sit transparently on the panel.
  *
- * This file lives in the `transcript/` component tree, which is already
- * reached only through the lazy-loaded RunTranscript route.  The
- * `manualChunks.markdown` group in vite.config.ts ensures that once this
- * import is reachable it lands in its own chunk, not the main entry.
+ * Consumers: the transcript (Turn, FindingCard), the Code tab's inline
+ * finding cards (InlineFindingCard) and the findings evidence panel
+ * (FindingEvidence, shared by the findings tables). All of them sit behind
+ * lazy-loaded routes, and the `manualChunks.markdown` group in vite.config.ts
+ * ensures react-markdown & co. land in their own chunk, not the main entry.
  */
 
 import ReactMarkdown from 'react-markdown';
