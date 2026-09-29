@@ -1,38 +1,35 @@
-// One event in the Situation Room live stream (also reused by the per-run
-// feed). A context-rich, openable timeline row built from a StreamCard
-// (lib/situationRoom/cards.ts): it surfaces WHICH agent, in WHICH workflow, for
-// WHICH project, and WHAT it did — plus step / unit / duration / tokens when the
-// event carries them — and expands to show the ids + transcript path. `await`
-// cards keep inline Approve / Reject; findings keep the rich severity + code
-// treatment; errors render via ErrorDetail. Nothing is fabricated: a field the
-// event doesn't carry simply isn't shown.
-//
-// Visual language mirrors Ghost's activity view: bordered `bg-panel` cards,
-// notable accents tint the border + a faint wash, a tone Badge, a strict
-// text-sm/note/meta hierarchy, mono ids and tabular-nums.
+// One row in the Situation Room live timeline (also reused by the per-run
+// feed). A StreamCard (lib/situationRoom/cards.ts) rendered as a timeline
+// entry: an absolute timestamp + a status-coloured marker on a connecting rail,
+// then a status pill, a plain-language "what happened" headline (agent · step ·
+// unit + outcome), workflow/run context, and — for findings — the full rich
+// body (severity, file:line, evidence, code, SCM link). `await` rows keep
+// inline Approve / Reject; errors render via ErrorDetail. Nothing fabricated: a
+// field the event doesn't carry simply isn't shown.
 
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import {
   AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Clock, Coins, Cog,
-  ExternalLink, Layers, Pause, PlayCircle, Search, ShieldAlert, Users,
+  ExternalLink, Layers, Pause, PlayCircle, Search, ShieldAlert, SkipForward, Users,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { cn } from '../../lib/cn';
 import { Badge, type BadgeTone } from '../ui/Badge';
-import type { CardForm, CardAccent, StreamCard } from '../../lib/situationRoom/cards';
+import type { DotColor } from '../ui/Dot';
+import type { CardForm, StreamCard } from '../../lib/situationRoom/cards';
 import CodeExcerpt from './CodeExcerpt';
 import ErrorDetail from './ErrorDetail';
 
-/** Relative "time ago" from a ms timestamp. */
-function rel(ts: number): string {
-  const sec = Math.round((Date.now() - ts) / 1000);
-  if (sec < 5) return 'now';
-  if (sec < 60) return `${sec}s`;
-  const min = Math.round(sec / 60);
-  if (min < 60) return `${min}m`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr}h`;
-  return `${Math.round(hr / 24)}d`;
+// The real "what happened" for a step lives in its transcript (tool calls,
+// files read/written, output) — not on the event. Fetch + render it on demand
+// when a row is opened, reusing the run transcript renderer. Lazy so the live
+// stream's bundle stays lean until someone actually opens a row.
+const TranscriptDetail = lazy(() => import('../TranscriptPanel'));
+
+/** Absolute wall-clock, HH:MM:SS — the timeline's left column. */
+function clock(ts: number): string {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
 
 /** Compact token count: 1234 → 1.2k. */
@@ -42,8 +39,11 @@ function fmtTokens(n: number): string {
   return `${Math.round(n / 100_000) / 10}M`;
 }
 
-function ActorIcon({ form, className }: { form: CardForm; className?: string }) {
+function KindIcon({ form, badge, className }: { form: CardForm; badge: string; className?: string }) {
   const cls = className ?? 'h-[13px] w-[13px]';
+  if (form === 'finding') return <ShieldAlert className={cls} />;
+  if (badge === 'Scanning') return <Search className={cls} />;
+  if (badge === 'Skipped') return <SkipForward className={cls} />;
   switch (form) {
     case 'await': return <Pause className={cls} />;
     case 'error': return <AlertTriangle className={cls} />;
@@ -54,25 +54,22 @@ function ActorIcon({ form, className }: { form: CardForm; className?: string }) 
   }
 }
 
-/** Accent → Badge tone + optional border/wash tint. Routine `brand`/`info`
- *  stay untinted; notable accents tint the card the way Ghost does. */
-function accentVisual(accent: CardAccent): { tone: BadgeTone; tint?: React.CSSProperties } {
-  const sev = (name: string, b: number, g: number): React.CSSProperties => ({
-    borderColor: `rgb(var(--c-sev-${name})/${b})`,
-    background: `rgb(var(--c-sev-${name})/${g})`,
-  });
-  switch (accent) {
-    case 'await':
-      return { tone: 'amber', tint: { borderColor: 'rgb(var(--c-status-awaiting)/.4)', background: 'rgb(var(--c-status-awaiting)/.06)' } };
-    case 'error':
-      return { tone: 'red', tint: { borderColor: 'rgb(var(--c-status-failed)/.4)', background: 'rgb(var(--c-status-failed)/.05)' } };
-    case 'critical': return { tone: 'red', tint: sev('critical', 0.4, 0.06) };
-    case 'high': return { tone: 'red', tint: sev('high', 0.4, 0.05) };
-    case 'medium': return { tone: 'amber', tint: sev('medium', 0.4, 0.05) };
-    case 'low': return { tone: 'sky', tint: sev('low', 0.35, 0.04) };
-    case 'info': return { tone: 'neutral' };
-    default: return { tone: 'brand' };
+/** Status pill tone + rail-marker colour, from the card's outcome. Green =
+ *  succeeded, red = failed, amber = awaiting, blue = in-progress, violet =
+ *  routine; findings tint by severity. */
+function statusVisual(card: StreamCard): { tone: BadgeTone; dot: DotColor } {
+  if (card.accent === 'error') return { tone: 'red', dot: 'failed' };
+  if (card.accent === 'await') return { tone: 'amber', dot: 'awaiting' };
+  if (card.form === 'finding') {
+    const s = card.severity;
+    if (s === 'critical' || s === 'high') return { tone: 'red', dot: 'failed' };
+    if (s === 'medium') return { tone: 'amber', dot: 'awaiting' };
+    return { tone: 'sky', dot: 'mute' };
   }
+  if (card.form === 'complete') return { tone: 'green', dot: 'done' };
+  if (card.badge === 'Skipped') return { tone: 'neutral', dot: 'mute' };
+  if (card.badge === 'Paused') return { tone: 'amber', dot: 'awaiting' };
+  return { tone: 'sky', dot: 'running' }; // scanning / working / fan-out / started
 }
 
 export interface ApproveState {
@@ -81,7 +78,7 @@ export interface ApproveState {
   error?: string;
 }
 
-/** A labelled meta chip in the context row (step / unit / duration / tokens). */
+/** A labelled meta chip (unit / duration / tokens / round). */
 function Meta({ icon, children }: { icon?: React.ReactNode; children: React.ReactNode }) {
   return (
     <span className="inline-flex items-center gap-1 font-mono tabular-nums text-meta text-ink-mute">
@@ -90,6 +87,15 @@ function Meta({ icon, children }: { icon?: React.ReactNode; children: React.Reac
     </span>
   );
 }
+
+const DOT_RGB: Record<DotColor, string> = {
+  brand: 'var(--c-brand-500)',
+  awaiting: 'var(--c-status-awaiting)',
+  failed: 'var(--c-status-failed)',
+  done: 'var(--c-status-done)',
+  running: 'var(--c-status-running)',
+  mute: 'var(--c-ink-mute)',
+};
 
 export default function EventCard({
   card,
@@ -106,7 +112,6 @@ export default function EventCard({
   branch?: string;
   workflow?: string;
   fresh?: boolean;
-  /** Per-run feeds already scope every card to one run — hide the redundant link. */
   hideRunLink?: boolean;
   onApprove?: (runId: string) => Promise<void>;
   onReject?: (runId: string) => Promise<void>;
@@ -117,13 +122,11 @@ export default function EventCard({
   const label = projectLabel ?? card.projectName;
   const wf = workflow ?? card.workflow;
   const canApprove = card.form === 'await' && !!onApprove && !!onReject;
-  const { tone, tint } = accentVisual(card.accent);
+  const { tone, dot } = statusVisual(card);
 
-  // The headline "what": prefer the agent, then the action title.
   const durationS = card.durationMs != null ? `${Math.round(card.durationMs / 100) / 10}s` : undefined;
-  const hasMeta = !!(card.stepId || card.unitKey || durationS || card.tokensIn != null || card.round || card.stepKind);
-  // Extra detail worth an expand: the transcript path + the full ids.
-  const hasExpand = !!(card.transcriptPath || card.runId || card.stepId || card.unitKey);
+  const hasMeta = !!(card.unitKey || durationS || card.tokensIn != null || card.round);
+  const showNote = !!card.detail && card.form !== 'complete' && card.form !== 'finding' && card.form !== 'error';
 
   async function act(kind: 'approve' | 'reject') {
     const runId = card.approvable?.runId;
@@ -143,149 +146,139 @@ export default function EventCard({
       ? `/projects/${card.wsId}/code?path=${encodeURIComponent(card.filePath)}${card.fileLine ? `&line=${card.fileLine}` : ''}`
       : undefined;
 
-  // Whether to show `detail` as a note line. For `complete` cards the detail is
-  // the redundant "ok · 5.2s / a→b tok" summary — already in the meta chips.
-  const showNote = !!card.detail && card.form !== 'complete' && card.form !== 'finding' && card.form !== 'error';
-
   return (
-    <article
-      data-testid="sr-ev"
-      data-accent={card.accent}
-      className={cn(
-        'rounded-lg border bg-panel px-3.5 py-3 transition-colors',
-        !tint && 'border-border hover:border-ink-mute',
-        fresh && 'ring-1 ring-brand-500/30',
-        state.resolved && 'opacity-70',
-      )}
-      style={tint}
-    >
-      {/* Header: badge · project · workflow · run · ago */}
-      <div className="flex items-center gap-2">
-        <Badge tone={tone}>{card.badge}</Badge>
-        {label && (
-          <span className="inline-flex min-w-0 items-center gap-1.5 truncate font-mono text-note font-medium text-ink">
-            {label}
-            {branch && <span className="font-normal text-ink-mute">{branch}</span>}
-          </span>
-        )}
-        {wf && (
-          <span className="inline-flex min-w-0 shrink items-center gap-1 truncate font-mono text-meta text-ink-mute" title={`workflow ${wf}`}>
-            <span className="text-ink-mute/60">/</span>
-            {wf}
-          </span>
-        )}
-        {card.runId && !hideRunLink && (
-          <Link
-            to={`/runs/${card.runId}`}
-            className="shrink-0 font-mono text-meta text-ink-mute transition-colors hover:text-ink"
-            title={`run ${card.runId}`}
-          >
-            {card.runId.slice(0, 8)}
-          </Link>
-        )}
-        {card.ts > 0 && (
-          <span className="ml-auto shrink-0 font-mono text-meta tabular-nums text-ink-mute" title={new Date(card.ts).toLocaleString()}>
-            {rel(card.ts)}
-          </span>
-        )}
+    <article data-testid="sr-ev" data-accent={card.accent} className={cn('relative flex gap-2.5', fresh && 'sr-fresh')}>
+      {/* Timeline column: absolute time + status marker on a connecting rail */}
+      <time
+        className="w-[52px] shrink-0 pt-0.5 text-right font-mono text-meta tabular-nums text-ink-mute"
+        title={card.ts ? new Date(card.ts).toLocaleString() : undefined}
+      >
+        {clock(card.ts)}
+      </time>
+      <div className="relative flex w-3 shrink-0 justify-center" aria-hidden>
+        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border" />
+        <span
+          className="relative z-10 mt-[5px] block h-2.5 w-2.5 rounded-full ring-4 ring-panel"
+          style={{ background: `rgb(${DOT_RGB[dot]})` }}
+        />
       </div>
 
-      {/* Headline: icon · agent · what */}
-      <div className="mt-2 flex items-start gap-2 text-sm font-medium text-ink">
-        <span className="mt-px shrink-0" style={card.form === 'finding' ? { color: `rgb(var(--c-sev-${card.severity ?? 'info'}))` } : card.form === 'error' ? { color: 'rgb(var(--c-status-failed))' } : card.form === 'await' ? { color: 'rgb(var(--c-status-awaiting))' } : undefined}>
-          {card.form === 'finding' ? <ShieldAlert className="h-4 w-4" /> : card.badge === 'Scanning' ? <Search className="h-[14px] w-[14px] text-ink-mute" /> : <ActorIcon form={card.form} className="h-[14px] w-[14px] text-ink-mute" />}
-        </span>
-        {card.agent && <span className="shrink-0 font-mono text-brand-700">{card.agent}</span>}
-        <span className="min-w-0">{card.title}</span>
-      </div>
-
-      {/* Meta chips: step · unit · duration · tokens · round */}
-      {hasMeta && (
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
-          {card.stepId && <Meta icon={<Layers className="h-3 w-3" />}>{card.stepId}</Meta>}
-          {card.unitKey && <Meta>· {card.unitKey}</Meta>}
-          {card.round && <Meta>round {card.round.n}/{card.round.max}</Meta>}
-          {durationS && <Meta icon={<Clock className="h-3 w-3" />}>{durationS}</Meta>}
-          {card.tokensIn != null && card.tokensOut != null && (
-            <Meta icon={<Coins className="h-3 w-3" />}>{fmtTokens(card.tokensIn)}→{fmtTokens(card.tokensOut)}</Meta>
+      {/* Content */}
+      <div className={cn('min-w-0 flex-1 pb-4', state.resolved && 'opacity-70')}>
+        {/* Line 1: status pill · workflow · run */}
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <Badge tone={tone}>{card.badge}</Badge>
+          {label && (
+            <span className="inline-flex min-w-0 items-center gap-1.5 truncate font-mono text-meta text-ink-dim">
+              {label}
+              {branch && <span className="text-ink-mute">{branch}</span>}
+            </span>
+          )}
+          {wf && (
+            <span className="inline-flex min-w-0 items-center gap-1 truncate font-mono text-meta text-ink-mute" title={`workflow ${wf}`}>
+              <span className="text-ink-mute/50">/</span>{wf}
+            </span>
+          )}
+          {card.runId && !hideRunLink && (
+            <Link to={`/runs/${card.runId}`} className="shrink-0 font-mono text-meta text-ink-mute transition-colors hover:text-ink" title={`run ${card.runId}`}>
+              {card.runId.slice(0, 8)}
+            </Link>
           )}
         </div>
-      )}
 
-      {/* Secondary note (real notes / reasons; not the redundant complete summary) */}
-      {showNote && <p className="mt-1.5 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
+        {/* Line 2: what happened — icon · agent · step/what */}
+        <div className="mt-1 flex items-start gap-1.5 text-sm font-medium text-ink">
+          <span className="mt-px shrink-0 text-ink-mute"><KindIcon form={card.form} badge={card.badge} className="h-[14px] w-[14px]" /></span>
+          {card.agent && <span className="shrink-0 font-mono text-brand-700">{card.agent}</span>}
+          {card.agent && <span className="shrink-0 text-ink-mute">·</span>}
+          <span className="min-w-0">{card.title}</span>
+        </div>
 
-      {/* Finding extras */}
-      {card.form === 'finding' && (
-        <>
-          {card.fileRef &&
-            (codeHref ? (
-              <Link to={codeHref} className="mt-1 inline-block font-mono text-meta text-ink-mute transition-colors hover:text-ink">{card.fileRef}</Link>
-            ) : (
-              <div className="mt-1 font-mono text-meta text-ink-mute">{card.fileRef}</div>
-            ))}
-          {card.detail && <p className="mt-1.5 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
-          {card.code && <div className="mt-2"><CodeExcerpt code={card.code} startLine={card.fileLine} filePath={card.filePath} /></div>}
-          {card.permalink && (
-            <a href={card.permalink} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-meta text-ink-dim transition-colors hover:text-ink">
-              <ExternalLink className="h-3 w-3" /> View on repository
-            </a>
-          )}
-        </>
-      )}
-
-      {/* Error body */}
-      {card.form === 'error' && card.detail && <div className="mt-2"><ErrorDetail text={card.detail} /></div>}
-
-      {/* Await approve / reject */}
-      {card.form === 'await' && (
-        state.resolved ? (
-          <span className="mt-2 inline-block text-note font-medium" style={{ color: `rgb(var(--c-status-${state.resolved === 'approved' ? 'done' : 'failed'}))` }}>
-            ✓ {state.resolved} · you
-          </span>
-        ) : canApprove ? (
-          <div className="mt-2.5 flex max-w-[320px] gap-2">
-            <button type="button" disabled={state.busy} onClick={() => act('approve')}
-              className="flex-1 rounded-md border px-3 py-1.5 text-note font-semibold transition-colors disabled:opacity-50"
-              style={{ background: 'rgb(var(--c-status-done)/.12)', color: 'rgb(var(--c-status-done))', borderColor: 'rgb(var(--c-status-done)/.35)' }}>
-              {state.busy ? '…' : 'Approve'}
-            </button>
-            <button type="button" disabled={state.busy} onClick={() => act('reject')}
-              className="flex-1 rounded-md border px-3 py-1.5 text-note font-semibold transition-colors disabled:opacity-50"
-              style={{ background: 'rgb(var(--c-status-failed)/.1)', color: 'rgb(var(--c-status-failed))', borderColor: 'rgb(var(--c-status-failed)/.35)' }}>
-              Reject
-            </button>
+        {/* Meta: unit target · round · duration · tokens */}
+        {hasMeta && (
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+            {card.unitKey && <Meta icon={<Layers className="h-3 w-3" />}>{card.unitKey}</Meta>}
+            {card.round && <Meta>round {card.round.n}/{card.round.max}</Meta>}
+            {durationS && <Meta icon={<Clock className="h-3 w-3" />}>{durationS}</Meta>}
+            {card.tokensIn != null && card.tokensOut != null && (
+              <Meta icon={<Coins className="h-3 w-3" />}>{fmtTokens(card.tokensIn)}→{fmtTokens(card.tokensOut)} tok</Meta>
+            )}
           </div>
-        ) : (
-          <span className="mt-2 inline-block text-note font-medium" style={{ color: 'rgb(var(--c-status-awaiting))' }}>Awaiting approval</span>
-        )
-      )}
-      {card.form === 'await' && state.error && <div className="mt-1.5 text-note" style={{ color: 'rgb(var(--c-err))' }}>Could not submit: {state.error}</div>}
+        )}
 
-      {/* Expand: ids + transcript path */}
-      {hasExpand && (
-        <div className="mt-2">
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-            className="inline-flex items-center gap-1 text-meta text-ink-mute transition-colors hover:text-ink"
-          >
-            {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-            {open ? 'Hide detail' : 'Detail'}
-          </button>
-          {open && (
-            <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md border border-border bg-surface/60 px-3 py-2 text-meta">
-              {card.runId && (<><dt className="text-ink-mute">run</dt><dd className="min-w-0 break-all font-mono text-ink-dim">{card.runId}</dd></>)}
-              {wf && (<><dt className="text-ink-mute">workflow</dt><dd className="min-w-0 break-all font-mono text-ink-dim">{wf}</dd></>)}
-              {card.stepId && (<><dt className="text-ink-mute">step</dt><dd className="min-w-0 break-all font-mono text-ink-dim">{card.stepId}{card.stepKind ? ` (${card.stepKind})` : ''}</dd></>)}
-              {card.unitKey && (<><dt className="text-ink-mute">unit</dt><dd className="min-w-0 break-all font-mono text-ink-dim">{card.unitKey}</dd></>)}
-              {card.agent && (<><dt className="text-ink-mute">agent</dt><dd className="min-w-0 break-all font-mono text-ink-dim">{card.agent}</dd></>)}
-              {card.transcriptPath && (<><dt className="text-ink-mute">transcript</dt><dd className="min-w-0 break-all font-mono text-ink-dim">{card.transcriptPath}</dd></>)}
-            </dl>
-          )}
-        </div>
-      )}
+        {/* Secondary note (real notes / reasons) */}
+        {showNote && <p className="mt-1 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
+
+        {/* Finding: the rich, detailed body */}
+        {card.form === 'finding' && (
+          <>
+            {card.fileRef &&
+              (codeHref ? (
+                <Link to={codeHref} className="mt-1 inline-block font-mono text-meta text-ink-mute transition-colors hover:text-ink">{card.fileRef}</Link>
+              ) : (
+                <div className="mt-1 font-mono text-meta text-ink-mute">{card.fileRef}</div>
+              ))}
+            {card.detail && <p className="mt-1 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
+            {card.code && <div className="mt-2"><CodeExcerpt code={card.code} startLine={card.fileLine} filePath={card.filePath} /></div>}
+            {card.permalink && (
+              <a href={card.permalink} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-meta text-ink-dim transition-colors hover:text-ink">
+                <ExternalLink className="h-3 w-3" /> View on repository
+              </a>
+            )}
+          </>
+        )}
+
+        {/* Error body */}
+        {card.form === 'error' && card.detail && <div className="mt-2"><ErrorDetail text={card.detail} /></div>}
+
+        {/* Await approve / reject */}
+        {card.form === 'await' && (
+          state.resolved ? (
+            <span className="mt-1.5 inline-block text-note font-medium" style={{ color: `rgb(var(--c-status-${state.resolved === 'approved' ? 'done' : 'failed'}))` }}>
+              ✓ {state.resolved} · you
+            </span>
+          ) : canApprove ? (
+            <div className="mt-2 flex max-w-[320px] gap-2">
+              <button type="button" disabled={state.busy} onClick={() => act('approve')}
+                className="flex-1 rounded-md border px-3 py-1.5 text-note font-semibold transition-colors disabled:opacity-50"
+                style={{ background: 'rgb(var(--c-status-done)/.12)', color: 'rgb(var(--c-status-done))', borderColor: 'rgb(var(--c-status-done)/.35)' }}>
+                {state.busy ? '…' : 'Approve'}
+              </button>
+              <button type="button" disabled={state.busy} onClick={() => act('reject')}
+                className="flex-1 rounded-md border px-3 py-1.5 text-note font-semibold transition-colors disabled:opacity-50"
+                style={{ background: 'rgb(var(--c-status-failed)/.1)', color: 'rgb(var(--c-status-failed))', borderColor: 'rgb(var(--c-status-failed)/.35)' }}>
+                Reject
+              </button>
+            </div>
+          ) : (
+            <span className="mt-1.5 inline-block text-note font-medium" style={{ color: 'rgb(var(--c-status-awaiting))' }}>Awaiting approval</span>
+          )
+        )}
+        {card.form === 'await' && state.error && <div className="mt-1.5 text-note" style={{ color: 'rgb(var(--c-err))' }}>Could not submit: {state.error}</div>}
+
+        {/* Expand → the step's actual transcript: which files, tool calls,
+            output. Only rows that carry a transcript path can open. */}
+        {card.transcriptPath && (
+          <div className="mt-2">
+            <button
+              type="button"
+              onClick={() => setOpen((v) => !v)}
+              aria-expanded={open}
+              className="inline-flex items-center gap-1 text-meta font-medium text-ink-mute transition-colors hover:text-ink"
+            >
+              {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              {open ? 'Hide what happened' : 'Show what happened'}
+            </button>
+            {open && (
+              <div className="mt-2 max-h-[440px] overflow-auto rounded-md border border-border bg-surface/40 p-2">
+                <Suspense fallback={<div className="p-3 text-meta text-ink-mute">Loading transcript…</div>}>
+                  <TranscriptDetail path={card.transcriptPath} runId={card.runId} live={false} embedded />
+                </Suspense>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </article>
   );
 }

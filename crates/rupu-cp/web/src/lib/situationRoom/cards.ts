@@ -143,7 +143,9 @@ export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: k.agent ? 'Scanning' : 'Step', stepId: k.step_id, agent: k.agent ?? undefined,
         stepKind: k.kind,
-        title: k.agent ? `${k.agent} · ${stepLabel(k.step_id)}` : stepLabel(k.step_id),
+        // Agent is rendered as its own field; the title is just the step so it
+        // isn't repeated ("agent agent · step").
+        title: stepLabel(k.step_id),
         detail: k.agent ? undefined : k.kind };
     case 'step_working': {
       const note = k.note?.trim();
@@ -174,13 +176,14 @@ export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: 'Fan-out', stepId: k.step_id, agent: k.agent ?? undefined,
         unitKey: k.unit_key, transcriptPath: k.transcript_path,
-        title: `${stepLabel(k.step_id)} · ${k.unit_key}`, detail: k.agent ? `agent ${k.agent}` : undefined };
+        // Agent + unit render as their own fields; keep the title the step.
+        title: stepLabel(k.step_id) };
     case 'unit_completed':
       return { ...base, form: 'complete', group: 'activity',
         accent: k.success ? 'brand' : 'error', badge: k.success ? 'Unit done' : 'Unit failed',
         stepId: k.step_id, unitKey: k.unit_key, tokensIn: k.tokens_in, tokensOut: k.tokens_out,
-        title: `${stepLabel(k.step_id)} · ${k.unit_key}`,
-        detail: `${k.success ? 'ok' : 'failed'} · ${k.tokens_in}→${k.tokens_out} tok` };
+        // Step is the title; unit + tokens render as their own meta fields.
+        title: stepLabel(k.step_id) };
     case 'panel_round':
       return { ...base, form: 'panel', group: 'activity', accent: 'brand',
         badge: 'Panel round', stepId: k.step_id, round: { n: k.round, max: k.max_iterations },

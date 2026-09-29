@@ -107,7 +107,7 @@ export default function EventStream({
       </div>
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-auto px-5 py-4">
-        <div className="mx-auto flex max-w-[820px] flex-col gap-2.5">
+        <div className="mx-auto flex max-w-[820px] flex-col">
           {shown.length === 0 ? (
             <div className="p-10 text-center text-note text-ink-dim">
               {cards.length === 0

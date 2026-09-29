@@ -43,8 +43,10 @@ describe('cardFromEvent', () => {
     const c = cardFromEvent(ev, 1000, 'k1')!;
     expect(c.group).toBe('activity');
     expect(c.badge).toBe('Scanning');
+    // Agent is a first-class field (rendered on its own), not baked into the
+    // title — the title is just the step, so it isn't shown twice.
     expect(c.agent).toBe('oracle-sec');
-    expect(c.title).toContain('oracle-sec');
+    expect(c.title).toBe('audit');
   });
 
   it('a note-less step_working heartbeat is dropped (null), not an empty row', () => {

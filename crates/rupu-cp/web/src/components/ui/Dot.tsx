@@ -2,13 +2,14 @@
 // theme.Dot). Colour comes from a themed `--c-*` token via inline style so the
 // same dot reads on light and dark. Static size classes only.
 
-export type DotColor = 'brand' | 'awaiting' | 'failed' | 'done' | 'mute';
+export type DotColor = 'brand' | 'awaiting' | 'failed' | 'done' | 'running' | 'mute';
 
 const TOKEN: Record<DotColor, string> = {
   brand: 'var(--c-brand-500)',
   awaiting: 'var(--c-status-awaiting)',
   failed: 'var(--c-status-failed)',
   done: 'var(--c-status-done)',
+  running: 'var(--c-status-running)',
   mute: 'var(--c-ink-mute)',
 };
 
