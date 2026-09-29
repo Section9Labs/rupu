@@ -34,7 +34,6 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
@@ -93,6 +92,7 @@ static GROW_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 fn os_per_process_cap() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
+        use std::sync::OnceLock;
         static CAP: OnceLock<Option<u64>> = OnceLock::new();
         *CAP.get_or_init(|| {
             let out = std::process::Command::new("/usr/sbin/sysctl")
