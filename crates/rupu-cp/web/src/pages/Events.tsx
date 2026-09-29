@@ -91,6 +91,9 @@ export default function Events() {
   const [projects, setProjects] = useState<ProjectRow[]>([]);
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
   const [runToWs, setRunToWs] = useState<Map<string, string>>(new Map());
+  // run_id → workflow_name, learned from the same lazy getRun call as the
+  // workspace. Lets each event surface which workflow it belongs to.
+  const [runToWorkflow, setRunToWorkflow] = useState<Map<string, string>>(new Map());
   // Authoritative *terminal* run.json statuses (completed/failed/cancelled/
   // rejected), learned via the same lazy getRun calls — reconciles runs whose
   // event log ended mid-step so they don't spin forever.
@@ -201,6 +204,10 @@ export default function Events() {
       api.getRun(runId).then((res) => {
         const ws = res.run.workspace_id;
         if (ws) setRunToWs((prev) => new Map(prev).set(runId, ws));
+        const wf = res.run.workflow_name;
+        if (typeof wf === 'string' && wf && !wf.startsWith('agent:')) {
+          setRunToWorkflow((prev) => new Map(prev).set(runId, wf));
+        }
         const status = res.run.status;
         if (typeof status === 'string' && TERMINAL_STATUSES.has(status)) {
           setRunStatus((prev) => new Map(prev).set(runId, status));
@@ -294,16 +301,17 @@ export default function Events() {
   }, [projects]);
 
   const resolveProject = useCallback(
-    (card: StreamCard): { label?: string; branch?: string } => {
-      if (card.projectName) return { label: card.projectName };
+    (card: StreamCard): { label?: string; branch?: string; workflow?: string } => {
+      const workflow = card.workflow ?? (card.runId ? runToWorkflow.get(card.runId) : undefined);
+      if (card.projectName) return { label: card.projectName, workflow };
       if (card.runId) {
         const ws = runToWs.get(card.runId);
         const p = ws ? wsById.get(ws) : undefined;
-        if (p) return { label: p.name, branch: p.branch ?? undefined };
+        if (p) return { label: p.name, branch: p.branch ?? undefined, workflow };
       }
-      return {};
+      return { workflow };
     },
-    [runToWs, wsById],
+    [runToWs, runToWorkflow, wsById],
   );
 
   const errors = useMemo(() => cards.filter((c) => c.group === 'error').length, [cards]);
