@@ -54,6 +54,32 @@
     "total_tokens": 3700
   },
   "workflow": {
+    "edges": [
+      {
+        "from": "plan",
+        "to": "fan"
+      },
+      {
+        "from": "fan",
+        "to": "par"
+      },
+      {
+        "from": "par",
+        "to": "review"
+      },
+      {
+        "from": "review",
+        "to": "approve"
+      },
+      {
+        "from": "approve",
+        "to": "create_pr"
+      },
+      {
+        "from": "create_pr",
+        "to": "build"
+      }
+    ],
     "steps": [
       {
         "agent": "rupuso",

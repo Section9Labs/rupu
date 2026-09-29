@@ -346,15 +346,33 @@ export function buildRunGraphModel(
   }
 
   // ------------------------------------------------------------------
-  // Phase 6: Build edges — linear chain.
+  // Phase 6: Build edges — the workflow's REAL DAG.
+  //
+  // The backend sends `workflow.edges` derived from the workflow's actual
+  // topology (split / join / branch / next / depends_on, or the legacy
+  // consecutive-pair chain for an edge-free workflow). Using them makes the
+  // run graph FORK where the workflow forks instead of collapsing every step
+  // into one inline line. Fall back to a linear chain only when the field is
+  // absent — an older backend, or a synthesized bare-agent / unpersisted DAG
+  // that carries no edges — so pre-`edges` responses still render.
   // ------------------------------------------------------------------
   const nodes = g.workflow.steps
     .map((dto) => nodeMap.get(dto.id))
     .filter((n): n is GraphNode => n !== undefined);
 
   const edges: GraphEdge[] = [];
-  for (let i = 0; i < nodes.length - 1; i++) {
-    edges.push({ from: nodes[i].id, to: nodes[i + 1].id });
+  const wfEdges = g.workflow.edges;
+  if (wfEdges !== undefined) {
+    for (const e of wfEdges) {
+      // Guard against an edge naming a step the skeleton doesn't include.
+      if (nodeMap.has(e.from) && nodeMap.has(e.to)) {
+        edges.push({ from: e.from, to: e.to });
+      }
+    }
+  } else {
+    for (let i = 0; i < nodes.length - 1; i++) {
+      edges.push({ from: nodes[i].id, to: nodes[i + 1].id });
+    }
   }
 
   // ------------------------------------------------------------------

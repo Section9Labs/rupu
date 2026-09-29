@@ -25,6 +25,9 @@ const STEP_KIND: Record<RunKind, StepKind> = {
   gate: 'approval_gate',
   action: 'action',
   run: 'run',
+  split: 'split',
+  join: 'join',
+  branch: 'branch',
 };
 
 /** Map a run-model step kind onto the editor's `StepKind` vocabulary. */
@@ -50,6 +53,9 @@ const LABELS: Record<RunKind, string> = {
   gate: 'gate',
   action: 'action',
   run: 'run',
+  split: 'split',
+  join: 'join',
+  branch: 'branch',
 };
 
 /** Short human label rendered in a node's kind pill. */

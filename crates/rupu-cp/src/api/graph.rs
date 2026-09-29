@@ -18,7 +18,9 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rupu_orchestrator::{executor::Event, runs::RunStore, Workflow};
+use rupu_orchestrator::{
+    executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges, Workflow,
+};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
@@ -265,6 +267,20 @@ fn merge_event_units(
 #[derive(Debug, Serialize)]
 pub struct StepDag {
     pub steps: Vec<StepNodeDto>,
+    /// The DAG's real control/data edges, so the run graph forks where the
+    /// workflow forks (`split`/`join`/`branch`/`next`/`depends_on`) instead of
+    /// fabricating a linear chain. Mirrors the web editor's `deriveEdges`:
+    /// [`workflow_edges`] (explicit ∪ inferred data-ref) in graph mode, or the
+    /// legacy consecutive-pair chain for an edge-free legacy workflow. Empty
+    /// for a single-node agent/unpersisted run.
+    pub edges: Vec<EdgeDto>,
+}
+
+/// One directed edge in the step DAG (`from` → `to`, both step ids).
+#[derive(Debug, Serialize)]
+pub struct EdgeDto {
+    pub from: String,
+    pub to: String,
 }
 
 /// One node in the step DAG.  The `kind` field drives how the UI renders
@@ -273,9 +289,11 @@ pub struct StepDag {
 pub struct StepNodeDto {
     /// Matches the `id:` in the workflow YAML.
     pub id: String,
-    /// `"step"` | `"for_each"` | `"parallel"` | `"panel"` | `"action"` | `"run"` |
-    /// `"gate"` — precedence: parallel > panel > gate > action > for_each >
-    /// step.
+    /// `"step"` | `"for_each"` | `"parallel"` | `"panel"` | `"branch"` |
+    /// `"split"` | `"join"` | `"action"` | `"run"` | `"gate"` — precedence:
+    /// parallel > panel > branch > split > join > gate > run > action >
+    /// for_each > step. `branch`/`split`/`join` are orchestration-only nodes
+    /// whose fork lives in [`StepDag::edges`].
     pub kind: String,
     /// Agent name for linear / `for_each` steps.
     pub agent: Option<String>,
@@ -356,6 +374,7 @@ pub fn agent_run_dag(workflow_name: &str) -> StepDag {
             action: None,
             approval_gate: None,
         }],
+        edges: vec![],
     }
 }
 
@@ -377,6 +396,7 @@ pub fn unpersisted_run_dag(workflow_name: &str) -> StepDag {
             action: None,
             approval_gate: None,
         }],
+        edges: vec![],
     }
 }
 
@@ -385,11 +405,61 @@ pub fn unpersisted_run_dag(workflow_name: &str) -> StepDag {
 /// The mapping is purely functional — no I/O, no fallibility.
 pub fn to_step_dag(wf: &Workflow) -> StepDag {
     let steps = wf.steps.iter().map(map_step).collect();
-    StepDag { steps }
+    StepDag {
+        steps,
+        edges: render_edges(wf),
+    }
+}
+
+/// The edges the run graph should render, matching the web editor's
+/// `deriveEdges` so the two views agree:
+///
+/// * **Graph mode** (the workflow declares any explicit edge — `next` /
+///   `split` / `join` / `depends_on`, or a loop): [`workflow_edges`], which is
+///   the explicit control edges unioned with inferred `steps.X` data-ref edges
+///   and `branch` then/else arms.
+/// * **Legacy mode** (an edge-free workflow authored before non-linear
+///   orchestration): the pre-existing consecutive-pair chain, unioned with the
+///   same data-ref / branch-arm edges `workflow_edges` already produces — so an
+///   old linear workflow still renders as the chain it always did.
+fn render_edges(wf: &Workflow) -> Vec<EdgeDto> {
+    // `workflow_edges` gives explicit ∪ data-ref ∪ branch-arm edges. In legacy
+    // mode it therefore emits data-ref/branch edges but NO chain, so add the
+    // consecutive-pair chain; the shared set dedups any overlap.
+    let mut set: std::collections::BTreeSet<(String, String)> =
+        workflow_edges(wf).into_iter().collect();
+    if !workflow_has_explicit_edges(wf) {
+        for pair in wf.steps.windows(2) {
+            set.insert((pair[0].id.clone(), pair[1].id.clone()));
+        }
+    }
+    set.into_iter()
+        .map(|(from, to)| EdgeDto { from, to })
+        .collect()
+}
+
+/// A [`StepNodeDto`] for an orchestration-only node (`split` / `join` /
+/// `branch`): it carries no agent/action/for_each work of its own — its shape
+/// in the graph is entirely its edges, so every optional is `None`.
+fn orch_node(id: &str, kind: &str) -> StepNodeDto {
+    StepNodeDto {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        agent: None,
+        for_each: None,
+        parallel: None,
+        panelists: None,
+        gate: None,
+        action: None,
+        approval_gate: None,
+    }
 }
 
 fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
-    // Kind precedence: parallel > panel > gate > action > for_each > step
+    // Kind precedence: parallel > panel > branch > split > join > gate >
+    // run > action > for_each > step (mirrors the web editor). The
+    // orchestration nodes (branch/split/join) carry no agent/action work; the
+    // fork itself lives in the edges (see `render_edges`).
     if let Some(subs) = &step.parallel {
         let parallel = subs
             .iter()
@@ -431,6 +501,17 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
             action: None,
             approval_gate: None,
         };
+    }
+
+    // Orchestration-only nodes: the bifurcation lives in the edges.
+    if step.branch.is_some() {
+        return orch_node(&step.id, "branch");
+    }
+    if step.split.is_some() {
+        return orch_node(&step.id, "split");
+    }
+    if step.join.is_some() {
+        return orch_node(&step.id, "join");
     }
 
     if rupu_orchestrator::is_approval_gate(step) {
@@ -703,6 +784,112 @@ mod tests {
         assert_eq!(dto.kind, "action");
         assert_eq!(dto.action.as_deref(), Some("scm.prs.create"));
         assert!(dto.approval_gate.is_none());
+    }
+
+    #[test]
+    fn map_step_orchestration_nodes_yield_split_join_branch_kinds() {
+        let split: rupu_orchestrator::Step =
+            serde_json::from_value(serde_json::json!({ "id": "fork", "split": ["a", "b"] }))
+                .expect("split step from json");
+        assert_eq!(map_step(&split).kind, "split");
+
+        let join: rupu_orchestrator::Step =
+            serde_json::from_value(serde_json::json!({ "id": "j", "join": {} }))
+                .expect("join step from json");
+        assert_eq!(map_step(&join).kind, "join");
+
+        let branch: rupu_orchestrator::Step = serde_json::from_value(serde_json::json!({
+            "id": "br",
+            "branch": { "condition": "{{ steps.x.success }}", "then": ["a"], "else": ["b"] },
+        }))
+        .expect("branch step from json");
+        assert_eq!(map_step(&branch).kind, "branch");
+    }
+
+    #[test]
+    fn render_edges_graph_mode_forks_on_split_and_rejoins() {
+        // A split step must produce TWO diverging edges and the join TWO
+        // converging ones — a real bifurcation, which is the whole fix. In
+        // graph mode there is NO consecutive-pair chain: edges come only from
+        // the declared topology.
+        let wf = rupu_orchestrator::Workflow::parse(
+            r#"
+name: forky
+steps:
+  - id: start
+    agent: a
+    prompt: go
+    next: [fork]
+  - id: fork
+    split: [left, right]
+  - id: left
+    agent: l
+    prompt: go
+    next: [join]
+  - id: right
+    agent: r
+    prompt: go
+    next: [join]
+  - id: join
+    join: {}
+"#,
+        )
+        .expect("forky workflow parses");
+        let dag = to_step_dag(&wf);
+        let has = |from: &str, to: &str| dag.edges.iter().any(|e| e.from == from && e.to == to);
+        assert!(has("start", "fork"));
+        assert!(has("fork", "left"));
+        assert!(has("fork", "right"));
+        assert!(has("left", "join"));
+        assert!(has("right", "join"));
+        assert_eq!(
+            dag.edges.iter().filter(|e| e.from == "fork").count(),
+            2,
+            "the split forks to exactly its two targets"
+        );
+        // The fork/join nodes report their orchestration kind.
+        let kind = |id: &str| {
+            dag.steps
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.kind.as_str())
+        };
+        assert_eq!(kind("fork"), Some("split"));
+        assert_eq!(kind("join"), Some("join"));
+    }
+
+    #[test]
+    fn render_edges_legacy_linear_workflow_is_the_consecutive_chain() {
+        // An edge-free workflow (no next/split/join/depends_on) keeps the
+        // pre-existing linear chain, so old linear workflows render unchanged.
+        let wf = rupu_orchestrator::Workflow::parse(
+            r#"
+name: linear
+steps:
+  - id: a
+    agent: x
+    prompt: go
+  - id: b
+    agent: y
+    prompt: go
+  - id: c
+    agent: z
+    prompt: go
+"#,
+        )
+        .expect("linear workflow parses");
+        let pairs: Vec<(String, String)> = to_step_dag(&wf)
+            .edges
+            .into_iter()
+            .map(|e| (e.from, e.to))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("b".to_string(), "c".to_string()),
+            ]
+        );
     }
 
     #[test]

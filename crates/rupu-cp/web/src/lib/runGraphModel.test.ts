@@ -20,6 +20,7 @@ function makeGraph(
     steps?: StepNodeDto[];
     step_results?: StepResultRecord[];
     units?: UnitCheckpoint[];
+    edges?: { from: string; to: string }[];
   } = {},
 ): RunGraphResponse {
   return {
@@ -29,7 +30,12 @@ function makeGraph(
       status: 'running',
       started_at: '2026-06-18T00:00:00Z',
     },
-    workflow: { steps: overrides.steps ?? [STEP_A, STEP_B, STEP_C] },
+    workflow: {
+      steps: overrides.steps ?? [STEP_A, STEP_B, STEP_C],
+      // Only attach `edges` when the test supplies them, so tests that omit
+      // it exercise the older-backend / linear-chain fallback path.
+      ...(overrides.edges !== undefined ? { edges: overrides.edges } : {}),
+    },
     step_results: overrides.step_results ?? [],
     units: overrides.units ?? [],
   };
@@ -62,6 +68,71 @@ describe('skeleton only', () => {
     const model = buildRunGraphModel(makeGraph(), []);
     expect(model.nodeById('b')?.id).toBe('b');
     expect(model.nodeById('z')).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1b. Real DAG edges — the run graph forks where the workflow forks.
+// ---------------------------------------------------------------------------
+
+describe('real DAG edges', () => {
+  const forkSteps: StepNodeDto[] = [
+    { id: 'start', kind: 'step', agent: 'a' },
+    { id: 'fork', kind: 'split' },
+    { id: 'left', kind: 'step', agent: 'l' },
+    { id: 'right', kind: 'step', agent: 'r' },
+    { id: 'join', kind: 'join' },
+  ];
+  const forkEdges = [
+    { from: 'start', to: 'fork' },
+    { from: 'fork', to: 'left' },
+    { from: 'fork', to: 'right' },
+    { from: 'left', to: 'join' },
+    { from: 'right', to: 'join' },
+  ];
+
+  it('uses workflow.edges when present, forking on a split', () => {
+    const model = buildRunGraphModel(makeGraph({ steps: forkSteps, edges: forkEdges }), []);
+    expect(model.edges).toEqual(forkEdges);
+    // The bifurcation: the split has two outgoing edges, the join two incoming.
+    expect(model.edges.filter((e) => e.from === 'fork')).toHaveLength(2);
+    expect(model.edges.filter((e) => e.to === 'join')).toHaveLength(2);
+    expect(model.nodeById('fork')!.kind).toBe('split');
+    expect(model.nodeById('join')!.kind).toBe('join');
+  });
+
+  it('drops an edge that names an unknown step', () => {
+    const model = buildRunGraphModel(
+      makeGraph({
+        steps: [
+          { id: 'a', kind: 'step' },
+          { id: 'b', kind: 'step' },
+        ],
+        edges: [
+          { from: 'a', to: 'b' },
+          { from: 'a', to: 'ghost' },
+        ],
+      }),
+      [],
+    );
+    expect(model.edges).toEqual([{ from: 'a', to: 'b' }]);
+  });
+
+  it('respects an explicit empty edges array (single-node run — no chain)', () => {
+    const model = buildRunGraphModel(
+      makeGraph({ steps: [{ id: 'only', kind: 'step' }], edges: [] }),
+      [],
+    );
+    expect(model.edges).toEqual([]);
+  });
+
+  it('falls back to a linear chain when the edges field is absent (older backend)', () => {
+    // makeGraph() omits `edges` → the model rebuilds the consecutive-pair chain.
+    const model = buildRunGraphModel(makeGraph(), []);
+    expect(model.edges).toEqual([
+      { from: 'a', to: 'b' },
+      { from: 'b', to: 'c' },
+    ]);
   });
 
   it('carries kind and agent from the DTO', () => {

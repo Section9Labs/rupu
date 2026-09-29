@@ -19,7 +19,7 @@ use rupu_cp::api::autoflow_claims::ClaimRow;
 use rupu_cp::api::code::{FileContent, FileListResult, TreeEntry, TreeResult};
 use rupu_cp::api::config::{ConfigView, RuntimeStatus};
 use rupu_cp::api::findings::{FindingOut, FindingsResponse, FindingsSummary};
-use rupu_cp::api::graph::{ApprovalGateDto, GateDto, StepDag, StepNodeDto, SubStepDto};
+use rupu_cp::api::graph::{ApprovalGateDto, EdgeDto, GateDto, StepDag, StepNodeDto, SubStepDto};
 use rupu_cp::api::projects::ProjectRow;
 use rupu_cp::api::runs::RunListRow;
 use rupu_cp::api::source::{AstResponse, SourceLine, SourceSlice};
@@ -840,6 +840,35 @@ fn run_graph_fixture_is_current() {
                 gate: None,
                 action: Some("cargo build".into()),
                 approval_gate: None,
+            },
+        ],
+        // Representative linear-chain edges (the run graph now carries the
+        // workflow's real DAG; a forking split/join case is covered by
+        // `graph.rs`'s unit tests).
+        edges: vec![
+            EdgeDto {
+                from: "plan".into(),
+                to: "fan".into(),
+            },
+            EdgeDto {
+                from: "fan".into(),
+                to: "par".into(),
+            },
+            EdgeDto {
+                from: "par".into(),
+                to: "review".into(),
+            },
+            EdgeDto {
+                from: "review".into(),
+                to: "approve".into(),
+            },
+            EdgeDto {
+                from: "approve".into(),
+                to: "create_pr".into(),
+            },
+            EdgeDto {
+                from: "create_pr".into(),
+                to: "build".into(),
             },
         ],
     };
