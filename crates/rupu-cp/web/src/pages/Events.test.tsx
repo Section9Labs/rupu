@@ -174,7 +174,7 @@ describe('Live Events (Situation Room) page', () => {
     await waitFor(() => expect(api.getRun).toHaveBeenCalledWith('run_stuck'));
     expect((await screen.findAllByText('billing-api')).length).toBeGreaterThan(0);
     await waitFor(() => expect(screen.getByText('idle')).toBeInTheDocument());
-    expect(screen.queryByText('writing files', { selector: '.sr-pcard *' })).not.toBeInTheDocument();
+    expect(screen.queryByText('writing files', { selector: '[data-testid="sr-pcard"] *' })).not.toBeInTheDocument();
   });
 
   it('a history-load failure does not block live events from arriving', async () => {

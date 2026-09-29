@@ -3,17 +3,19 @@
 // lib/situationRoom/cards.ts) plus, for `await` cards, inline Approve / Reject
 // wired to the real run-control API by the caller.
 //
-// Findings get the rich treatment — severity accent, a file:line that deep-
-// links to the Code viewer, the evidence rationale, the real code excerpt with
-// line numbers + syntax highlighting (CodeExcerpt), and an SCM permalink when
-// present. Errors render via ErrorDetail (Parsed/Raw for JSON). Agent activity
-// renders honestly (avatar + agent + step + note); no fabricated code.
+// Visual language mirrors Ghost's ActivityView: a bordered `bg-panel` card,
+// notable accents (await / error / finding severity) tint the border + a faint
+// wash, a tone Badge pill, a strict text-sm/note/meta hierarchy, mono run ids
+// and tabular-nums timestamps. Findings keep the rich treatment (severity
+// icon, file:line deep-link, evidence, real code excerpt, SCM permalink);
+// errors render via ErrorDetail. Nothing fabricated.
 
 import { useState } from 'react';
 import { AlertTriangle, CheckCircle2, Cog, ExternalLink, Pause, PlayCircle, Search, ShieldAlert, Users } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { cn } from '../../lib/cn';
-import type { CardForm, StreamCard } from '../../lib/situationRoom/cards';
+import { Badge, type BadgeTone } from '../ui/Badge';
+import type { CardForm, CardAccent, StreamCard } from '../../lib/situationRoom/cards';
 import CodeExcerpt from './CodeExcerpt';
 import ErrorDetail from './ErrorDetail';
 
@@ -29,8 +31,8 @@ function rel(ts: number): string {
   return `${Math.round(hr / 24)}d`;
 }
 
-function ActorIcon({ form }: { form: CardForm }) {
-  const cls = 'w-[13px] h-[13px]';
+function ActorIcon({ form, className }: { form: CardForm; className?: string }) {
+  const cls = className ?? 'w-[13px] h-[13px]';
   switch (form) {
     case 'await': return <Pause className={cls} />;
     case 'error': return <AlertTriangle className={cls} />;
@@ -41,12 +43,27 @@ function ActorIcon({ form }: { form: CardForm }) {
   }
 }
 
-/** Avatar tint follows the card accent so an error/awaiting card doesn't read
- *  as routine brand-purple activity. */
-function avatarStyle(accent: StreamCard['accent']): React.CSSProperties | undefined {
-  if (accent === 'error') return { background: 'rgb(var(--c-status-failed)/.12)', color: 'rgb(var(--c-status-failed))', borderColor: 'rgb(var(--c-status-failed)/.35)' };
-  if (accent === 'await') return { background: 'rgb(var(--c-status-awaiting)/.14)', color: 'rgb(var(--c-status-awaiting))', borderColor: 'rgb(var(--c-status-awaiting)/.35)' };
-  return undefined;
+/** Map a card accent to a Badge tone + optional border/wash tint. Routine
+ *  `brand` activity and `info` stay untinted (plain bordered card that lifts on
+ *  hover); notable accents tint the whole card the way Ghost tints a card for a
+ *  finding or a failure. */
+function accentVisual(accent: CardAccent): { tone: BadgeTone; tint?: React.CSSProperties } {
+  const sev = (name: string, borderA: number, bgA: number): React.CSSProperties => ({
+    borderColor: `rgb(var(--c-sev-${name})/${borderA})`,
+    background: `rgb(var(--c-sev-${name})/${bgA})`,
+  });
+  switch (accent) {
+    case 'await':
+      return { tone: 'amber', tint: { borderColor: 'rgb(var(--c-status-awaiting)/.4)', background: 'rgb(var(--c-status-awaiting)/.06)' } };
+    case 'error':
+      return { tone: 'red', tint: { borderColor: 'rgb(var(--c-status-failed)/.4)', background: 'rgb(var(--c-status-failed)/.05)' } };
+    case 'critical': return { tone: 'red', tint: sev('critical', 0.4, 0.06) };
+    case 'high': return { tone: 'red', tint: sev('high', 0.4, 0.05) };
+    case 'medium': return { tone: 'amber', tint: sev('medium', 0.4, 0.05) };
+    case 'low': return { tone: 'sky', tint: sev('low', 0.35, 0.04) };
+    case 'info': return { tone: 'neutral' };
+    default: return { tone: 'brand' };
+  }
 }
 
 export interface ApproveState {
@@ -77,6 +94,7 @@ export default function EventCard({
 
   const label = projectLabel ?? card.projectName;
   const canApprove = card.form === 'await' && !!onApprove && !!onReject;
+  const { tone, tint } = accentVisual(card.accent);
 
   async function act(kind: 'approve' | 'reject') {
     const runId = card.approvable?.runId;
@@ -97,92 +115,136 @@ export default function EventCard({
       : undefined;
 
   return (
-    <article className={cn('sr-ev', `sr-a-${card.accent}`, fresh && 'is-fresh', state.resolved && 'resolved')}>
-      <div className="sr-ev-head">
-        <span className={cn('sr-badge', `sr-a-${card.accent}`)}>{card.badge}</span>
+    <article
+      data-testid="sr-ev"
+      data-accent={card.accent}
+      className={cn(
+        'rounded-lg border bg-panel px-3.5 py-3 transition-colors',
+        !tint && 'border-border hover:border-ink-mute',
+        fresh && 'ring-1 ring-brand-500/30',
+        state.resolved && 'opacity-70',
+      )}
+      style={tint}
+    >
+      {/* Header: badge · project/branch · run · ago */}
+      <div className="flex items-center gap-2">
+        <Badge tone={tone}>{card.badge}</Badge>
         {label && (
-          <span className="sr-ev-repo">
+          <span className="inline-flex min-w-0 items-center gap-1.5 truncate font-mono text-note font-medium text-ink">
             {label}
-            {branch && <span className="br">{branch}</span>}
+            {branch && <span className="font-normal text-ink-mute">{branch}</span>}
           </span>
         )}
         {card.runId && !hideRunLink && (
-          <Link to={`/runs/${card.runId}`} className="sr-ev-run hover:text-ink transition-colors" title={`run ${card.runId}`}>
+          <Link
+            to={`/runs/${card.runId}`}
+            className="shrink-0 font-mono text-meta text-ink-mute transition-colors hover:text-ink"
+            title={`run ${card.runId}`}
+          >
             {card.runId.slice(0, 8)}
           </Link>
         )}
         {card.ts > 0 && (
-          <span className="sr-ev-ago" title={new Date(card.ts).toLocaleString()}>
+          <span
+            className="ml-auto shrink-0 font-mono text-meta tabular-nums text-ink-mute"
+            title={new Date(card.ts).toLocaleString()}
+          >
             {rel(card.ts)}
           </span>
         )}
       </div>
 
-      {card.form === 'finding' ? (
-        <>
-          <div className="sr-ev-title flex items-start gap-2">
-            <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" style={{ color: `rgb(var(--c-sev-${card.severity ?? 'info'}))` }} />
-            <span>{card.title}</span>
-          </div>
-          {card.fileRef && (
-            codeHref ? (
-              <Link to={codeHref} className="sr-fileref hover:text-ink transition-colors inline-block">{card.fileRef}</Link>
-            ) : (
-              <div className="sr-fileref">{card.fileRef}</div>
-            )
-          )}
-          {card.detail && <div className="sr-note">{card.detail}</div>}
-          {card.code && <CodeExcerpt code={card.code} startLine={card.fileLine} filePath={card.filePath} />}
-          {card.permalink && (
-            <a
-              href={card.permalink}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-2 inline-flex items-center gap-1 text-note text-ink-dim hover:text-ink transition-colors"
-            >
-              <ExternalLink className="w-3 h-3" /> View on repository
-            </a>
-          )}
-        </>
-      ) : card.form === 'error' ? (
-        <>
-          <div className="sr-actor">
-            <span className="sr-avatar" style={avatarStyle('error')}><AlertTriangle className="w-[13px] h-[13px]" /></span>
-            <span className="sr-ev-title">{card.title}</span>
-          </div>
-          {card.detail && <ErrorDetail text={card.detail} />}
-        </>
-      ) : card.form === 'await' ? (
-        <>
-          <div className="sr-ev-title">{card.title}</div>
-          {card.detail && <div className="sr-note">{card.detail}</div>}
-          {state.resolved ? (
-            <span className="sr-resolved-tag" style={{ color: `rgb(var(--c-status-${state.resolved === 'approved' ? 'done' : 'failed'}))` }}>
-              ✓ {state.resolved} · you
-            </span>
-          ) : canApprove ? (
-            <div className="sr-approve">
-              <button className="sr-btn ok" disabled={state.busy} onClick={() => act('approve')}>
-                {state.busy ? '…' : 'Approve'}
-              </button>
-              <button className="sr-btn no" disabled={state.busy} onClick={() => act('reject')}>Reject</button>
+      {/* Body per form */}
+      <div className="mt-2">
+        {card.form === 'finding' ? (
+          <>
+            <div className="flex items-start gap-2 text-sm font-medium text-ink">
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" style={{ color: `rgb(var(--c-sev-${card.severity ?? 'info'}))` }} />
+              <span className="min-w-0">{card.title}</span>
             </div>
-          ) : (
-            <span className="sr-resolved-tag" style={{ color: 'rgb(var(--c-status-awaiting))' }}>Awaiting approval</span>
-          )}
-          {state.error && <div className="sr-note" style={{ color: 'rgb(var(--c-err))' }}>Could not submit: {state.error}</div>}
-        </>
-      ) : (
-        <>
-          <div className="sr-actor">
-            <span className="sr-avatar" style={avatarStyle(card.accent)}>
-              {card.badge === 'Scanning' ? <Search className="w-[13px] h-[13px]" /> : <ActorIcon form={card.form} />}
-            </span>
-            <span className="sr-ev-title">{card.title}</span>
-          </div>
-          {card.detail && <div className="sr-note">{card.detail}</div>}
-        </>
-      )}
+            {card.fileRef &&
+              (codeHref ? (
+                <Link to={codeHref} className="mt-1 inline-block font-mono text-meta text-ink-mute transition-colors hover:text-ink">
+                  {card.fileRef}
+                </Link>
+              ) : (
+                <div className="mt-1 font-mono text-meta text-ink-mute">{card.fileRef}</div>
+              ))}
+            {card.detail && <p className="mt-1.5 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
+            {card.code && <div className="mt-2"><CodeExcerpt code={card.code} startLine={card.fileLine} filePath={card.filePath} /></div>}
+            {card.permalink && (
+              <a
+                href={card.permalink}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-2 inline-flex items-center gap-1 text-meta text-ink-dim transition-colors hover:text-ink"
+              >
+                <ExternalLink className="h-3 w-3" /> View on repository
+              </a>
+            )}
+          </>
+        ) : card.form === 'error' ? (
+          <>
+            <div className="flex items-center gap-2 text-sm font-medium text-ink">
+              <AlertTriangle className="h-[15px] w-[15px] shrink-0" style={{ color: 'rgb(var(--c-status-failed))' }} />
+              <span className="min-w-0">{card.title}</span>
+            </div>
+            {card.detail && <div className="mt-2"><ErrorDetail text={card.detail} /></div>}
+          </>
+        ) : card.form === 'await' ? (
+          <>
+            <div className="flex items-center gap-2 text-sm font-medium text-ink">
+              <Pause className="h-[15px] w-[15px] shrink-0" style={{ color: 'rgb(var(--c-status-awaiting))' }} />
+              <span className="min-w-0">{card.title}</span>
+            </div>
+            {card.detail && <p className="mt-1.5 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
+            {state.resolved ? (
+              <span
+                className="mt-2 inline-block text-note font-medium"
+                style={{ color: `rgb(var(--c-status-${state.resolved === 'approved' ? 'done' : 'failed'}))` }}
+              >
+                ✓ {state.resolved} · you
+              </span>
+            ) : canApprove ? (
+              <div className="mt-2.5 flex max-w-[320px] gap-2">
+                <button
+                  type="button"
+                  disabled={state.busy}
+                  onClick={() => act('approve')}
+                  className="flex-1 rounded-md border px-3 py-1.5 text-note font-semibold transition-colors disabled:opacity-50"
+                  style={{ background: 'rgb(var(--c-status-done)/.12)', color: 'rgb(var(--c-status-done))', borderColor: 'rgb(var(--c-status-done)/.35)' }}
+                >
+                  {state.busy ? '…' : 'Approve'}
+                </button>
+                <button
+                  type="button"
+                  disabled={state.busy}
+                  onClick={() => act('reject')}
+                  className="flex-1 rounded-md border px-3 py-1.5 text-note font-semibold transition-colors disabled:opacity-50"
+                  style={{ background: 'rgb(var(--c-status-failed)/.1)', color: 'rgb(var(--c-status-failed))', borderColor: 'rgb(var(--c-status-failed)/.35)' }}
+                >
+                  Reject
+                </button>
+              </div>
+            ) : (
+              <span className="mt-2 inline-block text-note font-medium" style={{ color: 'rgb(var(--c-status-awaiting))' }}>
+                Awaiting approval
+              </span>
+            )}
+            {state.error && <div className="mt-1.5 text-note" style={{ color: 'rgb(var(--c-err))' }}>Could not submit: {state.error}</div>}
+          </>
+        ) : (
+          <>
+            <div className="flex items-center gap-2 text-sm font-medium text-ink">
+              <span className="text-ink-mute">
+                {card.badge === 'Scanning' ? <Search className="h-[13px] w-[13px]" /> : <ActorIcon form={card.form} />}
+              </span>
+              <span className="min-w-0 truncate">{card.title}</span>
+            </div>
+            {card.detail && <p className="mt-1.5 text-note leading-relaxed text-ink-dim">{card.detail}</p>}
+          </>
+        )}
+      </div>
     </article>
   );
 }
