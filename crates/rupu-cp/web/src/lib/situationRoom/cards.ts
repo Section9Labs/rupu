@@ -57,8 +57,24 @@ export interface StreamCard {
   /** Project/workspace label. Findings carry it directly; event cards get it
    *  resolved by the page from run_id → workspace. */
   projectName?: string;
+  /** Workflow name — resolved by the page from run_id → run.json (like
+   *  projectName). Absent until resolved / for a bare-agent run. */
+  workflow?: string;
   stepId?: string;
   agent?: string;
+  /** Step kind (e.g. `for_each`, `panel`) when the event carries it. */
+  stepKind?: string;
+  /** Fan-out / panel unit key — WHICH target this event is about. */
+  unitKey?: string;
+  /** step_completed wall-clock, in ms. */
+  durationMs?: number;
+  /** unit_completed token counts. */
+  tokensIn?: number;
+  tokensOut?: number;
+  /** panel_round progress. */
+  round?: { n: number; max: number };
+  /** Deep-link to the step / unit transcript when the event carries one. */
+  transcriptPath?: string;
   /** Findings only: normalized severity, a `file:line` ref, and a real code
    *  excerpt from the finding's evidence (never fabricated). */
   severity?: FindingSeverity;
@@ -126,13 +142,15 @@ export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard
     case 'step_started':
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: k.agent ? 'Scanning' : 'Step', stepId: k.step_id, agent: k.agent ?? undefined,
+        stepKind: k.kind,
         title: k.agent ? `${k.agent} · ${stepLabel(k.step_id)}` : stepLabel(k.step_id),
         detail: k.agent ? undefined : k.kind };
     case 'step_working': {
       const note = k.note?.trim();
       if (!note) return null; // note-less heartbeat — step_started already covered it
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
-        badge: 'Working', stepId: k.step_id, title: stepLabel(k.step_id), detail: note };
+        badge: 'Working', stepId: k.step_id, title: stepLabel(k.step_id), detail: note,
+        transcriptPath: k.transcript_path ?? undefined };
     }
     case 'step_awaiting_approval':
       return { ...base, form: 'await', group: 'await', accent: 'await',
@@ -143,6 +161,7 @@ export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard
       return { ...base, form: 'complete', group: 'activity',
         accent: k.success ? 'brand' : 'error',
         badge: k.success ? 'Step done' : 'Step failed', stepId: k.step_id,
+        durationMs: k.duration_ms,
         title: stepLabel(k.step_id),
         detail: `${k.success ? 'ok' : 'failed'} · ${Math.round(k.duration_ms / 100) / 10}s` };
     case 'step_failed':
@@ -154,15 +173,17 @@ export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard
     case 'unit_started':
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: 'Fan-out', stepId: k.step_id, agent: k.agent ?? undefined,
+        unitKey: k.unit_key, transcriptPath: k.transcript_path,
         title: `${stepLabel(k.step_id)} · ${k.unit_key}`, detail: k.agent ? `agent ${k.agent}` : undefined };
     case 'unit_completed':
       return { ...base, form: 'complete', group: 'activity',
         accent: k.success ? 'brand' : 'error', badge: k.success ? 'Unit done' : 'Unit failed',
-        stepId: k.step_id, title: `${stepLabel(k.step_id)} · ${k.unit_key}`,
+        stepId: k.step_id, unitKey: k.unit_key, tokensIn: k.tokens_in, tokensOut: k.tokens_out,
+        title: `${stepLabel(k.step_id)} · ${k.unit_key}`,
         detail: `${k.success ? 'ok' : 'failed'} · ${k.tokens_in}→${k.tokens_out} tok` };
     case 'panel_round':
       return { ...base, form: 'panel', group: 'activity', accent: 'brand',
-        badge: 'Panel round', stepId: k.step_id,
+        badge: 'Panel round', stepId: k.step_id, round: { n: k.round, max: k.max_iterations },
         title: `${stepLabel(k.step_id)} · round ${k.round}/${k.max_iterations}`,
         detail: k.max_severity_remaining ? `max severity remaining: ${k.max_severity_remaining}` : undefined };
     case 'run_paused':

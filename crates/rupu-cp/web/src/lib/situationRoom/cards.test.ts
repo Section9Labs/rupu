@@ -9,10 +9,13 @@ import { cardFromEvent, cardFromFinding } from './cards';
 import type {
   FindingOut,
   StepAwaitingApprovalEvent,
+  StepCompletedEvent,
   StepFailedEvent,
   StepStartedEvent,
   StepWorkingEvent,
   PanelRoundEvent,
+  UnitStartedEvent,
+  UnitCompletedEvent,
 } from '../api';
 
 describe('cardFromEvent', () => {
@@ -63,6 +66,49 @@ describe('cardFromEvent', () => {
     expect(c.form).toBe('panel');
     expect(c.title).toContain('round 2/4');
     expect(c.detail).toContain('high');
+  });
+});
+
+describe('cardFromEvent enrichment — structured context fields', () => {
+  it('step_started carries the step kind', () => {
+    const ev: StepStartedEvent = { type: 'step_started', run_id: 'r1', step_id: 'assess', kind: 'for_each', agent: 'oracle' };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.agent).toBe('oracle');
+    expect(c.stepKind).toBe('for_each');
+  });
+
+  it('step_working carries the transcript path for a deep-link', () => {
+    const ev: StepWorkingEvent = { type: 'step_working', run_id: 'r1', step_id: 'assess', note: 'reading', transcript_path: 't/assess.jsonl' };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.transcriptPath).toBe('t/assess.jsonl');
+  });
+
+  it('step_completed carries the duration in ms', () => {
+    const ev: StepCompletedEvent = { type: 'step_completed', run_id: 'r1', step_id: 'assess', success: true, duration_ms: 5200 };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.durationMs).toBe(5200);
+  });
+
+  it('unit_started carries the unit key and transcript path', () => {
+    const ev: UnitStartedEvent = { type: 'unit_started', run_id: 'r1', step_id: 'assess', index: 3, unit_key: 'crates/db', agent: 'oracle', transcript_path: 't/u3.jsonl' };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.unitKey).toBe('crates/db');
+    expect(c.agent).toBe('oracle');
+    expect(c.transcriptPath).toBe('t/u3.jsonl');
+  });
+
+  it('unit_completed carries the unit key and token counts', () => {
+    const ev: UnitCompletedEvent = { type: 'unit_completed', run_id: 'r1', step_id: 'assess', index: 3, unit_key: 'crates/db', success: true, tokens_in: 1200, tokens_out: 340 };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.unitKey).toBe('crates/db');
+    expect(c.tokensIn).toBe(1200);
+    expect(c.tokensOut).toBe(340);
+  });
+
+  it('panel_round carries the round progress', () => {
+    const ev: PanelRoundEvent = { type: 'panel_round', run_id: 'r1', step_id: 'panel', round: 2, max_iterations: 4 };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.round).toEqual({ n: 2, max: 4 });
   });
 });
 

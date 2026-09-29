@@ -12,7 +12,10 @@ export type StreamFilter = 'all' | CardGroup;
  *  the badge, headline, secondary line, run id, project, agent, file ref,
  *  step id and severity. Lower-cased once for substring matching. */
 function haystack(c: StreamCard): string {
-  return [c.badge, c.title, c.detail, c.runId, c.projectName, c.agent, c.filePath, c.stepId, c.severity]
+  return [
+    c.badge, c.title, c.detail, c.runId, c.projectName, c.workflow, c.agent,
+    c.stepId, c.stepKind, c.unitKey, c.filePath, c.severity,
+  ]
     .filter((s): s is string => typeof s === 'string' && s.length > 0)
     .join(' ')
     .toLowerCase();

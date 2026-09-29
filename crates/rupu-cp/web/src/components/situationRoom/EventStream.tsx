@@ -32,7 +32,7 @@ export default function EventStream({
 }: {
   cards: StreamCard[];
   freshKeys: ReadonlySet<string>;
-  resolve: (card: StreamCard) => { label?: string; branch?: string };
+  resolve: (card: StreamCard) => { label?: string; branch?: string; workflow?: string };
   onApprove: (runId: string) => Promise<void>;
   onReject: (runId: string) => Promise<void>;
   hasMoreOlder: boolean;
@@ -125,6 +125,7 @@ export default function EventStream({
                   card={card}
                   projectLabel={r.label}
                   branch={r.branch}
+                  workflow={r.workflow}
                   fresh={freshKeys.has(card.key)}
                   onApprove={onApprove}
                   onReject={onReject}
