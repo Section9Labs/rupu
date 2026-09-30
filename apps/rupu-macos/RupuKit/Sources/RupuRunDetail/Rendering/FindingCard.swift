@@ -66,16 +66,6 @@ struct FindingFields: Equatable {
 /// "render what exists, `—` never fabricated" contract the view applies on
 /// top (`FindingCard.body`'s own field-by-field `nonEmpty` guards), rather
 /// than a card that renders nothing at all for a malformed input.
-///
-/// Two input shapes exist, one per findings profile (mirrors the web's
-/// `asFinding`/`asReportFinding`):
-/// - summary — `{scope, summary, severity, evidence: {rationale, …}}`;
-/// - full (the default) — `{scope, file_path?, line_range?, report: {…}}`
-///   with no top-level summary/severity/evidence. Those are derived from the
-///   report exactly as `report_finding` derives them for the ledger record:
-///   summary ← `report.title`, severity ← lowercased
-///   `report.rating.risk_rating`, rationale ← `report.root_cause`, excerpt ←
-///   the first `report.evidence[].excerpt`. Locators stay top-level.
 func parseFinding(_ input: JSONValue) -> FindingFields {
     guard case .object(let rec) = input else {
         return FindingFields(
@@ -93,37 +83,13 @@ func parseFinding(_ input: JSONValue) -> FindingFields {
         return nil
     }
 
-    let severityWire: String
-    let summary: String
-    let rationale: String
-    let codeExcerpt: String?
-    if case .object(let report)? = rec["report"] {
-        let rating: [String: JSONValue] = {
-            if case .object(let r)? = report["rating"] { return r }
-            return [:]
-        }()
-        severityWire = string(rating, "risk_rating")?.lowercased() ?? "info"
-        summary = string(report, "title") ?? ""
-        rationale = string(report, "root_cause") ?? ""
-        var excerpt: String?
-        if case .array(let claims)? = report["evidence"] {
-            for claim in claims {
-                if case .object(let c) = claim, let e = string(c, "excerpt") {
-                    excerpt = e
-                    break
-                }
-            }
-        }
-        codeExcerpt = excerpt
-    } else {
-        severityWire = string(rec, "severity") ?? "info"
-        summary = string(rec, "summary") ?? ""
-        rationale = string(evidence, "rationale") ?? ""
-        codeExcerpt = string(evidence, "code_excerpt")
-    }
+    let severityWire = string(rec, "severity") ?? "info"
+    let summary = string(rec, "summary") ?? ""
     let scope = string(rec, "scope") ?? ""
+    let rationale = string(evidence, "rationale") ?? ""
     let filePath = string(rec, "file_path")
     let concernID = string(rec, "concern_id")
+    let codeExcerpt = string(evidence, "code_excerpt")
 
     var lineRange: FindingFields.LineRange?
     if case .array(let arr)? = rec["line_range"], arr.count == 2,
