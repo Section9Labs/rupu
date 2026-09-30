@@ -34,6 +34,9 @@ pub struct FindingsContext {
     /// cannot know which agent instance made the call. `None` for callers
     /// with no codename.
     pub codename: Option<String>,
+    /// Provider paired with `model`, stamped on `Attribution.provider`.
+    /// There is no `agent`: an `action:` step is not an agent.
+    pub provider: Option<String>,
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -111,6 +114,8 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         model: ctx.model.clone(),
         surface: ctx.surface,
         codename: ctx.codename.clone(),
+        agent: None,
+        provider: ctx.provider.clone(),
     };
     let input = rupu_coverage::ReportFindingInput {
         file_path: args.file_path,

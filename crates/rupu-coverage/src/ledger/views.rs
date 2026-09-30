@@ -122,6 +122,8 @@ mod tests {
             model: "m".to_string(),
             surface: Surface::Workflow,
             codename: None,
+            agent: None,
+            provider: None,
         }
     }
 
@@ -155,6 +157,8 @@ mod tests {
                 model: "m".to_string(),
                 surface: Surface::Workflow,
                 codename: None,
+                agent: None,
+                provider: None,
             },
             declared_at: chrono::Utc::now(),
         };

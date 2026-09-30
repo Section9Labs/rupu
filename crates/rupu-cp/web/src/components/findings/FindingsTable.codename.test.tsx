@@ -58,3 +58,26 @@ describe('FindingRow — codename', () => {
     expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
   });
 });
+
+describe('findings — agent / provider / model', () => {
+  const withIdent: FindingOut = {
+    ...out,
+    declared_by: { run_id: 'r', model: 'claude-sonnet-4-6', surface: 'workflow', agent: 'sec-reviewer', provider: 'anthropic' },
+  };
+
+  it('FindingsTable shows agent · provider/model next to the codename', () => {
+    render(<MemoryRouter><FindingsTable findings={[withIdent]} showProvenance /></MemoryRouter>);
+    expect(screen.getByText('heron#3 · sec-reviewer · anthropic/claude-sonnet-4-6')).toBeInTheDocument();
+  });
+
+  it('FindingRow shows agent · provider/model next to the codename', () => {
+    render(<MemoryRouter><FindingRow finding={withIdent} /></MemoryRouter>);
+    expect(screen.getByText('heron#3 · sec-reviewer · anthropic/claude-sonnet-4-6')).toBeInTheDocument();
+  });
+
+  it('an old finding (model only in declared_by) shows the model', () => {
+    const old: FindingOut = { ...out, declared_by: { run_id: 'r', model: 'claude-sonnet-4-6', surface: 'workflow' } };
+    render(<MemoryRouter><FindingsTable findings={[old]} showProvenance /></MemoryRouter>);
+    expect(screen.getByText('heron#3 · claude-sonnet-4-6')).toBeInTheDocument();
+  });
+});

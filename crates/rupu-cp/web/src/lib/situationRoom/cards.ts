@@ -19,6 +19,7 @@ import {
   type RunEvent,
 } from '../api';
 import { memberLabel, parseCodename } from '../codename';
+import { findingCodename } from '../findingIdentity';
 
 /** Which filter chip a card answers to. `activity` is the catch-all for agent
  *  work / step + run lifecycle / panel rounds. */
@@ -280,6 +281,7 @@ function cardFromEventInner(ev: RunEvent, ts: number, key: string): StreamCard |
  *  severity accent, a `file:line` reference, the evidence rationale as the
  *  detail, and the real `code_excerpt` (when the finding carries one). */
 export function cardFromFinding(f: FindingOut): StreamCard {
+  const who = findingCodename(f);
   const sev = normFindingSeverity(f.severity);
   const ts = Date.parse(f.declared_at);
   const fileRef = f.file_path
@@ -305,6 +307,9 @@ export function cardFromFinding(f: FindingOut): StreamCard {
     filePath: f.file_path ?? undefined,
     fileLine: f.line_range?.[0],
     permalink: f.permalink ?? undefined,
-    ...named(f.codename || undefined),
+    ...named(who?.codename),
+    agent: who?.agent,
+    provider: who?.provider,
+    model: who?.model,
   };
 }

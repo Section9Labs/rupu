@@ -3276,6 +3276,7 @@ pub(crate) async fn resume_run(
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
             codename: Some(rupu_codename::crew_for(run_id)),
+            provider: cfg.default_provider.clone(),
         }),
     );
     let mode_str_for_policy = mode_str.clone();
@@ -4839,6 +4840,7 @@ async fn execute_workflow_invocation(
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
             codename: Some(rupu_codename::crew_for(&run_id)),
+            provider: cfg.default_provider.clone(),
         }),
     );
 

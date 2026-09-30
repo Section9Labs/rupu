@@ -104,7 +104,16 @@ export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps
                 {cwe.id}
               </a>
             )}
-            {named && <AgentName codename={named.codename} showCrew derived={named.derived} />}
+            {named && (
+              <AgentName
+                codename={named.codename}
+                agent={named.agent}
+                provider={named.provider}
+                model={named.model}
+                showCrew
+                derived={named.derived}
+              />
+            )}
             {finding.concern_id && (
               <span>
                 concern <span className="font-mono">{finding.concern_id}</span>

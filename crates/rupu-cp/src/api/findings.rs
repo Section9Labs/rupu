@@ -374,6 +374,8 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             surface: Surface::Workflow,
             codename: None,
+            agent: None,
+            provider: None,
         }
     }
 

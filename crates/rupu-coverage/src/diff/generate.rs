@@ -354,6 +354,8 @@ mod tests {
             model: "m1".to_string(),
             surface: Surface::Session,
             codename: None,
+            agent: None,
+            provider: None,
         }
     }
 

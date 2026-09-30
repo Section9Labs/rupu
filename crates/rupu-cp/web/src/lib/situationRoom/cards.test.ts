@@ -142,6 +142,17 @@ describe('cardFromFinding', () => {
     expect(c.fileLine).toBe(16);
   });
 
+  it('carries the declaring agent / provider / model from declared_by', () => {
+    const c = cardFromFinding({
+      ...base,
+      declared_by: { run_id: 'r', model: 'claude-sonnet-4-6', surface: 'workflow', agent: 'sec-reviewer', provider: 'anthropic' },
+    });
+    expect(c.codename).toBe('cobalt-harbor/heron#1');
+    expect(c.agent).toBe('sec-reviewer');
+    expect(c.provider).toBe('anthropic');
+    expect(c.model).toBe('claude-sonnet-4-6');
+  });
+
   it('an unknown severity falls back to info, and a missing file has no ref', () => {
     const c = cardFromFinding({ ...base, severity: 'bogus', file_path: null, line_range: null });
     expect(c.severity).toBe('info');

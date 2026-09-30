@@ -364,6 +364,8 @@ impl AgentDispatcher for CliAgentDispatcher {
             model: None,
             tool_mappings: None,
             codename: codename.clone(),
+            agent: None,
+            provider: None,
         };
 
         let opts = AgentRunOpts {

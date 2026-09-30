@@ -832,6 +832,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             model: None,
             tool_mappings: None,
             codename: Some(codename.to_string()),
+            agent: None,
+            provider: None,
         };
 
         let backend_id = "local_checkout".to_string();

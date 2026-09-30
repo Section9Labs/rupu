@@ -138,7 +138,14 @@ export function FindingsTable({
         const n = findingCodename(f);
         return n ? (
           <span className="text-note">
-            <AgentName codename={n.codename} showCrew derived={n.derived} />
+            <AgentName
+              codename={n.codename}
+              agent={n.agent}
+              provider={n.provider}
+              model={n.model}
+              showCrew
+              derived={n.derived}
+            />
           </span>
         ) : (
           <span className="text-ink-mute">—</span>

@@ -222,6 +222,8 @@ mod tests {
             model: model.to_string(),
             surface: Surface::Workflow,
             codename: None,
+            agent: None,
+            provider: None,
         }
     }
 

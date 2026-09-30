@@ -436,6 +436,8 @@ impl StepFactory for DefaultStepFactory {
                 model: None,
                 tool_mappings: None,
                 codename: None,
+                agent: None,
+                provider: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),

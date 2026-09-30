@@ -100,6 +100,14 @@ pub struct ToolContext {
     /// Codename of the running agent instance, for coverage attribution.
     #[serde(skip)]
     pub codename: Option<String>,
+    /// Name of the running agent — populated by the agent runner from
+    /// `AgentRunOpts.agent_name`, for coverage/finding attribution.
+    #[serde(skip)]
+    pub agent: Option<String>,
+    /// Provider serving the run — populated by the agent runner from
+    /// `AgentRunOpts.provider_name`, for coverage/finding attribution.
+    #[serde(skip)]
+    pub provider: Option<String>,
 }
 
 impl Default for ToolContext {
@@ -118,6 +126,8 @@ impl Default for ToolContext {
             model: None,
             tool_mappings: None,
             codename: None,
+            agent: None,
+            provider: None,
         }
     }
 }

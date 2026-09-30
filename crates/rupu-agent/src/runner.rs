@@ -964,6 +964,8 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     opts.tool_context.run_id = Some(opts.run_id.clone());
     opts.tool_context.model = Some(opts.model.clone());
     opts.tool_context.codename = opts.codename.clone();
+    opts.tool_context.agent = Some(opts.agent_name.clone());
+    opts.tool_context.provider = Some(opts.provider_name.clone());
 
     // Register coverage tools when coverage is enabled.
     if let Some(bundle) = &coverage {

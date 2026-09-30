@@ -95,6 +95,8 @@ mod tests {
             model: "mock".to_string(),
             surface: Surface::Workflow,
             codename: None,
+            agent: None,
+            provider: None,
         }
     }
 

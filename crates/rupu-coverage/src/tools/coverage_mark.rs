@@ -109,6 +109,8 @@ mod tests {
             codename: None,
             model: "m".to_string(),
             surface: Surface::Workflow,
+            agent: None,
+            provider: None,
         }
     }
 

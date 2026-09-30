@@ -7517,6 +7517,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             model: None,
             tool_mappings: None,
             codename: Some(codename.clone()),
+            agent: None,
+            provider: None,
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
@@ -8494,6 +8496,8 @@ mod tests {
                 model: "m".into(),
                 surface: Surface::Workflow,
                 codename: None,
+                agent: None,
+                provider: None,
             },
             at: Utc::now(),
         };

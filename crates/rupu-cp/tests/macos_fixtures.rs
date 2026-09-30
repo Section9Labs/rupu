@@ -1502,6 +1502,8 @@ fn coverage_attribution(run_id: &str) -> CoverageAttribution {
         model: "claude-sonnet-4-6".into(),
         surface: CoverageSurface::Workflow,
         codename: None,
+        agent: None,
+        provider: None,
     }
 }
 
