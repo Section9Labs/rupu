@@ -13,11 +13,13 @@
 
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
-import type { GraphNode } from '../../lib/runGraphModel';
+import type { GraphNode, UnitView } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
+import { memberLabel, parseCodename } from '../../lib/codename';
+import { RoleBadge } from '../codename/RoleBadge';
 
 export interface FanoutNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -29,6 +31,36 @@ type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
 
 const INLINE_THRESHOLD = FANOUT_INLINE_THRESHOLD;
 const PREVIEW_CELLS = 60;
+
+/** Compact crew-role header for a fan-out: role badge + role word + `×N`.
+ *  Fan-out steps carry no step-level codename (instances live on units), so
+ *  the role comes from the node's codename when set, else the first unit's.
+ *  Per-unit names stay out of the node — they live in unit lists/selection,
+ *  which keeps the header O(1) at hundreds–thousands of units. */
+function FanoutRole({ node, total }: { node: GraphNode; total: number }) {
+  const codename = node.codename ?? node.fanout?.units.find((u) => u.codename)?.codename;
+  if (!codename) return null;
+  const { role } = parseCodename(codename);
+  if (!role) return null;
+  return (
+    <span
+      data-testid="rg-fanout-role"
+      title={codename}
+      className="inline-flex shrink-0 items-center gap-1 normal-case tracking-normal"
+    >
+      <RoleBadge role={role} size={10} />
+      <span className="font-mono">
+        {role} ×{total}
+      </span>
+    </span>
+  );
+}
+
+/** Hover title for one unit square: `leaf · agent · provider/model · state`. */
+function unitTitle(node: GraphNode, u: UnitView, stateLabel: string): string {
+  const who = u.codename ? memberLabel(u.codename, node.agent, u.provider, u.model) : u.key;
+  return `${who} · ${stateLabel}`;
+}
 
 function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const { node, onOpenUnit, onExpandFanout } = data;
@@ -123,7 +155,10 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
           className="mb-1 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide"
           style={{ color: colors.get(accentKey) }}
         >
-          <span className="truncate">for_each · {node.id} · {total}</span>
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="truncate">for_each · {node.id} · {total}</span>
+            <FanoutRole node={node} total={total} />
+          </span>
           <span className="tabular-nums">
             {done} ✓
             {failed > 0 && (
@@ -139,7 +174,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
             <button
               key={u.index}
               type="button"
-              title={`${u.key} · ${stateStyle(colors, u.state).label}`}
+              title={unitTitle(node, u, stateStyle(colors, u.state).label)}
               onClick={() => onOpenUnit?.(node.id, u.index)}
               className="h-[15px] w-[15px] rounded-[3px] transition-transform hover:scale-110"
               style={{ background: glyphBg(colors, u.state) }}
@@ -162,10 +197,11 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
       <div
-        className="text-meta font-bold uppercase tracking-wide"
+        className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide"
         style={{ color: colors.get(accentKey) }}
       >
-        for_each · {node.id}
+        <span className="truncate">for_each · {node.id}</span>
+        <FanoutRole node={node} total={total} />
       </div>
 
       <div className="mt-1 flex items-baseline gap-2">

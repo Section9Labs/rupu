@@ -1410,6 +1410,7 @@ mod tests {
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    codename: None,
                 },
                 "name: demo\nsteps: []\n",
             )
@@ -1428,6 +1429,7 @@ mod tests {
                 mode: RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             })
             .unwrap();
         writer
@@ -1523,6 +1525,7 @@ mod tests {
                     finished_at: Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();

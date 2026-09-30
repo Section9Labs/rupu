@@ -17,6 +17,9 @@ import { cn } from '../../lib/cn';
 import { Badge, type BadgeTone } from '../ui/Badge';
 import type { DotColor } from '../ui/Dot';
 import type { CardForm, StreamCard } from '../../lib/situationRoom/cards';
+import { crewTint, memberLabel } from '../../lib/codename';
+import { AgentName } from '../codename/AgentName';
+import { useThemeMode } from '../codename/useThemeMode';
 import CodeExcerpt from './CodeExcerpt';
 import ErrorDetail from './ErrorDetail';
 
@@ -123,6 +126,11 @@ export default function EventCard({
   const wf = workflow ?? card.workflow;
   const canApprove = card.form === 'await' && !!onApprove && !!onReject;
   const { tone, dot } = statusVisual(card);
+  const mode = useThemeMode();
+  const tint = card.crew ? crewTint(card.crew, mode) : undefined;
+  // agent_started's headline already IS the member label — don't repeat it
+  // after the name.
+  const titleIsName = card.title === memberLabel(card.codename, card.agent, card.provider, card.model);
 
   const durationS = card.durationMs != null ? `${Math.round(card.durationMs / 100) / 10}s` : undefined;
   const hasMeta = !!(card.unitKey || durationS || card.tokensIn != null || card.round);
@@ -163,8 +171,17 @@ export default function EventCard({
         />
       </div>
 
-      {/* Content */}
-      <div className={cn('min-w-0 flex-1 pb-4', state.resolved && 'opacity-70')}>
+      {/* Content — a crew tint stripe runs down its left edge when the run
+          has a codename (palette colour, never hardcoded). */}
+      <div className={cn('relative min-w-0 flex-1 pb-4', tint && 'pl-2.5', state.resolved && 'opacity-70')}>
+        {tint && (
+          <span
+            data-testid="sr-crew-stripe"
+            aria-hidden
+            className="absolute bottom-4 left-0 top-0.5 w-0.5 rounded-full"
+            style={{ backgroundColor: tint }}
+          />
+        )}
         {/* Line 1: status pill · workflow · run */}
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <Badge tone={tone}>{card.badge}</Badge>
@@ -181,7 +198,7 @@ export default function EventCard({
           )}
           {card.runId && !hideRunLink && (
             <Link to={`/runs/${card.runId}`} className="shrink-0 font-mono text-meta text-ink-mute transition-colors hover:text-ink" title={`run ${card.runId}`}>
-              {card.runId.slice(0, 8)}
+              {card.crew ?? card.runId.slice(0, 8)}
             </Link>
           )}
         </div>
@@ -189,9 +206,23 @@ export default function EventCard({
         {/* Line 2: what happened — icon · agent · step/what */}
         <div className="mt-1 flex items-start gap-1.5 text-sm font-medium text-ink">
           <span className="mt-px shrink-0 text-ink-mute"><KindIcon form={card.form} badge={card.badge} className="h-[14px] w-[14px]" /></span>
-          {card.agent && <span className="shrink-0 font-mono text-brand-700">{card.agent}</span>}
-          {card.agent && <span className="shrink-0 text-ink-mute">·</span>}
-          <span className="min-w-0">{card.title}</span>
+          {card.codename ? (
+            <>
+              <span className="shrink-0 text-brand-700">
+                <AgentName codename={card.codename} agent={card.agent} provider={card.provider} model={card.model} />
+              </span>
+              {!titleIsName && <span className="shrink-0 text-ink-mute">·</span>}
+              {!titleIsName && <span className="min-w-0">{card.title}</span>}
+            </>
+          ) : titleIsName ? (
+            <span className="min-w-0 font-mono text-brand-700">{card.title}</span>
+          ) : (
+            <>
+              {card.agent && <span className="shrink-0 font-mono text-brand-700">{card.agent}</span>}
+              {card.agent && <span className="shrink-0 text-ink-mute">·</span>}
+              <span className="min-w-0">{card.title}</span>
+            </>
+          )}
         </div>
 
         {/* Meta: unit target · round · duration · tokens */}

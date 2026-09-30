@@ -56,10 +56,21 @@ vi.mock('../components/RunGraph', () => ({
   ),
 }));
 
-vi.mock('../components/TranscriptPanel', () => ({
-  __esModule: true,
-  default: ({ path }: { path: string }) => <div data-testid="transcript-panel">transcript:{path}</div>,
-}));
+vi.mock('../components/TranscriptPanel', async () => {
+  const { useContext } = await import('react');
+  const { SubrunIdentityContext } = await import('../components/transcript/subrunIdentity');
+  function MockTranscriptPanel({ path }: { path: string }) {
+    // Surface the sub-run identities RunDetail provides around the transcript.
+    const ids = useContext(SubrunIdentityContext);
+    const summary = [...ids.entries()].map(([k, v]) => `${k}=${v.provider ?? ''}/${v.model ?? ''}`).join(',');
+    return (
+      <div data-testid="transcript-panel" data-subruns={summary}>
+        transcript:{path}
+      </div>
+    );
+  }
+  return { __esModule: true, default: MockTranscriptPanel };
+});
 
 vi.mock('../components/run/StepTranscriptBrowser', () => ({
   __esModule: true,
@@ -1020,5 +1031,92 @@ describe('RunDetail — failed / unpersisted run', () => {
     // getting stuck on "Loading run…".
     expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument();
     expect(screen.queryByText('Loading run…')).not.toBeInTheDocument();
+  });
+});
+
+describe('RunDetail — codename', () => {
+  function stubCodenameApi(graph: RunGraphResponse) {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  it('renders the crew chip in the header', async () => {
+    stubCodenameApi({
+      ...GRAPH,
+      run: { ...GRAPH.run, codename: 'cobalt-harbor', codename_derived: false } as RunGraphResponse['run'],
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+  });
+
+  it('names the crew in the gate banner', async () => {
+    stubCodenameApi({
+      ...GRAPH,
+      run: {
+        ...GRAPH.run,
+        status: 'awaiting_approval',
+        awaiting_step_id: 'step_a',
+        codename: 'cobalt-harbor',
+        codename_derived: false,
+      } as RunGraphResponse['run'],
+    });
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByText(/cobalt-harbor is waiting for approval/)).toBeInTheDocument(),
+    );
+  });
+});
+
+describe('RunDetail selection label codenames', () => {
+  const CODENAME_GRAPH: RunGraphResponse = {
+    ...GRAPH,
+    step_results: [
+      { ...GRAPH.step_results[0], codename: 'jade-reef/heron' },
+    ],
+    units: [{ ...GRAPH.units[0], codename: 'jade-reef/lynx#0' }],
+  };
+
+  function stub() {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(CODENAME_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  it('shows the selected step codename next to its agent', async () => {
+    stub();
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('select-step-a'));
+    const sel = screen.getByTestId('run-selected-label');
+    expect(sel).toHaveTextContent('step_a');
+    expect(sel).toHaveTextContent('heron · reviewer');
+  });
+
+  it('shows the selected unit codename leaf when a unit is opened', async () => {
+    stub();
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('open-unit'));
+    expect(screen.getByTestId('run-selected-label')).toHaveTextContent('lynx#0');
+  });
+
+  it('provides dispatch_started sub-run identities to the transcript area', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(CODENAME_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation((_id, onEvent) => {
+      onEvent({
+        type: 'dispatch_started', run_id: 'run-1', sub_run_id: 'sub_9', agent: 'scanner',
+        transcript_path: '/t/sub.jsonl', codename: 'jade-reef/heron>lynx#1', provider: 'anthropic', model: 'claude-opus-5-5',
+      });
+      return () => {};
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('select-step-a'));
+    expect(screen.getByTestId('transcript-panel')).toHaveAttribute('data-subruns', 'sub_9=anthropic/claude-opus-5-5');
   });
 });

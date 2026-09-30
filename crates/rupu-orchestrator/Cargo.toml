@@ -27,6 +27,7 @@ futures-util.workspace = true
 rustix.workspace = true
 
 # In-workspace
+rupu-codename = { workspace = true }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-auth = { path = "../rupu-auth" }

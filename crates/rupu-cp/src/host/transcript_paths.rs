@@ -210,6 +210,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 
@@ -244,6 +245,7 @@ mod tests {
                         output: String::new(),
                         success: true,
                         is_fixer: false,
+                        codename: None,
                     }],
                     findings: vec![],
                     iterations: 0,
@@ -252,6 +254,7 @@ mod tests {
                     loop_iteration: None,
                     run_outcome: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -270,6 +273,7 @@ mod tests {
                     success: true,
                     finished_at: chrono::Utc::now(),
                     host: Some("host_abc".into()),
+                    codename: None,
                 },
             )
             .unwrap();
@@ -304,12 +308,16 @@ mod tests {
                 agent: None,
                 transcript_path: PathBuf::from("/remote/proj/.rupu/transcripts/run_01UNIT.jsonl"),
                 host: None,
+                codename: None,
             },
             Event::DispatchStarted {
                 run_id: id.into(),
                 sub_run_id: _sub_id.clone(),
                 agent: Some("reviewer".into()),
                 transcript_path: sub_transcript.clone(),
+                codename: None,
+                model: None,
+                provider: None,
             },
             Event::StepWorking {
                 run_id: id.into(),

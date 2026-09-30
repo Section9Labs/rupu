@@ -1,5 +1,7 @@
 [
   {
+    "codename": "cobalt-harbor",
+    "codename_derived": false,
     "duration_ms": null,
     "finished_at": null,
     "host_id": "local",
@@ -20,6 +22,8 @@
     "workflow_name": "nightly-health"
   },
   {
+    "codename": "cobalt-harbor",
+    "codename_derived": false,
     "duration_ms": null,
     "finished_at": null,
     "host_id": "mini",

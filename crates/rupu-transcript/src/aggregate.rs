@@ -244,6 +244,7 @@ mod tests {
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         }
     }
 

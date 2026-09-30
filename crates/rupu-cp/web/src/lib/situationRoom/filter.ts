@@ -10,11 +10,12 @@ export type StreamFilter = 'all' | CardGroup;
 
 /** The searchable text of a card: everything an operator might scan for —
  *  the badge, headline, secondary line, run id, project, agent, file ref,
- *  step id and severity. Lower-cased once for substring matching. */
+ *  step id, severity, and the agent's codename / crew / provider / model. Lower-cased once for substring matching. */
 function haystack(c: StreamCard): string {
   return [
     c.badge, c.title, c.detail, c.runId, c.projectName, c.workflow, c.agent,
     c.stepId, c.stepKind, c.unitKey, c.filePath, c.severity,
+    c.codename, c.crew, c.provider, c.model,
   ]
     .filter((s): s is string => typeof s === 'string' && s.length > 0)
     .join(' ')

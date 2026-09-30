@@ -90,6 +90,7 @@ impl StepFactory for FakeFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -118,6 +119,7 @@ async fn second_step_sees_first_step_output_via_template() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -169,6 +171,7 @@ async fn event_payload_is_visible_in_step_prompts() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 1);
@@ -229,6 +232,7 @@ async fn issue_payload_is_visible_in_step_prompts_and_when_filters() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -295,6 +299,7 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -314,6 +319,21 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
     assert!(fan.items[0].rendered_prompt.contains("review a.rs (1/3)"));
     assert!(fan.items[1].rendered_prompt.contains("review b.rs (2/3)"));
     assert!(fan.items[2].rendered_prompt.contains("review c.rs (3/3)"));
+    // Every unit gets its own instance codename `crew/role#n`, n = index + 1.
+    let names: Vec<&str> = fan
+        .items
+        .iter()
+        .map(|i| i.codename.as_deref().expect("fan-out unit codename"))
+        .collect();
+    for (i, n) in names.iter().enumerate() {
+        assert!(n.ends_with(&format!("#{}", i + 1)), "unit {i}: {n}");
+    }
+    let distinct: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        names.len(),
+        "unit codenames distinct: {names:?}"
+    );
 
     // The follow-up step sees `steps.review_each.results[*]`.
     let summary_prompt = &res.step_results[1].rendered_prompt;
@@ -361,6 +381,7 @@ async fn for_each_accepts_a_json_array_of_objects() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -410,6 +431,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -459,6 +481,7 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -540,6 +563,7 @@ impl StepFactory for FailingFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -582,6 +606,7 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -631,6 +656,7 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -693,6 +719,7 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -761,6 +788,7 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let triage = &res.step_results[0];
@@ -810,6 +838,7 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -860,6 +889,7 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(!res.run_id.is_empty(), "run_id should be populated");
@@ -931,6 +961,7 @@ async fn run_store_marks_run_failed_with_error_message() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let _ = run_workflow(opts).await.expect_err("workflow should fail");
 
@@ -981,6 +1012,7 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(
@@ -1040,6 +1072,7 @@ async fn approval_gate_pauses_run_and_persists_awaiting_state() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
 
@@ -1105,6 +1138,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let run_id = res.run_id.clone();
@@ -1149,6 +1183,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
 
@@ -1225,6 +1260,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(res.awaiting.is_none());
@@ -1334,6 +1370,7 @@ impl StepFactory for PanelFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -1362,6 +1399,7 @@ async fn panel_step_runs_panelists_in_parallel_and_aggregates_findings() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1434,6 +1472,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let summary_prompt = &res.step_results[1].rendered_prompt;
@@ -1486,6 +1525,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1595,6 +1635,7 @@ impl StepFactory for LoopingPanelFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -1641,6 +1682,7 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1729,6 +1771,7 @@ async fn panel_fixer_dispatch_does_not_leak_into_downstream_template_context() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1792,6 +1835,7 @@ async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1854,6 +1898,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1922,6 +1967,7 @@ async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() 
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.expect("workflow should pause");
@@ -1984,6 +2030,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.unwrap();
@@ -2037,6 +2084,7 @@ async fn unit_checkpoints_persist_each_fanout_item() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let checkpoints = store.read_unit_checkpoints(&res.run_id).unwrap();
@@ -2046,6 +2094,11 @@ async fn unit_checkpoints_persist_each_fanout_item() {
     indices.sort_unstable();
     assert_eq!(indices, vec![0, 1, 2]);
     assert!(checkpoints.iter().all(|c| c.step_id == "review_each"));
+    // The unit's codename is durable on its checkpoint (resume reads it back).
+    for c in &checkpoints {
+        let name = c.codename.as_deref().expect("checkpoint codename");
+        assert!(name.ends_with(&format!("#{}", c.index + 1)), "{name}");
+    }
 }
 
 // Factory that records every rendered prompt it builds opts for, and
@@ -2130,6 +2183,7 @@ impl StepFactory for RecordingFailingFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -2182,6 +2236,7 @@ async fn resume_reruns_only_failed_fanout_units() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let err = run_workflow(opts)
         .await
@@ -2232,9 +2287,21 @@ async fn resume_reruns_only_failed_fanout_units() {
                     output: cp.output.clone(),
                     success: true,
                     is_fixer: false,
+                    // Index 0 round-trips its checkpointed codename; index 2
+                    // simulates a pre-codename (legacy) checkpoint so the
+                    // runner's static-name fallback is exercised.
+                    codename: if cp.index == 0 {
+                        cp.codename.clone()
+                    } else {
+                        None
+                    },
                 },
             );
     }
+    let first_pass_names: std::collections::BTreeMap<usize, String> = checkpoints
+        .iter()
+        .map(|c| (c.index, c.codename.clone().expect("checkpoint codename")))
+        .collect();
 
     // Flip the persisted record back to Running (the CLI's resume_run
     // does this; tests mutate directly).
@@ -2279,6 +2346,7 @@ async fn resume_reruns_only_failed_fanout_units() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res = run_workflow(opts).await.unwrap();
 
@@ -2318,6 +2386,18 @@ async fn resume_reruns_only_failed_fanout_units() {
         "index 2 replayed output: {}",
         fan.items[2].output
     );
+
+    // Codenames survive the resume: replayed units keep (or, for a legacy
+    // checkpoint, deterministically re-mint) the same name the first pass
+    // stored, and the re-run unit gets the same slot name as before.
+    for item in &fan.items {
+        assert_eq!(
+            item.codename.as_deref(),
+            Some(first_pass_names[&item.index].as_str()),
+            "unit {} codename stable across resume",
+            item.index
+        );
+    }
 
     // Run completed.
     let record = store.load(&run_id).unwrap();

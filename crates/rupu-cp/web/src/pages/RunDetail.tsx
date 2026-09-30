@@ -44,6 +44,15 @@ import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/r
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
+import { CrewChip } from '../components/codename/CrewChip';
+import { AgentName } from '../components/codename/AgentName';
+import {
+  SubrunIdentityContext,
+  buildSubrunIdentities,
+  sameSubrunIdentities,
+  type SubrunIdentityMap,
+} from '../components/transcript/subrunIdentity';
+import { parseCodename } from '../lib/codename';
 
 const MAX_EVENTS = 2000;
 
@@ -395,6 +404,18 @@ export default function RunDetail() {
 
   // Plain RunEvent[] for the model builder (drop the seq wrapper).
   const rawEvents = useMemo<RunEvent[]>(() => events.map((e) => e.event), [events]);
+  // sub_run_id → codename/agent/provider/model from dispatch_started, so the
+  // transcript's dispatch tool cards can name their sub-agents fully.
+  // Seeded from the graph response's server-side fold so sub-agents dispatched
+  // before the capped live window still resolve. The previous Map is kept
+  // when a tick changed nothing, so context consumers don't re-render per event.
+  const subrunIdentitiesRef = useRef<SubrunIdentityMap>(new Map());
+  const subrunIdentities = useMemo(() => {
+    const next = buildSubrunIdentities(rawEvents, graph?.subrun_identities);
+    if (sameSubrunIdentities(subrunIdentitiesRef.current, next)) return subrunIdentitiesRef.current;
+    subrunIdentitiesRef.current = next;
+    return next;
+  }, [rawEvents, graph]);
 
   // Merge skeleton + checkpoints + live events into the render model. Cheap;
   // recompute on every event so the graph reflects live state.
@@ -437,6 +458,14 @@ export default function RunDetail() {
 
   // The effective run record from the graph.
   const run = graph?.run ?? null;
+  // run_id → run codename, so run-level cards in the Events feed (run_started,
+  // awaiting, completed …) get the crew tint stripe too.
+  const runId = run?.id;
+  const runCodename = run?.codename;
+  const crewByRun = useMemo<ReadonlyMap<string, string>>(
+    () => new Map(runId && runCodename ? [[runId, runCodename]] : []),
+    [runId, runCodename],
+  );
   // Usage for the header row from the graph.
   const displayUsage = graph?.usage;
 
@@ -723,6 +752,19 @@ export default function RunDetail() {
 
   const findingsCount = findings?.findings.length ?? 0;
   const selectedLabel = selection ? selection.stepId : 'whole run';
+  // The selected agent's identity: the chosen unit's (fan-out/panel/parallel
+  // instances live on units) or the linear step's own. Display-only — the
+  // cursor itself stays keyed by step id / unit index.
+  const selectedUnit =
+    selection?.unitIndex != null
+      ? selectedNode?.fanout?.units.find((u) => u.index === selection.unitIndex)
+      : undefined;
+  const selectedIdentity = selectedUnit ?? selectedNode ?? undefined;
+  // A for_each unit runs the step's one agent; panel/parallel units each run
+  // their own, which the node-level `agent` doesn't name.
+  const selectedAgent = selectedUnit
+    ? (selectedUnit.agent ?? (selectedNode?.kind === 'for_each' ? selectedNode.agent : undefined))
+    : selectedNode?.agent;
 
   return (
     // min-h-full (not h-full): the page grows past the viewport so the parent
@@ -735,6 +777,9 @@ export default function RunDetail() {
           <div className="min-w-0">
             <div className="flex items-center gap-3">
               <h1 className="truncate text-2xl font-semibold text-ink">{run.workflow_name}</h1>
+              {run.codename && (
+                <CrewChip crew={parseCodename(run.codename).crew} derived={run.codename_derived} />
+              )}
               <StatusPill status={effectiveStatus} />
               {host && host !== 'local' && (
                 <span className="rounded bg-info-bg px-1.5 py-0.5 text-note font-medium text-info ring-1 ring-info/30 font-mono">
@@ -837,7 +882,9 @@ export default function RunDetail() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-sm font-medium text-warn">
                 <Pause size={16} className="shrink-0" />
-                Awaiting approval · {awaitingGates.length} gates parked
+                {run.codename
+                  ? `${parseCodename(run.codename).crew} is waiting for approval · ${awaitingGates.length} gates parked`
+                  : `Awaiting approval · ${awaitingGates.length} gates parked`}
               </div>
               {cancellable && (
                 <Button
@@ -970,7 +1017,10 @@ export default function RunDetail() {
               <Pause size={16} className="mt-0.5 shrink-0 text-warn" />
               <div className="min-w-0">
                 <div className="text-sm font-medium text-warn">
-                  Awaiting approval · <span className="font-mono">{awaiting.stepId}</span>
+                  {run.codename
+                    ? `${parseCodename(run.codename).crew} is waiting for approval · `
+                    : 'Awaiting approval · '}
+                  <span className="font-mono">{awaiting.stepId}</span>
                 </div>
                 <p className="mt-0.5 break-words text-ui text-warn">{awaiting.reason}</p>
 
@@ -1181,7 +1231,20 @@ export default function RunDetail() {
       </div>
 
       <div className="px-8 pt-2 text-note text-ink-dim">
-        selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
+        <span data-testid="run-selected-label" className="inline-flex flex-wrap items-center gap-1.5">
+          selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
+          {selectedIdentity?.codename && (
+            <>
+              <span className="text-ink-mute">·</span>
+              <AgentName
+                codename={selectedIdentity.codename}
+                agent={selectedAgent}
+                provider={selectedIdentity.provider}
+                model={selectedIdentity.model}
+              />
+            </>
+          )}
+        </span>
       </div>
 
       {/* Definite, generous height so the transcript / events / findings panels
@@ -1189,35 +1252,38 @@ export default function RunDetail() {
           parent <main>. */}
       <div className="flex h-[65vh] min-h-[420px] flex-col px-8 pb-6 pt-3">
         {tab === 'transcript' && (
-          <div className="flex h-full min-h-0 flex-col overflow-auto">
-            {selection && selectedFanout ? (
-              <StepTranscriptBrowser
-                stepId={selection.stepId}
-                units={selectedFanout.units}
-                initialUnitIndex={selection.unitIndex}
-                runId={id}
-                host={host}
-              />
-            ) : selection && selectedTranscriptPath ? (
-              <TranscriptPanel
-                key={selectedTranscriptPath}
-                path={selectedTranscriptPath}
-                live={isRunning}
-                runId={id}
-                host={host}
-              />
-            ) : (
-              <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
-                {selection
-                  ? `No transcript yet for ${selection.stepId}.`
-                  : 'Select a step in the graph to view its transcript.'}
-              </div>
-            )}
-          </div>
+          <SubrunIdentityContext.Provider value={subrunIdentities}>
+            <div className="flex h-full min-h-0 flex-col overflow-auto">
+              {selection && selectedFanout ? (
+                <StepTranscriptBrowser
+                  stepId={selection.stepId}
+                  units={selectedFanout.units}
+                  agent={selectedNode?.kind === 'for_each' ? selectedNode.agent : undefined}
+                  initialUnitIndex={selection.unitIndex}
+                  runId={id}
+                  host={host}
+                />
+              ) : selection && selectedTranscriptPath ? (
+                <TranscriptPanel
+                  key={selectedTranscriptPath}
+                  path={selectedTranscriptPath}
+                  live={isRunning}
+                  runId={id}
+                  host={host}
+                />
+              ) : (
+                <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
+                  {selection
+                    ? `No transcript yet for ${selection.stepId}.`
+                    : 'Select a step in the graph to view its transcript.'}
+                </div>
+              )}
+            </div>
+          </SubrunIdentityContext.Provider>
         )}
         {tab === 'events' && (
           <div className="h-full min-h-0">
-            <RunEventFeed events={feedEvents} connection={connection} />
+            <RunEventFeed events={feedEvents} connection={connection} crewByRun={crewByRun} />
           </div>
         )}
         {tab === 'findings' && (

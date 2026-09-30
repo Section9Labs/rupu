@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rupu-ast",
+    "crates/rupu-codename",
     "crates/rupu-app-canvas",
     "crates/rupu-coverage",
     "crates/rupu-transcript",
@@ -158,6 +159,9 @@ httpmock = "0.7"
 serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+# Human codenames for runs/agents
+rupu-codename = { path = "crates/rupu-codename" }
 
 # Network egress observability (netflow)
 rupu-netflow = { path = "crates/rupu-netflow", default-features = false }

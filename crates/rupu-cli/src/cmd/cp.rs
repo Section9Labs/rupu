@@ -1508,6 +1508,7 @@ mod tests {
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         rec.sync_awaiting_compat();
         rec
@@ -1737,6 +1738,7 @@ mod tests {
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         rec.sync_awaiting_compat();
         store
@@ -1842,6 +1844,7 @@ mod tests {
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         rec.sync_awaiting_compat();
         store
@@ -1918,6 +1921,7 @@ mod tests {
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store
             .create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML)
@@ -2001,6 +2005,7 @@ mod tests {
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         // Single gate, `on_timeout: approve` — must route to `ExpireApprove`.
         store
@@ -2317,6 +2322,7 @@ mod tests {
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         rec.sync_awaiting_compat();
         rec

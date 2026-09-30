@@ -69,6 +69,7 @@ mod tests {
     #[test]
     fn argv_with_target_prompt_mode() {
         let req = AgentLaunchRequest {
+            codename: None,
             agent: "triage".into(),
             prompt: Some("look at PR".into()),
             mode: Some("bypass".into()),
@@ -97,6 +98,7 @@ mod tests {
     #[test]
     fn argv_minimal() {
         let req = AgentLaunchRequest {
+            codename: None,
             agent: "triage".into(),
             prompt: None,
             mode: None,
@@ -113,6 +115,7 @@ mod tests {
     #[test]
     fn argv_prompt_no_target() {
         let req = AgentLaunchRequest {
+            codename: None,
             agent: "triage".into(),
             prompt: Some("do a security audit".into()),
             mode: None,

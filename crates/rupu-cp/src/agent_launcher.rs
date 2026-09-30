@@ -16,6 +16,12 @@ pub struct AgentLaunchRequest {
     /// `HostConnector::honours_supplied_run_id` reports. `None` → the
     /// connector mints.
     pub run_id: Option<String>,
+    /// Codename minted by a placed unit's coordinator. Forwarded to the
+    /// remote `rupu run` as `RUPU_CODENAME` (an env var, so an older remote
+    /// binary ignores it instead of rejecting an unknown flag). SSH only this
+    /// arc; other connectors ignore it and the coordinator's records still
+    /// carry the name.
+    pub codename: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

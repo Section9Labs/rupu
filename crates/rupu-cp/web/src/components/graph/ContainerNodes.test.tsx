@@ -7,6 +7,7 @@
 // `rgba(<r>, <g>, <b>, <alpha>)`), since `useThemeColors` reads the raw
 // channels directly off `document.documentElement`'s inline style (no
 // var()-resolution involved).
+import { nodeSize, PARALLEL_HEADER_H, PARALLEL_SUBROW_ID_H, PARALLEL_PAD_V } from '../../lib/nodeSize';
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
@@ -197,5 +198,104 @@ describe('FanoutNode (large card, total > 12)', () => {
 
     expect(headerColor).toBe(pctColor);
     expect(pctColor).toBe(buttonColor);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Codenames (agent codenames Plan 2, Task 5)
+// ---------------------------------------------------------------------------
+
+describe('codenames on container nodes', () => {
+  it('FanoutNode (inline) header shows role badge + role word + ×N; unit titles carry the leaf · agent · provider/model', () => {
+    const node = {
+      ...FANOUT,
+      agent: 'scanner',
+      fanout: {
+        ...FANOUT.fanout!,
+        units: FANOUT.fanout!.units.map((u) => ({
+          ...u,
+          codename: `jade-reef/heron#${u.index}`,
+          ...(u.index === 0 ? { provider: 'anthropic', model: 'claude-opus-5-5' } : {}),
+        })),
+      },
+    } as GraphNode;
+    const { container } = renderFanout(node);
+    const role = screen.getByTestId('rg-fanout-role');
+    expect(role).toHaveTextContent('heron ×3');
+    expect(role.querySelector('svg[data-shape]')).not.toBeNull();
+    expect(container.querySelector('button[title^="heron#0 · scanner · anthropic/claude-opus-5-5"]')).not.toBeNull();
+    // placed unit (no provider/model) → just leaf · agent
+    expect(container.querySelector('button[title^="heron#1 · scanner ·"]')).not.toBeNull();
+  });
+
+  it('FanoutNode (large) header shows role + ×N and no per-unit names', () => {
+    const node = {
+      ...FANOUT_LARGE,
+      fanout: {
+        ...FANOUT_LARGE.fanout!,
+        units: FANOUT_LARGE.fanout!.units.map((u) => ({ ...u, codename: `jade-reef/heron#${u.index}` })),
+      },
+    } as GraphNode;
+    renderFanout(node);
+    expect(screen.getByTestId('rg-fanout-role')).toHaveTextContent('heron ×15');
+    expect(screen.queryByText(/heron#3/)).toBeNull();
+  });
+
+  it('FanoutNode without codenames renders no role header', () => {
+    renderFanout(FANOUT);
+    expect(screen.queryByTestId('rg-fanout-role')).toBeNull();
+  });
+
+  it('ParallelNode rows show the sub-step codename · agent · provider/model', () => {
+    const node = {
+      ...PARALLEL,
+      parallel: [
+        { id: 'lint', state: 'done', agent: 'linter', codename: 'jade-reef/heron.a', provider: 'anthropic', model: 'claude-opus-5-5' },
+        { id: 'test', state: 'running', agent: 'tester' },
+      ],
+    } as GraphNode;
+    renderParallel(node);
+    expect(screen.getByText('lint')).toBeInTheDocument();
+    expect(screen.getByText('heron.a · linter')).toBeInTheDocument();
+    // provider/model on its own line
+    expect(screen.getByText('anthropic/claude-opus-5-5')).toHaveAttribute('data-testid', 'agent-pm');
+    // no codename → sub id row still renders, no identity
+    expect(screen.getByText('test')).toBeInTheDocument();
+    // layout reserves the identity rows for every sub-step that runs an agent
+    expect(nodeSize(node).height).toBe(
+      PARALLEL_HEADER_H + 2 * PARALLEL_SUBROW_ID_H + PARALLEL_PAD_V,
+    );
+  });
+
+  it('PanelLoopNode unit title uses the unit agent, never the unit key', () => {
+    const node = {
+      ...PANEL,
+      fanout: {
+        ...PANEL.fanout!,
+        units: [
+          { index: 0, key: 'alice', state: 'done', codename: 'jade-reef/lynx1', agent: 'sec-reviewer', provider: 'openai', model: 'gpt-5' },
+          { index: 1, key: 'bob', state: 'running', codename: 'jade-reef/lynx2' },
+        ],
+      },
+    } as GraphNode;
+    const { container } = renderPanel(node);
+    expect(container.querySelector('button[title^="lynx1 · sec-reviewer · openai/gpt-5"]')).not.toBeNull();
+    // the unit row shows provider/model in full, on its own line
+    expect(screen.getByText('openai/gpt-5')).toHaveAttribute('data-testid', 'agent-pm');
+    expect(screen.getByText('lynx1 · sec-reviewer')).toBeInTheDocument();
+    expect(container.querySelector('button[title^="lynx2 · running"]')).not.toBeNull();
+    expect(container.querySelector('button[title*="bob"]')).toBeNull();
+  });
+
+  it('PanelLoopNode unit chips use the codename leaf when present', () => {
+    const node = {
+      ...PANEL,
+      fanout: {
+        ...PANEL.fanout!,
+        units: PANEL.fanout!.units.map((u, i) => ({ ...u, codename: `jade-reef/lynx${i + 1}` })),
+      },
+    } as GraphNode;
+    renderPanel(node);
+    expect(screen.getByText('lynx1')).toBeInTheDocument();
   });
 });

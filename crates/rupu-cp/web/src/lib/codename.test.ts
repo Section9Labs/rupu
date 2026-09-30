@@ -1,0 +1,34 @@
+import { describe, expect, it } from 'vitest';
+import { parseCodename, crewTint, roleBadge, memberLabel, identityTitle } from './codename';
+describe('codename', () => {
+  it('parses crew, leaf and role', () => {
+    expect(parseCodename('cobalt-harbor')).toEqual({ crew: 'cobalt-harbor', leaf: 'cobalt-harbor', role: undefined });
+    expect(parseCodename('cobalt-harbor/heron#412>lynx#3')).toEqual({ crew: 'cobalt-harbor', leaf: 'heron#412>lynx#3', role: 'lynx' });
+    expect(parseCodename('cobalt-harbor/heron#4.2').role).toBe('heron');
+  });
+  it('strips trailing digits from the role', () => {
+    expect(parseCodename('jade-reef/heron2').role).toBe('heron');
+    expect(roleBadge('heron', 'light')).toBeDefined();
+  });
+  it('looks up tints and badges by theme', () => {
+    expect(crewTint('cobalt-harbor', 'light')).toBe('#1d4ed8');
+    expect(crewTint('cobalt-harbor', 'dark')).toBe('#93b4fd');
+    expect(crewTint('nope-harbor', 'light')).toBeUndefined();
+    expect(roleBadge('heron', 'light')?.shape).toBeTypeOf('string');
+  });
+  it('builds member labels', () => {
+    expect(memberLabel('jade-reef/heron#4', 'security-reviewer', 'anthropic', 'claude-opus-5-5'))
+      .toBe('heron#4 · security-reviewer · anthropic/claude-opus-5-5');
+    expect(memberLabel(undefined, 'triage')).toBe('triage');
+  });
+  it('palette lookups ignore Object.prototype members', () => {
+    expect(crewTint('constructor-harbor', 'light')).toBeUndefined();
+    expect(crewTint('toString', 'dark')).toBeUndefined();
+    expect(roleBadge('constructor', 'light')).toBeUndefined();
+    expect(roleBadge('__proto__', 'light')).toBeUndefined();
+  });
+  it('builds the full identity title', () => {
+    expect(identityTitle('jade-reef/heron#4', 'rev', 'anthropic', 'opus')).toBe('jade-reef/heron#4 · rev · anthropic/opus');
+    expect(identityTitle('jade-reef/heron#4', undefined, undefined, 'opus')).toBe('jade-reef/heron#4 · opus');
+  });
+});

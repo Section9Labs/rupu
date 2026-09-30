@@ -13879,6 +13879,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13901,6 +13902,7 @@ steps:
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -14034,6 +14036,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14056,6 +14059,7 @@ steps:
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -14174,6 +14178,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14211,6 +14216,7 @@ steps:
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -14329,6 +14335,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14351,6 +14358,7 @@ steps:
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -14474,6 +14482,7 @@ steps:
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -14496,6 +14505,7 @@ steps:
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -14611,6 +14621,7 @@ steps:
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    codename: None,
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -14761,6 +14772,7 @@ steps:
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    codename: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -14936,6 +14948,7 @@ steps:
                     active_step_transcript_path: None,
                     final_output: None,
                     loop_progress: Default::default(),
+                    codename: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -14960,6 +14973,7 @@ steps:
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();

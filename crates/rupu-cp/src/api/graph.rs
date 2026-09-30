@@ -22,7 +22,7 @@ use rupu_orchestrator::{
     executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges, Workflow,
 };
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader};
 
 // ── Route ────────────────────────────────────────────────────────────────
@@ -108,7 +108,17 @@ fn build_run_graph_json(
     // Precedence: durable checkpoints WIN (they are the terminal record).
     // We only synthesize units for `(step_id, index)` pairs not already
     // present in the checkpoints.
-    let units = merge_event_units(id, store, checkpoints);
+    //
+    // The same single pass over events.jsonl also folds the agent identities
+    // (`AgentStarted` / `DispatchStarted`: codename, agent, provider, model),
+    // so the client doesn't depend on its bounded live-event window to name
+    // units — at 1000+ units that window drops the early `agent_started`s.
+    let EventFold {
+        units,
+        step_identities,
+        unit_identities,
+        subrun_identities,
+    } = merge_event_units(id, store, checkpoints);
 
     // 6. Token/cost rollup for the run-detail header breakdown.
     let usage = crate::usage::summarize_run(store, id, pricing);
@@ -119,6 +129,9 @@ fn build_run_graph_json(
         "step_results": step_results,
         "units": units,
         "usage": usage,
+        "step_identities": step_identities,
+        "unit_identities": unit_identities,
+        "subrun_identities": subrun_identities,
     }))
 }
 
@@ -170,6 +183,9 @@ async fn run_graph(
                 "step_results": Vec::<serde_json::Value>::new(),
                 "units": Vec::<serde_json::Value>::new(),
                 "usage": crate::usage::UsageSummary::default(),
+                "step_identities": serde_json::Map::new(),
+                "unit_identities": serde_json::Map::new(),
+                "subrun_identities": serde_json::Map::new(),
             })))
         }
         RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
@@ -180,11 +196,59 @@ async fn run_graph(
 /// then any units that exist only in `events.jsonl` (panel panelist/fixer
 /// runs). Each element keeps the [`UnitCheckpoint`] field shape so the
 /// frontend reads them uniformly.
+/// An agent instance's identity as folded from `events.jsonl`. Absent fields
+/// are omitted on the wire.
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
+struct Identity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+impl Identity {
+    /// Overlay `later` field-by-field: a later event wins where it carries a
+    /// value; an absent field keeps what an earlier event recorded.
+    fn overlay(&mut self, later: Identity) {
+        fn pick(slot: &mut Option<String>, v: Option<String>) {
+            if let Some(v) = v.filter(|v| !v.is_empty()) {
+                *slot = Some(v);
+            }
+        }
+        pick(&mut self.codename, later.codename);
+        pick(&mut self.agent, later.agent);
+        pick(&mut self.provider, later.provider);
+        pick(&mut self.model, later.model);
+    }
+}
+
+/// Everything [`merge_event_units`] folds out of one pass over `events.jsonl`.
+///
+/// - `units`: checkpoints + events-only units, each carrying its
+///   `AgentStarted` identity (`agent`/`provider`/`model`, and `codename`
+///   when the unit record had none).
+/// - `step_identities`: `{step_id: identity}` from step-level `AgentStarted`
+///   (no `unit_index`).
+/// - `unit_identities`: `{step_id: {unit_index: identity}}` from unit-level
+///   `AgentStarted` — also covers `parallel:` sub-steps, which have no unit
+///   record for the fold into `units` to land on.
+/// - `subrun_identities`: `{sub_run_id: identity}` from `DispatchStarted`.
+struct EventFold {
+    units: Vec<serde_json::Value>,
+    step_identities: BTreeMap<String, Identity>,
+    unit_identities: BTreeMap<String, BTreeMap<usize, Identity>>,
+    subrun_identities: BTreeMap<String, Identity>,
+}
+
 fn merge_event_units(
     id: &str,
     store: &RunStore,
     checkpoints: Vec<rupu_orchestrator::runs::UnitCheckpoint>,
-) -> Vec<serde_json::Value> {
+) -> EventFold {
     // Track every (step_id, index) already covered — checkpoints first.
     let mut seen: HashSet<(String, usize)> = checkpoints
         .iter()
@@ -197,11 +261,22 @@ fn merge_event_units(
         .filter_map(|c| serde_json::to_value(c).ok())
         .collect();
 
+    let mut step_identities: BTreeMap<String, Identity> = BTreeMap::new();
+    let mut unit_identities: BTreeMap<String, BTreeMap<usize, Identity>> = BTreeMap::new();
+    let mut subrun_identities: BTreeMap<String, Identity> = BTreeMap::new();
+
     // Read and parse the event stream; tolerate a missing/garbled file.
     let path = store.events_path(id);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
-        Err(_) => return out,
+        Err(_) => {
+            return EventFold {
+                units: out,
+                step_identities,
+                unit_identities,
+                subrun_identities,
+            }
+        }
     };
 
     // Synthesized (events-only) units, keyed by (step_id, index) so a later
@@ -225,6 +300,7 @@ fn merge_event_units(
                 index,
                 unit_key,
                 transcript_path,
+                codename,
                 ..
             } => {
                 let key = (step_id.clone(), index);
@@ -233,13 +309,17 @@ fn merge_event_units(
                 }
                 seen.insert(key.clone());
                 synthesized.insert(key, events_only.len());
-                events_only.push(serde_json::json!({
+                let mut unit = serde_json::json!({
                     "step_id": step_id,
                     "index": index,
                     "item": unit_key,
                     "transcript_path": transcript_path.to_string_lossy(),
                     "success": serde_json::Value::Null,
-                }));
+                });
+                if let Some(c) = codename {
+                    unit["codename"] = serde_json::Value::String(c);
+                }
+                events_only.push(unit);
             }
             Event::UnitCompleted {
                 step_id,
@@ -253,12 +333,99 @@ fn merge_event_units(
                     }
                 }
             }
+            Event::AgentStarted {
+                step_id,
+                unit_index,
+                codename,
+                agent,
+                provider,
+                model,
+                ..
+            } => {
+                let ident = Identity {
+                    codename,
+                    agent: Some(agent),
+                    provider,
+                    model,
+                };
+                let slot = match unit_index {
+                    None => step_identities.entry(step_id).or_default(),
+                    Some(i) => unit_identities
+                        .entry(step_id)
+                        .or_default()
+                        .entry(i)
+                        .or_default(),
+                };
+                slot.overlay(ident);
+            }
+            Event::DispatchStarted {
+                sub_run_id,
+                agent,
+                codename,
+                provider,
+                model,
+                ..
+            } => {
+                subrun_identities
+                    .entry(sub_run_id)
+                    .or_default()
+                    .overlay(Identity {
+                        codename,
+                        agent,
+                        provider,
+                        model,
+                    });
+            }
             _ => {}
         }
     }
 
     out.extend(events_only);
-    out
+
+    // Fold unit-level identities onto their unit records. The unit record's
+    // own `codename` (checkpoint / unit_started) stays authoritative.
+    for unit in &mut out {
+        let Some(obj) = unit.as_object_mut() else {
+            continue;
+        };
+        let (Some(step_id), Some(index)) = (
+            obj.get("step_id").and_then(|v| v.as_str()),
+            obj.get("index").and_then(|v| v.as_u64()),
+        ) else {
+            continue;
+        };
+        let Some(ident) = unit_identities
+            .get(step_id)
+            .and_then(|m| m.get(&(index as usize)))
+        else {
+            continue;
+        };
+        let has_codename = obj
+            .get("codename")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| !c.is_empty());
+        if !has_codename {
+            if let Some(c) = &ident.codename {
+                obj.insert("codename".into(), c.clone().into());
+            }
+        }
+        for (k, v) in [
+            ("agent", &ident.agent),
+            ("provider", &ident.provider),
+            ("model", &ident.model),
+        ] {
+            if let Some(v) = v {
+                obj.insert(k.into(), v.clone().into());
+            }
+        }
+    }
+
+    EventFold {
+        units: out,
+        step_identities,
+        unit_identities,
+        subrun_identities,
+    }
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────────
@@ -594,6 +761,155 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_only_unit_carries_unit_started_codename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        std::fs::create_dir_all(store.events_path("run_x").parent().unwrap()).unwrap();
+        let ev = |codename: Option<&str>, index: usize| {
+            serde_json::to_string(&Event::UnitStarted {
+                run_id: "run_x".into(),
+                step_id: "s".into(),
+                index,
+                unit_key: "a.rs".into(),
+                agent: Some("heron".into()),
+                transcript_path: "/t/u.jsonl".into(),
+                host: None,
+                codename: codename.map(str::to_string),
+            })
+            .unwrap()
+        };
+        std::fs::write(
+            store.events_path("run_x"),
+            format!("{}\n{}\n", ev(Some("jade-reef/hedgehog#1"), 0), ev(None, 1)),
+        )
+        .unwrap();
+        let units = merge_event_units("run_x", &store, Vec::new()).units;
+        assert_eq!(units[0]["codename"], "jade-reef/hedgehog#1");
+        assert!(units[1].get("codename").is_none());
+    }
+
+    /// `AgentStarted` / `DispatchStarted` identities are folded server-side
+    /// from the WHOLE events.jsonl — onto unit records by (step_id,
+    /// unit_index), into `step_identities` (no unit_index), `unit_identities`
+    /// and `subrun_identities` — so the client needn't hold every event.
+    #[test]
+    fn event_fold_collects_agent_and_dispatch_identities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        std::fs::create_dir_all(store.events_path("run_x").parent().unwrap()).unwrap();
+        let agent_started =
+            |step: &str, unit: Option<usize>, codename: Option<&str>, provider: Option<&str>| {
+                serde_json::to_string(&Event::AgentStarted {
+                    run_id: "run_x".into(),
+                    step_id: step.into(),
+                    unit_index: unit,
+                    codename: codename.map(str::to_string),
+                    agent: "sec-reviewer".into(),
+                    provider: provider.map(str::to_string),
+                    model: provider.map(|_| "claude-sonnet-4-6".to_string()),
+                    agent_run_id: "ar".into(),
+                    transcript_path: "/t/a.jsonl".into(),
+                })
+                .unwrap()
+            };
+        let unit_started = serde_json::to_string(&Event::UnitStarted {
+            run_id: "run_x".into(),
+            step_id: "fan".into(),
+            index: 3,
+            unit_key: "crates/db".into(),
+            agent: Some("sec-reviewer".into()),
+            transcript_path: "/t/u3.jsonl".into(),
+            host: None,
+            codename: None,
+        })
+        .unwrap();
+        let dispatch = serde_json::to_string(&Event::DispatchStarted {
+            run_id: "run_x".into(),
+            sub_run_id: "sub_1".into(),
+            agent: Some("helper".into()),
+            transcript_path: "/t/s.jsonl".into(),
+            codename: Some("jade-reef/heron>owl#1".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-5".into()),
+        })
+        .unwrap();
+        let lines = [
+            agent_started("lint", None, Some("jade-reef/heron"), Some("anthropic")),
+            // a later step-level event without provider keeps the earlier one
+            agent_started("lint", None, None, None),
+            unit_started,
+            agent_started("fan", Some(3), Some("jade-reef/lynx#3"), Some("anthropic")),
+            // parallel sub-step: identity with no unit record
+            agent_started("par", Some(1), Some("jade-reef/heron.b"), Some("anthropic")),
+            dispatch,
+        ];
+        std::fs::write(store.events_path("run_x"), lines.join("\n") + "\n").unwrap();
+
+        let fold = merge_event_units("run_x", &store, Vec::new());
+
+        // unit record picks up agent/provider/model and (absent) codename
+        let u = &fold.units[0];
+        assert_eq!(u["step_id"], "fan");
+        assert_eq!(u["codename"], "jade-reef/lynx#3");
+        assert_eq!(u["agent"], "sec-reviewer");
+        assert_eq!(u["provider"], "anthropic");
+        assert_eq!(u["model"], "claude-sonnet-4-6");
+
+        let step = &fold.step_identities["lint"];
+        assert_eq!(step.codename.as_deref(), Some("jade-reef/heron"));
+        assert_eq!(step.provider.as_deref(), Some("anthropic"));
+        assert_eq!(step.model.as_deref(), Some("claude-sonnet-4-6"));
+
+        let par = &fold.unit_identities["par"][&1];
+        assert_eq!(par.codename.as_deref(), Some("jade-reef/heron.b"));
+
+        let sub = &fold.subrun_identities["sub_1"];
+        assert_eq!(sub.codename.as_deref(), Some("jade-reef/heron>owl#1"));
+        assert_eq!(sub.agent.as_deref(), Some("helper"));
+        assert_eq!(sub.provider.as_deref(), Some("openai"));
+        assert_eq!(sub.model.as_deref(), Some("gpt-5"));
+
+        // Wire shape: unit_identities keys are stringified indices.
+        let v = serde_json::to_value(&fold.unit_identities).unwrap();
+        assert_eq!(v["par"]["1"]["codename"], "jade-reef/heron.b");
+    }
+
+    #[test]
+    fn unit_record_codename_beats_agent_started_codename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        std::fs::create_dir_all(store.events_path("run_x").parent().unwrap()).unwrap();
+        let started = serde_json::to_string(&Event::UnitStarted {
+            run_id: "run_x".into(),
+            step_id: "fan".into(),
+            index: 0,
+            unit_key: "a".into(),
+            agent: None,
+            transcript_path: "/t/u.jsonl".into(),
+            host: None,
+            codename: Some("jade-reef/lynx#0".into()),
+        })
+        .unwrap();
+        let agent = serde_json::to_string(&Event::AgentStarted {
+            run_id: "run_x".into(),
+            step_id: "fan".into(),
+            unit_index: Some(0),
+            codename: Some("other/name".into()),
+            agent: "a".into(),
+            provider: None,
+            model: None,
+            agent_run_id: "ar".into(),
+            transcript_path: "/t/a.jsonl".into(),
+        })
+        .unwrap();
+        std::fs::write(store.events_path("run_x"), format!("{started}\n{agent}\n")).unwrap();
+        let fold = merge_event_units("run_x", &store, Vec::new());
+        assert_eq!(fold.units[0]["codename"], "jade-reef/lynx#0");
+        assert_eq!(fold.units[0]["agent"], "a");
+        assert!(fold.units[0].get("provider").is_none());
+    }
 
     /// Build a `RunRecord` from JSON — optional fields fill via serde defaults,
     /// mirroring the on-disk `run.json` shape.

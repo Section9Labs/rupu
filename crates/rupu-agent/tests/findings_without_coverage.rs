@@ -75,6 +75,7 @@ fn opts_for(
         context_window_tokens: None,
         compact_at_percent: None,
         pause: None,
+        codename: None,
     }
 }
 
@@ -131,6 +132,9 @@ async fn granted_agent_records_a_finding_without_a_concerns_block() {
     );
     assert_eq!(rec["declared_by"]["model"], "mock-1");
     assert_eq!(rec["declared_by"]["surface"], "autoflow");
+    // Agent + provider ride along so the CP can show `agent · provider/model`.
+    assert_eq!(rec["declared_by"]["agent"], "net-assessor");
+    assert_eq!(rec["declared_by"]["provider"], "mock");
 }
 
 #[tokio::test]

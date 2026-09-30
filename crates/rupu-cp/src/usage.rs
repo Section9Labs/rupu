@@ -870,6 +870,7 @@ mod tests {
                     loop_iteration: None,
                     run_outcome: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -946,6 +947,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store.create(record, "").unwrap();
         store
@@ -968,6 +970,7 @@ mod tests {
                     loop_iteration: None,
                     run_outcome: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();

@@ -36,6 +36,7 @@ const USAGE: UsageSummary = {
 };
 
 const RECENT_RUN: RunListRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   id: 'run-1',
   workflow_name: 'nightly-scan',
   status: 'completed',
@@ -69,6 +70,7 @@ const DETAIL: ProjectDetailType = {
 const FINDINGS: FindingsResponse = {
   findings: [
     {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
       id: 'f-crit',
       ws_id: 'x',
       project: 'Acme Service',

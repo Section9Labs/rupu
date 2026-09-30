@@ -359,6 +359,7 @@ mod tests {
 
         let run_id = conn
             .launch_agent(AgentLaunchRequest {
+                codename: None,
                 agent: "my-agent".into(),
                 prompt: Some("do something".into()),
                 mode: None,

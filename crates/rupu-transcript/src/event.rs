@@ -61,6 +61,10 @@ pub enum Event {
         /// append). `None` on legacy transcripts.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         system_prompt: Option<String>,
+        /// Human codename of this agent instance (`crew/role#n>…`).
+        /// `None` on transcripts written before codenames existed.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        codename: Option<String>,
     },
     TurnStart {
         turn_idx: u32,

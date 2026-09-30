@@ -35,6 +35,7 @@ afterEach(() => {
 });
 
 const ACTIVE_SESSION: SessionSummary = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   session_id: 'sess-1',
   agent_name: 'reviewer',
   model: 'opus',
@@ -215,5 +216,13 @@ describe('SessionDetail host-aware', () => {
     // Wait for the session to render then confirm no chip.
     await screen.findByText(ACTIVE_SESSION.session_id);
     expect(screen.queryByText(/^on /)).not.toBeInTheDocument();
+  });
+});
+
+describe('SessionDetail — codename', () => {
+  it('renders the crew chip and member label in the header', async () => {
+    stubApi(ACTIVE_SESSION);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
   });
 });

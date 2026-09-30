@@ -84,6 +84,7 @@ mod tests {
                 kind: StepKind::Linear,
                 agent: None,
                 host: None,
+                codename: None,
             },
         );
         sink.emit(
@@ -118,6 +119,7 @@ mod tests {
                 kind: StepKind::Linear,
                 agent: Some("classifier".into()),
                 host: None,
+                codename: None,
             },
         );
         drop(sink);

@@ -32,6 +32,7 @@ function usage(): RunListRow['usage'] {
 
 const ROWS: RunListRow[] = [
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-run-manual',
     workflow_name: 'wf-running-manual',
     status: 'running',
@@ -41,6 +42,7 @@ const ROWS: RunListRow[] = [
     usage: usage(),
   },
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-done-cron',
     workflow_name: 'wf-completed-cron',
     status: 'completed',
@@ -50,6 +52,7 @@ const ROWS: RunListRow[] = [
     usage: usage(),
   },
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-fail-event',
     workflow_name: 'wf-failed-event',
     status: 'failed',
@@ -59,6 +62,7 @@ const ROWS: RunListRow[] = [
     usage: usage(),
   },
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-await-manual',
     workflow_name: 'wf-awaiting-manual',
     status: 'awaiting_approval',
@@ -262,5 +266,19 @@ describe('ProjectRunsTab — kit loading/empty/error states', () => {
     renderTab();
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('network down'));
+  });
+});
+
+describe('ProjectRunsTab — codenames', () => {
+  it('renders crew names and Find matches by codename', async () => {
+    mockRuns([
+      { ...ROWS[0], id: 'r-a', workflow_name: 'wf-a', codename: 'cobalt-harbor/heron#1' },
+      { ...ROWS[1], id: 'r-b', workflow_name: 'wf-b', codename: 'amber-fjord/kite#1' },
+    ]);
+    renderTab();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'cobalt' } });
+    await waitFor(() => expect(screen.queryByText('wf-b')).not.toBeInTheDocument());
+    expect(screen.getByText('wf-a')).toBeInTheDocument();
   });
 });

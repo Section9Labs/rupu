@@ -10,6 +10,7 @@ import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
+import { AgentIdentity } from '../codename/AgentIdentity';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -62,18 +63,25 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
         {subs.map((sub) => {
           const ss = stateStyle(colors, sub.state);
           return (
-            <div
-              key={sub.id}
-              className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1"
-            >
-              <span
-                className="inline-flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
-                style={{ background: ss.color }}
-                aria-hidden
-              >
-                {ss.glyph}
-              </span>
-              <span className="truncate text-note text-ink">{sub.id}</span>
+            <div key={sub.id} className="rounded-[6px] border border-border bg-panel px-1.5 py-1">
+              <div className="flex items-center gap-1.5">
+                <span
+                  className="inline-flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
+                  style={{ background: ss.color }}
+                  aria-hidden
+                >
+                  {ss.glyph}
+                </span>
+                <span className="min-w-0 truncate text-note text-ink">{sub.id}</span>
+              </div>
+              {/* identity on its own lines (PARALLEL_SUBROW_ID_H) */}
+              <AgentIdentity
+                className="pl-[18px] text-meta text-ink-dim"
+                codename={sub.codename}
+                agent={sub.agent}
+                provider={sub.provider}
+                model={sub.model}
+              />
             </div>
           );
         })}

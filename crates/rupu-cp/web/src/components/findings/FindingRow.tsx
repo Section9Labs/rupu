@@ -10,7 +10,9 @@ import { normFindingSeverity, type FindingRecord } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { cweFromFinding } from '../../lib/cwe';
 import { SEVERITY_STYLE } from '../../lib/severity';
+import { AgentName } from '../codename/AgentName';
 import { FindingEvidence } from './FindingEvidence';
+import { findingCodename } from './findingCodename';
 
 export interface FindingRowProps {
   finding: FindingRecord;
@@ -42,6 +44,7 @@ export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps
   );
 
   const cwe = cweFromFinding(finding);
+  const named = findingCodename(finding);
 
   // Provenance chip text — `project · target`, omitting empty halves.
   const provParts: string[] = [];
@@ -100,6 +103,16 @@ export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps
               >
                 {cwe.id}
               </a>
+            )}
+            {named && (
+              <AgentName
+                codename={named.codename}
+                agent={named.agent}
+                provider={named.provider}
+                model={named.model}
+                showCrew
+                derived={named.derived}
+              />
             )}
             {finding.concern_id && (
               <span>

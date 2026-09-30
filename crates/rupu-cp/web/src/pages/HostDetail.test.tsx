@@ -27,6 +27,7 @@ const HOST: HostView = {
 };
 
 const RUN: RunListRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   id: 'run-1',
   workflow_name: 'deploy-prod',
   status: 'completed',

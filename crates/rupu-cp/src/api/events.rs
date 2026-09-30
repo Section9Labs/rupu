@@ -358,6 +358,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store
             .create(record, "name: test\nsteps: []\n")
@@ -538,6 +539,7 @@ mod tests {
                 kind: StepKind::Linear,
                 agent: None,
                 host: None,
+                codename: None,
             })
             .collect();
         write_events(&store, "run_big", &events);

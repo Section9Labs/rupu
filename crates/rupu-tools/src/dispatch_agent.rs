@@ -149,7 +149,13 @@ impl Tool for DispatchAgentTool {
         };
 
         match dispatcher
-            .dispatch(&i.agent, child_prompt, parent_run_id, ctx.depth)
+            .dispatch(
+                &i.agent,
+                child_prompt,
+                parent_run_id,
+                ctx.depth,
+                ctx.codename.as_deref(),
+            )
             .await
         {
             Ok(outcome) => {
@@ -165,6 +171,7 @@ impl Tool for DispatchAgentTool {
                     "duration_ms": outcome.duration_ms,
                     "transcript_path": outcome.transcript_path.display().to_string(),
                     "sub_run_id": outcome.sub_run_id,
+                    "codename": outcome.codename,
                 });
                 Ok(ToolOutput {
                     stdout: serde_json::to_string_pretty(&body)
@@ -200,6 +207,17 @@ mod tests {
     #[derive(Debug)]
     struct StubDispatcher {
         return_output: String,
+        /// The `parent_codename` the tool handed the dispatcher.
+        seen_parent_codename: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl StubDispatcher {
+        fn stub(return_output: &str) -> Self {
+            Self {
+                return_output: return_output.into(),
+                seen_parent_codename: Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
     }
 
     #[async_trait]
@@ -210,10 +228,13 @@ mod tests {
             _prompt: String,
             _parent_run_id: &str,
             _parent_depth: u32,
+            parent_codename: Option<&str>,
         ) -> Result<DispatchOutcome, DispatchError> {
+            *self.seen_parent_codename.lock().unwrap() = parent_codename.map(str::to_string);
             Ok(DispatchOutcome {
                 agent: agent_name.to_string(),
                 sub_run_id: "sub_TEST".into(),
+                codename: Some("p>lynx#1".into()),
                 transcript_path: PathBuf::from("/tmp/sub_TEST/transcript.jsonl"),
                 output: self.return_output.clone(),
                 success: true,
@@ -257,9 +278,7 @@ mod tests {
     #[tokio::test]
     async fn errors_when_agent_not_in_allowlist() {
         let tool = DispatchAgentTool;
-        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
-            return_output: "ok".into(),
-        });
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::stub("ok"));
         let ctx = ctx_with(
             Some(disp),
             Some(vec!["reviewer".into()]),
@@ -280,9 +299,7 @@ mod tests {
     #[tokio::test]
     async fn errors_when_depth_at_ceiling() {
         let tool = DispatchAgentTool;
-        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
-            return_output: "ok".into(),
-        });
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::stub("ok"));
         let ctx = ctx_with(
             Some(disp),
             Some(vec!["reviewer".into()]),
@@ -303,9 +320,7 @@ mod tests {
     #[tokio::test]
     async fn returns_spec_shape_on_success() {
         let tool = DispatchAgentTool;
-        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
-            return_output: "child output".into(),
-        });
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::stub("child output"));
         let ctx = ctx_with(
             Some(disp),
             Some(vec!["reviewer".into()]),
@@ -331,11 +346,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passes_parent_codename_and_surfaces_child_codename() {
+        let tool = DispatchAgentTool;
+        let stub = StubDispatcher::stub("ok");
+        let seen = Arc::clone(&stub.seen_parent_codename);
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(stub);
+        let mut ctx = ctx_with(
+            Some(disp),
+            Some(vec!["reviewer".into()]),
+            Some("run_X".into()),
+            0,
+        );
+        ctx.codename = Some("jade-reef/heron#2".into());
+        let out = tool
+            .invoke(json!({ "agent": "reviewer", "prompt": "p" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "unexpected error: {:?}", out.error);
+        let parsed: Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("jade-reef/heron#2"));
+        assert_eq!(parsed["codename"], "p>lynx#1");
+    }
+
+    #[tokio::test]
     async fn merges_inputs_into_prompt() {
         let tool = DispatchAgentTool;
-        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
-            return_output: "ok".into(),
-        });
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::stub("ok"));
         let ctx = ctx_with(
             Some(disp),
             Some(vec!["reviewer".into()]),
@@ -359,9 +395,7 @@ mod tests {
     #[tokio::test]
     async fn errors_when_parent_run_id_missing() {
         let tool = DispatchAgentTool;
-        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
-            return_output: "ok".into(),
-        });
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::stub("ok"));
         let ctx = ctx_with(Some(disp), Some(vec!["reviewer".into()]), None, 0);
         let out = tool
             .invoke(json!({ "agent": "reviewer", "prompt": "hi" }), &ctx)

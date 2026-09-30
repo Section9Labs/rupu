@@ -35,6 +35,8 @@ import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../components/HostSelect';
 import { SessionStatusPill } from '../components/StatusPill';
+import { AgentName } from '../components/codename/AgentName';
+import { memberLabel } from '../lib/codename';
 import { usePagedList } from '../lib/usePagedList';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
@@ -84,7 +86,7 @@ export default function Sessions() {
   const q = query.trim().toLowerCase();
   const visible = q
     ? rows.filter((r) =>
-        [r.agent_name, r.session_id, r.host_id]
+        [r.agent_name, r.session_id, r.host_id, r.codename]
           .filter((v): v is string => Boolean(v))
           .some((v) => v.toLowerCase().includes(q)),
       )
@@ -252,7 +254,24 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     sortable: true,
     sortValue: (s) => s.agent_name,
     titleValue: (s) => s.agent_name,
-    render: (s) => <span className="text-sm font-medium text-ink">{s.agent_name}</span>,
+    render: (s) => (
+      <span className="text-sm font-medium text-ink">
+        {s.codename ? (
+          <AgentName
+            codename={s.codename}
+            agent={s.agent_name}
+            provider={s.provider_name}
+            model={s.model}
+            showCrew
+            derived={s.codename_derived}
+          />
+        ) : (
+          <span className="font-mono">
+            {memberLabel(undefined, s.agent_name, s.provider_name, s.model)}
+          </span>
+        )}
+      </span>
+    ),
   },
   {
     key: 'session',

@@ -19,7 +19,11 @@
     },
     "turns": 3,
     "duration_ms": 12500,
-    "host_id": "local"
+    "host_id": "local",
+    "codename": "cobalt-harbor/heron",
+    "codename_derived": false,
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6"
   },
   {
     "run_id": "run-11",
@@ -40,6 +44,8 @@
       "runs": 0
     },
     "turns": 0,
-    "duration_ms": null
+    "duration_ms": null,
+    "codename": "jade-reef",
+    "codename_derived": true
   }
 ]

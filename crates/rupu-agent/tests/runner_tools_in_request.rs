@@ -57,6 +57,7 @@ async fn run_passes_all_default_tools_to_provider() {
         context_window_tokens: None,
         compact_at_percent: None,
         pause: None,
+        codename: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -154,6 +155,7 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         context_window_tokens: None,
         compact_at_percent: None,
         pause: None,
+        codename: None,
     };
 
     run_agent(opts).await.unwrap();

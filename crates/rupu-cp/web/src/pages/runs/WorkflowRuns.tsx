@@ -20,6 +20,8 @@ import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { api, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
+import { CrewChip } from '../../components/codename/CrewChip';
+import { parseCodename } from '../../lib/codename';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
@@ -131,7 +133,7 @@ export default function WorkflowRuns() {
   const q = query.trim().toLowerCase();
   const visible = q
     ? filtered.filter((r) =>
-        [r.workflow_name, r.id, r.host_id]
+        [r.workflow_name, r.id, r.host_id, r.codename]
           .filter((v): v is string => Boolean(v))
           .some((v) => v.toLowerCase().includes(q)),
       )
@@ -364,7 +366,12 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     sortable: true,
     sortValue: (r) => r.workflow_name,
     titleValue: (r) => r.workflow_name,
-    render: (r) => <span className="text-sm font-medium text-ink">{r.workflow_name}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center gap-2">
+        {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
+        <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
+      </span>
+    ),
   },
   {
     key: 'run',

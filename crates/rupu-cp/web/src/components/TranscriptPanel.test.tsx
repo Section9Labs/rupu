@@ -76,6 +76,18 @@ describe('TranscriptPanel embedded mode', () => {
     expect(screen.getByText(/completed/)).toBeInTheDocument();
   });
 
+  it('renders the codename with agent · provider/model when run_start carries one', async () => {
+    const withCodename: TranscriptResponse = {
+      ...TRANSCRIPT,
+      events: TRANSCRIPT.events.map((ev) =>
+        ev.type === 'run_start' ? { ...ev, data: { ...ev.data, codename: 'otter-3/lead' } } : ev,
+      ),
+    };
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(withCodename);
+    renderPanel(false);
+    expect(await screen.findByText('lead · reviewer-agent · anthropic/opus')).toBeInTheDocument();
+  });
+
   it('hides the header/footer chrome when embedded, but keeps the turn body', async () => {
     vi.spyOn(api, 'getTranscript').mockResolvedValue(TRANSCRIPT);
     renderPanel(true);

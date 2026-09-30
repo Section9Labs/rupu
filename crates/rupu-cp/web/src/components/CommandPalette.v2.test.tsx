@@ -80,6 +80,7 @@ describe('CommandPalette v2', () => {
   it('shell="v2" navigates a finding entity result to /security', async () => {
     mockEmptyApi();
     const finding: FindingOut = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
       id: 'f-1',
       ws_id: 'ws-1',
       project: 'demo',

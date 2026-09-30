@@ -16,6 +16,7 @@ import { formatDuration } from '../lib/duration';
 import { Spinner } from './ui/Spinner';
 import { buildTranscriptView } from './transcript/transcriptView';
 import Turn from './transcript/Turn';
+import { AgentName } from './codename/AgentName';
 
 type LoadState = 'loading' | 'ready' | 'error';
 
@@ -184,13 +185,23 @@ export default function TranscriptPanel({
           unparsed/partial data-quality badges have something to show. */}
       {!embedded && (view.header || (typeof unparsed === 'number' && unparsed > 0) || partial) && (
         <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-border pb-1.5 text-note text-ink-dim">
-          {view.header && (
-            <>
-              <b className="text-ink">{view.header.agent || 'agent'}</b>
-              {view.header.provider && <span>· {view.header.provider}</span>}
-              {view.header.model && <span>· {view.header.model}</span>}
-            </>
-          )}
+          {view.header &&
+            (view.header.codename ? (
+              <span className="text-ink">
+                <AgentName
+                  codename={view.header.codename}
+                  agent={view.header.agent || undefined}
+                  provider={view.header.provider || undefined}
+                  model={view.header.model || undefined}
+                />
+              </span>
+            ) : (
+              <>
+                <b className="text-ink">{view.header.agent || 'agent'}</b>
+                {view.header.provider && <span>· {view.header.provider}</span>}
+                {view.header.model && <span>· {view.header.model}</span>}
+              </>
+            ))}
           {live && (
             <span
               className={cn(

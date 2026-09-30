@@ -218,6 +218,7 @@ mod tests {
             mode: RunMode::Ask,
             schema: None,
             system_prompt: None,
+            codename: None,
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');

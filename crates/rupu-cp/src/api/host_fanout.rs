@@ -110,6 +110,11 @@ pub(crate) async fn fan_out_sessions(
                         rows.into_iter()
                             .map(|mut row| {
                                 row["host_id"] = serde_json::json!(&host_id);
+                                crate::codename::inject_codename_row(
+                                    &mut row,
+                                    "session_id",
+                                    Some("agent_name"),
+                                );
                                 row
                             })
                             .collect()

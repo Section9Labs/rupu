@@ -283,10 +283,11 @@ impl LineStreamPrinter {
 
     // ── Public API ────────────────────────────────────────────────────────
 
-    /// `▶ <workflow_name>  <run_id>  HH:MM:SS`
+    /// `▶ <workflow_name>  ● <crew>  <run_id>  HH:MM:SS`
     pub fn workflow_header(
         &mut self,
         workflow_name: &str,
+        codename: Option<&str>,
         run_id: &str,
         started_at: DateTime<Utc>,
     ) {
@@ -295,6 +296,11 @@ impl LineStreamPrinter {
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, workflow_name, BRAND);
         buf.push_str("  ");
+        if let Some(c) = codename {
+            let crew = c.split('/').next().unwrap_or(c);
+            super::codename::write_crew(&mut buf, crew);
+            buf.push_str("  ");
+        }
         let _ = palette::write_colored(&mut buf, run_id, DIM);
         buf.push_str("  ");
         let ts = started_at.format("%H:%M:%S").to_string();
@@ -305,13 +311,24 @@ impl LineStreamPrinter {
         self.print_rail_only();
     }
 
-    /// `▶ <agent_name>  (<provider> · <model>)  <run_id>`
-    pub fn agent_header(&mut self, agent_name: &str, provider: &str, model: &str, run_id: &str) {
+    /// `▶ <agent_name>  ◆ <member>  (<provider> · <model>)  <run_id>`
+    pub fn agent_header(
+        &mut self,
+        agent_name: &str,
+        codename: Option<&str>,
+        provider: &str,
+        model: &str,
+        run_id: &str,
+    ) {
         let mut buf = String::new();
         let _ = palette::write_colored(&mut buf, "▶", BRAND);
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, agent_name, BRAND);
         buf.push_str("  ");
+        if let Some(c) = codename {
+            super::codename::write_member(&mut buf, c);
+            buf.push_str("  ");
+        }
         let meta = format!("({provider} · {model})");
         let _ = palette::write_colored(&mut buf, &meta, DIM);
         buf.push_str("  ");
@@ -321,7 +338,7 @@ impl LineStreamPrinter {
     }
 
     /// `▶ session attach  <agent_name>  <session_id>`
-    pub fn session_header(&mut self, session_id: &str, agent_name: &str) {
+    pub fn session_header(&mut self, session_id: &str, agent_name: &str, codename: Option<&str>) {
         let mut buf = String::new();
         let _ = palette::write_colored(&mut buf, "▶", BRAND);
         buf.push(' ');
@@ -329,6 +346,10 @@ impl LineStreamPrinter {
         buf.push_str("  ");
         let _ = palette::write_bold_colored(&mut buf, agent_name, BRAND);
         buf.push_str("  ");
+        if let Some(c) = codename {
+            super::codename::write_member(&mut buf, c);
+            buf.push_str("  ");
+        }
         let _ = palette::write_colored(&mut buf, session_id, DIM);
         self.out(&buf);
         self.print_rail_only();
@@ -1645,6 +1666,7 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             source: source.to_string(),
+            codename: None,
         }
     }
 

@@ -133,6 +133,9 @@ mod tests {
             run_id: "r".to_string(),
             model: "m".to_string(),
             surface: Surface::Workflow,
+            codename: None,
+            agent: None,
+            provider: None,
         }
     }
 

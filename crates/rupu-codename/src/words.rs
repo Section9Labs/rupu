@@ -1,0 +1,61 @@
+//! Word lists. FROZEN once shipped: `crew_for`/`role_word` index into
+//! these by hash, so reordering, inserting or removing a word renames every
+//! derive-on-read (legacy) record. `tests::golden_*` pins them.
+
+/// Crew nouns: places and objects. Never animals (reserved for roles) or colors.
+pub const NOUNS: &[&str] = &[
+    "anchor", "anvil", "arbor", "arch", "atlas", "aurora", "basin", "bastion", "bay", "beacon",
+    "bell", "bluff", "bough", "bridge", "brook", "butte", "cairn", "canal", "canopy", "canyon",
+    "cape", "cask", "castle", "cavern", "cellar", "chapel", "citadel", "cliff", "cloud", "coast",
+    "comet", "compass", "cove", "crag", "crater", "creek", "crest", "crown", "delta", "dune",
+    "ember", "estuary", "fen", "ferry", "field", "fjord", "flint", "forge", "fort", "fountain",
+    "gable", "garden", "geyser", "glacier", "glade", "glen", "gorge", "grove", "gulf", "harbor",
+    "haven", "hearth", "heath", "helm", "hill", "hollow", "horizon", "isle", "jetty", "keep",
+    "kettle", "kiln", "knoll", "lagoon", "lake", "lantern", "ledge", "lens", "loom", "manor",
+    "marsh", "meadow", "mesa", "mill", "mirror", "moor", "moraine", "nebula", "needle", "oasis",
+    "orbit", "orchard", "outpost", "palace", "pass", "pavilion", "peak", "pier", "pillar", "pine",
+    "plain", "plateau", "pond", "portal", "prairie", "prism", "quarry", "quay", "rampart",
+    "rapids", "reef", "ridge", "river", "road", "rock", "rudder", "sail", "savanna", "shoal",
+    "shore", "sierra", "signal", "sky", "slope", "spire", "spring", "spur", "star", "steppe",
+    "stone", "strait", "summit", "sundial", "tarn", "temple", "terrace", "thicket", "tide",
+    "timber", "tower", "trail", "tundra", "valley", "vault", "vessel", "vista", "volcano", "wharf",
+    "willow", "wind", "atoll", "barrow", "bayou", "beach", "bramble", "brink", "cascade",
+    "causeway", "chasm", "cinder", "cistern", "cobble", "corridor", "crossing", "dell", "dike",
+    "dockyard", "fathom", "foundry", "furnace", "garret", "gate", "grotto", "hamlet", "hangar",
+    "hedge", "inlet", "island", "kingdom", "ladder", "landing", "lattice", "lodge", "lookout",
+    "marina", "meridian", "mound", "narrows", "nexus", "paddock", "parapet", "pasture", "pergola",
+    "pinnacle", "quarter", "rain", "range", "refuge", "relay", "runway", "shelter", "sluice",
+    "sound", "spindle", "stack", "steeple", "stream", "tablet", "thatch", "tunnel", "turret",
+    "upland", "village", "vineyard", "wall", "well", "wood", "yard",
+];
+
+/// Role words: animals. Never colors or crew nouns.
+pub const ROLES: &[&str] = &[
+    "adder", "alpaca", "anole", "ant", "antelope", "ape", "asp", "auk", "avocet", "badger",
+    "barbel", "bat", "bear", "beaver", "bee", "beetle", "bison", "bittern", "boar", "bobcat",
+    "bonobo", "bream", "buffalo", "bunting", "buzzard", "caiman", "camel", "canary", "caracal",
+    "cardinal", "caribou", "carp", "cat", "catfish", "chamois", "cheetah", "chough", "cicada",
+    "civet", "clam", "cobra", "cod", "condor", "coot", "cougar", "coyote", "crab", "crane",
+    "cricket", "crow", "cuckoo", "curlew", "dace", "deer", "dingo", "dipper", "dodo", "dolphin",
+    "donkey", "dove", "drake", "dunlin", "eagle", "egret", "eider", "eland", "elk", "emu",
+    "ermine", "falcon", "ferret", "finch", "firefly", "flamingo", "fox", "frog", "gannet", "gar",
+    "gazelle", "gecko", "gerbil", "gibbon", "gnu", "goat", "godwit", "goose", "gopher", "gorilla",
+    "goshawk", "grebe", "grouse", "gull", "guppy", "hare", "harrier", "hawk", "hedgehog", "heron",
+    "hippo", "hoopoe", "hornet", "horse", "hyena", "ibex", "ibis", "iguana", "impala", "jackal",
+    "jaguar", "jay", "kestrel", "kite", "kiwi", "koala", "krill", "kudu", "lark", "lemming",
+    "lemur", "leopard", "limpet", "linnet", "lion", "llama", "lobster", "locust", "loon", "lory",
+    "lynx", "macaw", "magpie", "mallard", "mamba", "manatee", "mandrill", "mantis", "marlin",
+    "marmot", "marten", "merlin", "mink", "minnow", "mole", "mongoose", "moose", "moth", "mouse",
+    "mule", "murre", "narwhal", "newt", "numbat", "ocelot", "octopus", "okapi", "oriole", "oryx",
+    "osprey", "ostrich", "otter", "owl", "ox", "oyster", "panda", "panther", "parrot", "peacock",
+    "pelican", "penguin", "perch", "petrel", "pheasant", "pika", "pike", "pipit", "plover",
+    "polecat", "pony", "porpoise", "possum", "prawn", "puffin", "puma", "python", "quail",
+    "quokka", "quoll", "rabbit", "raccoon", "rail", "ram", "raven", "ray", "redstart", "reindeer",
+    "rhea", "rhino", "robin", "rook", "sable", "salmon", "sardine", "scarab", "seal", "serval",
+    "shark", "shrew", "shrike", "shrimp", "siskin", "skate", "skink", "skua", "skunk", "sloth",
+    "smelt", "snail", "snipe", "sparrow", "spider", "squid", "stag", "starling", "stoat", "stork",
+    "sturgeon", "sunbird", "swallow", "swan", "swift", "tahr", "tamarin", "tapir", "tarpon",
+    "tern", "termite", "thrush", "tiger", "toad", "tortoise", "toucan", "trout", "tuna", "turtle",
+    "urchin", "vicuna", "viper", "vole", "vulture", "wallaby", "walrus", "warbler", "wasp",
+    "weasel", "whale", "whelk", "wolf", "wombat", "wren", "yak", "zebra",
+];

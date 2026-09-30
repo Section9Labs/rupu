@@ -97,6 +97,17 @@ pub struct ToolContext {
     /// means no mappings are loaded; built-in tools self-instrument regardless.
     #[serde(skip)]
     pub tool_mappings: Option<std::sync::Arc<rupu_coverage::ToolMappings>>,
+    /// Codename of the running agent instance, for coverage attribution.
+    #[serde(skip)]
+    pub codename: Option<String>,
+    /// Name of the running agent — populated by the agent runner from
+    /// `AgentRunOpts.agent_name`, for coverage/finding attribution.
+    #[serde(skip)]
+    pub agent: Option<String>,
+    /// Provider serving the run — populated by the agent runner from
+    /// `AgentRunOpts.provider_name`, for coverage/finding attribution.
+    #[serde(skip)]
+    pub provider: Option<String>,
 }
 
 impl Default for ToolContext {
@@ -114,6 +125,9 @@ impl Default for ToolContext {
             run_id: None,
             model: None,
             tool_mappings: None,
+            codename: None,
+            agent: None,
+            provider: None,
         }
     }
 }
@@ -130,12 +144,18 @@ pub trait AgentDispatcher: Send + Sync + std::fmt::Debug {
     /// parent_depth + 1`), and runs the agent to completion. Returns
     /// the child's outcome — final assistant text, tokens used,
     /// duration, and the path to the persisted child transcript.
+    ///
+    /// `parent_codename` is the dispatching agent's own codename
+    /// ([`ToolContext::codename`]); the dispatcher mints the child's
+    /// `<parent>><role>#n` name from it. `None` (a legacy caller with no
+    /// codename) leaves the child unnamed.
     async fn dispatch(
         &self,
         agent_name: &str,
         prompt: String,
         parent_run_id: &str,
         parent_depth: u32,
+        parent_codename: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError>;
 }
 
@@ -146,6 +166,10 @@ pub struct DispatchOutcome {
     pub agent: String,
     /// Sub-run id (`sub_<ULID>`).
     pub sub_run_id: String,
+    /// The child's minted codename (`<parent>><role>#n`). `None` when
+    /// the parent had no codename to derive one from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
     /// Path to the persisted child transcript. The line-stream
     /// printer uses this to render the child's run inline as a
     /// child callout frame.

@@ -22,6 +22,7 @@ fn roundtrip_run_start() {
         mode: RunMode::Ask,
         schema: None,
         system_prompt: None,
+        codename: None,
     });
 }
 

@@ -26,6 +26,7 @@ import { useState } from 'react';
 import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
 import { StatusPill } from '../StatusPill';
 import { TriggerChip } from '../TriggerChip';
+import { CrewChip } from '../codename/CrewChip';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { FilterBar } from '../ui/FilterBar';
 import { FilterPills, type FilterPillOption } from '../ui/FilterPills';
@@ -39,6 +40,7 @@ import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
+import { parseCodename } from '../../lib/codename';
 
 // --- Filter definitions -----------------------------------------------------
 
@@ -99,7 +101,12 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
     sortable: true,
     sortValue: (r) => r.workflow_name,
     titleValue: (r) => r.workflow_name,
-    render: (r) => <span className="text-sm font-medium text-ink">{r.workflow_name}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center gap-2">
+        {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
+        <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
+      </span>
+    ),
   },
   {
     key: 'run',
@@ -211,7 +218,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
   const q = query.trim().toLowerCase();
   const visible = q
     ? filtered.filter((r) =>
-        [r.workflow_name, r.id, r.trigger]
+        [r.workflow_name, r.id, r.trigger, r.codename]
           .filter((v): v is string => Boolean(v))
           .some((v) => v.toLowerCase().includes(q)),
       )

@@ -56,6 +56,7 @@ impl AgentDispatcher for FakeDispatcher {
         prompt: String,
         _parent_run_id: &str,
         _parent_depth: u32,
+        _parent_codename: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.calls
             .lock()
@@ -80,6 +81,7 @@ impl AgentDispatcher for FakeDispatcher {
                 mode: rupu_transcript::RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             })
             .unwrap();
         writer
@@ -101,6 +103,7 @@ impl AgentDispatcher for FakeDispatcher {
 
         Ok(DispatchOutcome {
             agent: agent_name.to_string(),
+            codename: None,
             sub_run_id: sub_run_id.into(),
             transcript_path: path,
             output: "child says: code looks fine".into(),
@@ -178,6 +181,9 @@ impl StepFactory for DispatchFactory {
                 run_id: None,
                 model: None,
                 tool_mappings: None,
+                codename: None,
+                agent: None,
+                provider: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -206,6 +212,7 @@ impl StepFactory for DispatchFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -244,6 +251,7 @@ async fn parent_step_dispatches_child_and_sees_its_output() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -348,6 +356,9 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                     run_id: None,
                     model: None,
                     tool_mappings: None,
+                    codename: None,
+                    agent: None,
+                    provider: None,
                 },
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
@@ -376,6 +387,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -410,6 +422,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.expect("workflow runs");

@@ -15,6 +15,8 @@ fn ctx(workspace: &std::path::Path) -> FindingsContext {
         run_id: "run_mcp_test".to_string(),
         model: "gpt-5.6-cyber".to_string(),
         surface: rupu_coverage::Surface::Workflow,
+        codename: Some("jade-reef".to_string()),
+        provider: Some("openai".to_string()),
     }
 }
 
@@ -52,6 +54,11 @@ async fn records_a_host_finding_into_the_ledger() {
     assert_eq!(rec["severity"], "high");
     assert_eq!(rec["declared_by"]["run_id"], "run_mcp_test");
     assert_eq!(rec["declared_by"]["surface"], "workflow");
+    // Crew-only: one FindingsContext per workflow, not per step.
+    assert_eq!(rec["declared_by"]["codename"], "jade-reef");
+    assert_eq!(rec["declared_by"]["provider"], "openai");
+    // An action step is not an agent: no `agent` key.
+    assert!(rec["declared_by"].get("agent").is_none());
 }
 
 #[tokio::test]

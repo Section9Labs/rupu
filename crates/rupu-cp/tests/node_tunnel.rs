@@ -955,6 +955,7 @@ mod tunnel_connector {
 
     fn make_agent_req(agent: &str) -> rupu_cp::agent_launcher::AgentLaunchRequest {
         rupu_cp::agent_launcher::AgentLaunchRequest {
+            codename: None,
             agent: agent.to_string(),
             prompt: Some("do the thing".to_string()),
             mode: None,
@@ -1363,6 +1364,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     };
     store.create(rec, "").unwrap();
 
@@ -1428,6 +1430,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     };
     store.create(rec, "").unwrap();
 
@@ -1488,6 +1491,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     };
     store.create(rec, "").unwrap();
 

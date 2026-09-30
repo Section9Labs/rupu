@@ -40,6 +40,9 @@ async fn coverage_audit_cli_runs_on_populated_target() {
         run_id: "r".into(),
         model: "m".into(),
         surface: Surface::Workflow,
+        codename: None,
+        agent: None,
+        provider: None,
     };
     let touch = FileTouchEvent::Read {
         path: "src/auth/login.rs".into(),

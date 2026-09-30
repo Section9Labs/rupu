@@ -85,6 +85,7 @@ impl StepFactory for FakeFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -128,6 +129,7 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -146,19 +148,21 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
 
     // For a two-step linear workflow the expected sequence is:
     // RunStarted,
-    // StepStarted(alpha), StepWorking(alpha, transcript_path), StepCompleted(alpha),
-    // StepStarted(beta),  StepWorking(beta, transcript_path),  StepCompleted(beta),
+    // StepStarted(alpha), StepWorking(alpha, transcript_path), AgentStarted(alpha), StepCompleted(alpha),
+    // StepStarted(beta),  StepWorking(beta, transcript_path),  AgentStarted(beta),  StepCompleted(beta),
     // RunCompleted.
     // Each linear step emits a StepWorking carrying its (lazily-generated)
-    // transcript path so the live UI can tail the file while the step runs.
+    // transcript path so the live UI can tail the file while the step runs,
+    // then an AgentStarted announcing the agent instance (codename, agent,
+    // provider, model) the moment its opts are built.
     assert_eq!(
         events.len(),
-        8,
-        "expected 8 events for a two-step run, got {:?}",
+        10,
+        "expected 10 events for a two-step run, got {:?}",
         events.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>()
     );
 
-    // Verify ordering: StepStarted → StepWorking(path) → StepCompleted per step.
+    // Verify ordering: StepStarted → StepWorking(path) → AgentStarted → StepCompleted per step.
     assert!(matches!(events[1], Event::StepStarted { step_id: ref s, .. } if s == "alpha"));
     assert!(
         matches!(events[2], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "alpha"),
@@ -166,14 +170,20 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         events[2]
     );
     assert!(
-        matches!(events[3], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha")
-    );
-    assert!(matches!(events[4], Event::StepStarted { step_id: ref s, .. } if s == "beta"));
-    assert!(
-        matches!(events[5], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "beta")
+        matches!(events[3], Event::AgentStarted { step_id: ref s, .. } if s == "alpha"),
+        "alpha AgentStarted must follow StepWorking, got {:?}",
+        events[3]
     );
     assert!(
-        matches!(events[6], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta")
+        matches!(events[4], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha")
+    );
+    assert!(matches!(events[5], Event::StepStarted { step_id: ref s, .. } if s == "beta"));
+    assert!(
+        matches!(events[6], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "beta")
+    );
+    assert!(matches!(events[7], Event::AgentStarted { step_id: ref s, .. } if s == "beta"));
+    assert!(
+        matches!(events[8], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta")
     );
 }
 
@@ -217,6 +227,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -276,6 +287,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -330,6 +342,81 @@ steps:
     );
 }
 
+/// Panelists emit a high-severity finding (so a gate never clears); the
+/// fixer (`fixer-bot`) echoes its prompt.
+struct GatePanelFactory;
+#[async_trait::async_trait]
+impl StepFactory for GatePanelFactory {
+    async fn build_opts_for_step(
+        &self,
+        step_id: &str,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: std::path::PathBuf,
+        transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+    ) -> AgentRunOpts {
+        // Panelists emit a high-severity finding; fixer echoes the prompt.
+        let text = if agent_name == "fixer-bot" {
+            format!("fixed: {rendered_prompt}")
+        } else {
+            r#"{"findings":[{"severity":"high","title":"oops","body":"details"}]}"#.to_string()
+        };
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text,
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        AgentRunOpts {
+            seed_source: None,
+            agent_name: format!("ag-{agent_name}"),
+            agent_system_prompt: "panel".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: ToolContext::default(),
+            user_message: rendered_prompt,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: false,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: step_id.to_string(),
+            on_tool_call,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            pause: None,
+            codename: None,
+        }
+    }
+}
+
 #[tokio::test]
 async fn panel_gate_emits_panel_round_events() {
     // A panel with a gate that cannot clear (panelist always emits a `high`
@@ -345,78 +432,6 @@ async fn panel_gate_emits_panel_round_events() {
     impl EventSink for CollectSink2 {
         fn emit(&self, _run_id: &str, ev: &Event) {
             self.0.lock().unwrap().push(ev.clone());
-        }
-    }
-
-    struct GatePanelFactory;
-    #[async_trait::async_trait]
-    impl StepFactory for GatePanelFactory {
-        async fn build_opts_for_step(
-            &self,
-            step_id: &str,
-            agent_name: &str,
-            rendered_prompt: String,
-            run_id: String,
-            workspace_id: String,
-            workspace_path: std::path::PathBuf,
-            transcript_path: std::path::PathBuf,
-            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
-            // Panelists emit a high-severity finding; fixer echoes the prompt.
-            let text = if agent_name == "fixer-bot" {
-                format!("fixed: {rendered_prompt}")
-            } else {
-                r#"{"findings":[{"severity":"high","title":"oops","body":"details"}]}"#.to_string()
-            };
-            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
-                text,
-                stop: StopReason::EndTurn,
-                input_tokens: 1,
-                output_tokens: 1,
-            }]);
-            AgentRunOpts {
-                seed_source: None,
-                agent_name: format!("ag-{agent_name}"),
-                agent_system_prompt: "panel".into(),
-                agent_tools: None,
-                provider: Box::new(provider),
-                provider_name: "mock".into(),
-                model: "mock-1".into(),
-                run_id,
-                workspace_id,
-                workspace_path,
-                transcript_path,
-                max_turns: 5,
-                decider: Arc::new(BypassDecider),
-                tool_context: ToolContext::default(),
-                user_message: rendered_prompt,
-                initial_messages: Vec::new(),
-                turn_index_offset: 0,
-                mode_str: "bypass".into(),
-                no_stream: false,
-                suppress_stream_stdout: false,
-                mcp_registry: None,
-                effort: None,
-                context_window: None,
-                output_format: None,
-                output_schema: None,
-                anthropic_task_budget: None,
-                anthropic_context_management: None,
-                anthropic_speed: None,
-                parent_run_id: None,
-                depth: 0,
-                dispatchable_agents: None,
-                step_id: step_id.to_string(),
-                on_tool_call,
-                on_stream_event: None,
-                concerns: None,
-                max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
-                scope_name: None,
-                surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
-                pause: None,
-            }
         }
     }
 
@@ -456,6 +471,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -518,8 +534,257 @@ async fn no_event_sink_does_not_emit_any_events() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
+}
+
+#[tokio::test]
+async fn every_agent_instance_is_announced_with_codename_provider_and_model() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let sink: Arc<CollectSink> = Arc::new(CollectSink::default());
+    let wf = Workflow::parse(WF_TWO_STEPS).unwrap();
+    // `run_workflow` only honours `run_id_override` when a run store is
+    // attached (an in-memory run has an empty run id), so pin the crew
+    // (`jade-reef`) through a temp store.
+    let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_names".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(store.clone()),
+        workflow_yaml: Some(WF_TWO_STEPS.into()),
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: Some("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W".into()),
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+
+    let events = sink.events.lock().unwrap();
+    let started: Vec<(String, String, String, String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStarted {
+                step_id,
+                codename,
+                agent,
+                provider,
+                model,
+                ..
+            } => Some((
+                step_id.clone(),
+                codename.clone().unwrap(),
+                agent.clone(),
+                provider.clone().unwrap(),
+                model.clone().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec![
+            (
+                "alpha".into(),
+                "jade-reef/hedgehog".into(),
+                "ag".into(),
+                "mock".into(),
+                "mock-1".into()
+            ),
+            (
+                "beta".into(),
+                "jade-reef/heron".into(),
+                "ag".into(),
+                "mock".into(),
+                "mock-1".into()
+            ),
+        ]
+    );
+    let step_names: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::StepStarted { codename, .. } => codename.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(step_names, vec!["jade-reef/hedgehog", "jade-reef/heron"]);
+
+    // The crew is persisted on the run record, and each step result carries
+    // its instance codename.
+    let rec = store.load("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W").unwrap();
+    assert_eq!(rec.codename.as_deref(), Some("jade-reef"));
+    let in_memory: Vec<_> = res
+        .step_results
+        .iter()
+        .map(|r| (r.step_id.clone(), r.codename.clone()))
+        .collect();
+    let persisted: Vec<_> = store
+        .read_step_results("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W")
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.step_id, r.codename))
+        .collect();
+    let expected = vec![
+        ("alpha".to_string(), Some("jade-reef/hedgehog".to_string())),
+        ("beta".to_string(), Some("jade-reef/heron".to_string())),
+    ];
+    assert_eq!(in_memory, expected);
+    assert_eq!(persisted, expected);
+}
+
+/// Spec §3/§4.3: a def repeated in a panel is numbered by occurrence
+/// (`crew/<a>#1`, `crew/<a>#2`), a def appearing once is a singleton
+/// (`crew/<b>`), the gate's fixer is its own static slot, and every gate
+/// iteration re-runs the same slots under the same names.
+#[tokio::test]
+async fn panel_occurrences_and_fixer_slot_are_named() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let sink: Arc<CollectSink> = Arc::new(CollectSink::default());
+    let wf_yaml = r#"
+name: gate-panel-names
+steps:
+  - id: scan
+    panel:
+      subject: "check this"
+      panelists:
+        - reviewer-a
+        - reviewer-b
+        - reviewer-a
+      gate:
+        max_iterations: 2
+        until_no_findings_at_severity_or_above: high
+        fix_with: fixer-bot
+"#;
+    let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: Workflow::parse(wf_yaml).unwrap(),
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_panel_names".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(GatePanelFactory),
+        event: None,
+        run_store: Some(store.clone()),
+        workflow_yaml: Some(wf_yaml.into()),
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let crew = store.load(&res.run_id).unwrap().codename.expect("crew");
+
+    let events = sink.events.lock().unwrap();
+    let announced: Vec<(String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStarted {
+                step_id,
+                agent,
+                codename,
+                ..
+            } if step_id == "scan" => Some((agent.clone(), codename.clone().unwrap())),
+            _ => None,
+        })
+        .collect();
+    let names_of = |agent: &str| -> Vec<String> {
+        announced
+            .iter()
+            .filter(|(a, _)| a == agent)
+            .map(|(_, c)| c.clone())
+            .collect()
+    };
+    let role = |c: &str| -> String {
+        let parsed: rupu_codename::Codename = c.parse().unwrap();
+        assert_eq!(parsed.crew, crew, "{c}");
+        assert_eq!(parsed.segments.len(), 1, "{c}");
+        parsed.segments[0].role.clone()
+    };
+
+    let a = names_of("reviewer-a");
+    let b = names_of("reviewer-b");
+    let fixer = names_of("fixer-bot");
+    let role_a = role(&a[0]);
+    let role_b = role(&b[0]);
+    let role_f = role(&fixer[0]);
+    // Two rounds: each slot runs twice under the same name.
+    let mut a_sorted = a.clone();
+    a_sorted.sort();
+    assert_eq!(
+        a_sorted,
+        vec![
+            format!("{crew}/{role_a}#1"),
+            format!("{crew}/{role_a}#1"),
+            format!("{crew}/{role_a}#2"),
+            format!("{crew}/{role_a}#2"),
+        ]
+    );
+    assert_eq!(
+        b,
+        vec![format!("{crew}/{role_b}"); 2],
+        "singleton: no number"
+    );
+    assert!(
+        !fixer.is_empty(),
+        "the gate never clears, so the fixer runs"
+    );
+    assert!(
+        fixer.iter().all(|c| *c == format!("{crew}/{role_f}")),
+        "fixer is one static singleton slot across iterations: {fixer:?}"
+    );
+    assert!(
+        role_a != role_b && role_a != role_f && role_b != role_f,
+        "each slot gets its own role word: {role_a} {role_b} {role_f}"
+    );
+
+    // Persisted: panel items in panel order, fixer items named by the slot,
+    // and the panel step record itself unnamed (instances live on items).
+    let rec = &res.step_results[0];
+    assert_eq!(rec.codename, None);
+    let panel_items: Vec<_> = rec
+        .items
+        .iter()
+        .filter(|i| !i.is_fixer)
+        .map(|i| i.codename.clone().unwrap())
+        .collect();
+    assert_eq!(
+        panel_items,
+        vec![
+            format!("{crew}/{role_a}#1"),
+            format!("{crew}/{role_b}"),
+            format!("{crew}/{role_a}#2"),
+        ]
+    );
+    let fixer_items: Vec<_> = rec
+        .items
+        .iter()
+        .filter(|i| i.is_fixer)
+        .map(|i| i.codename.clone().unwrap())
+        .collect();
+    assert!(!fixer_items.is_empty(), "fixer runs are recorded");
+    assert!(
+        fixer_items.iter().all(|c| *c == format!("{crew}/{role_f}")),
+        "{fixer_items:?}"
+    );
 }

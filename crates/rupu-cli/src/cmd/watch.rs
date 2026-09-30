@@ -135,6 +135,15 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
 
 /// Replay a finished run by walking already-written step transcripts and
 /// printing events through the line-stream printer with a pace delay.
+/// Stored codename from `run.json`, else the legacy-derived one.
+fn load_run_record_codename(run_json: &std::path::Path, run_id: &str) -> String {
+    let stored = std::fs::read(run_json)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["codename"].as_str().map(str::to_string));
+    crate::output::codename::display_codename(stored.as_deref(), run_id, None)
+}
+
 fn replay_with_printer(
     workflow_name: &str,
     run_id: &str,
@@ -153,7 +162,8 @@ fn replay_with_printer(
     // Load run record for the header.
     let started_at = load_run_started_at(&run_json).unwrap_or_else(chrono::Utc::now);
     let mut printer = LineStreamPrinter::new();
-    printer.workflow_header(workflow_name, run_id, started_at);
+    let codename = load_run_record_codename(&run_json, run_id);
+    printer.workflow_header(workflow_name, Some(&codename), run_id, started_at);
 
     // Read step_results.jsonl to get ordered transcript paths.
     let Ok(bytes) = std::fs::read(&step_results_log) else {

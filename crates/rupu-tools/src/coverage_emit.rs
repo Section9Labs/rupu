@@ -15,6 +15,9 @@ pub fn attribution_from(ctx: &ToolContext) -> Attribution {
         run_id: ctx.run_id.clone().unwrap_or_default(),
         model: ctx.model.clone().unwrap_or_default(),
         surface: surface_for(ctx),
+        codename: ctx.codename.clone(),
+        agent: ctx.agent.clone(),
+        provider: ctx.provider.clone(),
     }
 }
 
@@ -120,5 +123,25 @@ mod mapped_touch_tests {
         let ctx = ToolContext::default(); // tool_mappings: None
         let input = serde_json::json!({ "path": "src/x.rs" });
         assert!(mapped_touch(&ctx, "cat_file", &input).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attribution_from_carries_agent_and_provider() {
+        let ctx = ToolContext {
+            run_id: Some("r".into()),
+            model: Some("m".into()),
+            agent: Some("rev".into()),
+            provider: Some("anthropic".into()),
+            ..ToolContext::default()
+        };
+        let a = attribution_from(&ctx);
+        assert_eq!(a.agent.as_deref(), Some("rev"));
+        assert_eq!(a.provider.as_deref(), Some("anthropic"));
+        assert_eq!(a.model, "m");
     }
 }

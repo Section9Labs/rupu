@@ -337,7 +337,12 @@ pub fn attach_and_print_with(
             .unwrap_or_else(|_| chrono::Utc::now())
     };
     if !opts.skip_header {
-        printer.workflow_header(workflow_name, run_id, started_at);
+        let stored = std::fs::read(&run_json)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["codename"].as_str().map(str::to_string));
+        let codename = super::codename::display_codename(stored.as_deref(), run_id, None);
+        printer.workflow_header(workflow_name, Some(&codename), run_id, started_at);
     }
     if let Some(record) = load_run_record(&run_json) {
         render_workflow_intro(printer, &record, opts.view_mode);
@@ -2974,7 +2979,13 @@ fn drain_step_results(
                 // Linear step — open a tailer if we have a transcript.
                 if rec.transcript_path.as_os_str().is_empty() || !rec.transcript_path.exists() {
                     // Header + immediate footer (nothing to stream).
-                    let spinner = printer.step_start(&rec.step_id, None, None, None);
+                    let rec_label = rec
+                        .codename
+                        .as_deref()
+                        .and_then(|c| c.parse::<rupu_codename::Codename>().ok())
+                        .map(|c| c.leaf());
+                    let spinner =
+                        printer.step_start(&rec.step_id, rec_label.as_deref(), None, None);
                     spinner.stop();
                     if rec.success {
                         printer.step_done(&rec.step_id, Duration::ZERO, 0);
@@ -2988,7 +2999,13 @@ fn drain_step_results(
                 }
                 opened.insert(rec.transcript_path.clone());
                 let tailer = TranscriptTailer::new(&rec.transcript_path);
-                let spinner = printer.step_start(&rec.step_id, None, None, None);
+                let rec_label = rec
+                        .codename
+                        .as_deref()
+                        .and_then(|c| c.parse::<rupu_codename::Codename>().ok())
+                        .map(|c| c.leaf());
+                    let spinner =
+                        printer.step_start(&rec.step_id, rec_label.as_deref(), None, None);
                 steps.push(StepState {
                     tailer,
                     run_id: rec.run_id.clone(),
@@ -3147,9 +3164,13 @@ fn render_child_item(
     // The headline replaces the agent slot in step_start so it shows
     // as the bold opener line. Provider + model still show in the
     // dim meta tail when present.
+    let labelled_headline = match item.codename.as_deref() {
+        Some(c) => super::codename::member_label(Some(c), &headline, None, None),
+        None => headline.clone(),
+    };
     let spinner = printer.step_start(
         &item.sub_id,
-        Some(&headline),
+        Some(&labelled_headline),
         non_empty(&provider),
         non_empty(&model),
     );
@@ -4009,6 +4030,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 
@@ -4337,6 +4359,7 @@ mod tests {
                     mode: rupu_transcript::RunMode::Readonly,
                     schema: None,
                     system_prompt: None,
+                    codename: None,
                 },
                 TxEvent::AssistantMessage {
                     content: "Summarized the implementation plan.".into(),
@@ -4368,6 +4391,7 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            codename: None,
         };
         std::fs::write(
             &step_results,
@@ -4695,6 +4719,7 @@ mod tests {
                 mode: rupu_transcript::RunMode::Readonly,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Child output\n\n- item one\n- item two".into(),
@@ -4735,6 +4760,7 @@ mod tests {
                 output: String::new(),
                 success: true,
                 is_fixer: false,
+                codename: None,
             }],
             findings: Vec::new(),
             iterations: 0,
@@ -4742,6 +4768,7 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            codename: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),
@@ -4825,6 +4852,7 @@ mod tests {
                 mode: rupu_transcript::RunMode::Readonly,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Reviewer output\n\n- looks good".into(),

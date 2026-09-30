@@ -11,8 +11,10 @@ import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
-import { PANEL_W, PANEL_H } from '../../lib/nodeSize';
+import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
+import { memberLabel } from '../../lib/codename';
+import { AgentIdentity } from '../codename/AgentIdentity';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -41,6 +43,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   // Panelist/fixer runs surface as fanout units (folded by step_id). Each is a
   // clickable chip that selects its transcript.
   const units = node.fanout?.units ?? [];
+  const box = nodeSize(node);
 
   return (
     <div
@@ -49,8 +52,8 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
       style={{
         borderColor: colors.alpha(accentKey, 0.4),
         background: colors.alpha(accentKey, 0.08),
-        width: PANEL_W,
-        minHeight: PANEL_H,
+        width: box.width,
+        minHeight: box.height,
       }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
@@ -100,23 +103,35 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
         </span>
       </div>
 
-      {/* panelist / fixer chips — each selects its transcript on click */}
+      {/* panelist / fixer rows — each selects its transcript on click. One
+          row per unit (PANEL_UNIT_ROW_H) so the identity's provider/model
+          line isn't clipped the way an 88px chip clipped it. */}
       {units.length > 0 && (
-        <div className="mt-1.5 flex flex-wrap gap-1">
+        <div className="mt-1.5 flex flex-col gap-1">
           {units.map((u) => (
             <button
               key={u.index}
               type="button"
-              title={`${u.key} · ${stateStyle(colors, u.state).label}`}
+              title={`${u.codename ? memberLabel(u.codename, u.agent, u.provider, u.model) : u.key} · ${stateStyle(colors, u.state).label}`}
               onClick={() => onOpenUnit?.(node.id, u.index)}
-              className="inline-flex items-center gap-1 rounded bg-panel/80 px-1.5 py-px text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
+              className="flex w-full min-w-0 items-start gap-1 rounded bg-panel/80 px-1.5 py-0.5 text-left text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
             >
               <span
-                className="inline-block h-2 w-2 shrink-0 rounded-[2px]"
+                className="mt-[3px] inline-block h-2 w-2 shrink-0 rounded-[2px]"
                 style={{ background: glyphBg(colors, u.state) }}
                 aria-hidden
               />
-              <span className="max-w-[88px] truncate">{u.key}</span>
+              {u.codename || u.agent ? (
+                <AgentIdentity
+                  className="flex-1"
+                  codename={u.codename}
+                  agent={u.agent}
+                  provider={u.provider}
+                  model={u.model}
+                />
+              ) : (
+                <span className="min-w-0 truncate">{u.key}</span>
+              )}
             </button>
           ))}
         </div>

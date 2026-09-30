@@ -347,6 +347,10 @@ struct SessionRecord {
     version: u32,
     session_id: String,
     agent_name: String,
+    /// `crew/role` — one identity across every turn (spec §3). `None` for
+    /// sessions created before codenames; readers use `derive_legacy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codename: Option<String>,
     #[serde(default)]
     description: Option<String>,
     provider_name: String,
@@ -463,6 +467,8 @@ impl SessionRecord {
 #[derive(Serialize)]
 struct SessionListRow {
     session_id: String,
+    /// Codename (stored, else derived for legacy sessions).
+    codename: String,
     agent: String,
     scope: String,
     status: String,
@@ -480,6 +486,7 @@ struct SessionListCsvRow {
     target: String,
     active_run_id: String,
     updated_at: String,
+    codename: String,
 }
 
 #[derive(Serialize)]
@@ -613,6 +620,7 @@ impl CollectionOutput for SessionListOutput {
             "target",
             "active_run_id",
             "updated_at",
+            "codename",
         ])
     }
 
@@ -639,7 +647,7 @@ fn render_session_list_table(
         prefs,
         prefs.render_opts(),
         vec![
-            "SESSION", "AGENT", "SCOPE", "STATUS", "TARGET", "RUN", "UPDATED",
+            "SESSION", "NAME", "AGENT", "SCOPE", "STATUS", "TARGET", "RUN", "UPDATED",
         ],
     )
     .with_summary("session");
@@ -653,6 +661,7 @@ fn render_session_list_table(
         };
         table = table.row(vec![
             CellValue::Id(row.session_id.clone()),
+            CellValue::Name(row.codename.clone()),
             CellValue::Text(row.agent.clone()),
             CellValue::Status(row.scope.clone()),
             CellValue::Status(row.status.clone()),
@@ -1187,6 +1196,11 @@ async fn list(
             }
             rows.push(SessionListRow {
                 session_id: session.session_id.clone(),
+                codename: crate::output::codename::display_codename(
+                    session.codename.as_deref(),
+                    &session.session_id,
+                    Some(&session.agent_name),
+                ),
                 agent: session.agent_name.clone(),
                 scope: scope.as_str().to_string(),
                 status: session.status.as_str().to_string(),
@@ -1201,6 +1215,7 @@ async fn list(
         .iter()
         .map(|row| SessionListCsvRow {
             session_id: row.session_id.clone(),
+            codename: row.codename.clone(),
             agent: row.agent.clone(),
             scope: row.scope.clone(),
             status: row.status.clone(),
@@ -1556,6 +1571,11 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         version: SessionRecord::VERSION,
         session_id: session_id.clone(),
         agent_name: spec.name.clone(),
+        codename: Some(
+            rupu_codename::Codename::crew_only(rupu_codename::crew_for(&session_id))
+                .child(rupu_codename::role_word(&spec.name), None)
+                .to_string(),
+        ),
         description: spec.description.clone(),
         provider_name,
         auth_mode: spec.auth,
@@ -6273,7 +6293,12 @@ fn render_session_attach_intro(
     printer: &mut crate::output::LineStreamPrinter,
     session: &SessionRecord,
 ) {
-    printer.session_header(&session.session_id, &session.agent_name);
+    let codename = crate::output::codename::display_codename(
+        session.codename.as_deref(),
+        &session.session_id,
+        Some(&session.agent_name),
+    );
+    printer.session_header(&session.session_id, &session.agent_name, Some(&codename));
     printer.sideband_event(
         session_attach_status(session.status),
         "session",
@@ -7125,6 +7150,7 @@ async fn run_compact_request(
         // TODO(Task 2, transcript fidelity plan 1): schema/system_prompt.
         schema: None,
         system_prompt: None,
+        codename: None,
     })?;
     writer.flush()?;
 
@@ -7474,6 +7500,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             &metadata,
         )?;
 
+        let codename = session.codename.clone().unwrap_or_else(|| {
+            rupu_codename::derive_legacy(&session.session_id, Some(&session.agent_name))
+        });
         let tool_context = ToolContext {
             workspace_path: session.workspace_path.clone(),
             bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
@@ -7487,6 +7516,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             run_id: None,
             model: None,
             tool_mappings: None,
+            codename: Some(codename.clone()),
+            agent: None,
+            provider: None,
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
@@ -7583,6 +7615,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             surface_tag: Some("session".to_string()),
             pause: None,
             seed_source,
+            codename: Some(codename.clone()),
         };
 
         let outcome = rupu_agent::run_agent(opts).await;
@@ -8027,6 +8060,34 @@ fn resolve_session_fragment(
         }
     }
 
+    // Codename (`crew` or `crew/role`) → the most recent session of that crew.
+    if fragment.parse::<rupu_codename::Codename>().is_ok() {
+        let mut crews = Vec::new();
+        for scope in [SessionScope::Active, SessionScope::Archived] {
+            for rec in load_sessions_in_scope(global, scope).unwrap_or_default() {
+                let shown = crate::output::codename::display_codename(
+                    rec.codename.as_deref(),
+                    &rec.session_id,
+                    Some(&rec.agent_name),
+                );
+                let crew = shown
+                    .parse::<rupu_codename::Codename>()
+                    .map(|c| c.crew)
+                    .unwrap_or_else(|_| shown.split('/').next().unwrap_or("").to_string());
+                crews.push(crate::output::codename::CrewCandidate {
+                    id: rec.session_id,
+                    crew,
+                    started_at: rec.created_at,
+                });
+            }
+        }
+        if let Some(id) = crate::output::codename::resolve_codename_fragment(&crews, fragment) {
+            if let Some(scope) = scope_of.get(&id).copied() {
+                return Ok((id, scope));
+            }
+        }
+    }
+
     match resolve(&candidates, fragment) {
         Resolution::Unique(id) => {
             let scope = scope_of
@@ -8328,6 +8389,7 @@ mod tests {
                 mode: RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             })
             .unwrap(),
         );
@@ -8433,6 +8495,9 @@ mod tests {
                 run_id: "r".into(),
                 model: "m".into(),
                 surface: Surface::Workflow,
+                codename: None,
+                agent: None,
+                provider: None,
             },
             at: Utc::now(),
         };
@@ -9740,11 +9805,20 @@ mod tests {
         assert!(plain.iter().any(|row| row.starts_with("│ streaming chunk")));
     }
 
+    #[test]
+    fn legacy_session_record_loads_without_codename() {
+        let mut v = serde_json::to_value(test_session_record()).unwrap();
+        v.as_object_mut().unwrap().remove("codename");
+        let rec: SessionRecord = serde_json::from_value(v).unwrap();
+        assert!(rec.codename.is_none());
+    }
+
     fn test_session_record() -> SessionRecord {
         SessionRecord {
             version: SessionRecord::VERSION,
             session_id: "ses_test01".into(),
             agent_name: "issue-reader".into(),
+            codename: None,
             description: Some("Persistent issue reader".into()),
             provider_name: "anthropic".into(),
             auth_mode: None,
@@ -10570,6 +10644,29 @@ mod tests {
     }
 
     #[test]
+    fn read_session_resolves_a_crew_codename_to_the_most_recent() {
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let global = tmp.path();
+        for (id, days) in [("ses_old", 5), ("ses_new", 1)] {
+            let mut record = test_session_record();
+            record.session_id = id.to_string();
+            record.codename = Some("jade-reef/numbat".into());
+            record.created_at = chrono::Utc::now() - chrono::Duration::days(days);
+            let dir = session_dir(global, SessionScope::Active, id);
+            std::fs::create_dir_all(&dir).expect("create session dir");
+            std::fs::write(
+                dir.join("session.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .expect("write");
+        }
+        let (rec, _) = read_session(global, "jade-reef").expect("resolves");
+        assert_eq!(rec.session_id, "ses_new");
+        let (rec, _) = read_session(global, "jade-reef/numbat").expect("resolves");
+        assert_eq!(rec.session_id, "ses_new");
+    }
+
+    #[test]
     fn read_session_resolves_a_compact_fragment() {
         let tmp = assert_fs::TempDir::new().expect("tempdir");
         let global = tmp.path();
@@ -10655,6 +10752,7 @@ mod tests {
     ) -> SessionListRow {
         SessionListRow {
             session_id: session_id.to_string(),
+            codename: "cobalt-harbor/heron".to_string(),
             agent: agent.to_string(),
             scope: scope.to_string(),
             status: status.to_string(),

@@ -10,7 +10,7 @@
 // ---------------------------------------------------------------------------
 
 export type TranscriptEvent =
-  | { type: 'run_start'; data: { run_id: string; workspace_id?: string; agent: string; provider: string; model: string; started_at: string; mode: string } }
+  | { type: 'run_start'; data: { run_id: string; workspace_id?: string; agent: string; provider: string; model: string; started_at: string; mode: string; codename?: string } }
   | { type: 'turn_start'; data: Record<string, unknown> }
   | { type: 'assistant_delta'; data: { content: string } }
   | { type: 'assistant_message'; data: { content: string; thinking?: string | null } }
@@ -47,6 +47,7 @@ export interface TranscriptSummary {
   duration_ms: number;
   started_at: string;
   error?: string | null;
+  codename?: string;
 }
 
 export interface TranscriptResponse {

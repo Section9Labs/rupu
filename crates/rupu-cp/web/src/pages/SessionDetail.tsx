@@ -16,6 +16,8 @@ import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
 import { isSessionActive, pollIntervalFor } from '../lib/sessionPoll';
 import UsageChip from '../components/UsageChip';
+import { AgentName } from '../components/codename/AgentName';
+import { memberLabel } from '../lib/codename';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
@@ -219,11 +221,20 @@ export default function SessionDetailPage() {
           <h1 className="font-mono text-base font-semibold text-ink break-all">
             {session.session_id}
           </h1>
-          <span className="text-ui text-ink-dim">
-            <span className="font-mono">{session.agent_name}</span>
-            <span className="mx-1 text-border">·</span>
-            <span className="font-mono">{session.model}</span>
-          </span>
+          {session.codename ? (
+            <AgentName
+              codename={session.codename}
+              agent={session.agent_name}
+              provider={session.provider_name}
+              model={session.model}
+              showCrew
+              derived={session.codename_derived}
+            />
+          ) : (
+            <span className="font-mono text-ui text-ink-dim">
+              {memberLabel(undefined, session.agent_name, session.provider_name, session.model)}
+            </span>
+          )}
           <span className="inline-flex items-center gap-1.5">
             <span
               className={cn('inline-block h-2 w-2 rounded-full', sessionStatusDot(session.status))}
