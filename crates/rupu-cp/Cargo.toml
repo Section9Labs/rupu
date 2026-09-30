@@ -35,6 +35,7 @@ mime_guess.workspace = true
 toml.workspace = true
 toml_edit = { workspace = true }
 fs2 = { workspace = true }
+rustix.workspace = true
 
 # In-workspace
 rupu-orchestrator = { path = "../rupu-orchestrator" }
