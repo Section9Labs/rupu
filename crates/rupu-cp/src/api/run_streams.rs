@@ -142,6 +142,11 @@ struct SessionForRunsDto {
     /// Stored session codename; absent on legacy sessions (derived on read).
     #[serde(default)]
     codename: Option<String>,
+    /// Provider + model the session's turns run on (`session.json`).
+    #[serde(default)]
+    provider_name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     runs: Vec<SessionRunRecordDto>,
 }
@@ -166,6 +171,12 @@ struct AgentRunRow {
     /// session's), or derived for a legacy record (`codename_derived`).
     codename: String,
     codename_derived: bool,
+    /// Provider + model the run used (standalone: `RunStart`; session turn:
+    /// the session's). `None` when neither source could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 /// One actionable autoflow *event* — a single launched run or awaiting/failed
@@ -236,26 +247,38 @@ fn stringify_status(v: &serde_json::Value) -> Option<String> {
 /// merge them with a plain LEXICOGRAPHIC string compare. `'+'` (0x2B) sorts
 /// before `'Z'` (0x5A), so a `+00:00`-suffixed row silently sorts as older
 /// than it is. Do not "tidy" this back into `.to_rfc3339()`.
-fn read_transcript_run_start(
-    path: &std::path::Path,
-) -> (Option<String>, Option<String>, Option<String>) {
+fn read_transcript_run_start(path: &std::path::Path) -> TranscriptRunStart {
     let mut iter = match rupu_transcript::JsonlReader::iter(path) {
         Ok(it) => it,
-        Err(_) => return (None, None, None),
+        Err(_) => return TranscriptRunStart::default(),
     };
     match iter.next() {
         Some(Ok(rupu_transcript::Event::RunStart {
             agent,
+            provider,
+            model,
             started_at,
             codename,
             ..
-        })) => (
-            Some(agent),
-            Some(started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        })) => TranscriptRunStart {
+            agent: Some(agent),
+            started_at: Some(started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
             codename,
-        ),
-        _ => (None, None, None),
+            provider: Some(provider).filter(|p| !p.is_empty()),
+            model: Some(model).filter(|m| !m.is_empty()),
+        },
+        _ => TranscriptRunStart::default(),
     }
+}
+
+/// What `read_transcript_run_start` recovers from a transcript's first line.
+#[derive(Default)]
+struct TranscriptRunStart {
+    agent: Option<String>,
+    started_at: Option<String>,
+    codename: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
 }
 
 /// Resolve `session_id`'s `agent_name` by loading its `session.json` from
@@ -356,9 +379,15 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
 
         // The standalone meta.json genuinely has no `agent`/`started_at`
         // fields — recover them from the transcript's first line.
-        let (mut agent, started_at, stored_codename) = match &transcript_path {
+        let TranscriptRunStart {
+            mut agent,
+            started_at,
+            codename: stored_codename,
+            provider,
+            model,
+        } = match &transcript_path {
             Some(tp) => read_transcript_run_start(std::path::Path::new(tp)),
-            None => (None, None, None),
+            None => TranscriptRunStart::default(),
         };
 
         // For session-turn runs whose transcript didn't yield an agent
@@ -388,6 +417,8 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
                 turns: 0,
                 duration_ms: None,
                 host_id: None,
+                provider,
+                model,
             },
             dto.pid,
         ));
@@ -508,6 +539,8 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                     turns: 0,
                     duration_ms: None,
                     host_id: None,
+                    provider: dto.provider_name.clone().filter(|p| !p.is_empty()),
+                    model: dto.model.clone().filter(|m| !m.is_empty()),
                 });
             }
         }
@@ -624,6 +657,10 @@ fn merge_agent_run_rows(a: AgentRunRow, b: AgentRunRow) -> AgentRunRow {
         // session turn; a plain merge collision keeps the session side too.
         codename: session.codename,
         codename_derived: session.codename_derived,
+        // Standalone's comes from the turn's own `RunStart` — the provider /
+        // model that actually served it — so it wins over the session's.
+        provider: standalone.provider.or(session.provider),
+        model: standalone.model.or(session.model),
     }
 }
 
@@ -1265,6 +1302,8 @@ mod tests {
                 host_id: Some("local".into()),
                 codename: "cobalt-harbor/heron".into(),
                 codename_derived: false,
+                provider: Some("anthropic".into()),
+                model: Some("claude-sonnet-4-6".into()),
             },
             AgentRunRow {
                 run_id: "run-11".into(),
@@ -1281,6 +1320,8 @@ mod tests {
                 host_id: None,
                 codename: "jade-reef".into(),
                 codename_derived: true,
+                provider: None,
+                model: None,
             },
         ];
         check_fixture("agent_run_rows.json", &rows);
@@ -1738,6 +1779,38 @@ mod tests {
     }
 
     #[test]
+    fn standalone_row_carries_run_start_provider_and_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_pm", None, None);
+        write_transcript_run_start(tmp.path(), "run_pm", "triage", "2026-01-01T00:00:00Z");
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(rows[0].model.as_deref(), Some("claude"));
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(v["provider"], "anthropic");
+        assert_eq!(v["model"], "claude");
+    }
+
+    #[test]
+    fn session_row_carries_session_provider_and_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions").join("ses_pm");
+        fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "agent_name": "session-agent",
+            "session_id": "ses_pm",
+            "provider_name": "openai",
+            "model": "gpt-5",
+            "runs": [{ "run_id": "run_s", "started_at": "2026-03-01T10:05:00Z" }],
+        });
+        fs::write(dir.join("session.json"), session.to_string()).unwrap();
+        let mut out = Vec::new();
+        collect_session_runs_from_dir(&tmp.path().join("sessions"), &mut out);
+        assert_eq!(out[0].provider.as_deref(), Some("openai"));
+        assert_eq!(out[0].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
     fn session_row_codename_stored_else_derived() {
         let tmp = tempfile::tempdir().unwrap();
         write_session_json_with_run(
@@ -2046,6 +2119,8 @@ mod tests {
                 host_id: None,
                 codename: format!("{source}-name"),
                 codename_derived: false,
+                provider: None,
+                model: None,
             }
         }
 

@@ -33,6 +33,7 @@ import { Spinner } from '../../components/ui/Spinner';
 import { Badge } from '../../components/ui/Badge';
 import { StatusPill } from '../../components/StatusPill';
 import { AgentName } from '../../components/codename/AgentName';
+import { memberLabel } from '../../lib/codename';
 import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { cn } from '../../lib/cn';
 import { shortId } from '../../lib/shortId';
@@ -450,7 +451,20 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     render: (r) => (
       <div className="min-w-0">
         <span className="block truncate text-sm font-medium text-ink">
-          <AgentName codename={r.codename} agent={r.agent ?? undefined} showCrew derived={r.codename_derived} />
+          {r.codename ? (
+            <AgentName
+              codename={r.codename}
+              agent={r.agent ?? undefined}
+              provider={r.provider ?? undefined}
+              model={r.model ?? undefined}
+              showCrew
+              derived={r.codename_derived}
+            />
+          ) : (
+            <span className="font-mono">
+              {memberLabel(undefined, r.agent ?? undefined, r.provider ?? undefined, r.model ?? undefined) || '—'}
+            </span>
+          )}
         </span>
         {(r.trigger_source || r.session_id) && (
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">

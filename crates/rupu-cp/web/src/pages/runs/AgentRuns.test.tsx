@@ -250,9 +250,9 @@ describe('AgentRuns — agent subject cell', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     const name = await screen.findByText(/review-pr/);
-    // AgentName's inner span carries the full codename tooltip; the
+    // AgentName's inner span carries the full identity tooltip; the
     // subject wrapper still truncates.
-    expect(name.parentElement).toHaveAttribute('title', 'cobalt-harbor/heron#1');
+    expect(name.parentElement).toHaveAttribute('title', 'cobalt-harbor/heron#1 · review-pr');
     expect(name.closest('[class*="truncate"]')).not.toBeNull();
   });
 
@@ -625,5 +625,27 @@ describe('AgentRuns — codenames', () => {
     fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'cobalt' } });
     await waitFor(() => expect(screen.queryByText('amber-fjord')).not.toBeInTheDocument());
     expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
+  });
+
+  it('shows the run provider/model next to the agent name', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([
+      { ...SESSION_ROW, provider: 'anthropic', model: 'claude-sonnet-4-6' },
+    ]);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    expect(
+      await screen.findByText('heron#1 · review-pr · anthropic/claude-sonnet-4-6'),
+    ).toBeInTheDocument();
+  });
+
+  it('a row with no codename still names its agent + provider/model', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([
+      { ...SESSION_ROW, codename: '', provider: 'openai', model: 'gpt-5' },
+    ]);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    expect(await screen.findByText('review-pr · openai/gpt-5')).toBeInTheDocument();
   });
 });

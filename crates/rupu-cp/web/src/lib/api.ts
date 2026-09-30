@@ -613,6 +613,10 @@ export interface AgentRunRow {
   run_id: string;
   source: 'standalone' | 'session';
   agent?: string | null;
+  /** Provider / model the run used (standalone: its transcript's run_start;
+   *  session turn: the session's). Absent when unknown or on older servers. */
+  provider?: string | null;
+  model?: string | null;
   session_id?: string | null;
   trigger_source?: string | null;
   status?: string | null;

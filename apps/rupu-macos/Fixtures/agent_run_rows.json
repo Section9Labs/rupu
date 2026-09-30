@@ -21,7 +21,9 @@
     "duration_ms": 12500,
     "host_id": "local",
     "codename": "cobalt-harbor/heron",
-    "codename_derived": false
+    "codename_derived": false,
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6"
   },
   {
     "run_id": "run-11",
