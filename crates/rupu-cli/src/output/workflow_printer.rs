@@ -273,6 +273,13 @@ pub struct AttachOpts {
     pub live_event_hook: Option<LiveWorkflowEventHook>,
     /// Control live output density for workflow body rendering.
     pub view_mode: LiveViewMode,
+    /// When `true`, do NOT print the terse `✓ <workflow> complete …` line on
+    /// successful completion: the caller prints the shared completion summary
+    /// (`output::run_summary`) right after the attach returns, which supersedes
+    /// it. The failure line is deliberately still printed — it carries the
+    /// run's `error:` text, which the summary does not. Default `false`
+    /// preserves the terse line for `rupu watch` and shared-printer callers.
+    pub suppress_done_line: bool,
 }
 
 /// Drive `printer` from a live or recently-finished workflow run.
@@ -498,13 +505,15 @@ pub fn attach_and_print_with(
                 );
                 flush_all_tailers(&mut steps, printer, &mut total_tokens, opts.view_mode);
 
-                let duration_ms = record
-                    .finished_at
-                    .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
-                    .unwrap_or(0);
-                let dur = Duration::from_millis(duration_ms);
                 printer.stop_ticker();
-                printer.workflow_done(workflow_name, run_id, dur, total_tokens);
+                if !opts.suppress_done_line {
+                    let duration_ms = record
+                        .finished_at
+                        .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
+                        .unwrap_or(0);
+                    let dur = Duration::from_millis(duration_ms);
+                    printer.workflow_done(workflow_name, run_id, dur, total_tokens);
+                }
                 return Ok(AttachOutcome::Done);
             }
             rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
@@ -714,16 +723,18 @@ pub fn attach_and_render_interactive_with(
         match final_outcome {
             AttachOutcome::Done => match record.status {
                 rupu_orchestrator::RunStatus::Completed => {
-                    let duration_ms = record
-                        .finished_at
-                        .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
-                        .unwrap_or(0);
-                    printer.workflow_done(
-                        workflow_name,
-                        run_id,
-                        Duration::from_millis(duration_ms),
-                        final_tokens,
-                    );
+                    if !opts.suppress_done_line {
+                        let duration_ms = record
+                            .finished_at
+                            .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
+                            .unwrap_or(0);
+                        printer.workflow_done(
+                            workflow_name,
+                            run_id,
+                            Duration::from_millis(duration_ms),
+                            final_tokens,
+                        );
+                    }
                 }
                 rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
                     printer.workflow_failed(

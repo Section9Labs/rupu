@@ -1689,8 +1689,8 @@ fn handle_live_run_keypress(
 /// to the viewport by [`render_view`], homes the cursor and clears, then
 /// repaints. No `MoveToPreviousLine`/`prev_lines` bookkeeping — the frame
 /// can never overflow or wrap, so it can never stack. The guard restores
-/// the normal screen on every exit path; a short final summary line is
-/// printed to the restored screen.
+/// the normal screen on every exit path. No summary is printed here: the
+/// caller prints the shared completion summary once the screen is restored.
 ///
 /// Best-effort: any I/O hiccup degrades to the next tick. The caller
 /// guards entry behind a tty check; non-tty falls back to the existing
@@ -1847,7 +1847,9 @@ pub async fn run_live_view(
     }
 
     // Render one final frame reflecting the terminal state, then drop the
-    // guard to restore the normal screen and print a short summary there.
+    // guard to restore the normal screen. The caller prints the shared
+    // completion summary there (see `cmd::workflow`), so this view emits no
+    // trailing line of its own.
     let now = Utc::now();
     let (cols, rows) = terminal::size().unwrap_or((100, 30));
     let frame = render_view(&state, &workflow, now, cols as usize, rows as usize);
@@ -1858,10 +1860,6 @@ pub async fn run_live_view(
     let _ = stdout.flush();
 
     drop(_screen);
-
-    let (label, _) = state.status_label();
-    let _ = writeln!(stdout, "{label} · run {run_id}");
-    let _ = stdout.flush();
     Ok(())
 }
 
