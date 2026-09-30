@@ -213,6 +213,8 @@ pub enum WorkflowParseError {
         "step `{step}`: `findings_profile` has no effect on a step that runs no agent; remove it"
     )]
     FindingsProfileOnNonAgentStep { step: String },
+    #[error("step `{step}`: `findings_profile` only applies to `action: findings.record` (this step calls `{tool}`); remove it")]
+    FindingsProfileOnNonFindingsAction { step: String, tool: String },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -1878,10 +1880,20 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
     }
 
     if step.findings_profile.is_some() {
+        // An `action:` step runs no agent, so the profile only means
+        // something when the tool is `findings.record`, where it decides what
+        // the call accepts (see `Workflow::action_findings_profile`). On any
+        // other tool it would parse and silently do nothing.
+        if let Some(tool) = step.action.as_deref() {
+            if tool != "findings.record" {
+                return Err(WorkflowParseError::FindingsProfileOnNonFindingsAction {
+                    step: step.id.clone(),
+                    tool: tool.to_string(),
+                });
+            }
+        }
         // A step that runs no agent has no findings contract to configure.
-        // (An `action:` step is the exception: it runs no agent, but the
-        // profile decides what `findings.record` accepts, so it is allowed
-        // there — see `Workflow::action_findings_profile`.)
+        // (An `action: findings.record` step is the exception, handled above.)
         // Branch / standalone gate / `run:` / bare `split`/`join` nodes are
         // classified with the same predicates the shape validation above
         // uses. (A `loop:<name>` supernode is synthesized at run time and
@@ -3419,6 +3431,37 @@ steps:
             WorkflowParseError::FindingsProfileOnNonAgentStep { step } => assert_eq!(step, "g"),
             other => panic!("expected FindingsProfileOnNonAgentStep, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn findings_profile_on_a_non_findings_action_step_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: c\n    action: issues.comment\n    with: { project: o/r, number: 1, body: hi }\n    findings_profile: summary\n";
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::FindingsProfileOnNonFindingsAction { step, tool } => {
+                assert_eq!(step, "c");
+                assert_eq!(tool, "issues.comment");
+            }
+            other => panic!("expected FindingsProfileOnNonFindingsAction, got {other:?}"),
+        }
+        // Same rule inside a gate's on_reject cleanup chain.
+        let on_reject = "name: w\nsteps:\n  - id: gate\n    approval:\n      required: true\n      on_reject:\n        - id: cleanup\n          action: issues.comment\n          with: { project: o/r, number: 1, body: hi }\n          findings_profile: summary\n";
+        match Workflow::parse(on_reject).unwrap_err() {
+            WorkflowParseError::FindingsProfileOnNonFindingsAction { step, .. } => {
+                assert_eq!(step, "cleanup");
+            }
+            other => panic!("expected FindingsProfileOnNonFindingsAction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findings_profile_on_a_findings_record_action_step_stays_legal() {
+        let raw = format!(
+            "name: w\nsteps:\n  - id: a\n    action: findings.record\n    with: {SUMMARY_WITH}\n    findings_profile: summary\n"
+        );
+        Workflow::parse(&raw).expect("findings.record may carry findings_profile");
+        // A non-findings action without the field is unaffected.
+        let plain = "name: w\nsteps:\n  - id: c\n    action: issues.comment\n    with: { project: o/r, number: 1, body: hi }\n";
+        Workflow::parse(plain).expect("no findings_profile, no complaint");
     }
 
     #[test]

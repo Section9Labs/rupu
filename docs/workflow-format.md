@@ -310,7 +310,7 @@ Common fields:
 | `max_parallel` | integer | `for_each`, `parallel`, `panel` | Concurrency cap, must be at least 1 |
 | `approval` | object | all steps | Human pause before the step dispatches |
 | `contract` | object | linear steps | Optional documentation for a structured step output |
-| `findings_profile` | `full` \| `summary` | agent steps (`step`/`for_each`/`parallel`/`panel`) | Findings contract for this step — see below |
+| `findings_profile` | `full` \| `summary` | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Findings contract for this step — see below |
 
 ### `actions`
 
@@ -384,7 +384,8 @@ Rules:
 - The field must never be silently ignored, so these are parse errors:
   - `findings_profile` on a remote step (`host:` / `distribute:`) — remote units resolve their profile from the agent file, so set `findingsProfile` in that agent's frontmatter instead (upgrade rupu on the remote host first: an older release rejects agent files that contain `findingsProfile`, because agent frontmatter does not accept unknown keys);
   - `defaults.findings_profile` in a workflow that has any remote step, for the same reason;
-  - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`). An `action:` step is the exception above: its profile decides what `findings.record` accepts.
+  - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`);
+  - `findings_profile` on an `action:` step that calls any tool other than `findings.record` (e.g. `action: issues.comment`) — only `findings.record` has a findings contract for the profile to configure.
 
 > **Upgrading:** the built-in profile is `full`, so an existing `action: findings.record` step that sends `summary` / `severity` / `rationale` now fails to parse. Add `findings_profile: summary` to that step (or `defaults.findings_profile: summary` to the workflow), or change its `with:` to send a `report`.
 
@@ -1322,7 +1323,7 @@ Common parse-time failures:
 - invalid input defaults or enum defaults
 - extraneous fields inside `trigger:`
 - an `action:` naming an unknown tool, or `with:` failing the tool's schema
-- a `findings_profile:` on an `action:`, remote, or agent-less step, or `defaults.findings_profile` alongside a remote step
+- a `findings_profile:` on a remote step, on an agent-less step, or on an `action:` step other than `findings.record`, or `defaults.findings_profile` alongside a remote step
 - a `branch:` target that doesn't exist, isn't forward, or appears in both arms
 - a `join:` with no inbound edges, or a `wait: { count: N }` exceeding its inbound path count
 - a cycle anywhere in the workflow's dependency graph
