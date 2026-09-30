@@ -267,11 +267,16 @@ impl RunView {
                 });
                 u.unit_key = unit_key.clone();
                 u.status = UnitStatus::Running;
-                if u.codename.is_none() {
-                    u.codename = codename.clone();
-                }
-                if u.host.is_none() {
+                // The runner re-emits `UnitStarted` for the same (step, index)
+                // when a unit is retried onto a fallback host, carrying the new
+                // host/codename. Overwrite (latest wins) rather than back-fill,
+                // so a retried unit doesn't keep the stale primary host. A
+                // re-emit that carries no value leaves the known one intact.
+                if host.is_some() {
                     u.host = host.clone();
+                }
+                if codename.is_some() {
+                    u.codename = codename.clone();
                 }
             }
             // `tokens_in`/`tokens_out` are deliberately ignored: they are
@@ -474,5 +479,106 @@ mod tests {
         });
         assert_eq!(v.steps[0].units[&0].provider.as_deref(), Some("openai"));
         assert_eq!(v.steps[0].units[&0].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn unit_started_reemit_overwrites_host_and_codename_on_fallback_retry() {
+        use rupu_orchestrator::executor::Event;
+        use rupu_orchestrator::runs::StepKind;
+        let mut v = RunView::default();
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            kind: StepKind::ForEach,
+            agent: None,
+            host: None,
+            codename: None,
+        });
+        let unit_started = |host: &str, codename: &str| Event::UnitStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            index: 0,
+            unit_key: "svc-0".into(),
+            agent: Some("breaker".into()),
+            transcript_path: "t0".into(),
+            host: Some(host.into()),
+            codename: Some(codename.into()),
+        };
+        // Primary host, then the runner re-emits UnitStarted for the same
+        // (step, index) when the unit is retried onto a fallback host.
+        v.apply(&unit_started("host-a", "otter#1"));
+        v.apply(&unit_started("host-b", "otter#2"));
+
+        let step = &v.steps[0];
+        assert_eq!(step.units.len(), 1, "retry must reuse the same slot");
+        let u = &step.units[&0];
+        assert_eq!(u.host.as_deref(), Some("host-b"), "latest host wins");
+        assert_eq!(
+            u.codename.as_deref(),
+            Some("otter#2"),
+            "latest codename wins"
+        );
+        assert_eq!(u.status, UnitStatus::Running);
+
+        // A re-emit that carries no host/codename must not erase what we know.
+        v.apply(&Event::UnitStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            index: 0,
+            unit_key: "svc-0".into(),
+            agent: Some("breaker".into()),
+            transcript_path: "t0".into(),
+            host: None,
+            codename: None,
+        });
+        let u = &v.steps[0].units[&0];
+        assert_eq!(u.host.as_deref(), Some("host-b"));
+        assert_eq!(u.codename.as_deref(), Some("otter#2"));
+    }
+
+    #[test]
+    fn sparse_out_of_order_unit_indices_are_keyed_by_their_own_index() {
+        use rupu_orchestrator::executor::Event;
+        use rupu_orchestrator::runs::StepKind;
+        let mut v = RunView::default();
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            kind: StepKind::ForEach,
+            agent: None,
+            host: None,
+            codename: None,
+        });
+        for i in [5usize, 2usize] {
+            v.apply(&Event::UnitStarted {
+                run_id: "r".into(),
+                step_id: "hunt".into(),
+                index: i,
+                unit_key: format!("svc-{i}"),
+                agent: Some("breaker".into()),
+                transcript_path: format!("t{i}").into(),
+                host: None,
+                codename: None,
+            });
+        }
+        v.apply(&Event::UnitCompleted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            index: 5,
+            unit_key: "svc-5".into(),
+            success: true,
+            tokens_in: 0,
+            tokens_out: 0,
+            host: None,
+        });
+
+        assert_eq!(v.steps.len(), 1, "no phantom step");
+        let step = &v.steps[0];
+        let keys: Vec<usize> = step.units.keys().copied().collect();
+        assert_eq!(keys, vec![2, 5]);
+        assert_eq!(step.units[&5].status, UnitStatus::Done);
+        assert_eq!(step.units[&5].unit_key, "svc-5");
+        assert_eq!(step.units[&2].status, UnitStatus::Running);
+        assert_eq!(step.units[&2].unit_key, "svc-2");
     }
 }
