@@ -1,7 +1,7 @@
 # rupu model-limits discovery — design
 
 **Date:** 2026-09-30
-**Status:** Design approved; plan not yet written
+**Status:** Design approved; plan written (`docs/superpowers/plans/2026-09-30-rupu-model-limits-discovery.md`)
 **Scope:** `rupu-providers`, `rupu-runtime`, `rupu-agent`, `rupu-orchestrator`, `rupu-cli`, `rupu-cp` (API + web). The macOS app is deprecated and out of scope.
 **Companion:** the response-outcomes spec (refusals, every stop/finish reason, unrecognized replies) is a separate design, brainstormed after this one. §9 lists what moved there.
 
@@ -44,6 +44,7 @@ Notes:
 - **Why `max_prompt_tokens` for Copilot.** It's often much smaller than the window (for example 128K vs 400K). VS Code Copilot uses it for the same reason.
 - **Codex's `max_context_window`** is only a ceiling for a user's own `config.toml` override. The wire has no window field, so rupu uses `context_window`.
 - **Made-up defaults are removed.** `DEFAULT_OAI_CONTEXT_WINDOW = 32_768` and `DEFAULT_OAI_MAX_OUTPUT = 8_192` (`crates/rupu-runtime/src/provider_factory.rs:64`) invent limits for unconfigured OpenAI-compatible models. Unset now means unknown, then live `max_model_len`.
+- **New trait method:** `LlmProvider::fetch_models(&mut self) -> Result<Vec<ModelInfo>, ProviderError>`. Its default returns `Err(NotImplemented)`, meaning the provider exposes no listing. It exists alongside the legacy `list_models(&self)`, which hides failures as an empty list, for two reasons: `&mut self` lets OAuth providers refresh an expired token before listing (Anthropic, Copilot), and a real error lets the resolver tell "fetch failed, use the stale cache" apart from "model not listed". The `tuned.rs` decorators forward it.
 - **New trait method:** `LlmProvider::output_shares_context(&self) -> bool`, default `true`. It says whether generated output counts against the same window as the input. Anthropic, Codex and OpenAI-compatible return `true`; Copilot and Gemini return `false`, because their input and output budgets are independent. It feeds the headroom rule in §6.4.
 - **Fetch timeout.** Model-list fetches use a 10s timeout, the same as the existing Anthropic models request (`anthropic.rs:1477`).
 
@@ -82,7 +83,7 @@ pub async fn resolve(
     overrides: LimitOverrides,   // spec.context_window_tokens / max_tokens / compact_at_percent
     provider_name: &str,
     model: &str,
-    provider: &dyn LlmProvider,  // the run's own instance: same auth, same host
+    provider: &mut dyn LlmProvider,  // the run's own instance: same auth, same host
     cfg: &Config,
     cache_dir: &Path,
 ) -> ModelLimits;
@@ -106,7 +107,6 @@ pub async fn resolve(
 - sub-agent dispatch: `crates/rupu-cli/src/cmd/dispatch.rs:419`, resolving the **child's** own provider and model
 - session start: `crates/rupu-cli/src/cmd/session.rs:1633`
 - the orchestrator step factory: `crates/rupu-orchestrator/src/step_factory.rs:498`
-- the in-process executor: `crates/rupu-orchestrator/src/executor/in_process.rs:476`
 
 Test harnesses and the runner's internal summary calls (`runner.rs:1839` etc.) use `ModelLimits::unknown()` or `ModelLimits::fixed(input, output)`.
 
@@ -147,7 +147,7 @@ The `input − output` headroom rule compacts early enough that a full-length re
 
 ### 6.5 Sessions
 
-The resolved `ModelLimits`, including sources, is stored on the session record at session start. This is an additive serde field: an older record without it resolves on the next start. Resume reuses the stored value; it never refetches in the middle of a session.
+The resolved `ModelLimits`, including sources, is stored on the session record on the session's **first turn**. `session start` builds no provider, so the first `_run-turn` resolves and writes it. This is an additive serde field: an older record without it resolves on its next turn. Later turns reuse the stored value; it never refetches in the middle of a session. After each turn, the run's final limits are written back (`RunResult.final_limits`), so a limit learned from an overflow error (§7) persists.
 
 ### 6.6 Run-start notice
 
@@ -198,8 +198,8 @@ rupu-cp stays read-only. It gets a new port, following the `RepoLister` / `Agent
 ```rust
 #[async_trait]
 pub trait ModelCatalog: Send + Sync {
-    async fn list(&self) -> Vec<ProviderModels>;
-    async fn refresh(&self, provider: Option<&str>) -> Vec<RefreshOutcome>;
+    async fn list(&self) -> Result<Vec<CatalogProvider>, ModelCatalogError>;
+    async fn refresh(&self, provider: Option<String>) -> Result<Vec<RefreshOutcome>, ModelCatalogError>;
 }
 ```
 
