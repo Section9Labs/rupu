@@ -7,7 +7,6 @@
 //   • a secondary, collapsed "Session details" disclosure (usage chart + fields)
 // Route: /sessions/:id
 
-import { AgentName } from '../components/codename/AgentName';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
@@ -17,6 +16,7 @@ import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
 import { isSessionActive, pollIntervalFor } from '../lib/sessionPoll';
 import UsageChip from '../components/UsageChip';
+import { AgentName } from '../components/codename/AgentName';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
