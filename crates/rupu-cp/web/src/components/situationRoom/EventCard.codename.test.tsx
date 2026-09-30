@@ -10,7 +10,7 @@ import { MemoryRouter } from 'react-router-dom';
 import EventCard from './EventCard';
 import { cardFromEvent } from '../../lib/situationRoom/cards';
 import { crewTint } from '../../lib/codename';
-import type { AgentStartedEvent, StepStartedEvent } from '../../lib/api';
+import type { AgentStartedEvent, StepStartedEvent, UnitStartedEvent } from '../../lib/api';
 
 afterEach(cleanup);
 
@@ -49,5 +49,41 @@ describe('EventCard — codenames', () => {
     expect(screen.getByText('oracle')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'run_01KS' })).toBeInTheDocument();
     expect(container.querySelector('[data-testid="sr-crew-stripe"]')).toBeNull();
+  });
+
+  it('legacy unit_started with a DERIVED name still gets its card, rendered muted', () => {
+    const ev: UnitStartedEvent = {
+      type: 'unit_started', run_id: 'run_01KS19A4MQXP', step_id: 'fan', index: 0,
+      unit_key: 'a.rs', agent: 'triage', transcript_path: '/t/u0.jsonl',
+      codename: 'jade-reef/numbat#1', codename_derived: true,
+    };
+    const card = cardFromEvent(ev, 1000, 'k');
+    expect(card).not.toBeNull();
+    expect(card!.codenameDerived).toBe(true);
+    render(<MemoryRouter><EventCard card={card!} /></MemoryRouter>);
+    const name = screen.getByText('numbat#1 · triage').closest('[title]') as HTMLElement;
+    expect(name.className).toMatch(/opacity-60/);
+    expect(name.getAttribute('title')).toMatch(/derived for a run recorded before codenames/);
+  });
+
+  it('derived step_started card is muted; a stored one is not', () => {
+    const derived: StepStartedEvent = {
+      type: 'step_started', run_id: 'run_01KS19A4MQXP', step_id: 'scan', kind: 'linear',
+      agent: 'oracle', codename: 'jade-reef/heron', codename_derived: true,
+    };
+    render(<MemoryRouter><EventCard card={cardFromEvent(derived, 1000, 'k')!} /></MemoryRouter>);
+    expect((screen.getByText('heron · oracle').closest('[title]') as HTMLElement).className).toMatch(/opacity-60/);
+    cleanup();
+    const stored: StepStartedEvent = { ...derived, codename_derived: undefined };
+    render(<MemoryRouter><EventCard card={cardFromEvent(stored, 1000, 'k')!} /></MemoryRouter>);
+    expect((screen.getByText('heron · oracle').closest('[title]') as HTMLElement).className).not.toMatch(/opacity-60/);
+  });
+
+  it('a stored-name unit_started stays suppressed (agent_started carries it)', () => {
+    const ev: UnitStartedEvent = {
+      type: 'unit_started', run_id: 'run_01KS19A4MQXP', step_id: 'fan', index: 0,
+      unit_key: 'a.rs', agent: 'triage', transcript_path: '/t/u0.jsonl', codename: 'jade-reef/numbat#1',
+    };
+    expect(cardFromEvent(ev, 1000, 'k')).toBeNull();
   });
 });

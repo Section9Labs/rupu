@@ -95,4 +95,17 @@ describe('StepTranscriptBrowser', () => {
     expect(ident.compareDocumentPosition(key) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(key.textContent).toBe('item-a');
   });
+
+  it('renders a derived unit name muted', () => {
+    const units: UnitView[] = [
+      { ...UNITS[0], codename: 'jade-reef/heron#1', codenameDerived: true },
+      { ...UNITS[1], codename: 'jade-reef/heron#2' },
+    ];
+    render(<StepTranscriptBrowser stepId="process_items" units={units} agent="scanner" />);
+    const derived = screen.getByText('heron#1 · scanner').closest('[title]') as HTMLElement;
+    expect(derived.className).toMatch(/opacity-60/);
+    expect(derived.getAttribute('title')).toMatch(/derived for a run recorded before codenames/);
+    const stored = screen.getByText('heron#2 · scanner').closest('[title]') as HTMLElement;
+    expect(stored.className).not.toMatch(/opacity-60/);
+  });
 });

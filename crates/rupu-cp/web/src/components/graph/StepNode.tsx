@@ -83,6 +83,7 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
       <AgentIdentity
         className="mt-1.5 text-meta text-ink-dim"
         codename={node.codename}
+        derived={node.codenameDerived}
         agent={node.agent}
         provider={node.provider}
         model={node.model}
