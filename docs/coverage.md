@@ -98,10 +98,114 @@ list them in the agent's `tools:`):
 | Tool | Purpose |
 |------|---------|
 | `coverage_mark` | record a `(concern, file)` verdict + evidence |
-| `report_finding` | record an issue (severity, location, remediation) |
+| `report_finding` | record an issue — a complete `report` under the `full` profile (default), or `summary` / `severity` / `evidence` under `summary`; see [Finding reports](#finding-reports) |
 | `coverage_remaining` | list in-scope files still lacking an assertion |
 | `coverage_status` | summary of assessed-vs-gap progress |
 | `coverage_concerns_search` / `coverage_concerns_detail` | search / fetch full bodies for index-mode catalogs |
+
+## Finding reports
+
+A finding is recorded once, as structured data, and every presentation is
+generated from that record. Agents do not also write a report file.
+
+### Profiles
+
+| Profile | What `report_finding` / `findings.record` accepts |
+|---------|----------------------------------------------------|
+| `full` (default) | A complete `report` object. `summary`, `severity`, and `evidence` are **rejected**: rupu derives them (`summary` ← `title`, `severity` ← `rating.risk_rating`, `evidence.rationale` ← `root_cause`). |
+| `summary` | The lightweight `summary` / `severity` / `evidence` record. A `report` is **refused**, never silently dropped. |
+
+Pick a profile with the agent's `findingsProfile` frontmatter, a workflow's
+`defaults.findings_profile`, or a step's `findings_profile`. Precedence is
+step → workflow defaults → agent `findingsProfile` → `full`
+(see `docs/agent-format.md` and `docs/workflow-format.md`). The chosen profile
+is stored on each finding record; records written before profiles existed read
+back as `summary`.
+
+> **Upgrading:** the built-in default is `full`, so an existing agent that
+> records thin findings is rejected until it declares `findingsProfile: summary`
+> or its prompt is updated to send a `report`. Agents outside the repo (for
+> example under `~/.rupu/agents/`) need that one-line change.
+
+### What `full` requires
+
+Every field of the report is required. The rules below are enforced at write
+time; a rejected call returns **every** problem at once, each with its field
+path, so the agent can fix them all in one retry. (A structurally malformed
+JSON argument surfaces as a single parse error instead.) Full-profile runs also
+get finding-writing guidance appended to the system prompt, so the agent needs
+no external reporting-standard file.
+
+- Required strings must be non-empty after trimming.
+- Ratings (`impact`, `risk_rating`, `risk_factor`) are `Low`/`Medium`/`High`/`Critical`;
+  `likelihood` is `Low`/`Medium`/`High`. `cwe` is a list of `CWE-<n>` ids and may be empty.
+- `evidence` needs at least one claim and `replication_steps` at least one step.
+- `file` values are workspace-relative and `lines` is `[start, end]` with `1 <= start <= end`.
+- `cross_references[].finding_id` must be an existing finding id.
+- The serialized report must fit `[findings].report_max_bytes` (default 256 KiB),
+  so a pasted log cannot swell the ledger. The limit is checked again after
+  artifact directories are expanded.
+
+### Sentinels
+
+Where information genuinely cannot be determined, a field uses a sentinel
+instead of being omitted or guessed. On the structured fields (tickets, call
+chain, patch, CI/CD detection, regression test, cross references) a sentinel is
+accepted only in its exact form, and only the ones listed for that field:
+
+| Sentinel | Used for |
+|----------|----------|
+| `Unknown` | owner, product, affected component, source repository, attack vector, CVSS score, tickets |
+| `Not Applicable` | source repository, when no source-controlled code is involved |
+| `None Provided` | tickets, when none are mentioned |
+| `None` | cross references, when there is no related finding |
+| `Not Provided — <justification>` (em dash) | call chain, recommended patch, CI/CD detection, regression test; the justification must be non-empty |
+
+`Unknown` is **not** accepted for the patch, CI/CD detection, or regression
+test: provide the item or say why it could not be produced.
+
+### Artifacts
+
+`report.artifacts[].path` lists proof-of-concept files (scripts, outputs,
+harnesses) as workspace-relative paths. At write time rupu hashes each one:
+
+- A file up to `[findings].artifact_max_bytes` (default 500 MB) is copied into a
+  content-addressed store at `<RUPU_HOME>/findings/artifacts/<aa>/<sha256>` and
+  recorded `stored: copied`. Identical content is stored once across runs and
+  projects, and the store outlives the workspace.
+- A larger file is recorded `stored: external` with its path, size, and sha256.
+- A directory expands to the files inside it, each handled by the same rule.
+  Symlinks inside a directory are skipped.
+- A path that escapes the workspace, does not exist, or names something other
+  than a regular file (a device, socket, or the like) rejects the finding, so a
+  typo is not silently dropped.
+
+### Configuration
+
+```toml
+[findings]
+artifact_max_bytes = 524288000   # copy cap per artifact file (default 500 MB)
+report_max_bytes = 262144        # serialized report budget (default 256 KiB)
+ticket_patterns = ["ABC-[0-9]+"] # extra hints appended to the full-profile guidance
+```
+
+`ticket_patterns` lets an organisation say which reference formats count as
+existing tickets. Nothing organisation-specific ships in rupu.
+
+### `rupu findings schema`
+
+```
+rupu findings schema                 Print the embedded draft-07 JSON Schema of a finding report
+rupu findings schema --advertised    Print the simplified copy used in tool definitions
+```
+
+The schema is embedded in the binary and kept in lockstep with the validator by
+a test, so external prompts and tools can be generated from rupu rather than
+maintained by hand.
+
+> Not built yet: Markdown / HTML / PDF export, the web report page, and the
+> macOS views arrive in later plans. Today a `full` report is stored on the
+> finding record and its artifacts are stored as described above.
 
 ## CLI
 
@@ -163,6 +267,8 @@ deterministic; sampling is not.
 
 ## See also
 
-- `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:`)
+- `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:` and `findingsProfile`)
+- `docs/workflow-format.md` — workflow `findings_profile` (step and `defaults`)
+- `docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md` — the finding report design
 - `docs/agent-authoring.md` — writing good agents
 - Slice specs/plans under `docs/superpowers/{specs,plans}/` (search `coverage-harness`)

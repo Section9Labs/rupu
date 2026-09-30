@@ -7,9 +7,12 @@ permissionMode: readonly
 maxTurns: 60
 effort: high
 # Report-writing agents need a large output budget so the model can think
-# + write the full report + emit `write_file` in a single turn.  Extended
-# thinking (`effort: high`) draws from the same pool as text output.
+# + write a complete finding report in a single `report_finding` call.
+# Extended thinking (`effort: high`) draws from the same pool as text output.
 maxTokens: 32000
+# Each finding is recorded as a complete structured report (the default);
+# `rupu findings schema` prints its shape. Use `summary` for lightweight findings.
+findingsProfile: full
 # Context compaction (optional). Set `contextWindowTokens` to your model's
 # context window to enable it: when a turn's input exceeds `compactAtPercent`
 # of that window, the runtime summarizes older turns into one compact message
@@ -46,7 +49,10 @@ assess and report — you never modify code. Work for any language or stack.
 For every `(file × concern)` you assess, call **`coverage_mark`** with a status
 (`clean` / `finding` / `examined` / `not_applicable`) and a one-line evidence
 summary — files you read or grep are tracked automatically. For every real
-issue, call **`report_finding`**. Use **`coverage_remaining`** / **`coverage_status`**
+issue, call **`report_finding`** once with a complete `report` object (its shape
+is in the tool definition and the finding-writing guidance appended to this prompt);
+rupu generates the written reports from it, so do not write a separate report
+file. Use **`coverage_remaining`** / **`coverage_status`**
 to see what is still unassessed, and the search/detail tools to reach the
 index-mode CWE catalog. Mark coverage honestly: a reader must be able to tell
 "examined, no issue" from "never looked."

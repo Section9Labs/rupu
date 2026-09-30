@@ -129,9 +129,12 @@ Currently supported:
 ```yaml
 defaults:
   continue_on_error: true
+  findings_profile: full     # full | summary — see `findings_profile` below
 ```
 
 If a step does not set `continue_on_error`, it inherits the workflow default.
+
+`defaults.findings_profile` sets the findings contract for every step that runs an agent, and for `action:` steps that call `findings.record`. A step's own `findings_profile` overrides it. See [`findings_profile`](#findings_profile).
 
 ---
 
@@ -307,6 +310,7 @@ Common fields:
 | `max_parallel` | integer | `for_each`, `parallel`, `panel` | Concurrency cap, must be at least 1 |
 | `approval` | object | all steps | Human pause before the step dispatches |
 | `contract` | object | linear steps | Optional documentation for a structured step output |
+| `findings_profile` | `full` \| `summary` | agent steps (`step`/`for_each`/`parallel`/`panel`) | Findings contract for this step — see below |
 
 ### `actions`
 
@@ -346,6 +350,40 @@ steps:
     agent: issue-reporter
     actions: []                          # unrestricted — full agent grant
 ```
+
+### `findings_profile`
+
+Chooses the contract findings are recorded under for a step: `full` (a complete structured `report`, the built-in default) or `summary` (the lightweight `summary` / `severity` / `evidence` record). See `docs/coverage.md` for what each requires.
+
+Precedence, most specific first:
+
+1. the step's `findings_profile`
+2. the workflow's `defaults.findings_profile`
+3. the agent's `findingsProfile` frontmatter (see [agent-format.md](agent-format.md#findingsprofile))
+4. `full`
+
+```yaml
+defaults:
+  findings_profile: full          # every agent step records complete reports...
+steps:
+  - id: sweep
+    agent: quick-scanner
+    prompt: "Skim {{ inputs.path }} for hard-coded secrets"
+    findings_profile: summary     # ...except this cheap first pass
+  - id: deep-dive
+    agent: security-assessor
+    prompt: "Assess {{ inputs.path }}"
+```
+
+Rules:
+
+- `parallel:` sub-steps inherit their parent step's profile; a sub-step has no `findings_profile` of its own.
+- `action:` steps have no step-level value: an `action: findings.record` step uses `defaults.findings_profile` (else `full`), and a `findings_profile:` on the `action:` step itself is a parse error.
+- Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
+- The field must never be silently ignored, so these are parse errors:
+  - `findings_profile` on a remote step (`host:` / `distribute:`) — remote units resolve their profile from the agent file, so set `findingsProfile` in that agent's frontmatter instead;
+  - `defaults.findings_profile` in a workflow that has any remote step, for the same reason;
+  - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`).
 
 ### `when`
 
@@ -1281,6 +1319,7 @@ Common parse-time failures:
 - invalid input defaults or enum defaults
 - extraneous fields inside `trigger:`
 - an `action:` naming an unknown tool, or `with:` failing the tool's schema
+- a `findings_profile:` on an `action:`, remote, or agent-less step, or `defaults.findings_profile` alongside a remote step
 - a `branch:` target that doesn't exist, isn't forward, or appears in both arms
 - a `join:` with no inbound edges, or a `wait: { count: N }` exceeding its inbound path count
 - a cycle anywhere in the workflow's dependency graph
