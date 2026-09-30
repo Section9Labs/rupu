@@ -11,8 +11,9 @@ pub struct FindingsConfig {
     /// Most files one report's artifacts may expand to (a directory counts
     /// every file inside it). Default 500.
     pub artifact_max_files: Option<usize>,
-    /// Most bytes one report's artifacts may add up to, copied or recorded
-    /// by hash. Default 2 GiB.
+    /// Most bytes one report's artifacts may add up to in the store: only
+    /// files copied into it count, not files over `artifact_max_bytes`
+    /// (which are recorded by reference). Default 2 GiB.
     pub artifact_total_max_bytes: Option<u64>,
     /// Serialized-size budget for one finding report. Default 256 KiB.
     pub report_max_bytes: Option<u64>,

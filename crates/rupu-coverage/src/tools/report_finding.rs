@@ -777,6 +777,32 @@ mod tests {
     }
 
     #[test]
+    fn an_artifact_over_the_per_file_cap_is_recorded_by_reference_not_rejected() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("huge.bin"), vec![9u8; 100]).unwrap();
+        let mut r = fixture_report();
+        r.artifacts = vec![crate::report::ArtifactRef {
+            path: "huge.bin".into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        // Bigger than both the per-file and the total cap.
+        let opts = crate::report::FindingWriteOptions {
+            artifact_max_bytes: 10,
+            artifact_total_max_bytes: 15,
+            ..full_opts(store.path())
+        };
+        report_finding(&paths, attribution(), full_input(r), &opts)
+            .expect("an over-cap file is recorded external, never a rejection");
+        assert!(paths.findings.exists(), "the finding was written");
+    }
+
+    #[test]
     fn artifacts_without_a_store_fail_loudly() {
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(ws.path().join("out.txt"), "x").unwrap();

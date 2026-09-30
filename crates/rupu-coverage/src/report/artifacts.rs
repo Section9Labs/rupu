@@ -7,7 +7,10 @@
 //!
 //! One report's artifacts are bounded ([`IngestLimits`]): every requested
 //! path is resolved and expanded first, and the whole set is refused if it
-//! is too many files or too many bytes, before a single byte is copied.
+//! is too many files, or if the files that would be copied into the store add
+//! up to too many bytes, before a single byte is copied. A file over the
+//! per-file cap is only hashed and recorded by reference, so it never counts
+//! toward the total and never causes a refusal.
 
 use crate::report::types::{ArtifactKind, ArtifactRef, ArtifactStorage};
 use crate::report::validate::rel_path_problem;
@@ -34,7 +37,7 @@ pub enum ArtifactError {
     NoStore,
     #[error("the requested artifacts expand to more than {max} files (`[findings].artifact_max_files` = {max}); list specific files instead of large directories")]
     TooManyFiles { max: usize },
-    #[error("the requested artifacts total {total} bytes across {files} files, over the {max} byte limit (`[findings].artifact_total_max_bytes`); list specific files instead of large directories")]
+    #[error("the artifacts to be copied into the store total {total} bytes across {files} files, over the {max} byte limit (`[findings].artifact_total_max_bytes`); files larger than `[findings].artifact_max_bytes` are recorded by reference and do not count; list specific files instead of large directories")]
     TooLarge { total: u64, files: usize, max: u64 },
 }
 
@@ -45,7 +48,9 @@ pub struct IngestLimits {
     pub max_file_bytes: u64,
     /// Most files the requested paths may expand to.
     pub max_files: usize,
-    /// Most bytes all of those files may add up to, copied or external.
+    /// Most bytes the files that will be copied (those at or under
+    /// `max_file_bytes`) may add up to. Files over `max_file_bytes` are
+    /// recorded external and do not count.
     pub max_total_bytes: u64,
 }
 
@@ -127,7 +132,9 @@ impl ArtifactStore {
 
     /// Resolve every requested path (expanding directories), check the whole
     /// set against `limits`, then hash and either copy (≤
-    /// `limits.max_file_bytes`) or record as external. Agent-supplied
+    /// `limits.max_file_bytes`) or record as external. The total-bytes bound
+    /// covers only the files that will be copied; a file over the per-file
+    /// cap is recorded by reference and never causes a refusal. Agent-supplied
     /// metadata on `requested` is ignored; only `path` is read.
     pub fn ingest(
         &self,
@@ -136,14 +143,21 @@ impl ArtifactStore {
         limits: IngestLimits,
     ) -> Result<Vec<ArtifactRef>, ArtifactError> {
         let files = self.resolve(workspace, requested, limits.max_files)?;
+        // Only files that will be copied count toward the total: a file over
+        // the per-file cap is hashed and recorded external, so it consumes no
+        // store space and must not get the finding rejected.
         let mut total = 0u64;
+        let mut copied = 0usize;
         for (_, _, size) in &files {
-            total = total.saturating_add(*size);
+            if *size <= limits.max_file_bytes {
+                total = total.saturating_add(*size);
+                copied += 1;
+            }
         }
         if total > limits.max_total_bytes {
             return Err(ArtifactError::TooLarge {
                 total,
-                files: files.len(),
+                files: copied,
                 max: limits.max_total_bytes,
             });
         }
@@ -670,6 +684,73 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("1200 bytes across 2 files"), "{msg}");
         assert!(!store.path().exists() || walk(store.path()).is_empty());
+    }
+
+    #[test]
+    fn a_file_over_both_caps_is_recorded_external_and_does_not_reject() {
+        let (ws, store) = setup();
+        fs::write(ws.path().join("huge.bin"), vec![7u8; 100]).unwrap();
+        let s = ArtifactStore::new(store.path());
+        let out = s
+            .ingest(
+                ws.path(),
+                &[req("huge.bin")],
+                IngestLimits {
+                    max_file_bytes: 10,
+                    max_total_bytes: 15,
+                    ..limits(10)
+                },
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].stored, Some(ArtifactStorage::External));
+        assert_eq!(out[0].size, 100);
+        assert_eq!(out[0].sha256.len(), 64);
+        // Recorded by reference: nothing was copied into the store.
+        assert!(!store.path().exists() || walk(store.path()).is_empty());
+    }
+
+    #[test]
+    fn external_files_do_not_count_toward_the_total_but_copied_ones_do() {
+        let (ws, store) = setup();
+        // One file over the per-file cap, two under it.
+        fs::write(ws.path().join("huge.bin"), vec![7u8; 100]).unwrap();
+        fs::write(ws.path().join("a.bin"), vec![1u8; 8]).unwrap();
+        fs::write(ws.path().join("b.bin"), vec![2u8; 8]).unwrap();
+        let s = ArtifactStore::new(store.path());
+        let tight = IngestLimits {
+            max_file_bytes: 10,
+            max_total_bytes: 15,
+            ..limits(10)
+        };
+        // Two copyable files sum to 16 > 15: still refused, and the huge
+        // external file is not in the count.
+        let err = s
+            .ingest(
+                ws.path(),
+                &[req("huge.bin"), req("a.bin"), req("b.bin")],
+                tight,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ArtifactError::TooLarge {
+                    total: 16,
+                    files: 2,
+                    max: 15
+                }
+            ),
+            "{err}"
+        );
+        assert!(!store.path().exists() || walk(store.path()).is_empty());
+        // Without the second copyable file the set fits, so the huge file is
+        // recorded external alongside the one copied file.
+        let out = s
+            .ingest(ws.path(), &[req("huge.bin"), req("a.bin")], tight)
+            .unwrap();
+        assert_eq!(out[0].stored, Some(ArtifactStorage::External));
+        assert_eq!(out[1].stored, Some(ArtifactStorage::Copied));
     }
 
     #[test]

@@ -195,10 +195,13 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A directory expands to the files inside it, each handled by the same rule.
   Symlinks inside a directory are skipped.
 - One report's artifacts are bounded before anything is copied: at most
-  `[findings].artifact_max_files` files (default 500) and
-  `[findings].artifact_total_max_bytes` bytes in total, copied or external
-  (default 2 GiB). A larger set rejects the finding with the count or total
-  named; list specific files instead of large directories.
+  `[findings].artifact_max_files` files (default 500), and the files that
+  will be copied into the store may add up to at most
+  `[findings].artifact_total_max_bytes` bytes (default 2 GiB). A file over
+  `artifact_max_bytes` is recorded by reference and does not count toward
+  that total, so it never rejects the finding. A larger set rejects the
+  finding with the count or total named; list specific files instead of
+  large directories.
 - A path that escapes the workspace, names the workspace root itself (`.`),
   does not exist, or names something other than a regular file (a device,
   socket, or the like) rejects the finding, so a typo is not silently dropped.
@@ -213,7 +216,7 @@ stored without a hash.
 [findings]
 artifact_max_bytes = 524288000   # copy cap per artifact file (default 500 MiB)
 artifact_max_files = 500         # files per report's artifacts (default 500)
-artifact_total_max_bytes = 2147483648  # bytes per report's artifacts (default 2 GiB)
+artifact_total_max_bytes = 2147483648  # bytes copied into the store per report (default 2 GiB)
 report_max_bytes = 262144        # serialized report budget (default 256 KiB)
 ticket_patterns = ["ABC-[0-9]+"] # extra hints appended to the full-profile guidance
 ```

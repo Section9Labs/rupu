@@ -23,7 +23,9 @@ pub struct FindingWriteOptions {
     /// Most files one report's artifacts may expand to (directories count
     /// each file inside them). Checked before anything is copied.
     pub artifact_max_files: usize,
-    /// Most bytes one report's artifacts may add up to, copied or external.
+    /// Most bytes one report's artifacts may add up to in the store: only
+    /// files at or under `artifact_max_bytes` (the ones that are copied)
+    /// count; a larger file is recorded by reference and never counts.
     /// Checked before anything is copied.
     pub artifact_total_max_bytes: u64,
     pub report_max_bytes: usize,
