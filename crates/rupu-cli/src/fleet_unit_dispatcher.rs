@@ -22,7 +22,8 @@ use rupu_cp::{
     },
 };
 use rupu_orchestrator::runner::{
-    PreparedWorkspace, UnitDispatch, UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
+    PreparedWorkspace, UnitCoverage, UnitDispatch, UnitDispatcher, UnitFailure, UnitOutcome,
+    WorkspaceConflict, WorkspaceDelta,
 };
 
 // ── Poll constants ─────────────────────────────────────────────────────────────
@@ -267,7 +268,11 @@ impl UnitDispatcher for FleetUnitDispatcher {
         Ok(PreparedWorkspace::new(encode_payload(&payload)))
     }
 
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         let conn = self.resolver.resolve(host)?;
         let unit_run_id = unit.run_id.clone();
 
@@ -319,7 +324,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                         );
                     }
                 }
-                return Err(host_err_to_run_err(e));
+                return Err(host_err_to_run_err(e).into());
             }
         };
 
@@ -405,7 +410,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     );
                     continue;
                 }
-                Err(e) => return Err(host_err_to_run_err(e)),
+                Err(e) => return Err(host_err_to_run_err(e).into()),
             };
 
             // All HostConnector::get_run impls return the query_run_detail
@@ -462,6 +467,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     success,
                     error,
                     workspace_delta,
+                    coverage: UnitCoverage::NotLaunched,
                 });
             }
         }
@@ -486,7 +492,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
         // timeout on a run the host said WAS running must not.
         let never_started = !observed && !started_evidence;
 
-        Err(RunError::Provider(
+        Err(UnitFailure::from(RunError::Provider(
             match (never_started, last_startup_err) {
                 // Never started: the run was launched but the host never showed
                 // any sign of it. Say that, rather than "timed out polling" — the
@@ -548,7 +554,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     POLL_MAX_WALL.as_secs()
                 ),
             },
-        ))
+        )))
     }
 
     /// Bridge the orchestrator's opaque deltas to the `rupu-workspace` codec and

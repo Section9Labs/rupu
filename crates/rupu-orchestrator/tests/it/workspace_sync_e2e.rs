@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitDispatch,
-    UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
+    run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitCoverage, UnitDispatch,
+    UnitDispatcher, UnitFailure, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
 };
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::StopReason;
@@ -85,7 +85,7 @@ impl UnitDispatcher for PlacedSyncDispatcher {
         &self,
         unit: UnitDispatch,
         _host: &str,
-    ) -> Result<UnitOutcome, RunError> {
+    ) -> Result<UnitOutcome, UnitFailure> {
         *self.saw_workspace_path.lock().unwrap() = unit.workspace.is_some();
         Ok(UnitOutcome {
             output: "REMOTE-EDITED".to_string(),
@@ -96,6 +96,7 @@ impl UnitDispatcher for PlacedSyncDispatcher {
                 deleted: vec![],
                 payload: b"EDITED".to_vec(),
             }),
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 
@@ -258,7 +259,7 @@ impl UnitDispatcher for FanoutSyncDispatcher {
         &self,
         unit: UnitDispatch,
         _host: &str,
-    ) -> Result<UnitOutcome, RunError> {
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.unit_payloads
             .lock()
             .unwrap()
@@ -275,6 +276,7 @@ impl UnitDispatcher for FanoutSyncDispatcher {
                 deleted: vec![],
                 payload: content,
             }),
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 

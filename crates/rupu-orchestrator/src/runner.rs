@@ -170,6 +170,45 @@ pub struct UnitOutcome {
     /// The unit's file changes when it ran with a synced workspace; `None`
     /// for a self-contained unit.
     pub workspace_delta: Option<WorkspaceDelta>,
+    /// What the unit recorded; see [`UnitCoverage`].
+    pub coverage: UnitCoverage,
+}
+
+/// What a remote unit recorded (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §A4), carried on every
+/// post-launch outcome — success or failure — so the runner can merge it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitCoverage {
+    /// The unit's coverage stream as its host connector delivered it.
+    Stream(Vec<u8>),
+    /// The connector could not deliver a stream; the reason is surfaced as a
+    /// `StepWarning`.
+    Unavailable(String),
+    /// The unit never launched: nothing to collect.
+    NotLaunched,
+}
+
+/// A remote unit that failed, with whatever coverage it recorded. `Err` keeps
+/// its meaning for the fan-out's fallback-host retry.
+#[derive(Debug)]
+pub struct UnitFailure {
+    pub error: RunError,
+    pub coverage: UnitCoverage,
+}
+
+impl From<RunError> for UnitFailure {
+    fn from(error: RunError) -> Self {
+        Self {
+            error,
+            coverage: UnitCoverage::NotLaunched,
+        }
+    }
+}
+
+impl std::fmt::Display for UnitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
 }
 
 /// Port that remote-fleet implementations plug into.
@@ -182,7 +221,11 @@ pub struct UnitOutcome {
 #[async_trait]
 pub trait UnitDispatcher: Send + Sync {
     /// Run one unit (an agent invocation) on `host` and return its output.
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError>;
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure>;
 
     /// Pack the coordinator workspace at `workspace_path` for staging.
     ///
@@ -1724,9 +1767,9 @@ async fn dispatch_unit_unless_terminating(
     dispatcher: &dyn UnitDispatcher,
     unit: UnitDispatch,
     host: &str,
-) -> Result<UnitOutcome, RunError> {
+) -> Result<UnitOutcome, UnitFailure> {
     if rupu_providers::credential_writes::terminating() {
-        return Err(RunError::Terminating);
+        return Err(RunError::Terminating.into());
     }
     dispatcher.dispatch_unit(unit, host).await
 }
@@ -7319,7 +7362,8 @@ async fn dispatch_placed_step(
             );
             placed_failure(step, host, outcome.output, source, continue_on_error)
         }
-        Err(source) => {
+        Err(failure) => {
+            let source = failure.error;
             let output = source.to_string();
             placed_failure(step, host, output, source, continue_on_error)
         }
@@ -8290,7 +8334,7 @@ async fn run_fanout_step(
                                                     msg.clone(),
                                                     false,
                                                     Some(msg),
-                                                    Some(second_err),
+                                                    Some(second_err.error),
                                                     None,
                                                     false,
                                                 )
@@ -10013,6 +10057,13 @@ mod tests {
             "src/a.rs"
         );
     }
+
+    #[test]
+    fn a_plain_run_error_is_a_failure_that_never_launched() {
+        let f: UnitFailure = RunError::Provider("boom".into()).into();
+        assert_eq!(f.coverage, UnitCoverage::NotLaunched);
+        assert_eq!(f.to_string(), RunError::Provider("boom".into()).to_string());
+    }
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -10070,19 +10121,20 @@ mod tests {
             &self,
             unit: UnitDispatch,
             host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((unit.index, host.to_string()));
             if self.fail_first_host.as_deref() == Some(host) {
-                return Err(RunError::Provider("host down".into()));
+                return Err(RunError::Provider("host down".into()).into());
             }
             Ok(UnitOutcome {
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -10260,16 +10312,17 @@ steps:
             &self,
             unit: UnitDispatch,
             host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.seen_run_ids.lock().unwrap().push(unit.run_id.clone());
             if self.fail_first_host.as_deref() == Some(host) {
-                return Err(RunError::Provider("host down".into()));
+                return Err(RunError::Provider("host down".into()).into());
             }
             Ok(UnitOutcome {
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
         fn unit_transcript_path(&self, host: &str, unit_run_id: &str) -> Option<PathBuf> {
@@ -10729,12 +10782,13 @@ steps:
             &self,
             _unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             Ok(UnitOutcome {
                 output: String::new(),
                 success: false,
                 error: Some("boom".into()),
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -10885,7 +10939,7 @@ steps:
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.saw_ws_path
                 .lock()
                 .unwrap()
@@ -10899,6 +10953,7 @@ steps:
                     deleted: vec![],
                     payload: vec![],
                 }),
+                coverage: UnitCoverage::NotLaunched,
             })
         }
 
@@ -11524,7 +11579,7 @@ steps:
             &self,
             unit: UnitDispatch,
             host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             let first = self.calls.lock().unwrap().is_empty();
             self.calls
                 .lock()
@@ -11538,6 +11593,7 @@ steps:
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -17976,7 +18032,7 @@ steps:
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             let is_first = self.calls.lock().unwrap().is_empty();
             self.calls.lock().unwrap().push(unit.index);
             let outcome = UnitOutcome {
@@ -17984,6 +18040,7 @@ steps:
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             };
             if is_first {
                 self.token.cancel();
@@ -18004,13 +18061,14 @@ steps:
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.calls.lock().unwrap().push(unit.index);
             Ok(UnitOutcome {
                 output: format!("out-{}", unit.index),
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }
@@ -18715,7 +18773,7 @@ mod manual_pause_drain {
             &self,
             unit: UnitDispatch,
             _host: &str,
-        ) -> Result<UnitOutcome, RunError> {
+        ) -> Result<UnitOutcome, UnitFailure> {
             self.calls.lock().unwrap().push(unit.step_id.clone());
             if let Some((id, token, after)) = &self.trip_on {
                 if *id == unit.step_id {
@@ -18734,6 +18792,7 @@ mod manual_pause_drain {
                 success: true,
                 error: None,
                 workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
             })
         }
     }

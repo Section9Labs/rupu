@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use rupu_agent::{AgentRunOpts, RunError};
 use rupu_coverage::FindingProfile::{self, Full, Summary};
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
+    run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
+    UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::{RunStore, Workflow};
 use std::collections::BTreeMap;
@@ -71,7 +72,11 @@ impl ProfileRecorder {
 
 #[async_trait]
 impl UnitDispatcher for ProfileRecorder {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.calls.lock().unwrap().push((
             unit.step_id.clone(),
             unit.index,
@@ -82,7 +87,7 @@ impl UnitDispatcher for ProfileRecorder {
             let mut failed = self.failed_once.lock().unwrap();
             if !*failed {
                 *failed = true;
-                return Err(RunError::Provider(format!("{host} refused the launch")));
+                return Err(RunError::Provider(format!("{host} refused the launch")).into());
             }
         }
         Ok(UnitOutcome {
@@ -90,6 +95,7 @@ impl UnitDispatcher for ProfileRecorder {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }

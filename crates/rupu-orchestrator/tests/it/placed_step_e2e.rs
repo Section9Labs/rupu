@@ -5,9 +5,10 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::runner::{
-    run_workflow, OrchestratorRunOpts, StepFactory, UnitDispatch, UnitDispatcher, UnitOutcome,
+    run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
+    UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::StopReason;
@@ -113,7 +114,11 @@ impl RecordingDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for RecordingDispatcher {
-    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.calls.lock().unwrap().push((
             unit.step_id.clone(),
             unit.agent.clone(),
@@ -125,6 +130,7 @@ impl UnitDispatcher for RecordingDispatcher {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }
@@ -347,7 +353,7 @@ impl UnitDispatcher for CodenameDispatcher {
         &self,
         unit: UnitDispatch,
         _host: &str,
-    ) -> Result<UnitOutcome, RunError> {
+    ) -> Result<UnitOutcome, UnitFailure> {
         self.seen
             .lock()
             .unwrap()
@@ -357,6 +363,7 @@ impl UnitDispatcher for CodenameDispatcher {
             success: true,
             error: None,
             workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
         })
     }
 }
