@@ -418,7 +418,7 @@ async fn connect_and_run(
             token: token.to_string(),
         },
         rupu_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: vec![],
+        capabilities: rupu_cp::node::protocol::node_capabilities(),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?))
         .await
@@ -665,6 +665,7 @@ fn spawn_control(exe: &Path, argv: &[String]) -> anyhow::Result<tokio::process::
 }
 
 fn spawn_run(exe: &Path, run_id: &str, spec: &RunSpec) -> anyhow::Result<tokio::process::Child> {
+    check_spec(spec)?;
     let argv = build_argv(run_id, spec);
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(&argv)
@@ -679,15 +680,28 @@ fn spawn_run(exe: &Path, run_id: &str, spec: &RunSpec) -> anyhow::Result<tokio::
     cmd.spawn().context("spawn rupu child")
 }
 
+/// Refuse a spec whose fields `build_argv` could not honour, rather than
+/// launch without them. `findings_profile` is an agent-run flag; `rupu
+/// workflow run` resolves profiles per step from the workflow file.
+fn check_spec(spec: &RunSpec) -> anyhow::Result<()> {
+    if spec.kind == RunSpecKind::Workflow && spec.findings_profile.is_some() {
+        anyhow::bail!(
+            "run spec for workflow `{}` carries a findings_profile, which applies to agent runs only",
+            spec.name
+        );
+    }
+    Ok(())
+}
+
 /// Build the argv (after the executable) for a local `rupu workflow run`
 /// or `rupu run` invocation dispatched by the node agent.
 ///
 /// Workflow: `workflow run <name> [<target>] --run-id <id> --plain [--input k=v]… [--mode m]`
-/// Agent:    `run <name> [<target>] --run-id <id> [--mode m] [--prompt p] [--tmp (if target)]`
+/// Agent:    `run <name> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--prompt p] [--tmp (if target)]`
 ///
 /// Flag names are verified against the clap definitions in `cmd/workflow.rs`
 /// (`--run-id`, `--plain`, `--input`, `--mode`) and `cmd/run.rs`
-/// (`--run-id`, `--mode`, `--prompt`, `--tmp`).
+/// (`--run-id`, `--mode`, `--findings-profile`, `--prompt`, `--tmp`).
 pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
     match spec.kind {
         RunSpecKind::Workflow => {
@@ -718,6 +732,10 @@ pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
             if let Some(m) = &spec.mode {
                 argv.push("--mode".to_string());
                 argv.push(m.clone());
+            }
+            if let Some(f) = spec.findings_profile {
+                argv.push("--findings-profile".to_string());
+                argv.push(f.as_str().to_string());
             }
             if let Some(p) = &spec.prompt {
                 argv.push("--prompt".to_string());
@@ -883,6 +901,20 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
         interval = args.interval,
         "node pull: starting"
     );
+
+    // Advertise what this worker honours: the bucket has no handshake, so the
+    // CP reads these markers before putting a job that needs a newer worker
+    // (e.g. one carrying `findings_profile`). A worker that can't write here
+    // can't upload results either, so fail startup rather than run unseen.
+    let info = rupu_cp::host::bucket::WorkerInfo {
+        worker_id: host_id.clone(),
+        rupu_version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: rupu_cp::node::protocol::node_capabilities(),
+    };
+    bucket
+        .put_worker_info(&host_id, &serde_json::to_vec(&info)?)
+        .await
+        .context("advertise worker capabilities (nodes/<worker>.json)")?;
 
     let mut active: HashMap<String, BucketRunState> = HashMap::new();
     let mut once_iters: u32 = 0;
@@ -1231,6 +1263,7 @@ mod tests {
             prompt: None,
             mode: Some("bypass".to_string()),
             target: Some("github:o/r".to_string()),
+            findings_profile: None,
         };
         let argv = build_argv("run_X", &spec);
         assert_eq!(
@@ -1262,6 +1295,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         let argv = build_argv("run_Y", &spec);
         assert_eq!(
@@ -1279,6 +1313,7 @@ mod tests {
             prompt: Some("look at this PR".to_string()),
             mode: Some("bypass".to_string()),
             target: Some("github:o/r".to_string()),
+            findings_profile: None,
         };
         let argv = build_argv("run_Z", &spec);
         assert_eq!(
@@ -1307,9 +1342,66 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         let argv = build_argv("run_W", &spec);
         assert_eq!(argv, vec!["run", "check", "--run-id", "run_W"]);
+    }
+
+    #[test]
+    fn build_argv_agent_carries_the_findings_profile() {
+        let spec = RunSpec {
+            kind: RunSpecKind::Agent,
+            name: "sec".to_string(),
+            inputs: BTreeMap::new(),
+            prompt: Some("audit".to_string()),
+            mode: None,
+            target: None,
+            findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+        };
+        let argv = build_argv("run_P", &spec);
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "sec",
+                "--run-id",
+                "run_P",
+                "--findings-profile",
+                "summary",
+                "--prompt",
+                "audit"
+            ]
+        );
+        // Round-trips through the real `rupu run` parser.
+        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
+        assert_eq!(
+            args.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+        check_spec(&spec).expect("an agent spec may carry a profile");
+    }
+
+    #[test]
+    fn a_workflow_spec_carrying_a_findings_profile_is_refused() {
+        let spec = RunSpec {
+            kind: RunSpecKind::Workflow,
+            name: "audit".to_string(),
+            inputs: BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: Some(rupu_coverage::FindingProfile::Full),
+        };
+        let err = check_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("agent runs only"), "{err}");
+    }
+
+    #[test]
+    fn the_node_advertises_findings_profile_support() {
+        assert!(rupu_cp::node::protocol::node_capabilities()
+            .iter()
+            .any(|c| c == rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE));
     }
 
     // ------------------------------------------------------------------

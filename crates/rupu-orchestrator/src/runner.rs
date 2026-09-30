@@ -137,6 +137,26 @@ pub struct UnitDispatch {
     /// directory each unit gets on the host is still its own — sharing the
     /// packed input is not sharing a working directory.
     pub workspace: Option<PreparedWorkspace>,
+    /// The step's findings profile as far as the coordinator can resolve it
+    /// (step `findings_profile` → workflow `defaults.findings_profile`; see
+    /// [`remote_unit_findings_profile`]). The dispatcher must deliver it to the
+    /// host as `rupu run --findings-profile` or refuse the launch. `None` ⇒
+    /// the host resolves from the agent file's `findingsProfile`, else `full`.
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
+}
+
+/// The findings profile a remote (`host:` / `distribute:`) unit must run
+/// under, as far as the coordinator can resolve it: step → workflow
+/// `defaults`. The rest of the chain (agent `findingsProfile` → `full`) lives
+/// in the agent file, which the host loads itself — so this returns `None`
+/// rather than falling back to the built-in default, which would override
+/// that frontmatter on the host. Same precedence `DefaultStepFactory` applies
+/// to a local step.
+pub(crate) fn remote_unit_findings_profile(
+    step: &Step,
+    defaults: &crate::workflow::WorkflowDefaults,
+) -> Option<rupu_coverage::FindingProfile> {
+    step.findings_profile.or(defaults.findings_profile)
 }
 
 /// Outcome of one unit dispatched to a remote host.
@@ -6045,6 +6065,7 @@ async fn dispatch_placed_step(
         index: 0,
         run_id: run_id.to_string(),
         workspace: prepared,
+        findings_profile: remote_unit_findings_profile(step, &opts.workflow.defaults),
     };
     match dispatcher.dispatch_unit(unit, host).await {
         Ok(outcome) if outcome.success => {
@@ -6685,6 +6706,9 @@ async fn run_fanout_step(
     // so a unit that hasn't started yet is never dispatched (local OR
     // remote) once a pause has landed.
     let unit_pause = opts.pause.clone();
+    // Same for every unit of the step (and its retry); `Copy`, so each
+    // spawned task gets its own.
+    let unit_findings_profile = remote_unit_findings_profile(step, &opts.workflow.defaults);
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -6821,6 +6845,7 @@ async fn run_fanout_step(
                                     index: idx,
                                     run_id: run_id_clone.clone(),
                                     workspace: unit_ws.clone(),
+                                    findings_profile: unit_findings_profile,
                                 };
                                 match dispatcher.dispatch_unit(unit, &host).await {
                                     Ok(outcome) => {
@@ -6885,6 +6910,7 @@ async fn run_fanout_step(
                                             index: idx,
                                             run_id: retry_run_id,
                                             workspace: unit_ws.clone(),
+                                            findings_profile: unit_findings_profile,
                                         };
                                         warn!(
                                             step = %step_id,

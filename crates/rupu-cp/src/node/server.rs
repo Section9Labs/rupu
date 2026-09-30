@@ -125,12 +125,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     };
 
-    let (node_id, token) = match frame {
+    let (node_id, token, capabilities, rupu_version) = match frame {
         Frame::Hello {
             node_id,
             auth: Auth::Token { token },
-            ..
-        } => (node_id, token),
+            capabilities,
+            rupu_version,
+        } => (node_id, token, capabilities, rupu_version),
         other => {
             warn!(frame_type = ?std::mem::discriminant(&other),
                   "node_tunnel: first frame was not Hello");
@@ -164,7 +165,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // ── 3. Register + Welcome ─────────────────────────────────────────────────
     let (tx, mut rx) = mpsc::channel::<Frame>(CHANNEL_CAPACITY);
-    let conn = state.node_registry.register(&node_id, tx);
+    let conn = state.node_registry.register_with_hello(
+        &node_id,
+        tx,
+        capabilities,
+        Some(rupu_version),
+    );
 
     let welcome = match serde_json::to_string(&Frame::Welcome {}) {
         Ok(s) => s,

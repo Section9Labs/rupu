@@ -869,3 +869,54 @@ mod inventory_fold_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod launch_agent_tests {
+    use super::*;
+    use crate::agent_launcher::AgentLaunchError;
+    use std::sync::Mutex;
+
+    struct Capture(Mutex<Option<AgentLaunchRequest>>);
+
+    #[async_trait::async_trait]
+    impl AgentLauncher for Capture {
+        async fn launch(&self, req: AgentLaunchRequest) -> Result<String, AgentLaunchError> {
+            *self.0.lock().unwrap() = Some(req);
+            Ok("run_LOCAL".into())
+        }
+    }
+
+    /// The local connector hands the request to `cp serve`'s launcher intact —
+    /// that launcher puts `findings_profile` on the `rupu run` argv
+    /// (`rupu-cli`'s `cp_agent_launcher` tests cover that hop).
+    #[tokio::test]
+    async fn launch_agent_forwards_the_findings_profile_to_the_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = Arc::new(Capture(Mutex::new(None)));
+        let conn = LocalHostConnector::new(
+            None,
+            Some(capture.clone()),
+            None,
+            None,
+            Arc::new(RunStore::new(tmp.path().join("runs"))),
+            tmp.path().to_path_buf(),
+        );
+        let id = conn
+            .launch_agent(AgentLaunchRequest {
+                agent: "sec".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: None,
+                findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+            })
+            .await
+            .unwrap();
+        assert_eq!(id, "run_LOCAL");
+        assert_eq!(
+            capture.0.lock().unwrap().as_ref().unwrap().findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+    }
+}

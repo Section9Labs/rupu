@@ -847,6 +847,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         mirror.create_run("run_01USAGE", "host_abc", &spec).unwrap();
         let recorded = PathBuf::from("/remote/proj/.rupu/transcripts/run_01A.jsonl");

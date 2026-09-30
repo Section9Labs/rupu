@@ -1161,6 +1161,13 @@ impl SshHostConnector {
             a.push("--mode".into());
             a.push(m.clone());
         }
+        // An older remote rupu rejects the unknown flag (clap) and the run
+        // fails with that in its launch log — refused, never silently run
+        // under the agent's own profile.
+        if let Some(f) = req.findings_profile {
+            a.push("--findings-profile".into());
+            a.push(f.as_str().into());
+        }
         if let Some(p) = &req.prompt {
             a.push("--prompt".into());
             a.push(p.clone());
@@ -1848,6 +1855,7 @@ impl HostConnector for SshHostConnector {
             prompt: None,
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: None,
         };
 
         // Build the remote command BEFORE creating the mirror run: a refused
@@ -1910,6 +1918,7 @@ impl HostConnector for SshHostConnector {
             prompt: req.prompt.clone(),
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: req.findings_profile,
         };
 
         // Build the remote command BEFORE creating the mirror run — see
@@ -4454,6 +4463,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5178,6 +5188,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5267,6 +5278,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5331,6 +5343,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5381,6 +5394,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5431,6 +5445,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5582,6 +5597,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5663,6 +5679,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5750,6 +5767,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -5838,6 +5856,7 @@ mod tests {
                     target: None,
                     working_dir: None,
                     run_id: None,
+                    findings_profile: None,
                 })
                 .await
                 .expect("launch_agent");
@@ -6130,6 +6149,7 @@ mod tests {
                 target: None,
                 working_dir: Some(STAGED_WD.into()),
                 run_id: None,
+                findings_profile: None,
             })
             .await
             .unwrap();
@@ -6163,6 +6183,7 @@ mod tests {
                 target: None,
                 working_dir: None,
                 run_id: Some("run_01MINTEDBYCOORD".into()),
+                findings_profile: None,
             })
             .await
             .unwrap();
@@ -6180,6 +6201,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_agent_passes_the_findings_profile_to_the_remote_rupu_run() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let id = conn
+            .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "sec".into(),
+                prompt: Some("audit".into()),
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some("run_01PROFILED".into()),
+                findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+            })
+            .await
+            .unwrap();
+        let cmds = fake.commands.lock().unwrap();
+        let launch = cmds
+            .iter()
+            .find(|c| c.contains("'rupu' 'run' 'sec'"))
+            .unwrap_or_else(|| panic!("no agent launch in {cmds:?}"));
+        assert!(
+            launch.contains("'--findings-profile' 'summary'"),
+            "the remote `rupu run` must carry the profile: {launch}"
+        );
+        drop(cmds);
+        let rec = run_store.load(&id).unwrap();
+        assert_eq!(rec.worker_id.as_deref(), Some("host_abc"));
+    }
+
+    #[test]
+    fn agent_argv_without_a_profile_omits_the_flag() {
+        let req = crate::agent_launcher::AgentLaunchRequest {
+            agent: "sec".into(),
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: None,
+        };
+        let argv = SshHostConnector::agent_argv(&req, "run_X");
+        assert!(!argv.iter().any(|a| a == "--findings-profile"), "{argv:?}");
+    }
+
+    #[tokio::test]
     async fn launch_agent_rejects_a_malformed_supplied_run_id_without_dispatching() {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
         let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
@@ -6191,6 +6257,7 @@ mod tests {
                 target: None,
                 working_dir: None,
                 run_id: Some("../evil".into()),
+                findings_profile: None,
             })
             .await
             .unwrap_err();
@@ -6466,6 +6533,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         }
     }
 
@@ -6477,6 +6545,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         }
     }
 

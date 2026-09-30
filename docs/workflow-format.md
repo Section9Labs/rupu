@@ -381,9 +381,10 @@ Rules:
 - An `action: findings.record` step resolves its profile as the step's own `findings_profile` → `defaults.findings_profile` → `full` (there is no agent frontmatter to consult). Gate `notify:` hooks have no step of their own and use `defaults.findings_profile` (else `full`).
 - `findings.record` needs different `with:` keys per profile, and a missing key is a parse error naming the step, the profile, and the keys: `full` needs `scope` and `report`; `summary` needs `scope`, `summary`, `severity`, and `rationale`. Only key presence is checked, so a value may be a `{{ … }}` template.
 - Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
+- Remote steps (`host:` / `distribute:`) follow the same order. The coordinator resolves the step's value, else `defaults.findings_profile`, and launches each unit with `rupu run --findings-profile <profile>`. When neither is set, the host resolves the agent's `findingsProfile` from its own copy of the agent file, then `full`. A fan-out unit retried on its fallback host keeps the profile.
+- A remote host that can't honour the profile refuses the launch; the unit doesn't run under a different profile. That covers an older tunnel node that didn't advertise support, a bucket whose pull workers haven't advertised it, and an HTTP host whose `/api/host/info` doesn't list it. An older SSH host's `rupu run` rejects the unknown flag, so the unit fails. One gap remains on bucket hosts: an old worker polling the same bucket as an upgraded one can't be detected and may still claim the unit.
+- Upgrade rupu on a remote host before adding `findingsProfile` to an agent it runs: an older release rejects agent files that contain `findingsProfile`, because agent frontmatter does not accept unknown keys.
 - The field must never be silently ignored, so these are parse errors:
-  - `findings_profile` on a remote step (`host:` / `distribute:`) — remote units resolve their profile from the agent file, so set `findingsProfile` in that agent's frontmatter instead (upgrade rupu on the remote host first: an older release rejects agent files that contain `findingsProfile`, because agent frontmatter does not accept unknown keys);
-  - `defaults.findings_profile` in a workflow that has any remote step, for the same reason;
   - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`);
   - `findings_profile` on an `action:` step that calls any tool other than `findings.record` (e.g. `action: issues.comment`) — only `findings.record` has a findings contract for the profile to configure.
 
@@ -1323,7 +1324,7 @@ Common parse-time failures:
 - invalid input defaults or enum defaults
 - extraneous fields inside `trigger:`
 - an `action:` naming an unknown tool, or `with:` failing the tool's schema
-- a `findings_profile:` on a remote step, on an agent-less step, or on an `action:` step other than `findings.record`, or `defaults.findings_profile` alongside a remote step
+- a `findings_profile:` on an agent-less step, or on an `action:` step other than `findings.record`
 - a `branch:` target that doesn't exist, isn't forward, or appears in both arms
 - a `join:` with no inbound edges, or a `wait: { count: N }` exceeding its inbound path count
 - a cycle anywhere in the workflow's dependency graph
