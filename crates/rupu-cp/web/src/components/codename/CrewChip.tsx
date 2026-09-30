@@ -14,7 +14,7 @@ export function CrewChip({ crew, derived }: { crew: string; derived?: boolean })
     >
       <span
         aria-hidden
-        className="inline-block h-2 w-2 rounded-full bg-muted"
+        className="inline-block h-2 w-2 rounded-full bg-ink-mute"
         style={tint ? { backgroundColor: tint } : undefined}
       />
       {crew}
