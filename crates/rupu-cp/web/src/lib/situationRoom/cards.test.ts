@@ -178,6 +178,8 @@ describe('cardFromEvent — codenames', () => {
     expect(c.model).toBe('claude-sonnet-4-6');
     expect(c.transcriptPath).toBe('t/ar1.jsonl');
     expect(c.group).toBe('activity');
+    // No 0-based `unit 4` beside the 1-based `heron#4`.
+    expect(c.detail).not.toMatch(/unit \d/);
   });
 
   it('unit_started carrying a codename yields no card (agent_started follows it)', () => {

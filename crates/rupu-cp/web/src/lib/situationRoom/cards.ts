@@ -252,7 +252,10 @@ function cardFromEventInner(ev: RunEvent, ts: number, key: string): StreamCard |
         transcriptPath: k.transcript_path,
         // The member label IS the headline: who launched, on what.
         title: memberLabel(k.codename, k.agent, k.provider, k.model),
-        detail: k.unit_index != null ? `${stepLabel(k.step_id)} · unit ${k.unit_index}` : stepLabel(k.step_id) };
+        // The codename (`heron#4`, 1-based) already identifies the unit; a
+        // 0-based `unit 3` beside it only contradicted it. The fan-out target
+        // (unitKey, from the page's unit_key index) is the useful context.
+        detail: stepLabel(k.step_id) };
     case 'unit_completed':
       return { ...base, form: 'complete', group: 'activity',
         accent: k.success ? 'brand' : 'error', badge: k.success ? 'Unit done' : 'Unit failed',
