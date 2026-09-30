@@ -530,3 +530,95 @@ fn print_real_legacy_run_names() {
         }
     }
 }
+
+#[test]
+fn event_namers_classify_once_per_run_and_never_open_a_namer_for_codename_era_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let modern_id = "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2Y";
+    let mut modern = legacy_record(modern_id, "legacy-fixture");
+    modern.codename = Some("olive-pine".into());
+    store.create(modern.clone(), WF).unwrap();
+    store
+        .create(legacy_record(RUN, "legacy-fixture"), WF)
+        .unwrap();
+    let mut namers = EventNamers::new(store.clone());
+
+    // A codename-era run's codename-less agent step: never derived.
+    let mut step = serde_json::json!({"type": "step_started", "run_id": modern_id,
+        "step_id": "alpha", "kind": "linear", "agent": "ag"});
+    assert!(!namers.fill_row(modern_id, &mut step));
+    assert!(step.get("codename").is_none());
+    assert!(namers.known_modern(modern_id));
+    assert_eq!(
+        namers.legacy_runs(),
+        0,
+        "no LegacyNamer for a codename-era run"
+    );
+
+    // note_record classifies without IO; legacy runs stay unclassified until
+    // their first unnamed event.
+    let mut other = EventNamers::new(store.clone());
+    other.note_record(&modern);
+    other.note_record(&legacy_record(RUN, "legacy-fixture"));
+    assert!(other.known_modern(modern_id));
+    assert!(!other.known_modern(RUN));
+    assert_eq!(other.cached_runs(), 1);
+
+    let mut legacy = serde_json::json!({"type": "step_started", "run_id": RUN,
+        "step_id": "alpha", "kind": "linear", "agent": "ag"});
+    assert!(namers.fill_row(RUN, &mut legacy));
+    assert_eq!(namers.legacy_runs(), 1);
+    assert_eq!(namers.cached_runs(), 2);
+
+    namers.evict(RUN);
+    namers.evict(modern_id);
+    assert_eq!(namers.cached_runs(), 0);
+}
+
+#[test]
+fn run_is_legacy_is_decided_by_the_run_record() {
+    let mut r = legacy_record(RUN, "wf");
+    assert!(run_is_legacy(&r));
+    r.codename = Some(String::new());
+    assert!(run_is_legacy(&r));
+    r.codename = Some("jade-reef".into());
+    assert!(!run_is_legacy(&r));
+    // fill_detail_steps leaves a codename-era run's unnamed records alone.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+    let mut detail = serde_json::json!({"steps": [
+        {"step_id": "alpha", "kind": "linear", "run_id": "", "skipped": true}
+    ]});
+    fill_detail_steps(&store, &r, &mut detail);
+    assert!(detail["steps"][0].get("codename").is_none());
+}
+
+#[test]
+fn a_sub_run_miss_rebuilds_the_tree_at_most_once_per_refresh_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+    store
+        .create(legacy_record(RUN, "legacy-fixture"), WF)
+        .unwrap();
+    let s1 = "sub_01J9ZQ3K4M5N6P7Q8R9S0T1V01";
+    let s2 = "sub_01J9ZQ3K4M5N6P7Q8R9S0T1V02";
+    let t = |sub: &str| {
+        store
+            .root
+            .join(RUN)
+            .join("sub")
+            .join(sub)
+            .join("transcript.jsonl")
+    };
+    write_run_start(&t(s1), "scout", None);
+    let mut d = LegacyNamer::open(&store, RUN);
+    assert!(d.sub(&store, s1).is_some());
+
+    // Dispatched after the build: inside the window a miss does not rebuild.
+    write_run_start(&t(s2), "scout", None);
+    assert!(d.sub(&store, s2).is_none());
+    // Once the window has passed, the next miss rebuilds and finds it.
+    d.subs_built_at = Some(Instant::now() - SUB_REFRESH);
+    assert!(d.sub(&store, s2).is_some());
+}

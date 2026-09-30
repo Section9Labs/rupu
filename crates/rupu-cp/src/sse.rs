@@ -26,18 +26,31 @@ pub async fn tail_events_sse(
     run_id: &str,
 ) -> std::io::Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
     let source = FileTailRunSource::open(&store.events_path(run_id)).await?;
-    let mut namers = crate::codename_legacy::EventNamers::new(store);
-    let stream = source.map(move |ev| Ok::<_, Infallible>(sse_frame(&mut namers, &ev)));
+    // Classified once, at attach, off the executor: `None` for a
+    // codename-era run, whose events then pass through untouched.
+    let namers = crate::codename_legacy::namers_for_run(store, run_id).await;
+    let stream = source.then(move |ev| {
+        let namers = namers.clone();
+        async move { Ok::<_, Infallible>(sse_frame(namers.as_ref(), ev).await) }
+    });
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-/// One SSE frame for `ev`. An agent-announcing event without a codename (a
-/// legacy run) is re-serialized with a derived one + `codename_derived: true`;
-/// every other event is serialized exactly as before.
-fn sse_frame(namers: &mut crate::codename_legacy::EventNamers, ev: &Event) -> SseEvent {
-    let framed = match namers.fill_typed(ev) {
+/// One SSE frame for `ev`. An agent-announcing event without a codename of a
+/// legacy run is re-serialized with a derived one + `codename_derived: true`
+/// (any disk work on the blocking pool); every other event is serialized
+/// exactly as before.
+async fn sse_frame(
+    namers: Option<&crate::codename_legacy::SharedEventNamers>,
+    ev: Event,
+) -> SseEvent {
+    let row = match namers {
+        Some(n) => crate::codename_legacy::name_event(n, &ev).await,
+        None => None,
+    };
+    let framed = match row {
         Some(row) => SseEvent::default().json_data(&row),
-        None => SseEvent::default().json_data(ev),
+        None => SseEvent::default().json_data(&ev),
     };
     framed.unwrap_or_else(|_| SseEvent::default().comment("event serialize error"))
 }
@@ -99,11 +112,21 @@ pub async fn tail_all_events_sse(
     run_store: Arc<RunStore>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(256);
-    let mut namers = crate::codename_legacy::EventNamers::new(run_store.clone());
-    let _coordinator = spawn_firehose_coordinator(run_store, tx, TERMINAL_FORWARDER_GRACE);
+    // Shared with the coordinator: it classifies each run from the record it
+    // lists (codename-era runs never open a legacy namer) and evicts a run's
+    // entry when it prunes that run's tail, so the cache stays bounded.
+    let namers = crate::codename_legacy::EventNamers::shared(run_store.clone());
+    let _coordinator = spawn_firehose_coordinator_named(
+        run_store,
+        tx,
+        TERMINAL_FORWARDER_GRACE,
+        Some(namers.clone()),
+    );
 
-    let stream =
-        MergedEvents { rx }.map(move |ev| Ok::<_, Infallible>(sse_frame(&mut namers, &ev)));
+    let stream = MergedEvents { rx }.then(move |ev| {
+        let namers = namers.clone();
+        async move { Ok::<_, Infallible>(sse_frame(Some(&namers), ev).await) }
+    });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
@@ -112,11 +135,29 @@ pub async fn tail_all_events_sse(
 /// testable without an axum server. Sends merged events into `tx` until the
 /// receiving side is dropped, then aborts every forwarder and exits;
 /// returns the coordinator task's handle so tests can observe that exit.
+#[cfg(test)]
 fn spawn_firehose_coordinator(
     run_store: Arc<RunStore>,
     tx: mpsc::Sender<Event>,
     terminal_grace: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_firehose_coordinator_named(run_store, tx, terminal_grace, None)
+}
+
+/// [`spawn_firehose_coordinator`] plus the stream's shared codename cache:
+/// each attached run is classified from its listed record, and its entry is
+/// evicted when its tail is pruned.
+fn spawn_firehose_coordinator_named(
+    run_store: Arc<RunStore>,
+    tx: mpsc::Sender<Event>,
+    terminal_grace: Duration,
+    namers: Option<crate::codename_legacy::SharedEventNamers>,
+) -> tokio::task::JoinHandle<()> {
+    let with_namers = move |f: &mut dyn FnMut(&mut crate::codename_legacy::EventNamers)| {
+        if let Some(n) = &namers {
+            f(&mut n.lock().unwrap_or_else(|p| p.into_inner()));
+        }
+    };
     tokio::spawn(async move {
         let mut seen: HashSet<String> = HashSet::new();
         // One forwarder task per tailed run, keyed by run id. A
@@ -153,6 +194,7 @@ fn spawn_firehose_coordinator(
                         // any id we haven't seen (a run started after connect).
                         let take = if first { active } else { !seen.contains(&r.id) };
                         if take && seen.insert(r.id.clone()) {
+                            with_namers(&mut |n| n.note_record(r));
                             let path = run_store.events_path(&r.id);
                             if let Ok(mut src) = FileTailRunSource::open(&path).await {
                                 let tx_run = tx.clone();
@@ -200,6 +242,7 @@ fn spawn_firehose_coordinator(
                         .cloned()
                         .collect();
                     for id in expired {
+                        with_namers(&mut |n| n.evict(&id));
                         if let Some(h) = forwarders.remove(&id) {
                             h.abort();
                         }
@@ -337,6 +380,36 @@ mod tests {
             Err(_) => {} // timed out with no event — pruned, as required
             Ok(ev) => panic!("expected no delivery after prune, got {ev:?}"),
         }
+    }
+
+    /// The firehose's codename cache is bounded by the tails it holds: an
+    /// attached run is classified from its listed record, and its entry is
+    /// evicted when its tail is pruned.
+    #[tokio::test(start_paused = true)]
+    async fn firehose_evicts_a_pruned_runs_codename_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let namers = crate::codename_legacy::EventNamers::shared(store.clone());
+        let (tx, mut rx) = mpsc::channel::<Event>(256);
+        spawn_firehose_coordinator_named(
+            store.clone(),
+            tx,
+            Duration::from_secs(5),
+            Some(namers.clone()),
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut record = seed_run(&store, "run_live", RunStatus::Running);
+        record.codename = Some("jade-reef".into());
+        store.update(&record).expect("update");
+        append_event(&store, "run_live", "step_one");
+        assert_eq!(recv_step(&mut rx).await.as_deref(), Some("step_one"));
+        assert!(namers.lock().unwrap().known_modern("run_live"));
+
+        record.status = RunStatus::Completed;
+        store.update(&record).expect("update status");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(namers.lock().unwrap().cached_runs(), 0);
     }
 
     /// Dropping the receiving side stops the coordinator: its task exits

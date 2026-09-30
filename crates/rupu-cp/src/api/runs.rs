@@ -74,7 +74,7 @@ async fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Valu
     let u = crate::usage::run_usage_blocking(Arc::clone(&s.run_store), id.to_string()).await;
     let usage = crate::usage::summarize_run_usage(&u, &s.pricing);
     let mut out = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
-    crate::codename_legacy::fill_detail_steps(&s.run_store, id, &mut out);
+    crate::codename_legacy::fill_detail_steps(&s.run_store, &record, &mut out);
     Ok(Json(out))
 }
 
@@ -642,7 +642,7 @@ pub fn query_run_detail(
     crate::codename::inject_codename(&mut out["run"], &record.id, None);
     // Legacy runs: derive names below the run level too (steps, units,
     // panelists, fixers, parallel sub-steps, findings).
-    crate::codename_legacy::fill_detail_steps(store, id, &mut out);
+    crate::codename_legacy::fill_detail_steps(store, &record, &mut out);
     Ok(out)
 }
 

@@ -530,6 +530,167 @@ async fn firehose_derives_names_for_an_active_legacy_run() {
     );
 }
 
+/// A codename-era run (its run.json carries a codename).
+const MODERN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2Y";
+const MODERN_SUB: &str = "sub_01J9ZQ3K4M5N6P7Q8R9S0T1V09";
+
+/// A codename-era run whose runner deliberately wrote codename-less records
+/// and events: a SKIPPED linear agent step, an agent-less gate step, and a
+/// `dispatch_started` without a codename (with a sub transcript on disk). The
+/// snapshot names agents for all of them, so ANY legacy derivation — opening
+/// a `LegacyNamer` for this run — would put derived names on the wire.
+fn seed_modern(runs: &Path, status: &str) {
+    const WF_MODERN: &str = r#"
+name: modern-fixture
+steps:
+  - id: alpha
+    agent: ag
+    actions: []
+    prompt: "a"
+  - id: skipme
+    agent: ag
+    actions: []
+    when: "false"
+    prompt: "s"
+  - id: gate
+    approval:
+      prompt: "ok?"
+"#;
+    let dir = runs.join(MODERN);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut rec = record(MODERN, Some("olive-pine"));
+    rec["status"] = json!(status);
+    std::fs::write(dir.join("run.json"), rec.to_string()).unwrap();
+    std::fs::write(dir.join("workflow.yaml"), WF_MODERN).unwrap();
+    write_lines(
+        &dir.join("step_results.jsonl"),
+        &[
+            step_rec(
+                "alpha",
+                "linear",
+                "run_MA",
+                json!({"codename": "olive-pine/stored"}),
+            ),
+            step_rec(
+                "skipme",
+                "linear",
+                "",
+                json!({"skipped": true, "success": true}),
+            ),
+            step_rec("gate", "linear", "", json!({})),
+        ],
+    );
+    write_lines(
+        &dir.join("events.jsonl"),
+        &[
+            json!({"type": "step_started", "run_id": MODERN, "step_id": "alpha",
+                   "kind": "linear", "agent": "ag", "codename": "olive-pine/stored"}),
+            json!({"type": "dispatch_started", "run_id": MODERN, "sub_run_id": MODERN_SUB,
+                   "agent": "scout", "transcript_path": "/t/msub.jsonl"}),
+            json!({"type": "step_skipped", "run_id": MODERN, "step_id": "skipme",
+                   "reason": "when false"}),
+            json!({"type": "step_started", "run_id": MODERN, "step_id": "skipme",
+                   "kind": "linear", "agent": "ag"}),
+            json!({"type": "step_started", "run_id": MODERN, "step_id": "gate",
+                   "kind": "linear"}),
+        ],
+    );
+    let sub_t = runs
+        .join("run_MA")
+        .join("sub")
+        .join(MODERN_SUB)
+        .join("transcript.jsonl");
+    std::fs::create_dir_all(sub_t.parent().unwrap()).unwrap();
+    std::fs::write(
+        &sub_t,
+        format!(
+            "{}\n",
+            json!({"type": "run_start", "data": {"run_id": MODERN_SUB, "workspace_id": "ws",
+                "agent": "scout", "provider": "anthropic", "model": "claude-x",
+                "started_at": "2026-09-10T19:34:20Z", "mode": "bypass"}})
+        ),
+    )
+    .unwrap();
+}
+
+/// No derived field, and no codename on the deliberately unnamed rows.
+fn assert_untouched_modern(v: &Value) {
+    assert_no_derived_flag_anywhere(v);
+    let s = v.to_string();
+    assert!(
+        !s.contains("olive-pine/hedgehog"),
+        "derived step name leaked: {s}"
+    );
+    assert!(!s.contains(">"), "derived sub-agent name leaked: {s}");
+}
+
+#[tokio::test]
+async fn codename_era_run_never_gets_derived_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runs = tmp.path().join("runs");
+    seed_modern(&runs, "running");
+    let addr = spawn_server(tmp.path()).await;
+
+    let d = get(addr, &format!("/api/runs/{MODERN}")).await;
+    assert_untouched_modern(&d["steps"]);
+    assert!(
+        d["steps"][1].get("codename").is_none(),
+        "skipped step: {}",
+        d["steps"][1]
+    );
+    assert!(d["steps"][2].get("codename").is_none(), "gate step");
+
+    let g = get(addr, &format!("/api/runs/{MODERN}/graph")).await;
+    for key in [
+        "step_results",
+        "units",
+        "step_identities",
+        "unit_identities",
+        "subrun_identities",
+    ] {
+        assert_untouched_modern(&g[key]);
+    }
+    assert!(g["subrun_identities"]
+        .get(MODERN_SUB)
+        .is_none_or(|s| s.get("codename").is_none()));
+
+    let rows = get(addr, "/api/events?limit=100").await;
+    let mine: Vec<&Value> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["run_id"] == MODERN)
+        .collect();
+    assert_eq!(mine.len(), 5);
+    for r in &mine {
+        assert_untouched_modern(r);
+    }
+    let unnamed = mine.iter().filter(|r| r.get("codename").is_none()).count();
+    assert_eq!(
+        unnamed, 4,
+        "only alpha's step_started carries a (stored) name"
+    );
+
+    // Per-run tail and the firehose: the last event (gate's step_started)
+    // arrives untouched, as does the codename-less dispatch before it.
+    for path in [
+        format!("/api/runs/{MODERN}/log"),
+        "/api/events/stream".to_string(),
+    ] {
+        let dispatch = first_frame(addr, &path, |v| {
+            v["run_id"] == MODERN && v["type"] == "dispatch_started"
+        })
+        .await;
+        assert!(dispatch.get("codename").is_none(), "{path}: {dispatch}");
+        let gate = first_frame(addr, &path, |v| {
+            v["run_id"] == MODERN && v["type"] == "step_started" && v["step_id"] == "skipme"
+        })
+        .await;
+        assert_untouched_modern(&gate);
+        assert!(gate.get("codename").is_none(), "{path}: {gate}");
+    }
+}
+
 #[test]
 fn legacy_fixture_has_no_codename_keys() {
     let tmp = tempfile::tempdir().unwrap();

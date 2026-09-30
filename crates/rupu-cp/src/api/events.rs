@@ -271,6 +271,9 @@ fn collect_recent_events(
     )));
 
     for run in runs.iter().take(MAX_RUNS_SCANNED) {
+        // Codename-era runs are classified from the record in hand: they
+        // never open a legacy namer.
+        namers.note_record(run);
         let path = run_store.events_path(&run.id);
         let Ok(file) = std::fs::File::open(&path) else {
             continue;

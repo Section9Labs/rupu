@@ -131,15 +131,17 @@ fn build_run_graph_json(
         .iter()
         .filter_map(|r| serde_json::to_value(r).ok())
         .collect();
-    derive_legacy_names(
-        store,
-        id,
-        &mut step_results,
-        &mut units,
-        &mut step_identities,
-        &mut unit_identities,
-        &mut subrun_identities,
-    );
+    if crate::codename_legacy::run_is_legacy(&run) {
+        derive_legacy_names(
+            store,
+            id,
+            &mut step_results,
+            &mut units,
+            &mut step_identities,
+            &mut unit_identities,
+            &mut subrun_identities,
+        );
+    }
 
     // 6. Token/cost rollup for the run-detail header breakdown.
     let usage = crate::usage::summarize_run(store, id, pricing);
@@ -263,7 +265,8 @@ impl Identity {
     }
 }
 
-/// Derive-on-read names for a run recorded before codenames (spec §6), via
+/// Derive-on-read names for a run recorded before codenames (spec §6) — the
+/// caller gates on [`crate::codename_legacy::run_is_legacy`] — via
 /// the shared [`crate::codename_legacy::LegacyNamer`]: fills missing
 /// codenames on `step_results` / `units`, and the identity maps where the
 /// event fold found none (legacy runs have no `agent_started` /

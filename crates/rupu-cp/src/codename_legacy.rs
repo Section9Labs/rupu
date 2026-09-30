@@ -18,10 +18,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rupu_codename::{crew_for, role_word, Codename, CrewNamer};
-use rupu_orchestrator::{codenames::RunNaming, executor::Event, runs::RunStore, Step, Workflow};
+use rupu_orchestrator::{
+    codenames::RunNaming,
+    executor::Event,
+    runs::{RunRecord, RunStore},
+    Step, Workflow,
+};
 use serde_json::{Map, Value};
 
 /// JSON key flagging a derived (not stored) codename.
@@ -71,8 +77,21 @@ pub struct LegacyNamer {
     panel_seen: HashMap<(String, u32, String), BTreeSet<usize>>,
     /// Sub-run identities, built lazily on first need.
     subs: Option<BTreeMap<String, SubIdentity>>,
-    /// Sub-run ids already missed once (a rebuild is attempted once per id).
-    sub_misses: HashSet<String>,
+    /// When `subs` was last (re)built: a live stream's cache miss rebuilds at
+    /// most once per [`SUB_REFRESH`], never once per new dispatch.
+    subs_built_at: Option<Instant>,
+}
+
+/// Minimum interval between two sub-run tree rebuilds for one run.
+const SUB_REFRESH: Duration = Duration::from_secs(2);
+
+/// Is `record` a run written before codenames existed? Decided ONCE per run
+/// from the run record — the only reliable signal: a codename-era runner
+/// still writes codename-less records/events on purpose (skipped / pruned /
+/// cancelled steps, gate / action / branch / split / join steps), and those
+/// must never get derived names.
+pub fn run_is_legacy(record: &RunRecord) -> bool {
+    record.codename.as_deref().is_none_or(str::is_empty)
 }
 
 fn has_codename(obj: &Map<String, Value>) -> bool {
@@ -147,7 +166,7 @@ impl LegacyNamer {
             agent_run,
             panel_seen: HashMap::new(),
             subs: None,
-            sub_misses: HashSet::new(),
+            subs_built_at: None,
         }
     }
 
@@ -529,7 +548,10 @@ impl LegacyNamer {
 
     /// Build `{sub_run_id: identity}` for every sub-run in this run's tree.
     /// `n` in `>{role}#n` is the order of that `(parent, role)` by sub-run
-    /// ULID (chronological) — the dispatcher's own counter order.
+    /// ULID (chronological) — the dispatcher's own counter order. Caveat: two
+    /// sub-runs minted in the same millisecond share their ULID timestamp and
+    /// order by the random suffix, which may not be dispatch order; such a
+    /// pair of same-(parent, role) siblings can have their `#n` swapped.
     fn build_subs(&mut self, store: &RunStore) -> BTreeMap<String, SubIdentity> {
         let mut parents = self.instance_parents(store);
         let root = self.root_codename();
@@ -606,17 +628,22 @@ impl LegacyNamer {
         if self.subs.is_none() {
             let built = self.build_subs(store);
             self.subs = Some(built);
+            self.subs_built_at = Some(Instant::now());
         }
         self.subs.as_ref().expect("just built")
     }
 
-    /// One sub-run's identity; a miss rebuilds the tree once per id (a live
-    /// run may have dispatched it after the cache was built).
+    /// One sub-run's identity. A miss (a live run dispatched it after the
+    /// cache was built) rebuilds the tree at most once per [`SUB_REFRESH`];
+    /// a miss inside the window stays unnamed (a later graph read names it).
     pub fn sub(&mut self, store: &RunStore, sub_run_id: &str) -> Option<SubIdentity> {
         if let Some(hit) = self.subs(store).get(sub_run_id) {
             return Some(hit.clone());
         }
-        if self.sub_misses.insert(sub_run_id.to_string()) {
+        let stale = self
+            .subs_built_at
+            .is_none_or(|t| t.elapsed() >= SUB_REFRESH);
+        if stale {
             self.subs = None;
             return self.subs(store).get(sub_run_id).cloned();
         }
@@ -748,14 +775,25 @@ pub fn event_needs_name(ev: &Event) -> bool {
     )
 }
 
-/// Per-stream / per-request cache of [`LegacyNamer`]s keyed by run id, so
-/// `workflow.yaml` is parsed at most once per run no matter how many events
-/// flow through. Owns its store handle so it can live inside a `'static`
-/// SSE stream.
+/// What an [`EventNamers`] knows about one run.
+enum RunNames {
+    /// A codename-era run (or one whose record can't be read): nothing is
+    /// ever derived, no snapshot is ever parsed. One byte of cache.
+    Modern,
+    Legacy(Box<LegacyNamer>),
+}
+
+/// Per-stream / per-request cache keyed by run id. Each run is classified
+/// ONCE ([`run_is_legacy`]); only a legacy run opens a [`LegacyNamer`]
+/// (parsing `workflow.yaml` once). Owns its store handle so it can live in a
+/// `'static` SSE stream; long-lived holders [`Self::evict`] finished runs.
 pub struct EventNamers {
     store: Arc<RunStore>,
-    by_run: HashMap<String, LegacyNamer>,
+    by_run: HashMap<String, RunNames>,
 }
+
+/// An [`EventNamers`] shared between an SSE stream and the task feeding it.
+pub type SharedEventNamers = Arc<Mutex<EventNamers>>;
 
 impl EventNamers {
     pub fn new(store: Arc<RunStore>) -> Self {
@@ -765,19 +803,64 @@ impl EventNamers {
         }
     }
 
-    /// Fill a missing codename on a serialized event row of run `run_id`.
-    pub fn fill_row(&mut self, run_id: &str, row: &mut Value) -> bool {
-        let store = &*self.store;
-        let namer = self
-            .by_run
-            .entry(run_id.to_string())
-            .or_insert_with(|| LegacyNamer::open(store, run_id));
-        namer.fill_event(store, row)
+    pub fn shared(store: Arc<RunStore>) -> SharedEventNamers {
+        Arc::new(Mutex::new(Self::new(store)))
     }
 
-    /// Typed variant for the SSE streams: `Some(row)` (the event with a
-    /// derived codename) only when a name was filled; `None` means "emit the
-    /// event exactly as before".
+    /// Classify a run from a record the caller already holds (no IO). A
+    /// legacy run's namer is still opened lazily, on its first unnamed event.
+    pub fn note_record(&mut self, record: &RunRecord) {
+        if !run_is_legacy(record) {
+            self.by_run.insert(record.id.clone(), RunNames::Modern);
+        }
+    }
+
+    /// True when this run is already known to need no derivation — the
+    /// no-IO fast path the streams check before going to the blocking pool.
+    pub fn known_modern(&self, run_id: &str) -> bool {
+        matches!(self.by_run.get(run_id), Some(RunNames::Modern))
+    }
+
+    /// Forget a run (its stream tail was pruned).
+    pub fn evict(&mut self, run_id: &str) {
+        self.by_run.remove(run_id);
+    }
+
+    /// Number of runs cached (tests / diagnostics).
+    pub fn cached_runs(&self) -> usize {
+        self.by_run.len()
+    }
+
+    /// Number of cached runs that opened a [`LegacyNamer`].
+    pub fn legacy_runs(&self) -> usize {
+        self.by_run
+            .values()
+            .filter(|r| matches!(r, RunNames::Legacy(_)))
+            .count()
+    }
+
+    /// Fill a missing codename on a serialized event row of run `run_id`.
+    /// Blocking (may read run.json / workflow.yaml / the sub-run tree).
+    pub fn fill_row(&mut self, run_id: &str, row: &mut Value) -> bool {
+        let store = Arc::clone(&self.store);
+        let names =
+            self.by_run
+                .entry(run_id.to_string())
+                .or_insert_with(|| match store.load(run_id) {
+                    Ok(rec) if run_is_legacy(&rec) => {
+                        RunNames::Legacy(Box::new(LegacyNamer::open(&store, run_id)))
+                    }
+                    _ => RunNames::Modern,
+                });
+        match names {
+            RunNames::Modern => false,
+            RunNames::Legacy(namer) => namer.fill_event(&store, row),
+        }
+    }
+
+    /// Typed variant: `Some(row)` (the event with a derived codename) only
+    /// when a name was filled; `None` means "emit the event exactly as
+    /// before". Blocking — async callers use [`name_event`].
     pub fn fill_typed(&mut self, ev: &Event) -> Option<Value> {
         if !event_needs_name(ev) {
             return None;
@@ -787,15 +870,60 @@ impl EventNamers {
     }
 }
 
+fn lock(namers: &SharedEventNamers) -> std::sync::MutexGuard<'_, EventNamers> {
+    namers.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Async, executor-safe [`EventNamers::fill_typed`]: events that need no
+/// name, and events of runs already known to be codename-era, return with no
+/// IO; anything else (classifying a new run, opening a legacy namer, walking
+/// its sub-run tree) runs on the blocking pool.
+pub async fn name_event(namers: &SharedEventNamers, ev: &Event) -> Option<Value> {
+    if !event_needs_name(ev) || lock(namers).known_modern(ev.run_id()) {
+        return None;
+    }
+    let namers = Arc::clone(namers);
+    let ev = ev.clone();
+    tokio::task::spawn_blocking(move || lock(&namers).fill_typed(&ev))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Classify one run for a per-run event stream, off the executor. `Some`
+/// (with the run's legacy namer already opened) only for a legacy run; a
+/// codename-era run — or an unreadable record — gets `None` and its stream
+/// never touches the derivation.
+pub async fn namers_for_run(store: Arc<RunStore>, run_id: &str) -> Option<SharedEventNamers> {
+    let id = run_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let record = store.load(&id).ok()?;
+        if !run_is_legacy(&record) {
+            return None;
+        }
+        let namer = LegacyNamer::open(&store, &id);
+        let mut namers = EventNamers::new(store);
+        namers.by_run.insert(id, RunNames::Legacy(Box::new(namer)));
+        Some(Arc::new(Mutex::new(namers)))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Fill derived codenames on a run-detail `{run, steps, usage}` object's
-/// `steps[]` (linear step records, `items[]`, panel `findings[]`). A run whose
-/// records are all named never has its snapshot parsed.
-pub fn fill_detail_steps(store: &RunStore, run_id: &str, detail: &mut Value) {
+/// `steps[]` (linear step records, `items[]`, panel `findings[]`) — for a
+/// legacy run only ([`run_is_legacy`]); a codename-era run is returned as is
+/// and its snapshot never parsed.
+pub fn fill_detail_steps(store: &RunStore, record: &RunRecord, detail: &mut Value) {
+    if !run_is_legacy(record) {
+        return;
+    }
     let Some(steps) = detail.get_mut("steps").and_then(Value::as_array_mut) else {
         return;
     };
     if steps.iter().any(record_lacks_name) {
-        LegacyNamer::open(store, run_id).fill_step_records(steps);
+        LegacyNamer::open(store, &record.id).fill_step_records(steps);
     }
 }
 
