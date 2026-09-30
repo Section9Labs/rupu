@@ -26,6 +26,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id", get(get_run).delete(delete_run))
         .route("/api/runs/:id/log", get(get_run_log))
         .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
+        .route("/api/runs/:id/usage", get(get_run_usage))
         .route("/api/runs/:id/autoflow", get(get_run_autoflow))
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
@@ -1164,6 +1165,186 @@ async fn get_run_usage_timeline(
             serde_json::to_value(Vec::<crate::usage::TurnPoint>::new())
                 .map_err(|e| ApiError::internal(e.to_string()))?,
         )),
+        RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
+    }
+}
+
+/// Query for `GET /api/runs/:id/usage`: the optional `?host=` plus the
+/// client's incremental cursor (`since` = how many points it holds, `epoch` =
+/// the series epoch they came from).
+#[derive(Debug, serde::Deserialize, Default)]
+pub(crate) struct RunUsageQuery {
+    #[serde(default)]
+    pub(crate) host: Option<String>,
+    #[serde(default)]
+    pub(crate) since: Option<usize>,
+    /// Accepts the string form the server emits (see [`RunUsageResponse::epoch`]).
+    #[serde(default, deserialize_with = "de_opt_u64_from_str")]
+    pub(crate) epoch: Option<u64>,
+}
+
+/// `GET /api/runs/:id/usage` — a run's live usage (spec 2026-09-29 §5.3).
+#[derive(Debug, serde::Serialize)]
+pub struct RunUsageResponse {
+    pub summary: crate::usage::UsageSummary,
+    /// Per step id (`""` = unattributed).
+    pub steps: std::collections::BTreeMap<String, crate::usage::UsageSummary>,
+    pub turns: u64,
+    pub partial: bool,
+    /// Serialized as a STRING: `RunUsage.epoch` is a u64 around 1.8e18
+    /// (UNIX-nanos base), beyond JS's 2^53 safe-integer range — a JSON number
+    /// would round and two epochs would compare equal in the browser.
+    #[serde(serialize_with = "ser_u64_as_string")]
+    pub epoch: u64,
+    /// Index of `points[0]` in the full series.
+    pub points_from: usize,
+    pub points: Vec<crate::usage::TurnPoint>,
+}
+
+fn ser_u64_as_string<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
+}
+
+/// `?epoch=` arrives as a query string; accept a decimal string (or absent).
+fn de_opt_u64_from_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    use serde::Deserialize as _;
+    let o: Option<String> = Option::deserialize(d)?;
+    o.map(|s| s.parse::<u64>().map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+/// Price a run's fold into the endpoint's response. The tail from `since` is
+/// served only when the client's `epoch` is the run's current one and `since`
+/// is within the series (the series is append-only within an epoch);
+/// otherwise the full series from 0 with the current epoch.
+fn run_usage_response(
+    u: &crate::usage_index::RunUsage,
+    pricing: &rupu_config::PricingConfig,
+    since: Option<usize>,
+    epoch: Option<u64>,
+) -> RunUsageResponse {
+    let from = match (since, epoch) {
+        (Some(n), Some(e)) if e == u.epoch && n <= u.points.len() => n,
+        _ => 0,
+    };
+    RunUsageResponse {
+        summary: crate::usage::summarize_run_usage(u, pricing),
+        steps: u
+            .by_step
+            .iter()
+            .map(|(k, rows)| (k.clone(), crate::usage::summarize(rows, pricing)))
+            .collect(),
+        turns: u.turns,
+        partial: u.partial,
+        epoch: u.epoch,
+        points_from: from,
+        points: u.points[from..].to_vec(),
+    }
+}
+
+fn run_usage_json(
+    u: &crate::usage_index::RunUsage,
+    pricing: &rupu_config::PricingConfig,
+    q: &RunUsageQuery,
+) -> ApiResult<serde_json::Value> {
+    serde_json::to_value(run_usage_response(u, pricing, q.since, q.epoch))
+        .map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// The live usage of run `id` in `store`: 404 unless the run exists there,
+/// then the fold — both off the async executor. The fold never fails the
+/// request (a failed fold reads as an empty, `partial` result).
+async fn local_run_usage(
+    store: Arc<RunStore>,
+    s: &AppState,
+    id: &str,
+    q: &RunUsageQuery,
+) -> ApiResult<serde_json::Value> {
+    {
+        let store = Arc::clone(&store);
+        let id = id.to_string();
+        blocking(move || {
+            store
+                .load(&id)
+                .map(drop)
+                .map_err(|e| run_not_found_or_internal(&id, e))
+        })
+        .await?;
+    }
+    let u = crate::usage::run_usage_blocking(store, id.to_string()).await;
+    run_usage_json(&u, &s.pricing, q)
+}
+
+/// `GET /api/runs/:id/usage` on a resolved host. Shared by the explicit
+/// `?host=` branch and the resolver's [`RunLocation::Host`] branch. Mirrored
+/// transports build from the local mirror; HTTP hosts proxy, forwarding the
+/// incremental cursor.
+async fn run_usage_from_host(
+    s: &AppState,
+    host_id: &str,
+    id: &str,
+    q: &RunUsageQuery,
+) -> ApiResult<serde_json::Value> {
+    let conn = resolve_host(s, host_id)?;
+    if conn.serves_runs_from_local_mirror() {
+        return local_run_usage(Arc::clone(&s.run_store), s, id, q).await;
+    }
+    let mut path = format!("/api/runs/{id}/usage");
+    let mut sep = '?';
+    if let Some(n) = q.since {
+        path.push_str(&format!("{sep}since={n}"));
+        sep = '&';
+    }
+    if let Some(e) = q.epoch {
+        path.push_str(&format!("{sep}epoch={e}"));
+    }
+    conn.proxy_get_json(&path).await.map_err(|e| match e {
+        // An older remote CP has no such route: it answers 404, or — through
+        // its SPA fallback — a 200 that is not JSON. Both mean "this host
+        // cannot serve live usage", which the web degrades on; never a 500.
+        HostConnectorError::NotFound(_) | HostConnectorError::Remote(0, _) => {
+            ApiError::not_found(format!("host {host_id} does not serve usage for run {id}"))
+        }
+        HostConnectorError::Unreachable(m) => {
+            ApiError::internal(format!("host {host_id} unreachable: {m}"))
+        }
+        other => ApiError::internal(other.to_string()),
+    })
+}
+
+/// `GET /api/runs/:id/usage[?host=<id>][&since=N&epoch=E]` — the run's live
+/// usage (spec 2026-09-29 §5.3): priced summary, per-step summaries, turns,
+/// `partial`, and the per-call series. `points` is append-only within an
+/// `epoch` (a decimal string on the wire), so a client holding `N` points of
+/// epoch `E` gets only the tail (`points_from = N`); any other cursor gets
+/// the full series from 0.
+///
+/// Routed exactly like [`get_run_usage_timeline`]: an explicit
+/// `?host=<remote-id>` first; otherwise [`resolve_run_location`] —
+/// `Global`/`ProjectLocal` fold the resolved store; `Host` proxies (or reads
+/// the local mirror); `Unpersisted` has no artifacts anywhere, so it is a 200
+/// with a zero summary and no points; `NotFound` → 404.
+async fn get_run_usage(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunUsageQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(host_id) = q.host.as_deref().filter(|h| *h != "local") {
+        return run_usage_from_host(&s, host_id, &id, &q).await.map(Json);
+    }
+
+    match resolve_run_location(&s, &id).await {
+        RunLocation::Global => local_run_usage(Arc::clone(&s.run_store), &s, &id, &q)
+            .await
+            .map(Json),
+        RunLocation::ProjectLocal { path } => {
+            let store = Arc::new(RunStore::new(path.join(".rupu").join("runs")));
+            local_run_usage(store, &s, &id, &q).await.map(Json)
+        }
+        RunLocation::Host { host_id } => run_usage_from_host(&s, &host_id, &id, &q).await.map(Json),
+        RunLocation::Unpersisted { .. } => {
+            run_usage_json(&crate::usage_index::RunUsage::default(), &s.pricing, &q).map(Json)
+        }
         RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
     }
 }
@@ -2995,6 +3176,134 @@ mod tests {
         .await
         .expect("a mirrored run must be served from the local mirror when the remote errors");
         assert_eq!(resp.0["run"]["id"], serde_json::json!("run_01MIRRORED"));
+    }
+
+    /// One serialized ledger row (`input`/`output` tokens) for `run_id`.
+    fn write_ledger_row(store: &RunStore, run_id: &str, input: u64, output: u64) {
+        use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+        let row = LedgerRow {
+            v: LEDGER_VERSION,
+            id: format!("{run_id}_u1"),
+            at: chrono::Utc::now(),
+            kind: LedgerKind::Turn,
+            step_id: Some("build".into()),
+            unit_index: None,
+            unit_key: None,
+            agent_run_id: format!("{run_id}_agent"),
+            parent_agent_run_id: None,
+            transcript: PathBuf::from(format!("/nowhere/{run_id}_agent.jsonl")),
+            agent: "builder".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: 0,
+        };
+        let mut line = serde_json::to_vec(&row).unwrap();
+        line.push(b'\n');
+        std::fs::write(store.usage_ledger_path(run_id), line).unwrap();
+    }
+
+    /// `?host=<mirrored transport>` builds the live usage from the local
+    /// mirror (the mirror-only connector's `proxy_get_json` panics).
+    #[tokio::test]
+    async fn run_usage_host_mirror_builds_from_the_local_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp).with_hosts(mirror_only_registry(&tmp));
+        s.run_store
+            .create(mirrored_record("run_01MIRRUSAGE"), "")
+            .unwrap();
+        write_ledger_row(&s.run_store, "run_01MIRRUSAGE", 100, 50);
+
+        let v = get_run_usage(
+            State(s),
+            Path("run_01MIRRUSAGE".into()),
+            Query(RunUsageQuery {
+                host: Some("host_mirror".into()),
+                ..RunUsageQuery::default()
+            }),
+        )
+        .await
+        .expect("a mirrored run's usage must be built from the local store")
+        .0;
+        assert_eq!(v["summary"]["total_tokens"], serde_json::json!(150), "{v}");
+        assert_eq!(v["steps"]["build"]["input_tokens"], serde_json::json!(100));
+        assert!(v["epoch"].is_string(), "{v}");
+        assert_eq!(v["points"].as_array().map(Vec::len), Some(1), "{v}");
+    }
+
+    /// Same mirror rule for the usage-timeline (now built off the executor).
+    #[tokio::test]
+    async fn run_usage_timeline_host_mirror_builds_from_the_local_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp).with_hosts(mirror_only_registry(&tmp));
+        s.run_store
+            .create(mirrored_record("run_01MIRRTL"), "")
+            .unwrap();
+        write_ledger_row(&s.run_store, "run_01MIRRTL", 7, 3);
+
+        let v = get_run_usage_timeline(
+            State(s),
+            Path("run_01MIRRTL".into()),
+            Query(RunDetailQuery {
+                host: Some("host_mirror".into()),
+            }),
+        )
+        .await
+        .expect("a mirrored run's timeline must be built from the local store")
+        .0;
+        let points = v.as_array().expect("array");
+        assert_eq!(points.len(), 1, "{v}");
+        assert_eq!(points[0]["tokens_in"], serde_json::json!(7));
+    }
+
+    /// A mirrored host whose run is not in the mirror → 404, not a panic/500.
+    #[tokio::test]
+    async fn run_usage_host_mirror_unknown_run_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp).with_hosts(mirror_only_registry(&tmp));
+        let err = get_run_usage(
+            State(s),
+            Path("run_01NOTMIRRORED".into()),
+            Query(RunUsageQuery {
+                host: Some("host_mirror".into()),
+                ..RunUsageQuery::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// An unpersisted autoflow run has no artifacts anywhere: a 200 with a
+    /// zero summary and an empty series (as the usage-timeline does).
+    #[tokio::test]
+    async fn run_usage_unpersisted_is_an_empty_200() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        write_cycle_with_run(
+            &tmp,
+            "2026-07-01",
+            "afc_unpersisted_usage",
+            "run_01UNPERSISTEDUSE",
+            "blocked",
+            "github:Section9Labs/rupu/issues/42",
+            "issue-supervisor-dispatch",
+            Some("401 invalid x-api-key"),
+            None,
+        );
+        let v = get_run_usage(
+            State(s),
+            Path("run_01UNPERSISTEDUSE".into()),
+            Query(RunUsageQuery::default()),
+        )
+        .await
+        .expect("an unpersisted run has no usage, not a 404")
+        .0;
+        assert_eq!(v["summary"]["total_tokens"], serde_json::json!(0), "{v}");
+        assert_eq!(v["points_from"], serde_json::json!(0), "{v}");
+        assert_eq!(v["points"], serde_json::json!([]), "{v}");
+        assert!(v["epoch"].is_string(), "{v}");
     }
 
     /// Sibling of the above: when the run is NOT in the local mirror either,

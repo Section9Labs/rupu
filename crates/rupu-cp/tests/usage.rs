@@ -1599,3 +1599,157 @@ async fn outliers_include_standalone_runs_and_never_double_count() {
     assert_eq!(out[0]["agent"], "solo");
     assert_eq!(out[0]["workflow_name"], "");
 }
+
+// ---------------------------------------------------------------------------
+// Part E: `GET /api/runs/:id/usage` — the live run usage endpoint (live usage
+// ledger, Plan 2 Task 3): summary, per-step summaries, turns, partial, a
+// STRING epoch, and an append-only incremental `points` series.
+// ---------------------------------------------------------------------------
+
+/// One serialized `LedgerRow` line (a turn of step `step`).
+fn ledger_line(id: &str, step: &str, input: u64, output: u64) -> Vec<u8> {
+    use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+    let row = LedgerRow {
+        v: LEDGER_VERSION,
+        id: id.into(),
+        at: chrono::Utc::now(),
+        kind: LedgerKind::Turn,
+        step_id: Some(step.into()),
+        unit_index: None,
+        unit_key: None,
+        agent_run_id: format!("run_AGENT_{step}"),
+        parent_agent_run_id: None,
+        transcript: std::path::PathBuf::from(format!("/nowhere/run_AGENT_{step}.jsonl")),
+        agent: "builder".into(),
+        provider: FOLD_PROVIDER.into(),
+        model: FOLD_MODEL.into(),
+        input_tokens: input,
+        output_tokens: output,
+        cached_tokens: 0,
+    };
+    let mut line = serde_json::to_vec(&row).unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn append_bytes(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    f.write_all(bytes).unwrap();
+}
+
+#[tokio::test]
+async fn run_usage_endpoint_serves_summary_steps_and_incremental_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let store = create_workflow_run(global, "run_LU", rupu_orchestrator::RunStatus::Running);
+    let ledger = store.usage_ledger_path("run_LU");
+    for (id, step, input) in [("u1", "a", 10), ("u2", "a", 20), ("u3", "b", 30)] {
+        append_bytes(&ledger, &ledger_line(id, step, input, 1));
+    }
+
+    let srv = spawn_server(global).await;
+    let v = get_json(format!("{}/api/runs/run_LU/usage", srv.base_url)).await;
+    assert_eq!(v["summary"]["total_tokens"], 63, "{v}");
+    assert_eq!(v["steps"]["a"]["input_tokens"], 30, "{v}");
+    assert_eq!(v["steps"]["b"]["input_tokens"], 30, "{v}");
+    assert_eq!(v["turns"], 3, "{v}");
+    assert_eq!(v["partial"], false, "{v}");
+    assert_eq!(v["points_from"], 0, "{v}");
+    assert_eq!(v["points"].as_array().unwrap().len(), 3, "{v}");
+    let epoch = v["epoch"]
+        .as_str()
+        .expect("epoch is a decimal string (u64 beyond JS's 2^53)")
+        .to_string();
+    assert!(epoch.parse::<u64>().is_ok(), "epoch {epoch:?}");
+
+    // One more row → an incremental fetch returns only the new point.
+    append_bytes(&ledger, &ledger_line("u4", "b", 40, 1));
+    let v2 = get_json(format!(
+        "{}/api/runs/run_LU/usage?since=3&epoch={epoch}",
+        srv.base_url
+    ))
+    .await;
+    assert_eq!(
+        v2["epoch"],
+        epoch.as_str(),
+        "pure growth keeps the epoch: {v2}"
+    );
+    assert_eq!(v2["points_from"], 3, "{v2}");
+    let pts = v2["points"].as_array().unwrap();
+    assert_eq!(pts.len(), 1, "{v2}");
+    assert_eq!(pts[0]["turn"], 4, "{v2}");
+    assert_eq!(pts[0]["label"], "b", "{v2}");
+    assert_eq!(pts[0]["tokens_in"], 40, "{v2}");
+    assert_eq!(v2["summary"]["total_tokens"], 104, "{v2}");
+    assert_eq!(v2["steps"]["b"]["input_tokens"], 70, "{v2}");
+
+    // Caught up: `since == len` is an empty tail, not a full resend.
+    let v_tail = get_json(format!(
+        "{}/api/runs/run_LU/usage?since=4&epoch={epoch}",
+        srv.base_url
+    ))
+    .await;
+    assert_eq!(v_tail["points_from"], 4, "{v_tail}");
+    assert_eq!(v_tail["points"].as_array().unwrap().len(), 0, "{v_tail}");
+
+    // A wrong epoch, a `since` past the end, or a `since` without an epoch →
+    // the full series from 0.
+    for q in [
+        "since=3&epoch=1".to_string(),
+        format!("since=9&epoch={epoch}"),
+        "since=3".to_string(),
+    ] {
+        let v3 = get_json(format!("{}/api/runs/run_LU/usage?{q}", srv.base_url)).await;
+        assert!(v3["epoch"].is_string(), "{q}: {v3}");
+        assert_eq!(v3["points_from"], 0, "{q}: {v3}");
+        assert_eq!(v3["points"].as_array().unwrap().len(), 4, "{q}: {v3}");
+    }
+}
+
+#[tokio::test]
+async fn run_usage_endpoint_404s_for_unknown_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let resp = reqwest::get(format!("{}/api/runs/run_nope/usage", srv.base_url))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn run_usage_endpoint_serves_a_project_local_run() {
+    // A run under a registered project's `.rupu/runs` resolves through
+    // `resolve_run_location` exactly like the usage-timeline endpoint.
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let proj = tempfile::tempdir().unwrap();
+    let store = create_workflow_run(
+        &proj.path().join(".rupu"),
+        "run_PL",
+        rupu_orchestrator::RunStatus::Completed,
+    );
+    append_bytes(
+        &store.usage_ledger_path("run_PL"),
+        &ledger_line("p1", "review", 7, 3),
+    );
+    let ws_dir = global.join("workspaces");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(
+        ws_dir.join("ws_pl.toml"),
+        format!(
+            "id = \"ws_pl\"\npath = \"{}\"\ncreated_at = \"2026-09-30T00:00:00Z\"\n",
+            proj.path().display()
+        ),
+    )
+    .unwrap();
+
+    let srv = spawn_server(global).await;
+    let v = get_json(format!("{}/api/runs/run_PL/usage", srv.base_url)).await;
+    assert_eq!(v["summary"]["total_tokens"], 10, "{v}");
+    assert_eq!(v["steps"]["review"]["output_tokens"], 3, "{v}");
+}

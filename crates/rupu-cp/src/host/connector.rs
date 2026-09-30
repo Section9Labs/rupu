@@ -354,9 +354,10 @@ pub trait HostConnector: Send + Sync {
     /// Whether this transport's runs are mirrored into the coordinator's own
     /// `RunStore` (by `NodeMirror`) rather than living only on the remote.
     ///
-    /// `true` means run-scoped detail endpoints (`graph`, `usage-timeline`)
-    /// must build from the local mirror: the artifacts are already here, and
-    /// these transports have no generic-GET surface to proxy to anyway.
+    /// `true` means run-scoped detail endpoints (`graph`, `usage-timeline`,
+    /// `usage`) must build from the local mirror: the artifacts are already
+    /// here, and these transports have no generic-GET surface to proxy to
+    /// anyway.
     /// `false` — the default, and the HTTP connector's answer — means the
     /// run's artifacts live on the remote and must be fetched over the wire.
     fn serves_runs_from_local_mirror(&self) -> bool {
