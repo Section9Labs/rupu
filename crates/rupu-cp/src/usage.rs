@@ -75,7 +75,12 @@ pub fn summarize(rows: &[UsageRow], pricing: &PricingConfig) -> UsageSummary {
         match rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent) {
             Some(price) => {
                 any_priced = true;
-                cost_acc += price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens);
+                cost_acc += price.cost_usd(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                );
             }
             None => out.priced = false,
         }
@@ -494,7 +499,12 @@ pub fn breakdown(
         entry.runs += row.runs;
         match rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent) {
             Some(price) => {
-                let c = price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens);
+                let c = price.cost_usd(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                );
                 entry.cost_usd = Some(entry.cost_usd.unwrap_or(0.0) + c);
             }
             None => entry.priced = false,
@@ -565,6 +575,34 @@ pub(crate) mod tests {
         assert!(s.priced);
         // 1M*3.0 + 1M*15.0 = $18.00
         assert!((s.cost_usd.unwrap() - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summarize_and_breakdown_bill_cache_writes_at_the_write_rate() {
+        // Sonnet 4.6 built-in: $3 in / $15 out, $0.30 read, $3.75 write.
+        // 1M prompt = 500k read + 300k write + 200k uncached; 100k output.
+        let pricing = PricingConfig::default();
+        let rows = [UsageRow {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cached_tokens: 500_000,
+            cache_write_tokens: 300_000,
+            ..row("anthropic", "claude-sonnet-4-6", 0, 0, 0)
+        }];
+        let want = 0.2 * 3.0 + 0.5 * 0.30 + 0.3 * 3.75 + 0.1 * 15.0;
+
+        let s = summarize(&rows, &pricing);
+        assert!(
+            (s.cost_usd.unwrap() - want).abs() < 1e-9,
+            "{:?}",
+            s.cost_usd
+        );
+        assert_eq!(s.cache_write_tokens, 300_000);
+
+        let b = breakdown(&rows, &pricing, GroupBy::Model);
+        assert_eq!(b.len(), 1);
+        assert!((b[0].cost_usd.unwrap() - want).abs() < 1e-9);
+        assert_eq!(b[0].cache_write_tokens, 300_000);
     }
 
     #[test]

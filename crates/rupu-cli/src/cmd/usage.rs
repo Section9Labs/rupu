@@ -1047,8 +1047,14 @@ fn join_values(values: &[String]) -> String {
 }
 
 fn cost_for_fact(fact: &UsageFact, pricing: &rupu_config::PricingConfig) -> Option<f64> {
-    rupu_config::pricing::lookup(pricing, &fact.provider, &fact.model, &fact.agent)
-        .map(|price| price.cost_usd(fact.input_tokens, fact.output_tokens, fact.cached_tokens))
+    rupu_config::pricing::lookup(pricing, &fact.provider, &fact.model, &fact.agent).map(|price| {
+        price.cost_usd(
+            fact.input_tokens,
+            fact.output_tokens,
+            fact.cached_tokens,
+            fact.cache_write_tokens,
+        )
+    })
 }
 
 fn compare_cost_then_tokens(

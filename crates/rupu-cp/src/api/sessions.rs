@@ -237,6 +237,8 @@ fn session_usage_from_totals(
                     dto.total_tokens_in,
                     dto.total_tokens_out,
                     dto.total_tokens_cached,
+                    // A session's own totals carry no cache-write count.
+                    0,
                 )
             },
         );

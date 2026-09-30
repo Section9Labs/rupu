@@ -2385,8 +2385,11 @@ mod on_tool_call_tests {
                 input_per_mtok: 1.25,
                 output_per_mtok: 10.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             };
-            let cost = pricing.cost_usd(result.total_tokens_in, result.total_tokens_out, 0);
+            // This Gemini fixture reports no cache reads or writes (the
+            // scripted `Usage` above zeroes both), so 0 is the real count.
+            let cost = pricing.cost_usd(result.total_tokens_in, result.total_tokens_out, 0, 0);
             (result.total_tokens_out, cost)
         }
 

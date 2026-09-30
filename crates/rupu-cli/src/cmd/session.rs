@@ -6431,7 +6431,8 @@ fn session_total_cost_detail(
     )?;
     Some(format!(
         "${:.2}",
-        pricing.cost_usd(session.total_tokens_in, session.total_tokens_out, 0)
+        // A session record's running totals carry no cache-write count.
+        pricing.cost_usd(session.total_tokens_in, session.total_tokens_out, 0, 0)
     ))
 }
 

@@ -1011,7 +1011,12 @@ async fn get_usage_runs(
             let priced_cost =
                 rupu_config::pricing::lookup(&s.pricing, &row.provider, &row.model, &row.agent)
                     .map(|price| {
-                        price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens)
+                        price.cost_usd(
+                            row.input_tokens,
+                            row.output_tokens,
+                            row.cached_tokens,
+                            row.cache_write_tokens,
+                        )
                     });
             out.push(UsageRunRow {
                 run_id: src.id.clone(),

@@ -2457,7 +2457,12 @@ fn run_cost_usd(
     let mut any = false;
     for r in rows {
         if let Some(p) = rupu_config::pricing::lookup(pricing, &r.provider, &r.model, &r.agent) {
-            total += p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens);
+            total += p.cost_usd(
+                r.input_tokens,
+                r.output_tokens,
+                r.cached_tokens,
+                r.cache_write_tokens,
+            );
             any = true;
         }
     }
@@ -2614,7 +2619,14 @@ async fn show_run(
             output_tokens: r.output_tokens,
             cached_tokens: r.cached_tokens,
             cost_usd: rupu_config::pricing::lookup(&cfg.pricing, &r.provider, &r.model, &r.agent)
-                .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens)),
+                .map(|p| {
+                    p.cost_usd(
+                        r.input_tokens,
+                        r.output_tokens,
+                        r.cached_tokens,
+                        r.cache_write_tokens,
+                    )
+                }),
         })
         .collect::<Vec<_>>();
     let usage_totals = (!usage_rows.is_empty()).then(|| WorkflowShowRunUsageTotals {
