@@ -4,6 +4,9 @@
 //! * [`dashboard`] — zone 1, the always-visible title / progress / meters.
 //! * [`graph`] — zone 2, one row per step with codename, agent, provider/model
 //!   and state.
+//! * [`fanout_block`] — a `for_each`/`parallel` step as a status density bar +
+//!   a few live movers (collapsed) or the filtered unit list (drilled); `graph`
+//!   delegates every fan-out step to it.
 //!
 //! Every datum is shown only when the run has actually produced it (no mock
 //! zeros): cost needs a priced run, findings need at least one finding,
@@ -13,11 +16,11 @@
 use chrono::{DateTime, Utc};
 use rupu_orchestrator::runs::{RunStatus, StepKind};
 
-use crate::output::live_view::nav::{Depth, NavState};
+use crate::output::live_view::nav::{Depth, NavState, UnitFilter};
 use crate::output::live_view::row::Line;
 use crate::output::palette::Status;
 use crate::output::run_model::{
-    fmt_hms, step_status, DispatchView, RunView, StepState, StepView, UnitStatus,
+    fmt_hms, step_status, DispatchView, RunView, StepState, StepView, UnitStatus, UnitView,
 };
 
 /// Display width of the `step N/M` progress bar, in columns.
@@ -164,19 +167,36 @@ pub fn graph(view: &RunView, nav: &NavState) -> Vec<Line> {
     let mut rows = Vec::new();
     for step in &view.steps {
         let marked = focus == Some(step.step_id.as_str());
-        match step.kind {
-            // Task 5: delegate ForEach/Parallel to fanout_block. Until then a
-            // fan-out step is a single header row (kind + unit count).
-            StepKind::ForEach | StepKind::Parallel => rows.push(step_row(step, marked)),
-            _ => {
-                rows.push(step_row(step, marked));
-                if marked {
-                    rows.extend(dispatch_rows(view, step));
-                }
+        if is_fan_out(step) {
+            rows.extend(fanout_block(step, nav, marked));
+        } else {
+            rows.push(step_row(step, marked));
+            if marked {
+                rows.extend(dispatch_rows(view, step));
             }
         }
     }
     rows
+}
+
+/// Whether `step` renders as a [`fanout_block`]: a `for_each` / `parallel`
+/// step, or a step that has actually produced fan-out units. The units test
+/// matters because a `run:` step that also carries `for_each:` stays
+/// `StepKind::Run` yet fans out. It is limited to the kinds that have no row
+/// label of their own: a panel's panelists (and a loop's body) also arrive as
+/// units, and those steps keep their `panel iter r/max` / `loop iter n` row.
+fn is_fan_out(step: &StepView) -> bool {
+    match step.kind {
+        StepKind::ForEach | StepKind::Parallel => true,
+        StepKind::Run | StepKind::Linear | StepKind::Unknown => !step.units.is_empty(),
+        StepKind::Panel
+        | StepKind::Loop
+        | StepKind::Branch
+        | StepKind::Split
+        | StepKind::Join
+        | StepKind::Action
+        | StepKind::ApprovalGate => false,
+    }
 }
 
 /// The step the operator has *chosen*, if any. While the view is following
@@ -217,6 +237,252 @@ fn step_row(step: &StepView, marked: bool) -> Line {
     join_dot(line, parts, true)
         .dim(LEADER)
         .status(st, format!("{} {}", st.glyph(), state_text(step)))
+}
+
+/// Display width of a fan-out density bar, in columns.
+const DENSITY_WIDTH: usize = 20;
+/// How many live movers a collapsed fan-out block lists.
+const MOVERS: usize = 4;
+/// Tree branch glyphs of a fan-out unit row.
+const BRANCH_MID: &str = "┣━ ";
+const BRANCH_LAST: &str = "┗━ ";
+
+/// A fan-out step (`for_each` / `parallel`, or a `run:` step with
+/// `for_each:`) as rows:
+///
+/// ```text
+/// ▸ ◐ hunt · for_each · 86 units
+///     ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░ 52/86 ✓52 ◐6 ✗2 ○26
+///     ┣━ ◐ otter#57 · svc-56 · anthropic/claude-opus-5-5 ···· ◐ running
+///     ┗━ … +82 more · [enter] expand
+/// ```
+///
+/// *Collapsed* (the step is not `selected`, or the view is still at `Run`
+/// depth): the header, the density row, and up to [`MOVERS`] live movers.
+/// *Expanded* (`selected` and drilled to `Step` or deeper): the header (tagged
+/// with the active unit filter), the density row — always the whole step's
+/// counts — and every unit admitted by `nav.filter()`, the cursor unit
+/// marked `▸`. Every number comes from [`StepView::unit_counts`].
+pub fn fanout_block(step: &StepView, nav: &NavState, selected: bool) -> Vec<Line> {
+    let expanded = selected && nav.depth() != Depth::Run;
+    let mut rows = vec![
+        fanout_header(step, nav, selected, expanded),
+        density_row(step),
+    ];
+    if expanded {
+        rows.extend(expanded_rows(step, nav));
+    } else {
+        rows.extend(mover_rows(step));
+    }
+    rows
+}
+
+/// `<▸|  ><glyph> <step_id> · <for_each|parallel> · <N units> [· <filter>]`,
+/// plus the duration of a completed step.
+fn fanout_header(step: &StepView, nav: &NavState, selected: bool, expanded: bool) -> Line {
+    let st = step_status(step.state);
+    let mut line = if selected {
+        Line::new().strong(SELECT_MARK)
+    } else {
+        Line::new().dim(NO_MARK)
+    };
+    line = line.status(st, st.glyph().to_string()).plain(" ");
+    line = if selected {
+        line.strong(&step.step_id)
+    } else {
+        line.plain(&step.step_id)
+    };
+
+    // A `run:` step with `for_each:` (and any other unit-carrying step that
+    // is not a `parallel`) is a `for_each` for display purposes.
+    let label = if step.kind == StepKind::Parallel {
+        "parallel"
+    } else {
+        "for_each"
+    };
+    let mut parts: Vec<Line> = fan_out_parts(label, step)
+        .into_iter()
+        .map(|k| Line::new().dim(k))
+        .collect();
+    let filter = filter_label(nav.filter()).filter(|_| expanded);
+    if let Some(f) = filter {
+        parts.push(Line::new().dim(f));
+    }
+    let line = join_dot(line, parts, true);
+
+    match (step.state, step.duration_ms) {
+        (StepState::Complete, Some(ms)) => line
+            .dim(LEADER)
+            .status(st, format!("{} {}", st.glyph(), fmt_hms(ms))),
+        _ => line,
+    }
+}
+
+/// The active unit filter as header text; `None` for `All`.
+fn filter_label(filter: UnitFilter) -> Option<&'static str> {
+    match filter {
+        UnitFilter::All => None,
+        UnitFilter::Running => Some("running"),
+        UnitFilter::Failed => Some("failed"),
+        UnitFilter::Done => Some("done"),
+    }
+}
+
+/// `<bar> <done>/<total> ✓<done> ◐<running> ✗<failed> ○<queued>` — a status
+/// count appears only when non-zero; all of it from `unit_counts()`.
+///
+/// Plan 3: per-unit spend. Units carry no per-unit tokens or cost yet, so the
+/// row has no `⇡tokens $cost` tail rather than a made-up one.
+fn density_row(step: &StepView) -> Line {
+    let c = step.unit_counts();
+    let filled = density_fill(c.done, c.total);
+    let mut line = Line::new()
+        .dim(CHILD_INDENT)
+        .good("▓".repeat(filled))
+        .dim("░".repeat(DENSITY_WIDTH - filled))
+        .plain(" ")
+        .strong(format!("{}/{}", c.done, c.total));
+    for (st, n) in [
+        (Status::Complete, c.done),
+        (Status::Working, c.running),
+        (Status::Failed, c.failed),
+        (Status::Waiting, c.queued),
+    ] {
+        if n > 0 {
+            line = line.plain(" ").status(st, format!("{}{n}", st.glyph()));
+        }
+    }
+    line
+}
+
+/// Filled cells of the density bar: `done / total` rounded half-up, but never
+/// a full bar until every unit is done nor an empty one once any is.
+/// `total == 0` is an empty bar (no division).
+fn density_fill(done: usize, total: usize) -> usize {
+    if total == 0 || done == 0 {
+        0
+    } else if done >= total {
+        DENSITY_WIDTH
+    } else {
+        ((done * DENSITY_WIDTH * 2 + total) / (total * 2)).clamp(1, DENSITY_WIDTH - 1)
+    }
+}
+
+/// Collapsed body: the live movers, then `… +K more` for the rest.
+fn mover_rows(step: &StepView) -> Vec<Line> {
+    let movers = live_movers(step);
+    let hidden = step.units.len().saturating_sub(movers.len());
+    let last = movers.len().saturating_sub(1);
+    let mut rows: Vec<Line> = movers
+        .iter()
+        .enumerate()
+        .map(|(i, u)| unit_row(u, hidden == 0 && i == last, false))
+        .collect();
+    if hidden > 0 {
+        rows.push(
+            Line::new()
+                .dim(NO_MARK)
+                .dim(NO_MARK)
+                .dim(BRANCH_LAST)
+                .dim(format!("… +{hidden} more · [enter] expand")),
+        );
+    }
+    rows
+}
+
+/// Up to [`MOVERS`] units to surface while the step is collapsed: the newest
+/// running units (highest indices — units start in index order), in index
+/// order, then — when fewer than that are running — the highest-index of the
+/// rest.
+///
+/// Plan 3: most-recently-*active*. `UnitView` carries no timestamps, so index
+/// order stands in for recency.
+fn live_movers(step: &StepView) -> Vec<&UnitView> {
+    let running: Vec<&UnitView> = step
+        .units
+        .values()
+        .filter(|u| u.status == UnitStatus::Running)
+        .collect();
+    let skip = running.len().saturating_sub(MOVERS);
+    let mut movers: Vec<&UnitView> = running.into_iter().skip(skip).collect();
+    let need = MOVERS.saturating_sub(movers.len());
+    let mut fill: Vec<&UnitView> = step
+        .units
+        .values()
+        .rev()
+        .filter(|u| u.status != UnitStatus::Running)
+        .take(need)
+        .collect();
+    fill.reverse();
+    movers.extend(fill);
+    movers
+}
+
+/// Expanded body: every unit the nav filter admits (or a note that none do),
+/// the cursor unit marked.
+fn expanded_rows(step: &StepView, nav: &NavState) -> Vec<Line> {
+    let units = nav.filtered_units(step);
+    if units.is_empty() {
+        let note = match filter_label(nav.filter()) {
+            Some(f) => format!("no {f} units"),
+            None => "no units".to_string(),
+        };
+        return vec![Line::new()
+            .dim(NO_MARK)
+            .dim(NO_MARK)
+            .dim(BRANCH_LAST)
+            .dim(note)];
+    }
+    let cursor = nav.selected_unit_in(step).map(|u| u.index);
+    let last = units.len() - 1;
+    units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| unit_row(u, i == last, cursor == Some(u.index)))
+        .collect()
+}
+
+/// `<mark><branch><glyph> <codename> · <unit_key> · <provider/model> ···· <state>`.
+/// The mark column lines up with the step glyph; absent parts are omitted
+/// (no codename before `AgentStarted`, no provider/model until it has run).
+fn unit_row(unit: &UnitView, closes: bool, marked: bool) -> Line {
+    let st = unit_status(unit.status);
+    let mut line = Line::new().dim(NO_MARK);
+    line = if marked {
+        line.strong(SELECT_MARK)
+    } else {
+        line.dim(NO_MARK)
+    };
+    let branch = if closes { BRANCH_LAST } else { BRANCH_MID };
+    line = line
+        .dim(branch)
+        .status(st, st.glyph().to_string())
+        .plain(" ");
+    let key = if unit.unit_key.is_empty() {
+        format!("unit {}", unit.index)
+    } else {
+        unit.unit_key.clone()
+    };
+    // The unit key takes the agent slot: codename · key · provider/model.
+    let parts = member_parts(
+        unit.codename.as_deref(),
+        Some(&key),
+        unit.provider.as_deref(),
+        unit.model.as_deref(),
+    );
+    join_dot(line, parts, false).dim(LEADER).status(
+        st,
+        format!("{} {}", st.glyph(), unit_state_text(unit.status)),
+    )
+}
+
+fn unit_state_text(status: UnitStatus) -> &'static str {
+    match status {
+        UnitStatus::Queued => "queued",
+        UnitStatus::Running => "running",
+        UnitStatus::Done => "done",
+        UnitStatus::Failed => "failed",
+    }
 }
 
 /// Kind annotation parts for non-linear kinds (`gate`, `panel iter 2/5`, …).
@@ -322,6 +588,10 @@ fn member_parts(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Vec<Line> {
+    // An empty string is "not produced" (it would print as a bare ` · `), and
+    // all three come off the wire, so control characters never get echoed.
+    let clean = |s: Option<&str>| s.filter(|s| !s.is_empty()).map(printable);
+    let (agent, provider, model) = (clean(agent), clean(provider), clean(model));
     let mut parts = Vec::new();
     if let Some(c) = codename.and_then(codename_line) {
         parts.push(c);
@@ -347,6 +617,14 @@ fn join_dot(mut line: Line, parts: Vec<Line>, lead: bool) -> Line {
         line.segments.extend(part.segments);
     }
     line
+}
+
+/// Wire text for a single-line row: control characters (ESC, newlines, …)
+/// become U+FFFD so they can neither reach the terminal nor break the row.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// A member codename as a row part: the crew prefix is dropped (the dashboard
@@ -383,9 +661,9 @@ fn codename_line(codename: &str) -> Option<Line> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output::live_view::nav::NavKey;
+    use crate::output::live_view::nav::{NavKey, UnitFilter};
     use crate::output::live_view::row::{render_plain, Style};
-    use crate::output::run_model::RunView;
+    use crate::output::run_model::{RunView, UnitView};
     use chrono::{Duration, TimeZone, Utc};
     use rupu_orchestrator::executor::Event;
     use rupu_orchestrator::runs::{RunStatus, StepKind};
@@ -793,38 +1071,357 @@ mod tests {
         assert!(!b.contains('\u{1b}') && !b.contains("heron"), "{b:?}");
     }
 
-    #[test]
-    fn fan_out_steps_render_a_single_header_line() {
-        // Until `fanout_block` lands, for_each / parallel are one header row
-        // (with the unit count when known), even when selected.
-        let mut v = RunView::default();
-        start_as(&mut v, "hunt", StepKind::ForEach, None, None);
-        for i in 0..3 {
-            v.apply(&Event::UnitStarted {
-                run_id: "r".into(),
-                step_id: "hunt".into(),
-                index: i,
-                unit_key: format!("svc-{i}"),
-                agent: None,
-                transcript_path: "t".into(),
-                host: None,
-                codename: None,
-            });
+    // ---- fan-out block ---------------------------------------------------
+
+    /// A fan-out unit with the wire-derived fields a live run would have:
+    /// every third unit has no codename; only started (non-queued) units know
+    /// their provider/model.
+    fn unit(i: usize, status: UnitStatus) -> UnitView {
+        let started = status != UnitStatus::Queued;
+        UnitView {
+            index: i,
+            unit_key: format!("svc-{i}"),
+            agent: Some("breaker".into()),
+            codename: matches!(i % 3, 1 | 2).then(|| format!("otter#{}", i + 1)),
+            provider: started.then(|| "anthropic".to_string()),
+            model: started.then(|| "claude-opus-5-5".to_string()),
+            host: None,
+            status,
         }
-        start_as(&mut v, "fan", StepKind::Parallel, None, None);
-        dispatch(
-            &mut v,
-            "sub_1",
-            "triage",
-            "wren#1",
-            "claude-haiku-4-5",
-            false,
-        );
-        let rows = graph(&v, &nav_at(&v, 1));
+    }
+
+    /// Step `id` of `kind` with one unit per entry of `statuses`.
+    fn fanout_with(id: &str, kind: StepKind, statuses: &[UnitStatus]) -> RunView {
+        let mut v = RunView::default();
+        v.status = RunStatus::Running;
+        start_as(&mut v, id, kind, None, None);
+        let step = v.step_mut(id);
+        for (i, st) in statuses.iter().enumerate() {
+            step.units.insert(i, unit(i, *st));
+        }
+        v
+    }
+
+    /// `hunt`: 86 units — 52 done, 6 running (54..60), 2 failed (7, 31),
+    /// 26 queued (60..86).
+    fn fanout_view_86() -> RunView {
+        let statuses: Vec<UnitStatus> = (0..86)
+            .map(|i| {
+                if i == 7 || i == 31 {
+                    UnitStatus::Failed
+                } else if i < 54 {
+                    UnitStatus::Done
+                } else if i < 60 {
+                    UnitStatus::Running
+                } else {
+                    UnitStatus::Queued
+                }
+            })
+            .collect();
+        fanout_with("hunt", StepKind::ForEach, &statuses)
+    }
+
+    /// A nav drilled into step 0 with the filter cycled `presses` times
+    /// (All -> Running -> Failed -> Done).
+    fn drilled(view: &RunView, presses: usize) -> NavState {
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, view);
+        for _ in 0..presses {
+            nav.apply(NavKey::Filter, view);
+        }
+        nav
+    }
+
+    fn lines_of(rows: &[Line]) -> Vec<String> {
+        rows.iter()
+            .map(|l| render_plain(std::slice::from_ref(l)))
+            .collect()
+    }
+
+    #[test]
+    fn fanout_collapsed_shows_density_movers_and_more_at_86_units() {
+        let v = fanout_view_86();
+        let step = &v.steps[0];
+        let rows = fanout_block(step, &NavState::default(), false);
         let s = render_plain(&rows);
-        assert_eq!(rows.len(), 2, "{s}");
-        assert!(s.contains("◐ hunt · for_each · 3 units"), "{s}");
-        assert!(s.contains("▸ ◐ fan · parallel"), "{s}");
-        assert!(!s.contains("wren#1"), "{s}");
+        insta::assert_snapshot!(s);
+
+        // The density row reconciles exactly with `unit_counts()`.
+        let c = step.unit_counts();
+        assert_eq!(
+            (c.done, c.running, c.failed, c.queued, c.total),
+            (52, 6, 2, 26, 86)
+        );
+        let lines = lines_of(&rows);
+        assert!(
+            lines[0].starts_with("  ◐ hunt · for_each · 86 units"),
+            "{s}"
+        );
+        assert!(
+            lines[1].ends_with(&format!(
+                " {}/{} ✓{} ◐{} ✗{} ○{}",
+                c.done, c.total, c.done, c.running, c.failed, c.queued
+            )),
+            "{s}"
+        );
+        // Four live movers — the last four running units — then `+K more`
+        // with K = total - shown.
+        assert_eq!(rows.len(), 2 + 4 + 1, "{s}");
+        for running in [56, 57, 58, 59] {
+            assert!(s.contains(&format!("svc-{running}")), "{s}");
+        }
+        for not_shown in [0, 7, 54, 55, 60, 85] {
+            assert!(
+                !s.contains(&format!("svc-{not_shown} ")),
+                "svc-{not_shown}:\n{s}"
+            );
+        }
+        assert!(lines[6].contains("… +82 more · [enter] expand"), "{s}");
+        // No per-unit spend exists yet, so none is invented.
+        assert!(!s.contains('⇡') && !s.contains('$'), "{s}");
+    }
+
+    #[test]
+    fn fanout_selected_at_run_depth_stays_collapsed_via_graph() {
+        let v = fanout_view_86();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::Down, &v); // operator-selected, still Run depth
+        let rows = graph(&v, &nav);
+        let s = render_plain(&rows);
+        assert!(s.starts_with("▸ ◐ hunt · for_each · 86 units"), "{s}");
+        assert!(s.contains("+82 more · [enter] expand"), "{s}");
+        assert_eq!(rows.len(), 7, "{s}");
+    }
+
+    #[test]
+    fn fanout_expanded_failed_filter_lists_only_failed_units() {
+        let v = fanout_view_86();
+        let nav = drilled(&v, 2);
+        assert_eq!(nav.filter(), UnitFilter::Failed);
+        let rows = fanout_block(&v.steps[0], &nav, true);
+        let s = render_plain(&rows);
+        insta::assert_snapshot!(s);
+
+        let lines = lines_of(&rows);
+        assert_eq!(lines.len(), 2 + 2, "{s}");
+        assert!(
+            lines[0].starts_with("▸ ◐ hunt · for_each · 86 units · failed"),
+            "{s}"
+        );
+        // The density row is unfiltered: counts still describe the whole step.
+        assert!(lines[1].ends_with("52/86 ✓52 ◐6 ✗2 ○26"), "{s}");
+        assert!(lines[2].contains("✗ otter#8 · svc-7 "), "{s}");
+        assert!(lines[3].contains("✗ otter#32 · svc-31 "), "{s}");
+        assert!(!s.contains("more") && !s.contains("expand"), "{s}");
+        // Below the (unfiltered) density row nothing but failed units renders.
+        for row in &lines[2..] {
+            assert!(
+                row.contains('✗') && !row.contains('✓') && !row.contains('○'),
+                "{s}"
+            );
+        }
+        assert_eq!(s.matches("svc-").count(), 2, "{s}");
+    }
+
+    #[test]
+    fn fanout_expanded_all_lists_every_unit_with_no_more_row() {
+        let v = fanout_view_86();
+        let nav = drilled(&v, 0);
+        let rows = fanout_block(&v.steps[0], &nav, true);
+        let s = render_plain(&rows);
+        assert_eq!(rows.len(), 2 + 86, "{s}");
+        assert!(!s.contains("more"), "{s}");
+        // `All` shows no filter tag.
+        assert!(lines_of(&rows)[0].ends_with("86 units"), "{s}");
+        // Tree closes on the last unit only.
+        assert_eq!(s.matches("┗━").count(), 1, "{s}");
+        let last = s.lines().last().unwrap();
+        assert!(last.contains("┗━ ○") && last.contains("svc-85"), "{s}");
+
+        let running = fanout_block(&v.steps[0], &drilled(&v, 1), true);
+        let s = render_plain(&running);
+        assert_eq!(running.len(), 2 + 6, "{s}");
+        assert!(lines_of(&running)[0].ends_with("86 units · running"), "{s}");
+        let done = fanout_block(&v.steps[0], &drilled(&v, 3), true);
+        assert_eq!(done.len(), 2 + 52, "done filter");
+        assert!(lines_of(&done)[0].ends_with("86 units · done"));
+    }
+
+    #[test]
+    fn fanout_marks_only_the_selected_unit_when_expanded() {
+        let v = fanout_view_86();
+        let mut nav = drilled(&v, 2); // Failed filter: svc-7, svc-31
+        let marked = |nav: &NavState| -> Vec<String> {
+            lines_of(&fanout_block(&v.steps[0], nav, true))
+                .into_iter()
+                .skip(2)
+                .filter(|l| l.trim_start().starts_with('▸'))
+                .collect()
+        };
+        let m = marked(&nav);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].contains("svc-7"), "{m:?}");
+        nav.apply(NavKey::Down, &v);
+        let m = marked(&nav);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].contains("svc-31"), "{m:?}");
+    }
+
+    #[test]
+    fn fanout_expanded_with_no_matching_units_says_so() {
+        let v = fanout_with(
+            "hunt",
+            StepKind::ForEach,
+            &[UnitStatus::Done, UnitStatus::Running],
+        );
+        let nav = drilled(&v, 2); // Failed
+        let s = render_plain(&fanout_block(&v.steps[0], &nav, true));
+        assert!(s.contains("no failed units"), "{s}");
+        assert!(!s.contains("svc-"), "{s}");
+    }
+
+    #[test]
+    fn run_step_carrying_units_routes_to_fanout_block() {
+        // `run:` + `for_each:` is StepKind::Run but carries units.
+        let v = fanout_with(
+            "sweep",
+            StepKind::Run,
+            &[UnitStatus::Done, UnitStatus::Running, UnitStatus::Failed],
+        );
+        let s = render_plain(&graph(&v, &NavState::default()));
+        assert!(s.contains("◐ sweep · for_each · 3 units"), "{s}");
+        assert!(s.contains(" 1/3 "), "{s}");
+        assert!(s.contains("✓1 ◐1 ✗1"), "{s}");
+        assert!(!s.contains("· run"), "{s}");
+        // A `run:` step with no units is still a plain `run` row.
+        let mut plain = RunView::default();
+        start_as(&mut plain, "cmd", StepKind::Run, None, None);
+        let s = render_plain(&graph(&plain, &NavState::default()));
+        assert_eq!(s.trim_start(), "◐ cmd · run ···· ◐ running", "{s}");
+    }
+
+    #[test]
+    fn panel_step_with_units_keeps_its_panel_row() {
+        // Panelists arrive as units; the panel row (round counter) must win.
+        let mut v = fanout_with(
+            "review",
+            StepKind::Panel,
+            &[UnitStatus::Done, UnitStatus::Running],
+        );
+        v.step_mut("review").panel_round = Some(2);
+        v.step_mut("review").panel_max = Some(5);
+        let s = render_plain(&graph(&v, &NavState::default()));
+        assert_eq!(
+            s.trim_start(),
+            "◐ review · panel iter 2/5 ···· ◐ running",
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn fanout_with_no_units_yet_renders_an_empty_bar_without_panicking() {
+        let v = fanout_with("hunt", StepKind::ForEach, &[]);
+        let rows = fanout_block(&v.steps[0], &NavState::default(), false);
+        let lines = lines_of(&rows);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert_eq!(lines[0].trim_start(), "◐ hunt · for_each");
+        assert_eq!(lines[1].trim_start(), format!("{} 0/0", "░".repeat(20)));
+        // Expanding an empty step does not panic either.
+        let nav = drilled(&v, 0);
+        let s = render_plain(&fanout_block(&v.steps[0], &nav, true));
+        assert!(s.contains("no units"), "{s}");
+    }
+
+    #[test]
+    fn density_bar_is_full_width_and_only_full_when_every_unit_is_done() {
+        let bar = |statuses: &[UnitStatus]| -> (usize, usize) {
+            let v = fanout_with("h", StepKind::ForEach, statuses);
+            let s = render_plain(&fanout_block(&v.steps[0], &NavState::default(), false));
+            (s.matches('▓').count(), s.matches('░').count())
+        };
+        let mut u = vec![UnitStatus::Done; 85];
+        u.push(UnitStatus::Running);
+        // 85/86 rounds to a full bar, but the step is not finished.
+        assert_eq!(bar(&u), (19, 1));
+        assert_eq!(bar(&[UnitStatus::Done; 86]), (20, 0));
+        // One done of many still shows progress.
+        let mut u = vec![UnitStatus::Queued; 200];
+        u[0] = UnitStatus::Done;
+        assert_eq!(bar(&u), (1, 19));
+        assert_eq!(bar(&[UnitStatus::Queued; 3]), (0, 20));
+    }
+
+    #[test]
+    fn small_fanout_shows_every_unit_and_closes_the_tree_without_more() {
+        let v = fanout_with(
+            "hunt",
+            StepKind::ForEach,
+            &[UnitStatus::Done, UnitStatus::Running, UnitStatus::Queued],
+        );
+        let s = render_plain(&fanout_block(&v.steps[0], &NavState::default(), false));
+        assert!(!s.contains("more") && !s.contains("expand"), "{s}");
+        assert_eq!(s.matches("┣━").count(), 2, "{s}");
+        assert_eq!(s.matches("┗━").count(), 1, "{s}");
+        let last = s.lines().last().unwrap();
+        assert!(last.contains("┗━ ○") && last.contains("svc-2"), "{s}");
+    }
+
+    #[test]
+    fn unit_rows_drop_empty_parts_and_control_characters() {
+        let mut v = fanout_with("hunt", StepKind::ForEach, &[UnitStatus::Running]);
+        let u = v.step_mut("hunt").units.get_mut(&0).unwrap();
+        u.codename = None;
+        u.provider = Some(String::new());
+        u.model = Some("opus".into());
+        let row = render_plain(&fanout_block(&v.steps[0], &NavState::default(), false)[2..]);
+        assert_eq!(
+            row.trim_start(),
+            "┗━ ◐ svc-0 · opus ···· ◐ running",
+            "{row}"
+        );
+
+        // Empty provider AND model, empty unit key: no dangling separators.
+        let u = v.step_mut("hunt").units.get_mut(&0).unwrap();
+        u.provider = Some(String::new());
+        u.model = Some(String::new());
+        u.unit_key = "hostile\u{1b}[31m\nkey".into();
+        let rows = fanout_block(&v.steps[0], &NavState::default(), false);
+        let row = render_plain(&rows[2..]);
+        assert!(!row.contains('\u{1b}') && !row.contains('\n'), "{row:?}");
+        assert!(!row.contains(" ·  ·") && !row.contains("· ····"), "{row}");
+
+        // The shared member formatter filters empty parts for step rows too.
+        let mut v = RunView::default();
+        start_as(&mut v, "a", StepKind::Linear, Some(""), None);
+        v.step_mut("a").provider = Some(String::new());
+        v.step_mut("a").model = Some(String::new());
+        let s = render_plain(&graph(&v, &NavState::default()));
+        assert_eq!(s.trim_start(), "◐ a ···· ◐ running", "{s}");
+    }
+
+    #[test]
+    fn movers_fill_from_non_running_units_when_fewer_than_four_run() {
+        // 1 running (index 2) + 5 others: the running unit leads, padded by
+        // the highest-index remaining units.
+        let v = fanout_with(
+            "hunt",
+            StepKind::ForEach,
+            &[
+                UnitStatus::Done,
+                UnitStatus::Done,
+                UnitStatus::Running,
+                UnitStatus::Queued,
+                UnitStatus::Queued,
+                UnitStatus::Queued,
+            ],
+        );
+        let s = render_plain(&fanout_block(&v.steps[0], &NavState::default(), false));
+        let keys: Vec<&str> = s
+            .lines()
+            .filter_map(|l| l.split("svc-").nth(1))
+            .map(|r| r.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["2", "3", "4", "5"], "{s}");
+        assert!(s.contains("+2 more · [enter] expand"), "{s}");
     }
 }

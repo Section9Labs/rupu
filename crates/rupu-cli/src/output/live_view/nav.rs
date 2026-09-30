@@ -157,14 +157,27 @@ impl NavState {
         subs.get(clamp_idx(self.sub_idx, subs.len())).copied()
     }
 
+    /// The unit under the cursor within `step`'s *filtered* list. Same answer
+    /// as [`NavState::selected_unit`] when `step` is the selected step; for
+    /// renderers that hold only the step (`layout::fanout_block`).
+    pub fn selected_unit_in<'a>(&self, step: &'a StepView) -> Option<&'a UnitView> {
+        let units = self.filtered_units(step);
+        units.get(clamp_idx(self.unit_idx, units.len())).copied()
+    }
+
+    /// `step`'s units admitted by the current filter, in unit-index order —
+    /// the list the unit cursor walks. One predicate for nav and renderers.
+    pub fn filtered_units<'a>(&self, step: &'a StepView) -> Vec<&'a UnitView> {
+        step.units
+            .values()
+            .filter(|u| self.filter.admits(u.status))
+            .collect()
+    }
+
     /// Filtered units of the selected step, in unit-index order.
     fn unit_list<'a>(&self, view: &'a RunView) -> Vec<&'a UnitView> {
         match self.selected_step(view) {
-            Some(step) => step
-                .units
-                .values()
-                .filter(|u| self.filter.admits(u.status))
-                .collect(),
+            Some(step) => self.filtered_units(step),
             None => Vec::new(),
         }
     }
@@ -713,6 +726,47 @@ mod tests {
         nav.sync(&v);
         assert_eq!(nav.depth(), Depth::Step);
         assert!(nav.selected_unit(&v).is_none());
+    }
+
+    #[test]
+    fn step_scoped_accessors_agree_with_the_view_scoped_ones() {
+        // `fanout_block` only holds the step, so nav must answer from it.
+        let mut v = fanout_view();
+        complete_unit(&mut v, "hunt", 0, true); // svc-0 Done
+        complete_unit(&mut v, "hunt", 1, false); // svc-1 Failed; svc-2 Running
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &v);
+        let step = &v.steps[0];
+        let keys = |nav: &NavState| -> Vec<String> {
+            nav.filtered_units(step)
+                .iter()
+                .map(|u| u.unit_key.clone())
+                .collect()
+        };
+        assert_eq!(keys(&nav), vec!["svc-0", "svc-1", "svc-2"]);
+        nav.apply(NavKey::Down, &v);
+        assert_eq!(
+            nav.selected_unit_in(step).map(|u| u.index),
+            nav.selected_unit(&v).map(|u| u.index)
+        );
+        assert_eq!(nav.selected_unit_in(step).map(|u| u.index), Some(1));
+
+        nav.apply(NavKey::Filter, &v); // Running
+        assert_eq!(keys(&nav), vec!["svc-2"]);
+        nav.apply(NavKey::Filter, &v); // Failed
+        assert_eq!(keys(&nav), vec!["svc-1"]);
+        assert_eq!(nav.selected_unit_in(step).map(|u| u.index), Some(1));
+
+        // A stale cursor clamps instead of indexing out of range, and a
+        // step with no matching units has no selection.
+        nav.apply(NavKey::Filter, &v); // Done
+        nav.apply(NavKey::Filter, &v); // All
+        let empty = RunView::default();
+        let mut bare = RunView::default();
+        start_step(&mut bare, "plan", StepKind::Linear);
+        assert!(nav.selected_unit_in(&bare.steps[0]).is_none());
+        assert!(nav.filtered_units(&bare.steps[0]).is_empty());
+        assert!(empty.steps.is_empty());
     }
 
     #[test]
