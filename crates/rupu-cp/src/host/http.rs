@@ -475,6 +475,14 @@ impl HostConnector for HttpHostConnector {
             .await
     }
 
+    /// Temporary until the HTTP transport lands: refuse loudly rather than
+    /// report "no stream arrived".
+    async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "coverage collection over HTTP is not implemented yet".into(),
+        ))
+    }
+
     async fn proxy_get_json(
         &self,
         path_and_query: &str,

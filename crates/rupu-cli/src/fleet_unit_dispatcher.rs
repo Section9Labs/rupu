@@ -870,6 +870,9 @@ mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+            Ok(Vec::new())
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -941,6 +944,9 @@ mod tests {
             _path: &str,
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
+        }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+            Ok(Vec::new())
         }
         async fn proxy_get_json(
             &self,
@@ -1276,6 +1282,9 @@ steps:
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+            Ok(Vec::new())
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -1585,6 +1594,9 @@ steps:
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+            Ok(Vec::new())
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -1712,6 +1724,9 @@ steps:
             _path: &str,
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
+        }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+            Ok(Vec::new())
         }
         async fn proxy_get_json(
             &self,

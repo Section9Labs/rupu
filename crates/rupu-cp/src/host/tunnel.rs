@@ -288,6 +288,10 @@ impl HostConnector for TunnelHostConnector {
         })
     }
 
+    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id)
+    }
+
     async fn stream_run_events(
         &self,
         run_id: &str,

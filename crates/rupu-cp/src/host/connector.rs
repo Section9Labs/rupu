@@ -346,6 +346,13 @@ pub trait HostConnector: Send + Sync {
         ))
     }
 
+    /// The coverage stream (`runs/<run_id>/coverage.jsonl`) the executing
+    /// host wrote for `run_id`, for the coordinator to merge (spec
+    /// 2026-09-30-rupu-remote-findings-transport-design.md §A2). `Ok(empty)`
+    /// ⇒ no stream arrived. Deliberately no default: every transport must say
+    /// how it delivers this, or refuse.
+    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError>;
+
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
     ///
@@ -867,6 +874,28 @@ pub(crate) async fn mirror_stream_run_events(
     open_run_events_tail(run_store, run_id).await
 }
 
+/// A run's coverage stream read from the coordinator's own run store: the
+/// local host's file, or a mirror-backed transport's mirrored copy.
+pub fn mirror_unit_coverage(
+    run_store: &RunStore,
+    run_id: &str,
+) -> Result<Vec<u8>, HostConnectorError> {
+    let valid = run_id.starts_with("run_")
+        && run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(HostConnectorError::Invalid(format!(
+            "{run_id:?} is not a valid run id"
+        )));
+    }
+    match std::fs::read(rupu_coverage::stream_path(&run_store.root, run_id)) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(HostConnectorError::Invalid(format!(
+            "read coverage stream for {run_id}: {e}"
+        ))),
+    }
+}
+
 /// Read and parse a transcript `.jsonl` file into the standard
 /// `{ "events": [...], "summary": … }` shape.
 ///
@@ -1053,6 +1082,9 @@ pub(crate) mod testing {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("StubConnector: get_transcript not configured")
         }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+            Ok(Vec::new())
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,
@@ -1124,6 +1156,9 @@ pub(crate) mod testing {
             ) -> Result<serde_json::Value, HostConnectorError> {
                 unimplemented!()
             }
+            async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+                Ok(Vec::new())
+            }
             async fn proxy_get_json(
                 &self,
                 _p: &str,
@@ -1143,5 +1178,23 @@ pub(crate) mod testing {
             Err(HostConnectorError::Unsupported(_))
         ));
         let _ = FeedGuard::noop();
+    }
+
+    #[test]
+    fn mirror_unit_coverage_reads_the_run_stream_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        assert_eq!(
+            mirror_unit_coverage(&store, "run_X1").unwrap(),
+            Vec::<u8>::new()
+        );
+        let p = rupu_coverage::stream_path(&store.root, "run_X1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"line\n").unwrap();
+        assert_eq!(mirror_unit_coverage(&store, "run_X1").unwrap(), b"line\n");
+        assert!(matches!(
+            mirror_unit_coverage(&store, "../etc"),
+            Err(HostConnectorError::Invalid(_))
+        ));
     }
 }

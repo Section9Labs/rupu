@@ -1240,6 +1240,9 @@ mod tests {
         ) -> Result<serde_json::Value, HostConnectorError> {
             Ok(self.report.clone())
         }
+        async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+            Ok(Vec::new())
+        }
         async fn proxy_get_json(
             &self,
             _path_and_query: &str,

@@ -386,6 +386,10 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_store_err(run_id, e))
     }
 
+    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id)
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         // Verify the run exists before opening the tail.
         self.run_store

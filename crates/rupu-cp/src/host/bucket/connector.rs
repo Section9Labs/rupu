@@ -321,6 +321,10 @@ impl HostConnector for BucketHostConnector {
         .await
     }
 
+    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+        crate::host::connector::mirror_unit_coverage(&self.run_store, run_id)
+    }
+
     async fn stream_run_events(
         &self,
         run_id: &str,
@@ -456,6 +460,19 @@ mod tests {
             spec.get("name").and_then(|v| v.as_str()),
             Some("my-agent")
         );
+    }
+
+    #[tokio::test]
+    async fn unit_coverage_reads_the_mirrored_stream() {
+        let (conn, run_store, _bucket, _tmp) = make_conn();
+        let run_id = conn.launch_agent(profile_req(None)).await.unwrap();
+        let p = rupu_coverage::stream_path(&run_store.root, &run_id);
+        std::fs::write(&p, b"{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"x\"}\n").unwrap();
+        assert!(conn
+            .unit_coverage(&run_id)
+            .await
+            .unwrap()
+            .starts_with(b"{\"ledger\":\"begin\""));
     }
 
     fn profile_req(profile: Option<rupu_coverage::FindingProfile>) -> AgentLaunchRequest {
