@@ -7,8 +7,8 @@ const FULL_GUIDANCE: &str = "\
 ## Recording findings
 
 Findings in this run use the full report profile. Record each finding with one \
-`report_finding` call whose `report` object is complete. rupu generates the \
-Markdown, HTML and PDF reports from it, so do not also write a report file.
+`report_finding` call whose `report` object is complete. The report is stored as \
+structured data and is the source of truth for this finding.
 
 - Write in a concise, formal, factual tone. Do not speculate.
 - Every field is required. When information genuinely cannot be determined, \

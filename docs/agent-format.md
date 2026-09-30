@@ -262,9 +262,9 @@ Coverage-concerns block (see `docs/coverage.md`). When present, the runner flatt
 
 ### `findingsProfile`
 
-Selects the contract an agent's findings are recorded under. It governs the agent's `report_finding` builtin (the coverage tool injected by `concerns:`).
+Selects the contract an agent's findings are recorded under. It governs the agent's `report_finding` builtin, whether the tool comes from a `concerns:` block (which injects the coverage tools) or from an explicit `tools: [report_finding]` grant.
 
-- `full` (default) — findings must include a complete `report` (see `rupu findings schema`). The tool rejects `summary`, `severity`, and `evidence` as separate arguments: rupu derives them from the report (`summary` from `title`, `severity` from `rating.risk_rating`, `evidence.rationale` from `root_cause`). A rejected call lists every validation problem at once so the agent can fix them all in one retry, and full-profile runs get finding-writing guidance appended to the system prompt. Agents should not also write a separate report file.
+- `full` (default) — findings must include a complete `report` (see `rupu findings schema`). The tool rejects `summary`, `severity`, and `evidence` as separate arguments: rupu derives them from the report (`summary` from `title`, `severity` from `rating.risk_rating`, `evidence.rationale` from `root_cause`). A rejected call lists every validation problem at once so the agent can fix them all in one retry. When the run can record findings (a `concerns:` block or `report_finding` in `tools:`), finding-writing guidance is appended to the system prompt. Because the structured report is the source of truth for the finding, a separate report file is no longer required.
 - `summary` — the lightweight `summary` / `severity` / `evidence` record. A `report` sent under `summary` is refused rather than silently dropped.
 
 A workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides this value. The order is step → workflow defaults → agent `findingsProfile` → `full`; see [workflow-format.md](workflow-format.md#findings_profile). A standalone `rupu run <agent>` uses the agent's value, or `full` when it is unset. Sub-agents started through `dispatch_agent` resolve only from their own agent file.
@@ -280,7 +280,7 @@ findingsProfile: summary   # lightweight findings; set to full for complete repo
 ---
 ```
 
-See `docs/coverage.md` for what a complete report requires.
+See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty), `artifacts`, and the optional `verification`.
 
 ### `maxTokens`
 

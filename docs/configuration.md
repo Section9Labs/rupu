@@ -219,6 +219,19 @@ fall back to the CP's compiled defaults.
 
 ---
 
+## `[findings]`
+
+Limits and hints for recorded findings; see [coverage.md](coverage.md#finding-reports)
+for what a finding report contains and how artifacts are stored.
+
+| Key                  | Type            | Default                     | Notes |
+|----------------------|-----------------|-----------------------------|-------|
+| `artifact_max_bytes` | integer         | `524288000` (500 MiB)       | Per-file cap for copying a finding's artifacts into `<RUPU_HOME>/findings/artifacts`. Larger files are recorded by hash only (`stored: external`) |
+| `report_max_bytes`   | integer         | `262144` (256 KiB)          | Serialized-size budget for one `full` finding report; a larger report is rejected with the size named |
+| `ticket_patterns`    | array\<string\> | `[]`                        | Patterns (regexes or URL prefixes) that identify existing tickets in your organisation; appended to the finding-writing guidance agents get under the `full` profile. Nothing organisation-specific ships in rupu |
+
+---
+
 ## `[update]`
 
 | Key       | Type   | Default   | Notes |

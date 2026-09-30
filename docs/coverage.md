@@ -105,8 +105,9 @@ list them in the agent's `tools:`):
 
 ## Finding reports
 
-A finding is recorded once, as structured data, and every presentation is
-generated from that record. Agents do not also write a report file.
+A finding is recorded once, as structured data. That structured record is the
+source of truth for the finding: rendered views and exports are built on it (see
+the "Not built yet" note at the end of this section for what exists today).
 
 ### Profiles
 
@@ -129,12 +130,19 @@ back as `summary`.
 
 ### What `full` requires
 
-Every field of the report is required. The rules below are enforced at write
-time; a rejected call returns **every** problem at once, each with its field
-path, so the agent can fix them all in one retry. (A structurally malformed
-JSON argument surfaces as a single parse error instead.) Full-profile runs also
-get finding-writing guidance appended to the system prompt, so the agent needs
-no external reporting-standard file.
+Every field of the report is required except `cwe` (it may be an empty list),
+`artifacts`, and `verification`. The rules below are enforced at write time; a
+rejected call returns **every** problem at once, each with its field path, so
+the agent can fix them all in one retry. (A structurally malformed JSON argument
+surfaces as a single parse error instead.) When a full-profile run can record
+findings (the agent has a `concerns:` block or `report_finding` in `tools:`),
+finding-writing guidance is also appended to its system prompt, so the agent
+needs no external reporting-standard file.
+
+`artifacts` is described under [Artifacts](#artifacts) below. `verification` is
+optional and is normally left to rupu or a verifier rather than the agent that
+wrote the finding: `{status: unverified|confirmed|disputed|inconclusive,
+by_run?, notes?}`.
 
 - Required strings must be non-empty after trimming.
 - Ratings (`impact`, `risk_rating`, `risk_factor`) are `Low`/`Medium`/`High`/`Critical`;
@@ -169,7 +177,7 @@ test: provide the item or say why it could not be produced.
 `report.artifacts[].path` lists proof-of-concept files (scripts, outputs,
 harnesses) as workspace-relative paths. At write time rupu hashes each one:
 
-- A file up to `[findings].artifact_max_bytes` (default 500 MB) is copied into a
+- A file up to `[findings].artifact_max_bytes` (default 500 MiB) is copied into a
   content-addressed store at `<RUPU_HOME>/findings/artifacts/<aa>/<sha256>` and
   recorded `stored: copied`. Identical content is stored once across runs and
   projects, and the store outlives the workspace.
@@ -184,13 +192,14 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 
 ```toml
 [findings]
-artifact_max_bytes = 524288000   # copy cap per artifact file (default 500 MB)
+artifact_max_bytes = 524288000   # copy cap per artifact file (default 500 MiB)
 report_max_bytes = 262144        # serialized report budget (default 256 KiB)
 ticket_patterns = ["ABC-[0-9]+"] # extra hints appended to the full-profile guidance
 ```
 
 `ticket_patterns` lets an organisation say which reference formats count as
-existing tickets. Nothing organisation-specific ships in rupu.
+existing tickets. Nothing organisation-specific ships in rupu. The keys are also
+listed in [configuration.md](configuration.md#findings).
 
 ### `rupu findings schema`
 
