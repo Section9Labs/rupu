@@ -200,10 +200,6 @@ pub enum WorkflowParseError {
     ActionsUnsupportedOnRemoteStep { step: String },
     #[error("step `{step}`: `findings_profile` is not supported on an `action:` step; set `defaults.findings_profile` instead")]
     FindingsProfileOnActionStep { step: String },
-    #[error("step `{step}`: `findings_profile` is not yet supported on a remote step (`host:` / `distribute:`); set `findingsProfile` in the agent's frontmatter instead")]
-    FindingsProfileOnRemoteStep { step: String },
-    #[error("`defaults.findings_profile` does not yet reach remote step `{step}` (`host:` / `distribute:`); set `findings_profile` on the local steps and `findingsProfile` in the remote agent's frontmatter instead")]
-    FindingsProfileDefaultWithRemoteSteps { step: String },
     #[error(
         "step `{step}`: `findings_profile` has no effect on a step that runs no agent; remove it"
     )]
@@ -1281,7 +1277,6 @@ impl Workflow {
             validate_step_shape(step)?;
             validate_step_actions(step)?;
         }
-        validate_findings_profile_default(&wf)?;
         for (name, def) in &wf.inputs {
             validate_input_def(name, def)?;
         }
@@ -1882,38 +1877,12 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
                 step: step.id.clone(),
             });
         }
-        // A remote unit never reaches `build_opts_for_step`; it launches
-        // `rupu run` on the host via a request that carries no profile, so
-        // the field would be silently ignored. Fail closed (same class as
-        // `ActionsUnsupportedOnRemoteStep`).
-        if step.host.is_some() || step.distribute.is_some() {
-            return Err(WorkflowParseError::FindingsProfileOnRemoteStep {
-                step: step.id.clone(),
-            });
-        }
+        // Remote (`host:` / `distribute:`) steps are fine: the runner puts
+        // the step → defaults profile on each `UnitDispatch`, and every host
+        // connector delivers it as `rupu run --findings-profile` or refuses
+        // the launch.
     }
 
-    Ok(())
-}
-
-/// `defaults.findings_profile` is resolved per step in `build_opts_for_step`,
-/// which a remote (`host:` / `distribute:`) step never reaches — so with any
-/// remote step present the default would be silently ignored on that step.
-/// Reject the combination at parse time (same fail-closed class as
-/// [`WorkflowParseError::ActionsUnsupportedOnRemoteStep`]).
-fn validate_findings_profile_default(wf: &Workflow) -> Result<(), WorkflowParseError> {
-    if wf.defaults.findings_profile.is_none() {
-        return Ok(());
-    }
-    if let Some(step) = wf
-        .steps
-        .iter()
-        .find(|s| s.host.is_some() || s.distribute.is_some())
-    {
-        return Err(WorkflowParseError::FindingsProfileDefaultWithRemoteSteps {
-            step: step.id.clone(),
-        });
-    }
     Ok(())
 }
 
@@ -3158,62 +3127,51 @@ steps:
         );
     }
 
-    // ── findings_profile fails closed where it would be silently ignored ────
+    // ── findings_profile placement ──────────────────────────────────────────
 
     #[test]
-    fn findings_profile_on_a_host_step_is_rejected() {
-        let raw = "name: w\nsteps:\n  - id: r\n    agent: a\n    prompt: p\n    host: some-host\n    findings_profile: summary\n";
-        match Workflow::parse(raw).unwrap_err() {
-            WorkflowParseError::FindingsProfileOnRemoteStep { step } => assert_eq!(step, "r"),
-            other => panic!("expected FindingsProfileOnRemoteStep, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn findings_profile_on_a_distribute_step_is_rejected() {
+    fn findings_profile_is_legal_on_remote_steps() {
+        // Remote units carry the profile to the host (`UnitDispatch` →
+        // `AgentLaunchRequest` → `rupu run --findings-profile`), so neither a
+        // step override nor a workflow default is ignored there any more.
         let raw = r#"
 name: w
+defaults:
+  findings_profile: summary
 steps:
+  - id: local
+    agent: a
+    prompt: p
+  - id: placed
+    agent: a
+    prompt: p
+    host: some-host
+    findings_profile: full
   - id: fan
     for_each: "x"
     agent: a
     prompt: p
     distribute:
       hosts: [h1]
-    findings_profile: full
+    findings_profile: summary
+  - id: placed_default
+    agent: a
+    prompt: p
+    host: some-host
 "#;
-        assert!(matches!(
-            Workflow::parse(raw).unwrap_err(),
-            WorkflowParseError::FindingsProfileOnRemoteStep { .. }
-        ));
-    }
-
-    #[test]
-    fn default_findings_profile_with_a_remote_step_is_rejected() {
-        let raw = "name: w\ndefaults:\n  findings_profile: summary\nsteps:\n  - id: local\n    agent: a\n    prompt: p\n  - id: remote\n    agent: a\n    prompt: p\n    host: some-host\n";
-        match Workflow::parse(raw).unwrap_err() {
-            WorkflowParseError::FindingsProfileDefaultWithRemoteSteps { step } => {
-                assert_eq!(step, "remote");
-            }
-            other => panic!("expected FindingsProfileDefaultWithRemoteSteps, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn default_findings_profile_with_only_local_steps_still_parses() {
-        let raw = "name: w\ndefaults:\n  findings_profile: summary\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n";
-        let wf = Workflow::parse(raw).expect("defaults.findings_profile is fine with local steps");
-        assert_eq!(
-            wf.defaults.findings_profile,
-            Some(rupu_coverage::FindingProfile::Summary)
-        );
-    }
-
-    #[test]
-    fn remote_step_without_any_findings_profile_still_parses() {
-        // The new checks only fire when a profile is actually set.
-        let raw = "name: w\nsteps:\n  - id: r\n    agent: a\n    prompt: p\n    host: some-host\n";
-        Workflow::parse(raw).expect("a remote step with no findings_profile must stay legal");
+        use rupu_coverage::FindingProfile::{Full, Summary};
+        let wf = Workflow::parse(raw).expect("findings_profile must be legal on remote steps");
+        assert_eq!(wf.defaults.findings_profile, Some(Summary));
+        let by_id = |id: &str| {
+            wf.steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .findings_profile
+        };
+        assert_eq!(by_id("placed"), Some(Full));
+        assert_eq!(by_id("fan"), Some(Summary));
+        assert_eq!(by_id("placed_default"), None);
     }
 
     #[test]
