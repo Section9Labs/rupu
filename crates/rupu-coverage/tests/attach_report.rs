@@ -265,3 +265,291 @@ fn a_new_finding_can_still_be_appended_after_an_attach() {
     assert_eq!(read_findings(&paths).unwrap().len(), 2);
     assert!(paths.root.join("findings.jsonl.lock").exists());
 }
+
+#[test]
+fn two_imports_in_the_same_second_keep_separate_backups() {
+    let (_d, paths) = setup();
+    let a = seed_summary(&paths);
+    let b = seed_summary(&paths);
+    let original = std::fs::read(&paths.findings).unwrap();
+
+    let first = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: a,
+            report: report(),
+        }],
+        &full_opts(),
+        false,
+    )
+    .unwrap();
+    let after_first = std::fs::read(&paths.findings).unwrap();
+    let second = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: b,
+            report: report(),
+        }],
+        &full_opts(),
+        false,
+    )
+    .unwrap();
+
+    let (b1, b2) = (first.backup.unwrap(), second.backup.unwrap());
+    assert_ne!(
+        b1, b2,
+        "the second import must not overwrite the first backup"
+    );
+    // Each backup is the ledger as it stood before its own import.
+    assert_eq!(std::fs::read(&b1).unwrap(), original);
+    assert_eq!(std::fs::read(&b2).unwrap(), after_first);
+}
+
+#[test]
+fn an_id_on_two_ledger_lines_is_left_alone() {
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+    let line = std::fs::read_to_string(&paths.findings).unwrap();
+    let doubled = format!("{line}{line}");
+    std::fs::write(&paths.findings, &doubled).unwrap();
+
+    let batch = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: id,
+            report: report(),
+        }],
+        &full_opts(),
+        false,
+    )
+    .unwrap();
+    assert!(matches!(
+        batch.outcomes.as_slice(),
+        [AttachOutcome::Duplicate]
+    ));
+    assert!(batch.backup.is_none());
+    assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), doubled);
+}
+
+#[test]
+fn a_dry_run_refuses_artifacts_when_there_is_no_store() {
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+    std::fs::write(paths.workspace.join("out.txt"), "x").unwrap();
+    let mut r = report();
+    r.artifacts = vec![rupu_coverage::report::ArtifactRef {
+        path: "out.txt".into(),
+        sha256: String::new(),
+        size: 0,
+        kind: None,
+        stored: None,
+        host: None,
+    }];
+    let opts = full_opts(); // no artifact_root
+    let dry = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: id.clone(),
+            report: r.clone(),
+        }],
+        &opts,
+        true,
+    )
+    .unwrap();
+    // The same refusal a real run gives.
+    let real = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: id,
+            report: r,
+        }],
+        &opts,
+        false,
+    )
+    .unwrap();
+    for batch in [dry, real] {
+        match batch.outcomes.as_slice() {
+            [AttachOutcome::Rejected(rupu_coverage::ReportFindingError::Artifact(
+                rupu_coverage::report::ArtifactError::NoStore,
+            ))] => {}
+            o => panic!("expected Rejected(NoStore), got {o:?}"),
+        }
+    }
+}
+
+#[test]
+fn untouched_bytes_survive_crlf_non_utf8_and_a_missing_final_newline() {
+    let (_d, paths) = setup();
+    seed_summary(&paths);
+    let b = seed_summary(&paths);
+    let c = seed_summary(&paths);
+    let ledger = std::fs::read_to_string(&paths.findings).unwrap();
+    let mut lines = ledger.lines();
+    let (la, lb, lc) = (
+        lines.next().unwrap(),
+        lines.next().unwrap(),
+        lines.next().unwrap(),
+    );
+
+    // a: CRLF, untouched. Then a line that is not UTF-8, untouched. b: CRLF,
+    // attached, must keep its CRLF. c: no final newline, attached, must stay
+    // unterminated.
+    let mut original = Vec::new();
+    original.extend_from_slice(format!("{la}\r\n").as_bytes());
+    original.extend_from_slice(b"\xff\xfe not utf-8\n");
+    original.extend_from_slice(format!("{lb}\r\n").as_bytes());
+    original.extend_from_slice(lc.as_bytes());
+    std::fs::write(&paths.findings, &original).unwrap();
+
+    let batch = attach_reports(
+        &paths,
+        vec![
+            AttachItem {
+                finding_id: b.clone(),
+                report: report(),
+            },
+            AttachItem {
+                finding_id: c.clone(),
+                report: report(),
+            },
+        ],
+        &full_opts(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        batch
+            .outcomes
+            .iter()
+            .all(|o| matches!(o, AttachOutcome::Attached)),
+        "{:?}",
+        batch.outcomes
+    );
+    assert_eq!(std::fs::read(batch.backup.unwrap()).unwrap(), original);
+
+    let after = std::fs::read(&paths.findings).unwrap();
+    let segments: Vec<&[u8]> = after.split_inclusive(|b| *b == b'\n').collect();
+    assert_eq!(segments.len(), 4);
+    // Untouched: byte for byte, CRLF and all.
+    assert_eq!(segments[0], format!("{la}\r\n").as_bytes());
+    assert_eq!(segments[1], b"\xff\xfe not utf-8\n");
+    // Replaced: each keeps its own terminator.
+    assert!(segments[2].ends_with(b"\r\n"));
+    assert!(
+        !segments[3].ends_with(b"\n"),
+        "the last line stays unterminated"
+    );
+    for (seg, id) in [(segments[2], &b), (segments[3], &c)] {
+        let v: serde_json::Value = serde_json::from_slice(seg).unwrap();
+        assert_eq!(&v["id"], id.as_str());
+        assert_eq!(v["profile"], "full");
+        assert_eq!(v["report"]["title"], report().title.as_str());
+    }
+}
+
+#[test]
+fn a_stored_report_the_lenient_load_dropped_is_never_overwritten() {
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+    // Legacy-shaped: no `profile` key, so it loads as a summary record, but
+    // it carries a `report` this build cannot parse.
+    let mut v: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&paths.findings).unwrap().trim()).unwrap();
+    v.as_object_mut().unwrap().remove("profile");
+    v["report"] = serde_json::json!({ "title": "only a title" });
+    let line = format!("{}\n", serde_json::to_string(&v).unwrap());
+    std::fs::write(&paths.findings, &line).unwrap();
+    let loaded = &read_findings(&paths).unwrap()[0];
+    assert!(loaded.report.is_none(), "loads leniently");
+    assert_eq!(loaded.profile, FindingProfile::Summary);
+
+    for dry_run in [true, false] {
+        let batch = attach_reports(
+            &paths,
+            vec![AttachItem {
+                finding_id: id.clone(),
+                report: report(),
+            }],
+            &full_opts(),
+            dry_run,
+        )
+        .unwrap();
+        assert!(matches!(
+            batch.outcomes.as_slice(),
+            [AttachOutcome::AlreadyHasReport]
+        ));
+        assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), line);
+    }
+}
+
+#[test]
+fn writers_wait_for_the_ledger_lock() {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+
+    // Hold the ledger lock from here, the way a writer mid-append would.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.root.join("findings.jsonl.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+
+    let (tx, rx) = channel();
+    let append = {
+        let (paths, tx) = (paths.clone(), tx.clone());
+        std::thread::spawn(move || {
+            seed_summary(&paths);
+            tx.send("append").unwrap();
+        })
+    };
+    let attach = {
+        let (paths, tx, id) = (paths.clone(), tx, id.clone());
+        std::thread::spawn(move || {
+            let batch = attach_reports(
+                &paths,
+                vec![AttachItem {
+                    finding_id: id,
+                    report: report(),
+                }],
+                &full_opts(),
+                false,
+            )
+            .unwrap();
+            assert!(matches!(
+                batch.outcomes.as_slice(),
+                [AttachOutcome::Attached]
+            ));
+            tx.send("attach").unwrap();
+        })
+    };
+
+    match rx.recv_timeout(Duration::from_millis(300)) {
+        Err(RecvTimeoutError::Timeout) => {}
+        other => panic!("a writer finished while the lock was held: {other:?}"),
+    }
+    drop(lock); // releases the lock
+
+    let mut done = vec![
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("first writer completes"),
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("second writer completes"),
+    ];
+    done.sort_unstable();
+    assert_eq!(done, ["append", "attach"]);
+    append.join().unwrap();
+    attach.join().unwrap();
+
+    // Neither writer lost the other's work, whichever went first.
+    let records = read_findings(&paths).unwrap();
+    assert_eq!(records.len(), 2);
+    let attached = records.iter().find(|r| r.id == id).unwrap();
+    assert_eq!(attached.profile, FindingProfile::Full);
+    assert!(attached.report.is_some());
+    assert!(records.iter().any(|r| r.id != id && r.report.is_none()));
+}

@@ -7,18 +7,20 @@
 //! validation, claim hashing and artifact store as `report_finding`, and a
 //! finding that already has a report is never touched. The ledger is
 //! replaced atomically under the ledger lock, after a byte-for-byte backup,
-//! and every other line (including ones nothing can parse, and keys this
-//! version does not know) is written back unchanged.
+//! and every other line is written back byte for byte (CRLF endings, a
+//! missing final newline, lines that are not UTF-8 or not JSON, and keys this
+//! version does not know all survive). The line that is replaced keeps its
+//! own line terminator.
 
 use crate::ledger::events::FindingRecord;
 use crate::ledger::paths::CoveragePaths;
-use crate::report::{FindingProfile, FindingReport, FindingWriteOptions};
+use crate::report::{ArtifactError, FindingProfile, FindingReport, FindingWriteOptions};
 use crate::tools::report_finding::{
     check_full_report, derived_fields, lock_findings, prepare_full_report, ReportFindingError,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A report to attach to the finding `finding_id`.
 #[derive(Debug, Clone)]
@@ -58,17 +60,38 @@ pub fn attach_reports(
     opts: &FindingWriteOptions,
     dry_run: bool,
 ) -> std::io::Result<AttachBatch> {
+    attach_reports_with(paths, items, opts, dry_run, &mut || {})
+}
+
+/// [`attach_reports`] with a hook that runs after the replacement ledger is
+/// staged and before it is renamed into place: the only window in which a
+/// writer that does not take the lock can change the ledger, so tests use it
+/// to stand in for one.
+fn attach_reports_with(
+    paths: &CoveragePaths,
+    items: Vec<AttachItem>,
+    opts: &FindingWriteOptions,
+    dry_run: bool,
+    before_rename: &mut dyn FnMut(),
+) -> std::io::Result<AttachBatch> {
     let _lock = lock_findings(paths)?;
-    let raw = match std::fs::read_to_string(&paths.findings) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let raw = match std::fs::read(&paths.findings) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
-    let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+    let read_len = raw.len() as u64;
+    // One segment per line, each with its own terminator. Segments nothing
+    // replaces are written back exactly as read.
+    let mut segments: Vec<Vec<u8>> = raw
+        .split_inclusive(|b| *b == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
     let mut at: HashMap<String, Vec<usize>> = HashMap::new();
     let mut records: HashMap<usize, FindingRecord> = HashMap::new();
-    for (i, line) in lines.iter().enumerate() {
-        if let Ok(r) = serde_json::from_str::<FindingRecord>(line) {
+    for (i, seg) in segments.iter().enumerate() {
+        if let Some(r) = line_text(seg).and_then(|t| serde_json::from_str::<FindingRecord>(t).ok())
+        {
             at.entry(r.id.clone()).or_default().push(i);
             records.insert(i, r);
         }
@@ -84,10 +107,25 @@ pub fn attach_reports(
             Some([i]) if claimed.contains(i) => AttachOutcome::Duplicate,
             Some([i]) => {
                 let record = &records[i];
-                if record.report.is_some() || record.profile == FindingProfile::Full {
+                let text = line_text(&segments[*i]).unwrap_or_default();
+                // `record.report` is read leniently (a report this build
+                // cannot parse loads as `None`), so the raw line is checked
+                // too: a stored report is never overwritten.
+                if record.report.is_some()
+                    || record.profile == FindingProfile::Full
+                    || has_raw_report(text)
+                {
                     AttachOutcome::AlreadyHasReport
                 } else if dry_run {
-                    match check_full_report(&item.report, &known, opts) {
+                    // The same rejections a real run gives, minus the ones
+                    // that need the artifact store to be touched.
+                    match check_full_report(&item.report, &known, opts).and_then(|()| {
+                        if !item.report.artifacts.is_empty() && opts.artifact_root.is_none() {
+                            Err(ReportFindingError::Artifact(ArtifactError::NoStore))
+                        } else {
+                            Ok(())
+                        }
+                    }) {
                         Ok(()) => {
                             claimed.insert(*i);
                             AttachOutcome::Attached
@@ -98,11 +136,12 @@ pub fn attach_reports(
                     // Only a report that attaches claims the finding: a
                     // rejected one leaves it free for a later item.
                     match prepare_full_report(paths, item.report, &known, opts)
-                        .and_then(|report| Ok(upgraded_line(&lines[*i], &report)?))
+                        .and_then(|report| Ok(upgraded_line(text, &report)?))
                     {
-                        Ok(line) => {
+                        Ok(mut line) => {
+                            line.push_str(terminator(&segments[*i]));
                             claimed.insert(*i);
-                            lines[*i] = line;
+                            segments[*i] = line.into_bytes();
                             changed = true;
                             AttachOutcome::Attached
                         }
@@ -116,11 +155,40 @@ pub fn attach_reports(
     }
 
     let backup = if changed {
-        Some(replace_ledger(paths, &lines)?)
+        Some(replace_ledger(paths, &segments, read_len, before_rename)?)
     } else {
         None
     };
     Ok(AttachBatch { outcomes, backup })
+}
+
+/// A ledger line as JSON text: `None` when it is not UTF-8, otherwise the
+/// text without its `\n` / `\r\n` terminator.
+fn line_text(segment: &[u8]) -> Option<&str> {
+    std::str::from_utf8(segment)
+        .ok()
+        .map(|t| t.trim_end_matches(['\n', '\r']))
+}
+
+/// The line terminator `segment` ends with: `"\r\n"`, `"\n"`, or `""` for
+/// an unterminated final line.
+fn terminator(segment: &[u8]) -> &'static str {
+    if segment.ends_with(b"\r\n") {
+        "\r\n"
+    } else if segment.ends_with(b"\n") {
+        "\n"
+    } else {
+        ""
+    }
+}
+
+/// Whether the raw line carries a non-null `report` key, whether or not this
+/// build can parse what is in it.
+fn has_raw_report(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("report").map(|r| !r.is_null()))
+        .unwrap_or(false)
 }
 
 /// `line` with the report attached and the fields a full finding derives
@@ -145,32 +213,186 @@ fn upgraded_line(line: &str, report: &FindingReport) -> Result<String, serde_jso
     serde_json::to_string(&v)
 }
 
-/// Back the ledger up byte for byte, then replace it with `lines` via a
-/// temp file and a rename, so a reader sees the old ledger or the new one,
-/// never a mix. Returns the backup's path.
-fn replace_ledger(paths: &CoveragePaths, lines: &[String]) -> std::io::Result<PathBuf> {
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let base = paths
-        .root
-        .join(format!("findings.jsonl.pre-import-{stamp}"));
+/// The first unused `findings.jsonl.pre-import-<stamp>[-n]` in `root`.
+fn backup_path(root: &Path, stamp: &str) -> PathBuf {
+    let base = root.join(format!("findings.jsonl.pre-import-{stamp}"));
     let mut backup = base.clone();
     let mut n = 1;
     while backup.exists() {
         n += 1;
         backup = PathBuf::from(format!("{}-{n}", base.display()));
     }
-    std::fs::copy(&paths.findings, &backup)?;
+    backup
+}
 
+/// Back the ledger up byte for byte, then replace it with `segments` via a
+/// temp file and a rename, so a reader sees the old ledger or the new one,
+/// never a mix. Returns the backup's path. On any failure before the rename
+/// nothing is left behind: not the temp file, not the backup.
+///
+/// The lock only excludes writers that take it. `read_len` is the ledger's
+/// length when it was read; if it has changed by the time the replacement is
+/// ready, a writer that did not take the lock appended in between and the
+/// rename would drop its line, so the import is abandoned instead.
+fn replace_ledger(
+    paths: &CoveragePaths,
+    segments: &[Vec<u8>],
+    read_len: u64,
+    before_rename: &mut dyn FnMut(),
+) -> std::io::Result<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let backup = backup_path(&paths.root, &stamp);
+    std::fs::copy(&paths.findings, &backup)?;
     let tmp = paths.root.join("findings.jsonl.import-tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        for line in lines {
-            f.write_all(line.as_bytes())?;
-            f.write_all(b"\n")?;
-        }
-        f.sync_all()?;
+    let swapped = stage_and_swap(paths, segments, read_len, &tmp, before_rename);
+    if swapped.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&backup);
     }
-    std::fs::set_permissions(&tmp, std::fs::metadata(&paths.findings)?.permissions())?;
-    std::fs::rename(&tmp, &paths.findings)?;
+    swapped?;
+    // Make the rename itself durable, not only the file's contents.
+    match std::fs::File::open(&paths.root).and_then(|d| d.sync_all()) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            ) => {}
+        other => other?,
+    }
     Ok(backup)
+}
+
+fn stage_and_swap(
+    paths: &CoveragePaths,
+    segments: &[Vec<u8>],
+    read_len: u64,
+    tmp: &Path,
+    before_rename: &mut dyn FnMut(),
+) -> std::io::Result<()> {
+    let permissions = std::fs::metadata(&paths.findings)?.permissions();
+    let mut f = std::fs::File::create(tmp)?;
+    // Before any content is written, so it is never readable at a looser
+    // mode than the ledger it replaces.
+    f.set_permissions(permissions)?;
+    for segment in segments {
+        f.write_all(segment)?;
+    }
+    f.sync_all()?;
+    drop(f);
+    before_rename();
+    if std::fs::metadata(&paths.findings)?.len() != read_len {
+        return Err(std::io::Error::other(
+            "the findings ledger changed during import (a writer that does not take the ledger lock appended to it); nothing was written, retry the import",
+        ));
+    }
+    std::fs::rename(tmp, &paths.findings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::events::{Attribution, FindingEvidence, FindingScope, Surface};
+    use crate::report::FindingProfile;
+    use crate::tools::report_finding::{report_finding, ReportFindingInput};
+    use crate::Severity;
+
+    fn report() -> FindingReport {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap()
+    }
+
+    fn seed_summary(paths: &CoveragePaths) -> String {
+        let input = ReportFindingInput {
+            file_path: None,
+            line_range: None,
+            target_ref: None,
+            scope: FindingScope::Repo,
+            summary: Some("s".into()),
+            severity: Some(Severity::Low),
+            concern_id: None,
+            evidence: Some(FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".into(),
+                references: vec![],
+            }),
+            report: None,
+        };
+        let attribution = Attribution {
+            run_id: "r".into(),
+            model: "m".into(),
+            surface: Surface::Workflow,
+        };
+        let opts = FindingWriteOptions::default().with_profile(FindingProfile::Summary);
+        report_finding(paths, attribution, input, &opts).unwrap().id
+    }
+
+    fn names(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_ledger_that_changed_during_import_is_left_as_the_other_writer_wrote_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let id = seed_summary(&paths);
+        let original = std::fs::read(&paths.findings).unwrap();
+
+        // A writer that does not take the lock appends between the read and
+        // the rename.
+        let appended = b"{\"from\":\"a writer that ignores the lock\"}\n";
+        let err = attach_reports_with(
+            &paths,
+            vec![AttachItem {
+                finding_id: id,
+                report: report(),
+            }],
+            &FindingWriteOptions::default().with_profile(FindingProfile::Full),
+            false,
+            &mut || {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&paths.findings)
+                    .unwrap()
+                    .write_all(appended)
+                    .unwrap();
+            },
+        )
+        .expect_err("the import must be abandoned");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("changed during import"), "{err}");
+
+        // The other writer's line is intact and nothing of ours is written.
+        let mut expected = original;
+        expected.extend_from_slice(appended);
+        assert_eq!(std::fs::read(&paths.findings).unwrap(), expected);
+        let leftovers: Vec<_> = names(&paths.root)
+            .into_iter()
+            .filter(|n| n.contains("pre-import") || n.contains("import-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn backups_taken_in_the_same_second_get_distinct_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stamp = "20260930T120000Z";
+        let first = backup_path(tmp.path(), stamp);
+        std::fs::write(&first, "1").unwrap();
+        let second = backup_path(tmp.path(), stamp);
+        std::fs::write(&second, "2").unwrap();
+        let third = backup_path(tmp.path(), stamp);
+        assert_eq!(
+            first.file_name().unwrap(),
+            "findings.jsonl.pre-import-20260930T120000Z"
+        );
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_ne!(first, third);
+    }
 }
