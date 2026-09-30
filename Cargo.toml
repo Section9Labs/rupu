@@ -39,6 +39,8 @@ tokio-util = "0.7"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Field paths (`report.call_chain[0].role`) on tool-input parse errors.
+serde_path_to_error = "0.1.20"
 serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["chrono"] }
 jsonschema = "0.18"

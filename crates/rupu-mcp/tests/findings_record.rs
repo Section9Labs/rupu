@@ -350,3 +350,40 @@ async fn a_per_call_profile_overrides_the_run_default() {
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].profile, rupu_coverage::FindingProfile::Summary);
 }
+
+#[tokio::test]
+async fn structural_errors_name_the_field_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let mut report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    report["call_chain"][0]["role"] = serde_json::json!("entrypoint");
+    let msg = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report.clone() }),
+        )
+        .await
+        .expect_err("a bad nested variant must be refused")
+        .to_string();
+    assert!(msg.contains("report.call_chain[0].role"), "{msg}");
+    assert!(msg.contains("unknown variant `entrypoint`"), "{msg}");
+
+    report["call_chain"][0]["role"] = serde_json::json!("sink");
+    let hop = report["call_chain"][0].as_object_mut().unwrap();
+    let label = hop.remove("label").unwrap();
+    hop.insert("lable".into(), label);
+    let msg = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("a nested typo must be refused")
+        .to_string();
+    assert!(msg.contains("report.call_chain[0]"), "{msg}");
+    assert!(msg.contains("lable"), "{msg}");
+}

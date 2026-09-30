@@ -117,7 +117,9 @@ impl ToolDispatcher {
                             .to_string(),
                     )
                 })?;
-                let parsed: tools::findings::RecordArgs = serde_json::from_value(args)
+                // `serde_path_to_error` so a structural error names its field
+                // path (`report.call_chain[0].role: unknown variant ...`).
+                let parsed: tools::findings::RecordArgs = serde_path_to_error::deserialize(args)
                     .map_err(|e| McpError::Tool(format!("invalid findings.record input: {e}")))?;
                 let mut ctx = ctx.clone();
                 if let Some(profile) = findings_profile {
