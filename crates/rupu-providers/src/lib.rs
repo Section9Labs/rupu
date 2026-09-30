@@ -22,6 +22,7 @@ pub mod github_copilot;
 pub mod google_gemini;
 pub mod local;
 pub mod model_catalog;
+pub mod model_limits;
 pub mod model_pool;
 pub mod model_registry;
 pub mod model_scorer;

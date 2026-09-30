@@ -54,6 +54,23 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Fetch the live model catalog with limits (spec 2026-09-30 §3).
+    /// `&mut self` so OAuth providers can refresh their token first. Unlike
+    /// `list_models`, a failure is an `Err`, never an empty list.
+    /// `Err(ProviderError::NotImplemented)` means the provider exposes no
+    /// model listing.
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        Err(ProviderError::NotImplemented {
+            provider: self.provider_id().to_string(),
+        })
+    }
+
+    /// Whether generated output counts against the same window as the
+    /// input (spec §3). Copilot and Gemini have independent budgets.
+    fn output_shares_context(&self) -> bool {
+        true
+    }
+
     /// Liveness + authorization probe: does this provider answer an
     /// authenticated request right now?
     ///
