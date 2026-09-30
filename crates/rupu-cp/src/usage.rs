@@ -252,12 +252,7 @@ pub fn run_metrics_paths(paths: &[PathBuf], pricing: &PricingConfig) -> RunMetri
 /// turns; the duration is the run record's wall clock once it has finished,
 /// else the longest transcript `RunComplete`.
 pub fn run_metrics(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> RunMetrics {
-    let u = run_usage(store, run_id);
-    let wall_clock = store.load(run_id).ok().and_then(|rec| {
-        let finished = rec.finished_at?;
-        let ms = (finished - rec.started_at).num_milliseconds();
-        Some(u64::try_from(ms).unwrap_or(0))
-    });
+    let (u, wall_clock) = UsageIndex::global().run_usage_and_wall_clock(store, run_id);
     RunMetrics {
         usage: summarize_run_usage(&u, pricing),
         turns: u.turns,

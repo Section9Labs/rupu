@@ -25,7 +25,7 @@ use crate::host::transcript_paths::{agent_mirror_path, cache_path, global_dir_of
 use crate::usage::TurnPoint;
 use rupu_orchestrator::runs::{
     known_transcript_from_event_line, known_transcripts_from_step_result_line, KnownTranscript,
-    RunStore,
+    RunRecord, RunStore,
 };
 use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow};
 use rupu_transcript::{transcript_key, Event, JsonlCursor, UsageRow};
@@ -78,12 +78,16 @@ pub struct RunUsage {
     pub turns: u64,
     /// Longest `RunComplete.duration_ms` among fallback transcripts.
     pub duration_ms: Option<u64>,
-    /// Per-call series: ledger rows in arrival order, then fallback
-    /// transcripts in known-set order. `turn` is the 1-based index.
+    /// Per-call series, append-only in observation order: each refresh
+    /// appends the ledger's new rows, then each fallback transcript's new
+    /// usage events in known-set order. `turn` is the 1-based index. See
+    /// [`Series`] for when it is instead rebuilt canonically (ledger, then
+    /// fallback) — the only times `epoch` moves.
     pub points: Vec<TurnPoint>,
     /// A transcript that should exist could not be read anywhere.
     pub partial: bool,
-    /// Changes whenever this run's series is rebuilt non-append-only (Plan 2 `epoch`).
+    /// Changes whenever this run's series is rebuilt non-append-only (Plan 2
+    /// `epoch`); pure appends never move it.
     pub epoch: u64,
 }
 
@@ -328,8 +332,9 @@ impl Acc {
         });
     }
 
-    /// One fallback transcript (one contributing transcript per model key; a
-    /// file with `RunStart` and no usage still counts as a zero row).
+    /// One fallback transcript's totals (one contributing transcript per model
+    /// key; a file with `RunStart` and no usage still counts as a zero row).
+    /// Its points reach the output through the [`Series`], not from here.
     fn transcript(&mut self, label: &str, f: &TranscriptFold) {
         for (key, t) in &f.by_model {
             self.row(label, key, *t);
@@ -338,9 +343,6 @@ impl Acc {
             if let Some(start) = &f.start {
                 self.row(label, start, Tokens::default());
             }
-        }
-        for t in &f.points {
-            self.point(label, *t);
         }
         self.turns += f.turns;
         if let Some(d) = f.duration_ms {
@@ -363,6 +365,120 @@ impl Acc {
             partial,
             epoch,
         }
+    }
+}
+
+/// One point of a run's owned per-turn series.
+#[derive(Debug, Clone)]
+enum SeriesPoint {
+    /// `LedgerFold::points[i]` — the raw `(agent_run_id, tokens)`, labelled
+    /// through the parent chain at build time (a child's row can arrive before
+    /// its ancestor's).
+    Ledger(usize),
+    /// A fallback transcript's point, labelled when observed.
+    Fallback(Arc<str>, Tokens),
+}
+
+/// How much of one fallback transcript's fold the series has consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Watermark {
+    path: PathBuf,
+    resets: u64,
+    taken: usize,
+}
+
+/// A fallback transcript feeding a build, in known-set order.
+struct FallbackSrc {
+    key: String,
+    label: Arc<str>,
+    path: PathBuf,
+    fold: Arc<Mutex<TranscriptFold>>,
+}
+
+/// A run's per-turn series, append-only in OBSERVATION order (spec §4.3 as
+/// amended by the Task 8 fix ruling): each refresh appends the ledger's new
+/// points, then each fallback transcript's new points in known-set order, so
+/// Plan 2's `since=N` client only ever sees the series grow. It is rebuilt
+/// canonically — every ledger point in ledger order, then every fallback
+/// point in known-set order — only when that is impossible:
+/// - the ledger reset after some of its points were emitted;
+/// - an emitted fallback transcript reset (shrank / was replaced) or now
+///   resolves to a different file;
+/// - an emitted fallback key left the fallback set (its ledger rows arrived,
+///   or it no longer resolves), so its points must go.
+///
+/// A fallback key none of whose points were emitted never forces a rebuild.
+#[derive(Debug, Default)]
+struct Series {
+    points: Vec<SeriesPoint>,
+    /// `LedgerFold::points` already appended.
+    ledger_taken: usize,
+    /// Per fallback key.
+    marks: HashMap<String, Watermark>,
+}
+
+impl Series {
+    /// Append every point not yet observed. Returns `true` when the series had
+    /// to be rebuilt canonically instead (the caller moves the epoch).
+    fn advance(
+        &mut self,
+        ledger: &LedgerFold,
+        ledger_reset: bool,
+        fallback: &[FallbackSrc],
+    ) -> bool {
+        let live: HashSet<&str> = fallback.iter().map(|f| f.key.as_str()).collect();
+        let mut rebuild = (ledger_reset && self.ledger_taken > 0)
+            || self.ledger_taken > ledger.points.len()
+            || self
+                .marks
+                .iter()
+                .any(|(k, m)| m.taken > 0 && !live.contains(k.as_str()));
+        let mut rebuilt = false;
+        loop {
+            if rebuild {
+                *self = Series::default();
+                rebuilt = true;
+                rebuild = false;
+            }
+            self.points
+                .extend((self.ledger_taken..ledger.points.len()).map(SeriesPoint::Ledger));
+            self.ledger_taken = ledger.points.len();
+            for src in fallback {
+                let f = lock_fold(&src.fold);
+                let mark = self
+                    .marks
+                    .entry(src.key.clone())
+                    .or_insert_with(|| Watermark {
+                        path: src.path.clone(),
+                        resets: f.resets,
+                        taken: 0,
+                    });
+                if mark.path != src.path || mark.resets != f.resets || mark.taken > f.points.len() {
+                    if mark.taken > 0 {
+                        rebuild = true; // its emitted points are no longer true
+                        break;
+                    }
+                    // Nothing of it emitted yet: just re-anchor.
+                    *mark = Watermark {
+                        path: src.path.clone(),
+                        resets: f.resets,
+                        taken: 0,
+                    };
+                }
+                let fresh = f.points.get(mark.taken..).unwrap_or_default();
+                self.points.extend(
+                    fresh
+                        .iter()
+                        .map(|t| SeriesPoint::Fallback(Arc::clone(&src.label), *t)),
+                );
+                mark.taken = f.points.len();
+            }
+            if !rebuild {
+                break;
+            }
+        }
+        self.marks.retain(|k, _| live.contains(k.as_str()));
+        rebuilt
     }
 }
 
@@ -392,11 +508,13 @@ fn attribute(
 }
 
 /// Spec §4.2 rule 4: ledger agents (attributed through their parent chain)
-/// first, then each fallback transcript in known-set order.
+/// first, then each fallback transcript in known-set order; `points` are the
+/// run's [`Series`], labelled here.
 fn build_usage(
     ledger: &LedgerFold,
     known_step: &dyn Fn(&str) -> Option<String>,
-    fallback: &[(String, Arc<Mutex<TranscriptFold>>)],
+    fallback: &[FallbackSrc],
+    series: &[SeriesPoint],
     partial: bool,
     epoch: u64,
 ) -> RunUsage {
@@ -415,13 +533,21 @@ fn build_usage(
         }
         attributed.insert(id.as_str(), label);
     }
-    for (id, t) in &ledger.points {
-        let label = attributed.get(id.as_str()).cloned().unwrap_or_default();
-        acc.point(&label, *t);
-    }
     acc.turns += ledger.turns;
-    for (label, fold) in fallback {
-        acc.transcript(label, &lock_fold(fold));
+    for src in fallback {
+        acc.transcript(&src.label, &lock_fold(&src.fold));
+    }
+    for p in series {
+        match p {
+            SeriesPoint::Ledger(i) => {
+                let Some((id, t)) = ledger.points.get(*i) else {
+                    continue; // unreachable: a ledger reset rebuilds the series
+                };
+                let label = attributed.get(id.as_str()).map_or("", String::as_str);
+                acc.point(label, *t);
+            }
+            SeriesPoint::Fallback(label, t) => acc.point(label, *t),
+        }
     }
     acc.finish(partial, epoch)
 }
@@ -477,6 +603,11 @@ struct RunState {
     known_idx: HashMap<String, usize>,
     /// Fallback transcripts the last build folded.
     fallback: Vec<FallbackView>,
+    /// The per-turn series, append-only in observation order.
+    series: Series,
+    /// `finished_at - started_at` of the last loaded run record (still valid
+    /// while sealed: `run.json` is part of the seal).
+    wall_clock_ms: Option<u64>,
     seal: Option<Seal>,
     last: Option<Arc<RunUsage>>,
     epoch: u64,
@@ -558,6 +689,12 @@ fn resolve(path: &Path, key: &str, worker: Option<&str>, global: &Path) -> Optio
         }
     }
     None
+}
+
+/// A finished run's wall-clock duration.
+fn wall_clock_ms(rec: &RunRecord) -> Option<u64> {
+    let finished = rec.finished_at?;
+    Some(u64::try_from((finished - rec.started_at).num_milliseconds()).unwrap_or(0))
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -653,6 +790,19 @@ impl UsageIndex {
         self.refresh(&mut st, store, run_id)
     }
 
+    /// [`Self::run_usage`] plus the run record's wall-clock duration once it
+    /// has finished, from the same record load (none at all while sealed).
+    pub(crate) fn run_usage_and_wall_clock(
+        &self,
+        store: &RunStore,
+        run_id: &str,
+    ) -> (Arc<RunUsage>, Option<u64>) {
+        let state = self.run_state(store, run_id);
+        let mut st = self.lock_run(&state);
+        let usage = self.refresh(&mut st, store, run_id);
+        (usage, st.wall_clock_ms)
+    }
+
     fn refresh(&self, st: &mut RunState, store: &RunStore, run_id: &str) -> Arc<RunUsage> {
         let ledger_path = store.usage_ledger_path(run_id);
         let events_path = store.events_path(run_id);
@@ -673,11 +823,11 @@ impl UsageIndex {
         st.seal = None;
 
         let rec = store.load(run_id).ok();
+        st.wall_clock_ms = rec.as_ref().and_then(wall_clock_ms);
         let worker = rec.as_ref().and_then(|r| r.worker_id.clone());
         let terminal = rec.as_ref().is_some_and(|r| r.status.is_terminal());
-        let had_last = st.last.is_some();
-        let mut changed = !had_last;
-        let mut bump = false;
+        let mut changed = st.last.is_none();
+        let mut ledger_reset = false;
         let mut partial = false;
 
         // Rule 1: the ledger.
@@ -685,7 +835,7 @@ impl UsageIndex {
             Ok((reset, bytes, lines)) => {
                 if reset {
                     st.ledger.clear_keep_cursor();
-                    bump = true;
+                    ledger_reset = true;
                     changed = true;
                 }
                 changed |= bytes > 0;
@@ -747,11 +897,9 @@ impl UsageIndex {
 
         // Rule 3: fallback for every known key without ledger rows.
         let global = global_dir_of(store);
-        let mut fallback: Vec<(String, Arc<Mutex<TranscriptFold>>)> = Vec::new();
+        let mut fallback: Vec<FallbackSrc> = Vec::new();
         let mut views: Vec<FallbackView> = Vec::new();
         let mut mirrors: Vec<(PathBuf, Stat)> = Vec::new();
-        let previous: HashMap<&str, &FallbackView> =
-            st.fallback.iter().map(|v| (v.key.as_str(), v)).collect();
         for k in &st.known {
             if st.ledger.keys.contains(&k.kt.key) {
                 continue;
@@ -775,19 +923,17 @@ impl UsageIndex {
                 partial |= f.unreadable;
                 FallbackView {
                     key: k.kt.key.clone(),
-                    path,
+                    path: path.clone(),
                     generation: f.generation,
                     resets: f.resets,
                 }
             };
-            match previous.get(view.key.as_str()) {
-                // Rule 5: a fallback transcript reset re-writes its points.
-                Some(old) => bump |= old.resets != view.resets || old.path != view.path,
-                // Rule 5: a fallback key appearing after ledger points exist.
-                None => bump |= had_last && !st.ledger.points.is_empty(),
-            }
-            let label = k.kt.step_id.clone().unwrap_or_default();
-            fallback.push((label, fold));
+            fallback.push(FallbackSrc {
+                key: k.kt.key.clone(),
+                label: Arc::from(k.kt.step_id.as_deref().unwrap_or_default()),
+                path,
+                fold,
+            });
             views.push(view);
         }
         changed |= views != st.fallback;
@@ -799,16 +945,35 @@ impl UsageIndex {
         let usage = match reuse {
             Some(last) => last,
             None => {
+                // Rule 5 (as amended): the epoch moves only when the series
+                // could not stay append-only and was rebuilt canonically.
+                let rebuilt = st.series.advance(&st.ledger, ledger_reset, &fallback);
+                if rebuilt {
+                    st.epoch = st.epoch.saturating_add(1);
+                }
                 let known_step = |key: &str| st.known_step(key);
-                let mut built = build_usage(&st.ledger, &known_step, &fallback, partial, st.epoch);
-                if let Some(last) = &st.last {
-                    // Any non-append change to the series (a ledger point
-                    // landing ahead of fallback points, a key moving from
-                    // fallback to ledger, …) also moves the epoch.
-                    bump |= !built.points.starts_with(&last.points);
-                    if bump {
-                        st.epoch = st.epoch.saturating_add(1);
-                        built.epoch = st.epoch;
+                let built = build_usage(
+                    &st.ledger,
+                    &known_step,
+                    &fallback,
+                    &st.series.points,
+                    partial,
+                    st.epoch,
+                );
+                if cfg!(debug_assertions) && !rebuilt {
+                    if let Some(last) = &st.last {
+                        // Tokens only: a ledger point's label may legitimately
+                        // resolve later (a child row before its ancestor's).
+                        let tok = |p: &TurnPoint| (p.tokens_in, p.tokens_out, p.tokens_cached);
+                        debug_assert!(
+                            last.points.len() <= built.points.len()
+                                && last
+                                    .points
+                                    .iter()
+                                    .zip(&built.points)
+                                    .all(|(a, b)| tok(a) == tok(b)),
+                            "usage series changed without an epoch bump"
+                        );
                     }
                 }
                 st.fallback = views;
@@ -833,7 +998,7 @@ impl UsageIndex {
     /// file sets `partial`. Only the per-file folds are cached.
     pub fn transcripts_usage(&self, labeled: &[(String, PathBuf)]) -> Arc<RunUsage> {
         let mut seen: HashSet<&Path> = HashSet::new();
-        let mut fallback: Vec<(String, Arc<Mutex<TranscriptFold>>)> = Vec::new();
+        let mut fallback: Vec<FallbackSrc> = Vec::new();
         let mut partial = false;
         let mut resets = 0u64;
         for (label, path) in labeled {
@@ -851,13 +1016,25 @@ impl UsageIndex {
                 partial |= f.unreadable;
                 resets = resets.saturating_add(f.resets);
             }
-            fallback.push((label.clone(), fold));
+            fallback.push(FallbackSrc {
+                key: path.to_string_lossy().into_owned(),
+                label: Arc::from(label.as_str()),
+                path: path.clone(),
+                fold,
+            });
         }
         let no_ledger = LedgerFold::default();
+        let mut series = Series::default();
+        series.advance(&no_ledger, false, &fallback);
         let epoch = self.base_epoch.saturating_add(resets);
         let no_labels = |_: &str| None;
         Arc::new(build_usage(
-            &no_ledger, &no_labels, &fallback, partial, epoch,
+            &no_ledger,
+            &no_labels,
+            &fallback,
+            &series.points,
+            partial,
+            epoch,
         ))
     }
 
@@ -1105,14 +1282,42 @@ mod tests {
     }
 
     /// Everything but `epoch` (two indexes have different base epochs).
-    fn assert_same_usage(a: &RunUsage, b: &RunUsage) {
+    /// `exact_order: false` compares `points` as a multiset: for a run fed by
+    /// more than one source, an incremental series is in observation order
+    /// while a one-shot fold is in canonical order.
+    fn assert_same_usage(a: &RunUsage, b: &RunUsage, exact_order: bool) {
         assert_eq!(a.rows, b.rows, "rows");
         assert_eq!(a.by_step, b.by_step, "by_step");
         assert_eq!(a.by_unit, b.by_unit, "by_unit");
         assert_eq!(a.turns, b.turns, "turns");
         assert_eq!(a.duration_ms, b.duration_ms, "duration_ms");
-        assert_eq!(a.points, b.points, "points");
         assert_eq!(a.partial, b.partial, "partial");
+        if exact_order {
+            assert_eq!(a.points, b.points, "points");
+        } else {
+            let key = |p: &TurnPoint| (p.label.clone(), p.tokens_in, p.tokens_out, p.tokens_cached);
+            let mut pa: Vec<_> = a.points.iter().map(key).collect();
+            let mut pb: Vec<_> = b.points.iter().map(key).collect();
+            pa.sort();
+            pb.sort();
+            assert_eq!(pa, pb, "points (as a multiset)");
+            for u in [a, b] {
+                let turns: Vec<u64> = u.points.iter().map(|p| p.turn).collect();
+                let want: Vec<u64> = (1..=u.points.len() as u64).collect();
+                assert_eq!(turns, want, "turn is the 1-based index");
+            }
+        }
+    }
+
+    /// `next` only extends `prev`: same epoch, `prev.points` a prefix.
+    fn assert_extends(prev: &RunUsage, next: &RunUsage) {
+        assert_eq!(next.epoch, prev.epoch, "pure growth keeps the epoch");
+        assert!(
+            next.points.starts_with(&prev.points),
+            "the series must only extend:\n prev {:?}\n next {:?}",
+            prev.points,
+            next.points
+        );
     }
 
     #[test]
@@ -1466,12 +1671,14 @@ mod tests {
             "half-written lines are not counted yet"
         );
         assert_eq!(second.turns, 5 + 2);
+        assert_extends(&first, &second);
 
         append(&ledger, tail);
         append(&tf, ftail);
         let third = idx.run_usage(&store, "run_INCR");
+        assert_extends(&second, &third);
         let fresh = UsageIndex::default().run_usage(&store, "run_INCR");
-        assert_same_usage(&third, &fresh);
+        assert_same_usage(&third, &fresh, false);
         assert_eq!(total(&third).input, 21 + 6000);
         assert_eq!(third.turns, 6 + 3);
     }
@@ -1584,6 +1791,9 @@ mod tests {
         let appended = idx.run_usage(&store, "run_EPOCH");
         assert_eq!(appended.epoch, e1, "pure appends keep the epoch");
         assert_eq!(total(&appended).input, 600);
+        // A single-source run: incremental order IS canonical order.
+        let fresh = UsageIndex::default().run_usage(&store, "run_EPOCH");
+        assert_same_usage(&appended, &fresh, true);
 
         // The file shrank: the ledger fold restarts and the epoch moves on.
         std::fs::write(&ledger, row("01E9", 7)).unwrap();
@@ -1591,41 +1801,278 @@ mod tests {
         assert_eq!(reset.epoch, e1 + 1);
         assert_eq!(total(&reset), tok(7, 1));
         assert_eq!(reset.points.len(), 1);
+
+        // Replaced by a LONGER file (new inode, e.g. a mirror's atomic
+        // rename): still a reset, so still a rebuild.
+        let replacement = ledger.with_extension("jsonl.tmp");
+        std::fs::write(
+            &replacement,
+            [row("01F1", 1), row("01F2", 2), row("01F3", 3)].concat(),
+        )
+        .unwrap();
+        std::fs::rename(&replacement, &ledger).unwrap();
+        let replaced = idx.run_usage(&store, "run_EPOCH");
+        assert_eq!(replaced.epoch, e1 + 2);
+        assert_eq!(total(&replaced), tok(6, 3));
+        let fresh = UsageIndex::default().run_usage(&store, "run_EPOCH");
+        assert_same_usage(&replaced, &fresh, true);
     }
 
     #[test]
-    fn a_ledger_point_landing_before_fallback_points_bumps_epoch() {
+    fn a_zero_point_fallback_key_never_bumps_the_epoch() {
+        // An all-local ledger run: a new unit's transcript is announced
+        // (RunStart written, no usage yet) before its first ledger row.
         let tmp = tempfile::tempdir().unwrap();
         let store = run_store(tmp.path());
-        create_run(&store, "run_MIXED", RunStatus::Running);
-        let f = tmp.path().join("transcripts/run_F.jsonl");
-        append(&f, &transcript_lines("legacy", PROVIDER, MODEL, &[(9, 9)]));
-        store
-            .append_step_result("run_MIXED", &step_result("old", &f))
-            .unwrap();
-        let idx = UsageIndex::default();
-        let before = idx.run_usage(&store, "run_MIXED");
-
-        // Ledger points sort ahead of fallback points, so the series is no
-        // longer an append of the previous one.
-        let t = tmp.path().join("transcripts/run_A.jsonl");
+        create_run(&store, "run_ZERO", RunStatus::Running);
+        let a = tmp.path().join("transcripts/run_A.jsonl");
+        let b = tmp.path().join("transcripts/run_B.jsonl");
+        let ledger = store.usage_ledger_path("run_ZERO");
         append(
-            &store.usage_ledger_path("run_MIXED"),
+            &ledger,
             &ledger_line(
-                "01M1",
+                "01Z1",
+                Some("s"),
+                Some(0),
+                "run_A",
+                None,
+                &a,
+                10,
+                1,
+                LedgerKind::Turn,
+            ),
+        );
+        let idx = UsageIndex::default();
+        let u0 = idx.run_usage(&store, "run_ZERO");
+
+        append(&b, &transcript_lines("fanner", PROVIDER, MODEL, &[]));
+        append(
+            &store.events_path("run_ZERO"),
+            &unit_started("run_ZERO", "s", 1, &b),
+        );
+        let u1 = idx.run_usage(&store, "run_ZERO");
+        assert_extends(&u0, &u1);
+        assert_eq!(
+            u1.rows.iter().map(|r| r.runs).sum::<u64>(),
+            2,
+            "the new unit is a zero row"
+        );
+
+        // Its first call lands in the ledger: the key leaves the fallback set
+        // with nothing of it emitted.
+        append(
+            &ledger,
+            &ledger_line(
+                "01Z2",
+                Some("s"),
+                Some(1),
+                "run_B",
+                None,
+                &b,
+                20,
+                2,
+                LedgerKind::Turn,
+            ),
+        );
+        let u2 = idx.run_usage(&store, "run_ZERO");
+        assert_extends(&u1, &u2);
+        assert_eq!(total(&u2), tok(30, 3));
+    }
+
+    #[test]
+    fn a_mixed_run_series_only_extends_as_both_sources_grow() {
+        // Ledger rows for a local step (run_A) + a fallback transcript (run_B,
+        // e.g. a placed unit's mirror), appended to alternately.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_MIX", RunStatus::Running);
+        let a = tmp.path().join("transcripts/run_A.jsonl");
+        let b = tmp.path().join("transcripts/run_B.jsonl");
+        let ledger = store.usage_ledger_path("run_MIX");
+        append(
+            &ledger,
+            &ledger_line(
+                "01X0",
                 Some("s"),
                 None,
                 "run_A",
                 None,
-                &t,
+                &a,
                 1,
                 1,
                 LedgerKind::Turn,
             ),
         );
-        let after = idx.run_usage(&store, "run_MIXED");
-        assert_ne!(after.epoch, before.epoch);
-        assert_eq!(after.points.len(), 2);
+        append(
+            &b,
+            &transcript_lines("remote", PROVIDER, MODEL, &[(100, 10)]),
+        );
+        store
+            .append_step_result("run_MIX", &step_result("placed", &b))
+            .unwrap();
+
+        let idx = UsageIndex::default();
+        let mut prev = idx.run_usage(&store, "run_MIX");
+        let e0 = prev.epoch;
+        for i in 1..=6u32 {
+            if i % 2 == 1 {
+                let id = format!("01X{i}");
+                append(
+                    &ledger,
+                    &ledger_line(
+                        &id,
+                        Some("s"),
+                        None,
+                        "run_A",
+                        None,
+                        &a,
+                        u64::from(i),
+                        1,
+                        LedgerKind::Turn,
+                    ),
+                );
+            } else {
+                append(&b, &usage_line(PROVIDER, MODEL, 100 * i, 10, None));
+            }
+            let next = idx.run_usage(&store, "run_MIX");
+            assert_extends(&prev, &next);
+            assert_eq!(next.points.len(), prev.points.len() + 1);
+            prev = next;
+        }
+        assert_eq!(prev.epoch, e0);
+        let labels: Vec<&str> = prev.points.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["s", "placed", "s", "placed", "s", "placed", "s", "placed"]
+        );
+        // Totals equal a one-shot fold; only the point order differs.
+        let fresh = UsageIndex::default().run_usage(&store, "run_MIX");
+        assert_same_usage(&prev, &fresh, false);
+    }
+
+    #[test]
+    fn growing_fallback_transcripts_keep_the_epoch() {
+        // A legacy (no-ledger) run whose two transcripts grow alternately:
+        // growth of the non-last one must not reorder the series.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_TWO", RunStatus::Running);
+        let f1 = tmp.path().join("transcripts/run_F1.jsonl");
+        let f2 = tmp.path().join("transcripts/run_F2.jsonl");
+        append(&f1, &transcript_lines("one", PROVIDER, MODEL, &[(1, 1)]));
+        append(&f2, &transcript_lines("two", PROVIDER, MODEL, &[(2, 2)]));
+        store
+            .append_step_result("run_TWO", &step_result("one", &f1))
+            .unwrap();
+        append(
+            &store.events_path("run_TWO"),
+            &unit_started("run_TWO", "two", 0, &f2),
+        );
+
+        let idx = UsageIndex::default();
+        let mut prev = idx.run_usage(&store, "run_TWO");
+        for i in 1..=4u32 {
+            let f = if i % 2 == 1 { &f1 } else { &f2 };
+            append(f, &usage_line(PROVIDER, MODEL, 10 * i, 1, None));
+            let next = idx.run_usage(&store, "run_TWO");
+            assert_extends(&prev, &next);
+            assert_eq!(next.points.len(), prev.points.len() + 1);
+            prev = next;
+        }
+        let fresh = UsageIndex::default().run_usage(&store, "run_TWO");
+        assert_same_usage(&prev, &fresh, false);
+    }
+
+    #[test]
+    fn a_fallback_file_shrink_bumps_the_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_SHRINK", RunStatus::Running);
+        let f = tmp.path().join("transcripts/run_F.jsonl");
+        append(
+            &f,
+            &transcript_lines("legacy", PROVIDER, MODEL, &[(10, 1), (20, 2)]),
+        );
+        store
+            .append_step_result("run_SHRINK", &step_result("old", &f))
+            .unwrap();
+        let idx = UsageIndex::default();
+        let u0 = idx.run_usage(&store, "run_SHRINK");
+        assert_eq!(u0.points.len(), 2);
+
+        std::fs::write(&f, transcript_lines("legacy", PROVIDER, MODEL, &[(5, 5)])).unwrap();
+        let u1 = idx.run_usage(&store, "run_SHRINK");
+        assert_eq!(u1.epoch, u0.epoch + 1);
+        assert_eq!(total(&u1), tok(5, 5));
+        assert_eq!(u1.points.len(), 1);
+        let fresh = UsageIndex::default().run_usage(&store, "run_SHRINK");
+        assert_same_usage(&u1, &fresh, true);
+    }
+
+    #[test]
+    fn a_key_moving_from_fallback_to_ledger_after_emitting_bumps_and_goes_canonical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_MOVE", RunStatus::Running);
+        let a = tmp.path().join("transcripts/run_A.jsonl");
+        let b = tmp.path().join("transcripts/run_B.jsonl");
+        let ledger = store.usage_ledger_path("run_MOVE");
+        // run_B is first seen as a fallback transcript; its point is emitted.
+        append(&b, &transcript_lines("coder", PROVIDER, MODEL, &[(5, 5)]));
+        append(
+            &store.events_path("run_MOVE"),
+            &unit_started("run_MOVE", "fan", 0, &b),
+        );
+        let idx = UsageIndex::default();
+        let u0 = idx.run_usage(&store, "run_MOVE");
+
+        // Another agent's ledger row appends in observation order.
+        append(
+            &ledger,
+            &ledger_line(
+                "01V1",
+                Some("s"),
+                None,
+                "run_A",
+                None,
+                &a,
+                1,
+                1,
+                LedgerKind::Turn,
+            ),
+        );
+        let u1 = idx.run_usage(&store, "run_MOVE");
+        assert_extends(&u0, &u1);
+        let labels: Vec<&str> = u1.points.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["fan", "s"]);
+
+        // run_B's own ledger row lands: its emitted fallback point must go, so
+        // the series is rebuilt canonically and the epoch moves.
+        append(
+            &ledger,
+            &ledger_line(
+                "01V2",
+                Some("fan"),
+                Some(0),
+                "run_B",
+                None,
+                &b,
+                5,
+                5,
+                LedgerKind::Turn,
+            ),
+        );
+        let u2 = idx.run_usage(&store, "run_MOVE");
+        assert_eq!(u2.epoch, u0.epoch + 1);
+        let labels: Vec<&str> = u2.points.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["s", "fan"],
+            "canonical: ledger points in ledger order"
+        );
+        assert_eq!(total(&u2), tok(6, 6));
+        let fresh = UsageIndex::default().run_usage(&store, "run_MOVE");
+        assert_same_usage(&u2, &fresh, true);
     }
 
     #[test]
@@ -1731,6 +2178,47 @@ mod tests {
             vec![s, l],
             "known first, then ledger transcripts that exist"
         );
+    }
+
+    #[test]
+    fn run_metrics_prefers_the_finished_records_wall_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        let f = tmp.path().join("transcripts/run_F.jsonl");
+        let complete = event_json(&Event::RunComplete {
+            run_id: "run_F".into(),
+            status: rupu_transcript::RunStatus::Ok,
+            total_tokens: 2,
+            duration_ms: 4200,
+            error: None,
+        });
+        append(
+            &f,
+            &(transcript_lines("a", PROVIDER, MODEL, &[(1, 1)]) + &complete),
+        );
+        let pricing = rupu_config::PricingConfig::default();
+
+        // Unfinished record: the transcript's RunComplete duration.
+        create_run(&store, "run_WALLA", RunStatus::Running);
+        store
+            .append_step_result("run_WALLA", &step_result("s", &f))
+            .unwrap();
+        let m = crate::usage::run_metrics(&store, "run_WALLA", &pricing);
+        assert_eq!(m.duration_ms, Some(4200));
+        assert_eq!(m.turns, 1);
+
+        // Finished record: its wall clock, stable across sealed re-reads.
+        let mut rec = record("run_WALLB", RunStatus::Completed, None);
+        rec.finished_at = Some(rec.started_at + chrono::Duration::seconds(90));
+        store.create(rec, "").unwrap();
+        store
+            .append_step_result("run_WALLB", &step_result("s", &f))
+            .unwrap();
+        for _ in 0..2 {
+            let m = crate::usage::run_metrics(&store, "run_WALLB", &pricing);
+            assert_eq!(m.duration_ms, Some(90_000));
+            assert_eq!(m.usage.total_tokens, 2);
+        }
     }
 
     #[test]
