@@ -20,7 +20,8 @@
       "total_tokens": 490,
       "cost_usd": 0.04,
       "priced": true,
-      "runs": 2
+      "runs": 2,
+      "partial": false
     },
     "host_id": "local"
   },
@@ -42,7 +43,8 @@
       "total_tokens": 0,
       "cost_usd": null,
       "priced": false,
-      "runs": 0
+      "runs": 0,
+      "partial": false
     }
   }
 ]

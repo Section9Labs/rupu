@@ -627,6 +627,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 cost_usd: b.cost_usd,
                 priced: b.priced,
                 runs: b.runs,
+                partial: false,
             };
             dto.run_count = b.runs;
             dto.last_run = last_runs.get(&name).cloned();
@@ -2999,6 +3000,7 @@ mod tests {
                 cost_usd: Some(0.42),
                 priced: true,
                 runs: 3,
+                partial: false,
             },
             run_count: 3,
             last_run: Some("2026-08-20T12:00:00+00:00".into()),

@@ -16,7 +16,8 @@
       "total_tokens": 490,
       "cost_usd": 0.04,
       "priced": true,
-      "runs": 1
+      "runs": 1,
+      "partial": false
     },
     "turns": 2,
     "duration_ms": 8000,
@@ -39,7 +40,8 @@
       "total_tokens": 0,
       "cost_usd": null,
       "priced": false,
-      "runs": 0
+      "runs": 0,
+      "partial": false
     },
     "detail": "worker crashed",
     "host_id": "local"

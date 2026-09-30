@@ -1,11 +1,23 @@
 //! Token + dollar-cost aggregation for the control plane.
 //!
-//! Pure read-side composition of `rupu_transcript::aggregate` (tokens per
-//! provider/model/agent) and `rupu_config::pricing` (USD price lookup +
-//! `ModelPricing::cost_usd`). Cost is an estimate: when a model has no
-//! resolvable price we report tokens with `priced = false` and never
-//! fabricate a dollar figure.
+//! **A run's usage is ledger-first** (spec 2026-09-29 §4): the sum of its
+//! usage-ledger rows (`<runs>/<id>/usage.jsonl`, one row per LLM call made
+//! anywhere in the run, dispatch children included), plus — for every known
+//! transcript (step results ∪ live events ∪ dispatched sub-runs) that has no
+//! ledger row — a fold of that transcript file, resolved through the host
+//! mirror rules. A transcript that should exist but can't be read anywhere
+//! marks the result `partial`. That one definition lives in
+//! [`crate::usage_index`] (incremental, cached process-wide); this module's
+//! [`run_usage`] / [`transcripts_usage`] are its entry points, and
+//! [`summarize_run`] / [`run_metrics`] / [`run_transcript_paths`] are built
+//! on it.
+//!
+//! Pricing is `rupu_config::pricing` (USD price lookup +
+//! `ModelPricing::cost_usd`), applied here, never stored. Cost is an
+//! estimate: when a model has no resolvable price we report tokens with
+//! `priced = false` and never fabricate a dollar figure.
 
+use crate::usage_index::{RunUsage, UsageIndex};
 use rupu_config::PricingConfig;
 use rupu_orchestrator::runs::RunStore;
 use rupu_transcript::TimeWindow;
@@ -14,6 +26,7 @@ use rupu_transcript::{Event, JsonlReader};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Token + cost summary for a run, or any rollup of runs.
 ///
@@ -35,6 +48,11 @@ pub struct UsageSummary {
     pub priced: bool,
     /// Distinct runs contributing (for rollups).
     pub runs: u64,
+    /// `true` when a transcript that should exist could not be read anywhere
+    /// (a finished step's file is gone, or a mirrored run's transcript never
+    /// arrived), so the totals are a lower bound. ORed by [`rollup`].
+    #[serde(default)]
+    pub partial: bool,
 }
 
 /// Fold token rows into a single summary, pricing each row.
@@ -64,63 +82,54 @@ pub fn summarize(rows: &[UsageRow], pricing: &PricingConfig) -> UsageSummary {
 }
 
 /// Aggregate the given transcript files and summarize the result.
+///
+/// Prefer [`transcripts_usage`] + [`summarize_run_usage`] (incremental, shared
+/// fold cache); this full re-read stays for the standalone/session callers
+/// that have not moved yet.
 pub fn summarize_paths(paths: &[PathBuf], pricing: &PricingConfig) -> UsageSummary {
     let rows = rupu_transcript::aggregate(paths, TimeWindow::default());
     summarize(&rows, pricing)
 }
 
+/// A run's usage — the one definition (ledger-first, fallback over known
+/// transcripts without ledger rows). Incremental and cached process-wide in
+/// [`UsageIndex::global`].
+pub fn run_usage(store: &RunStore, run_id: &str) -> Arc<RunUsage> {
+    UsageIndex::global().run_usage(store, run_id)
+}
+
+/// Usage of explicit transcript files (standalone runs, session turns),
+/// each labelled by the caller, through the same per-file fold cache.
+pub fn transcripts_usage(labeled: &[(String, PathBuf)]) -> Arc<RunUsage> {
+    UsageIndex::global().transcripts_usage(labeled)
+}
+
+/// Price a [`RunUsage`]; carries its `partial` flag through.
+pub fn summarize_run_usage(u: &RunUsage, pricing: &PricingConfig) -> UsageSummary {
+    let mut s = summarize(&u.rows, pricing);
+    s.partial = u.partial;
+    s
+}
+
 /// All transcript paths a run produced, resolved to the file that serves
-/// each one on this coordinator (spec §6.3): one per step result, plus one
-/// per fan-out / panel sub-unit. A path that does not exist locally and
-/// belongs to a run executed by a remote host (`worker_id`) is mapped to
-/// that host's mirror cache (`host::transcript_paths::cache_path`) when the
-/// cache file exists; otherwise the recorded path is kept unchanged
-/// (`rupu_transcript::aggregate` tolerates unreadable paths, so a still-open
-/// or never-mirrored transcript degrades to "no rows" rather than an
-/// error). A local run, or a `worker_id` this coordinator has no mirror
-/// directory for, is untouched — the existing-file check alone decides
-/// whether the recorded path is trusted.
+/// each one on this coordinator: the run's known transcripts (step results,
+/// live events, dispatched sub-runs) plus every usage-ledger row's
+/// transcript that exists. A recorded path that does not exist locally is
+/// mapped to the executing host's mirror cache (`worker_id`,
+/// `host::transcript_paths::cache_path`) or the agent mirror path when that
+/// file exists; otherwise the recorded path is kept unchanged (callers
+/// tolerate unreadable paths, so a still-open or never-mirrored transcript
+/// degrades to "no rows" rather than an error).
 ///
-/// Every caller of this function — `summarize_run`, `run_metrics`,
-/// `RunListRow::with_usage`, `query_run_detail`, `rupu-cli`'s `run show`/`run
-/// list`, and `LocalHostConnector` (which is what `GET /api/runs` and
-/// `GET /api/runs/:id` reach for a run mirrored from SSH, since the mirror
-/// lives in the LOCAL store) — gets this resolution for free, with no
-/// signature change and no `HostRegistry` dependency (which would be
-/// circular: the registry owns the local connector).
+/// This is the K-resolution helper of [`crate::usage_index`]; usage totals
+/// should come from [`run_usage`], not from re-aggregating these paths.
 pub fn run_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
-    let records = store.read_step_results(run_id).unwrap_or_default();
-    let mut paths = Vec::new();
-    for record in &records {
-        paths.push(record.transcript_path.clone());
-        for item in &record.items {
-            paths.push(item.transcript_path.clone());
-        }
-    }
-    let Ok(rec) = store.load(run_id) else {
-        return paths;
-    };
-    let Some(worker) = rec.worker_id.as_deref() else {
-        return paths;
-    };
-    let global = crate::host::transcript_paths::global_dir_of(store);
-    paths
-        .into_iter()
-        .map(|p| {
-            if p.exists() {
-                return p;
-            }
-            match crate::host::transcript_paths::cache_path(&global, worker, &p) {
-                Some(c) if c.exists() => c,
-                _ => p,
-            }
-        })
-        .collect()
+    UsageIndex::global().resolved_transcripts(store, run_id)
 }
 
 /// Token + cost summary for a single run.
 pub fn summarize_run(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> UsageSummary {
-    summarize_paths(&run_transcript_paths(store, run_id), pricing)
+    summarize_run_usage(&run_usage(store, run_id), pricing)
 }
 
 /// Token usage + turn count + duration for one run.
@@ -227,6 +236,9 @@ fn aggregate_rows_and_metrics(paths: &[PathBuf]) -> (Vec<UsageRow>, u64, Option<
 
 /// Full per-run metrics (usage + turns + duration) from transcript paths.
 /// Reads each path exactly once via [`aggregate_rows_and_metrics`].
+///
+/// Prefer [`transcripts_usage`] (incremental, shared fold cache); this full
+/// re-read stays for the callers that have not moved yet.
 pub fn run_metrics_paths(paths: &[PathBuf], pricing: &PricingConfig) -> RunMetrics {
     let (rows, turns, duration_ms) = aggregate_rows_and_metrics(paths);
     RunMetrics {
@@ -236,9 +248,21 @@ pub fn run_metrics_paths(paths: &[PathBuf], pricing: &PricingConfig) -> RunMetri
     }
 }
 
-/// Full per-run metrics for a run in the store.
+/// Full per-run metrics for a run in the store: [`run_usage`]'s tokens and
+/// turns; the duration is the run record's wall clock once it has finished,
+/// else the longest transcript `RunComplete`.
 pub fn run_metrics(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> RunMetrics {
-    run_metrics_paths(&run_transcript_paths(store, run_id), pricing)
+    let u = run_usage(store, run_id);
+    let wall_clock = store.load(run_id).ok().and_then(|rec| {
+        let finished = rec.finished_at?;
+        let ms = (finished - rec.started_at).num_milliseconds();
+        Some(u64::try_from(ms).unwrap_or(0))
+    });
+    RunMetrics {
+        usage: summarize_run_usage(&u, pricing),
+        turns: u.turns,
+        duration_ms: wall_clock.or(u.duration_ms),
+    }
 }
 
 /// Combine many summaries into one. Token fields add; `priced` ANDs across
@@ -263,6 +287,7 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
         if !s.priced {
             out.priced = false;
         }
+        out.partial |= s.partial;
     }
     out.total_tokens = out.input_tokens + out.output_tokens;
     out.cost_usd = if any_cost { Some(cost_acc) } else { None };
@@ -489,6 +514,9 @@ pub struct TurnPoint {
 /// `Usage` event becomes one point; transcripts are read in the given order
 /// and the `turn` counter is global across all of them. Unreadable/partial
 /// files are skipped.
+///
+/// Prefer [`transcripts_usage`]'s `points` (incremental, shared fold cache);
+/// this full re-read stays for the callers that have not moved yet.
 pub fn turn_series(labeled_paths: &[(String, PathBuf)]) -> Vec<TurnPoint> {
     let mut out: Vec<TurnPoint> = Vec::new();
     for (label, path) in labeled_paths {
@@ -517,7 +545,7 @@ pub fn turn_series(labeled_paths: &[(String, PathBuf)]) -> Vec<TurnPoint> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn row(provider: &str, model: &str, input: u64, output: u64, cached: u64) -> UsageRow {
@@ -617,6 +645,7 @@ mod tests {
             cost_usd: Some(2.0),
             priced: true,
             runs: 1,
+            partial: false,
         };
         let unpriced = UsageSummary {
             input_tokens: 20,
@@ -626,6 +655,7 @@ mod tests {
             cost_usd: None,
             priced: false,
             runs: 1,
+            partial: false,
         };
         let r = rollup([priced, unpriced].into_iter());
         assert_eq!(r.input_tokens, 30);
@@ -634,6 +664,30 @@ mod tests {
         assert_eq!(r.runs, 2);
         assert!(!r.priced);
         assert!((r.cost_usd.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rollup_ors_partial_and_summarize_run_usage_carries_it() {
+        let whole = UsageSummary {
+            priced: true,
+            ..UsageSummary::default()
+        };
+        let short = UsageSummary {
+            priced: true,
+            partial: true,
+            ..UsageSummary::default()
+        };
+        assert!(!rollup([whole.clone(), whole.clone()].into_iter()).partial);
+        assert!(rollup([whole, short].into_iter()).partial);
+
+        let u = crate::usage_index::RunUsage {
+            rows: vec![row("anthropic", "claude-sonnet-4-6", 10, 5, 0)],
+            partial: true,
+            ..Default::default()
+        };
+        let s = summarize_run_usage(&u, &PricingConfig::default());
+        assert!(s.partial);
+        assert_eq!(s.total_tokens, 15);
     }
 
     #[test]
@@ -743,6 +797,7 @@ mod tests {
                 cost_usd: Some(1.0),
                 priced: true,
                 runs: 1,
+                partial: false,
             },
             Some("2026-01-02T00:00:00Z".into()),
         );
@@ -755,6 +810,7 @@ mod tests {
                 cost_usd: Some(2.0),
                 priced: true,
                 runs: 1,
+                partial: false,
             },
             Some("2026-01-01T00:00:00Z".into()),
         );
@@ -837,7 +893,7 @@ mod tests {
 
     // ── `run_transcript_paths`' host-mirror fallback (spec §6.3) ──────────
 
-    fn seed_remote_run(tmp: &std::path::Path) -> (std::sync::Arc<RunStore>, PathBuf) {
+    pub(crate) fn seed_remote_run(tmp: &std::path::Path) -> (std::sync::Arc<RunStore>, PathBuf) {
         let store = std::sync::Arc::new(RunStore::new(tmp.join("runs")));
         let mirror = crate::node::NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {

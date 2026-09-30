@@ -49,6 +49,7 @@
     "cost_usd": 0.42,
     "input_tokens": 3000,
     "output_tokens": 700,
+    "partial": false,
     "priced": true,
     "runs": 1,
     "total_tokens": 3700

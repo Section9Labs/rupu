@@ -18,6 +18,7 @@
       "cost_usd": 0.85,
       "input_tokens": 5000,
       "output_tokens": 1200,
+      "partial": false,
       "priced": true,
       "runs": 2,
       "total_tokens": 6200
@@ -38,6 +39,7 @@
         "cost_usd": 0.12,
         "input_tokens": 1000,
         "output_tokens": 200,
+        "partial": false,
         "priced": true,
         "runs": 1,
         "total_tokens": 1200
@@ -57,6 +59,7 @@
         "cost_usd": null,
         "input_tokens": 0,
         "output_tokens": 0,
+        "partial": false,
         "priced": false,
         "runs": 0,
         "total_tokens": 0
@@ -88,6 +91,7 @@
     "cost_usd": 0.85,
     "input_tokens": 5000,
     "output_tokens": 1200,
+    "partial": false,
     "priced": true,
     "runs": 2,
     "total_tokens": 6200

@@ -271,6 +271,7 @@ fn run_list_row_fixture_is_current() {
             cost_usd: Some(0.12),
             priced: true,
             runs: 1,
+            partial: false,
         },
         turns: 4,
         duration_ms: None,
@@ -725,6 +726,7 @@ fn run_detail_fixture_is_current() {
         cost_usd: Some(0.85),
         priced: true,
         runs: 2,
+        partial: false,
     };
 
     let value = serde_json::json!({
@@ -926,6 +928,7 @@ fn run_graph_fixture_is_current() {
         cost_usd: Some(0.42),
         priced: true,
         runs: 1,
+        partial: false,
     };
 
     let value = serde_json::json!({
@@ -1028,6 +1031,7 @@ fn projects_fixture_is_current() {
             cost_usd: Some(0.85),
             priced: true,
             runs: 2,
+            partial: false,
         },
         run_count: 14,
         last_active: Some("2026-08-20T12:00:00Z".into()),
@@ -1295,6 +1299,7 @@ fn project_detail_fixture_is_current() {
             cost_usd: Some(0.85),
             priced: true,
             runs: 2,
+            partial: false,
         },
         run_count: 14,
         last_active: Some("2026-08-20T12:00:00Z".into()),
@@ -1316,6 +1321,7 @@ fn project_detail_fixture_is_current() {
                 cost_usd: Some(0.12),
                 priced: true,
                 runs: 1,
+                partial: false,
             },
             turns: 4,
             duration_ms: Some(360_000),
@@ -1341,6 +1347,7 @@ fn project_detail_fixture_is_current() {
         cost_usd: Some(0.85),
         priced: true,
         runs: 2,
+        partial: false,
     };
 
     let value = serde_json::json!({
@@ -1388,6 +1395,7 @@ fn project_runs_fixture_is_current() {
             cost_usd: Some(0.12),
             priced: true,
             runs: 1,
+            partial: false,
         },
         turns: 4,
         duration_ms: Some(360_000),
@@ -1797,6 +1805,7 @@ fn usage_fixture_is_current() {
         cost_usd: Some(12.71),
         priced: false, // at least one contributing model is unpriced
         runs: 6,
+        partial: false,
     };
 
     let breakdown = vec![

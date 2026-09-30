@@ -15,7 +15,8 @@
       "total_tokens": 6200,
       "cost_usd": 0.85,
       "priced": true,
-      "runs": 2
+      "runs": 2,
+      "partial": false
     },
     "run_count": 14,
     "last_active": "2026-08-20T12:00:00Z"

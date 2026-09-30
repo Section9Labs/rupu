@@ -1216,20 +1216,44 @@ impl RunStore {
         }
         let mut roots: Vec<String> = vec![run_id.to_string()];
         roots.extend(out.iter().map(|k| k.key.clone()));
+        for k in self.dispatched_transcripts(roots.iter().map(String::as_str)) {
+            push(k, &mut out);
+        }
+        out
+    }
+
+    /// The sub-run-walk half of [`Self::known_transcripts`]: every
+    /// dispatched sub-run transcript reachable from any of `roots` (a
+    /// workflow run id, or the transcript key of an agent run that may have
+    /// dispatched children), at any depth, deduped by sub-run id,
+    /// `step_id: None`. Exposed so an incremental consumer (the CP usage
+    /// index) that already tails `step_results.jsonl` / `events.jsonl`
+    /// itself can run just the walk without re-reading both files. Same
+    /// cycle and depth guards as [`Self::sub_run_ids_recursive`].
+    pub fn dispatched_transcripts<'a>(
+        &self,
+        roots: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<KnownTranscript> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = Vec::new();
         for root in roots {
-            for (parent, sub) in self.sub_run_edges_recursive(&root) {
-                let path = self.sub_run_transcript(&parent, &sub);
-                push(
-                    KnownTranscript {
+            for (parent, sub) in self.sub_run_edges_recursive(root) {
+                if seen.insert(sub.clone()) {
+                    let path = self.sub_run_transcript(&parent, &sub);
+                    out.push(KnownTranscript {
                         key: sub,
                         step_id: None,
                         path,
-                    },
-                    &mut out,
-                );
+                    });
+                }
             }
         }
         out
+    }
+
+    /// Path to the run's `step_results.jsonl` (for incremental tailers).
+    pub fn step_results_path(&self, run_id: &str) -> PathBuf {
+        self.step_results_log(run_id)
     }
 
     /// Load a run by id.

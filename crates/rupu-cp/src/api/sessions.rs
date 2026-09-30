@@ -165,6 +165,7 @@ fn session_usage(
         priced: cost_usd.is_some(),
         cost_usd,
         runs: 1,
+        partial: false,
     }
 }
 

@@ -183,6 +183,7 @@ fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsa
         cost_usd: summary_val.get("total_cost_usd").and_then(|x| x.as_f64()),
         priced: !partial_at(summary_val),
         runs: u64_at(summary_val, "total_runs"),
+        partial: false,
     };
 
     let empty = Vec::new();

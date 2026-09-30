@@ -24,6 +24,7 @@ pub mod state;
 pub mod transcript_mutator;
 pub mod transcript_tail;
 pub mod usage;
+pub mod usage_index;
 
 use anyhow::Context as _;
 use rupu_config::PricingConfig;

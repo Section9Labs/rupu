@@ -2519,6 +2519,7 @@ mod tests {
                 cost_usd: Some(0.42),
                 priced: true,
                 runs: 5,
+                partial: false,
             },
             run_count: 5,
             last_run: Some("2026-08-20T12:00:00+00:00".into()),
@@ -2554,6 +2555,7 @@ mod tests {
             cost_usd: Some(0.42),
             priced: true,
             runs: 5,
+            partial: false,
         };
         // Mirrors `load_detail`'s `json!` shape exactly.
         let value = serde_json::json!({
