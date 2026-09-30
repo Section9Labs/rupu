@@ -7,6 +7,8 @@
 
 pub mod profile;
 pub mod types;
+pub mod validate;
 
 pub use profile::FindingProfile;
 pub use types::*;
+pub use validate::{validate_report, FieldError, ReportValidationError, ValidateCtx};
