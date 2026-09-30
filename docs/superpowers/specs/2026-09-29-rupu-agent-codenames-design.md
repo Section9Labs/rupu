@@ -43,9 +43,9 @@ Examples:
 | Session agent (every turn) | `saffron-ridge/heron` |
 | Sub-agent in a session | `saffron-ridge/heron>lynx#5` |
 
-**`#n` rule.** Omitted only when the orchestrator knows statically the agent is a singleton (a plain linear workflow step, a standalone run, a session's own agent). Fan-out units (`for_each`, `parallel`, `panel` members, fixers) and every dynamic dispatch (`dispatch_agent`, `dispatch_agents_parallel`) are always numbered from `#1`. Fan-out `n` = unit index + 1. Dynamic-dispatch `n` = a per-(parent, role) counter; in sessions that counter is **session-wide and persisted** so it keeps climbing across turns and worker restarts.
+**`#n` rule.** Omitted only when the orchestrator knows statically the agent is a singleton (a plain linear workflow step, a standalone run, a session's own agent). A `panel` member whose agent def appears only once in that panel is also a singleton (`crew/hawk`, not `crew/hawk#1`); a def repeated within a panel is numbered per def. Fan-out units (`for_each`, `parallel`, fixers) and every dynamic dispatch (`dispatch_agent`, `dispatch_agents_parallel`) are always numbered from `#1`. Fan-out `n` = unit index + 1. Dynamic-dispatch `n` = a per-(parent, role) counter; in sessions that counter is **session-wide and persisted** so it keeps climbing across turns and worker restarts.
 
-**Sessions** keep one identity across turns. Turns are labelled "turn N", never renamed.
+**Sessions** keep one identity across turns. Turns are labelled "turn N", never renamed. (Session turns currently run with no sub-agent dispatcher, so session sub-agent names are grammar-only until dispatch lands for sessions.)
 
 **Display.** Long paths render as the leaf (`heron#412>lynx#3`) under a crew chip; full path in tooltip/breadcrumb. Full string is always the searchable/copyable form.
 
@@ -66,7 +66,11 @@ New leaf crate, no rupu deps (workspace deps only: `serde`).
 - Names are **minted once and stored**; they are never recomputed for records that have one. Word-list edits therefore never rename history.
 - Word lists are append-only in practice; the derive-on-read fallback (§6) is the only thing that recomputes, and it is explicitly marked `derived`.
 
-### 4.3 Role collisions
+### 4.3 Static slots
+
+At run start the orchestrator walks the workflow in step order and allocates a role word per **static slot** (linear/fan-out step agent; each `parallel:` sub-step; each distinct panelist def; the panel `fix_with` fixer; each `on_reject` cleanup step). The first slot of a def gets the def's canonical word; a def used in a *second* slot gets the next free word, so two linear steps running the same agent never share a codename. Loop iterations and panel gate iterations re-run the same slot and keep its identity (like session turns). The walk is deterministic, so resume recomputes the same words; dynamic allocations (sub-dispatch roles, instance counters) persist to `<run_dir>/codenames.json`.
+
+### 4.4 Role collisions
 Across *different* crews the same agent def always hashes to the same base word (cross-run memory: "heron = security-reviewer"). Only within a crew can a probe move it; the allocator state is persisted in the run so resume keeps the same assignment.
 
 ## 5. Minting + storage
@@ -90,8 +94,9 @@ New fields (all `#[serde(default, skip_serializing_if = "Option::is_none")]`, so
 - `StepResultRecord.codename`, `ItemResultRecord.codename`, `UnitCheckpoint.codename`
 - `DispatchOutcome.codename`
 - orchestrator `FindingRecord.codename` (panel findings: the member that raised it)
-- `rupu_coverage` ledger `Attribution.codename` (findings via `findings.record` / `report_finding`: the declaring instance)
-- executor `Event` variants that carry an actor gain `codename`
+- `rupu_coverage` ledger `Attribution.codename`: the declaring instance for the `report_finding` builtin and file-touch events. The MCP `findings.record` path is built once per workflow (`FindingsContext`), so it attributes to the **crew** only — per-instance attribution there needs a per-step MCP context and is out of scope.
+- executor `Event` variants that carry an actor (`StepStarted`, `UnitStarted`, `DispatchStarted`) gain `codename`
+- **new executor event `AgentStarted`** `{ run_id, step_id, unit_index, codename, agent, provider, model, agent_run_id, transcript_path }`, emitted by the orchestrator the moment an agent instance's opts are built (the first point provider + model are known) — so every event consumer (Live Events, live view, firehose) shows *who* (codename + agent) is running *on what* (provider · model). `DispatchStarted` gains `provider`/`model` too (its emission moves after the child's provider is built). Placed units run their agent on the remote host, so the coordinator's `AgentStarted` for them carries `provider`/`model` = `None`; the remote transcript's `RunStart` has them.
 
 **Agent self-awareness.** The system prompt gets one line: `Your call sign in this run is <leaf> (crew <crew>). Sign any comments, issues or PR notes you post with it.` — the "self-naming" layer, zero extra turns. `RunStart.system_prompt` already records it.
 
