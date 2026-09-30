@@ -22,6 +22,7 @@ mod linear_runner;
 mod multi_gate_path_scoped;
 mod pause_resume_e2e;
 mod placed_step_e2e;
+mod remote_coverage_ingest;
 mod remote_findings_profile;
 mod run_step_workflow;
 mod runner_events;

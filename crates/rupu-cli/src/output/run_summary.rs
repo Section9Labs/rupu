@@ -46,6 +46,15 @@ fn findings_line(by_severity: &BTreeMap<String, usize>) -> Option<String> {
     Some(parts.join(" · "))
 }
 
+/// One `⚠ <step>: <message>` line per `StepWarning` the run emitted, in
+/// arrival order. The summary is printed after the live view's alternate
+/// screen is gone, so this is the only place a warning (e.g. a remote unit
+/// whose coverage could not be collected) outlives the run — print every one;
+/// dropping any would hide a gap in the findings.
+fn warning_lines(v: &RunView) -> Vec<String> {
+    v.warnings.iter().map(|w| format!("⚠ {w}")).collect()
+}
+
 pub fn render_completion_summary(v: &RunView, now: DateTime<Utc>) -> String {
     let mut out = String::new();
     let elapsed = v.elapsed_ms(now).map(fmt_hms).unwrap_or_default();
@@ -59,6 +68,10 @@ pub fn render_completion_summary(v: &RunView, now: DateTime<Utc>) -> String {
             v.crew.as_deref().unwrap_or("-"),
             elapsed,
         ));
+        for line in warning_lines(v) {
+            out.push_str(&line);
+            out.push('\n');
+        }
         // A view built from events alone may not have gates populated;
         // stay honest and point at the run rather than inventing a gate.
         if v.gates.is_empty() {
@@ -170,6 +183,11 @@ pub fn render_completion_summary(v: &RunView, now: DateTime<Utc>) -> String {
             "failed  {}  → resume to retry\n",
             failed_units.join("  ")
         ));
+    }
+
+    for line in warning_lines(v) {
+        out.push_str(&line);
+        out.push('\n');
     }
 
     out.push_str(&format!(
@@ -411,5 +429,39 @@ mod tests {
             Some("findings 10 · 3 HIGH · 4 INFO · 2 ALPHA · 1 ZETA")
         );
         assert_eq!(findings_line(&BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn step_warning_is_recorded_and_shown_in_the_summary() {
+        let mut v = completed_view();
+        assert!(warning_lines(&v).is_empty());
+        let before = render_completion_summary(&v, now());
+        assert!(!before.contains('⚠'), "{before}");
+        for (index, message) in [(None, "no coverage"), (Some(2), "host went away")] {
+            v.apply(&rupu_orchestrator::executor::Event::StepWarning {
+                run_id: "run_01ABC".into(),
+                step_id: "assess".into(),
+                index,
+                message: message.into(),
+            });
+        }
+        assert_eq!(v.warnings, vec!["assess: no coverage", "assess: host went away"]);
+        assert_eq!(
+            warning_lines(&v),
+            vec!["⚠ assess: no coverage", "⚠ assess: host went away"]
+        );
+        // A warning is information, never a step or run failure.
+        assert_eq!(v.status, RunStatus::Completed);
+        let s = render_completion_summary(&v, now());
+        assert!(
+            s.contains("⚠ assess: no coverage\n⚠ assess: host went away\n"),
+            "every warning, in order:\n{s}"
+        );
+
+        // A run parked at a gate still shows them.
+        let mut parked = awaiting_view(vec![gate("approve", None)]);
+        parked.warnings = v.warnings.clone();
+        let s = render_completion_summary(&parked, now());
+        assert!(s.contains("⚠ assess: host went away"), "{s}");
     }
 }

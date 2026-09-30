@@ -7258,6 +7258,75 @@ async fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, st
     }
 }
 
+/// Take the coverage out of a dispatch result, leaving `NotLaunched`.
+fn take_coverage(r: &mut Result<UnitOutcome, UnitFailure>) -> UnitCoverage {
+    let slot = match r {
+        Ok(o) => &mut o.coverage,
+        Err(f) => &mut f.coverage,
+    };
+    std::mem::replace(slot, UnitCoverage::NotLaunched)
+}
+
+/// Merge a remote unit's coverage into the coordinator workspace (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §A4) and surface
+/// anything that went wrong as a `StepWarning`. Never fails the unit.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_remote_unit_coverage(
+    workspace: &Path,
+    host: &str,
+    coverage: UnitCoverage,
+    sink: Option<&Arc<dyn crate::executor::EventSink>>,
+    workflow_run_id: &str,
+    step_id: &str,
+    index: Option<usize>,
+) {
+    let warn = |message: String| {
+        warn!(step = %step_id, host, %message, "remote unit coverage");
+        if let Some(sink) = sink {
+            sink.emit(
+                workflow_run_id,
+                &crate::executor::Event::StepWarning {
+                    run_id: workflow_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    index,
+                    message,
+                },
+            );
+        }
+    };
+    let bytes = match coverage {
+        UnitCoverage::NotLaunched => return,
+        UnitCoverage::Unavailable(reason) => {
+            warn(format!(
+                "coverage from host {host} was not collected: {reason}"
+            ));
+            return;
+        }
+        UnitCoverage::Stream(bytes) => bytes,
+    };
+    let source = rupu_coverage::IngestSource {
+        host: (host != "local").then(|| host.to_string()),
+    };
+    let ws = workspace.to_path_buf();
+    let merged = tokio::task::spawn_blocking(move || {
+        rupu_coverage::ingest_unit_stream(&ws, &source, &bytes)
+    })
+    .await;
+    match merged {
+        Ok(Ok(r)) if !r.begin_seen => warn(format!(
+            "host {host} sent no coverage stream (it may predate coverage streaming — upgrade \
+             rupu there); this unit's findings and coverage were not collected"
+        )),
+        Ok(Ok(r)) if r.malformed > 0 => warn(format!(
+            "{} malformed coverage line(s) from host {host} were skipped ({} merged)",
+            r.malformed, r.appended
+        )),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn(format!("merging coverage from host {host} failed: {e}")),
+        Err(e) => warn(format!("merging coverage from host {host} panicked: {e}")),
+    }
+}
+
 /// Run a host-placed linear step as a single remote unit through the
 /// [`UnitDispatcher`] port (index 0). Mirrors the fan-out remote path:
 /// `Ok(success:true)` → that output; `Ok(success:false)` or `Err` → a
@@ -7325,7 +7394,18 @@ async fn dispatch_placed_step(
         run_id,
         transcript_path.to_path_buf(),
     );
-    match dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await {
+    let mut result = dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await;
+    ingest_remote_unit_coverage(
+        &opts.workspace_path,
+        host,
+        take_coverage(&mut result),
+        opts.event_sink.as_ref(),
+        workflow_run_id,
+        &step.id,
+        None,
+    )
+    .await;
+    match result {
         Ok(outcome) if outcome.success => {
             let output = outcome.output;
             let ws_delta = outcome.workspace_delta;
@@ -8183,13 +8263,23 @@ async fn run_fanout_step(
                                     &run_id_clone,
                                     transcript_clone.clone(),
                                 );
-                                match dispatch_unit_unless_terminating(
+                                let mut result = dispatch_unit_unless_terminating(
                                     dispatcher.as_ref(),
                                     unit,
                                     &host,
                                 )
-                                .await
-                                {
+                                .await;
+                                ingest_remote_unit_coverage(
+                                    &workspace_path,
+                                    &host,
+                                    take_coverage(&mut result),
+                                    event_sink.as_ref(),
+                                    &workflow_run_id,
+                                    &step_id,
+                                    Some(idx),
+                                )
+                                .await;
+                                match result {
                                     Ok(outcome) => {
                                         // Important fix: when the agent ran but failed
                                         // (success=false), synthesize a raw_error so
@@ -8298,13 +8388,23 @@ async fn run_fanout_step(
                                             &retry_run_id,
                                             transcript_path.clone(),
                                         );
-                                        match dispatch_unit_unless_terminating(
+                                        let mut retry_result = dispatch_unit_unless_terminating(
                                             dispatcher.as_ref(),
                                             retry_unit,
                                             retry_host,
                                         )
-                                        .await
-                                        {
+                                        .await;
+                                        ingest_remote_unit_coverage(
+                                            &workspace_path,
+                                            retry_host,
+                                            take_coverage(&mut retry_result),
+                                            event_sink.as_ref(),
+                                            &workflow_run_id,
+                                            &step_id,
+                                            Some(idx),
+                                        )
+                                        .await;
+                                        match retry_result {
                                             Ok(outcome) => {
                                                 // Same fix as primary path: synthesize
                                                 // raw_error for a failed-but-Ok outcome.

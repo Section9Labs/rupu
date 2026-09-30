@@ -141,6 +141,9 @@ pub struct RunView {
     /// step-result record (a finding that persists across bounded-loop
     /// iterations is counted once per iteration). Empty when none.
     pub findings_by_severity: BTreeMap<String, usize>,
+    /// `StepWarning` messages, in arrival order, as `"<step>: <message>"`
+    /// (e.g. a remote unit whose coverage could not be collected).
+    pub warnings: Vec<String>,
     /// Step that was active most recently — the attribution target for a
     /// dispatch (which carries no `step_id`).
     last_active_step: Option<String>,
@@ -234,6 +237,12 @@ impl RunView {
             }
             Event::StepSkipped { step_id, .. } => {
                 self.step_mut(step_id).state = StepState::Skipped;
+            }
+            Event::StepWarning {
+                step_id, message, ..
+            } => {
+                // Information only: never a step or run failure.
+                self.warnings.push(format!("{step_id}: {message}"));
             }
             Event::StepPaused { step_id, .. } => {
                 self.step_mut(step_id).state = StepState::Paused;
