@@ -235,7 +235,9 @@ pub struct RefreshOutcome {
 }
 
 /// Refetch live model lists (spec §8). Providers run in parallel, each
-/// bounded by [`FETCH_TIMEOUT`]; one failing never fails the others.
+/// bounded by [`FETCH_TIMEOUT`] as a whole (client build, credential
+/// resolution and any token refresh included, not just the HTTP listing);
+/// one failing or hanging never fails the others.
 pub async fn refresh(
     cfg: &rupu_config::Config,
     global_dir: &Path,
@@ -247,60 +249,80 @@ pub async fn refresh(
     let registry = ModelRegistry::with_cache_dir(cache_dir(global_dir));
     let registry = &registry;
     let jobs = names.iter().map(|name| async move {
-        let fail = |error: String| RefreshOutcome {
-            provider: name.clone(),
-            ok: false,
-            count: 0,
-            error: Some(error),
-        };
-        let pcfg = provider_factory::provider_config_for(name, &cfg.providers);
-        let model = provider_factory::resolve_model(
-            None,
-            cfg.default_model.as_deref(),
-            pcfg.openai_compatible
-                .as_ref()
-                .map(|p| p.default_model.as_str()),
-        );
-        let mut provider = match provider_factory::build_for_provider_with_config(
-            name,
-            &model,
-            None,
-            resolver,
-            &pcfg,
-            std::sync::Arc::new(rupu_netflow::NullSink),
-        )
-        .await
+        match tokio::time::timeout(FETCH_TIMEOUT, refresh_one(name, cfg, resolver, registry)).await
         {
-            Ok((_, p)) => p,
-            Err(provider_factory::FactoryError::NotWiredInV0(k)) => {
-                return fail(format!("provider kind \"{k}\" is not wired for listing"))
-            }
-            Err(e) => return fail(e.to_string()),
-        };
-        match tokio::time::timeout(FETCH_TIMEOUT, provider.fetch_models()).await {
-            Ok(Ok(models)) => {
-                let count = models.len();
-                registry.set_live_cache(name, models).await;
-                if let Err(e) = registry.save_cache(name).await {
-                    return fail(format!(
-                        "fetched {count} models but could not write the cache: {e}"
-                    ));
-                }
-                RefreshOutcome {
-                    provider: name.clone(),
-                    ok: true,
-                    count,
-                    error: None,
-                }
-            }
-            Ok(Err(ProviderError::NotImplemented { .. })) => fail(format!(
-                "no live model-list endpoint — declare limits in [[providers.{name}.models]]"
-            )),
-            Ok(Err(e)) => fail(e.to_string()),
-            Err(_) => fail(format!("timed out after {}s", FETCH_TIMEOUT.as_secs())),
+            Ok(outcome) => outcome,
+            Err(_) => RefreshOutcome {
+                provider: name.clone(),
+                ok: false,
+                count: 0,
+                error: Some(format!("timed out after {}s", FETCH_TIMEOUT.as_secs())),
+            },
         }
     });
     Ok(futures_util::future::join_all(jobs).await)
+}
+
+/// One provider's refresh: build the client, fetch, write the cache. The
+/// caller bounds all of it with [`FETCH_TIMEOUT`]; the cache write is an
+/// atomic rename, so being dropped mid-write leaves the old file intact.
+async fn refresh_one(
+    name: &str,
+    cfg: &rupu_config::Config,
+    resolver: &dyn rupu_auth::CredentialResolver,
+    registry: &ModelRegistry,
+) -> RefreshOutcome {
+    let fail = |error: String| RefreshOutcome {
+        provider: name.to_string(),
+        ok: false,
+        count: 0,
+        error: Some(error),
+    };
+    let pcfg = provider_factory::provider_config_for(name, &cfg.providers);
+    let model = provider_factory::resolve_model(
+        None,
+        cfg.default_model.as_deref(),
+        pcfg.openai_compatible
+            .as_ref()
+            .map(|p| p.default_model.as_str()),
+    );
+    let mut provider = match provider_factory::build_for_provider_with_config(
+        name,
+        &model,
+        None,
+        resolver,
+        &pcfg,
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )
+    .await
+    {
+        Ok((_, p)) => p,
+        Err(provider_factory::FactoryError::NotWiredInV0(k)) => {
+            return fail(format!("provider kind \"{k}\" is not wired for listing"))
+        }
+        Err(e) => return fail(e.to_string()),
+    };
+    match provider.fetch_models().await {
+        Ok(models) => {
+            let count = models.len();
+            registry.set_live_cache(name, models).await;
+            if let Err(e) = registry.save_cache(name).await {
+                return fail(format!(
+                    "fetched {count} models but could not write the cache: {e}"
+                ));
+            }
+            RefreshOutcome {
+                provider: name.to_string(),
+                ok: true,
+                count,
+                error: None,
+            }
+        }
+        Err(ProviderError::NotImplemented { .. }) => fail(format!(
+            "no live model-list endpoint — declare limits in [[providers.{name}.models]]"
+        )),
+        Err(e) => fail(e.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -333,13 +355,28 @@ pub async fn catalog(
     for p in names {
         let fetched_at = registry.fetched_at(&p).await;
         let stale = fetched_at.is_some() && registry.cache_is_stale(&p).await;
-        let models = registry
-            .list(&p)
-            .await
-            .into_iter()
-            .map(|m| CatalogModel {
-                input_tokens: (m.entry.context_window > 0).then_some(m.entry.context_window),
-                output_tokens: (m.entry.max_output_tokens > 0).then_some(m.entry.max_output_tokens),
+        let mut models = Vec::new();
+        for m in registry.list(&p).await {
+            // `list` lets a config entry replace the live one wholesale, so
+            // its unset fields read 0. `resolve` fills those per field from
+            // the live cache; so does the catalog, or the two would disagree
+            // about the same model. The row stays `custom`: config owns it.
+            let live = match m.source {
+                ModelSource::Custom => registry.find_live(&p, &m.entry.id).await,
+                _ => None,
+            };
+            let pick = |own: u32, live: Option<u32>| {
+                Some(own).filter(|n| *n > 0).or(live.filter(|n| *n > 0))
+            };
+            models.push(CatalogModel {
+                input_tokens: pick(
+                    m.entry.context_window,
+                    live.as_ref().map(|l| l.context_window),
+                ),
+                output_tokens: pick(
+                    m.entry.max_output_tokens,
+                    live.as_ref().map(|l| l.max_output_tokens),
+                ),
                 source: match m.source {
                     ModelSource::Custom => "custom",
                     ModelSource::Live => "live",
@@ -347,8 +384,8 @@ pub async fn catalog(
                 }
                 .to_string(),
                 id: m.entry.id,
-            })
-            .collect();
+            });
+        }
         out.push(CatalogProvider {
             provider: p,
             fetched_at,

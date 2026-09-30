@@ -12,6 +12,9 @@ struct Fake {
     calls: Arc<AtomicUsize>,
     shares: bool,
     id: ProviderId,
+    /// Sleep this long (tokio time, so `start_paused` tests are instant)
+    /// before answering.
+    delay: Option<std::time::Duration>,
 }
 
 #[async_trait::async_trait]
@@ -34,6 +37,9 @@ impl LlmProvider for Fake {
     }
     async fn fetch_models(&mut self) -> Result<Vec<ModelInfo>, ProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(d) = self.delay {
+            tokio::time::sleep(d).await;
+        }
         match &self.result {
             Ok(ms) => Ok(ms
                 .iter()
@@ -66,6 +72,7 @@ fn fake(result: Result<Vec<(&'static str, u32, u32)>, &'static str>) -> (Fake, A
             calls: calls.clone(),
             shares: true,
             id: ProviderId::Anthropic,
+            delay: None,
         },
         calls,
     )
@@ -395,4 +402,329 @@ async fn catalog_lists_custom_models_with_unknown_limits_as_none() {
     assert_eq!(by_id("claude-pinned").output_tokens, None);
     assert_eq!(by_id("claude-pinned").source, "custom");
     assert_eq!(by_id("claude-bare").input_tokens, None);
+}
+
+// ---- resolve precedence table (spec §10) ------------------------------------
+
+fn custom_ctx(
+    tmp: &tempfile::TempDir,
+    context_window: Option<u32>,
+    max_output: Option<u32>,
+) -> LimitsContext {
+    let mut c = ctx(tmp);
+    c.custom.insert(
+        "anthropic".into(),
+        vec![rupu_config::CustomModel {
+            id: "claude-a".into(),
+            context_window,
+            max_output,
+        }],
+    );
+    c
+}
+
+#[tokio::test]
+async fn config_zero_falls_through_to_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = custom_ctx(&tmp, Some(0), Some(0));
+    let (mut p, _) = fake(Ok(vec![("claude-a", 1_000_000, 128_000)]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &c,
+    )
+    .await;
+    assert_eq!(l.input.tokens, Some(1_000_000));
+    assert!(matches!(l.input.source, LimitSource::Live { .. }));
+    assert_eq!(l.output.tokens, Some(128_000));
+    assert!(matches!(l.output.source, LimitSource::Live { .. }));
+}
+
+#[tokio::test]
+async fn agent_beats_config_on_the_same_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = custom_ctx(&tmp, Some(500_000), Some(32_000));
+    let (mut p, _) = fake(Ok(vec![("claude-a", 1_000_000, 128_000)]));
+    let o = LimitOverrides {
+        context_window_tokens: Some(300_000),
+        max_tokens: Some(4096),
+        compact_at_percent: None,
+    };
+    let l = resolve(o, "anthropic", "claude-a", &mut p, &c).await;
+    assert_eq!(
+        (l.input.tokens, &l.input.source),
+        (Some(300_000), &LimitSource::Agent)
+    );
+    assert_eq!(
+        (l.output.tokens, &l.output.source),
+        (Some(4096), &LimitSource::Agent)
+    );
+}
+
+#[tokio::test]
+async fn live_zero_is_unknown_not_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut p, _) = fake(Ok(vec![("claude-a", 0, 0)]));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert_eq!(
+        (l.input.tokens, &l.input.source),
+        (None, &LimitSource::Unknown)
+    );
+    assert_eq!(
+        (l.output.tokens, &l.output.source),
+        (None, &LimitSource::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn compact_percent_defaults_to_80_and_clamps_to_10_95() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut p, _) = fake(Ok(vec![("claude-a", 1_000, 1_000)]));
+    let pct = |o: Option<u8>| LimitOverrides {
+        compact_at_percent: o,
+        ..LimitOverrides::default()
+    };
+    let c = ctx(&tmp);
+    let l = resolve(pct(None), "anthropic", "claude-a", &mut p, &c).await;
+    assert_eq!(l.compact_at_percent, 80);
+    let l = resolve(pct(Some(99)), "anthropic", "claude-a", &mut p, &c).await;
+    assert_eq!(l.compact_at_percent, 95);
+    let l = resolve(pct(Some(3)), "anthropic", "claude-a", &mut p, &c).await;
+    assert_eq!(l.compact_at_percent, 10);
+    let l = resolve(pct(Some(60)), "anthropic", "claude-a", &mut p, &c).await;
+    assert_eq!(l.compact_at_percent, 60);
+}
+
+#[tokio::test]
+async fn fetch_error_with_no_cache_is_unknown_with_a_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut p, calls) = fake(Err("connection refused"));
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        (l.input.tokens, &l.input.source),
+        (None, &LimitSource::Unknown)
+    );
+    assert_eq!(
+        (l.output.tokens, &l.output.source),
+        (None, &LimitSource::Unknown)
+    );
+    let note = l.note.as_deref().unwrap();
+    assert!(note.contains("refresh failed"), "{note}");
+    assert!(note.contains("connection refused"), "{note}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_fetch_times_out_to_unknown_with_a_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut p = Fake {
+        result: Ok(vec![("claude-a", 1_000_000, 128_000)]),
+        calls: calls.clone(),
+        shares: true,
+        id: ProviderId::Anthropic,
+        delay: Some(std::time::Duration::from_secs(3600)),
+    };
+    let l = resolve(
+        LimitOverrides::default(),
+        "anthropic",
+        "claude-a",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        (l.input.tokens, &l.input.source),
+        (None, &LimitSource::Unknown)
+    );
+    let note = l.note.as_deref().unwrap();
+    assert!(note.contains("timed out after 10s"), "{note}");
+    // The late answer was dropped, never cached.
+    assert!(!tmp.path().join("cache/models/anthropic.json").exists());
+}
+
+#[tokio::test]
+async fn non_sharing_non_anthropic_provider_reports_its_own_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut p = Fake {
+        result: Ok(vec![("m-x", 131_072, 8_192)]),
+        calls: Arc::new(AtomicUsize::new(0)),
+        shares: false,
+        id: ProviderId::OpenaiCompatible,
+        delay: None,
+    };
+    let l = resolve(
+        LimitOverrides::default(),
+        "oracle",
+        "m-x",
+        &mut p,
+        &ctx(&tmp),
+    )
+    .await;
+    assert!(!l.output_shares_context);
+    assert_eq!(l.output_fallback, None);
+    assert_eq!(l.input.tokens, Some(131_072));
+}
+
+// ---- refresh bound + catalog merge -------------------------------------------
+
+/// A credential lookup that outlasts `FETCH_TIMEOUT` by a wide margin, then
+/// fails. The build step (not the fetch) is what hangs here.
+struct SlowResolver;
+
+#[async_trait::async_trait]
+impl rupu_auth::CredentialResolver for SlowResolver {
+    async fn get(
+        &self,
+        _provider: &str,
+        _hint: Option<rupu_providers::AuthMode>,
+    ) -> anyhow::Result<(
+        rupu_providers::AuthMode,
+        rupu_providers::auth::AuthCredentials,
+    )> {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        anyhow::bail!("credential store answered too late")
+    }
+    async fn refresh(
+        &self,
+        _provider: &str,
+        _mode: rupu_providers::AuthMode,
+    ) -> anyhow::Result<rupu_providers::auth::AuthCredentials> {
+        unreachable!()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_bounds_the_whole_provider_job_not_just_the_fetch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = rupu_config::Config::default();
+    let cfg_path = tmp.path().join("config.toml");
+    let out = rupu_runtime::model_limits::refresh(
+        &cfg,
+        tmp.path(),
+        &cfg_path,
+        &SlowResolver,
+        Some("anthropic"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.len(), 1);
+    assert!(!out[0].ok);
+    assert_eq!(out[0].count, 0);
+    assert_eq!(out[0].error.as_deref(), Some("timed out after 10s"));
+}
+
+/// Mock an openai-compatible `/v1/models` and refresh `oracle` from it.
+async fn refreshed_oracle(
+    tmp: &tempfile::TempDir,
+    body: serde_json::Value,
+    models: Vec<rupu_config::CustomModel>,
+) -> rupu_config::Config {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/v1/models");
+        then.status(200).json_body(body);
+    });
+    let mut cfg = oracle_cfg(format!("{}/v1", server.url("")));
+    cfg.providers.get_mut("oracle").unwrap().models = models;
+    let out = rupu_runtime::model_limits::refresh(
+        &cfg,
+        tmp.path(),
+        &tmp.path().join("config.toml"),
+        &AnyKey,
+        Some("oracle"),
+    )
+    .await
+    .unwrap();
+    assert!(out[0].ok, "{:?}", out[0]);
+    cfg
+}
+
+#[tokio::test]
+async fn catalog_fills_a_config_models_unset_limits_from_live() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = refreshed_oracle(
+        &tmp,
+        serde_json::json!({ "data": [{ "id": "base-model", "max_model_len": 4096 }] }),
+        vec![rupu_config::CustomModel {
+            id: "base-model".into(),
+            context_window: None,
+            max_output: None,
+        }],
+    )
+    .await;
+    let cat = rupu_runtime::model_limits::catalog(
+        &cfg,
+        tmp.path(),
+        &tmp.path().join("config.toml"),
+        Some("oracle"),
+    )
+    .await
+    .unwrap();
+    let m = cat[0].models.iter().find(|m| m.id == "base-model").unwrap();
+    assert_eq!(
+        m.input_tokens,
+        Some(4096),
+        "live fills the unset config field"
+    );
+    assert_eq!(m.source, "custom", "a config entry still owns the row");
+    assert!(cat[0].fetched_at.is_some());
+}
+
+#[tokio::test]
+async fn catalog_merges_config_and_live_per_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A fresh v2 cache with both live limits set (the openai-compatible
+    // listing never reports an output cap, so write the file directly).
+    let dir = tmp.path().join("cache/models");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("oracle.json"),
+        format!(
+            r#"{{"schema":2,"fetched_at":"{}","models":[{{"id":"base-model","context_window":4096,"max_output_tokens":1024}}]}}"#,
+            chrono::Utc::now().to_rfc3339()
+        ),
+    )
+    .unwrap();
+    // Config pins only the window.
+    let mut cfg = oracle_cfg("http://127.0.0.1:9/v1".into());
+    cfg.providers.get_mut("oracle").unwrap().models = vec![rupu_config::CustomModel {
+        id: "base-model".into(),
+        context_window: Some(9000),
+        max_output: None,
+    }];
+    let cat = rupu_runtime::model_limits::catalog(
+        &cfg,
+        tmp.path(),
+        &tmp.path().join("config.toml"),
+        Some("oracle"),
+    )
+    .await
+    .unwrap();
+    let m = cat[0].models.iter().find(|m| m.id == "base-model").unwrap();
+    assert_eq!(m.input_tokens, Some(9000), "config wins where set");
+    assert_eq!(
+        m.output_tokens,
+        Some(1024),
+        "live fills what config left unset"
+    );
+    assert_eq!(m.source, "custom");
 }
