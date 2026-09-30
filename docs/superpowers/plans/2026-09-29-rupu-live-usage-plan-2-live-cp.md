@@ -342,6 +342,10 @@ pub struct RunUsageResponse {
     pub steps: std::collections::BTreeMap<String, crate::usage::UsageSummary>,
     pub turns: u64,
     pub partial: bool,
+    /// Serialized as a STRING: `RunUsage.epoch` is a u64 around 1.8e18
+    /// (UNIX-nanos base), beyond JS's 2^53 safe-integer range — a JSON number
+    /// would round and two epochs would compare equal in the browser.
+    #[serde(serialize_with = "ser_u64_as_string")]
     pub epoch: u64,
     /// Index of `points[0]` in the full series.
     pub points_from: usize,
@@ -365,7 +369,7 @@ async fn run_usage_endpoint_serves_summary_steps_and_incremental_points() {
     assert_eq!(v["steps"]["a"]["input_tokens"], 30);
     assert_eq!(v["points_from"], 0);
     assert_eq!(v["points"].as_array().unwrap().len(), 3);
-    let epoch = v["epoch"].as_u64().unwrap();
+    let epoch = v["epoch"].as_str().expect("epoch is a string").to_string();
 
     // Append one more row → incremental fetch returns only the new point.
     append_ledger_row(/* step "b", input 40, output 1 */);
@@ -376,6 +380,7 @@ async fn run_usage_endpoint_serves_summary_steps_and_incremental_points() {
 
     // Wrong epoch → full series.
     let v3 = get_json(&app, "/api/runs/<id>/usage?since=3&epoch=1").await;
+    assert!(v3["epoch"].is_string());
     assert_eq!(v3["points_from"], 0);
     assert_eq!(v3["points"].as_array().unwrap().len(), 4);
 }
@@ -401,8 +406,19 @@ pub struct RunUsageQuery {
     pub host: Option<String>,
     #[serde(default)]
     pub since: Option<usize>,
-    #[serde(default)]
+    /// Accepts the string form the server emits (see `RunUsageResponse.epoch`).
+    #[serde(default, deserialize_with = "de_opt_u64_from_str")]
     pub epoch: Option<u64>,
+}
+
+fn ser_u64_as_string<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
+}
+
+/// `?epoch=` arrives as a query string; accept a decimal string (or absent).
+fn de_opt_u64_from_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let o: Option<String> = Option::deserialize(d)?;
+    o.map(|s| s.parse::<u64>().map_err(serde::de::Error::custom)).transpose()
 }
 
 fn build_run_usage_json(
@@ -483,11 +499,11 @@ git commit -m "feat(cp): GET /api/runs/:id/usage — live summary, per-step, app
 ```ts
 export interface RunUsageResponse {
   summary: UsageSummary; steps: Record<string, UsageSummary>; turns: number;
-  partial: boolean; epoch: number; points_from: number; points: UsageTimelinePoint[];
+  partial: boolean; /** decimal string — exceeds JS 2^53 */ epoch: string; points_from: number; points: UsageTimelinePoint[];
 }
 export interface RunUsageState {
   summary: UsageSummary; steps: Record<string, UsageSummary>; turns: number;
-  partial: boolean; epoch: number; points: UsageTimelinePoint[];
+  partial: boolean; epoch: string; points: UsageTimelinePoint[];
 }
 export function mergeRunUsage(prev: RunUsageState | null, resp: RunUsageResponse): RunUsageState;
 export function useRunUsage(id: string | undefined, host: string | undefined, live: boolean,
@@ -506,7 +522,7 @@ const pt = (turn: number) => ({ turn, label: 's', tokens_in: turn, tokens_out: 1
 const summary = (total: number) => ({ input_tokens: total, output_tokens: 0, cached_tokens: 0,
   total_tokens: total, cost_usd: null, priced: true, runs: 1 });
 const resp = (over: Partial<Parameters<typeof mergeRunUsage>[1]>) => ({
-  summary: summary(0), steps: {}, turns: 0, partial: false, epoch: 7, points_from: 0, points: [], ...over,
+  summary: summary(0), steps: {}, turns: 0, partial: false, epoch: '7', points_from: 0, points: [], ...over,
 });
 
 describe('mergeRunUsage', () => {
@@ -518,9 +534,9 @@ describe('mergeRunUsage', () => {
   });
   it('replaces the series on epoch change or points_from 0', () => {
     const a = mergeRunUsage(null, resp({ points: [pt(1), pt(2)] }));
-    const b = mergeRunUsage(a, resp({ epoch: 8, points: [pt(1)] }));
+    const b = mergeRunUsage(a, resp({ epoch: '8', points: [pt(1)] }));
     expect(b.points).toHaveLength(1);
-    expect(b.epoch).toBe(8);
+    expect(b.epoch).toBe('8');
   });
   it('truncates to points_from before appending (server resent a tail)', () => {
     const a = mergeRunUsage(null, resp({ points: [pt(1), pt(2), pt(3)] }));
@@ -541,7 +557,7 @@ describe('useRunUsage', () => {
       { initialProps: { live: true } });
     await waitFor(() => expect(result.current.usage?.points).toHaveLength(1));
     await act(async () => { vi.advanceTimersByTime(60); });
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('run_1', { host: undefined, since: 1, epoch: 7 }));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith('run_1', { host: undefined, since: 1, epoch: '7' }));
     const calls = spy.mock.calls.length;
     rerender({ live: false });
     await act(async () => { vi.advanceTimersByTime(500); });
@@ -570,10 +586,10 @@ Expected: FAIL (module missing).
   - `api.ts`: add the interface, plus
 
 ```ts
-  getRunUsage(id: string, opts?: { host?: string; since?: number; epoch?: number }): Promise<RunUsageResponse> {
+  getRunUsage(id: string, opts?: { host?: string; since?: number; epoch?: string }): Promise<RunUsageResponse> {
     const q = new URLSearchParams();
     if (opts?.host) q.set('host', opts.host);
-    if (opts?.since != null && opts?.epoch != null) { q.set('since', String(opts.since)); q.set('epoch', String(opts.epoch)); }
+    if (opts?.since != null && opts?.epoch != null) { q.set('since', String(opts.since)); q.set('epoch', opts.epoch); }
     const qs = q.toString() ? `?${q}` : '';
     return request<RunUsageResponse>(`/api/runs/${encodeURIComponent(id)}/usage${qs}`);
   },
@@ -588,7 +604,7 @@ import type { UsageSummary } from './usage';
 
 export interface RunUsageState {
   summary: UsageSummary; steps: Record<string, UsageSummary>; turns: number;
-  partial: boolean; epoch: number; points: UsageTimelinePoint[];
+  partial: boolean; epoch: string; points: UsageTimelinePoint[];
 }
 
 /** Fold one server response into the client series (append-only within an epoch). */

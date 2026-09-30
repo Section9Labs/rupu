@@ -229,7 +229,7 @@ pub struct RunUsage {
     pub by_step: BTreeMap<String, Vec<UsageRow>>,  // "" = unattributed
     pub turns: u64,
     pub duration_ms: Option<u64>,
-    pub points: Vec<TurnPoint>,  // ledger arrival order, then fallback order
+    pub points: Vec<TurnPoint>,  // append-only, in the order the index first observed each point (ledger + fallback interleaved); canonical ledger-then-fallback order only after an epoch bump
     pub partial: bool,
 }
 ```
@@ -304,7 +304,7 @@ timeline) folds the session's run transcripts instead of `session.json` totals.
  "partial": false, "epoch": "…", "points_from": N, "points": [TurnPoint…]}
 ```
 
-- `points` are appended in arrival order.
+- `points` are appended in arrival order (observation order across ledger and fallback sources). `epoch` is a decimal **string** on the wire (u64 ≈ 1.8e18 exceeds JS 2^53) and bumps only on a real rebuild: a file reset, a resolved-path change, or a key moving fallback→ledger after emitting fallback points.
 - When `epoch` mismatches (CP restart, file reset, or a fallback transcript
   appearing out of order), the server answers from `0` with the new epoch.
 - It routes by `?host=` / `resolve_run_location` exactly like
