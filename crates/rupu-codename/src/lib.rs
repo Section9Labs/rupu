@@ -4,10 +4,12 @@
 
 mod codename;
 mod hash;
+mod namer;
 mod palette;
 mod words;
 
 pub use codename::{Codename, ParseCodenameError, Segment};
+pub use namer::{CrewNamer, SharedNamer};
 pub use palette::{crew_tint, role_badge, Badge, Shape, Tint, COLORS};
 pub use words::{NOUNS, ROLES};
 
@@ -102,5 +104,19 @@ mod tests {
             derive_legacy("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", Some("triage")),
             "jade-reef/numbat"
         );
+    }
+
+    #[test]
+    fn word_lists_are_frozen() {
+        // A failure here means the frozen lists changed, which renames legacy
+        // records — don't "fix" by updating the hashes.
+        let nouns_hash = fnv1a64(&NOUNS.join(","));
+        assert_eq!(nouns_hash, 0x76c4_bee0_8d53_6abc);
+
+        let roles_hash = fnv1a64(&ROLES.join(","));
+        assert_eq!(roles_hash, 0xba0e_02a7_b33c_3871);
+
+        let colors_hash = fnv1a64(&COLORS.iter().map(|c| c.0).collect::<Vec<_>>().join(","));
+        assert_eq!(colors_hash, 0x7760_8cd3_c69b_c2e0);
     }
 }

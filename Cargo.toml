@@ -160,8 +160,10 @@ serial_test = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
-# Network egress observability (netflow)
+# Human codenames for runs/agents
 rupu-codename = { path = "crates/rupu-codename" }
+
+# Network egress observability (netflow)
 rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
 
 [workspace.lints.rust]
