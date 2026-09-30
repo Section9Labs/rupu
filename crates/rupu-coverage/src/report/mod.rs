@@ -5,11 +5,13 @@
 //! Markdown/HTML/PDF exports) is generated from it, so the agent writes it
 //! exactly once. Design: docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md
 
+pub mod artifacts;
 pub mod profile;
 pub mod schema;
 pub mod types;
 pub mod validate;
 
+pub use artifacts::{ArtifactError, ArtifactStore};
 pub use profile::FindingProfile;
 pub use types::*;
 pub use validate::{validate_report, FieldError, ReportValidationError, ValidateCtx};
