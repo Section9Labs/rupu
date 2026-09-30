@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::hash::fnv1a64;
 use crate::{Codename, ROLES};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CrewNamer {
     pub crew: String,
     /// agent def → words allocated to it, in order; `[0]` is canonical.
@@ -19,7 +19,19 @@ pub struct CrewNamer {
     /// `"<parent codename>><role>"` → last issued instance number.
     #[serde(default)]
     counters: BTreeMap<String, u32>,
+    /// Set by every state-changing call; [`SharedNamer::with`] clears it and
+    /// persists when it was set. Not part of the namer's value.
+    #[serde(skip)]
+    dirty: bool,
 }
+
+impl PartialEq for CrewNamer {
+    fn eq(&self, other: &Self) -> bool {
+        self.crew == other.crew && self.roles == other.roles && self.counters == other.counters
+    }
+}
+
+impl Eq for CrewNamer {}
 
 impl CrewNamer {
     pub fn new(crew: impl Into<String>) -> Self {
@@ -52,6 +64,7 @@ impl CrewNamer {
     /// A new word for a new static slot of `agent_def`.
     pub fn allocate_role(&mut self, agent_def: &str) -> String {
         let w = self.probe(agent_def);
+        self.dirty = true;
         self.roles
             .entry(agent_def.to_string())
             .or_default()
@@ -72,13 +85,16 @@ impl CrewNamer {
         let v = self.roles.entry(agent_def.to_string()).or_default();
         if !v.iter().any(|w| w == word) {
             v.insert(0, word.to_string());
+            self.dirty = true;
         }
     }
 
     pub fn next_instance(&mut self, parent: &Codename, role: &str) -> u32 {
         let c = self.counters.entry(format!("{parent}>{role}")).or_insert(0);
         *c += 1;
-        *c
+        let n = *c;
+        self.dirty = true;
+        n
     }
 }
 
@@ -121,27 +137,38 @@ impl SharedNamer {
             path: Some(path),
         };
         if fresh {
-            s.persist(&s.snapshot());
+            let guard = s.lock();
+            s.persist(&guard);
         }
         s
     }
 
-    fn snapshot(&self) -> CrewNamer {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CrewNamer> {
         match self.inner.lock() {
-            Ok(g) => g.clone(),
-            Err(p) => p.into_inner().clone(),
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
         }
     }
 
+    /// Write `state` to the namer file. Callers hold the namer's lock, so
+    /// in-process writes are ordered; the temp name is unique per process
+    /// and call (`<file>.<pid>.<seq>.tmp`), so two processes sharing a run
+    /// dir never interleave bytes in one temp file before the atomic rename.
     fn persist(&self, state: &CrewNamer) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(path) = &self.path else { return };
         let write = || -> std::io::Result<()> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
-            std::fs::rename(&tmp, path)
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut tmp = path.clone().into_os_string();
+            tmp.push(format!(".{}.{seq}.tmp", std::process::id()));
+            let tmp = PathBuf::from(tmp);
+            std::fs::write(&tmp, serde_json::to_vec(state)?)?;
+            std::fs::rename(&tmp, path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
         };
         if let Err(e) = write() {
             // Names are already stored on the records that carry them; the
@@ -151,42 +178,20 @@ impl SharedNamer {
         }
     }
 
-    /// Run `f` against the namer; persist if it changed state (while holding the lock).
+    /// Run `f` against the namer; persist (still holding the lock, so writes
+    /// land in call order) if it changed state.
     pub fn with<R>(&self, f: impl FnOnce(&mut CrewNamer) -> R) -> R {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let before = guard.clone();
+        let mut guard = self.lock();
+        guard.dirty = false;
         let out = f(&mut guard);
-        if *guard != before {
-            self.persist_locked(&guard);
+        if std::mem::take(&mut guard.dirty) {
+            self.persist(&guard);
         }
         out
     }
 
-    /// Persist while holding the MutexGuard to serialize writes.
-    fn persist_locked(&self, state: &CrewNamer) {
-        let Some(path) = &self.path else { return };
-        let write = || -> std::io::Result<()> {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
-            std::fs::rename(&tmp, path)
-        };
-        if let Err(e) = write() {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "failed to persist codenames.json"
-            );
-        }
-    }
-
     pub fn crew(&self) -> String {
-        self.snapshot().crew
+        self.lock().crew.clone()
     }
 }
 
@@ -243,6 +248,37 @@ mod tests {
         let again = SharedNamer::open_or_init(path, || panic!("must load, not init"));
         assert_eq!(again.with(|n| n.next_instance(&parent, "lynx")), 2);
         assert_eq!(again.crew(), "jade-reef");
+    }
+
+    #[test]
+    fn with_persists_only_on_change_compact_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codenames.json");
+        let s = SharedNamer::open_or_init(path.clone(), || CrewNamer::new("jade-reef"));
+        s.with(|n| n.allocate_role("ag"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains('\n'), "compact JSON: {body}");
+        assert!(
+            !body.contains("dirty"),
+            "dirty flag is not persisted: {body}"
+        );
+
+        // A read-only call (the def already has a canonical word) does not
+        // rewrite the file.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(s.with(|n| n.canonical_role("ag")), "hedgehog");
+        assert!(!path.exists(), "unchanged namer must not be persisted");
+
+        s.with(|n| n.seed_role("ag", "hedgehog")); // already present: no-op
+        assert!(!path.exists());
+        s.with(|n| n.seed_role("other", "lynx"));
+        assert!(path.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
