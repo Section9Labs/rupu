@@ -5,12 +5,14 @@
 
 use crate::model::{ExportFinding, ReportMeta};
 use crate::number;
+use crate::text::{longest_backtick_run, one_line};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::report::{
-    ArtifactStorage, FindingReport, Likelihood, OrSentinel, Relation, RiskLevel, Ticket,
-    NOT_PROVIDED_PREFIX,
+    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, FindingReport, Likelihood, OrSentinel,
+    Relation, RiskLevel, Ticket, VerificationStatus, NOT_PROVIDED_PREFIX,
 };
-use rupu_coverage::{FindingProfile, Severity};
+use rupu_coverage::FindingRecord;
+use rupu_coverage::{FindingProfile, FindingScope, Severity, Surface};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,29 +83,11 @@ fn nonblank(s: &Option<String>) -> Option<&str> {
     s.as_deref().filter(|s| !s.trim().is_empty())
 }
 
-fn oneline(s: &str) -> String {
-    s.split(['\n', '\r'])
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// An inline code span holding `s` verbatim: the delimiter is longer than
 /// any backtick run inside, padded when the text starts or ends with one.
 fn code_span(s: &str) -> String {
-    let s = oneline(s);
-    let mut longest = 0;
-    let mut run = 0;
-    for c in s.chars() {
-        if c == '`' {
-            run += 1;
-            longest = longest.max(run);
-        } else {
-            run = 0;
-        }
-    }
-    let ticks = "`".repeat(longest + 1);
+    let s = one_line(s);
+    let ticks = "`".repeat(longest_backtick_run(&s) + 1);
     let pad = if s.starts_with('`') || s.ends_with('`') {
         " "
     } else {
@@ -183,6 +167,35 @@ fn profile_word(p: FindingProfile) -> &'static str {
     }
 }
 
+fn scope_word(s: FindingScope) -> &'static str {
+    match s {
+        FindingScope::Line => "line",
+        FindingScope::File => "file",
+        FindingScope::Repo => "repo",
+        FindingScope::Host => "host",
+        FindingScope::Endpoint => "endpoint",
+        FindingScope::Resource => "resource",
+    }
+}
+
+fn surface_word(s: Surface) -> &'static str {
+    match s {
+        Surface::Workflow => "workflow",
+        Surface::Agent => "agent",
+        Surface::Autoflow => "autoflow",
+        Surface::Session => "session",
+    }
+}
+
+fn verification_word(s: VerificationStatus) -> &'static str {
+    match s {
+        VerificationStatus::Unverified => "Unverified",
+        VerificationStatus::Confirmed => "Confirmed",
+        VerificationStatus::Disputed => "Disputed",
+        VerificationStatus::Inconclusive => "Inconclusive",
+    }
+}
+
 fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
@@ -193,9 +206,15 @@ fn tickets_text(t: &OrSentinel<Vec<Ticket>>) -> String {
         OrSentinel::Value(v) if v.is_empty() => "None Provided".to_string(),
         OrSentinel::Value(v) => v
             .iter()
-            .map(|t| match nonblank(&t.url) {
-                Some(url) => format!("{} {} ({url})", t.kind, t.identifier),
-                None => format!("{} {}", t.kind, t.identifier),
+            .map(|t| {
+                let mut s = format!("{} {}", t.kind, t.identifier);
+                if let Some(url) = nonblank(&t.url) {
+                    s.push_str(&format!(" ({url})"));
+                }
+                if let Some(n) = nonblank(&t.notes) {
+                    s.push_str(&format!(" — {}", one_line(n)));
+                }
+                s
             })
             .collect::<Vec<_>>()
             .join("; "),
@@ -214,68 +233,115 @@ fn value_or_note<T>(
     }
 }
 
-fn provenance(f: &ExportFinding) -> Vec<Block> {
+/// Where the record says the finding is: `file:a-b`, else the target ref.
+fn record_location(r: &FindingRecord) -> Option<String> {
+    location(r.file_path.as_deref(), r.line_range, None)
+        .or_else(|| nonblank(&r.target_ref).map(str::to_string))
+}
+
+/// Who declared the finding, and (for a full report) the record-level
+/// facts the report itself has no field for. `report` is `Some` only for the
+/// full layout: the summary layout already shows location and concern up top.
+fn provenance(f: &ExportFinding, report: Option<&FindingReport>) -> Vec<Block> {
     let r = &f.input.record;
-    vec![
-        heading("Provenance"),
-        Block::Fields(vec![
-            kv("Finding ID", r.id.clone()),
-            kv("Project", f.input.project.clone()),
-            kv(
-                "Workflow",
-                f.input
-                    .workflow_name
-                    .clone()
-                    .unwrap_or_else(|| "—".to_string()),
-            ),
-            kv("Run", r.declared_by.run_id.clone()),
-            kv("Model", r.declared_by.model.clone()),
-            kv("Declared", rfc3339(r.declared_at)),
-        ]),
-    ]
+    let mut rows = vec![
+        kv("Finding ID", r.id.clone()),
+        kv("Project", f.input.project.clone()),
+        kv(
+            "Workflow",
+            f.input
+                .workflow_name
+                .clone()
+                .unwrap_or_else(|| "—".to_string()),
+        ),
+        kv("Run", r.declared_by.run_id.clone()),
+        kv("Surface", surface_word(r.declared_by.surface)),
+        kv("Model", r.declared_by.model.clone()),
+        kv("Declared", rfc3339(r.declared_at)),
+    ];
+    if let Some(report) = report {
+        if let Some(c) = nonblank(&r.concern_id) {
+            rows.push(kv("Concern", c));
+        }
+        rows.push(kv("Scope", scope_word(r.scope)));
+        if let Some(l) = record_location(r) {
+            rows.push(kv("Location", l));
+        }
+        if let Some(v) = &report.verification {
+            let mut s = verification_word(v.status).to_string();
+            if let Some(by) = nonblank(&v.by_run) {
+                s.push_str(&format!(" by {by}"));
+            }
+            if let Some(n) = nonblank(&v.notes) {
+                s.push_str(&format!(" — {}", one_line(n)));
+            }
+            rows.push(kv("Verification", s));
+        }
+    }
+    vec![heading("Provenance"), Block::Fields(rows)]
 }
 
 /// One finding, in the reporting standard's section order. A finding with no
-/// recorded report (a summary record, or a full record whose report could
-/// not be loaded) gets the short summary layout.
+/// recorded report gets the short summary layout: a summary record says so,
+/// and a full record whose report this build could not load says that.
 pub fn finding_blocks(f: &ExportFinding, numbers: &HashMap<String, String>) -> Vec<Block> {
-    match &f.input.record.report {
-        Some(report) => full_blocks(f, report, numbers),
-        None => summary_blocks(f),
+    let r = &f.input.record;
+    match (&r.report, r.profile) {
+        (Some(report), _) => full_blocks(f, report, numbers),
+        (None, FindingProfile::Full) => summary_blocks(
+            f,
+            "Full report could not be loaded by this build — summary record shown.",
+        ),
+        (None, FindingProfile::Summary) => {
+            summary_blocks(f, "Summary finding — no full report was recorded.")
+        }
     }
 }
 
-fn hop_step(h: &rupu_coverage::report::ChainHop) -> String {
-    let mut s = format!("**{}**", h.label);
+/// One call-chain hop as a step. Every agent-supplied part is collapsed to
+/// one line: a label with a newline in it must not start a Markdown block.
+fn hop_step(h: &ChainHop) -> String {
+    let mut s = format!("**{}**", one_line(&h.label));
     if let Some(l) = location(h.file.as_deref(), h.lines, h.binary_va.as_deref()) {
         s.push_str(&format!(" — {}", code_span(&l)));
     }
     match (nonblank(&h.gate), nonblank(&h.passes_because)) {
-        (Some(g), Some(p)) => s.push_str(&format!(" — gate: {g} (passes because {p})")),
-        (Some(g), None) => s.push_str(&format!(" — gate: {g}")),
-        (None, Some(p)) => s.push_str(&format!(" — passes because {p}")),
+        (Some(g), Some(p)) => s.push_str(&format!(
+            " — gate: {} (passes because {})",
+            one_line(g),
+            one_line(p)
+        )),
+        (Some(g), None) => s.push_str(&format!(" — gate: {}", one_line(g))),
+        (None, Some(p)) => s.push_str(&format!(" — passes because {}", one_line(p))),
         (None, None) => {}
     }
     s
 }
 
-fn artifact_row(a: &rupu_coverage::report::ArtifactRef) -> Vec<String> {
-    let stored = match (a.stored, nonblank(&a.host)) {
-        (Some(ArtifactStorage::Copied), _) => "Copied".to_string(),
-        (Some(ArtifactStorage::External), Some(h)) => format!("External ({h})"),
-        (Some(ArtifactStorage::External), None) => "External".to_string(),
-        (None, _) => "—".to_string(),
-    };
-    let sha: String = a.sha256.chars().take(12).collect();
+fn sha_prefix(sha: &str) -> Option<String> {
+    let p: String = sha.chars().take(12).collect();
+    (!p.is_empty()).then_some(p)
+}
+
+fn artifact_row(a: &ArtifactRef) -> Vec<String> {
+    let dash = || "—".to_string();
     vec![
         a.path.clone(),
-        if sha.is_empty() {
-            "—".to_string()
-        } else {
-            sha
-        },
+        sha_prefix(&a.sha256).unwrap_or_else(dash),
         format!("{} B", a.size),
-        stored,
+        a.kind
+            .map(|k| match k {
+                ArtifactKind::Text => "Text",
+                ArtifactKind::Binary => "Binary",
+            })
+            .map_or_else(dash, str::to_string),
+        a.stored
+            .map(|s| match s {
+                ArtifactStorage::Copied => "Copied",
+                ArtifactStorage::External => "External",
+            })
+            .map_or_else(dash, str::to_string),
+        nonblank(&a.host).map_or_else(dash, str::to_string),
     ]
 }
 
@@ -284,22 +350,28 @@ fn full_blocks(
     r: &FindingReport,
     numbers: &HashMap<String, String>,
 ) -> Vec<Block> {
+    let mut identity = vec![
+        kv("Identifier", f.number.clone()),
+        kv("Owner", r.ownership.owner.clone()),
+        kv("Product", r.ownership.product.clone()),
+        kv("Affected Component", r.ownership.affected_component.clone()),
+        kv("Source Repository", r.ownership.source_repository.clone()),
+        kv("Existing Ticket References", tickets_text(&r.tickets)),
+        kv("Impact", risk(r.rating.impact)),
+        kv("Category", r.category.clone()),
+    ];
+    if !r.cwe.is_empty() {
+        identity.push(kv("CWE", r.cwe.join(", ")));
+    }
+    identity.extend([
+        kv("Attack Vector", r.attack_vector.clone()),
+        kv("Likelihood", likelihood(r.rating.likelihood)),
+        kv("Risk Rating", risk(r.rating.risk_rating)),
+    ]);
     let mut b = vec![
         Block::Filename(number::filename(f, "pdf")),
         Block::Title(r.title.clone()),
-        Block::Fields(vec![
-            kv("Identifier", f.number.clone()),
-            kv("Owner", r.ownership.owner.clone()),
-            kv("Product", r.ownership.product.clone()),
-            kv("Affected Component", r.ownership.affected_component.clone()),
-            kv("Source Repository", r.ownership.source_repository.clone()),
-            kv("Existing Ticket References", tickets_text(&r.tickets)),
-            kv("Impact", risk(r.rating.impact)),
-            kv("Category", r.category.clone()),
-            kv("Attack Vector", r.attack_vector.clone()),
-            kv("Likelihood", likelihood(r.rating.likelihood)),
-            kv("Risk Rating", risk(r.rating.risk_rating)),
-        ]),
+        Block::Fields(identity),
         heading("Description"),
         prose(r.description.clone()),
         heading("Impact"),
@@ -324,10 +396,17 @@ fn full_blocks(
     }
     for e in &r.evidence {
         let loc = location(e.file.as_deref(), e.lines, e.binary_va.as_deref());
-        b.push(prose(match loc {
-            Some(l) => format!("**{}** — {}", code_span(&l), e.claim),
-            None => e.claim.clone(),
-        }));
+        let mut claim = match loc {
+            Some(l) => format!("**{}** — {}", code_span(&l), e.claim.trim_end()),
+            None => e.claim.trim_end().to_string(),
+        };
+        if let Some(a) = nonblank(&e.artifact) {
+            claim.push_str(&format!(" — proven by {}", code_span(a)));
+        }
+        if let Some(sha) = e.sha256.as_deref().and_then(sha_prefix) {
+            claim.push_str(&format!(" (sha256 {sha})"));
+        }
+        b.push(prose(claim));
         if let Some(x) = nonblank(&e.excerpt) {
             b.push(code(e.lang.as_deref(), x));
         }
@@ -375,7 +454,7 @@ fn full_blocks(
             .map(|c| {
                 let who = numbers.get(&c.finding_id).unwrap_or(&c.finding_id);
                 match nonblank(&c.note) {
-                    Some(n) => format!("- {who} ({}) — {}", relation(c.relation), oneline(n)),
+                    Some(n) => format!("- {who} ({}) — {}", relation(c.relation), one_line(n)),
                     None => format!("- {who} ({})", relation(c.relation)),
                 }
             })
@@ -397,22 +476,27 @@ fn full_blocks(
     if !r.artifacts.is_empty() {
         b.push(heading("Artifacts"));
         b.push(Block::Table {
-            headers: ["Path", "SHA-256 (first 12 chars)", "Size", "Stored"]
-                .map(str::to_string)
-                .to_vec(),
+            headers: [
+                "Path",
+                "SHA-256 (first 12 chars)",
+                "Size",
+                "Kind",
+                "Stored",
+                "Host",
+            ]
+            .map(str::to_string)
+            .to_vec(),
             rows: r.artifacts.iter().map(artifact_row).collect(),
         });
     }
 
-    b.extend(provenance(f));
+    b.extend(provenance(f, Some(r)));
     b
 }
 
-fn summary_blocks(f: &ExportFinding) -> Vec<Block> {
+fn summary_blocks(f: &ExportFinding, note: &str) -> Vec<Block> {
     let r = &f.input.record;
-    let loc = location(r.file_path.as_deref(), r.line_range, None)
-        .or_else(|| nonblank(&r.target_ref).map(str::to_string))
-        .unwrap_or_else(|| "—".to_string());
+    let loc = record_location(r).unwrap_or_else(|| "—".to_string());
     let mut b = vec![
         Block::Filename(number::filename(f, "pdf")),
         Block::Title(r.summary.clone()),
@@ -422,7 +506,7 @@ fn summary_blocks(f: &ExportFinding) -> Vec<Block> {
             kv("Location", loc),
             kv("Concern", nonblank(&r.concern_id).unwrap_or("—")),
         ]),
-        Block::Note("Summary finding — no full report was recorded.".to_string()),
+        Block::Note(note.to_string()),
         heading("Rationale"),
         prose(r.evidence.rationale.clone()),
     ];
@@ -435,12 +519,12 @@ fn summary_blocks(f: &ExportFinding) -> Vec<Block> {
             r.evidence
                 .references
                 .iter()
-                .map(|x| format!("- {}", oneline(x)))
+                .map(|x| format!("- {}", one_line(x)))
                 .collect::<Vec<_>>()
                 .join("\n"),
         ));
     }
-    b.extend(provenance(f));
+    b.extend(provenance(f, None));
     b
 }
 

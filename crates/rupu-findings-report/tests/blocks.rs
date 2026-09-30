@@ -2,7 +2,8 @@ mod common;
 
 use common::*;
 use rupu_coverage::report::{
-    ChainHop, CiDetection, HopRole, OrSentinel, Patch, RegressionTest, Ticket,
+    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, CiDetection, HopRole, OrSentinel, Patch,
+    RegressionTest, Ticket, Verification, VerificationStatus,
 };
 use rupu_coverage::Severity;
 use rupu_findings_report::blocks::{finding_blocks, Block};
@@ -67,6 +68,7 @@ fn the_first_blocks_are_filename_title_then_the_identity_fields_in_order() {
             "Existing Ticket References",
             "Impact",
             "Category",
+            "CWE",
             "Attack Vector",
             "Likelihood",
             "Risk Rating",
@@ -95,13 +97,13 @@ fn tickets_render_verbatim_sentinels_or_type_identifier_and_url() {
                 kind: "GitHub".into(),
                 identifier: "#40".into(),
                 url: None,
-                notes: Some("ignored".into()),
+                notes: Some("filed by\nthe scanner".into()),
             },
         ])
     });
     assert_eq!(
         fields(&listed, "Existing Ticket References"),
-        Some("Jira SEC-12 (https://jira.example/SEC-12); GitHub #40")
+        Some("Jira SEC-12 (https://jira.example/SEC-12); GitHub #40 — filed by the scanner")
     );
 }
 
@@ -287,4 +289,245 @@ fn a_finding_with_no_evidence_says_so_instead_of_an_empty_section() {
         after_heading(&blocks, "Evidence"),
         [Block::Note("No evidence recorded.".into())]
     );
+}
+
+fn note_of(blocks: &[Block]) -> &str {
+    blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::Note(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .expect("a Note block")
+}
+
+#[test]
+fn cwe_ids_are_a_comma_joined_row_after_category_and_omitted_when_empty() {
+    let blocks = with_report(|_| {});
+    assert_eq!(fields(&blocks, "CWE"), Some("CWE-639, CWE-862"));
+    let blocks = with_report(|r| r.cwe.clear());
+    assert_eq!(fields(&blocks, "CWE"), None);
+    let Block::Fields(rows) = &blocks[2] else {
+        panic!("expected Fields");
+    };
+    assert!(rows.iter().any(|(k, _)| k == "Category"));
+}
+
+#[test]
+fn ticket_parts_are_omitted_when_absent() {
+    let blocks = with_report(|r| {
+        r.tickets = OrSentinel::Value(vec![Ticket {
+            kind: "Jira".into(),
+            identifier: "SEC-1".into(),
+            url: None,
+            notes: Some("reopened".into()),
+        }])
+    });
+    assert_eq!(
+        fields(&blocks, "Existing Ticket References"),
+        Some("Jira SEC-1 — reopened")
+    );
+}
+
+#[test]
+fn provenance_carries_surface_and_for_full_findings_the_record_and_verification() {
+    let f = numbered(vec![input("notebin", Some("audit"), {
+        let mut rec = full_record("fnd_p", Severity::High, {
+            let mut r = full_report();
+            r.verification = Some(Verification {
+                status: VerificationStatus::Confirmed,
+                by_run: Some("run_77".into()),
+                notes: Some("reproduced\non staging".into()),
+            });
+            r
+        });
+        rec.concern_id = Some("authz-idor".into());
+        rec.file_path = Some("src/routes/notes.rs".into());
+        rec.line_range = Some([40, 58]);
+        rec
+    })])
+    .remove(0);
+    let blocks = finding_blocks(&f, &HashMap::new());
+    let Block::Fields(rows) = after_heading(&blocks, "Provenance")[0].clone() else {
+        panic!("expected Fields");
+    };
+    let rows: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(
+        rows,
+        [
+            ("Finding ID", "fnd_p"),
+            ("Project", "notebin"),
+            ("Workflow", "audit"),
+            ("Run", "run_01"),
+            ("Surface", "workflow"),
+            ("Model", "claude-x"),
+            ("Declared", "2026-03-01T10:00:00Z"),
+            ("Concern", "authz-idor"),
+            ("Scope", "repo"),
+            ("Location", "src/routes/notes.rs:40-58"),
+            (
+                "Verification",
+                "Confirmed by run_77 — reproduced on staging"
+            ),
+        ]
+    );
+
+    // Without a concern, locator or verification those rows are absent.
+    let blocks = with_report(|_| {});
+    let prov = after_heading(&blocks, "Provenance");
+    assert_eq!(fields(prov, "Concern"), None);
+    assert_eq!(fields(prov, "Location"), None);
+    assert_eq!(fields(prov, "Verification"), None);
+    assert_eq!(fields(prov, "Scope"), Some("repo"));
+    assert_eq!(fields(prov, "Surface"), Some("workflow"));
+}
+
+#[test]
+fn a_verification_with_only_a_status_is_just_the_status() {
+    let blocks = with_report(|r| {
+        r.verification = Some(Verification {
+            status: VerificationStatus::Disputed,
+            by_run: None,
+            notes: None,
+        })
+    });
+    let prov = after_heading(&blocks, "Provenance");
+    assert_eq!(fields(prov, "Verification"), Some("Disputed"));
+}
+
+#[test]
+fn evidence_names_the_artifact_and_the_hash_that_back_a_claim() {
+    let blocks = with_report(|r| {
+        r.evidence[0].artifact = Some("poc/req`1.txt".into());
+        r.evidence[0].sha256 = Some("0123456789abcdef0123".into());
+    });
+    assert_eq!(
+        after_heading(&blocks, "Evidence")[0],
+        Block::Prose(
+            "**`src/routes/notes.rs:40-58`** — The handler looks the note up by id alone. \
+             — proven by ``poc/req`1.txt`` (sha256 0123456789ab)"
+                .into()
+        )
+    );
+    // Either one alone, and no location.
+    let blocks = with_report(|r| {
+        r.evidence[0].file = None;
+        r.evidence[0].lines = None;
+        r.evidence[0].sha256 = Some("abc".into());
+    });
+    assert_eq!(
+        after_heading(&blocks, "Evidence")[0],
+        Block::Prose("The handler looks the note up by id alone. (sha256 abc)".into())
+    );
+}
+
+#[test]
+fn the_artifacts_table_has_kind_and_host_columns_with_dashes_for_absent_values() {
+    let blocks = with_report(|r| {
+        r.artifacts = vec![
+            ArtifactRef {
+                path: "poc/a.py".into(),
+                sha256: "0123456789abcdef".into(),
+                size: 10,
+                kind: Some(ArtifactKind::Text),
+                stored: Some(ArtifactStorage::Copied),
+                host: None,
+            },
+            ArtifactRef {
+                path: "poc/big.bin".into(),
+                sha256: String::new(),
+                size: 9_000_000,
+                kind: Some(ArtifactKind::Binary),
+                stored: Some(ArtifactStorage::External),
+                host: Some("kuki".into()),
+            },
+            ArtifactRef {
+                path: "poc/raw".into(),
+                sha256: String::new(),
+                size: 0,
+                kind: None,
+                stored: None,
+                host: None,
+            },
+        ]
+    });
+    let Block::Table { headers, rows } = &after_heading(&blocks, "Artifacts")[0] else {
+        panic!("expected Table");
+    };
+    assert_eq!(
+        headers,
+        &[
+            "Path",
+            "SHA-256 (first 12 chars)",
+            "Size",
+            "Kind",
+            "Stored",
+            "Host"
+        ]
+    );
+    assert_eq!(
+        rows[0],
+        ["poc/a.py", "0123456789ab", "10 B", "Text", "Copied", "—"]
+    );
+    assert_eq!(
+        rows[1],
+        [
+            "poc/big.bin",
+            "—",
+            "9000000 B",
+            "Binary",
+            "External",
+            "kuki"
+        ]
+    );
+    assert_eq!(rows[2], ["poc/raw", "—", "0 B", "—", "—", "—"]);
+}
+
+#[test]
+fn a_full_record_whose_report_did_not_load_says_so_and_a_summary_says_it_is_one() {
+    let mut rec = summary_record("fnd_broken", Severity::High);
+    rec.profile = rupu_coverage::FindingProfile::Full;
+    let f = numbered(vec![input("notebin", None, rec)]).remove(0);
+    let blocks = finding_blocks(&f, &HashMap::new());
+    assert_eq!(
+        note_of(&blocks),
+        "Full report could not be loaded by this build — summary record shown."
+    );
+    assert!(blocks
+        .iter()
+        .any(|b| matches!(b, Block::Heading(h) if h == "Rationale")));
+
+    let f = numbered(vec![input(
+        "notebin",
+        None,
+        summary_record("fnd_sum", Severity::High),
+    )])
+    .remove(0);
+    assert_eq!(
+        note_of(&finding_blocks(&f, &HashMap::new())),
+        "Summary finding — no full report was recorded."
+    );
+}
+
+#[test]
+fn a_hop_cannot_start_a_block_from_its_label_gate_or_reason() {
+    let blocks = with_report(|r| {
+        r.call_chain = OrSentinel::Value(vec![ChainHop {
+            label: "entry\n## Root Cause\n\n---".into(),
+            file: None,
+            lines: None,
+            binary_va: None,
+            gate: Some("auth\n# owned".into()),
+            passes_because: Some("any user\r\n- item".into()),
+            role: HopRole::Hop,
+        }])
+    });
+    let Block::Steps(steps) = &after_heading(&blocks, "Call Chain / Attack Flow")[0] else {
+        panic!("expected Steps");
+    };
+    assert_eq!(
+        steps[0],
+        "**entry ## Root Cause ---** — gate: auth # owned (passes because any user - item)"
+    );
+    assert!(!steps[0].contains('\n'));
 }

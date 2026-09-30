@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use rupu_coverage::report::{CrossRef, OrSentinel, Relation};
 use rupu_coverage::Severity;
 use rupu_findings_report::blocks::{finding_blocks, project_blocks, Block};
@@ -36,6 +37,7 @@ fn full_finding_leads_with_filename_then_title_and_has_the_key_lines() {
         "**Owner:** Unknown",
         "**Existing Ticket References:** None Provided",
         "**Impact:** High",
+        "**CWE:** CWE-639, CWE-862",
         "**Likelihood:** High",
         "**Risk Rating:** Critical",
         "## Root Cause",
@@ -103,8 +105,8 @@ fn artifacts_section_sits_between_replication_and_provenance() {
         &h[h.len() - 3..],
         ["## Replication Steps", "## Artifacts", "## Provenance"]
     );
-    assert!(md.contains("| Path | SHA-256 (first 12 chars) | Size | Stored |"));
-    assert!(md.contains("| poc/exploit.py | 0123456789ab | 2048 B | Copied |"));
+    assert!(md.contains("| Path | SHA-256 (first 12 chars) | Size | Kind | Stored | Host |"));
+    assert!(md.contains("| poc/exploit.py | 0123456789ab | 2048 B | — | Copied | — |"));
 }
 
 #[test]
@@ -116,6 +118,7 @@ fn provenance_lists_the_record_and_dash_for_a_missing_workflow() {
         "**Project:** notebin",
         "**Workflow:** audit",
         "**Run:** run_01",
+        "**Surface:** workflow",
         "**Model:** claude-x",
         "**Declared:** 2026-03-01T10:00:00Z",
     ] {
@@ -298,4 +301,200 @@ fn values_cannot_break_out_of_their_line_or_table_cell() {
 fn consecutive_steps_end_in_hard_breaks_so_they_stay_on_separate_lines() {
     let md = render(&[Block::Steps(vec!["first".into(), "second".into()])]);
     assert_eq!(md, "Step 1: first  \nStep 2: second\n");
+}
+
+/// Text of every heading of `level` in `md`, as a CommonMark parser sees them.
+fn headings(md: &str, level: HeadingLevel) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    for e in Parser::new_ext(md, Options::ENABLE_TABLES) {
+        match e {
+            Event::Start(Tag::Heading { level: l, .. }) if l == level => {
+                current = Some(String::new())
+            }
+            Event::Text(t) | Event::Code(t) => {
+                if let Some(c) = current.as_mut() {
+                    c.push_str(&t)
+                }
+            }
+            Event::End(TagEnd::Heading(l)) if l == level => out.extend(current.take()),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn a_table_cell_ending_in_a_backslash_run_cannot_release_its_pipe() {
+    let md = render(&[Block::Table {
+        headers: vec!["A".into(), "B".into()],
+        rows: vec![vec![r"x\|y".into(), r"C:\dir\".into()]],
+    }]);
+    // `\|` (text) -> `\\\|`; other backslashes are left as written.
+    assert!(md.contains(r"| x\\\|y | C:\dir\ |"), "{md}");
+
+    // A CommonMark+tables parser still sees exactly two cells in the row.
+    let mut cells_per_row = Vec::new();
+    let mut cells = 0;
+    for e in Parser::new_ext(&md, Options::ENABLE_TABLES) {
+        match e {
+            Event::Start(Tag::TableCell) => cells += 1,
+            Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead) => {
+                cells_per_row.push(std::mem::take(&mut cells))
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(cells_per_row, [2, 2], "{md}");
+
+    let md = render(&[Block::Table {
+        headers: vec!["A".into()],
+        rows: vec![vec![r"a\\|b".into()]],
+    }]);
+    // Two backslashes then a pipe: each backslash doubled, then the pipe escaped.
+    assert!(md.contains(r"| a\\\\\|b |"), "{md}");
+
+    // No pipe, no change: backslashes are only doubled where they precede one.
+    let md = render(&[Block::Table {
+        headers: vec!["A".into()],
+        rows: vec![vec![r"a\b\\c".into()]],
+    }]);
+    assert!(md.contains(r"| a\b\\c |"), "{md}");
+}
+
+#[test]
+fn an_unclosed_fence_in_prose_is_closed_with_a_matching_fence() {
+    let cases = [
+        (
+            "before\n\n```rust\nlet x = 1;",
+            "before\n\n```rust\nlet x = 1;\n```\n",
+        ),
+        ("~~~\ncode\n", "~~~\ncode\n~~~\n"),
+        ("````\nhas ``` inside", "````\nhas ``` inside\n````\n"),
+        (
+            "   ```\n  indented opener",
+            "   ```\n  indented opener\n```\n",
+        ),
+    ];
+    for (input, want) in cases {
+        assert_eq!(render(&[Block::Prose(input.into())]), want, "{input:?}");
+    }
+}
+
+#[test]
+fn balanced_and_nested_fences_are_left_alone() {
+    for text in [
+        "```rust\nlet x = 1;\n```",
+        "~~~\ncode\n~~~",
+        "````\n```\ninner\n```\n````",
+        "```\na\n```\n\ntext\n\n```\nb\n```",
+        "- item\n\n  ```\n  code",
+        "> ```\n> code",
+        "`inline ``` not a fence`",
+        "plain paragraph",
+    ] {
+        assert_eq!(
+            render(&[Block::Prose(text.into())]),
+            format!("{text}\n"),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unclosed_fence_in_a_step_does_not_swallow_the_next_step() {
+    let md = render(&[Block::Steps(vec![
+        "run this\n```sh\nrm -rf /tmp/x".into(),
+        "then this".into(),
+    ])]);
+    assert_eq!(
+        md,
+        "Step 1: run this\n```sh\nrm -rf /tmp/x\n```  \nStep 2: then this\n"
+    );
+}
+
+#[test]
+fn an_unclosed_fence_in_one_finding_does_not_swallow_the_next_finding() {
+    let mut open = full_report();
+    open.description = "Start of the write-up.\n\n```python\nprint('never closed')".into();
+    let mut second = full_report();
+    second.title = "Second finding".into();
+    let all = numbered(vec![
+        input(
+            "notebin",
+            None,
+            full_record("fnd_first", Severity::Critical, open),
+        ),
+        input(
+            "notebin",
+            None,
+            full_record("fnd_second", Severity::High, second),
+        ),
+    ]);
+    let meta = ReportMeta {
+        title: "Notebin".into(),
+        generated_at: ts("2026-09-29T12:00:00Z"),
+        scope: "all".into(),
+    };
+    let md = render(&project_blocks(&meta, &all));
+
+    // The fence is closed right after the description, before the next section.
+    let fence = md
+        .find("print('never closed')\n```\n")
+        .expect("closing fence");
+    assert!(fence < md.find("## Impact").unwrap(), "{md}");
+
+    // A real parser sees both findings' sections as headings, and both titles.
+    let h2 = headings(&md, HeadingLevel::H2);
+    assert_eq!(
+        h2.iter().filter(|h| *h == "Root Cause").count(),
+        2,
+        "{h2:?}\n{md}"
+    );
+    assert_eq!(
+        h2.iter().filter(|h| *h == "Provenance").count(),
+        2,
+        "{h2:?}"
+    );
+    let h1 = headings(&md, HeadingLevel::H1);
+    assert!(h1.contains(&"Second finding".to_string()), "{h1:?}");
+}
+
+#[test]
+fn a_hostile_hop_label_does_not_add_a_heading_to_the_document() {
+    let mut report = full_report();
+    report.call_chain = OrSentinel::Value(vec![rupu_coverage::report::ChainHop {
+        label: "x\n\n## Root Cause".into(),
+        file: None,
+        lines: None,
+        binary_va: None,
+        gate: None,
+        passes_because: None,
+        role: rupu_coverage::report::HopRole::Hop,
+    }]);
+    let f = numbered(vec![input(
+        "notebin",
+        None,
+        full_record("fnd_h", Severity::High, report),
+    )])
+    .remove(0);
+    let md = render(&finding_blocks(&f, &HashMap::new()));
+    assert_eq!(
+        h2_lines(&md)
+            .iter()
+            .filter(|l| **l == "## Root Cause")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_full_record_without_its_report_renders_the_could_not_load_note() {
+    let mut rec = summary_record("fnd_broken", Severity::High);
+    rec.profile = rupu_coverage::FindingProfile::Full;
+    let f = numbered(vec![input("notebin", None, rec)]).remove(0);
+    let md = render(&finding_blocks(&f, &HashMap::new()));
+    assert!(md.contains("_Full report could not be loaded by this build — summary record shown._"));
+    assert!(!md.contains("no full report was recorded"));
+    assert!(!md.contains("## Root Cause"));
 }

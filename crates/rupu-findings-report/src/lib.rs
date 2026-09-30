@@ -9,3 +9,4 @@ pub mod markdown;
 pub mod model;
 pub mod number;
 pub mod prose;
+mod text;
