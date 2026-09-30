@@ -183,6 +183,55 @@ unit **is** the pin gesture from the mock — there is no separate `p` key; `ent
 into a unit pins its stream, `←`/`backspace` unpins by popping back to the
 firehose.
 
+#### Full key reference
+
+The depth axis: `↑↓` move within a level; `enter`/`→` drills in; `←`/`backspace`
+pops out.
+
+```
+  ↑↓ move          RUN overview            mint-tundra
+  within     ┌────────────────────────────────────────────────┐
+  a level    │  dashboard · collapsed graph · firehose feed    │
+             └───────────────┬────────────────────────────────┘
+       enter / → / l  ⇣ drill in        ⇡ ← / backspace / h  pop out
+             ┌───────────────▼────────────────────────────────┐
+             │  STEP     mint-tundra › hunt                    │
+             │  full fan-out unit list · filter with /         │
+             └───────────────┬────────────────────────────────┘
+       enter / → / l  ⇣                 ⇡ ← / backspace / h
+             ┌───────────────▼────────────────────────────────┐
+             │  UNIT     mint-tundra › hunt › otter#41         │
+             │  this unit's live stream (thinking · tools)     │
+             └───────────────┬────────────────────────────────┘
+       enter / → / l  ⇣                 ⇡ ← / backspace / h
+             ┌───────────────▼────────────────────────────────┐
+             │  SUB-AGENT   … › otter#41 › wren#1              │
+             │  the dispatched child's live stream             │
+             └────────────────────────────────────────────────┘
+```
+
+| Key | Context | Action |
+|-----|---------|--------|
+| `↑`/`k` | anywhere | move selection up within the current level |
+| `↓`/`j` | anywhere | move selection down within the current level |
+| `Tab`/`Shift+Tab` | anywhere | cycle selection (alias of ↓/↑) |
+| `enter`/`→`/`l` | on a step/unit | drill in one level (expand fan-out → pin unit → enter sub-agent) |
+| `←`/`backspace`/`h` | drilled in | pop out one level toward the overview; no-op at the top |
+| `a` | navigating | auto-follow — drop manual selection, track newest activity |
+| `/` | expanded fan-out | filter units by status: running → failed → done → all |
+| `a` | at a gate (modal) | approve the gate |
+| `r` | at a gate (modal) | reject the gate |
+| `v` | at a gate (modal) | view findings behind the gate |
+| `enter` | at a gate (modal) | gate details |
+| `q` | always | quit the viewer — the run keeps running |
+| `Esc` | always | pause the run cooperatively at the next safe boundary |
+| `Ctrl-C` | always | quit cleanly (restores terminal); the run keeps running |
+
+Two keys are **modal** and the footer legend always shows the live set: `a` is
+auto-follow while navigating but approve at a focused gate; `enter` is drill-in on a
+step/unit but gate details at a focused gate. Safety invariant: only `Esc` pauses
+the run — `q` and `Ctrl-C` leave it running.
+
 ### 4. `live_layout.rs` — adaptive rows
 
 Pure function: `(RunView, NavState, terminal W×H) → Vec<Row>`. No I/O. This is the
