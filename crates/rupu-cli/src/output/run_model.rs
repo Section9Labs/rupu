@@ -13,6 +13,8 @@ use rupu_orchestrator::executor::Event;
 use rupu_orchestrator::runs::{RunStatus, StepKind};
 use rupu_orchestrator::RunStore;
 
+use crate::output::palette::Status;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitStatus {
     Queued,
@@ -442,6 +444,43 @@ impl RunView {
         v.usage = Some(rupu_cp::usage::summarize_run(store, run_id, pricing));
 
         v
+    }
+
+    /// Wall-clock elapsed time: `finished_at − started_at`, or
+    /// `now − started_at` while the run is still live. `None` until the run
+    /// has started; a clock that runs backwards clamps to 0.
+    pub fn elapsed_ms(&self, now: DateTime<Utc>) -> Option<u64> {
+        let start = self.started_at?;
+        let end = self.finished_at.unwrap_or(now);
+        Some((end - start).num_milliseconds().max(0) as u64)
+    }
+}
+
+/// Hours-aware duration. Under a minute → `"Ns"`; under an hour →
+/// `"Mm SSs"`; an hour or more → `"Hh MMm"` (seconds dropped past the hour).
+pub fn fmt_hms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Map a step's lifecycle state onto the shared palette status (glyph +
+/// colour). `Paused` reads as `Waiting`: it is parked, not progressing.
+pub fn step_status(state: StepState) -> Status {
+    match state {
+        StepState::Pending => Status::Waiting,
+        StepState::Running => Status::Working,
+        StepState::AwaitingApproval => Status::Awaiting,
+        StepState::Complete => Status::Complete,
+        StepState::Failed => Status::Failed,
+        StepState::Skipped => Status::Skipped,
+        StepState::Paused => Status::Waiting,
     }
 }
 
@@ -916,5 +955,26 @@ mod tests {
         assert_eq!(v.run_id, "run_GONE");
         assert!(v.steps.is_empty());
         assert_eq!(v.usage.unwrap().total_tokens, 0);
+    }
+
+    #[test]
+    fn fmt_hms_is_hours_aware() {
+        assert_eq!(fmt_hms(18_000), "18s");
+        assert_eq!(fmt_hms(123_000), "2m 03s");
+        assert_eq!(fmt_hms(3_840_000), "1h 04m");
+        assert_eq!(fmt_hms(11_220_000), "3h 07m");
+    }
+
+    #[test]
+    fn step_status_maps_to_palette() {
+        use crate::output::palette::Status;
+        assert!(matches!(step_status(StepState::Complete), Status::Complete));
+        assert!(matches!(step_status(StepState::Running), Status::Working));
+        assert!(matches!(
+            step_status(StepState::AwaitingApproval),
+            Status::Awaiting
+        ));
+        assert!(matches!(step_status(StepState::Skipped), Status::Skipped));
+        assert!(matches!(step_status(StepState::Pending), Status::Waiting));
     }
 }
