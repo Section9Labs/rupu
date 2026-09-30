@@ -2775,6 +2775,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         s.run_store.create(record, "name: wf\n").unwrap();
         write_agent_transcript(transcript_path, agent);
@@ -2798,6 +2799,7 @@ mod tests {
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();

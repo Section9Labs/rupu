@@ -30,6 +30,8 @@ pub enum Event {
         /// restores `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codename: Option<String>,
     },
     StepWorking {
         run_id: String,
@@ -42,6 +44,25 @@ pub enum Event {
         /// absent in older event logs (serde default restores `None`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript_path: Option<PathBuf>,
+    },
+    /// An agent instance is about to run: the first moment its provider and
+    /// model are known. One per agent instance (linear step, fan-out unit,
+    /// parallel sub-step, panelist, fixer, on_reject cleanup). Placed units
+    /// run remotely, so `provider`/`model` are `None` for them.
+    AgentStarted {
+        run_id: String,
+        step_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit_index: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codename: Option<String>,
+        agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        agent_run_id: String,
+        transcript_path: PathBuf,
     },
     StepAwaitingApproval {
         run_id: String,
@@ -86,6 +107,8 @@ pub enum Event {
         /// default restores `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codename: Option<String>,
     },
     /// One fan-out unit finished. `tokens_in` / `tokens_out` are
     /// best-effort: the runner's per-unit dispatch result does not carry
@@ -150,6 +173,12 @@ pub enum Event {
         sub_run_id: String,
         agent: Option<String>,
         transcript_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// A dispatched child agent run finished. `tokens_in` / `tokens_out`
     /// are the child run's totals (best-effort `0` if the child errored
@@ -169,6 +198,7 @@ impl Event {
             Event::RunStarted { run_id, .. }
             | Event::StepStarted { run_id, .. }
             | Event::StepWorking { run_id, .. }
+            | Event::AgentStarted { run_id, .. }
             | Event::StepAwaitingApproval { run_id, .. }
             | Event::StepCompleted { run_id, .. }
             | Event::StepFailed { run_id, .. }
@@ -239,6 +269,7 @@ mod tests {
             kind: StepKind::Linear,
             agent: Some("builder".into()),
             host: Some("worker-1".into()),
+            codename: None,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(json.contains("\"host\":\"worker-1\""), "json: {json}");
@@ -390,6 +421,9 @@ mod tests {
             sub_run_id: "sub_child".into(),
             agent: Some("security-reviewer".into()),
             transcript_path: PathBuf::from("/runs/run_parent/sub_child.jsonl"),
+            codename: None,
+            model: None,
+            provider: None,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(
@@ -406,6 +440,7 @@ mod tests {
                 sub_run_id,
                 agent,
                 transcript_path,
+                ..
             } => {
                 assert_eq!(run_id, "run_parent");
                 assert_eq!(sub_run_id, "sub_child");
@@ -460,5 +495,26 @@ mod tests {
         let bad = r#"{"type":"step_warped","run_id":"r","step_id":"s"}"#;
         let res: Result<Event, _> = serde_json::from_str(bad);
         assert!(res.is_err(), "unknown variant should fail to deserialize");
+    }
+
+    #[test]
+    fn agent_started_serde_and_run_id() {
+        let ev = Event::AgentStarted {
+            run_id: "run_W".into(),
+            step_id: "review".into(),
+            unit_index: Some(3),
+            codename: Some("jade-reef/heron#4".into()),
+            agent: "security-reviewer".into(),
+            provider: Some("anthropic".into()),
+            model: Some("claude-opus-5-5".into()),
+            agent_run_id: "run_U".into(),
+            transcript_path: "/t.jsonl".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "agent_started");
+        assert_eq!(v["codename"], "jade-reef/heron#4");
+        assert_eq!(ev.run_id(), "run_W");
+        let legacy = r#"{"type":"unit_started","run_id":"r","step_id":"s","index":0,"unit_key":"k","agent":null,"transcript_path":"/t"}"#;
+        assert!(serde_json::from_str::<Event>(legacy).is_ok());
     }
 }

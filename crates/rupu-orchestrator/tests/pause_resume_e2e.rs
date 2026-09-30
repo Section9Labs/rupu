@@ -936,6 +936,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
                     output: cp.output.clone(),
                     success: true,
                     is_fixer: false,
+                    codename: None,
                 },
             );
     }

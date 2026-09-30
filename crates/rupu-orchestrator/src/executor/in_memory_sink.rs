@@ -51,6 +51,7 @@ mod tests {
                 kind: StepKind::Linear,
                 agent: None,
                 host: None,
+                codename: None,
             },
         );
         let ev_a = a.recv().await.expect("a recv");
@@ -70,6 +71,7 @@ mod tests {
                 kind: StepKind::Linear,
                 agent: None,
                 host: None,
+                codename: None,
             },
         );
     }

@@ -128,6 +128,8 @@ pub struct UnitDispatch {
     /// run's id (and therefore its mirrored transcript path, see
     /// [`UnitDispatcher::unit_transcript_path`]) before dispatch.
     pub run_id: String,
+    /// Codename of the agent instance this unit runs as (minted by the coordinator).
+    pub codename: Option<String>,
     /// The packed coordinator workspace when this unit's effective workspace
     /// mode is `Sync`. `None` ⇒ self-contained (unchanged).
     ///
@@ -533,6 +535,8 @@ pub struct StepResult {
     /// Host that executed this step. `None` = local. `Some(id)` = a remote
     /// fleet host (a placed step).
     pub host: Option<String>,
+    /// Codename of the singleton member that ran this step; `None` for fan-out/panel/parallel steps.
+    pub codename: Option<String>,
 }
 
 /// Runtime form of one finding emitted by a panelist. Aggregated
@@ -545,6 +549,8 @@ pub struct Finding {
     pub severity: crate::workflow::Severity,
     pub title: String,
     pub body: String,
+    /// Codename of the agent instance that emitted this finding.
+    pub codename: Option<String>,
 }
 
 impl Default for StepResult {
@@ -568,6 +574,7 @@ impl Default for StepResult {
             resolved: true,
             loop_iteration: None,
             host: None,
+            codename: None,
         }
     }
 }
@@ -611,6 +618,8 @@ pub struct ItemResult {
     /// formatting chosen for an unrelated purpose (human-readable unit
     /// labelling).
     pub is_fixer: bool,
+    /// Codename of the agent instance that ran this unit.
+    pub codename: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -911,6 +920,7 @@ pub async fn run_workflow(
                 permission_mode: opts.factory.permission_mode().map(str::to_string),
                 final_output: None,
                 loop_progress: std::collections::BTreeMap::new(),
+                codename: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
@@ -2382,6 +2392,7 @@ async fn run_scheduler_scoped(
                             kind: crate::runs::StepKind::Branch,
                             agent: None,
                             host: None,
+                            codename: None,
                         },
                     );
                 }
@@ -2472,6 +2483,7 @@ async fn run_scheduler_scoped(
                             kind: crate::runs::StepKind::Split,
                             agent: None,
                             host: None,
+                            codename: None,
                         },
                     );
                 }
@@ -2549,6 +2561,7 @@ async fn run_scheduler_scoped(
                                 kind: crate::runs::StepKind::Loop,
                                 agent: None,
                                 host: None,
+                                codename: None,
                             },
                         );
                     }
@@ -2667,6 +2680,7 @@ async fn run_scheduler_scoped(
                         kind: step_kind,
                         agent: step.agent.clone(),
                         host: step.host.clone(),
+                        codename: None,
                     },
                 );
             }
@@ -3958,6 +3972,7 @@ fn drain_joins(
                 output: src.output.clone(),
                 success: src.success,
                 is_fixer: false,
+                codename: None,
             });
         }
         let join_step = &wf.steps[j];
@@ -3970,6 +3985,7 @@ fn drain_joins(
                     kind: crate::runs::StepKind::Join,
                     agent: None,
                     host: None,
+                    codename: None,
                 },
             );
         }
@@ -4400,6 +4416,7 @@ async fn run_steps_over(
                         kind: crate::runs::StepKind::Branch,
                         agent: None,
                         host: None,
+                        codename: None,
                     },
                 );
             }
@@ -4458,6 +4475,7 @@ async fn run_steps_over(
                     kind: step_kind,
                     agent: step.agent.clone(),
                     host: step.host.clone(),
+                    codename: None,
                 },
             );
         }
@@ -5521,6 +5539,7 @@ fn emit_gate_result(
                 kind: crate::runs::StepKind::ApprovalGate,
                 agent: None,
                 host: None,
+                codename: None,
             },
         );
     }
@@ -5684,6 +5703,7 @@ pub async fn run_reject_cleanup(
                         kind: crate::runs::StepKind::Action,
                         agent: None,
                         host: None,
+                        codename: None,
                     },
                 );
             }
@@ -5771,6 +5791,7 @@ pub async fn run_reject_cleanup(
                     kind: crate::runs::StepKind::Linear,
                     agent: step.agent.clone(),
                     host: step.host.clone(),
+                    codename: None,
                 },
             );
         }
@@ -6022,6 +6043,7 @@ async fn dispatch_placed_step(
         index: 0,
         run_id: run_id.to_string(),
         workspace: prepared,
+        codename: None,
     };
     match dispatcher.dispatch_unit(unit, host).await {
         Ok(outcome) if outcome.success => {
@@ -6419,6 +6441,7 @@ async fn run_fanout_run_step(
                 output,
                 success,
                 is_fixer: false,
+                codename: None,
             },
         ));
     }
@@ -6441,6 +6464,7 @@ async fn run_fanout_run_step(
                     success: r.success,
                     finished_at: chrono::Utc::now(),
                     host: None,
+                    codename: None,
                 };
                 if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
                     warn!(step = %step.id, index = idx, error = %e, "failed to append unit checkpoint");
@@ -6753,6 +6777,7 @@ async fn run_fanout_step(
                         agent: Some(unit_agent.clone()),
                         transcript_path: transcript_clone.clone(),
                         host: placement_host.clone(),
+                        codename: None,
                     },
                 );
             }
@@ -6798,6 +6823,7 @@ async fn run_fanout_step(
                                     index: idx,
                                     run_id: run_id_clone.clone(),
                                     workspace: unit_ws.clone(),
+                                    codename: None,
                                 };
                                 match dispatcher.dispatch_unit(unit, &host).await {
                                     Ok(outcome) => {
@@ -6862,6 +6888,7 @@ async fn run_fanout_step(
                                             index: idx,
                                             run_id: retry_run_id,
                                             workspace: unit_ws.clone(),
+                                            codename: None,
                                         };
                                         warn!(
                                             step = %step_id,
@@ -6888,6 +6915,7 @@ async fn run_fanout_step(
                                                     agent: Some(unit_agent.clone()),
                                                     transcript_path: transcript_path.clone(),
                                                     host: placement_host.clone(),
+                                                    codename: None,
                                                 },
                                             );
                                         }
@@ -7063,6 +7091,7 @@ async fn run_fanout_step(
                     success: o.success,
                     finished_at: chrono::Utc::now(),
                     host: o.host.clone(),
+                    codename: None,
                 };
                 if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
                     warn!(step = %step.id, index = o.idx, error = %e, "failed to append unit checkpoint");
@@ -7115,6 +7144,7 @@ async fn run_fanout_step(
                     output: o.output.clone(),
                     success: true,
                     is_fixer: false,
+                    codename: None,
                 },
             );
         }
@@ -7140,6 +7170,7 @@ async fn run_fanout_step(
             output: o.output.clone(),
             success: o.success,
             is_fixer: false,
+            codename: None,
         })
         .collect();
     items_vec.extend(resumed.into_values());
@@ -7343,6 +7374,7 @@ async fn run_parallel_step(
             output: o.output.clone(),
             success: o.success,
             is_fixer: false,
+            codename: None,
         })
         .collect();
     let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
@@ -7824,6 +7856,7 @@ async fn run_panel_step(
                     output: output.clone(),
                     success: true,
                     is_fixer: true,
+                    codename: None,
                 });
                 subject = output;
                 // Loop continues; pass is dropped — its findings are
@@ -7858,6 +7891,7 @@ async fn run_panel_step(
                     output: error.to_string(),
                     success: false,
                     is_fixer: true,
+                    codename: None,
                 });
                 warn!(step = %step.id, error = %error, "fixer agent failed; tolerating via continue_on_error");
                 break (pass, false);
@@ -7921,6 +7955,7 @@ impl PanelPass {
             resolved,
             loop_iteration: None,
             host: None,
+            codename: None,
         }
     }
 }
@@ -7993,6 +8028,7 @@ async fn dispatch_fixer(
                 agent: Some(fixer_agent.to_string()),
                 transcript_path: transcript_path.clone(),
                 host: None,
+                codename: None,
             },
         );
     }
@@ -8138,6 +8174,7 @@ async fn run_panel_iteration(
                         agent: Some(unit_agent.clone()),
                         transcript_path: transcript_clone.clone(),
                         host: None,
+                        codename: None,
                     },
                 );
             }
@@ -8236,6 +8273,7 @@ async fn run_panel_iteration(
                         severity: p.severity,
                         title: p.title,
                         body: p.body,
+                        codename: None,
                     });
                 }
             }
@@ -8257,6 +8295,7 @@ async fn run_panel_iteration(
             output: o.output.clone(),
             success: o.success,
             is_fixer: false,
+            codename: None,
         })
         .collect();
     let success = items_vec.iter().all(|i| i.success);
@@ -10373,6 +10412,7 @@ steps:
                         output: cp.output.clone(),
                         success: true,
                         is_fixer: false,
+                        codename: None,
                     },
                 );
         }
@@ -13527,6 +13567,7 @@ loops:
                     permission_mode: None,
                     final_output: None,
                     loop_progress: BTreeMap::new(),
+                    codename: None,
                 },
                 REFINE_WF,
             )

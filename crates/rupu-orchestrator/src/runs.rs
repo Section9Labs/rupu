@@ -126,6 +126,9 @@ pub struct RunRecord {
     /// Set when the run reaches a terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
+    /// Crew codename (`adjective-noun`) minted for this run. Absent on legacy runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -606,6 +609,9 @@ pub struct StepResultRecord {
     /// record written before the field existed (mirrors `UnitCheckpoint::host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Codename of the singleton member that ran this step. `None` for fan-out/panel/parallel steps (instances live on `items`) and legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 /// Captured process outcome for a `run:` step. `None` for every other
@@ -642,6 +648,9 @@ pub struct FindingRecord {
     pub severity: String,
     pub title: String,
     pub body: String,
+    /// Codename of the agent instance that emitted this finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,6 +680,9 @@ pub struct ItemResultRecord {
     /// restate it as "impossible": it is merely unreachable in practice.
     #[serde(default)]
     pub is_fixer: bool,
+    /// Codename of the agent instance that ran this unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 /// One durable per-unit checkpoint for a fan-out (`for_each`) step,
@@ -702,6 +714,9 @@ pub struct UnitCheckpoint {
     /// was added; serde default restores `None` on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Codename of the agent instance that ran this unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 impl From<&StepResult> for StepResultRecord {
@@ -725,6 +740,7 @@ impl From<&StepResult> for StepResultRecord {
                     severity: f.severity.as_str().to_string(),
                     title: f.title.clone(),
                     body: f.body.clone(),
+                    codename: f.codename.clone(),
                 })
                 .collect(),
             iterations: sr.iterations,
@@ -732,6 +748,7 @@ impl From<&StepResult> for StepResultRecord {
             finished_at: Utc::now(),
             loop_iteration: sr.loop_iteration,
             host: sr.host.clone(),
+            codename: sr.codename.clone(),
         }
     }
 }
@@ -748,6 +765,7 @@ impl From<&ItemResult> for ItemResultRecord {
             output: i.output.clone(),
             success: i.success,
             is_fixer: i.is_fixer,
+            codename: i.codename.clone(),
         }
     }
 }
@@ -773,12 +791,14 @@ impl From<&StepResultRecord> for StepResult {
                     severity: crate::workflow::Severity::parse_lossy(&f.severity),
                     title: f.title.clone(),
                     body: f.body.clone(),
+                    codename: f.codename.clone(),
                 })
                 .collect(),
             iterations: rec.iterations,
             resolved: rec.resolved,
             loop_iteration: rec.loop_iteration,
             host: rec.host.clone(),
+            codename: rec.codename.clone(),
         }
     }
 }
@@ -795,6 +815,7 @@ impl From<&ItemResultRecord> for ItemResult {
             output: rec.output.clone(),
             success: rec.success,
             is_fixer: rec.is_fixer,
+            codename: rec.codename.clone(),
         }
     }
 }
@@ -2846,6 +2867,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: BTreeMap::new(),
+            codename: None,
         }
     }
 
@@ -2867,6 +2889,7 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            codename: None,
         }
     }
 
@@ -3172,6 +3195,7 @@ mod tests {
             success: true,
             finished_at: Utc::now(),
             host: None,
+            codename: None,
         };
         let cp1 = UnitCheckpoint {
             step_id: "review_each".into(),
@@ -3183,6 +3207,7 @@ mod tests {
             success: false,
             finished_at: Utc::now(),
             host: None,
+            codename: None,
         };
         store.append_unit_checkpoint(&rec.id, &cp0).unwrap();
         store.append_unit_checkpoint(&rec.id, &cp1).unwrap();
@@ -5232,6 +5257,7 @@ mod tests {
             success: true,
             finished_at: Utc::now(),
             host: Some("h1".into()),
+            codename: None,
         };
 
         // Serializes with the host field present.
@@ -5463,5 +5489,32 @@ mod tests {
             "recursion must stop well short of the full pathological chain: {} ids",
             ids.len()
         );
+    }
+
+    #[test]
+    fn legacy_records_round_trip_without_codename_keys() {
+        let legacy = r#"{"step_id":"s","index":0,"item":1,"run_id":"run_X","transcript_path":"/t","output":"","success":true,"finished_at":"2026-09-29T00:00:00Z"}"#;
+        let cp: UnitCheckpoint = serde_json::from_str(legacy).unwrap();
+        assert!(cp.codename.is_none());
+        assert_eq!(serde_json::to_string(&cp).unwrap(), legacy);
+    }
+
+    #[test]
+    fn codename_survives_step_result_conversion() {
+        let item = crate::runner::ItemResult {
+            index: 0,
+            item: serde_json::json!(1),
+            sub_id: "0".into(),
+            rendered_prompt: String::new(),
+            run_id: "run_U".into(),
+            transcript_path: "/t".into(),
+            output: String::new(),
+            success: true,
+            is_fixer: false,
+            codename: Some("jade-reef/heron#1".into()),
+        };
+        let rec = ItemResultRecord::from(&item);
+        assert_eq!(rec.codename.as_deref(), Some("jade-reef/heron#1"));
+        assert_eq!(crate::runner::ItemResult::from(&rec).codename, item.codename);
     }
 }

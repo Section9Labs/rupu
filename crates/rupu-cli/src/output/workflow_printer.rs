@@ -4009,6 +4009,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 
@@ -4369,6 +4370,7 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            codename: None,
         };
         std::fs::write(
             &step_results,
@@ -4737,6 +4739,7 @@ mod tests {
                 output: String::new(),
                 success: true,
                 is_fixer: false,
+                codename: None,
             }],
             findings: Vec::new(),
             iterations: 0,
@@ -4744,6 +4747,7 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            codename: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),

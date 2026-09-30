@@ -4478,6 +4478,7 @@ mod tests {
                     loop_iteration: None,
                     run_outcome: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();

@@ -1645,6 +1645,7 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
             source: source.to_string(),
+            codename: None,
         }
     }
 

@@ -753,6 +753,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 
@@ -815,6 +816,7 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            codename: None,
         }
     }
 

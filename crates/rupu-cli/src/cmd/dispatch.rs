@@ -234,6 +234,9 @@ impl AgentDispatcher for CliAgentDispatcher {
                     sub_run_id: sub_run_id.clone(),
                     agent: Some(agent_name.to_string()),
                     transcript_path: transcript_path.clone(),
+                    codename: None,
+                    model: None,
+                    provider: None,
                 },
             );
         }

@@ -72,6 +72,7 @@ fn events_fixture_is_current() {
             kind: StepKind::Linear,
             agent: Some("rupuso".into()),
             host: None,
+            codename: None,
         },
         Event::StepWorking {
             run_id: "run-01".into(),
@@ -109,6 +110,7 @@ fn events_fixture_is_current() {
             agent: None,
             transcript_path: "t/u0.jsonl".into(),
             host: None,
+            codename: None,
         },
         Event::UnitCompleted {
             run_id: "run-01".into(),
@@ -156,6 +158,9 @@ fn events_fixture_is_current() {
             sub_run_id: "run-02".into(),
             agent: Some("reviewer".into()),
             transcript_path: "t/d.jsonl".into(),
+            codename: None,
+            model: None,
+            provider: None,
         },
         Event::DispatchCompleted {
             run_id: "run-01".into(),
@@ -187,6 +192,7 @@ fn assert_events_cover_every_variant(events: &[Event]) {
             Event::RunStarted { .. } => {}
             Event::StepStarted { .. } => {}
             Event::StepWorking { .. } => {}
+            Event::AgentStarted { .. } => {}
             Event::StepAwaitingApproval { .. } => {}
             Event::StepCompleted { .. } => {}
             Event::StepFailed { .. } => {}
@@ -249,6 +255,7 @@ fn sample_run_record(id: &str, started_at: chrono::DateTime<chrono::Utc>) -> Run
         permission_mode: Some("ask".into()),
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     }
 }
 
@@ -691,6 +698,7 @@ fn run_detail_fixture_is_current() {
         loop_iteration: None,
         run_outcome: None,
         host: None,
+        codename: None,
     };
     let step_panel = StepResultRecord {
         step_id: "review".into(),
@@ -707,6 +715,7 @@ fn run_detail_fixture_is_current() {
             severity: "high".into(),
             title: "Missing null check".into(),
             body: "Potential panic on None".into(),
+            codename: None,
         }],
         iterations: 2,
         resolved: true,
@@ -714,6 +723,7 @@ fn run_detail_fixture_is_current() {
         loop_iteration: None,
         run_outcome: None,
         host: None,
+        codename: None,
     };
 
     let usage = UsageSummary {
@@ -891,6 +901,7 @@ fn run_graph_fixture_is_current() {
         loop_iteration: None,
         run_outcome: None,
         host: None,
+        codename: None,
     };
 
     // One durable checkpoint (`success: true`) plus one events-only
@@ -908,6 +919,7 @@ fn run_graph_fixture_is_current() {
         success: true,
         finished_at: t,
         host: None,
+        codename: None,
     };
     let synthesized_unit = serde_json::json!({
         "step_id": "fan",

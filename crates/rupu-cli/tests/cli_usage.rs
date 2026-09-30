@@ -155,6 +155,7 @@ fn sample_run_record(
         active_step_transcript_path: None,
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     }
 }
 
@@ -222,6 +223,7 @@ fn sample_step_result(run_id: &str, transcript_path: &Path) -> StepResultRecord 
         finished_at: Utc::now(),
         loop_iteration: None,
         host: None,
+        codename: None,
     }
 }
 

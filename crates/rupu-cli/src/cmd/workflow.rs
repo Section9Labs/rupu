@@ -3117,6 +3117,7 @@ pub(crate) async fn resume_run(
                     output: cp.output.clone(),
                     success: true,
                     is_fixer: false,
+                    codename: None,
                 },
             );
         } else {
@@ -5431,6 +5432,7 @@ mod tests {
             active_step_transcript_path: Some(PathBuf::from("/tmp/transcripts/step.jsonl")),
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 

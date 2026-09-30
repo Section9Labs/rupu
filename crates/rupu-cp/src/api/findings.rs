@@ -741,6 +741,7 @@ mod tests {
                 agent: Some("oracle".into()),
                 transcript_path: tmp.path().join("transcripts/run_unit0.jsonl"),
                 host: None,
+                codename: None,
             },
             Event::StepWorking {
                 run_id: parent.into(),
@@ -783,6 +784,7 @@ mod tests {
                 .path()
                 .join("runs/run_parent/sub/sub_child/transcript.jsonl"),
             host: None,
+            codename: None,
         };
         std::fs::write(&ev_path, serde_json::to_string(&ev).unwrap() + "\n").unwrap();
         let scope = resolve_run_scope(&store, parent);

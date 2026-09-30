@@ -957,6 +957,7 @@ mod tests {
             index: 0,
             run_id: "r".to_string(),
             workspace: None,
+            codename: None,
         }
     }
 

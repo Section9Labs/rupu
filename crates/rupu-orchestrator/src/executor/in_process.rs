@@ -285,6 +285,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             permission_mode: None,
                             final_output: None,
                             loop_progress: BTreeMap::new(),
+                            codename: None,
                         },
                     );
                 }

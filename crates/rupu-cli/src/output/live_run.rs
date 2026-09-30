@@ -410,6 +410,8 @@ impl LiveRunState {
                     }
                 }
             }
+            // Display for agent identity lands with the codename UI work.
+            WfEvent::AgentStarted { .. } => {}
             WfEvent::StepAwaitingApproval { step_id, .. } => {
                 if let Some(step) = self.step_mut(step_id) {
                     step.status = NodeStatus::Awaiting;
@@ -2102,6 +2104,7 @@ mod tests {
             kind: StepKind::Linear,
             agent: Some("reporter".into()),
             host: None,
+            codename: None,
         });
         assert_eq!(state.active.step_id.as_deref(), Some("report"));
         assert_eq!(state.active.agent.as_deref(), Some("reporter"));
@@ -2199,6 +2202,7 @@ mod tests {
             agent: Some("oracle-assessor".into()),
             transcript_path: path.clone(),
             host: None,
+            codename: None,
         });
         let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
         assert_eq!(step.units[2].status, NodeStatus::Working);
@@ -2274,6 +2278,7 @@ mod tests {
             agent: Some("oracle-assessor".into()),
             transcript_path: std::path::PathBuf::from("/runs/u3.jsonl"),
             host: None,
+            codename: None,
         });
         let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
         assert_eq!(step.units.len(), 4);
@@ -2305,6 +2310,9 @@ mod tests {
             sub_run_id: "sub_child".into(),
             agent: Some("security-reviewer".into()),
             transcript_path: path.clone(),
+            codename: None,
+            model: None,
+            provider: None,
         });
         let step = state.steps.iter().find(|s| s.id == "report").unwrap();
         assert_eq!(step.units.len(), 1);
@@ -2325,6 +2333,9 @@ mod tests {
             sub_run_id: "sub_child".into(),
             agent: Some("security-reviewer".into()),
             transcript_path: path2.clone(),
+            codename: None,
+            model: None,
+            provider: None,
         });
         let step = state.steps.iter().find(|s| s.id == "report").unwrap();
         assert_eq!(step.units.len(), 1, "no duplicate slot on redelivery");
@@ -2339,6 +2350,9 @@ mod tests {
             sub_run_id: "sub_child".into(),
             agent: Some("security-reviewer".into()),
             transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
+            codename: None,
+            model: None,
+            provider: None,
         });
         let run_in_before = state.tokens_in;
         let run_out_before = state.tokens_out;
@@ -2364,6 +2378,9 @@ mod tests {
             sub_run_id: "sub_fail".into(),
             agent: Some("other-agent".into()),
             transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_fail.jsonl"),
+            codename: None,
+            model: None,
+            provider: None,
         });
         state.apply(&WfEvent::DispatchCompleted {
             run_id: "run_01ABC".into(),
@@ -2407,6 +2424,9 @@ mod tests {
             sub_run_id: "sub_child".into(),
             agent: Some("security-reviewer".into()),
             transcript_path: path.clone(),
+            codename: None,
+            model: None,
+            provider: None,
         });
         assert_eq!(
             state.navigable_nodes(),
@@ -2429,12 +2449,18 @@ mod tests {
             sub_run_id: "sub_a".into(),
             agent: Some("agent-a".into()),
             transcript_path: path_a,
+            codename: None,
+            model: None,
+            provider: None,
         });
         state.apply(&WfEvent::DispatchStarted {
             run_id: "run_01ABC".into(),
             sub_run_id: "sub_b".into(),
             agent: Some("agent-b".into()),
             transcript_path: path_b,
+            codename: None,
+            model: None,
+            provider: None,
         });
         let step = state.steps.iter().find(|s| s.id == "report").unwrap();
         assert_eq!(step.units.len(), 2);
@@ -2832,6 +2858,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 
@@ -2994,6 +3021,7 @@ mod tests {
             kind: StepKind::Linear,
             agent: Some("reporter".into()),
             host: None,
+            codename: None,
         });
 
         assert_eq!(

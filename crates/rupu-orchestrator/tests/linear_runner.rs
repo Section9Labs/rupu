@@ -2237,6 +2237,7 @@ async fn resume_reruns_only_failed_fanout_units() {
                     output: cp.output.clone(),
                     success: true,
                     is_fixer: false,
+                    codename: None,
                 },
             );
     }
