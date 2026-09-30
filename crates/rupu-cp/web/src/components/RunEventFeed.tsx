@@ -10,7 +10,7 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { cn } from '../lib/cn';
-import { cardFromEvent, type StreamCard } from '../lib/situationRoom/cards';
+import { cardFromEvent, unitKeyIndex, type StreamCard } from '../lib/situationRoom/cards';
 import EventCard from './situationRoom/EventCard';
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting';
@@ -42,9 +42,10 @@ export default function RunEventFeed({
   // note-less step_working heartbeat → cardFromEvent returns null).
   const cards = useMemo<StreamCard[]>(() => {
     const out: StreamCard[] = [];
+    const ctx = { unitKeys: unitKeyIndex(events.map((e) => e.event)) };
     for (let i = events.length - 1; i >= 0; i--) {
       const { seq, event } = events[i];
-      const c = cardFromEvent(event, tsOf(event), `run-ev-${seq}`);
+      const c = cardFromEvent(event, tsOf(event), `run-ev-${seq}`, ctx);
       if (c) out.push(c);
     }
     return out;

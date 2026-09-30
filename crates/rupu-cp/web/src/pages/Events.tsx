@@ -23,7 +23,7 @@ import {
   type RunEvent,
 } from '../lib/api';
 import { type ConnectionState } from '../components/RunEventFeed';
-import { cardFromEvent, cardFromFinding, type StreamCard } from '../lib/situationRoom/cards';
+import { cardFromEvent, cardFromFinding, unitKeyIndex, type StreamCard } from '../lib/situationRoom/cards';
 import { buildRoster, buildVitals, deriveActivity, reconcileActivity } from '../lib/situationRoom/roster';
 import PulseStrip from '../components/situationRoom/PulseStrip';
 import EventStream from '../components/situationRoom/EventStream';
@@ -269,8 +269,9 @@ export default function Events() {
   // ── derived view models ──
   const eventCards = useMemo(() => {
     const out: StreamCard[] = [];
+    const ctx = { crewByRun: runToCodename, unitKeys: unitKeyIndex(items.map((i) => i.event)) };
     for (const { key, ts, event } of items) {
-      const c = cardFromEvent(event, ts, key, runToCodename);
+      const c = cardFromEvent(event, ts, key, ctx);
       if (c) out.push(c);
     }
     return out;

@@ -33,8 +33,10 @@ describe('FindingsTable — agent column', () => {
   it('renders a derived codename muted', () => {
     const legacy: FindingOut = { ...out, codename: 'jade-reef', codename_derived: true };
     render(<MemoryRouter><FindingsTable findings={[legacy]} showProvenance /></MemoryRouter>);
-    const leaf = screen.getAllByText('jade-reef').find((el) => el.closest('.opacity-60'));
-    expect(leaf).toBeDefined();
+    // Crew-only (derived) codename: the crew renders exactly once, muted.
+    const all = screen.getAllByText('jade-reef');
+    expect(all).toHaveLength(1);
+    expect(all[0].closest('.opacity-60')).not.toBeNull();
   });
 
   it('falls back to declared_by.codename on a plain FindingRecord (coverage detail)', () => {

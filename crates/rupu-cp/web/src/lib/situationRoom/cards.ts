@@ -123,19 +123,50 @@ function stepLabel(stepId: string | undefined): string {
  * frames are stamped with arrival time (mirroring the existing Events page).
  * `key` is likewise caller-owned so history↔live dedup stays in one place.
  */
+/** Cross-event context the caller (which holds the whole event list) can
+ *  supply; `cardFromEvent` itself stays a pure per-event mapper. */
+export interface CardContext {
+  /** run_id → run codename (the page resolves it via getRun). Gives cards
+   *  with no codename of their own (run_started / awaiting / completed …)
+   *  their run's crew word, so every card of a run shares the tint. */
+  crewByRun?: ReadonlyMap<string, string>;
+  /** (run, step, unit index) → unit_key, from {@link unitKeyIndex}. Lets an
+   *  agent_started card show the fan-out target its (suppressed, named)
+   *  unit_started carried. */
+  unitKeys?: ReadonlyMap<string, string>;
+}
+
+function unitKeyId(runId: string, stepId: string, index: number): string {
+  return `${runId}\u0000${stepId}\u0000${index}`;
+}
+
+/** Index every `unit_started`'s unit_key by (run, step, index). */
+export function unitKeyIndex(events: Iterable<RunEvent>): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const ev of events) {
+    if (!isKnownRunEvent(ev) || ev.type !== 'unit_started') continue;
+    out.set(unitKeyId(ev.run_id, ev.step_id, ev.index), ev.unit_key);
+  }
+  return out;
+}
+
 export function cardFromEvent(
   ev: RunEvent,
   ts: number,
   key: string,
-  crewByRun?: ReadonlyMap<string, string>,
+  ctx?: CardContext,
 ): StreamCard | null {
-  const card = cardFromEventInner(ev, ts, key);
-  if (!card || card.crew || !card.runId || !crewByRun) return card;
-  // Run-level cards (run_started / awaiting / completed …) carry no codename
-  // of their own; the page resolves run_id → run.codename and we take its
-  // crew word so every card of a run shares the tint.
-  const runName = crewByRun.get(card.runId);
-  return runName ? { ...card, crew: parseCodename(runName).crew } : card;
+  let card = cardFromEventInner(ev, ts, key);
+  if (!card || !ctx) return card;
+  if (ctx.unitKeys && isKnownRunEvent(ev) && ev.type === 'agent_started' && ev.unit_index != null) {
+    const unitKey = ctx.unitKeys.get(unitKeyId(ev.run_id, ev.step_id, ev.unit_index));
+    if (unitKey) card = { ...card, unitKey };
+  }
+  if (!card.crew && card.runId && ctx.crewByRun) {
+    const runName = ctx.crewByRun.get(card.runId);
+    if (runName) card = { ...card, crew: parseCodename(runName).crew };
+  }
+  return card;
 }
 
 /** Codename + its crew word, spread onto a card when the event carries one. */

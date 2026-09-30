@@ -5,7 +5,7 @@
 // an empty row).
 
 import { describe, it, expect } from 'vitest';
-import { cardFromEvent, cardFromFinding } from './cards';
+import { cardFromEvent, cardFromFinding, unitKeyIndex } from './cards';
 import type {
   FindingOut,
   StepAwaitingApprovalEvent,
@@ -191,7 +191,7 @@ describe('cardFromEvent — codenames', () => {
   it('run-level cards take their crew from the caller-supplied run lookup', () => {
     const ev: RunStartedEvent = { type: 'run_started', run_id: 'r1', event_version: 1, workflow_path: 'wf.yaml', started_at: '2026-09-29T00:00:00Z' };
     expect(cardFromEvent(ev, 1000, 'k1')!.crew).toBeUndefined();
-    const c = cardFromEvent(ev, 1000, 'k1', new Map([['r1', 'jade-reef']]))!;
+    const c = cardFromEvent(ev, 1000, 'k1', { crewByRun: new Map([['r1', 'jade-reef']]) })!;
     expect(c.crew).toBe('jade-reef');
     expect(c.codename).toBeUndefined();
   });
@@ -210,3 +210,20 @@ describe('cardFromFinding — codenames', () => {
     expect(c.crew).toBe('cobalt-harbor');
   });
 });
+
+describe('cardFromEvent — agent_started unit target', () => {
+  it('carries the unit_key of the matching (suppressed) unit_started', () => {
+    const unit: UnitStartedEvent = { type: 'unit_started', run_id: 'r1', step_id: 'review', index: 4, unit_key: 'crates/db', agent: 'sec-reviewer', codename: 'jade-reef/heron#4', transcript_path: 't/u4.jsonl' };
+    const other: UnitStartedEvent = { ...unit, index: 5, unit_key: 'crates/api' };
+    const ev: AgentStartedEvent = {
+      type: 'agent_started', run_id: 'r1', step_id: 'review', unit_index: 4,
+      codename: 'jade-reef/heron#4', agent: 'sec-reviewer', agent_run_id: 'ar1', transcript_path: 't/ar1.jsonl',
+    };
+    const unitKeys = unitKeyIndex([unit, other]);
+    expect(cardFromEvent(ev, 1000, 'k', { unitKeys })!.unitKey).toBe('crates/db');
+    // No matching unit_started (or no index) → no unit target, never guessed.
+    expect(cardFromEvent(ev, 1000, 'k')!.unitKey).toBeUndefined();
+    expect(cardFromEvent({ ...ev, unit_index: undefined }, 1000, 'k', { unitKeys })!.unitKey).toBeUndefined();
+  });
+});
+

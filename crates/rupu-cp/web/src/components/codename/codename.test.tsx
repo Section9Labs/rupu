@@ -14,6 +14,20 @@ describe('codename components', () => {
     expect(container.querySelector('[title="jade-reef/heron#4"]')).not.toBeNull();
     expect(container.querySelector('svg')).not.toBeNull();
   });
+  it('AgentName showCrew with a crew-only codename renders the crew once', () => {
+    const { container, getAllByText } = render(<AgentName codename="jade-reef" showCrew derived />);
+    expect(getAllByText('jade-reef')).toHaveLength(1);
+    expect(container.textContent).toBe('jade-reef');
+    expect(container.querySelector('.opacity-60')).not.toBeNull();
+  });
+  it('AgentName showCrew with a crew-only codename keeps the agent · provider/model label', () => {
+    const { container } = render(<AgentName codename="jade-reef" agent="oracle" provider="anthropic" model="m" showCrew />);
+    expect(container.textContent).toBe('jade-reeforacle · anthropic/m');
+  });
+  it('AgentName showCrew with a member segment shows crew chip + leaf label', () => {
+    const { container } = render(<AgentName codename="jade-reef/heron#4" showCrew />);
+    expect(container.textContent).toBe('jade-reefheron#4');
+  });
   it('CrewChip derived is muted with title', () => {
     const { container } = render(<CrewChip crew="cobalt-harbor" derived />);
     const el = container.querySelector('[title="derived for a run recorded before codenames"]');
