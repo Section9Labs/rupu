@@ -157,6 +157,14 @@ fn host_err_to_run_err(e: HostConnectorError) -> RunError {
     RunError::Provider(e.to_string())
 }
 
+/// The unit's coverage stream, or why it could not be collected.
+async fn collect_coverage(conn: &Arc<dyn HostConnector>, run_id: &str, host: &str) -> UnitCoverage {
+    match conn.unit_coverage(run_id).await {
+        Ok(bytes) => UnitCoverage::Stream(bytes),
+        Err(e) => UnitCoverage::Unavailable(format!("host {host}: {e}")),
+    }
+}
+
 // ── Workspace-delta bridge ──────────────────────────────────────────────────
 //
 // The orchestrator's `WorkspaceDelta` is opaque: `payload` is whatever the
@@ -410,7 +418,13 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     );
                     continue;
                 }
-                Err(e) => return Err(host_err_to_run_err(e).into()),
+                Err(e) => {
+                    let coverage = collect_coverage(&conn, &run_id, host).await;
+                    return Err(UnitFailure {
+                        error: host_err_to_run_err(e),
+                        coverage,
+                    });
+                }
             };
 
             // All HostConnector::get_run impls return the query_run_detail
@@ -432,6 +446,11 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 // lost). No-op for transports that don't mirror this way.
                 conn.await_run_mirror(&run_id).await;
 
+                // The unit's coverage stream, on every terminal outcome: a
+                // failed unit's findings are still real. Collected before the
+                // delta so a delta error below still carries it.
+                let coverage = collect_coverage(&conn, &run_id, host).await;
+
                 let output = run["final_output"].as_str().unwrap_or("").to_string();
                 let success = status == "completed";
                 let error = (!success).then(|| {
@@ -448,11 +467,24 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 // but carry no delta.
                 let workspace_delta = match (&working_dir, success) {
                     (Some(dir), true) => {
-                        let bytes = conn
-                            .collect_workspace_delta(dir)
-                            .await
-                            .map_err(host_err_to_run_err)?;
-                        let delta = decode_delta(&bytes).map_err(host_err_to_run_err)?;
+                        let bytes = match conn.collect_workspace_delta(dir).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return Err(UnitFailure {
+                                    error: host_err_to_run_err(e),
+                                    coverage,
+                                })
+                            }
+                        };
+                        let delta = match decode_delta(&bytes) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return Err(UnitFailure {
+                                    error: host_err_to_run_err(e),
+                                    coverage,
+                                })
+                            }
+                        };
                         Some(to_orchestrator_delta(&delta))
                     }
                     (Some(dir), false) => {
@@ -467,7 +499,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     success,
                     error,
                     workspace_delta,
-                    coverage: UnitCoverage::NotLaunched,
+                    coverage,
                 });
             }
         }
@@ -492,8 +524,16 @@ impl UnitDispatcher for FleetUnitDispatcher {
         // timeout on a run the host said WAS running must not.
         let never_started = !observed && !started_evidence;
 
-        Err(UnitFailure::from(RunError::Provider(
-            match (never_started, last_startup_err) {
+        // A run the host never showed has no stream to collect — and saying
+        // "no coverage stream" on top of "never started" would mislead.
+        let coverage = if never_started {
+            UnitCoverage::NotLaunched
+        } else {
+            collect_coverage(&conn, &run_id, host).await
+        };
+
+        Err(UnitFailure {
+            error: RunError::Provider(match (never_started, last_startup_err) {
                 // Never started: the run was launched but the host never showed
                 // any sign of it. Say that, rather than "timed out polling" — the
                 // distinction is the difference between "still running, we gave
@@ -553,8 +593,9 @@ impl UnitDispatcher for FleetUnitDispatcher {
                  on the host — its work is not lost, only unobserved from here",
                     POLL_MAX_WALL.as_secs()
                 ),
-            },
-        )))
+            }),
+            coverage,
+        })
     }
 
     /// Bridge the orchestrator's opaque deltas to the `rupu-workspace` codec and
@@ -692,6 +733,16 @@ mod tests {
         /// The most recent `launch_agent` request, so tests can assert what
         /// the dispatcher forwarded (the unit's minted id, its profile).
         launched: std::sync::Mutex<Option<AgentLaunchRequest>>,
+        /// What `unit_coverage` answers: the unit's coverage stream.
+        coverage: Vec<u8>,
+        /// When set, `unit_coverage` fails as an unreachable host would.
+        coverage_fails: bool,
+        /// What `collect_workspace_delta` returns. `None` models a host that
+        /// cannot be reached when the coordinator asks for the delta.
+        delta: Option<Vec<u8>>,
+        /// When set, `get_run` fails once the `non_terminal_polls` have been
+        /// served — a host that stops answering after the run was observed.
+        poll_error_after_running: bool,
     }
 
     impl FakeConnector {
@@ -711,6 +762,10 @@ mod tests {
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
                 start_evidence: RunStartEvidence::NoTrace,
                 launched: Default::default(),
+                coverage: Vec::new(),
+                coverage_fails: false,
+                delta: None,
+                poll_error_after_running: false,
             }
         }
 
@@ -745,6 +800,10 @@ mod tests {
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
                 start_evidence: RunStartEvidence::NoTrace,
                 launched: Default::default(),
+                coverage: Vec::new(),
+                coverage_fails: false,
+                delta: None,
+                poll_error_after_running: false,
             }
         }
 
@@ -818,6 +877,9 @@ mod tests {
                 self.non_terminal_polls.fetch_sub(1, Ordering::SeqCst);
                 return Ok(serde_json::json!({ "run": { "status": "running" } }));
             }
+            if self.poll_error_after_running {
+                return Err(HostConnectorError::Unreachable("host went away".into()));
+            }
             Ok(self.get_run_response.clone())
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
@@ -877,7 +939,23 @@ mod tests {
             unimplemented!()
         }
         async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-            Ok(Vec::new())
+            self.calls.lock().unwrap().push("unit_coverage");
+            if self.coverage_fails {
+                return Err(HostConnectorError::Unreachable("down".into()));
+            }
+            Ok(self.coverage.clone())
+        }
+        async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
+            Ok("/stage/w".to_string())
+        }
+        async fn collect_workspace_delta(
+            &self,
+            _working_dir: &str,
+        ) -> Result<Vec<u8>, HostConnectorError> {
+            match &self.delta {
+                Some(bytes) => Ok(bytes.clone()),
+                None => Err(HostConnectorError::Unreachable("host went away".into())),
+            }
         }
         async fn proxy_get_json(
             &self,
@@ -1076,6 +1154,135 @@ mod tests {
         assert!(!out.success);
         let err = out.error.expect("failed run must have an error field");
         assert!(err.contains("boom"), "expected 'boom' in error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_completed_unit_carries_its_coverage_stream() {
+        let mut conn = FakeConnector::completed();
+        conn.coverage = b"stream".to_vec();
+        let conn = Arc::new(conn);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert_eq!(out.coverage, UnitCoverage::Stream(b"stream".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_unit_still_carries_its_coverage() {
+        let mut conn = FakeConnector::failed();
+        conn.coverage = b"stream".to_vec();
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(!out.success);
+        assert_eq!(out.coverage, UnitCoverage::Stream(b"stream".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_connector_that_cannot_deliver_is_unavailable() {
+        let mut conn = FakeConnector::completed();
+        conn.coverage_fails = true;
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(
+            matches!(&out.coverage, UnitCoverage::Unavailable(m) if m.contains("h1")),
+            "{:?}",
+            out.coverage
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_failure_carries_nothing() {
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::new(UnreachableConnector),
+            PathBuf::from("/g"),
+        );
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+    }
+
+    /// A workspace delta that cannot be collected fails the unit — but the
+    /// coverage stream was already collected and rides the failure.
+    #[tokio::test]
+    async fn a_delta_collection_failure_still_carries_the_coverage() {
+        let mut conn = FakeConnector::completed();
+        conn.coverage = b"stream".to_vec();
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let mut unit = make_unit();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
+        unit.workspace = Some(prepared_ws(&d, ws.path()).await);
+
+        let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
+        assert!(err.to_string().contains("host went away"), "{err}");
+        assert_eq!(err.coverage, UnitCoverage::Stream(b"stream".to_vec()));
+    }
+
+    /// Same, when the delta arrives but does not decode.
+    #[tokio::test]
+    async fn a_delta_decode_failure_still_carries_the_coverage() {
+        let mut conn = FakeConnector::completed();
+        conn.coverage = b"stream".to_vec();
+        conn.delta = Some(Vec::new());
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let mut unit = make_unit();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
+        unit.workspace = Some(prepared_ws(&d, ws.path()).await);
+
+        let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
+        assert!(err.to_string().contains("too short"), "{err}");
+        assert_eq!(err.coverage, UnitCoverage::Stream(b"stream".to_vec()));
+    }
+
+    /// A poll error after the run was observed is real (the host knows the
+    /// run), so the unit's coverage is collected before the error returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_error_after_the_run_was_observed_carries_its_coverage() {
+        let mut conn = FakeConnector::completed();
+        conn.non_terminal_polls = std::sync::atomic::AtomicU32::new(1);
+        conn.poll_error_after_running = true;
+        conn.coverage = b"partial".to_vec();
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert!(err.to_string().contains("host went away"), "{err}");
+        assert_eq!(err.coverage, UnitCoverage::Stream(b"partial".to_vec()));
+    }
+
+    /// A wall-clock timeout on a run the host showed to be alive still
+    /// collects what the run recorded so far.
+    #[tokio::test(start_paused = true)]
+    async fn a_wall_timeout_on_a_started_run_carries_its_coverage() {
+        let mut conn = FakeConnector::alive_but_unobservable_for(u32::MAX);
+        conn.coverage = b"partial".to_vec();
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(err.coverage, UnitCoverage::Stream(b"partial".to_vec()));
+    }
+
+    /// A run the host never showed has no stream: it is `NotLaunched`, and the
+    /// dispatcher does not even ask for one.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_started_run_carries_nothing_and_asks_for_nothing() {
+        let mut conn = FakeConnector::completed_after_startup_delay(u32::MAX);
+        conn.coverage = b"would-be-stream".to_vec();
+        let conn = Arc::new(conn);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            PathBuf::from("/g"),
+        );
+
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert!(err.to_string().contains("never registered"), "{err}");
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        assert!(
+            !conn.calls.lock().unwrap().contains(&"unit_coverage"),
+            "a never-started run must not be asked for coverage"
+        );
     }
 
     /// A fake fleet `HostConnector` (never overrides `pause_run`/`resume_run`)
