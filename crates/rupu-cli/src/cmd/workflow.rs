@@ -3117,7 +3117,7 @@ pub(crate) async fn resume_run(
                     output: cp.output.clone(),
                     success: true,
                     is_fixer: false,
-                    codename: None,
+                    codename: cp.codename.clone(),
                 },
             );
         } else {
@@ -3348,6 +3348,7 @@ pub(crate) async fn resume_run(
         unit_dispatcher,
         action_dispatcher: Some(action_dispatcher),
         pause: Some(pause_token.clone()),
+        naming: None,
     };
 
     println!("rupu: resuming run {run_id}");
@@ -4864,6 +4865,7 @@ async fn execute_workflow_invocation(
         unit_dispatcher,
         action_dispatcher: Some(Arc::clone(&action_dispatcher)),
         pause: Some(pause_token.clone()),
+        naming: None,
     };
 
     // Opt-in live three-zone view (dashboard + git-graph spine + focus
@@ -5049,6 +5051,7 @@ async fn execute_workflow_invocation(
                         unit_dispatcher: resume_unit_dispatcher,
                         action_dispatcher: Some(Arc::clone(&action_dispatcher)),
                         pause: Some(pause_token.clone()),
+                        naming: None,
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));
                     current_run_id = result.run_id.clone();

@@ -91,6 +91,7 @@ async fn run_in(
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     })
     .await
 }
@@ -485,6 +486,7 @@ async fn run_then_resume(
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let first = run_workflow(mk(None)).await.expect("first pass completes");

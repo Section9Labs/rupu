@@ -175,6 +175,7 @@ impl WorkflowExecutor for InProcessExecutor {
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: Some(pause.clone()),
+            naming: None,
         };
 
         // 7. Stash state before spawning (so tail() works immediately).
@@ -285,7 +286,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             permission_mode: None,
                             final_output: None,
                             loop_progress: BTreeMap::new(),
-                            codename: None,
+                            codename: Some(rupu_codename::crew_for(id)),
                         },
                     );
                 }

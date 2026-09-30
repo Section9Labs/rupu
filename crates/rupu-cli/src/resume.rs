@@ -360,6 +360,7 @@ async fn rebuild_opts_from_disk(
         unit_dispatcher: None,
         action_dispatcher: Some(action_dispatcher),
         pause: None,
+        naming: None,
     };
 
     Ok((opts, prior_step_results))

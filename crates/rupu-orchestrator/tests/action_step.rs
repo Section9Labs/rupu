@@ -363,6 +363,7 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("run completes");
@@ -462,6 +463,7 @@ async fn templated_with_values_render_before_reaching_the_connector() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.expect("run completes");
@@ -523,6 +525,7 @@ async fn templated_numeric_field_reaches_the_connector_as_a_json_number() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -579,6 +582,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let err = run_workflow(opts)
@@ -642,6 +646,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -705,6 +710,7 @@ async fn connector_error_fails_the_run_by_default() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let err = run_workflow(opts)
@@ -766,6 +772,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -856,6 +863,7 @@ async fn readonly_mode_blocks_write_tool_before_the_connector_is_called() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let err = run_workflow(opts)
@@ -917,6 +925,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -984,6 +993,7 @@ async fn missing_action_dispatcher_errors_naming_the_step() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let err = run_workflow(opts)
@@ -1046,6 +1056,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
     let awaiting = res1.awaiting.clone().expect("must pause at the gate");
@@ -1097,6 +1108,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
@@ -1171,6 +1183,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("run completes");

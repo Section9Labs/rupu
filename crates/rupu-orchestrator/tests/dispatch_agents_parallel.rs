@@ -267,6 +267,7 @@ async fn parent_step_fans_out_two_children_and_aggregates() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -327,6 +328,7 @@ async fn one_child_failure_marks_all_succeeded_false_but_parent_continues() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -379,6 +381,7 @@ async fn allowlist_violation_blocks_dispatch_at_the_parallel_layer() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.expect("workflow runs");

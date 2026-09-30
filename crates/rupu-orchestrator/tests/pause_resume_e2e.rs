@@ -326,6 +326,7 @@ async fn run_pause_then_resume_completes() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: Some(token),
+        naming: None,
     };
 
     let res1 = run_workflow(opts1)
@@ -487,6 +488,7 @@ async fn run_pause_then_resume_completes() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -659,6 +661,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: Some(token),
+        naming: None,
     };
 
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -738,6 +741,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -872,6 +876,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
         unit_dispatcher: Some(dispatcher1.clone()),
         action_dispatcher: None,
         pause: Some(token),
+        naming: None,
     };
 
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -977,6 +982,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
         unit_dispatcher: Some(dispatcher2.clone()),
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res2 = run_workflow(opts2).await.expect("resume completes");

@@ -227,6 +227,7 @@ async fn distributed_fanout_round_robin_results_and_host_persisted() {
         unit_dispatcher: Some(dispatcher.clone()),
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -320,6 +321,7 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)

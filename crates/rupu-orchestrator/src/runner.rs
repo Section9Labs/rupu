@@ -459,6 +459,75 @@ pub struct OrchestratorRunOpts {
     /// constructs one). Plan 2 wires this from `rupu-cli`; Plan 4's notify
     /// hooks reuse the same [`execute_action_step`] helper this drives.
     pub action_dispatcher: Option<Arc<rupu_mcp::ToolDispatcher>>,
+    /// Codename assignment for this run. `None` ⇒ `run_workflow` builds one;
+    /// callers that also own a sub-agent dispatcher pass theirs so both share
+    /// one `CrewNamer`.
+    pub naming: Option<std::sync::Arc<crate::codenames::RunNaming>>,
+}
+
+/// Build (or reuse the caller-supplied) [`crate::codenames::RunNaming`] for
+/// `run_id` and store it on `opts` so every dispatch site below reads the
+/// same assignment.
+fn ensure_naming(opts: &mut OrchestratorRunOpts, run_id: &str) -> Arc<crate::codenames::RunNaming> {
+    if let Some(n) = &opts.naming {
+        return n.clone();
+    }
+    let dir = opts.run_store.as_ref().map(|s| s.root.join(run_id));
+    let n = Arc::new(crate::codenames::RunNaming::open(
+        &opts.workflow,
+        run_id,
+        dir.as_deref(),
+    ));
+    opts.naming = Some(n.clone());
+    n
+}
+
+/// The step-level codename of an agent-running step (`crew/role`), or `None`
+/// for a step that runs no agent of its own (branch, split, join, gate,
+/// action, `run:`, parallel/panel containers) or when no naming is wired.
+fn step_codename(opts: &OrchestratorRunOpts, step: &Step) -> Option<rupu_codename::Codename> {
+    let naming = opts.naming.as_ref()?;
+    step.agent.as_deref().map(|a| naming.step(&step.id, a))
+}
+
+/// Who a [`dispatch_one`] call is, for the `AgentStarted` announcement.
+struct AgentAnnounce<'a> {
+    sink: Option<&'a Arc<dyn crate::executor::EventSink>>,
+    workflow_run_id: &'a str,
+    unit_index: Option<usize>,
+    codename: Option<rupu_codename::Codename>,
+}
+
+/// Emit `AgentStarted` for an agent instance whose opts the coordinator does
+/// not build (a placed step/unit runs its agent on the remote host), so
+/// `provider`/`model` are unknown here — the remote transcript has them.
+#[allow(clippy::too_many_arguments)]
+fn announce_placed_agent(
+    sink: Option<&Arc<dyn crate::executor::EventSink>>,
+    workflow_run_id: &str,
+    step_id: &str,
+    unit_index: Option<usize>,
+    codename: Option<String>,
+    agent: &str,
+    agent_run_id: &str,
+    transcript_path: PathBuf,
+) {
+    if let Some(sink) = sink {
+        sink.emit(
+            workflow_run_id,
+            &crate::executor::Event::AgentStarted {
+                run_id: workflow_run_id.to_string(),
+                step_id: step_id.to_string(),
+                unit_index,
+                codename,
+                agent: agent.to_string(),
+                provider: None,
+                model: None,
+                agent_run_id: agent_run_id.to_string(),
+                transcript_path,
+            },
+        );
+    }
 }
 
 /// Why a run paused. Threaded onto [`AwaitingInfo`] / [`ResumeState`] so the
@@ -810,7 +879,7 @@ impl ResumeState {
 }
 
 pub async fn run_workflow(
-    opts: OrchestratorRunOpts,
+    mut opts: OrchestratorRunOpts,
 ) -> Result<OrchestratorRunResult, RunWorkflowError> {
     // Phase 2 (Task 5): `is_nonlinear` used to be an honesty GATE here —
     // reject before any work started. It is now a ROUTER instead (spec §9):
@@ -871,6 +940,11 @@ pub async fn run_workflow(
             (String::new(), Vec::new(), None)
         };
 
+    // Codenames (spec §4.3): the static walk is a pure function of the
+    // workflow + run id, so a resume recomputes the same words; dynamic
+    // state reloads from `<run_dir>/codenames.json`.
+    let naming = ensure_naming(&mut opts, &run_id);
+
     // Create the on-disk record only on a fresh run. On resume the
     // record already exists and is mutated by the CLI's approve
     // path before we re-enter the loop.
@@ -920,7 +994,7 @@ pub async fn run_workflow(
                 permission_mode: opts.factory.permission_mode().map(str::to_string),
                 final_output: None,
                 loop_progress: std::collections::BTreeMap::new(),
-                codename: None,
+                codename: Some(naming.crew().to_string()),
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
@@ -2680,7 +2754,7 @@ async fn run_scheduler_scoped(
                         kind: step_kind,
                         agent: step.agent.clone(),
                         host: step.host.clone(),
-                        codename: None,
+                        codename: step_codename(opts, step).map(|c| c.to_string()),
                     },
                 );
             }
@@ -3972,7 +4046,7 @@ fn drain_joins(
                 output: src.output.clone(),
                 success: src.success,
                 is_fixer: false,
-                codename: None,
+                codename: src.codename.clone(),
             });
         }
         let join_step = &wf.steps[j];
@@ -4475,7 +4549,7 @@ async fn run_steps_over(
                     kind: step_kind,
                     agent: step.agent.clone(),
                     host: step.host.clone(),
-                    codename: None,
+                    codename: step_codename(opts, step).map(|c| c.to_string()),
                 },
             );
         }
@@ -4566,7 +4640,7 @@ async fn run_node(
     let dispatch_result: Result<StepResult, RunWorkflowError> = if step.panel.is_some() {
         run_panel_step(run_id, step, ctx, opts, effective_continue_on_error).await
     } else if step.parallel.is_some() {
-        run_parallel_step(step, ctx, opts, effective_continue_on_error).await
+        run_parallel_step(run_id, step, ctx, opts, effective_continue_on_error).await
     } else if step.run.is_some() && step.for_each.is_some() {
         // `run:` + `for_each:` — fan the command across items. Checked
         // BEFORE the generic for_each arm, which assumes an agent.
@@ -5604,7 +5678,7 @@ fn emit_gate_result(
 /// expiry with no operator involved at all (the gate sweep's own
 /// `ExpireThenCleanupReject` arm).
 pub async fn run_reject_cleanup(
-    opts: OrchestratorRunOpts,
+    mut opts: OrchestratorRunOpts,
     rejected_step_id: &str,
     reason: &str,
     via: &str,
@@ -5615,9 +5689,11 @@ pub async fn run_reject_cleanup(
         .steps
         .iter()
         .find(|s| s.id == rejected_step_id)
+        .cloned()
     else {
         return Ok(()); // legacy inline approval or unknown id — nothing to run
     };
+    let gate = &gate;
     if !crate::workflow::is_approval_gate(gate) {
         return Ok(());
     }
@@ -5644,6 +5720,9 @@ pub async fn run_reject_cleanup(
         .as_ref()
         .map(|r| r.prior_step_results.clone())
         .unwrap_or_default();
+    // Same run id ⇒ same static walk ⇒ each `on_reject` agent step gets the
+    // slot `RunNaming` allocated for it at run start (spec §4.3).
+    let naming = ensure_naming(&mut opts, &run_id);
 
     // 2. The gate's own rejected result, recorded BEFORE the chain runs
     //    (a `via`/`decision` variant of Task 3's now-generalized
@@ -5781,6 +5860,7 @@ pub async fn run_reject_cleanup(
         let prompt = step.prompt.as_deref().unwrap_or_default();
         let step_run_id = format!("run_{}", Ulid::new());
         let transcript_path = opts.transcript_dir.join(format!("{step_run_id}.jsonl"));
+        let codename = naming.sub(rejected_step_id, &step.id, agent_name);
 
         if let Some(sink) = opts.event_sink.as_ref() {
             sink.emit(
@@ -5791,7 +5871,7 @@ pub async fn run_reject_cleanup(
                     kind: crate::runs::StepKind::Linear,
                     agent: step.agent.clone(),
                     host: step.host.clone(),
-                    codename: None,
+                    codename: Some(codename.to_string()),
                 },
             );
         }
@@ -5819,6 +5899,7 @@ pub async fn run_reject_cleanup(
                     success: false,
                     skipped: false,
                     kind: crate::runs::StepKind::Linear,
+                    codename: Some(codename.to_string()),
                     ..Default::default()
                 };
                 persist_step_result(&opts, &run_id, &result);
@@ -5840,6 +5921,12 @@ pub async fn run_reject_cleanup(
             None,
             None,
             None,
+            AgentAnnounce {
+                sink: opts.event_sink.as_ref(),
+                workflow_run_id: &run_id,
+                unit_index: None,
+                codename: Some(codename.clone()),
+            },
         )
         .await;
         let duration_ms = step_timer.elapsed().as_millis() as u64;
@@ -5888,6 +5975,7 @@ pub async fn run_reject_cleanup(
             success,
             skipped: false,
             kind: crate::runs::StepKind::Linear,
+            codename: Some(codename.to_string()),
             ..Default::default()
         };
         persist_step_result(&opts, &run_id, &result);
@@ -6009,6 +6097,9 @@ async fn dispatch_placed_step(
     opts: &OrchestratorRunOpts,
     continue_on_error: bool,
     sync: bool,
+    workflow_run_id: &str,
+    codename: Option<&rupu_codename::Codename>,
+    transcript_path: &Path,
 ) -> Result<(String, bool), RunWorkflowError> {
     let Some(dispatcher) = opts.unit_dispatcher.as_ref() else {
         let source =
@@ -6043,8 +6134,18 @@ async fn dispatch_placed_step(
         index: 0,
         run_id: run_id.to_string(),
         workspace: prepared,
-        codename: None,
+        codename: codename.map(ToString::to_string),
     };
+    announce_placed_agent(
+        opts.event_sink.as_ref(),
+        workflow_run_id,
+        &step.id,
+        None,
+        unit.codename.clone(),
+        agent_name,
+        run_id,
+        transcript_path.to_path_buf(),
+    );
     match dispatcher.dispatch_unit(unit, host).await {
         Ok(outcome) if outcome.success => {
             let output = outcome.output;
@@ -6147,6 +6248,7 @@ async fn run_linear_step(
         .zip(opts.unit_dispatcher.as_ref())
         .and_then(|(host, d)| d.unit_transcript_path(host, &run_id))
         .unwrap_or_else(|| opts.transcript_dir.join(format!("{run_id}.jsonl")));
+    let codename = step_codename(opts, step);
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
     // Announce the running step's transcript path on the live event stream.
     // A linear step generates this path lazily (after the outer-loop
@@ -6178,6 +6280,9 @@ async fn run_linear_step(
                 opts,
                 continue_on_error,
                 sync,
+                workflow_run_id,
+                codename.as_ref(),
+                &transcript_path,
             )
             .await?
         }
@@ -6230,6 +6335,12 @@ async fn run_linear_step(
                 on_tool_call,
                 opts.pause.clone(),
                 resume_seed,
+                AgentAnnounce {
+                    sink: opts.event_sink.as_ref(),
+                    workflow_run_id,
+                    unit_index: None,
+                    codename: codename.clone(),
+                },
             )
             .await;
 
@@ -6281,6 +6392,7 @@ async fn run_linear_step(
         skipped: false,
         items: Vec::new(),
         host: step.host.clone(),
+        codename: codename.map(|c| c.to_string()),
         ..Default::default()
     }))
 }
@@ -6579,7 +6691,18 @@ async fn run_fanout_step(
                     continue;
                 }
                 if item_result.success {
-                    resumed.insert(*idx, item_result.clone());
+                    let mut replayed = item_result.clone();
+                    // A pre-codename checkpoint carries none: mint the
+                    // unit's static name (same value a fresh run would
+                    // have stored — spec §4.3's walk is deterministic).
+                    if replayed.codename.is_none() {
+                        replayed.codename = opts
+                            .naming
+                            .as_ref()
+                            .zip(step.agent.as_deref())
+                            .map(|(n, a)| n.unit(&step.id, a, *idx).to_string());
+                    }
+                    resumed.insert(*idx, replayed);
                 }
             }
             if !resumed.is_empty() {
@@ -6724,6 +6847,12 @@ async fn run_fanout_step(
         // mode is active. None ⇒ self-contained; Some ⇒ the unit stages this
         // payload into its OWN remote directory and returns a delta.
         let unit_workspace = prepared_workspace.clone();
+        // `crew/role#n` (n = idx + 1); a retry on the fallback host becomes
+        // `…#n.2` below.
+        let mut unit_codename: Option<rupu_codename::Codename> = opts
+            .naming
+            .as_ref()
+            .map(|n| n.unit(&step.id, &agent_name_root, idx));
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -6763,6 +6892,7 @@ async fn run_fanout_step(
                     host: placement_host,
                     workspace_delta: None,
                     paused: true,
+                    codename: unit_codename.map(|c| c.to_string()),
                 };
             }
 
@@ -6777,7 +6907,7 @@ async fn run_fanout_step(
                         agent: Some(unit_agent.clone()),
                         transcript_path: transcript_clone.clone(),
                         host: placement_host.clone(),
-                        codename: None,
+                        codename: unit_codename.as_ref().map(ToString::to_string),
                     },
                 );
             }
@@ -6823,8 +6953,18 @@ async fn run_fanout_step(
                                     index: idx,
                                     run_id: run_id_clone.clone(),
                                     workspace: unit_ws.clone(),
-                                    codename: None,
+                                    codename: unit_codename.as_ref().map(ToString::to_string),
                                 };
+                                announce_placed_agent(
+                                    event_sink.as_ref(),
+                                    &workflow_run_id,
+                                    &step_id,
+                                    Some(idx),
+                                    unit.codename.clone(),
+                                    &agent_name,
+                                    &run_id_clone,
+                                    transcript_clone.clone(),
+                                );
                                 match dispatcher.dispatch_unit(unit, &host).await {
                                     Ok(outcome) => {
                                         // Important fix: when the agent ran but failed
@@ -6877,6 +7017,8 @@ async fn run_fanout_step(
                                         run_id = retry_run_id.clone();
                                         transcript_path = retry_path.clone();
                                         placement_host = Some(retry_host.to_string());
+                                        unit_codename =
+                                            unit_codename.take().map(|c| c.with_attempt(2));
                                         // The retry stages the SAME packed
                                         // payload on the fallback host — one more
                                         // reason the pack belongs to the step and
@@ -6886,9 +7028,11 @@ async fn run_fanout_step(
                                             agent: agent_name.clone(),
                                             rendered_prompt: rendered_clone.clone(),
                                             index: idx,
-                                            run_id: retry_run_id,
+                                            run_id: retry_run_id.clone(),
                                             workspace: unit_ws.clone(),
-                                            codename: None,
+                                            codename: unit_codename
+                                                .as_ref()
+                                                .map(ToString::to_string),
                                         };
                                         warn!(
                                             step = %step_id,
@@ -6915,10 +7059,20 @@ async fn run_fanout_step(
                                                     agent: Some(unit_agent.clone()),
                                                     transcript_path: transcript_path.clone(),
                                                     host: placement_host.clone(),
-                                                    codename: None,
+                                                    codename: retry_unit.codename.clone(),
                                                 },
                                             );
                                         }
+                                        announce_placed_agent(
+                                            event_sink.as_ref(),
+                                            &workflow_run_id,
+                                            &step_id,
+                                            Some(idx),
+                                            retry_unit.codename.clone(),
+                                            &agent_name,
+                                            &retry_run_id,
+                                            transcript_path.clone(),
+                                        );
                                         match dispatcher.dispatch_unit(retry_unit, retry_host).await
                                         {
                                             Ok(outcome) => {
@@ -6981,6 +7135,12 @@ async fn run_fanout_step(
                         None,
                         pause_for_task.clone(),
                         None,
+                        AgentAnnounce {
+                            sink: event_sink.as_ref(),
+                            workflow_run_id: &workflow_run_id,
+                            unit_index: Some(idx),
+                            codename: unit_codename.clone(),
+                        },
                     )
                     .await;
                     match outcome {
@@ -7043,6 +7203,7 @@ async fn run_fanout_step(
                 host: placement_host,
                 workspace_delta,
                 paused,
+                codename: unit_codename.map(|c| c.to_string()),
             }
         }));
     }
@@ -7091,7 +7252,7 @@ async fn run_fanout_step(
                     success: o.success,
                     finished_at: chrono::Utc::now(),
                     host: o.host.clone(),
-                    codename: None,
+                    codename: o.codename.clone(),
                 };
                 if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
                     warn!(step = %step.id, index = o.idx, error = %e, "failed to append unit checkpoint");
@@ -7144,7 +7305,7 @@ async fn run_fanout_step(
                     output: o.output.clone(),
                     success: true,
                     is_fixer: false,
-                    codename: None,
+                    codename: o.codename.clone(),
                 },
             );
         }
@@ -7170,7 +7331,7 @@ async fn run_fanout_step(
             output: o.output.clone(),
             success: o.success,
             is_fixer: false,
-            codename: None,
+            codename: o.codename.clone(),
         })
         .collect();
     items_vec.extend(resumed.into_values());
@@ -7232,6 +7393,7 @@ async fn run_fanout_step(
         skipped: false,
         kind: crate::runs::StepKind::ForEach,
         items: items_vec,
+        codename: step_codename(opts, step).map(|c| c.to_string()),
         ..Default::default()
     }))
 }
@@ -7244,6 +7406,7 @@ async fn run_fanout_step(
 /// results land in both `steps.<id>.results[*]` (positional, in
 /// declared order) and `steps.<id>.sub_results.<sub_id>` (named).
 async fn run_parallel_step(
+    workflow_run_id: &str,
     step: &Step,
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
@@ -7289,6 +7452,12 @@ async fn run_parallel_step(
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
         let parent_step_id = step.id.clone();
+        let codename = opts
+            .naming
+            .as_ref()
+            .map(|n| n.sub(&step.id, &sub_id, &sub_agent_name));
+        let event_sink = opts.event_sink.clone();
+        let workflow_run_id = workflow_run_id.to_string();
 
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem
@@ -7311,6 +7480,12 @@ async fn run_parallel_step(
                 // Parallel sub-steps pause at the step boundary, not mid-unit.
                 None,
                 None,
+                AgentAnnounce {
+                    sink: event_sink.as_ref(),
+                    workflow_run_id: &workflow_run_id,
+                    unit_index: Some(idx),
+                    codename: codename.clone(),
+                },
             )
             .await;
             let (success, error_str, raw_error) = match outcome {
@@ -7333,6 +7508,7 @@ async fn run_parallel_step(
                 success,
                 error: error_str,
                 raw_error,
+                codename: codename.map(|c| c.to_string()),
             }
         }));
     }
@@ -7374,7 +7550,7 @@ async fn run_parallel_step(
             output: o.output.clone(),
             success: o.success,
             is_fixer: false,
-            codename: None,
+            codename: o.codename.clone(),
         })
         .collect();
     let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
@@ -7415,6 +7591,7 @@ struct ParallelSubOutcome {
     #[allow(dead_code)]
     error: Option<String>,
     raw_error: Option<RunError>,
+    codename: Option<String>,
 }
 
 /// Internal fan-out task return type. Carries the typed `RunError`
@@ -7448,6 +7625,8 @@ struct FanoutItemOutcome {
     /// excluded from the `continue_on_error` abort check and from the
     /// on-disk checkpoint, and re-dispatched fresh on resume.
     paused: bool,
+    /// The unit's instance codename (`crew/role#n`, `…#n.2` after a retry).
+    codename: Option<String>,
 }
 
 /// Build the agent opts via the factory and dispatch one agent run.
@@ -7490,6 +7669,7 @@ async fn dispatch_one(
     on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     pause: Option<CancellationToken>,
     resume_seed: Option<(Vec<Message>, String)>,
+    announce: AgentAnnounce<'_>,
 ) -> Result<RunResult, RunError> {
     let mut agent_opts = factory
         .build_opts_for_step(
@@ -7505,6 +7685,26 @@ async fn dispatch_one(
         .await;
     // The orchestrator owns the pause signal, not the factory.
     agent_opts.pause = pause;
+    agent_opts.codename = announce.codename.as_ref().map(ToString::to_string);
+    // First point the instance's provider + model are known (spec §5).
+    // `agent` is the workflow's agent name, not whatever display name the
+    // factory put on the opts.
+    if let Some(sink) = announce.sink {
+        sink.emit(
+            announce.workflow_run_id,
+            &crate::executor::Event::AgentStarted {
+                run_id: announce.workflow_run_id.to_string(),
+                step_id: step_id.to_string(),
+                unit_index: announce.unit_index,
+                codename: agent_opts.codename.clone(),
+                agent: agent_name.to_string(),
+                provider: Some(agent_opts.provider_name.clone()),
+                model: Some(agent_opts.model.clone()),
+                agent_run_id: agent_opts.run_id.clone(),
+                transcript_path: agent_opts.transcript_path.clone(),
+            },
+        );
+    }
     if let Some((initial_messages, user_message)) = resume_seed {
         agent_opts.initial_messages = initial_messages;
         agent_opts.user_message = user_message;
@@ -7781,6 +7981,12 @@ async fn run_panel_step(
     // fixer is not silently dropped the way an early iteration's
     // panelist items already are (`final_pass.items` only).
     let mut fixer_items: Vec<ItemResult> = Vec::new();
+    // The fixer is one static slot (spec §4.3): every gate iteration's fixer
+    // keeps the same codename.
+    let fixer_codename = opts
+        .naming
+        .as_ref()
+        .map(|n| n.fixer(&step.id, &gate.fix_with));
     let (mut final_pass, resolved) = loop {
         iterations += 1;
         if let Some(sink) = opts.event_sink.as_ref() {
@@ -7838,6 +8044,7 @@ async fn run_panel_step(
             &gate.fix_with,
             &fixer_subject,
             opts,
+            fixer_codename.as_ref(),
         )
         .await?;
         match fixer_outcome {
@@ -7856,7 +8063,7 @@ async fn run_panel_step(
                     output: output.clone(),
                     success: true,
                     is_fixer: true,
-                    codename: None,
+                    codename: fixer_codename.as_ref().map(ToString::to_string),
                 });
                 subject = output;
                 // Loop continues; pass is dropped — its findings are
@@ -7891,7 +8098,7 @@ async fn run_panel_step(
                     output: error.to_string(),
                     success: false,
                     is_fixer: true,
-                    codename: None,
+                    codename: fixer_codename.as_ref().map(ToString::to_string),
                 });
                 warn!(step = %step.id, error = %error, "fixer agent failed; tolerating via continue_on_error");
                 break (pass, false);
@@ -8013,6 +8220,7 @@ async fn dispatch_fixer(
     fixer_agent: &str,
     rendered_prompt: &str,
     opts: &OrchestratorRunOpts,
+    codename: Option<&rupu_codename::Codename>,
 ) -> Result<FixerOutcome, RunWorkflowError> {
     let run_id = format!("run_{}", Ulid::new());
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
@@ -8028,7 +8236,7 @@ async fn dispatch_fixer(
                 agent: Some(fixer_agent.to_string()),
                 transcript_path: transcript_path.clone(),
                 host: None,
-                codename: None,
+                codename: codename.map(ToString::to_string),
             },
         );
     }
@@ -8045,6 +8253,12 @@ async fn dispatch_fixer(
         // Panel fixer runs pause at the step boundary, not mid-unit.
         None,
         None,
+        AgentAnnounce {
+            sink: opts.event_sink.as_ref(),
+            workflow_run_id,
+            unit_index: Some(unit_index),
+            codename: codename.cloned(),
+        },
     )
     .await;
     let success = outcome.is_ok();
@@ -8157,6 +8371,21 @@ async fn run_panel_iteration(
         let event_sink = opts.event_sink.clone();
         let workflow_run_id = workflow_run_id.to_string();
         let unit_agent = agent_name.clone();
+        // Spec §3: a panelist def that appears once in the panel is a
+        // singleton (`crew/hawk`); a repeated def is numbered per def by
+        // its occurrence (`crew/hawk#1`, `crew/hawk#2`). Gate iterations
+        // re-run the same slot and keep the same name (spec §4.3).
+        let codename = opts.naming.as_ref().map(|n| {
+            let count = panel.panelists.iter().filter(|p| **p == agent_name).count();
+            let occurrence = (count > 1).then(|| {
+                let k = panel.panelists[..=idx]
+                    .iter()
+                    .filter(|p| **p == agent_name)
+                    .count();
+                u32::try_from(k).unwrap_or(u32::MAX)
+            });
+            n.panelist(&step.id, &agent_name, occurrence)
+        });
 
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem
@@ -8174,7 +8403,7 @@ async fn run_panel_iteration(
                         agent: Some(unit_agent.clone()),
                         transcript_path: transcript_clone.clone(),
                         host: None,
-                        codename: None,
+                        codename: codename.as_ref().map(ToString::to_string),
                     },
                 );
             }
@@ -8191,6 +8420,12 @@ async fn run_panel_iteration(
                 // Panel panelists pause at the step boundary, not mid-unit.
                 None,
                 None,
+                AgentAnnounce {
+                    sink: event_sink.as_ref(),
+                    workflow_run_id: &workflow_run_id,
+                    unit_index: Some(view_index),
+                    codename: codename.clone(),
+                },
             )
             .await;
             let (success, _err_str, raw_error) = match outcome {
@@ -8227,6 +8462,7 @@ async fn run_panel_iteration(
                 output,
                 success,
                 raw_error,
+                codename: codename.map(|c| c.to_string()),
             }
         }));
     }
@@ -8273,7 +8509,7 @@ async fn run_panel_iteration(
                         severity: p.severity,
                         title: p.title,
                         body: p.body,
-                        codename: None,
+                        codename: o.codename.clone(),
                     });
                 }
             }
@@ -8295,7 +8531,7 @@ async fn run_panel_iteration(
             output: o.output.clone(),
             success: o.success,
             is_fixer: false,
-            codename: None,
+            codename: o.codename.clone(),
         })
         .collect();
     let success = items_vec.iter().all(|i| i.success);
@@ -8326,6 +8562,8 @@ struct PanelOutcome {
     output: String,
     success: bool,
     raw_error: Option<RunError>,
+    /// The panelist's instance codename; stamped on every finding it raises.
+    codename: Option<String>,
 }
 
 /// One parsed finding. Lives only inside this module — the public
@@ -8556,6 +8794,7 @@ mod tests {
             unit_dispatcher: Some(dispatcher),
             action_dispatcher: None,
             pause: None,
+            naming: None,
         }
     }
 
@@ -9141,6 +9380,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
 
         let err = run_workflow(opts)
@@ -9852,6 +10092,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         }
     }
 
@@ -10350,6 +10591,7 @@ steps:
             unit_dispatcher: Some(dispatcher1.clone()),
             action_dispatcher: None,
             pause: Some(token),
+            naming: None,
         };
 
         let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -10455,6 +10697,7 @@ steps:
             unit_dispatcher: Some(dispatcher2.clone()),
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -11258,6 +11501,7 @@ mod dag_scheduler_golden {
             unit_dispatcher: None,
             action_dispatcher: Some(build_dispatcher()),
             pause: None,
+            naming: None,
         };
         let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)
             .unwrap_or_else(|e| panic!("{name}: resolve_inputs failed: {e}"));
@@ -11578,6 +11822,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         }
     }
 
@@ -12098,6 +12343,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         }
     }
 
@@ -12293,6 +12539,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
 
         tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
@@ -12577,6 +12824,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         }
     }
 
@@ -12778,6 +13026,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
@@ -13006,6 +13255,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause,
+            naming: None,
         }
     }
 
@@ -13308,6 +13558,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
 
         let res2 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts2))
@@ -13450,6 +13701,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res1 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts1))
             .await
@@ -13497,6 +13749,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res2 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts2))
             .await
@@ -13604,6 +13857,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let resolved_inputs = BTreeMap::new();
         let mut step_results: Vec<StepResult> = Vec::new();
@@ -13702,6 +13956,7 @@ loops:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let outcome2 = tokio::time::timeout(
             Duration::from_secs(5),
@@ -13883,6 +14138,7 @@ mod join_and_prune {
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         }
     }
 
@@ -14956,6 +15212,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res1 = run_workflow(opts1)
             .await
@@ -15041,6 +15298,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res2 = run_workflow(opts2)
             .await
@@ -15100,6 +15358,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res3 = run_workflow(opts3)
             .await
@@ -15186,6 +15445,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res1 = run_workflow(opts1).await.expect("both gates batch-park");
         let run_id = res1.run_id.clone();
@@ -15240,6 +15500,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res2 = run_workflow(opts2)
             .await
@@ -15313,6 +15574,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res1 = run_workflow(opts1).await.expect("pauses at gate_a");
         let run_id = res1.run_id.clone();
@@ -15351,6 +15613,7 @@ steps:
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         };
         let res2 = run_workflow(opts2)
             .await
@@ -15509,6 +15772,7 @@ mod resume_and_cancel {
             unit_dispatcher: None,
             action_dispatcher: None,
             pause,
+            naming: None,
         }
     }
 
@@ -16296,6 +16560,7 @@ mod agent_terminal_status {
             unit_dispatcher: None,
             action_dispatcher: None,
             pause: None,
+            naming: None,
         }
     }
 

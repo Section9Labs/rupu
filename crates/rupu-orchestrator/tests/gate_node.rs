@@ -335,6 +335,7 @@ async fn gate_auto_approve_completes_without_pausing() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("run completes");
@@ -410,6 +411,7 @@ async fn gate_without_auto_approve_parks_awaiting_approval() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("a pause is Ok, not Err");
@@ -475,6 +477,7 @@ async fn gate_approve_resume_continues_to_next_step() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
     let awaiting = res1.awaiting.clone().expect("must pause at the gate");
@@ -522,6 +525,7 @@ async fn gate_approve_resume_continues_to_next_step() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -601,6 +605,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
     let awaiting = res1.awaiting.clone().expect("must pause at the gate");
@@ -645,6 +650,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -713,6 +719,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
     let awaiting = res1.awaiting.clone().expect("must pause at the gate");
@@ -774,6 +781,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
@@ -861,6 +869,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
     let run_id = res1.run_id.clone();
@@ -902,6 +911,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
@@ -962,6 +972,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
     let run_id = res1.run_id.clone();
@@ -1017,6 +1028,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
@@ -1099,6 +1111,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
     let awaiting = res1.awaiting.clone().expect("must pause at the gate");
@@ -1155,6 +1168,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_reject_cleanup(opts2, &rejected_step_id, &reason, "timeout", None)
@@ -1243,6 +1257,7 @@ async fn notify_fires_when_gate_parks() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("a pause is Ok, not Err");
@@ -1310,6 +1325,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("run completes");
@@ -1354,6 +1370,7 @@ async fn notify_failure_does_not_block_the_park() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -1398,6 +1415,7 @@ async fn notify_skips_gracefully_with_no_action_dispatcher() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -1473,6 +1491,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
     let res1 = run_workflow(opts1).await.expect("both gates batch-park");
     let run_id = res1.run_id.clone();
@@ -1551,6 +1570,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
@@ -1676,6 +1696,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("run completes");
@@ -1735,6 +1756,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("run completes");
@@ -1788,6 +1810,7 @@ async fn notify_hook_transcript_is_referenced_by_a_persisted_step_result() {
         unit_dispatcher: None,
         action_dispatcher: Some(dispatcher),
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("a pause is Ok, not Err");

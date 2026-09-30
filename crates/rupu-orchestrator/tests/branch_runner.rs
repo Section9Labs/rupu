@@ -120,6 +120,7 @@ fn opts_for(wf: Workflow, tmp: &assert_fs::TempDir, sink: Arc<CollectSink>) -> O
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     }
 }
 

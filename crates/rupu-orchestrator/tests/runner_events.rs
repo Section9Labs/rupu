@@ -129,6 +129,7 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -147,19 +148,21 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
 
     // For a two-step linear workflow the expected sequence is:
     // RunStarted,
-    // StepStarted(alpha), StepWorking(alpha, transcript_path), StepCompleted(alpha),
-    // StepStarted(beta),  StepWorking(beta, transcript_path),  StepCompleted(beta),
+    // StepStarted(alpha), StepWorking(alpha, transcript_path), AgentStarted(alpha), StepCompleted(alpha),
+    // StepStarted(beta),  StepWorking(beta, transcript_path),  AgentStarted(beta),  StepCompleted(beta),
     // RunCompleted.
     // Each linear step emits a StepWorking carrying its (lazily-generated)
-    // transcript path so the live UI can tail the file while the step runs.
+    // transcript path so the live UI can tail the file while the step runs,
+    // then an AgentStarted announcing the agent instance (codename, agent,
+    // provider, model) the moment its opts are built.
     assert_eq!(
         events.len(),
-        8,
-        "expected 8 events for a two-step run, got {:?}",
+        10,
+        "expected 10 events for a two-step run, got {:?}",
         events.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>()
     );
 
-    // Verify ordering: StepStarted → StepWorking(path) → StepCompleted per step.
+    // Verify ordering: StepStarted → StepWorking(path) → AgentStarted → StepCompleted per step.
     assert!(matches!(events[1], Event::StepStarted { step_id: ref s, .. } if s == "alpha"));
     assert!(
         matches!(events[2], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "alpha"),
@@ -167,14 +170,20 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         events[2]
     );
     assert!(
-        matches!(events[3], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha")
-    );
-    assert!(matches!(events[4], Event::StepStarted { step_id: ref s, .. } if s == "beta"));
-    assert!(
-        matches!(events[5], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "beta")
+        matches!(events[3], Event::AgentStarted { step_id: ref s, .. } if s == "alpha"),
+        "alpha AgentStarted must follow StepWorking, got {:?}",
+        events[3]
     );
     assert!(
-        matches!(events[6], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta")
+        matches!(events[4], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha")
+    );
+    assert!(matches!(events[5], Event::StepStarted { step_id: ref s, .. } if s == "beta"));
+    assert!(
+        matches!(events[6], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "beta")
+    );
+    assert!(matches!(events[7], Event::AgentStarted { step_id: ref s, .. } if s == "beta"));
+    assert!(
+        matches!(events[8], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta")
     );
 }
 
@@ -218,6 +227,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -277,6 +287,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -458,6 +469,7 @@ steps:
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -520,8 +532,97 @@ async fn no_event_sink_does_not_emit_any_events() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
+}
+
+#[tokio::test]
+async fn every_agent_instance_is_announced_with_codename_provider_and_model() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let sink: Arc<CollectSink> = Arc::new(CollectSink::default());
+    let wf = Workflow::parse(WF_TWO_STEPS).unwrap();
+    // `run_workflow` only honours `run_id_override` when a run store is
+    // attached (an in-memory run has an empty run id), so pin the crew
+    // (`jade-reef`) through a temp store.
+    let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_names".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(store.clone()),
+        workflow_yaml: Some(WF_TWO_STEPS.into()),
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: Some("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W".into()),
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    run_workflow(opts).await.unwrap();
+
+    let events = sink.events.lock().unwrap();
+    let started: Vec<(String, String, String, String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStarted {
+                step_id,
+                codename,
+                agent,
+                provider,
+                model,
+                ..
+            } => Some((
+                step_id.clone(),
+                codename.clone().unwrap(),
+                agent.clone(),
+                provider.clone().unwrap(),
+                model.clone().unwrap(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec![
+            (
+                "alpha".into(),
+                "jade-reef/hedgehog".into(),
+                "ag".into(),
+                "mock".into(),
+                "mock-1".into()
+            ),
+            (
+                "beta".into(),
+                "jade-reef/heron".into(),
+                "ag".into(),
+                "mock".into(),
+                "mock-1".into()
+            ),
+        ]
+    );
+    let step_names: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::StepStarted { codename, .. } => codename.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(step_names, vec!["jade-reef/hedgehog", "jade-reef/heron"]);
+
+    // The crew is persisted on the run record, and each step result carries
+    // its instance codename.
+    let rec = store.load("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W").unwrap();
+    assert_eq!(rec.codename.as_deref(), Some("jade-reef"));
 }
