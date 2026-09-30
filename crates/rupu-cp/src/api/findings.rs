@@ -281,23 +281,17 @@ fn project_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Collect every finding across every registered workspace's coverage
-/// targets, tagged with provenance (`ws_id` / `project` / `target_id`) but
-/// WITHOUT the `RunStore` `workflow_name` join — `list_findings` does that
-/// join itself afterward, since it needs `AppState.run_store`.
+/// Every registered workspace's coverage targets, with their findings ledger
+/// read: `f(workspace, target_id, ledger paths, records)` once per target.
 ///
-/// `pub`: this is the one workspace/target walk. `list_findings`,
-/// `LocalHostConnector::dashboard_summary`'s open-findings count
-/// (`host/local.rs`) and the report exports (here, and `rupu findings
-/// export`) all call it rather than each re-implementing the walk.
-///
-/// Tolerant by design: a workspace whose path is gone, or a target whose
-/// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather
-/// than failing the caller.
-pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
+/// This is the one workspace/target walk. Tolerant by design: a workspace
+/// whose path is gone, or a target whose `findings.jsonl` is absent/unreadable,
+/// is skipped with a `warn!` rather than failing the caller.
+fn each_ledger(
+    global_dir: &std::path::Path,
+    mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
+) {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
-
-    let mut out: Vec<FindingOut> = Vec::new();
     for w in &workspaces {
         let wp = std::path::Path::new(&w.path);
         let targets = match discover_targets(wp) {
@@ -307,7 +301,6 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
                 continue;
             }
         };
-        let project = project_name(&w.path);
         for t in targets {
             let paths = CoveragePaths::new(wp, &t.target_id);
             let records = match read_findings(&paths) {
@@ -317,38 +310,72 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
                     continue;
                 }
             };
-            for record in records {
-                // `w` (the owning workspace) is already in hand for every
-                // finding in this loop — no separate lookup/memoization is
-                // needed, unlike a flat finding list without provenance.
-                let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
-                    (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
-                        remote,
-                        w.initial_branch.as_deref(),
-                        path,
-                        record.line_range,
-                    ),
-                    _ => None,
-                };
-                let (codename, codename_derived) = crate::codename::named(
-                    record.declared_by.codename.as_deref(),
-                    &record.declared_by.run_id,
-                    None,
-                );
-                out.push(FindingOut {
-                    codename,
-                    codename_derived,
-                    ws_id: w.id.clone(),
-                    project: project.clone(),
-                    target_id: t.target_id.clone(),
-                    workflow_name: None,
-                    permalink,
-                    report_summary: None,
-                    record,
-                });
-            }
+            f(w, &t.target_id, paths, records);
         }
     }
+}
+
+/// Collect every finding across every registered workspace's coverage
+/// targets, tagged with provenance (`ws_id` / `project` / `target_id`) but
+/// WITHOUT the `RunStore` `workflow_name` join — `list_findings` does that
+/// join itself afterward, since it needs `AppState.run_store`.
+///
+/// `pub`: this is the one workspace/target walk (via [`each_ledger`]).
+/// `list_findings`, `LocalHostConnector::dashboard_summary`'s open-findings
+/// count (`host/local.rs`) and the report exports (here, and `rupu findings
+/// export`) all call it rather than each re-implementing the walk.
+///
+/// Tolerant by design: a workspace whose path is gone, or a target whose
+/// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather
+/// than failing the caller.
+pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
+    let mut out: Vec<FindingOut> = Vec::new();
+    each_ledger(global_dir, |w, target_id, _paths, records| {
+        let project = project_name(&w.path);
+        for record in records {
+            // `w` (the owning workspace) is already in hand for every
+            // finding in this target — no separate lookup/memoization is
+            // needed, unlike a flat finding list without provenance.
+            let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
+                (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
+                    remote,
+                    w.initial_branch.as_deref(),
+                    path,
+                    record.line_range,
+                ),
+                _ => None,
+            };
+            let (codename, codename_derived) = crate::codename::named(
+                record.declared_by.codename.as_deref(),
+                &record.declared_by.run_id,
+                None,
+            );
+            out.push(FindingOut {
+                codename,
+                codename_derived,
+                ws_id: w.id.clone(),
+                project: project.clone(),
+                target_id: target_id.to_string(),
+                workflow_name: None,
+                permalink,
+                report_summary: None,
+                record,
+            });
+        }
+    });
+    out
+}
+
+/// Which ledger holds each finding: id → the coverage paths of every ledger
+/// it appears in (normally exactly one). Read-only; `rupu findings import`
+/// uses it to find the finding a report belongs to.
+pub fn finding_ledgers(global_dir: &std::path::Path) -> HashMap<String, Vec<CoveragePaths>> {
+    let mut out: HashMap<String, Vec<CoveragePaths>> = HashMap::new();
+    each_ledger(global_dir, |_, _, paths, records| {
+        for r in records {
+            out.entry(r.id).or_default().push(paths.clone());
+        }
+    });
     out
 }
 
@@ -1658,6 +1685,56 @@ mod tests {
         let stored = by_id("fnd_no_loc");
         assert_eq!(stored.codename, "cobalt-harbor/heron#3");
         assert!(!stored.codename_derived);
+    }
+
+    /// `finding_ledgers` maps each finding id to the coverage paths of the
+    /// ledger holding it, using the same walk as `collect_all_findings`.
+    #[test]
+    fn finding_ledgers_maps_ids_to_their_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws = rupu_workspace::Workspace {
+            id: "ws1".to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: None,
+            initial_branch: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        std::fs::create_dir_all(global.join("workspaces")).unwrap();
+        std::fs::write(
+            global.join("workspaces").join("ws1.toml"),
+            toml::to_string(&ws).unwrap(),
+        )
+        .unwrap();
+
+        let paths = CoveragePaths::new(&repo, "tgt1");
+        paths.ensure_dir().unwrap();
+        let a = finding("fnd_a", Severity::High, "2026-01-01T00:00:00Z").record;
+        let b = finding("fnd_b", Severity::Low, "2026-01-02T00:00:00Z").record;
+        std::fs::write(
+            &paths.findings,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&a).unwrap(),
+                serde_json::to_string(&b).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let map = finding_ledgers(global);
+        assert_eq!(map.len(), 2);
+        for id in ["fnd_a", "fnd_b"] {
+            let held = &map[id];
+            assert_eq!(held.len(), 1, "{id}");
+            assert_eq!(held[0].findings, paths.findings, "{id}");
+        }
+        assert!(!map.contains_key("fnd_missing"));
+        // An empty registry yields an empty map rather than an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(finding_ledgers(empty.path()).is_empty());
     }
 
     #[test]

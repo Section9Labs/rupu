@@ -1,7 +1,11 @@
-//! `rupu findings` — the finding report contract and report exports.
-//! Thin: the schema comes from `rupu_coverage::report`, and an export is
+//! `rupu findings` — the finding report contract, report exports, and the
+//! one-time import of reports written before the full profile.
+//! Thin: the schema comes from `rupu_coverage::report`, an export is
 //! collected, selected and rendered by `rupu_cp::api::findings` /
-//! `rupu_findings_report`; this module parses arguments and writes the bytes.
+//! `rupu_findings_report`, and an import is parsed by
+//! `rupu_findings_report::import` and written by
+//! `rupu_coverage::tools::attach_reports`; this module parses arguments,
+//! moves bytes and prints.
 
 use crate::output::formats::OutputFormat;
 use crate::output::report;
@@ -32,6 +36,15 @@ pub enum Action {
     /// `[findings].export_id_prefix` in the GLOBAL config (`~/.rupu/config.toml`);
     /// a project's `.rupu/config.toml` never changes it.
     Export(ExportArgs),
+    /// Attach reports written before the full profile to their findings.
+    ///
+    /// A one-time migration aid: reads Markdown finding reports in the report
+    /// layout, and attaches each to the summary finding whose `fnd_` id it
+    /// cites. The finding becomes a full-profile finding. A report attaches
+    /// whole or not at all; a finding that already has a report is left
+    /// alone; each changed ledger is backed up first
+    /// (`findings.jsonl.pre-import-<time>`).
+    Import(ImportArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -75,6 +88,20 @@ pub struct ExportArgs {
     /// generated file name.
     #[arg(short = 'o', long, value_name = "PATH")]
     output: PathBuf,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ImportArgs {
+    /// Report files, or directories to search for `*.md` files.
+    #[arg(required = true, value_name = "PATH")]
+    paths: Vec<PathBuf>,
+    /// The finding a single report belongs to, when it does not cite exactly
+    /// one finding id itself. Only with one file.
+    #[arg(long = "id", value_name = "FINDING_ID", value_parser = non_blank)]
+    id: Option<String>,
+    /// Parse and validate every report; change nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// The document formats `--to` accepts.
@@ -124,11 +151,13 @@ fn cwe_id(raw: &str) -> Result<String, String> {
 }
 
 pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
-    // Both actions write a schema / a file: the global `--format` (table,
-    // json, csv, …) has nothing to shape. The document format is `--to`.
+    // Every action writes a schema / a file / a status listing: the global
+    // `--format` (table, json, csv, …) has nothing to shape. The document
+    // format is `--to`.
     let command_name = match action {
         Action::Schema { .. } => "findings schema",
         Action::Export(_) => "findings export",
+        Action::Import(_) => "findings import",
     };
     crate::output::formats::ensure_supported(command_name, format, report::TABLE_ONLY)
 }
@@ -137,6 +166,7 @@ pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
         Action::Schema { advertised } => schema_cmd(advertised),
         Action::Export(args) => export_cmd(&args),
+        Action::Import(args) => import_cmd(&args),
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -287,6 +317,300 @@ fn export_cmd(args: &ExportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Files larger than this are not finding reports.
+const IMPORT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// What became of one file named for import.
+enum Line {
+    Attached(String),
+    Skipped(String),
+    Failed(String, Vec<String>),
+}
+
+impl Line {
+    fn failed(why: impl Into<String>) -> Self {
+        Line::Failed(why.into(), Vec::new())
+    }
+}
+
+/// The finding a report belongs to: `--id`, else the one id it cites.
+fn report_id(flag: Option<&str>, cited: &[String]) -> Result<String, String> {
+    match (flag, cited) {
+        (Some(id), _) => Ok(id.to_string()),
+        (None, [one]) => Ok(one.clone()),
+        (None, []) => Err("cites no finding id; import it alone with --id".to_string()),
+        (None, many) => Err(format!(
+            "cites several finding ids ({}); import it alone with --id",
+            many.join(", ")
+        )),
+    }
+}
+
+/// A report file's text; anything over [`IMPORT_MAX_BYTES`] is refused
+/// without being read whole.
+fn read_report_file(file: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)?
+        .take(IMPORT_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > IMPORT_MAX_BYTES {
+        anyhow::bail!("larger than 4 MiB");
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
+    use rupu_coverage::tools::report_finding::ReportFindingError;
+    use rupu_coverage::tools::{attach_reports, AttachItem, AttachOutcome};
+    use rupu_findings_report::import::{parse_report, retain_known_cross_references, Parsed};
+    use std::collections::{BTreeMap, HashSet};
+
+    let files = report_files(&args.paths)?;
+    if args.id.is_some() && (files.len() != 1 || args.paths.iter().any(|p| !p.is_file())) {
+        anyhow::bail!("--id needs exactly one report file");
+    }
+    let global = crate::paths::global_dir()?;
+    // Limits come from the global config, as for the export prefix; an
+    // unreadable config falls back to the defaults with a warning.
+    let cfg_path = global.join("config.toml");
+    let cfg = match rupu_config::layer_files_locked(Some(&cfg_path), None) {
+        Ok(c) => c.findings,
+        Err(e) => {
+            crate::output::diag::warn(
+                &crate::output::diag::prefs_for_diag(false),
+                format!(
+                    "cannot read {}: {e}; using the default findings limits",
+                    cfg_path.display()
+                ),
+            );
+            Default::default()
+        }
+    };
+    let opts = crate::findings_opts::base_options(&global, &cfg);
+    let ledgers = cp_findings::finding_ledgers(&global);
+    // ledger file → the ids in it. A ledger only accepts cross-references to
+    // its own findings.
+    let mut ids_by_ledger: BTreeMap<PathBuf, HashSet<String>> = BTreeMap::new();
+    for (id, homes) in &ledgers {
+        for home in homes {
+            ids_by_ledger
+                .entry(home.findings.clone())
+                .or_default()
+                .insert(id.clone());
+        }
+    }
+
+    let mut lines: BTreeMap<PathBuf, Line> = BTreeMap::new();
+    // finding id → the files whose report is for it
+    let mut wanted: BTreeMap<String, Vec<(PathBuf, rupu_coverage::FindingReport)>> =
+        BTreeMap::new();
+    for file in &files {
+        let parsed = read_report_file(file).and_then(|md| Ok(parse_report(&md)?));
+        match parsed {
+            Err(e) => {
+                lines.insert(file.clone(), Line::failed(e.to_string()));
+            }
+            Ok(Parsed::NotAReport) => {
+                lines.insert(file.clone(), Line::Skipped("not a finding report".into()));
+            }
+            Ok(Parsed::Report { report, cited_ids }) => {
+                match report_id(args.id.as_deref(), &cited_ids) {
+                    Ok(id) => wanted.entry(id).or_default().push((file.clone(), report)),
+                    Err(why) => {
+                        lines.insert(file.clone(), Line::failed(why));
+                    }
+                }
+            }
+        }
+    }
+
+    // Group by ledger; refuse an id two files claim, or one not found in
+    // exactly one ledger.
+    let mut by_ledger: BTreeMap<
+        PathBuf,
+        (rupu_coverage::CoveragePaths, Vec<(PathBuf, AttachItem)>),
+    > = BTreeMap::new();
+    for (id, reports) in wanted {
+        if reports.len() > 1 {
+            let names: Vec<String> = reports
+                .iter()
+                .map(|(f, _)| f.display().to_string())
+                .collect();
+            for (f, _) in reports {
+                lines.insert(
+                    f,
+                    Line::failed(format!(
+                        "{} reports cite {id}: {}",
+                        names.len(),
+                        names.join(", ")
+                    )),
+                );
+            }
+            continue;
+        }
+        let (file, mut report) = reports.into_iter().next().expect("one report");
+        // The same ledger may be listed twice (a workspace registered twice,
+        // an id on two lines of it); only distinct ledger files count.
+        let mut homes: Vec<&rupu_coverage::CoveragePaths> = Vec::new();
+        for home in ledgers.get(&id).into_iter().flatten() {
+            if !homes.iter().any(|h| h.findings == home.findings) {
+                homes.push(home);
+            }
+        }
+        let paths = match homes.as_slice() {
+            [one] => (*one).clone(),
+            [] => {
+                lines.insert(
+                    file,
+                    Line::failed(format!("no finding {id} in any registered project")),
+                );
+                continue;
+            }
+            _ => {
+                lines.insert(
+                    file,
+                    Line::failed(format!("{id} is in more than one ledger")),
+                );
+                continue;
+            }
+        };
+        // Keep cross-references to the ledger's other findings only: one to
+        // the finding the report is being attached to is a self-reference.
+        let known = ids_by_ledger.entry(paths.findings.clone()).or_default();
+        let own = known.remove(&id);
+        retain_known_cross_references(&mut report, known);
+        if own {
+            known.insert(id.clone());
+        }
+        by_ledger
+            .entry(paths.findings.clone())
+            .or_insert_with(|| (paths.clone(), Vec::new()))
+            .1
+            .push((
+                file,
+                AttachItem {
+                    finding_id: id,
+                    report,
+                },
+            ));
+    }
+
+    let mut backups = Vec::new();
+    for (_, (paths, items)) in by_ledger {
+        let (files, items): (Vec<PathBuf>, Vec<AttachItem>) = items.into_iter().unzip();
+        let ids: Vec<String> = items.iter().map(|i| i.finding_id.clone()).collect();
+        // One ledger failing (it changed under us, or cannot be locked or
+        // written) fails its own files and leaves the other ledgers to go on.
+        let batch = match attach_reports(&paths, items, &opts, args.dry_run) {
+            Ok(b) => b,
+            Err(e) => {
+                for file in files {
+                    lines.insert(
+                        file,
+                        Line::failed(format!("cannot update {}: {e}", paths.findings.display())),
+                    );
+                }
+                continue;
+            }
+        };
+        backups.extend(batch.backup);
+        for ((file, id), outcome) in files.into_iter().zip(ids).zip(batch.outcomes) {
+            let line = match outcome {
+                AttachOutcome::Attached => Line::Attached(id),
+                AttachOutcome::AlreadyHasReport => {
+                    Line::Skipped(format!("{id} already has a report"))
+                }
+                AttachOutcome::NotFound => {
+                    Line::failed(format!("no parseable finding {id} in its ledger"))
+                }
+                AttachOutcome::Duplicate => {
+                    Line::failed(format!("{id} appears more than once in its ledger"))
+                }
+                AttachOutcome::Rejected(ReportFindingError::Report(v)) => Line::Failed(
+                    format!("{} problem(s) in the report", v.0.len()),
+                    v.0.iter()
+                        .map(|e| format!("{}: {}", e.path, e.message))
+                        .collect(),
+                ),
+                AttachOutcome::Rejected(e) => Line::failed(e.to_string()),
+            };
+            lines.insert(file, line);
+        }
+    }
+
+    let (mut attached, mut skipped, mut failed) = (0, 0, 0);
+    let verb = if args.dry_run {
+        "would attach"
+    } else {
+        "attached"
+    };
+    for (file, line) in &lines {
+        match line {
+            Line::Attached(id) => {
+                attached += 1;
+                println!("{verb:<12} {} → {id}", file.display());
+            }
+            Line::Skipped(why) => {
+                skipped += 1;
+                println!("{:<12} {}: {why}", "skipped", file.display());
+            }
+            Line::Failed(why, details) => {
+                failed += 1;
+                println!("{:<12} {}: {why}", "failed", file.display());
+                for d in details {
+                    println!("{:<12}   {d}", "");
+                }
+            }
+        }
+    }
+    for b in &backups {
+        println!("{:<12} {}", "backup", b.display());
+    }
+    println!("{attached} {verb}, {skipped} skipped, {failed} failed");
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} file(s) were not imported", lines.len());
+    }
+    Ok(())
+}
+
+/// The files named, plus every `*.md` under the directories named, in path
+/// order. Hidden directories and files found while searching are skipped.
+fn report_files(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(&path, out)?;
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+            {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        let meta = std::fs::metadata(p).with_context(|| format!("cannot read {}", p.display()))?;
+        if meta.is_dir() {
+            walk(p, &mut out).with_context(|| format!("cannot read {}", p.display()))?;
+        } else {
+            out.push(p.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,8 +628,18 @@ mod tests {
             .chain(args.iter().copied());
         match Harness::try_parse_from(argv).unwrap().action {
             Action::Export(a) => a,
-            Action::Schema { .. } => unreachable!(),
+            Action::Schema { .. } | Action::Import(_) => unreachable!(),
         }
+    }
+
+    fn import(args: &[&str]) -> Result<ImportArgs, clap::Error> {
+        let argv = ["harness", "import"]
+            .into_iter()
+            .chain(args.iter().copied());
+        Harness::try_parse_from(argv).map(|h| match h.action {
+            Action::Import(a) => a,
+            _ => unreachable!(),
+        })
     }
 
     #[test]
@@ -383,13 +717,103 @@ mod tests {
     #[test]
     fn the_global_format_flag_has_nothing_to_shape() {
         let export_action = Action::Export(export(&[]));
+        let import_action = Action::Import(import(&["reports"]).unwrap());
         let schema = Action::Schema { advertised: false };
-        for action in [&export_action, &schema] {
+        for action in [&export_action, &import_action, &schema] {
             assert!(ensure_output_format(action, OutputFormat::Table).is_ok());
             for f in [OutputFormat::Json, OutputFormat::Csv, OutputFormat::Pretty] {
                 assert!(ensure_output_format(action, f).is_err(), "{f}");
             }
         }
+    }
+
+    #[test]
+    fn import_takes_paths_an_optional_id_and_a_dry_run_flag() {
+        let a = import(&["a.md", "dir", "--dry-run", "--id", " fnd_1 "]).unwrap();
+        assert_eq!(a.paths, [PathBuf::from("a.md"), PathBuf::from("dir")]);
+        assert_eq!(a.id.as_deref(), Some("fnd_1"));
+        assert!(a.dry_run);
+        let a = import(&["a.md"]).unwrap();
+        assert!(a.id.is_none() && !a.dry_run);
+        // At least one path; a blank id is a usage error.
+        assert!(import(&[]).is_err());
+        assert!(import(&["a.md", "--id", "  "]).is_err());
+    }
+
+    #[test]
+    fn a_report_belongs_to_the_flagged_id_else_the_one_it_cites() {
+        let cited = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(report_id(None, &cited(&["fnd_1"])).unwrap(), "fnd_1");
+        // `--id` wins over whatever is cited, including nothing or several.
+        assert_eq!(
+            report_id(Some("fnd_9"), &cited(&["fnd_1"])).unwrap(),
+            "fnd_9"
+        );
+        assert_eq!(report_id(Some("fnd_9"), &[]).unwrap(), "fnd_9");
+        assert_eq!(
+            report_id(Some("fnd_9"), &cited(&["fnd_1", "fnd_2"])).unwrap(),
+            "fnd_9"
+        );
+        let none = report_id(None, &[]).unwrap_err();
+        assert!(
+            none.contains("cites no finding id") && none.contains("--id"),
+            "{none}"
+        );
+        let many = report_id(None, &cited(&["fnd_1", "fnd_2"])).unwrap_err();
+        assert!(
+            many.contains("fnd_1, fnd_2") && many.contains("--id"),
+            "{many}"
+        );
+    }
+
+    #[test]
+    fn report_files_walks_directories_for_markdown_in_path_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        for f in [
+            "b.md",
+            "a.MD",
+            "notes.txt",
+            "sub/c.md",
+            "sub/deeper/d.md",
+            ".hidden/e.md",
+            ".dot.md",
+        ] {
+            std::fs::write(root.join(f), "x").unwrap();
+        }
+        let got = report_files(&[root.to_path_buf()]).unwrap();
+        let rel: Vec<_> = got
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(rel, ["a.MD", "b.md", "sub/c.md", "sub/deeper/d.md"]);
+        // A file named outright is taken as is (whatever its extension, and
+        // even a hidden one); naming it twice, or its directory as well,
+        // lists it once.
+        let txt = root.join("notes.txt");
+        let hidden = root.join(".dot.md");
+        let got =
+            report_files(&[txt.clone(), root.join("sub"), txt.clone(), hidden.clone()]).unwrap();
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert!(got.contains(&txt) && got.contains(&hidden));
+        assert!(report_files(&[root.join("missing")]).is_err());
+    }
+
+    #[test]
+    fn an_oversized_report_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("big.md");
+        std::fs::write(&big, vec![b'a'; IMPORT_MAX_BYTES + 1]).unwrap();
+        let err = read_report_file(&big).unwrap_err();
+        assert!(err.to_string().contains("larger than 4 MiB"), "{err}");
+        let ok = tmp.path().join("ok.md");
+        std::fs::write(&ok, vec![b'a'; IMPORT_MAX_BYTES]).unwrap();
+        assert_eq!(read_report_file(&ok).unwrap().len(), IMPORT_MAX_BYTES);
+        let bin = tmp.path().join("bin.md");
+        std::fs::write(&bin, [0xff, 0xfe]).unwrap();
+        assert!(read_report_file(&bin).is_err());
     }
 
     #[test]

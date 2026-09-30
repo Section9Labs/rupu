@@ -372,6 +372,22 @@ native id the report cites. It is best-effort. Reports that don't parse are
 listed, never partially written. This is a one-time migration aid, not a
 supported input path.
 
+### Deviations as built (Plan 4 and Plan 5)
+
+- **Plan 4 (macOS parity) was dropped:** the macOS app is deprecated, so new
+  features target the CLI and the control-plane web UI only.
+- **Plan 5** (`docs/superpowers/plans/2026-09-30-rupu-finding-reports-plan-5-import.md`)
+  shipped the importer above. It matches a report to its finding by the `fnd_`
+  id the report cites outside its Cross-References section, with `--id` as the
+  override for a single file. The rewrite is a single locked, backed-up, atomic
+  replacement of the ledger (`rupu_coverage::tools::attach_reports`), and a
+  finding that already has a report is never changed. Missing content follows
+  the no-invention rules: a field or section the schema has no sentinel for
+  fails the file; one it has a sentinel for gets `Unknown`, `None`, or `Not
+  Provided — section missing from the imported report`; and a missing part of
+  a section that is present is `Not stated in the imported report.` See
+  `docs/coverage.md#importing-reports-written-before-the-full-profile`.
+
 ## Error handling
 
 - Validation errors are returned to the agent as a tool error that lists
@@ -417,12 +433,13 @@ supported input path.
    endpoints.
 3. **Exports:** `rupu-findings-report` crate (md/html/Typst PDF),
    per-finding and project report, CLI + CP endpoints + export dialog.
-4. **macOS parity.**
-5. **Backfill importer** (optional).
+4. **macOS parity.** Dropped: the macOS app is deprecated.
+5. **Backfill importer** (optional). Shipped.
 
 ## Out of scope
 
-- Upgrading summary findings to full in place.
+- Upgrading summary findings to full in place, other than the one-time
+  `rupu findings import` backfill above.
 - Ticket creation in external trackers (the mockup's "Create ticket" button
   is a later arc).
 - Automatic artifact GC.

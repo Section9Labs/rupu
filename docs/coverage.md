@@ -456,6 +456,90 @@ and the same global-config prefix as the CLI. At most two PDF exports render at
 once in `cp serve` (a Typst compile is CPU- and memory-heavy); further PDF
 requests wait their turn, while Markdown and HTML are never held up.
 
+### Importing reports written before the full profile
+
+Findings recorded before the `full` profile existed are summary findings, with
+their report written separately as Markdown. `rupu findings import` attaches
+those reports to their findings. It is a one-time migration aid, not an input
+path: nothing else writes a report onto an existing finding, and the parser is
+best-effort.
+
+```
+rupu findings import <PATH>... [--id <fnd_…>] [--dry-run]
+```
+
+`PATH` is a report file, or a directory searched (recursively, skipping hidden
+files and directories) for `*.md` files. A file named outright is always read,
+whatever its extension. A file over 4 MiB fails.
+
+**Layouts read.** Two spellings of the report layout: the one `rupu findings
+export --to md` writes, and a plain-text one with bare heading lines
+(`Description`, `Root Cause`, …) and `Label: value` fields (`Impact: High`,
+`Finding ID: fnd_…`). A file with fewer than three of the layout's section
+headings (a README, an index) is skipped, not failed. A file that holds several
+findings is refused; split it into one file per finding first.
+
+**Which finding.** The one `fnd_` id the report cites outside its
+Cross-References section, usually on its `Finding ID:` line. A report that cites
+none, or several, fails; import it alone with `--id <fnd_…>`, which names the
+finding for a single report file (`--id` with a directory or several files is a
+usage error). The finding is looked up across the registered projects, as
+`rupu findings export` does, and must be in exactly one project's ledger. Two
+files for the same finding fail both.
+
+**What happens to the finding.** It becomes a full-profile finding. The report
+goes through the same validation as `report_finding` and attaches whole or not
+at all: a report that fails validation is listed with every problem and changes
+nothing. `summary`, `severity` and `evidence` are re-derived from the report, as
+for any full finding; the id, provenance (run, model, surface, declared-at),
+location and every other field of the record are kept. A finding that already
+has a report is skipped, never changed. Before a ledger is rewritten it is
+copied byte for byte to `findings.jsonl.pre-import-<UTC time>` beside it (for
+example `findings.jsonl.pre-import-20260930T101500Z`), and it is then replaced
+atomically under the ledger lock: every other line is written back unchanged.
+The size limits and ticket patterns come from `[findings]` in the global config,
+as when a report is recorded.
+
+`--dry-run` parses and validates every report and prints `would attach` for
+those that would go in; it writes nothing, not even a backup. It does not open
+a report's artifact files, so a missing artifact is only found by a real run.
+
+**Missing content.** Nothing is invented. A field or section the schema has no
+sentinel for must be in the file, or the file fails: the title; Category,
+Attack Vector, Impact, Likelihood, Risk Rating and Risk Factor; and the
+Description, Impact, Location, Root Cause, Evidence, Remediation, Replication
+Steps and References sections (Evidence and Replication Steps need at least one
+entry). A rating that is not a level the schema allows fails too. Where the
+schema has a sentinel, it is used: `Unknown` for a missing Owner, Product,
+Affected Component, Source Repository, CVSS or ticket-references field; `None`
+for a missing Cross-References section; and `Not Provided — section missing from
+the imported report` for a call chain, patch, CI/CD detection or regression test
+section the file lacks. A part missing from a section that is present, such as
+the stage of a CI check, is `Not stated in the imported report.` Text with no
+field to hold it is kept at the end of References, under `Other imported text:`.
+
+**Cross-references, evidence and artifacts.** The Cross-References text is kept
+verbatim in References. Each `fnd_` id it names also becomes a cross-reference
+link, but only to another finding in the same ledger: an id in a different
+ledger, and the finding's own id, are not linked. Code blocks in a call chain
+become evidence claims. Artifacts the report lists (an Artifacts table or list)
+must exist in the finding's workspace; the report is refused with the reason
+when one does not.
+
+**Output.** One line per file: `attached` (`would attach` on a dry run),
+`skipped` (not a report, or the finding already has one) or `failed` with the
+reason and, for a report that fails validation, each problem beneath it. Then a
+`backup` line for each ledger that was rewritten, and a totals line. The exit
+status is non-zero when any file failed. A ledger that cannot be updated (it
+cannot be locked or written, or it changed while the import ran) fails its own
+files and leaves the other ledgers to be imported.
+
+**Known limit.** The ledger lock only excludes writers that take it. An unlocked
+append that changes the ledger's length before the import replaces it is
+detected, and that ledger is left as it was; a placed or remote run that syncs
+its ledger back while an import runs is not covered by the lock. Import when no
+placed runs are active.
+
 ## CLI
 
 All inspection commands take the global `--format table|json|csv` flag
