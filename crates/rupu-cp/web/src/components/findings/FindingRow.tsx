@@ -10,6 +10,7 @@ import { normFindingSeverity, type FindingRecord } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { cweFromFinding } from '../../lib/cwe';
 import { SEVERITY_STYLE } from '../../lib/severity';
+import { FindingEvidence } from './FindingEvidence';
 
 export interface FindingRowProps {
   finding: FindingRecord;
@@ -34,10 +35,11 @@ export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps
   if (finding.line_range) locationParts.push(`${finding.line_range[0]}–${finding.line_range[1]}`);
   const location = locationParts.join(':');
 
-  const rationale = finding.evidence?.rationale ?? '';
-  const excerpt = finding.evidence?.code_excerpt ?? '';
-  const references = finding.evidence?.references ?? [];
-  const hasEvidence = Boolean(rationale || excerpt || references.length > 0);
+  const hasEvidence = Boolean(
+    finding.evidence?.rationale ||
+      finding.evidence?.code_excerpt ||
+      (finding.evidence?.references ?? []).length > 0,
+  );
 
   const cwe = cweFromFinding(finding);
 
@@ -117,24 +119,8 @@ export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps
           </div>
 
           {hasEvidence && open && (
-            <div className="mt-2 space-y-2">
-              {rationale && (
-                <p className="text-ui text-ink-dim leading-snug whitespace-pre-wrap">
-                  {rationale}
-                </p>
-              )}
-              {excerpt && (
-                <pre className="overflow-x-auto rounded bg-surface ring-1 ring-border px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre">
-                  {excerpt}
-                </pre>
-              )}
-              {references.length > 0 && (
-                <ul className="list-disc pl-4 text-note text-ink-mute space-y-0.5">
-                  {references.map((ref, i) => (
-                    <li key={i} className="break-all font-mono">{ref}</li>
-                  ))}
-                </ul>
-              )}
+            <div className="mt-2">
+              <FindingEvidence finding={finding} />
             </div>
           )}
         </div>

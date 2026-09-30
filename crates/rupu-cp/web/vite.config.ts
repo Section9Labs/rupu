@@ -18,8 +18,9 @@ export default defineConfig({
           // Charting — only loaded on Dashboard.
           charts: ['recharts'],
           // Markdown rendering (react-markdown + rehype-highlight + highlight.js)
-          // — loaded by the transcript route and by the project Code tab
-          // (ProjectCodeTab, itself React.lazy-loaded), isolated from the main entry.
+          // — loaded by the transcript route, the project Code tab
+          // (ProjectCodeTab, itself React.lazy-loaded) and the findings tables'
+          // evidence panel (FindingEvidence), isolated from the main entry.
           markdown: ['react-markdown', 'remark-gfm', 'rehype-highlight', 'highlight.js'],
           // CodeMirror 6 — shared by the lazy code/expression editors. Named so
           // the shared core lands in `codemirror-*.js` (never the main entry)
