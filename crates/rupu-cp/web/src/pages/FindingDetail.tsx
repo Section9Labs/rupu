@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, type FindingDetail as Detail } from '../lib/api';
+import { api, apiErrorMessage, type FindingDetail as Detail } from '../lib/api';
 import { completeness } from '../lib/findingReport';
 import Markdown from '../components/transcript/Markdown';
 import { FindingEvidence } from '../components/findings/FindingEvidence';
@@ -74,7 +74,7 @@ export default function FindingDetail() {
     setError(null);
     api.getFinding(id).then(
       (d) => { if (live) setDetail(d); },
-      (e: unknown) => { if (live) setError(e instanceof Error ? e.message : String(e)); },
+      (e: unknown) => { if (live) setError(apiErrorMessage(e)); },
     );
     return () => { live = false; };
   }, [id]);

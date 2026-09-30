@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { findingArtifactUrl } from '../../../lib/api';
+import { ApiError, apiErrorMessage, findingArtifactUrl } from '../../../lib/api';
 import { formatBytes, type ArtifactRef } from '../../../lib/findingReport';
 
 const PREVIEW_LIMIT = 256 * 1024;
@@ -7,15 +7,7 @@ const PREVIEW_LIMIT = 256 * 1024;
 /** Server errors are `{"error": "..."}`; show the message, not the JSON. */
 async function errorMessage(res: Response): Promise<string> {
   const raw = await res.text().catch(() => '');
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string' && parsed.error) {
-      return parsed.error;
-    }
-  } catch {
-    // not JSON; fall through to the raw text
-  }
-  return raw.trim() || res.statusText || `Request failed (HTTP ${res.status})`;
+  return apiErrorMessage(new ApiError(res.status, raw || res.statusText, raw));
 }
 
 export default function ArtifactBrowser({ findingId, artifacts }: { findingId: string; artifacts: ArtifactRef[] }) {
@@ -47,7 +39,7 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
       const body = await res.text();
       if (current()) setText(body);
     } catch (e) {
-      if (current()) setError(e instanceof Error ? e.message : String(e));
+      if (current()) setError(apiErrorMessage(e));
     } finally {
       if (current()) setLoading(false);
     }

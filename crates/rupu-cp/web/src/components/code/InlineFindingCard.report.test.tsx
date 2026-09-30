@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import fixture from '../../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
-import { api, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
+import { api, ApiError, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
 import type { FindingReport } from '../../lib/findingReport';
 import InlineFindingCard from './InlineFindingCard';
 
@@ -172,6 +172,16 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     expect(screen.getAllByText(ROOT_CAUSE)).toHaveLength(1);
     // the full report link is still reachable so the user can retry there
     expect(screen.getByRole('link', { name: /Open full report/ })).toBeInTheDocument();
+  });
+
+  it('shows the message from a JSON API error body, not the JSON', async () => {
+    const body = JSON.stringify({ error: 'finding f-full not found' });
+    vi.spyOn(api, 'getFinding').mockRejectedValue(new ApiError(404, body, body));
+    view(FULL);
+    fireEvent.click(header());
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Couldn’t load the report: finding f-full not found');
+    expect(alert).not.toHaveTextContent('"error"');
   });
 
   it('drops a late response for a previous finding after the card is re-pointed at another id', async () => {

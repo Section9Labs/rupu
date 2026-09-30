@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import fixture from '../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
-import { api, type FindingDetail as Detail } from '../lib/api';
+import { api, ApiError, type FindingDetail as Detail } from '../lib/api';
 import type { FindingReport } from '../lib/findingReport';
 import FindingDetail from './FindingDetail';
 
@@ -141,6 +141,16 @@ describe('FindingDetail page', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('404 finding not found');
+  });
+
+  it('shows the message from a JSON API error body, not the JSON', async () => {
+    const body = JSON.stringify({ error: 'finding x not found' });
+    vi.spyOn(api, 'getFinding').mockRejectedValue(new ApiError(404, body, body));
+    renderAt('x');
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('finding x not found');
+    expect(alert).not.toHaveTextContent('"error"');
   });
 
   it('shows a loading indicator before the finding arrives', () => {

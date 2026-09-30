@@ -35,6 +35,28 @@ export class ApiError extends Error {
   }
 }
 
+/** A human-readable message for anything a fetch chain can throw. The CP
+ *  answers errors as `{"error": "…"}`, so an `ApiError` yields that message
+ *  rather than the raw JSON body; a non-JSON body is shown as text, and an
+ *  empty one falls back to the HTTP status. A plain `Error` yields its
+ *  message and anything else its string form. */
+export function apiErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    const raw = e.body.trim();
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string' && parsed.error.trim()) {
+        return parsed.error;
+      }
+    } catch {
+      // not JSON; fall through to the raw text
+    }
+    return raw || e.message.trim() || `Request failed (HTTP ${e.status})`;
+  }
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
 // ---------------------------------------------------------------------------
 // Core fetch wrapper
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@
 
 import { useEffect, useId, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
+import { api, apiErrorMessage, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
 import { isSentinel, sentinelLabel } from '../../lib/findingReport';
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
 import CallChain from '../findings/report/CallChain';
@@ -147,7 +147,7 @@ export default function InlineFindingCard({ finding, stale }: InlineFindingCardP
         if (live) setDetail(d);
       },
       (e: unknown) => {
-        if (live) setLoadError(e instanceof Error ? e.message : String(e));
+        if (live) setLoadError(apiErrorMessage(e));
       },
     );
     return () => {
