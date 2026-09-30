@@ -178,27 +178,37 @@ discovered under the root plus each node's examination depth.
 
 Agentiflows adopt this directly:
 
-- **An agentiflow names its engagement profile(s).** A required `profile:` field.
-  This is resolved and propagated to every unit the lead spawns, so every
-  workflow run and dispatched agent records findings and coverage under the right
-  profile. Resolution and fail-closed rules are the profile spec's (§"Selection,
-  resolution & enforcement"): unknown profile id → hard error at load.
-- **Scope = the profile's root asset(s).** The agentiflow's `scope:` block
-  *instantiates* the root asset kind(s) the profile declares (`network`'s `scope`
-  kind with `cidrs`/`out_of_scope`/`window`; `web`'s `target` with
-  `in_scope_hosts`/`auth`; `code`'s repo root). This is typed and deterministic —
-  the exact structure the future warden/sandbox reads. Agentiflows define no
-  separate scope schema.
-- **Pool defaults from the profile `bundle`.** `profile: network` defaults the
-  pool to that profile's `bundle.agents` (`recon`, `service-analyst`,
-  `exploit-verifier`) and `bundle.workflows` (`network-assessment`); the
-  agentiflow may narrow or extend. (Per the profile spec, `bundle.tools` is
-  launcher prefill only, never a grant — agentiflow tool access still comes from
-  agent frontmatter + tiers, §13.)
+- **An agentiflow names an engagement-profile *set*.** A required
+  `engagement_profiles:` list (mirroring workflow `defaults.engagement_profiles`),
+  which may be a single id, several ids (`[network, web]`), or one **composite**
+  id that `includes` others (`pentest`). The active set is resolved at the
+  agentiflow level and propagated to every unit the lead spawns; a generated
+  workflow or a spawned unit may **narrow** the set for a step (a pure-recon step
+  to `network` only) but never widen it. Resolution and fail-closed rules are the
+  profile spec's: unknown profile id → hard error at load; an asset/finding whose
+  kind namespace is not in the active (narrowed) set → rejected at write time.
+- **Findings route by asset-kind namespace, not by a step tag.** Asset kinds are
+  namespaced by their owning profile (`network:service`, `web:route`), so one
+  agent in one unit can file a `network:service` finding and a `web:route`
+  finding side by side, each validated by its owning profile. Goal predicates
+  reference the namespaced kinds (§14).
+- **Scope = the active profiles' root asset(s), possibly several.** The `scope:`
+  block instantiates each active profile's root kind(s) — a `pentest` carries a
+  `network:scope` root *and* a `web:target` root; the in-scope sets union (the
+  profile spec's rule). Each root names its profile-namespaced kind and carries
+  that kind's coordinates/attributes (`network:scope` → `cidrs`/`out_of_scope`/
+  `window`; `web:target` → `url`/`in_scope_hosts`/`auth`). Typed and
+  deterministic — the exact structure the future warden/sandbox reads.
+  Agentiflows define no separate scope schema.
+- **Pool defaults from the union of the active profiles' `bundle`s.**
+  `engagement_profiles: [network, web]` defaults the pool to the union of both
+  bundles' `agents`/`workflows`; the agentiflow may narrow or extend. (Per the
+  profile spec, `bundle.tools` is launcher prefill only, never a grant —
+  agentiflow tool access still comes from agent frontmatter + tiers, §13.)
 - **Goals are predicates over profile-typed assets/findings/coverage** (§14): a
-  finding's classification uses the profile's taxonomy, a host capability is an
-  asset at a coverage-ladder depth, "covered" is the profile's depth ladder.
-- **Coverage stop = the profile's asset-tree depth ladder** (§15).
+  finding's classification uses the owning profile's taxonomy, a host capability
+  is an asset at a coverage-ladder depth, "covered" is the profile's depth ladder.
+- **Coverage stop = the active profiles' asset-tree depth ladders** (§15).
 
 Dependency/sequencing: the agentiflow *machinery* (envelope, collectors, comms,
 goals-over-findings) is profile-agnostic and can land against `code`/`binary`
@@ -347,7 +357,9 @@ flip.
   unchanged — the process boundary is at the lead→unit seam only.
 - The board and mailboxes are **file-backed**, so cross-process coordination is
   natural; the collectors poll files.
-- Each unit is launched carrying the active engagement profile.
+- Each unit is launched carrying the active engagement-profile *set* (findings
+  route to their owning profile by asset-kind namespace, §7); a unit may narrow
+  the set, never widen it.
 
 ### 10.3 Fan-out governance
 
@@ -435,8 +447,8 @@ goals:
   - id: root-1122
     objective: "Obtain root on 1.1.2.2."
     # an asset in the network profile's graph reaching the 'exploited' depth,
-    # backed by a verified finding
-    target: { asset: { kind: host, locator: { host: "1.1.2.2" } }, depth_at_least: exploited, verified: true }
+    # backed by a verified finding. Asset kind is profile-namespaced.
+    target: { asset: { kind: "network:host", locator: { host: "1.1.2.2" } }, depth_at_least: exploited, verified: true }
     required: true
     verify_with: exploit-verifier   # optional independent corroboration
 ```
@@ -517,20 +529,22 @@ Lives at `.rupu/agentiflows/<name>.yaml` (project), then `~/.rupu/agentiflows/`
 (global), mirroring workflow/agent discovery.
 
 ```yaml
-name: rce-hunt
-description: Find and verify remote code execution across the in-scope services.
+name: acme-pentest
+description: Assess the in-scope hosts and the web app; find and verify RCE.
 lead: orchestrator-lead            # an agent in the pool; auto-holds Tier 1+2
 
-profile: network                   # engagement profile(s) — required; a list is allowed.
-                                   #   Resolved + propagated to every spawned unit.
+engagement_profiles: [network, web]   # the active set — one id, several, or a
+                                      #   composite (e.g. `pentest`). Resolved at
+                                      #   the agentiflow level, propagated to every
+                                      #   unit; a unit/step may narrow, never widen.
 
 goals:                             # objective predicates over profile-typed evidence
   - id: rce
-    objective: "Find 10 verified RCE issues across the in-scope services."
+    objective: "Find 10 verified RCE issues across the in-scope targets."
     target: { findings: { classification: "CWE-94", verified: true }, count_gte: 10 }
     required: true
 
-coverage:                          # optional deterministic stop (profile asset tree)
+coverage:                          # optional deterministic stop (profile asset trees)
   reach: 0.9
   depth: tested
 
@@ -540,21 +554,25 @@ budget:                            # any subset; first to trip wins
   rounds: 40
   soft_at: 0.8
 
-scope:                             # instantiates the PROFILE'S root asset(s).
+scope:                             # instantiates EACH active profile's root asset(s).
   authorized: true                 #   Typed + deterministic (future sandbox/warden input).
-  # fields below are the network profile's `scope` root-asset shape:
-  cidrs: ["10.0.0.0/24"]
-  hosts: ["1.1.2.2"]
-  out_of_scope: ["10.0.0.9"]
-  window: "2026-10-01/2026-10-05"
-  mode: bypass                     # run permission mode for the fleet
-                                   #   (code-enforcement of scope is deferred, §4)
+  mode: bypass                     #   Run permission mode for the fleet
+                                   #   (code-enforcement of scope is deferred, §4).
+  roots:                           #   In-scope sets union across roots.
+    - kind: network:scope          #     the network profile's `scope` root shape
+      cidrs: ["10.0.0.0/24"]
+      hosts: ["1.1.2.2"]
+      out_of_scope: ["10.0.0.9"]
+      window: "2026-10-01/2026-10-05"
+    - kind: web:target             #     the web profile's `target` root shape
+      url: "https://app.acme.test"
+      in_scope_hosts: ["app.acme.test"]
 
-pool:                              # defaults from the profile's `bundle`; may narrow/extend
-  agents: [recon, service-analyst, exploit-verifier, finding-fixer]
-  workflows: [network-assessment, investigate-then-fix]   # or: all
+pool:                              # defaults from the UNION of the active profiles'
+  agents: [recon, service-analyst, exploit-verifier, crawler, appsec-tester, finding-fixer]
+  workflows: [network-assessment, web-assessment, investigate-then-fix]   # or: all
 
-workspace: { strategy: worktree, branch: "agentiflow/rce-hunt" }
+workspace: { strategy: worktree, branch: "agentiflow/acme-pentest" }
 
 round:
   lead_max_turns: 200              # large — the round core is effectively agentic
@@ -563,21 +581,24 @@ round:
 trigger: manual                    # manual | cron | event (reuse existing)
 ```
 
-- **Required:** `name`, `lead`, `profile`, at least one of `goals` / `coverage`,
-  and `scope`.
-- **`scope` is required and complete** — it instantiates the profile's root
-  asset(s). Its *shape* is the profile's (a `code` agentiflow's scope is a repo
-  root; a `web` agentiflow's is a `target` origin). Its enforcement is deferred
-  (§4), not its definition. Authored deterministically so the sandbox/warden reads
-  it directly.
-- **`pool`** defaults to the profile's `bundle.agents`/`bundle.workflows`;
-  explicit values narrow or extend it.
+- **Required:** `name`, `lead`, `engagement_profiles`, at least one of `goals` /
+  `coverage`, and `scope`.
+- **`scope` is required and complete** — `scope.roots` instantiates each active
+  profile's root kind(s), each root carrying its profile-namespaced kind and that
+  kind's coordinates/attributes. A single-profile agentiflow has one root (a
+  `code` scope is a repo root; a standalone `web` scope is one `web:target`). Its
+  enforcement is deferred (§4), not its definition. Authored deterministically so
+  the sandbox/warden reads it directly.
+- **`pool`** defaults to the union of the active profiles'
+  `bundle.agents`/`bundle.workflows`; explicit values narrow or extend it.
 - Parsing/validation: a new `AgentiflowDef::parse(&str)` (in-memory,
-  filesystem-free), analogous to `Workflow::parse`. Validates: `profile`
-  resolvable (fail-closed), goals predicates well-formed **against the resolved
-  profile's taxonomy/asset-kinds/ladder**, `scope` matches the profile's
-  root-asset shape, pool agents/workflows resolvable where cheap, budget
-  dimensions ≥ 0, `scope.authorized == true`, `lead` ∈ pool.
+  filesystem-free), analogous to `Workflow::parse`. Validates: every
+  `engagement_profiles` id resolvable and composites expanded (fail-closed); goal
+  predicates well-formed **against the active set's taxonomies/namespaced
+  asset-kinds/ladders**; each `scope.roots` entry's `kind` is a root kind of an
+  active profile and carries that kind's required coordinates/attributes; pool
+  agents/workflows resolvable where cheap; budget dimensions ≥ 0;
+  `scope.authorized == true`; `lead` ∈ pool.
 
 ## 19. Persistence and run model
 
@@ -585,8 +606,8 @@ trigger: manual                    # manual | cron | event (reuse existing)
   agentiflow run distinctly (parent run with child unit runs; `RunRecord` already
   has `parent_run_id`).
 - **Run dir:** `<global>/agentiflows/<id>/`
-  - `agentiflow.json` — record (profile(s), goals + status, budget state, coverage
-    state, round count, codename, stop reason).
+  - `agentiflow.json` — record (the active `engagement_profiles` set, goals +
+    status, budget state, coverage state, round count, codename, stop reason).
   - `agentiflow.yaml` — definition snapshot.
   - `lead/` — the lead's session transcript + session record.
   - `board/` — claims, posts, directives.
@@ -691,10 +712,13 @@ skill.)
 - **Dispatch/isolation:** non-blocking spawn returns immediately; a panicking unit
   doesn't kill the fleet; per-unit SIGTERM; orphan reap; legacy blocking
   `dispatch_agent` unchanged.
-- **Profile integration:** an agentiflow with `profile: X` propagates X to every
-  spawned unit; a goal predicate referencing a taxonomy/asset-kind the profile
-  doesn't declare is rejected at parse (fail-closed); `scope` mismatching the
-  profile's root-asset shape is rejected.
+- **Profile integration:** an agentiflow's `engagement_profiles` set (incl. a
+  composite that expands) propagates to every spawned unit; a unit may narrow but
+  a widen is rejected; a goal predicate referencing a namespaced asset-kind /
+  taxonomy no active profile declares is rejected at parse (fail-closed); a
+  `scope.roots` entry whose `kind` isn't a root kind of an active profile, or that
+  omits that kind's required coordinates, is rejected; a finding whose asset-kind
+  namespace is outside the active set is rejected at write time.
 - **Pool safety:** running a catalogued workflow whose agents escape the pool is
   rejected fail-closed.
 - **End-to-end (operator gate):** matt runs a real agentiflow with a measurable
@@ -713,8 +737,10 @@ skill.)
   `expr:` escape hatch. Start minimal (`count_gte`/`exists`/`depth_at_least`).
 - **`CommandCollector` cadence controls:** run-every-turn vs interval vs on-change,
   plus its own timeout/rate budget. Decide in Plan 1.
-- **Multi-profile agentiflows:** the definition permits a `profile:` list; v1 runs
-  a single profile (matching the profiles pilot). When to light up multi.
+- **Multi-profile agentiflows:** the definition permits an `engagement_profiles`
+  set / composite; the profiles *pilot* runs a single profile, so v1 agentiflows
+  follow that until the network + web profiles land. When to light up true
+  concurrent multi-profile.
 - **Sub-lead depth:** whether `orchestrator`-capable agents run full rounds
   (recursive envelopes) or only dispatch. v1: dispatch only.
 
