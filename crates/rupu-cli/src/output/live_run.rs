@@ -1321,15 +1321,19 @@ pub fn render_focus(
         .or_else(|| state.active.step_id.clone())
         .unwrap_or_else(|| "—".to_string());
     let header_left = if state.active.codename.is_some() || state.active.provider.is_some() {
-        format!(
-            "{unit} · {}",
-            super::codename::member_label(
-                state.active.codename.as_deref(),
-                &agent,
-                state.active.provider.as_deref(),
-                state.active.model.as_deref(),
-            )
-        )
+        let label = super::codename::member_label(
+            state.active.codename.as_deref(),
+            &agent,
+            state.active.provider.as_deref(),
+            state.active.model.as_deref(),
+        );
+        // A dispatched sub-agent's unit key IS its agent name; repeating it
+        // as a prefix would print `agent · leaf · agent`.
+        if unit == agent {
+            label
+        } else {
+            format!("{unit} · {label}")
+        }
     } else {
         format!("{unit} · {agent}")
     };
@@ -2314,6 +2318,27 @@ mod tests {
         );
         let step = state.steps.iter().find(|s| s.id == "report").unwrap();
         assert_eq!(step.provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn dispatched_subagent_focus_header_does_not_repeat_agent() {
+        let mut state = fanout_state(true);
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_1".into(),
+            agent: Some("lynx-helper".into()),
+            transcript_path: std::path::PathBuf::from("/tmp/d.jsonl"),
+            codename: Some("jade-reef/heron#1>lynx#1".into()),
+            provider: Some("anthropic".into()),
+            model: Some("claude-opus-5-5".into()),
+        });
+        let focus = stripped(render_focus(&state, ts(33), 120, 6));
+        let head = &focus[0];
+        assert!(
+            head.contains("lynx#1 · lynx-helper · anthropic/claude-opus-5-5"),
+            "{head}"
+        );
+        assert_eq!(head.matches("lynx-helper").count(), 1, "{head}");
     }
 
     #[test]
