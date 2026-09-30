@@ -1,9 +1,13 @@
-use crate::{error::ApiResult, state::AppState};
+use crate::{
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
+use rupu_coverage::report::{summarize, ReportSummary};
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
 use rupu_orchestrator::{executor::Event, runs::RunStore};
 use rupu_workspace::WorkspaceStore;
@@ -12,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/findings", get(list_findings))
+    Router::new()
+        .route("/api/findings", get(list_findings))
+        .route("/api/findings/:id", get(get_finding))
 }
 
 /// A single finding plus its provenance (which workspace / project / coverage
@@ -38,8 +44,68 @@ pub struct FindingOut {
     /// no `file_path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permalink: Option<String>,
+    /// Present for full-profile findings in LIST responses: the fields a row
+    /// needs, without the report body (which `GET /api/findings/:id` serves).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_summary: Option<ReportSummary>,
     #[serde(flatten)]
     pub record: FindingRecord,
+}
+
+impl FindingOut {
+    /// The list-endpoint shape: summary fields in, report body out.
+    pub(crate) fn into_list_row(mut self) -> Self {
+        self.report_summary = self.record.report.as_ref().map(summarize);
+        self.record.report = None;
+        self
+    }
+}
+
+/// How a report evidence claim's file compares with the copy on disk now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimState {
+    /// The file still hashes to the value recorded with the claim.
+    Current,
+    /// The file exists but its contents changed since the finding was recorded.
+    Changed,
+    /// The file is gone (or escapes the workspace).
+    Missing,
+    /// No file or no recorded hash to compare (binary targets, summary claims).
+    Unknown,
+}
+
+/// One [`ClaimState`] per `report.evidence[i]`, comparing each claim's recorded
+/// `sha256` against the file's current contents under `workspace`.
+pub(crate) fn claim_states(
+    workspace: &std::path::Path,
+    r: &rupu_coverage::FindingReport,
+) -> Vec<ClaimState> {
+    r.evidence
+        .iter()
+        .map(|c| match (&c.file, &c.sha256) {
+            (Some(file), Some(recorded)) => {
+                match crate::api::source::resolve_under_workspace(workspace, file) {
+                    Ok(p) if p.is_file() => match rupu_coverage::report::sha256_file(&p) {
+                        Ok(now) if &now == recorded => ClaimState::Current,
+                        Ok(_) => ClaimState::Changed,
+                        Err(_) => ClaimState::Missing,
+                    },
+                    _ => ClaimState::Missing,
+                }
+            }
+            _ => ClaimState::Unknown,
+        })
+        .collect()
+}
+
+/// `GET /api/findings/:id` — one finding with its full report body and the
+/// staleness of each evidence claim.
+#[derive(Debug, Serialize)]
+pub struct FindingDetail {
+    #[serde(flatten)]
+    pub finding: FindingOut,
+    pub evidence_status: Vec<ClaimState>,
 }
 
 /// Optional query filters for `GET /api/findings`.
@@ -220,6 +286,7 @@ pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingO
                     target_id: t.target_id.clone(),
                     workflow_name: None,
                     permalink,
+                    report_summary: None,
                     record,
                 });
             }
@@ -344,7 +411,47 @@ async fn list_findings(
         .as_ref()
         .map(|parent| resolve_run_scope(&s.run_store, parent));
 
-    Ok(Json(scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow)))
+    let mut resp = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow);
+    // List rows never carry the report body; full-profile rows get a summary.
+    resp.findings = resp
+        .findings
+        .into_iter()
+        .map(FindingOut::into_list_row)
+        .collect();
+    Ok(Json(resp))
+}
+
+/// `GET /api/findings/:id` — the full finding (report body included) plus a
+/// per-claim staleness verdict against the owning workspace's current files.
+async fn get_finding(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<FindingDetail>> {
+    let global = s.global_dir.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        collect_all_findings(&global)
+            .into_iter()
+            .find(|f| f.record.id == id)
+            .ok_or(id)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut finding = found.map_err(|id| ApiError::not_found(format!("finding {id} not found")))?;
+    if let Ok(run) = s.run_store.load(&finding.record.declared_by.run_id) {
+        finding.workflow_name = Some(run.workflow_name);
+    }
+    let evidence_status = match (
+        &finding.record.report,
+        crate::api::code::load_workspace(&s, &finding.ws_id),
+    ) {
+        (Some(report), Ok(ws)) => claim_states(std::path::Path::new(&ws.path), report),
+        (Some(report), Err(_)) => vec![ClaimState::Unknown; report.evidence.len()],
+        (None, _) => Vec::new(),
+    };
+    Ok(Json(FindingDetail {
+        finding,
+        evidence_status,
+    }))
 }
 
 #[cfg(test)]
@@ -390,6 +497,7 @@ mod tests {
             target_id: "tgt".to_string(),
             workflow_name: workflow_name.map(|s| s.to_string()),
             permalink: None,
+            report_summary: None,
             record: FindingRecord {
                 id: id.to_string(),
                 file_path: Some("src/a.rs".to_string()),
@@ -456,6 +564,7 @@ mod tests {
                 target_id: "tgt1".into(),
                 workflow_name: Some("nightly-health".into()),
                 permalink: Some("https://github.com/o/r/blob/main/src/a.rs#L17-L19".into()),
+                report_summary: None,
                 record: FindingRecord {
                     id: "fnd_1".into(),
                     file_path: Some("src/a.rs".into()),
@@ -482,6 +591,7 @@ mod tests {
                 target_id: "tgt1".into(),
                 workflow_name: None,
                 permalink: None,
+                report_summary: None,
                 record: FindingRecord {
                     id: "fnd_2".into(),
                     file_path: None,
@@ -903,5 +1013,162 @@ mod tests {
         assert_eq!(q2.ws_id, None);
         assert_eq!(q2.workflow, None);
         assert_eq!(q2.run_id, None);
+    }
+
+    fn full_record(id: &str) -> FindingRecord {
+        let report: rupu_coverage::FindingReport = serde_json::from_str(include_str!(
+            "../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap();
+        let mut rec = finding(id, Severity::Critical, "2026-09-29T00:00:00Z").record;
+        rec.profile = rupu_coverage::FindingProfile::Full;
+        rec.summary = report.title.clone();
+        rec.report = Some(report);
+        rec
+    }
+
+    #[test]
+    fn list_rows_carry_report_summary_not_report() {
+        let mut out = finding("f1", Severity::Critical, "2026-09-29T00:00:00Z");
+        out.record = full_record("f1");
+        let row = out.into_list_row();
+        assert!(row.record.report.is_none());
+        let s = row
+            .report_summary
+            .clone()
+            .expect("summary for full-profile rows");
+        assert_eq!(s.completeness.total, 11);
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("report").is_none());
+        assert!(json["report_summary"]["root_cause"].is_string());
+    }
+
+    #[test]
+    fn summary_rows_have_no_report_summary_key() {
+        let row = finding("f2", Severity::High, "2026-09-29T00:00:00Z").into_list_row();
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("report_summary").is_none());
+    }
+
+    #[test]
+    fn claim_states_compare_file_hashes() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/routes")).unwrap();
+        std::fs::write(ws.path().join("src/routes/notes.rs"), "fn a() {}\n").unwrap();
+        let mut report = full_record("f3").report.unwrap();
+        let current =
+            rupu_coverage::report::sha256_file(&ws.path().join("src/routes/notes.rs")).unwrap();
+        report.evidence[0].sha256 = Some(current.clone());
+        let mut changed = report.evidence[0].clone();
+        changed.sha256 = Some("0".repeat(64));
+        let mut missing = report.evidence[0].clone();
+        missing.file = Some("src/gone.rs".into());
+        let mut unknown = report.evidence[0].clone();
+        unknown.sha256 = None;
+        report.evidence = vec![report.evidence[0].clone(), changed, missing, unknown];
+        assert_eq!(
+            claim_states(ws.path(), &report),
+            vec![
+                ClaimState::Current,
+                ClaimState::Changed,
+                ClaimState::Missing,
+                ClaimState::Unknown
+            ]
+        );
+    }
+
+    /// Register a workspace at `<global>/repo` and write `records` as the
+    /// findings ledger of one coverage target under it.
+    fn seed_workspace_findings(
+        global: &std::path::Path,
+        records: &[FindingRecord],
+    ) -> std::path::PathBuf {
+        let repo = global.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws = rupu_workspace::Workspace {
+            id: "ws1".to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: None,
+            initial_branch: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        let workspaces_dir = global.join("workspaces");
+        std::fs::create_dir_all(&workspaces_dir).unwrap();
+        std::fs::write(
+            workspaces_dir.join("ws1.toml"),
+            toml::to_string(&ws).unwrap(),
+        )
+        .unwrap();
+        let paths = CoveragePaths::new(&repo, "tgt1");
+        paths.ensure_dir().unwrap();
+        let jsonl: String = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.findings, jsonl).unwrap();
+        repo
+    }
+
+    async fn get_json(app: Router, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn get_finding_serves_report_and_evidence_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rec = full_record("fnd_detail");
+        // Pin the first claim's hash to a real file so it reports `current`.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src/routes")).unwrap();
+        std::fs::write(repo.join("src/routes/notes.rs"), "fn a() {}\n").unwrap();
+        {
+            let report = rec.report.as_mut().unwrap();
+            let file = report.evidence[0].file.clone().unwrap();
+            let sha = rupu_coverage::report::sha256_file(&repo.join(&file)).unwrap();
+            report.evidence[0].sha256 = Some(sha);
+        }
+        let evidence_len = rec.report.as_ref().unwrap().evidence.len();
+        seed_workspace_findings(tmp.path(), &[rec, full_record("fnd_other")]);
+
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let app = routes().with_state(state);
+
+        let (status, json) = get_json(app.clone(), "/api/findings/fnd_detail").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["id"], "fnd_detail");
+        assert!(json["report"]["title"].is_string());
+        let ev = json["evidence_status"].as_array().unwrap();
+        assert_eq!(ev.len(), evidence_len);
+        assert_eq!(ev[0], "current");
+        // The detail endpoint serves the body, not the list-row summary.
+        assert!(json.get("report_summary").is_none());
+
+        let (status, json) = get_json(app.clone(), "/api/findings/fnd_nope").await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "finding fnd_nope not found");
+
+        // The list endpoint slims the same finding to a summary.
+        let (status, json) = get_json(app, "/api/findings").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let rows = json["findings"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row.get("report").is_none());
+            assert!(row["report_summary"]["root_cause"].is_string());
+        }
     }
 }

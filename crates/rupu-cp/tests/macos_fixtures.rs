@@ -1499,6 +1499,7 @@ fn findings_global_fixture_is_current() {
             permalink: Some(
                 "https://github.com/section9labs/rupu/blob/main/src/auth/session.rs#L42-L58".into(),
             ),
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_critical_1".into(),
                 file_path: Some("src/auth/session.rs".into()),
@@ -1531,6 +1532,7 @@ fn findings_global_fixture_is_current() {
             target_id: "web-api".into(),
             workflow_name: Some("nightly-security".into()),
             permalink: None,
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_high_1".into(),
                 file_path: None,
@@ -1559,6 +1561,7 @@ fn findings_global_fixture_is_current() {
             permalink: Some(
                 "https://github.com/section9labs/phi-cell/blob/main/src/train.rs#L100-L112".into(),
             ),
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_medium_1".into(),
                 file_path: Some("src/train.rs".into()),
@@ -1588,6 +1591,7 @@ fn findings_global_fixture_is_current() {
             target_id: "ml-pipeline".into(),
             workflow_name: Some("weekly-audit".into()),
             permalink: None,
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_info_1".into(),
                 file_path: None,
