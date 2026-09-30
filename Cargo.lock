@@ -4615,6 +4615,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "unicode-width",
  "which",
  "whoami",
  "zip",
