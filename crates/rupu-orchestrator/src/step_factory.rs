@@ -463,6 +463,7 @@ impl StepFactory for DefaultStepFactory {
             step_id: step_id.to_string(),
             on_tool_call: Some(audited_on_tool_call),
             on_stream_event: None,
+            on_usage: None,
             // Workflow-level concerns take precedence over agent-level concerns.
             // When the workflow declares `concerns:`, every step uses it —
             // the agent frontmatter's `concerns:` is ignored for this run.

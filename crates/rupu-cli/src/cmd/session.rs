@@ -7570,6 +7570,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: Some(on_stream_event),
+            on_usage: None,
             concerns: session.concerns.clone(),
             max_tokens: session
                 .max_tokens

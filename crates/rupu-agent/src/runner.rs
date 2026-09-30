@@ -101,6 +101,30 @@ pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 pub type OnToolCallCallback = std::sync::Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
 pub type OnStreamEventCallback = std::sync::Arc<dyn Fn(StreamEvent) + Send + Sync>;
 
+/// Which kind of LLM call a [`UsageTurn`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageKind {
+    /// A normal agent turn.
+    Turn,
+    /// The context-compaction summariser call.
+    Compaction,
+}
+
+/// One billed LLM call, as reported to [`AgentRunOpts::on_usage`]. The
+/// numbers are identical to the transcript's matching `Usage` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageTurn {
+    pub kind: UsageKind,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    /// Billable output (output + reasoning) — identical to the transcript.
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+pub type OnUsageCallback = std::sync::Arc<dyn Fn(&UsageTurn) + Send + Sync>;
+
 fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
     if input.len() <= max_bytes {
         return input;
@@ -303,6 +327,9 @@ pub(crate) fn rebuild_compacted(
 pub struct CompactionOutcome {
     pub messages: Vec<Message>,
     pub summarized_messages: usize,
+    /// Token usage of the summariser call itself (billed, but not part of
+    /// the turn-scoped run totals).
+    pub usage: rupu_providers::Usage,
 }
 
 /// Compact a conversation by summarising the middle messages. Returns
@@ -410,6 +437,7 @@ self-contained.";
     Ok(Some(CompactionOutcome {
         messages: rebuilt,
         summarized_messages,
+        usage: summary_resp.usage.clone(),
     }))
 }
 
@@ -470,6 +498,34 @@ async fn compact_context(
     {
         Ok(Some(outcome)) => {
             let middle_len = outcome.summarized_messages;
+            // The summariser call is billed like any other: record it in the
+            // transcript (tagged `purpose: compaction`) and tell the usage
+            // hook, so the run's spend is complete. Deliberately NOT added to
+            // `total_in`/`total_out` — those feed `RunComplete.total_tokens`
+            // and the context-budget arithmetic, which are turn-scoped.
+            let cu = &outcome.usage;
+            let billable = cu.output_tokens as u64 + cu.reasoning_tokens as u64;
+            if let Err(e) = writer.write(&Event::Usage {
+                provider: opts.provider_name.clone(),
+                model: opts.model.clone(),
+                served_model: None,
+                input_tokens: cu.input_tokens,
+                output_tokens: billable as u32,
+                cached_tokens: cu.cached_tokens,
+                purpose: Some("compaction".to_string()),
+            }) {
+                tracing::warn!(error = %e, "failed to write compaction usage event to transcript");
+            }
+            if let Some(cb) = &opts.on_usage {
+                cb(&UsageTurn {
+                    kind: UsageKind::Compaction,
+                    provider: opts.provider_name.clone(),
+                    model: opts.model.clone(),
+                    input_tokens: cu.input_tokens as u64,
+                    output_tokens: billable,
+                    cached_tokens: cu.cached_tokens as u64,
+                });
+            }
             *messages = outcome.messages;
             let post = serde_json::to_value(&*messages).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to serialize post-compaction messages");
@@ -683,6 +739,12 @@ pub struct AgentRunOpts {
     /// provider is generating. Used by session attach to surface
     /// real-time usage/progress without changing transcript schema.
     pub on_stream_event: Option<OnStreamEventCallback>,
+    /// Per-LLM-call usage hook (spec 2026-09-29 §3.3). Invoked synchronously
+    /// right after every transcript `Usage` write — normal turns AND the
+    /// compaction summariser — before any early exit, so no billed call can
+    /// be missed. Must be cheap and must never panic; the orchestrator uses
+    /// it to append the run's usage ledger.
+    pub on_usage: Option<OnUsageCallback>,
     /// Coverage concerns block. When `Some`, the runner flattens the
     /// catalog, writes a snapshot, injects coverage tools, and prepends
     /// the catalog to the system prompt. `None` (default) disables all
@@ -728,6 +790,9 @@ pub struct RunResult {
     pub turns: u32,
     pub total_tokens_in: u64,
     pub total_tokens_out: u64,
+    /// Sum of the provider-reported cached input tokens across the run's
+    /// turns (compaction summariser calls excluded, like the other totals).
+    pub total_tokens_cached: u64,
     pub final_messages: Vec<Message>,
     /// `true` when the run stopped at a cooperative pause boundary rather
     /// than completing or erroring (see [`AgentRunOpts::pause`]). The
@@ -1073,6 +1138,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     let initial_turn_idx = turn_idx;
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
+    let mut total_cached: u64 = 0;
     let mut runtime_mode = parse_mode_for_runtime(&opts.mode_str);
     // Clone the cooperative pause token so it can be awaited in `select!`
     // arms without borrowing `opts` (which the provider call borrows
@@ -1315,6 +1381,17 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 cached_tokens: resp.usage.cached_tokens,
                 purpose: None,
             })?;
+            total_cached += resp.usage.cached_tokens as u64;
+            if let Some(cb) = &opts.on_usage {
+                cb(&UsageTurn {
+                    kind: UsageKind::Turn,
+                    provider: opts.provider_name.clone(),
+                    model: opts.model.clone(),
+                    input_tokens: resp.usage.input_tokens as u64,
+                    output_tokens: billable_output_tokens,
+                    cached_tokens: resp.usage.cached_tokens as u64,
+                });
+            }
 
             // Proactive context compaction: if the previous turn's input exceeded
             // the configured threshold, summarise older turns before building the
@@ -1625,6 +1702,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             turns: turn_idx.saturating_sub(initial_turn_idx),
             total_tokens_in: total_in,
             total_tokens_out: total_out,
+            total_tokens_cached: total_cached,
             final_messages: messages,
             paused,
             error: terminal_error,
@@ -1788,6 +1866,7 @@ mod on_tool_call_tests {
             step_id: "s1".into(),
             on_tool_call: Some(cb),
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -1888,6 +1967,7 @@ mod on_tool_call_tests {
             step_id: "s1".into(),
             on_tool_call: Some(cb),
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -2002,6 +2082,7 @@ mod on_tool_call_tests {
             step_id: "s1".into(),
             on_tool_call: Some(cb),
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -2085,6 +2166,7 @@ mod on_tool_call_tests {
             step_id: "s1".into(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -2161,6 +2243,7 @@ mod on_tool_call_tests {
             step_id: "s1".into(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -2258,6 +2341,7 @@ mod on_tool_call_tests {
                 step_id: "s1".into(),
                 on_tool_call: None,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -2549,6 +2633,14 @@ pub enum ScriptedTurn {
         stop: StopReason,
         usage: Usage,
     },
+    /// Like `AssistantBlocks`, but carries a full [`Usage`] instead of the
+    /// fixed 1/1 — needed to script a tool-use turn with specific token
+    /// counts (e.g. usage-hook / compaction-trigger tests).
+    AssistantBlocksWithUsage {
+        content: Vec<ContentBlock>,
+        stop: StopReason,
+        usage: Usage,
+    },
     /// Replay an arbitrary block sequence verbatim. Use when a turn's exact
     /// block shape matters — e.g. `Reasoning` before `Text`, or several `Text`
     /// blocks in one turn — which the higher-level variants can't express.
@@ -2625,6 +2717,17 @@ impl LlmProvider for MockProvider {
                     output_tokens: 1,
                     ..Default::default()
                 },
+            }),
+            ScriptedTurn::AssistantBlocksWithUsage {
+                content,
+                stop,
+                usage,
+            } => Ok(LlmResponse {
+                id: "mock".to_string(),
+                model: "mock-1".to_string(),
+                content,
+                stop_reason: Some(stop),
+                usage,
             }),
             ScriptedTurn::AssistantTextWithUsage { text, stop, usage } => Ok(LlmResponse {
                 id: "mock".to_string(),
@@ -3046,6 +3149,7 @@ mod compaction_tests {
             step_id: "s1".into(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -3122,6 +3226,9 @@ mod compaction_tests {
         .await;
 
         let outcome = result.expect("no provider error").expect("should compact");
+        // The summariser call's own usage is surfaced for billing/ledger.
+        assert_eq!(outcome.usage.input_tokens, 500);
+        assert_eq!(outcome.usage.output_tokens, 10);
         assert_eq!(
             outcome.messages[0].role,
             Role::User,
@@ -3309,6 +3416,7 @@ mod pause_tests {
             step_id: "s1".into(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -3647,6 +3755,7 @@ mod reasoning_tests {
             step_id: "s1".into(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
