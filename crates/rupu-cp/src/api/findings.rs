@@ -3,11 +3,16 @@ use crate::{
     state::AppState,
 };
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
+    http::{header, HeaderValue},
+    response::Response,
     routing::get,
     Json, Router,
 };
-use rupu_coverage::report::{summarize, ReportSummary};
+use rupu_coverage::report::{
+    summarize, ArtifactKind, ArtifactStorage, ArtifactStore, ReportSummary,
+};
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
 use rupu_orchestrator::{executor::Event, runs::RunStore};
 use rupu_workspace::WorkspaceStore;
@@ -19,6 +24,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/findings", get(list_findings))
         .route("/api/findings/:id", get(get_finding))
+        .route("/api/findings/:id/artifacts/:sha256", get(get_artifact))
 }
 
 /// A single finding plus its provenance (which workspace / project / coverage
@@ -448,6 +454,15 @@ async fn list_findings(
     Ok(Json(resp))
 }
 
+/// Find one finding by id across every registered workspace. Synchronous and
+/// potentially slow (it reads every coverage ledger): async callers must run
+/// it under `spawn_blocking`.
+fn find_finding(global: &std::path::Path, id: &str) -> Option<FindingOut> {
+    collect_all_findings(global)
+        .into_iter()
+        .find(|f| f.record.id == id)
+}
+
 /// `GET /api/findings/:id` — the full finding (report body included) plus a
 /// per-claim staleness verdict against the owning workspace's current files.
 async fn get_finding(
@@ -455,15 +470,12 @@ async fn get_finding(
     Path(id): Path<String>,
 ) -> ApiResult<Json<FindingDetail>> {
     let global = s.global_dir.clone();
-    let found = tokio::task::spawn_blocking(move || {
-        collect_all_findings(&global)
-            .into_iter()
-            .find(|f| f.record.id == id)
-            .ok_or(id)
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut finding = found.map_err(|id| ApiError::not_found(format!("finding {id} not found")))?;
+    let id_for_lookup = id.clone();
+    let found = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut finding =
+        found.ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
     if let Ok(run) = s.run_store.load(&finding.record.declared_by.run_id) {
         finding.workflow_name = Some(run.workflow_name);
     }
@@ -485,6 +497,127 @@ async fn get_finding(
         finding,
         evidence_status,
     }))
+}
+
+/// The `filename` an artifact is offered under: the last `/`-separated segment
+/// of its recorded path, with `"`, `\` and control characters replaced by `_`
+/// so the value can never break out of the quoted `Content-Disposition`
+/// parameter.
+fn safe_filename(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c == '"' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "artifact".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// `GET /api/findings/:id/artifacts/:sha256` — the bytes of an artifact the
+/// finding's report references.
+///
+/// Only artifacts listed in the finding's own `report.artifacts` are served, so
+/// this can never be used to read an arbitrary blob out of the shared store.
+/// Artifacts are never rendered as HTML: text is `text/plain` inline, anything
+/// else an `application/octet-stream` attachment, always `nosniff`.
+async fn get_artifact(
+    State(s): State<AppState>,
+    Path((id, sha)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let store = ArtifactStore::new(s.global_dir.join("findings").join("artifacts"));
+    let blob = store.blob_path_checked(&sha).ok_or_else(|| {
+        ApiError::bad_request("artifact id must be a 64-character lowercase sha256")
+    })?;
+    let global = s.global_dir.clone();
+    let id_for_lookup = id.clone();
+    let finding = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    let artifact = finding
+        .record
+        .report
+        .as_ref()
+        .and_then(|r| r.artifacts.iter().find(|a| a.sha256 == sha))
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("this finding does not reference that artifact"))?;
+
+    let path = match (artifact.stored, artifact.host.as_deref()) {
+        (Some(ArtifactStorage::External), Some(host)) => {
+            return Err(ApiError::not_found(format!(
+                "artifact is stored on host {host}; remote fetch is not supported yet"
+            )));
+        }
+        (Some(ArtifactStorage::External), None) => {
+            let ws = crate::api::code::load_workspace(&s, &finding.ws_id)?;
+            let gone = || ApiError::not_found("artifact is no longer in the workspace");
+            let p = crate::api::source::resolve_under_workspace(
+                std::path::Path::new(&ws.path),
+                &artifact.path,
+            )
+            .map_err(|_| gone())?;
+            if !p.is_file() {
+                return Err(gone());
+            }
+            // Hashing reads the whole file, so keep it off the runtime.
+            let hashed = p.clone();
+            let now =
+                tokio::task::spawn_blocking(move || rupu_coverage::report::sha256_file(&hashed))
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
+            if now != sha {
+                return Err(ApiError::conflict(
+                    "artifact changed since the finding was recorded",
+                ));
+            }
+            p
+        }
+        _ => {
+            if !blob.is_file() {
+                return Err(ApiError::not_found("artifact blob missing from the store"));
+            }
+            blob
+        }
+    };
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    let name = safe_filename(&artifact.path);
+    let (ctype, disposition) = match artifact.kind {
+        Some(ArtifactKind::Text) => (
+            "text/plain; charset=utf-8",
+            format!("inline; filename=\"{name}\""),
+        ),
+        _ => (
+            "application/octet-stream",
+            format!("attachment; filename=\"{name}\""),
+        ),
+    };
+    let mut resp = Response::new(body);
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -1264,5 +1397,448 @@ mod tests {
         assert_eq!(json["id"], "fnd_summary");
         assert_eq!(json["evidence_status"], serde_json::json!([]));
         assert!(json.get("report").is_none());
+    }
+
+    // ---- GET /api/findings/:id/artifacts/:sha256 ----
+
+    use rupu_coverage::report::{ArtifactKind, ArtifactRef, ArtifactStorage, ArtifactStore};
+
+    fn artifact_ref(
+        path: &str,
+        sha: &str,
+        size: u64,
+        kind: Option<ArtifactKind>,
+        stored: Option<ArtifactStorage>,
+        host: Option<&str>,
+    ) -> ArtifactRef {
+        ArtifactRef {
+            path: path.to_string(),
+            sha256: sha.to_string(),
+            size,
+            kind,
+            stored,
+            host: host.map(str::to_string),
+        }
+    }
+
+    /// Copy `bytes` into the content-addressed store under
+    /// `<global>/findings/artifacts` and return its sha256.
+    fn store_blob(global: &std::path::Path, bytes: &[u8]) -> String {
+        let scratch = global.join("blob-scratch.tmp");
+        std::fs::write(&scratch, bytes).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&scratch).unwrap();
+        let dest = ArtifactStore::new(global.join("findings").join("artifacts")).blob_path(&sha);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(&scratch, &dest).unwrap();
+        std::fs::remove_file(&scratch).unwrap();
+        sha
+    }
+
+    /// Seed workspace `ws1` with one full-profile finding `fnd_art` whose
+    /// report lists exactly `artifacts`.
+    fn seed_artifact_finding(global: &std::path::Path, artifacts: Vec<ArtifactRef>) {
+        let mut rec = full_record("fnd_art");
+        rec.report.as_mut().unwrap().artifacts = artifacts;
+        seed_workspace_findings(global, &[rec]);
+    }
+
+    fn app_for(global: &std::path::Path) -> Router {
+        let state = AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default());
+        routes().with_state(state)
+    }
+
+    async fn get_raw(
+        app: Router,
+        uri: &str,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt as _;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    fn error_of(body: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    fn header_str<'a>(h: &'a axum::http::HeaderMap, name: &str) -> &'a str {
+        h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn artifact_copied_text_is_served_inline_as_plain_text() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = b"<html><script>alert(1)</script></html>\n";
+        let sha = store_blob(tmp.path(), body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "logs/notes.txt",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        // Even HTML-looking text is plain text, never rendered.
+        assert!(header_str(&headers, "content-type").starts_with("text/plain"));
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        let disp = header_str(&headers, "content-disposition");
+        assert!(disp.starts_with("inline"), "disposition: {disp}");
+        assert!(
+            disp.contains("filename=\"notes.txt\""),
+            "disposition: {disp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_copied_binary_is_an_octet_stream_attachment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body: &[u8] = &[0, 159, 146, 150, 1, 2, 255];
+        let sha = store_blob(tmp.path(), body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "out/capture.pcap",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Binary),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        assert_eq!(
+            header_str(&headers, "content-type"),
+            "application/octet-stream"
+        );
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        let disp = header_str(&headers, "content-disposition");
+        assert!(disp.starts_with("attachment"), "disposition: {disp}");
+        assert!(
+            disp.contains("filename=\"capture.pcap\""),
+            "disposition: {disp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_not_listed_on_the_finding_is_404_even_if_the_blob_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let listed = store_blob(tmp.path(), b"listed\n");
+        // A blob that is in the store (e.g. another finding's artifact) but is
+        // not referenced by `fnd_art`.
+        let unlisted = store_blob(tmp.path(), b"someone else's secret\n");
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "a.txt",
+                &listed,
+                7,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{unlisted}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_of(&bytes),
+            "this finding does not reference that artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_unknown_finding_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = store_blob(tmp.path(), b"x\n");
+        seed_artifact_finding(tmp.path(), vec![]);
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_nope/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "finding fnd_nope not found");
+    }
+
+    #[tokio::test]
+    async fn artifact_malformed_sha_is_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = store_blob(tmp.path(), b"x\n");
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "x.txt",
+                &sha,
+                2,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let app = app_for(tmp.path());
+        for bad in [
+            sha.to_uppercase(),
+            sha[..63].to_string(),
+            format!("{sha}0"),
+            "z".repeat(64),
+            "abc".to_string(),
+        ] {
+            let (status, _, _) = get_raw(
+                app.clone(),
+                &format!("/api/findings/fnd_art/artifacts/{bad}"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "sha `{bad}` must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_copied_but_missing_from_the_store_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Listed, but no blob was ever written to the store.
+        let sha = "a".repeat(64);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "gone.txt",
+                &sha,
+                1,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "artifact blob missing from the store");
+    }
+
+    #[tokio::test]
+    async fn artifact_external_on_a_remote_host_is_404_naming_the_host() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = "b".repeat(64);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "/var/log/big.bin",
+                &sha,
+                9_999_999_999,
+                Some(ArtifactKind::Binary),
+                Some(ArtifactStorage::External),
+                Some("build-box-7"),
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        let msg = error_of(&bytes);
+        assert!(msg.contains("build-box-7"), "message: {msg}");
+        assert!(
+            msg.contains("remote fetch is not supported yet"),
+            "message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_streams_when_the_workspace_file_is_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("dumps")).unwrap();
+        let body = b"external but intact\n";
+        std::fs::write(repo.join("dumps/big.log"), body).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("dumps/big.log")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dumps/big.log",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        assert!(header_str(&headers, "content-type").starts_with("text/plain"));
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_changed_since_recording_is_409() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("dump.log"), b"as recorded\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("dump.log")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dump.log",
+                &sha,
+                12,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        // The workspace file is edited after the finding was recorded.
+        std::fs::write(repo.join("dump.log"), b"edited later\n").unwrap();
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error_of(&bytes),
+            "artifact changed since the finding was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_missing_from_the_workspace_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = "c".repeat(64);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "deleted.log",
+                &sha,
+                3,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "artifact is no longer in the workspace");
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_never_escapes_the_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `<global>/outside.txt` is next to the workspace at `<global>/repo`,
+        // and it really does hash to the recorded value: only the escape check
+        // can explain a refusal.
+        std::fs::write(tmp.path().join("outside.txt"), b"not yours\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&tmp.path().join("outside.txt")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![
+                artifact_ref(
+                    "../outside.txt",
+                    &sha,
+                    10,
+                    Some(ArtifactKind::Text),
+                    Some(ArtifactStorage::External),
+                    None,
+                ),
+                artifact_ref(
+                    tmp.path().join("outside.txt").to_str().unwrap(),
+                    &sha,
+                    10,
+                    Some(ArtifactKind::Text),
+                    Some(ArtifactStorage::External),
+                    None,
+                ),
+            ],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "artifact is no longer in the workspace");
+    }
+
+    #[tokio::test]
+    async fn artifact_filename_quotes_are_sanitized_in_the_disposition() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = store_blob(tmp.path(), b"hi\n");
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dir/evil\"; x=\"y.txt",
+                &sha,
+                3,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, _) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            header_str(&headers, "content-disposition"),
+            "inline; filename=\"evil_; x=_y.txt\""
+        );
+    }
+
+    #[test]
+    fn safe_filename_takes_the_basename_and_neutralizes_header_breakers() {
+        assert_eq!(safe_filename("a/b/notes.txt"), "notes.txt");
+        assert_eq!(safe_filename("notes.txt"), "notes.txt");
+        assert_eq!(safe_filename("we\"ird\\name.txt"), "we_ird_name.txt");
+        assert_eq!(safe_filename("x\r\ny\tz.txt"), "x__y_z.txt");
+        // A trailing slash leaves nothing to name the download with.
+        assert_eq!(safe_filename("dir/"), "artifact");
+        assert_eq!(safe_filename(""), "artifact");
     }
 }
