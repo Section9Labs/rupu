@@ -183,7 +183,12 @@ fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsa
         cost_usd: summary_val.get("total_cost_usd").and_then(|x| x.as_f64()),
         priced: !partial_at(summary_val),
         runs: u64_at(summary_val, "total_runs"),
-        partial: false,
+        // A remote that reports its totals as a lower bound stays one here;
+        // older reports carry no `partial` field.
+        partial: summary_val
+            .get("partial")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
     };
 
     let empty = Vec::new();
@@ -1063,6 +1068,27 @@ mod tests {
             row.host_id.is_empty(),
             "the caller tags rows with the real host id"
         );
+    }
+
+    /// A remote that says its totals are a lower bound (`summary.partial`)
+    /// stays partial here; a report without the field is not partial.
+    #[test]
+    fn remote_usage_report_carries_partial_when_present() {
+        let mut report = serde_json::json!({
+            "summary": {
+                "total_input_tokens": 7, "total_output_tokens": 3,
+                "total_cached_tokens": 0, "total_tokens": 10,
+                "total_runs": 1, "total_cost_usd": 0.1, "cost_partial": false,
+                "partial": true
+            },
+            "rows": []
+        });
+        let body = usage_body_from_remote_report(&report).expect("mappable");
+        assert!(body.summary.partial, "summary.partial: true is kept");
+
+        report["summary"].as_object_mut().unwrap().remove("partial");
+        let body = usage_body_from_remote_report(&report).expect("mappable");
+        assert!(!body.summary.partial, "absent -> not partial");
     }
 
     /// A partially-priced remote must not be reported as fully priced, and

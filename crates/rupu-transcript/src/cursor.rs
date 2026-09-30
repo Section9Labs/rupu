@@ -94,13 +94,23 @@ impl JsonlCursor {
         let mut f = File::open(path)?;
         f.seek(SeekFrom::Start(self.offset))?;
         let mut carry: Vec<u8> = Vec::new();
-        let mut buf = vec![0u8; CHUNK];
+        // Sized to what is pending (capped at CHUNK), not a fixed 4 MiB per
+        // drain: a live tail usually has a few hundred new bytes. If the file
+        // grew past the stat mid-drain, the buffer grows to CHUNK so the rest
+        // is still read in large chunks.
+        let pending = usize::try_from(meta.len() - self.offset).unwrap_or(CHUNK);
+        let mut buf = vec![0u8; pending.clamp(1, CHUNK)];
+        let mut read_total = 0usize;
         loop {
             let n = f.read(&mut buf)?;
             if n == 0 {
                 break;
             }
             carry.extend_from_slice(&buf[..n]);
+            read_total = read_total.saturating_add(n);
+            if read_total > pending && buf.len() < CHUNK {
+                buf.resize(CHUNK, 0);
+            }
             let Some(last_nl) = carry.iter().rposition(|b| *b == b'\n') else {
                 continue;
             };

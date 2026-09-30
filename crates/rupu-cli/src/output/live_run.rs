@@ -154,11 +154,27 @@ pub struct StepState {
 }
 
 impl StepState {
-    fn done_units(&self) -> usize {
+    /// The rows the `done/total` summary counts. A real fan-out's rows are
+    /// its indexed units — dispatch-child slots appended to the same vec are
+    /// not units (`fanout_total` counts indexed rows only). A step with no
+    /// indexed rows at all — a `parallel` step, which emits no unit events,
+    /// or a plain step whose agent dispatches — counts every row.
+    fn counted_units(&self) -> impl Iterator<Item = &UnitState> {
+        let indexed = self.units.iter().any(|u| u.index.is_some());
         self.units
             .iter()
+            .filter(move |u| !indexed || u.index.is_some())
+    }
+
+    fn done_units(&self) -> usize {
+        self.counted_units()
             .filter(|u| matches!(u.status, NodeStatus::Complete | NodeStatus::Failed))
             .count()
+    }
+
+    fn total_units(&self) -> usize {
+        self.fanout_total
+            .unwrap_or_else(|| self.counted_units().count())
     }
 }
 
@@ -758,7 +774,8 @@ fn fanout_unit_mut(units: &mut Vec<UnitState>, index: usize) -> &mut UnitState {
 /// `progress = (completed_steps + active_step_fraction) / total`, where
 /// `active_step_fraction` is:
 ///   - fan-out (`for_each` / `parallel`): `done_units / total_units`
-///     (units in `Complete`/`Failed` over `fanout_total` or `units.len()`),
+///     (counted units in `Complete`/`Failed` over `fanout_total` or the
+///     counted-unit count — see `StepState::counted_units`),
 ///   - panel: `iteration / max_iterations`,
 ///   - linear / unknown: `0.0`.
 ///
@@ -774,7 +791,7 @@ fn overall_progress_fraction(state: &LiveRunState) -> f64 {
         .find(|s| matches!(s.status, NodeStatus::Active | NodeStatus::Working))
         .map(|step| match step.kind {
             StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
-                let total_units = step.fanout_total.unwrap_or(step.units.len());
+                let total_units = step.total_units();
                 if total_units == 0 {
                     0.0
                 } else {
@@ -1018,7 +1035,7 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
             }
             StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
                 let is_active = matches!(step.status, NodeStatus::Active | NodeStatus::Working);
-                let total_units = step.fanout_total.unwrap_or(step.units.len());
+                let total_units = step.total_units();
                 let done = step.done_units();
                 let kind_word = match step.kind {
                     StepKind::ForEach => "for_each",
@@ -2316,6 +2333,102 @@ mod tests {
         state.active.agent = None;
         state.active.active_unit_transcript = None;
         state
+    }
+
+    /// `fanout_state` with `assess` reset to a single-unit `for_each`
+    /// (no rows yet) whose agent dispatches two children, both completed.
+    fn one_unit_fanout_with_dispatch_children() -> LiveRunState {
+        let mut state = fanout_state(true);
+        let assess = state.steps.iter_mut().find(|s| s.id == "assess").unwrap();
+        assess.units.clear();
+        assess.fanout_total = None;
+        state.apply(&WfEvent::UnitStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 0,
+            unit_key: "only-unit".into(),
+            agent: Some("fanner".into()),
+            transcript_path: std::path::PathBuf::from("/runs/only-unit.jsonl"),
+            host: None,
+        });
+        for child in ["sub_kid_a", "sub_kid_b"] {
+            state.apply(&WfEvent::DispatchStarted {
+                run_id: "run_01ABC".into(),
+                sub_run_id: child.into(),
+                agent: Some("helper".into()),
+                transcript_path: std::path::PathBuf::from(format!("/runs/{child}.jsonl")),
+            });
+            state.apply(&WfEvent::DispatchCompleted {
+                run_id: "run_01ABC".into(),
+                sub_run_id: child.into(),
+                success: true,
+                tokens_in: 3,
+                tokens_out: 1,
+            });
+        }
+        state
+    }
+
+    #[test]
+    fn fanout_done_count_ignores_dispatch_child_rows() {
+        let mut state = one_unit_fanout_with_dispatch_children();
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        assert_eq!(step.units.len(), 3, "1 unit + 2 dispatch-child rows");
+        assert_eq!(step.done_units(), 0, "the one unit is still working");
+        assert_eq!(step.total_units(), 1);
+        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
+        assert!(
+            rows.iter().any(|r| r.contains("0/1")),
+            "header shows 0/1, never 2/3: {rows:#?}"
+        );
+
+        state.apply(&WfEvent::UnitCompleted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 0,
+            unit_key: "only-unit".into(),
+            success: true,
+            tokens_in: 10,
+            tokens_out: 2,
+            host: None,
+        });
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        assert_eq!(step.done_units(), 1);
+        assert_eq!(step.total_units(), 1);
+        let rows = stripped(render_graph(&state, &empty_workflow(), 79));
+        assert!(
+            rows.iter().any(|r| r.contains("1/1")) && !rows.iter().any(|r| r.contains("3/1")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_step_with_only_dispatch_children_still_counts_them() {
+        // A `parallel` step emits no unit events, so its rows are all
+        // dispatch children: they stay the done/total population.
+        let mut state = dispatch_state();
+        let report = state.steps.iter_mut().find(|s| s.id == "report").unwrap();
+        report.kind = StepKind::Parallel;
+        for (child, done) in [("sub_p1", true), ("sub_p2", false)] {
+            state.apply(&WfEvent::DispatchStarted {
+                run_id: "run_01ABC".into(),
+                sub_run_id: child.into(),
+                agent: Some("helper".into()),
+                transcript_path: std::path::PathBuf::from(format!("/runs/{child}.jsonl")),
+            });
+            if done {
+                state.apply(&WfEvent::DispatchCompleted {
+                    run_id: "run_01ABC".into(),
+                    sub_run_id: child.into(),
+                    success: true,
+                    tokens_in: 1,
+                    tokens_out: 1,
+                });
+            }
+        }
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.done_units(), 1);
+        assert_eq!(step.total_units(), 2);
     }
 
     #[test]

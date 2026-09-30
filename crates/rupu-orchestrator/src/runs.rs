@@ -857,22 +857,37 @@ pub fn known_transcript_from_event_line(line: &str) -> Option<KnownTranscript> {
 }
 
 /// Transcripts a single `step_results.jsonl` line names: the step's own
-/// plus every fan-out item's, all labelled with the step id. A malformed
-/// line yields nothing.
+/// plus every fan-out item's, all labelled with the step id. Parsed
+/// leniently as JSON (like [`known_transcript_from_event_line`]) — only
+/// `step_id`, `transcript_path` and `items[].transcript_path` are read — so
+/// a newer writer's record shape never drops a step or its items from
+/// discovery. A line that isn't a JSON object with a string `step_id`
+/// yields nothing.
 pub fn known_transcripts_from_step_result_line(line: &str) -> Vec<KnownTranscript> {
-    let Ok(rec) = serde_json::from_str::<StepResultRecord>(line) else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
+    let Some(step_id) = v.get("step_id").and_then(|s| s.as_str()) else {
+        return Vec::new();
+    };
+    let path_of = |o: &serde_json::Value| {
+        o.get("transcript_path")
+            .and_then(|p| p.as_str())
+            .map(PathBuf::from)
+    };
     let mut out = Vec::new();
-    out.extend(known(
-        rec.transcript_path.clone(),
-        Some(rec.step_id.clone()),
-    ));
-    for item in &rec.items {
-        out.extend(known(
-            item.transcript_path.clone(),
-            Some(rec.step_id.clone()),
-        ));
+    if let Some(p) = path_of(&v) {
+        out.extend(known(p, Some(step_id.to_string())));
+    }
+    for item in v
+        .get("items")
+        .and_then(|i| i.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(p) = path_of(item) {
+            out.extend(known(p, Some(step_id.to_string())));
+        }
     }
     out
 }
@@ -5788,5 +5803,42 @@ mod tests {
             "{got:?}"
         );
         assert!(known_transcripts_from_step_result_line("{not json").is_empty());
+    }
+
+    #[test]
+    fn known_transcripts_from_step_result_line_survives_a_newer_writers_shape() {
+        // A newer writer: an unknown `kind`, fields this binary doesn't know,
+        // and items missing fields this binary's record type requires. Usage
+        // discovery needs only the ids and paths.
+        let line = serde_json::json!({
+            "step_id": "s9",
+            "run_id": "run_WF",
+            "transcript_path": "/x/run_C.jsonl",
+            "kind": "quantum_fanout",
+            "novel_field": {"nested": true},
+            "items": [
+                {"transcript_path": "/x/run_D.jsonl", "shiny": 1},
+                {"index": 1},
+                {"transcript_path": "/x/run_E.jsonl"}
+            ]
+        })
+        .to_string();
+        let got = known_transcripts_from_step_result_line(&line);
+        let pairs: Vec<(&str, Option<&str>)> = got
+            .iter()
+            .map(|k| (k.key.as_str(), k.step_id.as_deref()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("run_C", Some("s9")),
+                ("run_D", Some("s9")),
+                ("run_E", Some("s9"))
+            ],
+            "{got:?}"
+        );
+        // No step id: nothing to label the transcripts with.
+        let anon = serde_json::json!({"transcript_path": "/x/run_F.jsonl"}).to_string();
+        assert!(known_transcripts_from_step_result_line(&anon).is_empty());
     }
 }

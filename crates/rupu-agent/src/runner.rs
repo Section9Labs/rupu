@@ -740,10 +740,13 @@ pub struct AgentRunOpts {
     /// real-time usage/progress without changing transcript schema.
     pub on_stream_event: Option<OnStreamEventCallback>,
     /// Per-LLM-call usage hook (spec 2026-09-29 §3.3). Invoked synchronously
-    /// right after every transcript `Usage` write — normal turns AND the
-    /// compaction summariser — before any early exit, so no billed call can
-    /// be missed. Must be cheap and must never panic; the orchestrator uses
-    /// it to append the run's usage ledger.
+    /// once per billed call — normal turns AND the compaction summariser —
+    /// alongside its transcript `Usage` event and before any early exit, so
+    /// no billed call can be missed: a normal turn's hook fires just BEFORE
+    /// its `Usage` write (a failed write, which aborts the run, still leaves
+    /// the call reported); the compaction hook fires after its best-effort
+    /// write, whose failure is only logged. Must be cheap and must never
+    /// panic; the orchestrator uses it to append the run's usage ledger.
     pub on_usage: Option<OnUsageCallback>,
     /// Coverage concerns block. When `Some`, the runner flattens the
     /// catalog, writes a snapshot, injects coverage tools, and prepends
@@ -1365,6 +1368,19 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 resp.usage.output_tokens as u64 + resp.usage.reasoning_tokens as u64;
             total_in += resp.usage.input_tokens as u64;
             total_out += billable_output_tokens;
+            // The call is billed whether or not the transcript write below
+            // succeeds: report it to the usage hook (the run's ledger) FIRST,
+            // so a failed write can't drop its row.
+            if let Some(cb) = &opts.on_usage {
+                cb(&UsageTurn {
+                    kind: UsageKind::Turn,
+                    provider: opts.provider_name.clone(),
+                    model: opts.model.clone(),
+                    input_tokens: resp.usage.input_tokens as u64,
+                    output_tokens: billable_output_tokens,
+                    cached_tokens: resp.usage.cached_tokens as u64,
+                });
+            }
             writer.write(&Event::Usage {
                 provider: opts.provider_name.clone(),
                 model: opts.model.clone(), // requested model (meaningful attribution; priced)
@@ -1382,16 +1398,6 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 purpose: None,
             })?;
             total_cached += resp.usage.cached_tokens as u64;
-            if let Some(cb) = &opts.on_usage {
-                cb(&UsageTurn {
-                    kind: UsageKind::Turn,
-                    provider: opts.provider_name.clone(),
-                    model: opts.model.clone(),
-                    input_tokens: resp.usage.input_tokens as u64,
-                    output_tokens: billable_output_tokens,
-                    cached_tokens: resp.usage.cached_tokens as u64,
-                });
-            }
 
             // Proactive context compaction: if the previous turn's input exceeded
             // the configured threshold, summarise older turns before building the

@@ -146,8 +146,10 @@ anywhere inside the workflow run (`RunStore::usage_ledger_path(run_id)`).
   `AgentRunOpts.on_usage: Option<OnUsageCallback>`, where
   `OnUsageCallback = Arc<dyn Fn(&UsageTurn) + Send + Sync>` and
   `UsageTurn { kind, provider, model, input_tokens, output_tokens, cached_tokens }`.
-  - It is invoked immediately after every transcript `Event::Usage` write:
-    `runner.rs` ~1316, *before* any early exit.
+  - It is invoked once per billed call, alongside its transcript `Event::Usage`
+    write (`runner.rs` ~1316), *before* any early exit. For a normal turn it
+    fires just *before* the write, so a failed transcript write (which aborts
+    the run) still leaves the billed call in the ledger.
   - `compact_messages` gains a `Usage` transcript event and an `on_usage(kind:
     compaction)` call for the summariser request.
 - **Workflow steps.** `dispatch_one` (`rupu-orchestrator/src/runner.rs` ~7449) is
@@ -292,7 +294,8 @@ Transcripts already claimed by any run's K (for example placed-unit mirrors) are
 excluded.
 
 `UsageRunRow` gains `kind: "workflow" | "agent" | "session"`; standalone rows have
-`workflow_name: null`. Session usage (`api/sessions.rs::session_usage` and the
+`workflow_name: ""` (the empty string, not `null`: installed macOS builds decode
+`workflow_name` as a non-optional string, so `null` would break them). Session usage (`api/sessions.rs::session_usage` and the
 timeline) folds the session's run transcripts instead of `session.json` totals.
 
 ### 5.3 Live endpoint (Plan 2)
