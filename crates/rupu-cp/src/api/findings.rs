@@ -1440,11 +1440,12 @@ mod tests {
         );
     }
 
+    // Claims cite source files: far below the 500 MiB artifact cap.
+    const _: () = assert!(CLAIM_HASH_MAX_BYTES < rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES);
+
     #[test]
     fn claim_states_use_the_dedicated_claim_hash_cap_not_the_artifact_cap() {
-        // Claims cite source files: 64 MiB, far below the 500 MiB artifact cap.
         assert_eq!(CLAIM_HASH_MAX_BYTES, 64 * 1024 * 1024);
-        assert!(CLAIM_HASH_MAX_BYTES < rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES);
         let ws = tempfile::TempDir::new().unwrap();
         // A sparse file one byte over the cap: never read, so this stays cheap.
         let big = std::fs::File::create(ws.path().join("big.log")).unwrap();
