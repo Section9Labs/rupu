@@ -966,6 +966,29 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_ms_handles_live_finished_and_backwards_clock() {
+        use chrono::{Duration, TimeZone};
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap();
+
+        // Not started: nothing to measure.
+        assert_eq!(RunView::default().elapsed_ms(t0), None);
+
+        // Live: measured against `now`.
+        let mut v = RunView {
+            started_at: Some(t0),
+            ..Default::default()
+        };
+        assert_eq!(v.elapsed_ms(t0 + Duration::seconds(5)), Some(5_000));
+
+        // Clock running backwards clamps to 0 rather than wrapping to a huge u64.
+        assert_eq!(v.elapsed_ms(t0 - Duration::seconds(1)), Some(0));
+
+        // Finished wins: `finished_at`, not `now`.
+        v.finished_at = Some(t0 + Duration::seconds(3));
+        assert_eq!(v.elapsed_ms(t0 + Duration::seconds(100)), Some(3_000));
+    }
+
+    #[test]
     fn step_status_maps_to_palette() {
         use crate::output::palette::Status;
         assert!(matches!(step_status(StepState::Complete), Status::Complete));
