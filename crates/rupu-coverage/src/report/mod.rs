@@ -6,6 +6,7 @@
 //! exactly once. Design: docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md
 
 pub mod profile;
+pub mod schema;
 pub mod types;
 pub mod validate;
 
