@@ -563,6 +563,9 @@ fn an_unclosed_html_block_in_prose_does_not_swallow_the_later_sections() {
         "<![CDATA[ note body",
         "<style>\nbody { display: none }",
         "<div>\n\n<pre>",
+        // A lone CR ends a line in CommonMark too.
+        "Summary.\r<script>",
+        "Summary.\r\r<!-- todo",
     ] {
         let md = with_description(description);
         // A real parser still sees every later section as a heading.

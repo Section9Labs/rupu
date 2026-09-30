@@ -195,9 +195,12 @@ fn shift_headings(md: &str) -> String {
 /// Agent Markdown made safe to splice into the report at a line start: HTML
 /// block starts escaped, headings shifted below the document's own, and an
 /// unclosed top-level fence closed (last, since escaping can expose a fence
-/// that an HTML block used to hide).
+/// that an HTML block used to hide). Line endings are normalized to `\n`
+/// first: CommonMark also ends a line at a lone `\r`, which the line-based
+/// passes would otherwise not see as a line start.
 fn agent_markdown(md: &str) -> String {
-    close_open_fence(&shift_headings(&escape_html_block_starts(md)))
+    let md = md.replace("\r\n", "\n").replace('\r', "\n");
+    close_open_fence(&shift_headings(&escape_html_block_starts(&md)))
 }
 
 /// Render blocks as CommonMark (with GFM tables), the reference layout the
