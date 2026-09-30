@@ -2870,6 +2870,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transcript_list_80_cols_keeps_run_id_and_name_unbroken() {
+        let mut row = transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            Some("fix the flaky test"),
+            "triage",
+            "completed",
+            "2026-07-30 13:00:00",
+        );
+        row.codename = "jade-reef/numbat".to_string();
+        let out = build_transcript_list_table(
+            &[row],
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        )
+        .render_at_width(transcript_list_test_now(), 80);
+        // Id and Name cells never wrap; lower-value columns may.
+        let line = out
+            .lines()
+            .find(|l| l.contains("run_01KYSMDN"))
+            .unwrap_or_else(|| panic!("RUN ID cell broken: {out}"));
+        assert!(line.contains("jade-reef/numbat"), "NAME cell broken: {out}");
+    }
+
     fn prune_row(
         run_id: &str,
         scope: &str,
