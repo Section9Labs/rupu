@@ -1937,6 +1937,12 @@ impl AnthropicClient {
                         .to_string();
                     if let Some(usage) = msg.get("usage") {
                         acc.wire = serde_json::from_value(usage.clone()).unwrap_or_default();
+                        // message_start's `output_tokens` is a placeholder
+                        // (real streams send 1). Output is authoritative only
+                        // from `message_delta`; a nonzero placeholder would
+                        // freeze the live output estimate, which only
+                        // updates while output == 0.
+                        acc.wire.output_tokens = 0;
                         // Anthropic's output_tokens already includes reasoning
                         // tokens, so reasoning_tokens stays at 0 — see the
                         // contrast note on `Usage::reasoning_tokens`.
@@ -2138,14 +2144,25 @@ impl AnthropicClient {
 /// `Usage.input_tokens` means "the whole prompt".
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AnthropicWireUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     input_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     output_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_read_input_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_creation_input_tokens: u32,
+}
+
+/// `#[serde(default)]` covers a missing key, not an explicit `null` — and the
+/// Anthropic SDK types declare the cache fields optional. Map `null` to 0 so
+/// one null counter cannot zero the others (streaming) or fail the whole
+/// response parse (non-streaming).
+fn null_as_zero<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(d)?.unwrap_or(0))
 }
 
 impl AnthropicWireUsage {
@@ -3837,6 +3854,76 @@ mod tests {
         assert_eq!(response.usage.cached_tokens, 200);
         assert_eq!(response.usage.cache_write_tokens, 30);
         assert_eq!(response.usage.output_tokens, 9);
+    }
+
+    #[test]
+    fn stream_message_start_output_tokens_is_not_authoritative() {
+        // Real streams send `"output_tokens": 1` in message_start. The live
+        // output estimate only updates while output == 0, so the first
+        // snapshot must carry 0; the final value comes from message_delta.
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let mut snapshots: Vec<Usage> = Vec::new();
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_o","model":"claude-opus-5-5","usage":{"input_tokens":25,"output_tokens":1}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |se| {
+                    if let StreamEvent::UsageSnapshot(u) = se {
+                        snapshots.push(u);
+                    }
+                })
+                .unwrap();
+        }
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].input_tokens, 25);
+        assert_eq!(snapshots[0].output_tokens, 0);
+        assert_eq!(snapshots[1].output_tokens, 42);
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 25);
+        assert_eq!(response.usage.output_tokens, 42);
+    }
+
+    #[test]
+    fn stream_message_start_null_cache_field_keeps_other_counters() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let event = crate::sse::SseEvent {
+            event_type: "message_start".into(),
+            data: r#"{"type":"message_start","message":{"id":"msg_n","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":null}}}"#.into(),
+        };
+        client
+            .process_sse_event(&event, &mut acc, &mut |_| {})
+            .unwrap();
+        let response = acc.into_response().unwrap();
+        // 10 + 200 + (null -> 0): input and read survive the null write field.
+        assert_eq!(response.usage.input_tokens, 210);
+        assert_eq!(response.usage.cached_tokens, 200);
+        assert_eq!(response.usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn decode_response_tolerates_null_cache_fields() {
+        let body = r#"{
+            "id": "msg_x", "model": "claude-opus-5-5",
+            "content": [{"type":"text","text":"hi"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": null, "cache_creation_input_tokens": 30}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let resp = parsed.into_llm_response();
+        assert_eq!(resp.usage.input_tokens, 40);
+        assert_eq!(resp.usage.cached_tokens, 0);
+        assert_eq!(resp.usage.cache_write_tokens, 30);
+        assert_eq!(resp.usage.output_tokens, 5);
     }
 
     #[test]

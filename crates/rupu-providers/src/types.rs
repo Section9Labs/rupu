@@ -119,8 +119,13 @@ pub enum StopReason {
 /// Token usage for a request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// The WHOLE prompt, including cache reads and cache writes, for every
+    /// provider. Anthropic's wire `input_tokens` excludes both, so
+    /// `anthropic.rs` normalizes at the provider boundary.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt tokens served from the provider's prompt cache (cache reads) —
+    /// a SUBSET of `input_tokens`.
     // The `cache_read_input_tokens` alias is legacy and harmless: Anthropic
     // wire usage is now parsed by `anthropic::AnthropicWireUsage`, which
     // normalizes at the provider boundary. Never normalize in this
