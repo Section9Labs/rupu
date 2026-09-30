@@ -117,9 +117,12 @@ the "Not built yet" note at the end of this section for what exists today).
 | `summary` | The lightweight `summary` / `severity` / `evidence` record. A `report` is **refused**, never silently dropped. |
 
 Pick a profile with the agent's `findingsProfile` frontmatter, a workflow's
-`defaults.findings_profile`, or a step's `findings_profile`. Precedence is
-step → workflow defaults → agent `findingsProfile` → `full`
-(see `docs/agent-format.md` and `docs/workflow-format.md`). The chosen profile
+`defaults.findings_profile`, a step's `findings_profile`, or `rupu run
+--findings-profile` for a standalone run. Precedence is
+step (or the flag) → workflow defaults → agent `findingsProfile` → `full`
+(see `docs/agent-format.md` and `docs/workflow-format.md`). Remote workflow
+units (`host:` / `distribute:`) get the same resolution: the step or default
+value travels to the host as `--findings-profile`. The chosen profile
 is stored on each finding record; records written before profiles existed read
 back as `summary`.
 
@@ -187,6 +190,11 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A path that escapes the workspace, does not exist, or names something other
   than a regular file (a device, socket, or the like) rejects the finding, so a
   typo is not silently dropped.
+- A remote workflow unit (`host:` / `distribute:`) runs `report_finding` on the
+  host, so its artifacts go into **that host's** store and are recorded
+  `stored: copied` with no `host`. Recording them as `stored: external` with
+  `host` set, and pulling them into the coordinator's store on first view, is
+  specified but not built yet.
 
 ### Configuration
 

@@ -380,10 +380,9 @@ Rules:
 - `parallel:` sub-steps inherit their parent step's profile; a sub-step has no `findings_profile` of its own.
 - `action:` steps have no step-level value: an `action: findings.record` step uses `defaults.findings_profile` (else `full`), and a `findings_profile:` on the `action:` step itself is a parse error.
 - Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
-- The field must never be silently ignored, so these are parse errors:
-  - `findings_profile` on a remote step (`host:` / `distribute:`) — remote units resolve their profile from the agent file, so set `findingsProfile` in that agent's frontmatter instead;
-  - `defaults.findings_profile` in a workflow that has any remote step, for the same reason;
-  - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`).
+- Remote steps (`host:` / `distribute:`) follow the same order. The coordinator resolves the step's value, else `defaults.findings_profile`, and launches each unit with `rupu run --findings-profile <profile>`. When neither is set, the host resolves the agent's `findingsProfile` from its own copy of the agent file, then `full`. A fan-out unit retried on its fallback host keeps the profile.
+- A remote host that can't honour the profile refuses the launch; the unit doesn't run under a different profile. That covers an older tunnel node that didn't advertise support, a bucket whose pull workers haven't advertised it, and an HTTP host whose `/api/host/info` doesn't list it. An older SSH host's `rupu run` rejects the unknown flag, so the unit fails. One gap remains on bucket hosts: an old worker polling the same bucket as an upgraded one can't be detected and may still claim the unit.
+- `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`) is a parse error, since it would have no effect.
 
 ### `when`
 
@@ -1319,7 +1318,7 @@ Common parse-time failures:
 - invalid input defaults or enum defaults
 - extraneous fields inside `trigger:`
 - an `action:` naming an unknown tool, or `with:` failing the tool's schema
-- a `findings_profile:` on an `action:`, remote, or agent-less step, or `defaults.findings_profile` alongside a remote step
+- a `findings_profile:` on an `action:` or agent-less step
 - a `branch:` target that doesn't exist, isn't forward, or appears in both arms
 - a `join:` with no inbound edges, or a `wait: { count: N }` exceeding its inbound path count
 - a cycle anywhere in the workflow's dependency graph
