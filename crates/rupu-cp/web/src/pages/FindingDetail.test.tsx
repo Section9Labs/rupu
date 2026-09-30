@@ -149,6 +149,19 @@ describe('FindingDetail page', () => {
     expect(screen.queryByRole('navigation', { name: 'Report sections' })).toBeNull();
   });
 
+  it('says a full-profile finding with an unreadable report cannot be displayed, not that it is a summary', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report: null }));
+    renderAt();
+
+    expect(await screen.findByRole('heading', { level: 1 })).toHaveTextContent("Notes API returns another user's note by id");
+    expect(screen.getByText(
+      "This finding has a full report that this version of rupu can't display (it may have been written by a newer version).",
+    )).toBeInTheDocument();
+    expect(screen.queryByText(/recorded as a summary/)).toBeNull();
+    // the summary + rationale still render
+    expect(screen.getByText('The lookup ignores the owner id.')).toBeInTheDocument();
+  });
+
   it('summary layout also has a back link to the findings list', async () => {
     vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'summary', report: null }));
     renderAt();

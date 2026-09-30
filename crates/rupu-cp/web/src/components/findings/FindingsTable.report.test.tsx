@@ -67,6 +67,16 @@ describe('FindingsTable — Report column', () => {
     expect(within(rowOf('Summary only finding')).getByText('summary')).toBeInTheDocument();
   });
 
+  it('shows "unreadable" for a full-profile row whose report could not be parsed', () => {
+    const unreadable = base({ id: 'unread-1', summary: 'Unreadable report finding', profile: 'full' });
+    renderTable([unreadable, SUMMARY]);
+    const cell = within(rowOf('Unreadable report finding')).getByText('unreadable');
+    expect(cell).toBeInTheDocument();
+    expect(cell).toHaveClass('text-ink-mute');
+    expect(within(rowOf('Unreadable report finding')).queryByText('summary')).toBeNull();
+    expect(within(rowOf('Summary only finding')).getByText('summary')).toBeInTheDocument();
+  });
+
   it('prefers report_summary.cwe over concern-derived CWE in the CWE column', () => {
     renderTable([{ ...FULL, concern_id: 'cwe-top25:cwe-787-oob' }]);
     const link = within(rowOf('Full report finding')).getByRole('link', { name: 'CWE-639' });

@@ -26,7 +26,7 @@
 import { useEffect, useId, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, apiErrorMessage, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
-import { isSentinel, sentinelLabel } from '../../lib/findingReport';
+import { isSentinel, sentinelLabel, UNREADABLE_REPORT_NOTE } from '../../lib/findingReport';
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
 import CallChain from '../findings/report/CallChain';
 import EvidenceClaims from '../findings/report/EvidenceClaims';
@@ -51,7 +51,7 @@ function ReportTabs({ detail, wsId }: { detail: FindingDetail; wsId?: string }) 
   const baseId = useId();
   const report = detail.report;
   if (!report) {
-    return <p className={EMPTY_NOTE}>This finding has no structured report body.</p>;
+    return <p className={EMPTY_NOTE}>{UNREADABLE_REPORT_NOTE}</p>;
   }
   const patch = report.recommended_patch;
   return (

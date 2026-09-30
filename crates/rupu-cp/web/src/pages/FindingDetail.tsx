@@ -6,7 +6,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, apiErrorMessage, type FindingDetail as Detail } from '../lib/api';
-import { completeness } from '../lib/findingReport';
+import { completeness, UNREADABLE_REPORT_NOTE } from '../lib/findingReport';
 import Markdown from '../components/transcript/Markdown';
 import { FindingEvidence } from '../components/findings/FindingEvidence';
 import Section from '../components/findings/report/Section';
@@ -89,7 +89,11 @@ export default function FindingDetail() {
       <div className="mx-auto max-w-4xl space-y-6 p-8">
         <BackLink />
         <h1 className="text-2xl font-semibold text-ink">{detail.summary}</h1>
-        <p className="text-ui text-ink-mute">This finding was recorded as a summary, without a full report.</p>
+        <p className="text-ui text-ink-mute">
+          {detail.profile === 'full'
+            ? UNREADABLE_REPORT_NOTE
+            : 'This finding was recorded as a summary, without a full report.'}
+        </p>
         <FindingEvidence finding={detail} />
         <Provenance detail={detail} />
       </div>

@@ -85,6 +85,10 @@ export function FindingsTable({
             {f.report_summary.completeness.filled}/{f.report_summary.completeness.total}
             {f.report_summary.has_poc && <span className="ml-1 text-ok">PoC</span>}
           </span>
+        ) : f.profile === 'full' ? (
+          // A full-profile row without a report_summary carries a report this
+          // build couldn't parse (e.g. written by a newer rupu).
+          <span className="text-note text-ink-mute">unreadable</span>
         ) : (
           <span className="text-note text-ink-mute">summary</span>
         ),

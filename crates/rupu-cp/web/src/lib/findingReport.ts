@@ -61,6 +61,12 @@ export interface ReportSummary {
 }
 export type ClaimState = 'current' | 'changed' | 'missing' | 'unknown';
 
+/** Shown where a `profile: 'full'` finding has no `report`: the ledger line
+ *  carries a report this build could not parse (for example one written by a
+ *  newer rupu), which loads as `None`. */
+export const UNREADABLE_REPORT_NOTE =
+  "This finding has a full report that this version of rupu can't display (it may have been written by a newer version).";
+
 export function isSentinel<T>(v: OrSentinel<T>): v is string {
   return typeof v === 'string';
 }

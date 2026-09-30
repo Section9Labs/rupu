@@ -174,6 +174,15 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     expect(screen.getByRole('link', { name: /Open full report/ })).toBeInTheDocument();
   });
 
+  it('says the report cannot be displayed when a full-profile detail has no report', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(detailOf({ report: null }));
+    view(FULL);
+    fireEvent.click(header());
+    expect(await screen.findByText(/can't display/)).toBeInTheDocument();
+    expect(screen.queryByText(/no structured report body/)).toBeNull();
+    expect(screen.queryByRole('tablist')).toBeNull();
+  });
+
   it('shows the message from a JSON API error body, not the JSON', async () => {
     const body = JSON.stringify({ error: 'finding f-full not found' });
     vi.spyOn(api, 'getFinding').mockRejectedValue(new ApiError(404, body, body));
