@@ -22,7 +22,7 @@ const ID2: &str = "fnd_01J00000000000000000000002";
 
 fn report_of(md: &str) -> (rupu_coverage::FindingReport, Vec<String>) {
     match parse_report(md).expect("parses") {
-        Parsed::Report { report, cited_ids } => (report, cited_ids),
+        Parsed::Report { report, own_ids } => (report, own_ids),
         Parsed::NotAReport => panic!("expected a report"),
     }
 }
@@ -41,8 +41,8 @@ fn assert_valid(r: &rupu_coverage::FindingReport, known: &[&str]) {
 
 #[test]
 fn the_plain_layout_parses_into_a_valid_report() {
-    let (r, cited) = report_of(PLAIN);
-    assert_eq!(cited, vec![ID1.to_string()]);
+    let (r, own) = report_of(PLAIN);
+    assert_eq!(own, vec![ID1.to_string()]);
     assert_eq!(r.title, "Notes API returns another user's note by id");
     assert_eq!(r.ownership.owner, "Unknown");
     assert_eq!(r.ownership.product, "Notebin (sample app)");
@@ -114,9 +114,10 @@ fn the_plain_layout_parses_into_a_valid_report() {
 
 #[test]
 fn the_markdown_layout_keeps_tickets_cross_references_and_chain_code() {
-    let (r, cited) = report_of(MARKDOWN);
-    // The cross-reference's id is not the report's own.
-    assert_eq!(cited, vec![ID2.to_string()]);
+    let (r, own) = report_of(MARKDOWN);
+    // The cross-reference's id is not the report's own; the `**Finding ID:**`
+    // line's is.
+    assert_eq!(own, vec![ID2.to_string()]);
     let OrSentinel::Value(t) = &r.tickets else {
         panic!("{:?}", r.tickets)
     };
@@ -213,8 +214,13 @@ fn an_exported_report_round_trips() {
         render_finding(&f, &number_map(std::slice::from_ref(&f)), Format::Markdown).unwrap(),
     )
     .unwrap();
-    let (r, cited) = report_of(&md);
-    assert_eq!(cited, vec![ID1.to_string()]);
+    let (r, own) = report_of(&md);
+    // From the exporter's Provenance row, `**Finding ID:** fnd_…`.
+    assert_eq!(own, vec![ID1.to_string()]);
+    assert!(
+        md.contains(&format!("**Finding ID:** {ID1}")),
+        "the exporter's spelling changed:\n{md}"
+    );
     assert_eq!(r.title, original.title);
     assert_eq!(r.ownership, original.ownership);
     assert_eq!(r.tickets, original.tickets);
@@ -501,8 +507,8 @@ fn an_exported_report_with_every_optional_part_round_trips() {
         notes: None,
     });
 
-    let (r, cited) = report_of(&exported(original.clone()));
-    assert_eq!(cited, vec![ID1.to_string()]);
+    let (r, own) = report_of(&exported(original.clone()));
+    assert_eq!(own, vec![ID1.to_string()]);
     assert_eq!(r.tickets, original.tickets);
     assert_eq!(r.description, original.description);
     assert_eq!(r.call_chain, original.call_chain);
@@ -697,9 +703,9 @@ fn identifier_and_severity_are_kept() {
 
 #[test]
 fn a_byte_order_mark_is_ignored() {
-    let (r, cited) = report_of(&format!("\u{feff}{PLAIN}"));
+    let (r, own) = report_of(&format!("\u{feff}{PLAIN}"));
     assert_eq!(r.title, "Notes API returns another user's note by id");
-    assert_eq!(cited, vec![ID1.to_string()]);
+    assert_eq!(own, vec![ID1.to_string()]);
     let (r, _) = report_of(&format!(
         "\u{feff}{}",
         MARKDOWN.replace("Filename: NB-002 - Share links never expire.pdf\n\n", "")
@@ -897,8 +903,9 @@ fn a_self_reference_stays_until_the_caller_drops_it() {
             "the owner stops sharing the note.",
             &format!("the owner stops sharing the note. See {ID1}."),
         );
-    let (mut r, cited) = report_of(&md);
-    assert_eq!(cited, vec![ID2.to_string(), ID1.to_string()]);
+    let (mut r, own) = report_of(&md);
+    // Only the labelled id is the report's own; the one in the prose is not.
+    assert_eq!(own, vec![ID2.to_string()]);
     let OrSentinel::Value(x) = &r.cross_references else {
         panic!("{:?}", r.cross_references)
     };
@@ -1132,8 +1139,8 @@ fn a_plain_line_under_the_finding_id_is_kept() {
         &format!("Finding ID: {ID1}\n"),
         &format!("Finding ID: {ID1}\nFound by the nightly scanner on staging\n"),
     );
-    let (r, cited) = report_of(&md);
-    assert_eq!(cited, vec![ID1.to_string()]);
+    let (r, own) = report_of(&md);
+    assert_eq!(own, vec![ID1.to_string()]);
     assert!(
         other_text(&r).contains("Found by the nightly scanner on staging"),
         "{}",
@@ -1154,4 +1161,295 @@ fn a_step_marker_alone_in_evidence_takes_the_next_line() {
         "The token claims have no expiry (`src/share/token.rs:5-9`)."
     );
     assert_valid(&r, &[ID1]);
+}
+
+// ---- final review fixes ----------------------------------------------------
+
+/// PLAIN without its `Finding ID:` line.
+fn plain_unlabelled() -> String {
+    PLAIN.replace(&format!("Finding ID: {ID1}\n"), "")
+}
+
+#[test]
+fn an_id_mentioned_only_in_prose_is_not_the_reports_own() {
+    // The final review's probe: no id line, and the description names one
+    // other finding. That finding must not be taken for this report's.
+    let md = plain_unlabelled().replace(
+        "The get_note handler loads",
+        &format!("Like {ID2}, the get_note handler loads"),
+    );
+    let (r, own) = report_of(&md);
+    assert!(own.is_empty(), "{own:?}");
+    assert!(
+        r.description.starts_with(&format!("Like {ID2}")),
+        "{}",
+        r.description
+    );
+}
+
+#[test]
+fn every_id_label_spelling_is_read_and_never_taken_for_the_title() {
+    for label in [
+        "Finding ID:",
+        "Native Finding:",
+        "native finding id:",
+        "RUPU FINDING:",
+        "Rupu Finding ID:",
+        "Native Rupu Finding:",
+        "**Native Finding:**",
+        "**Native Finding**:",
+    ] {
+        let md = PLAIN.replace("Finding ID:", label);
+        let (r, own) = report_of(&md);
+        assert_eq!(own, [ID1], "{label}");
+        assert_eq!(r.title, "Notes API returns another user's note by id");
+        // A line that says nothing but the id is consumed.
+        assert!(!other_text(&r).contains(ID1), "{label}: {}", other_text(&r));
+    }
+    // First in a file with no `Filename:` line, the id line is a field, not
+    // the title.
+    let md = format!(
+        "Native Finding: {ID1}\n\n{}",
+        plain_unlabelled().split_once("\n\n").unwrap().1
+    );
+    let (r, own) = report_of(&md);
+    assert_eq!(own, [ID1]);
+    assert_eq!(r.title, "Notes API returns another user's note by id");
+}
+
+#[test]
+fn an_id_line_counts_in_any_section_but_cross_references_and_code() {
+    // In a section: read, and taken out of the section's text.
+    let md = plain_unlabelled().replace(
+        "Description\n",
+        &format!("Description\nNative Finding: {ID1}\n"),
+    );
+    let (r, own) = report_of(&md);
+    assert_eq!(own, [ID1]);
+    assert!(
+        !r.description.contains("Native Finding"),
+        "{}",
+        r.description
+    );
+    assert_valid(&r, &[]);
+
+    // In Cross-References an id names another finding.
+    let md = plain_unlabelled().replace(
+        "Cross-References\nNone\n",
+        &format!("Cross-References\nFinding ID: {ID2}\n"),
+    );
+    let (_, own) = report_of(&md);
+    assert!(own.is_empty(), "{own:?}");
+
+    // In a code block it is code.
+    let md = plain_unlabelled().replace(
+        "Ok(Json(note))\n",
+        &format!("Ok(Json(note))\n// Finding ID: {ID2}\nFinding ID: {ID2}\n"),
+    );
+    let (r, own) = report_of(&md);
+    assert!(own.is_empty(), "{own:?}");
+    assert!(r.evidence[0].excerpt.as_deref().unwrap().contains(ID2));
+}
+
+#[test]
+fn every_distinct_labelled_id_is_reported() {
+    let md = PLAIN.replace(
+        "Owner: Unknown\n",
+        &format!("Owner: Unknown\nNative Finding: {ID2}\n"),
+    );
+    let (_, own) = report_of(&md);
+    assert_eq!(own, [ID1, ID2]);
+    // The same id on two lines is one id.
+    let md = format!("{PLAIN}\nProvenance\n**Finding ID:** {ID1}\n");
+    let (_, own) = report_of(&md);
+    assert_eq!(own, [ID1]);
+}
+
+#[test]
+fn text_beyond_the_id_on_an_id_line_is_kept() {
+    let md = PLAIN.replace(
+        &format!("Finding ID: {ID1}\n"),
+        &format!("Finding ID: {ID1} (merged from an earlier duplicate report)\n"),
+    );
+    let (r, own) = report_of(&md);
+    assert_eq!(own, [ID1]);
+    assert!(
+        other_text(&r).contains(&format!(
+            "Header:\n\nIdentifier: NB-001\nFinding ID: {ID1} (merged from an earlier duplicate report)"
+        )),
+        "{}",
+        other_text(&r)
+    );
+
+    // In a section it moves to Other imported text under the section's name.
+    let md = plain_unlabelled().replace(
+        "Impact\nAny signed-in",
+        &format!("Impact\nNative Finding: {ID1}, first seen on staging\nAny signed-in"),
+    );
+    let (r, own) = report_of(&md);
+    assert_eq!(own, [ID1]);
+    assert!(!r.impact.contains("Native Finding"), "{}", r.impact);
+    assert!(
+        other_text(&r).contains(&format!(
+            "Impact:\n\nNative Finding: {ID1}, first seen on staging"
+        )),
+        "{}",
+        other_text(&r)
+    );
+
+    // In Provenance it stays in place with the rest of that section.
+    let md = format!("{PLAIN}\nProvenance\nFinding ID: {ID1} (renumbered)\nRun: run_7\n");
+    let (r, _) = report_of(&md);
+    assert!(
+        other_text(&r).contains(&format!(
+            "Provenance:\n\nFinding ID: {ID1} (renumbered)\nRun: run_7"
+        )),
+        "{}",
+        other_text(&r)
+    );
+
+    // An id line with no id on it is not an id line, and is kept.
+    let md = PLAIN.replace(
+        &format!("Finding ID: {ID1}\n"),
+        "Finding ID: not assigned yet\n",
+    );
+    let (r, own) = report_of(&md);
+    assert!(own.is_empty(), "{own:?}");
+    assert!(
+        other_text(&r).contains("Finding ID: not assigned yet"),
+        "{}",
+        other_text(&r)
+    );
+}
+
+#[test]
+fn a_labelled_id_without_the_report_sections_fails() {
+    let md = format!("# Share links never expire\n\nFinding ID: {ID2}\n\n## Description\n\nLinks never expire.\n");
+    let err = parse_report(&md).unwrap_err();
+    assert_eq!(err, ImportError::MissingReportSections);
+    assert_eq!(
+        err.to_string(),
+        "has a Finding ID line but is missing the report sections"
+    );
+    // Also when the id line is in the one section there is.
+    let md = format!("# Notes\n\n## Description\n\n**Native Finding:** {ID2}\n");
+    assert_eq!(
+        parse_report(&md).unwrap_err(),
+        ImportError::MissingReportSections
+    );
+    // Without an id line the same file is simply not a report.
+    let md = "# Share links never expire\n\n## Description\n\nLinks never expire.\n";
+    assert_eq!(parse_report(md).unwrap(), Parsed::NotAReport);
+}
+
+#[test]
+fn a_banner_before_the_title_is_kept_as_other_text() {
+    const BANNER: &str = "CONFIDENTIAL — sample";
+    // Plain layout: the line after `Filename:`.
+    let (r, _) = report_of(&format!("{BANNER}\n{PLAIN}"));
+    assert_eq!(r.title, "Notes API returns another user's note by id");
+    assert!(
+        other_text(&r).starts_with(&format!("Header:\n\n{BANNER}")),
+        "{}",
+        other_text(&r)
+    );
+    // Exported layout: the `#` heading, with or without a file name line.
+    let (r, _) = report_of(&format!("{BANNER}\n\n{MARKDOWN}"));
+    assert_eq!(r.title, "Share links never expire");
+    assert!(other_text(&r).contains(BANNER), "{}", other_text(&r));
+    let no_filename = MARKDOWN.replace("Filename: NB-002 - Share links never expire.pdf\n\n", "");
+    let (r, _) = report_of(&format!("{BANNER}\n\n{no_filename}"));
+    assert_eq!(r.title, "Share links never expire");
+    assert!(other_text(&r).contains(BANNER), "{}", other_text(&r));
+}
+
+#[test]
+fn an_artifact_list_item_is_its_path_and_the_rest_is_kept() {
+    let md = format!(
+        "{PLAIN}\nArtifacts\n- `poc/fetch_other_note.sh` — the proof-of-concept script\n- out/capture.pcap raw capture from staging\n- out/plain.log\n"
+    );
+    let (r, _) = report_of(&md);
+    let paths: Vec<&str> = r.artifacts.iter().map(|a| a.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "poc/fetch_other_note.sh",
+            "out/capture.pcap",
+            "out/plain.log"
+        ]
+    );
+    let other = other_text(&r);
+    assert!(
+        other.contains(
+            "Artifacts:\n\n- `poc/fetch_other_note.sh` — the proof-of-concept script\n- out/capture.pcap raw capture from staging"
+        ),
+        "{other}"
+    );
+    assert!(!other.contains("out/plain.log"), "{other}");
+}
+
+#[test]
+fn a_diff_after_not_provided_is_still_the_patch() {
+    let start = PLAIN.find("Recommended Patch\n").unwrap();
+    let end = PLAIN.find("CI/CD Detection\n").unwrap();
+    let md = format!(
+        "{}Recommended Patch\nNot provided upstream; a suggested change:\n\n```diff\n--- a/src/routes/notes.rs\n+++ b/src/routes/notes.rs\n@@\n-a\n+b\n```\n\n{}",
+        &PLAIN[..start],
+        &PLAIN[end..]
+    );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(p) = &r.recommended_patch else {
+        panic!("{:?}", r.recommended_patch)
+    };
+    assert!(
+        p.diff.starts_with("--- a/src/routes/notes.rs"),
+        "{}",
+        p.diff
+    );
+    assert_eq!(
+        p.notes.as_deref(),
+        Some("Not provided upstream; a suggested change:")
+    );
+    // With no diff block, the same opening is the sentinel.
+    let md = format!(
+        "{}Recommended Patch\nNot provided: the vendor owns this code.\n\n{}",
+        &PLAIN[..start],
+        &PLAIN[end..]
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.recommended_patch,
+        OrSentinel::Sentinel("Not Provided — the vendor owns this code.".into())
+    );
+}
+
+#[test]
+fn cwe_ids_come_from_category_and_reference_lines_that_start_with_one() {
+    let references = |text: &str| {
+        let start = PLAIN.find("References\nCWE-639").unwrap();
+        let end = PLAIN.find("\nCVSS v3").unwrap();
+        format!("{}References\n{text}\n{}", &PLAIN[..start], &PLAIN[end..])
+    };
+    // Mentioned in passing: not taken.
+    let (r, _) = report_of(&references(
+        "Unlike CWE-79 (XSS), this is an access-control flaw.",
+    ));
+    assert!(r.cwe.is_empty(), "{:?}", r.cwe);
+    assert!(r.references.contains("Unlike CWE-79"), "{}", r.references);
+    assert_valid(&r, &[]);
+    // A line that starts with an id gives every id on it; other lines none.
+    let (r, _) = report_of(&references(
+        "- CWE-639 Authorization bypass (see also CWE-862)\nSee CWE-200 for the data exposed.\n**CWE-285**: Improper Authorization",
+    ));
+    assert_eq!(r.cwe, ["CWE-639", "CWE-862", "CWE-285"]);
+    // The fixture's References line starts `CWE-639:` and continues
+    // `; CWE-862: …`.
+    let (r, _) = report_of(PLAIN);
+    assert_eq!(r.cwe, ["CWE-639", "CWE-862"]);
+    // Category is always read.
+    let (r, _) = report_of(&references("OWASP A01:2021 Broken Access Control").replace(
+        "Category: Authorization Bypass Through User-Controlled Key",
+        "Category: CWE-639 Authorization Bypass Through User-Controlled Key",
+    ));
+    assert_eq!(r.cwe, ["CWE-639"]);
 }

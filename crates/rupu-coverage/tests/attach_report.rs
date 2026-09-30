@@ -411,16 +411,195 @@ fn a_dry_run_takes_no_lock_and_works_on_a_read_only_directory() {
     assert_eq!(listing(&paths.root), before_listing);
 
     // A real run needs the lock and the directory, so it cannot go ahead.
-    assert!(attach_reports(
+    // Every item is still assessed: a report with problems lists them, and
+    // one that would have attached is "not written".
+    let other = {
+        drop(_guard);
+        let other = seed_summary(&paths);
+        std::fs::remove_file(paths.root.join("findings.jsonl.lock")).unwrap();
+        other
+    };
+    let before_bytes = std::fs::read(&paths.findings).unwrap();
+    let _guard = ReadOnlyDir::new(&paths.root).expect("enforced above");
+    let mut invalid = report();
+    invalid.title = "   ".into();
+    let real = attach_reports(
+        &paths,
+        vec![
+            AttachItem {
+                finding_id: other,
+                report: invalid,
+            },
+            AttachItem {
+                finding_id: id,
+                report: report(),
+            },
+        ],
+        &full_opts(),
+        false,
+    )
+    .expect("the ledger is readable");
+    assert!(real.write_error.is_some());
+    assert!(real.backup.is_none());
+    match &real.outcomes[0] {
+        AttachOutcome::Rejected(e) => assert!(e.to_string().contains("report.title"), "{e}"),
+        o => panic!("expected Rejected, got {o:?}"),
+    }
+    assert!(
+        matches!(real.outcomes[1], AttachOutcome::NotWritten),
+        "{:?}",
+        real.outcomes[1]
+    );
+    assert_eq!(std::fs::read(&paths.findings).unwrap(), before_bytes);
+}
+
+#[test]
+fn imported_claims_carry_no_hash() {
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+    // The claim's file is in the workspace, so `report_finding` would hash
+    // it. An imported claim was made against the code as it was when the
+    // report was written, so it is left unhashed.
+    std::fs::create_dir_all(paths.workspace.join("src/routes")).unwrap();
+    std::fs::write(
+        paths.workspace.join("src/routes/notes.rs"),
+        "async fn get_note() {}\n",
+    )
+    .unwrap();
+    let mut r = report();
+    assert_eq!(r.evidence[0].file.as_deref(), Some("src/routes/notes.rs"));
+    r.evidence[0].sha256 = Some("ab".repeat(32));
+    let batch = attach_reports(
         &paths,
         vec![AttachItem {
-            finding_id: id,
-            report: report(),
+            finding_id: id.clone(),
+            report: r,
         }],
         &full_opts(),
         false,
     )
-    .is_err());
+    .unwrap();
+    assert!(matches!(
+        batch.outcomes.as_slice(),
+        [AttachOutcome::Attached]
+    ));
+    let rec = read_findings(&paths)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.id == id)
+        .unwrap();
+    let evidence = &rec.report.unwrap().evidence;
+    assert!(evidence.iter().all(|c| c.sha256.is_none()), "{evidence:?}");
+}
+
+#[test]
+fn a_report_cannot_cross_reference_the_finding_it_is_attached_to() {
+    use rupu_coverage::report::{CrossRef, OrSentinel, Relation};
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+    let other = seed_summary(&paths);
+    let cross = |to: &str| CrossRef {
+        finding_id: to.to_string(),
+        relation: Relation::Sibling,
+        note: None,
+    };
+    let mut to_itself = report();
+    to_itself.cross_references = OrSentinel::Value(vec![cross(&other), cross(&id)]);
+    let mut to_other = report();
+    to_other.cross_references = OrSentinel::Value(vec![cross(&other)]);
+    for dry_run in [true, false] {
+        let batch = attach_reports(
+            &paths,
+            vec![AttachItem {
+                finding_id: id.clone(),
+                report: to_itself.clone(),
+            }],
+            &full_opts(),
+            dry_run,
+        )
+        .unwrap();
+        match batch.outcomes.as_slice() {
+            [AttachOutcome::Rejected(e)] => assert!(
+                e.to_string()
+                    .contains("report.cross_references[1].finding_id"),
+                "{e}"
+            ),
+            o => panic!("dry_run={dry_run}: expected Rejected, got {o:?}"),
+        }
+    }
+    // The other finding is still a valid target, and the id is restored for
+    // the items after it.
+    let batch = attach_reports(
+        &paths,
+        vec![
+            AttachItem {
+                finding_id: id.clone(),
+                report: to_itself,
+            },
+            AttachItem {
+                finding_id: id.clone(),
+                report: to_other,
+            },
+        ],
+        &full_opts(),
+        false,
+    )
+    .unwrap();
+    assert!(matches!(batch.outcomes[0], AttachOutcome::Rejected(_)));
+    assert!(
+        matches!(batch.outcomes[1], AttachOutcome::Attached),
+        "{:?}",
+        batch.outcomes[1]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_ledger_is_never_replaced() {
+    let (d, paths) = setup();
+    let id = seed_summary(&paths);
+    // The real ledger lives elsewhere; the coverage directory holds a link.
+    let real = d.path().join("elsewhere.jsonl");
+    std::fs::rename(&paths.findings, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &paths.findings).unwrap();
+    let before = std::fs::read(&real).unwrap();
+
+    for dry_run in [true, false] {
+        let batch = attach_reports(
+            &paths,
+            vec![AttachItem {
+                finding_id: id.clone(),
+                report: report(),
+            }],
+            &full_opts(),
+            dry_run,
+        )
+        .unwrap();
+        let err = batch.write_error.expect("refused");
+        let text = err.to_string();
+        assert!(text.contains("is a symlink"), "{text}");
+        assert!(
+            text.contains(&paths.findings.display().to_string()),
+            "{text}"
+        );
+        assert!(matches!(
+            batch.outcomes.as_slice(),
+            [AttachOutcome::NotWritten]
+        ));
+        assert!(batch.backup.is_none());
+        assert!(std::fs::symlink_metadata(&paths.findings)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), before);
+    }
+    assert!(
+        !listing(&paths.root)
+            .iter()
+            .any(|n| n.contains("pre-import")),
+        "{:?}",
+        listing(&paths.root)
+    );
 }
 
 #[test]

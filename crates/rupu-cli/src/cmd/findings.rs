@@ -39,11 +39,12 @@ pub enum Action {
     /// Attach reports written before the full profile to their findings.
     ///
     /// A one-time migration aid: reads Markdown finding reports in the report
-    /// layout, and attaches each to the summary finding whose `fnd_` id it
-    /// cites. The finding becomes a full-profile finding. A report attaches
-    /// whole or not at all; a finding that already has a report is left
-    /// alone; each changed ledger is backed up first
-    /// (`findings.jsonl.pre-import-<time>`).
+    /// layout, and attaches each to the summary finding its `Finding ID:`
+    /// line names (also read: `Native Finding:`, `Rupu Finding ID:` and
+    /// similar labels; an id mentioned only in prose is never used). The
+    /// finding becomes a full-profile finding. A report attaches whole or not
+    /// at all; a finding that already has a report is left alone; each
+    /// changed ledger is backed up first (`findings.jsonl.pre-import-<time>`).
     Import(ImportArgs),
 }
 
@@ -95,8 +96,9 @@ pub struct ImportArgs {
     /// Report files, or directories to search for `*.md` files.
     #[arg(required = true, value_name = "PATH")]
     paths: Vec<PathBuf>,
-    /// The finding a single report belongs to, when it does not cite exactly
-    /// one finding id itself. Only with one file.
+    /// The finding a single report belongs to, for a report with no
+    /// `Finding ID:` line. Only with one file; refused when the report's own
+    /// `Finding ID:` line names a different finding.
     #[arg(long = "id", value_name = "FINDING_ID", value_parser = non_blank)]
     id: Option<String>,
     /// Parse and validate every report and check that the artifacts it lists
@@ -337,16 +339,19 @@ impl Line {
     }
 }
 
-/// The finding a report belongs to: `--id`, else the one id it cites.
-fn report_id(flag: Option<&str>, cited: &[String]) -> Result<String, String> {
-    match (flag, cited) {
-        (Some(id), _) => Ok(id.to_string()),
-        (None, [one]) => Ok(one.clone()),
-        (None, []) => Err("cites no finding id; import it alone with --id".to_string()),
-        (None, many) => Err(format!(
-            "cites several finding ids ({}); import it alone with --id",
-            many.join(", ")
+/// The finding a report belongs to: the one id its labelled id lines give
+/// (`own`), else `--id`. Several labelled ids, a `--id` that disagrees with
+/// the labelled one, or neither, fail.
+fn report_id(flag: Option<&str>, own: &[String]) -> Result<String, String> {
+    match (own, flag) {
+        ([_, _, ..], _) => Err(format!(
+            "cites several finding ids on Finding ID lines ({})",
+            own.join(", ")
         )),
+        ([one], Some(id)) if one != id => Err(format!("the report says {one}; --id says {id}")),
+        ([one], _) => Ok(one.clone()),
+        ([], Some(id)) => Ok(id.to_string()),
+        ([], None) => Err("no Finding ID line; import it alone with --id".to_string()),
     }
 }
 
@@ -365,11 +370,20 @@ fn read_report_file(file: &Path) -> anyhow::Result<String> {
 }
 
 /// What an [`AttachOutcome`] means for the file whose report was for `id`.
-fn outcome_line(id: String, outcome: rupu_coverage::tools::AttachOutcome) -> Line {
+/// `not_written` is the failure line for a report that would have attached
+/// to a ledger that was not written.
+fn outcome_line(
+    id: String,
+    outcome: rupu_coverage::tools::AttachOutcome,
+    not_written: Option<&str>,
+) -> Line {
     use rupu_coverage::tools::report_finding::ReportFindingError;
     use rupu_coverage::tools::AttachOutcome;
     match outcome {
         AttachOutcome::Attached => Line::Attached(id),
+        AttachOutcome::NotWritten => {
+            Line::failed(not_written.unwrap_or("the ledger was not written"))
+        }
         AttachOutcome::AlreadyHasReport => Line::Skipped(format!("{id} already has a report")),
         AttachOutcome::NotFound => Line::failed(format!("no parseable finding {id} in its ledger")),
         AttachOutcome::Duplicate => {
@@ -447,8 +461,8 @@ fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
             Ok(Parsed::NotAReport) => {
                 lines.insert(file.clone(), Line::Skipped("not a finding report".into()));
             }
-            Ok(Parsed::Report { report, cited_ids }) => {
-                match report_id(args.id.as_deref(), &cited_ids) {
+            Ok(Parsed::Report { report, own_ids }) => {
+                match report_id(args.id.as_deref(), &own_ids) {
                     Ok(id) => wanted.entry(id).or_default().push((file.clone(), report)),
                     Err(why) => {
                         lines.insert(file.clone(), Line::failed(why));
@@ -533,23 +547,29 @@ fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
     for (_, (paths, items)) in by_ledger {
         let (files, items): (Vec<PathBuf>, Vec<AttachItem>) = items.into_iter().unzip();
         let ids: Vec<String> = items.iter().map(|i| i.finding_id.clone()).collect();
-        // One ledger failing (it changed under us, or cannot be locked or
-        // written) fails its own files and leaves the other ledgers to go on.
+        // One ledger failing fails its own files and leaves the other
+        // ledgers to go on. A ledger that cannot be written (it cannot be
+        // locked, is a symlink, or changed under us) still has every report
+        // assessed: those with problems list them, and only those that would
+        // have attached fail with the write error.
         let batch = match attach_reports(&paths, items, &opts, args.dry_run) {
             Ok(b) => b,
             Err(e) => {
                 for file in files {
                     lines.insert(
                         file,
-                        Line::failed(format!("cannot update {}: {e}", paths.findings.display())),
+                        Line::failed(format!("cannot read {}: {e}", paths.findings.display())),
                     );
                 }
                 continue;
             }
         };
         backups.extend(batch.backup);
+        let not_written = batch
+            .write_error
+            .map(|e| format!("cannot update {}: {e}", paths.findings.display()));
         for ((file, id), outcome) in files.into_iter().zip(ids).zip(batch.outcomes) {
-            lines.insert(file, outcome_line(id, outcome));
+            lines.insert(file, outcome_line(id, outcome, not_written.as_deref()));
         }
     }
 
@@ -602,9 +622,12 @@ struct Found {
 /// order. While searching, hidden files and directories are skipped and
 /// symlinks are not followed (a symlinked file or directory is not found).
 ///
-/// A named path that cannot be read fails the search, naming the path and
-/// the OS error. A path found *while searching* that cannot be read is
-/// recorded in [`Found::unreadable`] and the search goes on.
+/// A named path that does not exist (or cannot be looked up), and a named
+/// directory that cannot be listed, fail the search, naming the path and the
+/// OS error. A path found *while searching* that cannot be read is recorded
+/// in [`Found::unreadable`] and the search goes on. A named *file* is only
+/// looked up here: one that cannot be read fails when it is read, as its own
+/// failed line.
 fn find_reports(paths: &[PathBuf]) -> anyhow::Result<Found> {
     fn walk(dir: &Path, found: &mut Found) {
         match std::fs::read_dir(dir) {
@@ -799,29 +822,28 @@ mod tests {
     }
 
     #[test]
-    fn a_report_belongs_to_the_flagged_id_else_the_one_it_cites() {
-        let cited = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(report_id(None, &cited(&["fnd_1"])).unwrap(), "fnd_1");
-        // `--id` wins over whatever is cited, including nothing or several.
-        assert_eq!(
-            report_id(Some("fnd_9"), &cited(&["fnd_1"])).unwrap(),
-            "fnd_9"
-        );
+    fn a_report_belongs_to_its_labelled_id_else_the_flagged_one() {
+        let own = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(report_id(None, &own(&["fnd_1"])).unwrap(), "fnd_1");
+        // `--id` that agrees, or names the finding of a report with no id
+        // line.
+        assert_eq!(report_id(Some("fnd_1"), &own(&["fnd_1"])).unwrap(), "fnd_1");
         assert_eq!(report_id(Some("fnd_9"), &[]).unwrap(), "fnd_9");
+        // `--id` never overrides the report's own id line.
         assert_eq!(
-            report_id(Some("fnd_9"), &cited(&["fnd_1", "fnd_2"])).unwrap(),
-            "fnd_9"
+            report_id(Some("fnd_9"), &own(&["fnd_1"])).unwrap_err(),
+            "the report says fnd_1; --id says fnd_9"
         );
-        let none = report_id(None, &[]).unwrap_err();
-        assert!(
-            none.contains("cites no finding id") && none.contains("--id"),
-            "{none}"
+        assert_eq!(
+            report_id(None, &[]).unwrap_err(),
+            "no Finding ID line; import it alone with --id"
         );
-        let many = report_id(None, &cited(&["fnd_1", "fnd_2"])).unwrap_err();
-        assert!(
-            many.contains("fnd_1, fnd_2") && many.contains("--id"),
-            "{many}"
-        );
+        for flag in [None, Some("fnd_1")] {
+            assert_eq!(
+                report_id(flag, &own(&["fnd_1", "fnd_2"])).unwrap_err(),
+                "cites several finding ids on Finding ID lines (fnd_1, fnd_2)"
+            );
+        }
     }
 
     /// A path whose mode is changed for a test and put back when dropped, so
@@ -1015,19 +1037,19 @@ mod tests {
         use rupu_coverage::tools::AttachOutcome;
         let id = || "fnd_1".to_string();
         assert_eq!(
-            outcome_line(id(), AttachOutcome::Attached),
+            outcome_line(id(), AttachOutcome::Attached, None),
             Line::Attached(id())
         );
         assert_eq!(
-            outcome_line(id(), AttachOutcome::AlreadyHasReport),
+            outcome_line(id(), AttachOutcome::AlreadyHasReport, None),
             Line::Skipped("fnd_1 already has a report".into())
         );
         assert_eq!(
-            outcome_line(id(), AttachOutcome::NotFound),
+            outcome_line(id(), AttachOutcome::NotFound, None),
             Line::failed("no parseable finding fnd_1 in its ledger")
         );
         assert_eq!(
-            outcome_line(id(), AttachOutcome::Duplicate),
+            outcome_line(id(), AttachOutcome::Duplicate, None),
             Line::failed("fnd_1 appears more than once in its ledger")
         );
         let problems = ReportValidationError(vec![
@@ -1043,7 +1065,8 @@ mod tests {
         assert_eq!(
             outcome_line(
                 id(),
-                AttachOutcome::Rejected(ReportFindingError::Report(problems))
+                AttachOutcome::Rejected(ReportFindingError::Report(problems)),
+                None
             ),
             Line::Failed(
                 "2 problem(s) in the report".into(),
@@ -1058,9 +1081,20 @@ mod tests {
                 id(),
                 AttachOutcome::Rejected(ReportFindingError::Artifact(ArtifactError::Missing {
                     path: "out/x.txt".into()
-                }))
+                })),
+                None
             ),
             Line::failed("artifact `out/x.txt` does not exist in the workspace")
+        );
+        // A report that would have attached to a ledger that was not written
+        // fails with the write error.
+        assert_eq!(
+            outcome_line(
+                id(),
+                AttachOutcome::NotWritten,
+                Some("cannot update l: locked")
+            ),
+            Line::failed("cannot update l: locked")
         );
     }
 

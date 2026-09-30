@@ -131,7 +131,7 @@ pub fn report_finding(
                 .into_iter()
                 .map(|f| f.id)
                 .collect();
-            let report = prepare_full_report(paths, report, &known, opts)?;
+            let report = prepare_full_report(paths, report, &known, opts, ClaimHashes::Record)?;
             let (summary, severity, evidence) = derived_fields(&report);
             (summary, severity, evidence, Some(report))
         }
@@ -197,23 +197,91 @@ pub fn report_finding(
         profile: opts.profile,
         report,
     };
-    // Held across the append so it cannot interleave with an import's
-    // rewrite of this ledger.
-    let _lock = lock_findings(paths)?;
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.findings)?;
     // One `write_all` of the line and its newline together: with two
     // writes, a concurrent writer appending to the same ledger could land
     // its line between ours and our newline, fusing two records into one
     // unparseable line.
     let mut line = serde_json::to_string(&record)?;
     line.push('\n');
-    f.write_all(line.as_bytes())?;
-    f.flush()?;
+    append_line(paths, line.as_bytes(), std::fs::File::lock)?;
     Ok(ReportFindingOutput { id })
+}
+
+/// Append `line` to the ledger, holding the ledger lock (taken with `lock`)
+/// across the append so it cannot interleave with an import's rewrite.
+///
+/// Where the filesystem cannot lock at all (some network and FUSE mounts:
+/// see [`lock_unsupported`]) the line is appended without the lock and a
+/// warning is logged, as before the lock existed: losing the finding would be
+/// worse. An import cannot run on such a ledger (it requires the lock), so
+/// there is nothing to interleave with. Any other lock failure is an error.
+fn append_line(
+    paths: &CoveragePaths,
+    line: &[u8],
+    lock: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let lock_file = open_lock_file(paths)?;
+    if let Err(e) = lock(&lock_file) {
+        if !lock_unsupported(&e) {
+            return Err(e);
+        }
+        tracing::warn!(
+            error = %e,
+            ledger = ?paths.findings,
+            "this filesystem cannot lock the findings ledger; appending without the lock"
+        );
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.findings)?;
+    f.write_all(line)?;
+    f.flush()?;
+    // `lock_file` drops here, releasing the lock after the append.
+    Ok(())
+}
+
+/// Whether a lock error means the filesystem cannot lock at all, rather than
+/// a failure to report: `ErrorKind::Unsupported` (`ENOSYS`, `EOPNOTSUPP`),
+/// `ENOLCK`, and `ENOTSUP` where it differs from `EOPNOTSUPP`.
+fn lock_unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+        || e.raw_os_error()
+            .is_some_and(|n| NO_LOCK_ERRNOS.contains(&n))
+}
+
+/// `ENOLCK`, `ENOTSUP` and `EOPNOTSUPP`: on Apple platforms, and on Linux
+/// for the architectures that use the generic errno table. Other targets
+/// rely on `ErrorKind::Unsupported` alone.
+const NO_LOCK_ERRNOS: &[i32] = if cfg!(target_vendor = "apple") {
+    &[77, 45, 102]
+} else if cfg!(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv64"
+    )
+)) {
+    &[37, 95]
+} else {
+    &[]
+};
+
+/// Whether [`prepare_full_report`] records the SHA-256 of each evidence
+/// claim's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimHashes {
+    /// Hash each claim's file as it is now: a new finding, whose claims were
+    /// just made against this code.
+    Record,
+    /// Leave every claim unhashed: an imported report, whose claims were made
+    /// against the code as it was when the report was written. Hashing today's
+    /// file would present old evidence as current.
+    Skip,
 }
 
 /// Everything `validate_report` checks, plus the rule that a report may not
@@ -254,14 +322,17 @@ pub(crate) fn check_full_report(
 }
 
 /// Validate a full-profile report and turn it into what the ledger stores:
-/// claim hashes recomputed, artifacts ingested into the store, the size
-/// budget re-checked. Shared by `report_finding` (a new finding) and
-/// `attach_reports` (a report imported onto an existing finding).
+/// claim hashes recomputed (or, with [`ClaimHashes::Skip`], left unset),
+/// artifacts ingested into the store, the size budget re-checked. Shared by
+/// `report_finding` (a new finding, [`ClaimHashes::Record`]) and
+/// `attach_reports` (a report imported onto an existing finding,
+/// [`ClaimHashes::Skip`]).
 pub(crate) fn prepare_full_report(
     paths: &CoveragePaths,
     mut report: crate::report::FindingReport,
     known: &[String],
     opts: &crate::report::FindingWriteOptions,
+    hashes: ClaimHashes,
 ) -> Result<crate::report::FindingReport, ReportFindingError> {
     check_full_report(&report, known, opts)?;
     // A claim's hash is rupu's record of the file at write time, not
@@ -279,7 +350,9 @@ pub(crate) fn prepare_full_report(
         report.artifacts =
             store.ingest(&paths.workspace, &report.artifacts, opts.ingest_limits())?;
     }
-    hash_claim_files(&paths.workspace, &mut report, opts.artifact_max_bytes);
+    if hashes == ClaimHashes::Record {
+        hash_claim_files(&paths.workspace, &mut report, opts.artifact_max_bytes);
+    }
     // Directory artifacts expand to one entry per file, so the report
     // can grow far past the budget `validate_report` checked. Re-check
     // before anything reaches the ledger.
@@ -319,14 +392,19 @@ pub(crate) fn derived_fields(
 /// by rename, and a lock held on the replaced file would not exclude the
 /// next writer. Released when the returned handle drops.
 pub(crate) fn lock_findings(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
+    let f = open_lock_file(paths)?;
+    f.lock()?;
+    Ok(f)
+}
+
+/// The ledger's lock sidecar (`findings.jsonl.lock`), created if missing.
+fn open_lock_file(paths: &CoveragePaths) -> std::io::Result<std::fs::File> {
     paths.ensure_dir()?;
-    let f = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(paths.root.join("findings.jsonl.lock"))?;
-    f.lock()?;
-    Ok(f)
+        .open(paths.root.join("findings.jsonl.lock"))
 }
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a
@@ -1025,6 +1103,59 @@ mod tests {
             "{err}"
         );
         assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn an_append_goes_ahead_unlocked_only_where_the_filesystem_cannot_lock() {
+        use std::io::{Error, ErrorKind};
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        // A filesystem that cannot lock: the finding is still recorded.
+        append_line(&paths, b"{\"n\":1}\n", |_| {
+            Err(Error::from(ErrorKind::Unsupported))
+        })
+        .expect("unsupported locking falls back to an unlocked append");
+        let mut expected = "{\"n\":1}\n".to_string();
+        for &errno in NO_LOCK_ERRNOS {
+            append_line(&paths, b"{\"n\":2}\n", |_| {
+                Err(Error::from_raw_os_error(errno))
+            })
+            .unwrap_or_else(|e| panic!("errno {errno}: {e}"));
+            expected.push_str("{\"n\":2}\n");
+        }
+        assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), expected);
+        // Any other lock failure is an error, and nothing is appended.
+        let err = append_line(&paths, b"{\"n\":3}\n", |_| {
+            Err(Error::from(ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), expected);
+        // And the real lock is taken when it can be.
+        append_line(&paths, b"{\"n\":4}\n", std::fs::File::lock).unwrap();
+        assert!(std::fs::read_to_string(&paths.findings)
+            .unwrap()
+            .ends_with("{\"n\":4}\n"));
+    }
+
+    #[test]
+    fn claim_hashes_are_skipped_on_request() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/routes")).unwrap();
+        std::fs::write(ws.path().join("src/routes/notes.rs"), "fn get_note() {}\n").unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut r = fixture_report();
+        r.evidence[0].sha256 = Some("0".repeat(64));
+        let opts = crate::report::FindingWriteOptions::default();
+        let recorded =
+            prepare_full_report(&paths, r.clone(), &[], &opts, ClaimHashes::Record).unwrap();
+        assert_eq!(
+            recorded.evidence[0].sha256.as_ref().map(String::len),
+            Some(64)
+        );
+        assert_ne!(recorded.evidence[0].sha256, r.evidence[0].sha256);
+        let skipped = prepare_full_report(&paths, r, &[], &opts, ClaimHashes::Skip).unwrap();
+        assert_eq!(skipped.evidence[0].sha256, None, "not hashed, and not kept");
     }
 
     #[test]

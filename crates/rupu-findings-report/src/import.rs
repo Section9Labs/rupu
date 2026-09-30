@@ -23,8 +23,13 @@
 //! `\` it puts before a line-leading `<` is removed. Prose headings it
 //! shifted two levels down are kept as they are: an author's own deeper
 //! heading looks the same. Values the exporter collapses to one line (fields,
-//! hop labels) stay collapsed, and so do claim hashes it shortens: rupu
-//! rehashes a claim's file whenever a report is written.
+//! hop labels) stay collapsed. Claim hashes it shortens are dropped: the
+//! prefix cannot be checked against anything.
+//!
+//! The report's own finding id is read only from a labelled id line
+//! ([`ID_LABELS`]: `Finding ID: fnd_…`, `Native Finding: fnd_…`, …), in the
+//! header or any section but Cross-References, outside code. An id merely
+//! mentioned in prose is never taken for it.
 //!
 //! The result must still pass `validate_report`; the caller runs it.
 
@@ -47,22 +52,37 @@ const NO_EVIDENCE: &str = "No evidence recorded.";
 /// text no field has a place for.
 pub const OTHER_TEXT: &str = "Other imported text:";
 /// Fields never kept as other text: the file name is derived from the
-/// identifier and title, and the finding id is the record's own.
-const NEVER_KEPT: &[&str] = &["filename", "finding id"];
+/// identifier and title. (An id line is dropped only when it says nothing
+/// but the id; see [`ID_LABELS`].)
+const NEVER_KEPT: &[&str] = &["filename"];
+
+/// Labels (lower-case; `**Label:**`, `**Label**:` and `Label:` all read)
+/// of a line that states the report's own finding id. The exporter writes
+/// `**Finding ID:** fnd_…` in Provenance.
+pub const ID_LABELS: &[&str] = &[
+    "finding id",
+    "native finding",
+    "native finding id",
+    "rupu finding",
+    "rupu finding id",
+    "native rupu finding",
+];
 
 // `Report` dwarfs `NotAReport`, but one value is built per file and moved
 // straight out, and the variant's shape is the module's contract.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parsed {
-    /// A finding report, and the finding ids it cites outside its
-    /// cross-references. Its own id is expected to be the only one.
+    /// A finding report, and the distinct finding ids its labelled id lines
+    /// state ([`ID_LABELS`]), in the order they appear: its own id, when
+    /// there is exactly one. Ids cited anywhere else are not in it.
     Report {
         report: FindingReport,
-        cited_ids: Vec<String>,
+        own_ids: Vec<String>,
     },
-    /// Fewer than three of the layout's section headings: not a finding
-    /// report (an index, a README). Skipped, not an error.
+    /// Fewer than three of the layout's section headings and no labelled
+    /// finding id: not a finding report (an index, a README). Skipped, not an
+    /// error.
     NotAReport,
 }
 
@@ -80,6 +100,10 @@ pub enum ImportError {
     },
     #[error("the file holds {0} findings; split it into one file per finding first")]
     SeveralFindings(usize),
+    /// A labelled finding id, but fewer than three of the layout's section
+    /// headings: meant as a report, so not skipped.
+    #[error("has a Finding ID line but is missing the report sections")]
+    MissingReportSections,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,11 +171,17 @@ const SECTIONS: &[(&str, Sec)] = &[
     ("provenance", Sec::Provenance),
 ];
 
-/// Field labels of the layout's header block (lower-case).
+/// Field labels of the layout's header block (lower-case). The id labels
+/// are fields too, so an id line is never taken for the title.
 const FIELDS: &[&str] = &[
     "filename",
     "identifier",
     "finding id",
+    "native finding",
+    "native finding id",
+    "rupu finding",
+    "rupu finding id",
+    "native rupu finding",
     "owner",
     "product",
     "affected component",
@@ -183,7 +213,15 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
     let mut doc = split(&md);
     let kinds: HashSet<Sec> = doc.sections.iter().map(|(s, _)| *s).collect();
     if kinds.len() < 3 {
-        return Ok(Parsed::NotAReport);
+        // A labelled id says the file is meant as a report: say so rather
+        // than skip it.
+        let labelled =
+            !header_id_lines(&doc.header).is_empty() || !take_id_lines(&mut doc).0.is_empty();
+        return if labelled {
+            Err(ImportError::MissingReportSections)
+        } else {
+            Ok(Parsed::NotAReport)
+        };
     }
     let findings = doc.filename_lines.max(doc.description_headings);
     if findings > 1 {
@@ -193,16 +231,24 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
     let mut header = header(&doc.header);
     let trailing = take_trailing_fields(&mut doc, &mut header);
 
-    let cited_ids = {
-        let mut text = doc.header.join("\n");
-        for (s, body) in &doc.sections {
-            if *s != Sec::CrossRefs {
-                text.push('\n');
-                text.push_str(&body.join("\n"));
-            }
+    // The report's own id: labelled id lines only. A header id line that
+    // says nothing but the id is consumed; one that says more is kept as
+    // other text, as is one that holds no id.
+    let mut own_ids: Vec<String> = Vec::new();
+    for f in &mut header.fields {
+        if !ID_LABELS.contains(&f.key.as_str()) {
+            continue;
         }
-        fnd_ids(&text)
-    };
+        let ids = fnd_ids(&f.value);
+        if !ids.is_empty() {
+            f.used = !says_more_than(&f.value, &ids);
+            own_ids.extend(ids);
+        }
+    }
+    let (section_ids, id_text) = take_id_lines(&mut doc);
+    own_ids.extend(section_ids);
+    let mut seen: HashSet<String> = HashSet::new();
+    own_ids.retain(|id| seen.insert(id.clone()));
 
     // Text no field consumed, as (where it came from, text): appended to
     // `references` so nothing in the imported report is lost.
@@ -260,10 +306,11 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
     if replication_steps.is_empty() {
         return Err(ImportError::MissingSection(Sec::Replication.name()));
     }
-    let mut references = required(Sec::References)?.text();
+    let references_body = required(Sec::References)?;
+    let mut references = references_body.text();
     let cwe = match &cwe_field {
         Some(v) => cwe_ids(v),
-        None => cwe_ids(&format!("{category}\n{references}")),
+        None => fallback_cwe_ids(&category, &references_body),
     };
     let (cross_references, verbatim) = cross_refs(section(&doc, Sec::CrossRefs).as_ref());
     if let Some(text) = verbatim {
@@ -274,6 +321,7 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
         .unwrap_or_default();
 
     other.extend(header.leftovers());
+    other.extend(id_text);
     let notes = [
         ("Ticket references", ticket_text),
         ("Impact rating", impact_note),
@@ -327,8 +375,121 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
             artifacts,
             verification: None,
         },
-        cited_ids,
+        own_ids,
     })
+}
+
+/// The ids on `line` when it is a labelled id line ([`ID_LABELS`]) naming at
+/// least one `fnd_` id, and whether it says more than its ids.
+fn id_label(line: &str) -> Option<(Vec<String>, bool)> {
+    let (key, value) = labelled(line)?;
+    if !ID_LABELS.contains(&key.as_str()) {
+        return None;
+    }
+    let ids = fnd_ids(&value);
+    let more = says_more_than(&value, &ids);
+    (!ids.is_empty()).then_some((ids, more))
+}
+
+/// Whether `value` holds text beyond `ids` (and the punctuation, emphasis
+/// or code span around them).
+fn says_more_than(value: &str, ids: &[String]) -> bool {
+    let mut rest = value.to_string();
+    for id in ids {
+        rest = rest.replace(id.as_str(), "");
+    }
+    rest.chars().any(char::is_alphanumeric)
+}
+
+/// Whether each line is inside a fenced code block (the fence lines
+/// included).
+fn code_mask(lines: &[String]) -> Vec<bool> {
+    let mut fence: Option<(char, usize)> = None;
+    lines
+        .iter()
+        .map(|line| {
+            if let Some(open) = fence {
+                if closes(line, open) {
+                    fence = None;
+                }
+                true
+            } else if let Some(open) = opens(line) {
+                fence = Some(open);
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
+/// Four spaces or a tab of indentation: an indented code line.
+fn indented_code(line: &str) -> bool {
+    let unspaced = line.trim_start_matches(' ');
+    line.len() - unspaced.len() >= 4 || unspaced.starts_with('\t')
+}
+
+/// The ids of the header's labelled id lines, outside code.
+fn header_id_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .zip(code_mask(lines))
+        .filter(|(_, code)| !code)
+        .filter_map(|(l, _)| id_label(l))
+        .flat_map(|(ids, _)| ids)
+        .collect()
+}
+
+/// Take the labelled id lines out of every section but Cross-References
+/// (where an id names another finding), outside code. Returns their ids,
+/// and each line that says more than its id as (section, line) for Other
+/// imported text. In Provenance, whose text is all kept as other text, such
+/// a line stays where it is instead.
+fn take_id_lines(doc: &mut Doc) -> (Vec<String>, Vec<(String, String)>) {
+    let mut ids: Vec<String> = Vec::new();
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for (s, body) in &mut doc.sections {
+        let sec = *s;
+        if sec == Sec::CrossRefs {
+            continue;
+        }
+        let code = code_mask(body);
+        let mut i = 0;
+        body.retain(|line| {
+            let in_code = code[i] || indented_code(line);
+            i += 1;
+            let Some((found, more)) = (!in_code).then(|| id_label(line)).flatten() else {
+                return true;
+            };
+            ids.extend(found);
+            if more && sec == Sec::Provenance {
+                return true;
+            }
+            if more {
+                kept.push((sec.name().to_string(), line.trim_end().to_string()));
+            }
+            false
+        });
+    }
+    (ids, kept)
+}
+
+/// CWE ids when the report has no CWE field: every id in Category, and
+/// every id on a References line that starts with one (`CWE-639: …`,
+/// `- CWE-639 …`). An id mentioned in passing ("unlike CWE-79 …") is not
+/// taken.
+fn fallback_cwe_ids(category: &str, references: &Body) -> Vec<String> {
+    let mut text = category.to_string();
+    for (line, code) in references.lines() {
+        let t = strip_marker(line).trim_start_matches(['[', '*', '_', '`', '(']);
+        let starts = t.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cwe-"))
+            && t[4..].starts_with(|c: char| c.is_ascii_digit());
+        if !code && starts {
+            text.push('\n');
+            text.push_str(line);
+        }
+    }
+    cwe_ids(&text)
 }
 
 /// The heading `Other imported text:` and one `<where>:` block per source,
@@ -399,9 +560,9 @@ pub fn fnd_ids(text: &str) -> Vec<String> {
 /// `references`. An emptied list becomes `None`.
 ///
 /// The parser links every `fnd_` id the Cross-References section names,
-/// the report's own included (it cannot tell which cited id is its own), so
-/// the caller passes the ledger's ids *minus* the id the report is being
-/// attached to, and a self-reference is dropped here.
+/// the report's own included, so the caller passes the ledger's ids *minus*
+/// the id the report is being attached to, and a self-reference is dropped
+/// here.
 pub fn retain_known_cross_references(report: &mut FindingReport, known: &HashSet<String>) {
     if let OrSentinel::Value(refs) = &mut report.cross_references {
         refs.retain(|r| known.contains(&r.finding_id));
@@ -578,9 +739,7 @@ fn closes(line: &str, (c, n): (char, usize)) -> bool {
 }
 
 fn heading(line: &str) -> Option<Sec> {
-    // Four spaces or a tab of indentation make an indented code line.
-    let unspaced = line.trim_start_matches(' ');
-    if line.len() - unspaced.len() >= 4 || unspaced.starts_with('\t') {
+    if indented_code(line) {
         return None;
     }
     let mut t = line.trim();
@@ -800,10 +959,14 @@ struct HField {
 #[derive(Debug)]
 enum HLine {
     Field(usize),
+    /// A line of text outside code: a title candidate.
     Text(String),
+    /// A line of a code block: kept, never the title.
+    Code(String),
     Gap,
-    /// An unknown heading before the first section: the text under it is
-    /// kept under its name.
+    /// A `#` line (trimmed) before the first section. A title candidate;
+    /// otherwise an unknown heading, and the text under it is kept under its
+    /// name.
     Heading(String),
 }
 
@@ -851,10 +1014,10 @@ impl Header {
             match l {
                 HLine::Heading(h) => {
                     flush(&at, &mut buf, under_heading);
-                    at = h.clone();
+                    at = h.trim_matches('#').trim().to_string();
                     under_heading = true;
                 }
-                HLine::Text(t) => buf.push(t.clone()),
+                HLine::Text(t) | HLine::Code(t) => buf.push(t.clone()),
                 // One blank line between kept paragraphs, however many there were.
                 HLine::Gap if buf.last().is_some_and(|x| !x.is_empty()) => buf.push(String::new()),
                 HLine::Gap => {}
@@ -864,15 +1027,61 @@ impl Header {
         flush(&at, &mut buf, under_heading);
         out
     }
+
+    /// Take the title out of the lines: a level-1 `#` heading, else the
+    /// first non-blank line after `Filename:` when that is not a field, else
+    /// the first line that is not a field. Anything before it (a banner) is
+    /// left as other text.
+    fn take_title(&mut self) {
+        fn title_of(l: &HLine) -> Option<String> {
+            let (HLine::Text(raw) | HLine::Heading(raw)) = l else {
+                return None;
+            };
+            let t = raw.trim().trim_start_matches('#').trim();
+            let t = strip_pair(strip_pair(t, "**"), "__").trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        /// `# Title`: exactly one `#`, then a space or nothing.
+        fn level_one(l: &HLine) -> bool {
+            let HLine::Heading(raw) = l else {
+                return false;
+            };
+            raw.strip_prefix('#')
+                .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
+        }
+        let lines = &self.lines;
+        let atx = || {
+            lines
+                .iter()
+                .position(|l| level_one(l) && title_of(l).is_some())
+        };
+        let after_filename = || {
+            let f = lines
+                .iter()
+                .position(|l| matches!(l, HLine::Field(i) if self.fields[*i].key == "filename"))?;
+            let next = f
+                + 1
+                + lines[f + 1..]
+                    .iter()
+                    .position(|l| !matches!(l, HLine::Gap))?;
+            title_of(&lines[next]).map(|_| next)
+        };
+        let first = || lines.iter().position(|l| title_of(l).is_some());
+        if let Some(i) = atx().or_else(after_filename).or_else(first) {
+            self.title = title_of(&self.lines[i]);
+            self.lines[i] = HLine::Gap;
+        }
+    }
 }
 
 /// Whether `line` continues the field `f` above it: an indented line or a
 /// list item that is not a field of its own. A ticket list's own labels
-/// (`Identifier:`, `URL:` …) belong to it. `Filename:` and `Finding ID:`
-/// are single values and never continue.
+/// (`Identifier:`, `URL:` …) belong to it. `Filename:` and the id lines are
+/// single values and never continue.
 fn continues_field(f: &HField, line: &str) -> bool {
     let tickets = f.key == "existing ticket references";
-    !matches!(f.key.as_str(), "filename" | "finding id")
+    f.key != "filename"
+        && !ID_LABELS.contains(&f.key.as_str())
         && (line.starts_with(char::is_whitespace) || is_list_item(line))
         && (tickets || field(line).is_none())
 }
@@ -885,14 +1094,14 @@ fn header(lines: &[String]) -> Header {
     let mut fence: Option<(char, usize)> = None;
     for line in lines {
         if let Some(open) = fence {
-            h.lines.push(HLine::Text(line.to_string()));
+            h.lines.push(HLine::Code(line.to_string()));
             if closes(line, open) {
                 fence = None;
             }
             continue;
         }
         if let Some(open) = opens(line) {
-            h.lines.push(HLine::Text(line.to_string()));
+            h.lines.push(HLine::Code(line.to_string()));
             fence = Some(open);
             open_field = None;
             continue;
@@ -928,19 +1137,13 @@ fn header(lines: &[String]) -> Header {
                 raw: vec![line.trim_end().to_string()],
                 used: false,
             });
-        } else if h.title.is_none() {
-            let t = t.trim_start_matches('#').trim();
-            let t = strip_pair(strip_pair(t, "**"), "__").trim();
-            if !t.is_empty() {
-                h.title = Some(t.to_string());
-            }
         } else if t.starts_with('#') {
-            h.lines
-                .push(HLine::Heading(t.trim_matches('#').trim().to_string()));
+            h.lines.push(HLine::Heading(t.to_string()));
         } else {
             h.lines.push(HLine::Text(line.trim_end().to_string()));
         }
     }
+    h.take_title();
     h
 }
 
@@ -1636,9 +1839,10 @@ fn paragraphs(lines: &[String]) -> Vec<String> {
 }
 
 /// A claim without the exporter's trailing ` (sha256 <first 12>)`: a display
-/// prefix of rupu's hash of the claim's file, which rupu recomputes whenever
-/// a report is written. A hash of any other length is the author's and
-/// stays in the claim.
+/// prefix of rupu's hash of the claim's file when the report was recorded.
+/// A prefix cannot be checked against the file, so it is dropped (an
+/// imported claim is stored unhashed). A hash of any other length is the
+/// author's and stays in the claim.
 fn strip_sha_suffix(t: &str) -> &str {
     t.strip_suffix(')')
         .and_then(|x| x.rsplit_once(" (sha256 "))
@@ -1724,29 +1928,29 @@ fn is_diff(info: &str, content: &str) -> bool {
         || content.starts_with("@@")
 }
 
+/// The first diff block is the patch and the rest of the section its notes,
+/// even when the text opens "Not provided …" (a diff that follows is still
+/// a diff). With no diff block, the section is a sentinel.
 fn patch(body: Option<&Body>) -> OrSentinel<Patch> {
     let Some(body) = body else { return missing() };
-    let text = body.text();
-    if let Some(s) = not_provided(&text) {
-        return OrSentinel::Sentinel(s);
-    }
     let found = body.0.iter().enumerate().find_map(|(i, b)| match b {
         Block::Fence { info, content, .. } if is_diff(info, content) => Some((i, content.clone())),
         _ => None,
     });
-    match found {
-        Some((i, diff)) => {
-            let rest = render(&without(&body.0, i));
-            OrSentinel::Value(Patch {
-                diff,
-                notes: (!rest.is_empty()).then_some(rest),
-            })
-        }
-        None => OrSentinel::Sentinel(format!(
+    if let Some((i, diff)) = found {
+        let rest = render(&without(&body.0, i));
+        return OrSentinel::Value(Patch {
+            diff,
+            notes: (!rest.is_empty()).then_some(rest),
+        });
+    }
+    let text = body.text();
+    OrSentinel::Sentinel(not_provided(&text).unwrap_or_else(|| {
+        format!(
             "{NOT_PROVIDED_PREFIX}the imported report gives no unified diff: {}",
             one_line(&text)
-        )),
-    }
+        )
+    }))
 }
 
 /// The value of the first line labelled with one of `keys`, taken out of the
@@ -2045,7 +2249,9 @@ fn kept(lines: &[&str]) -> Option<String> {
 /// Artifact paths, from the exporter's table or a list, and the section's
 /// other text. rupu fills in the hash, size and storage when the report is
 /// written, so the exporter's table is otherwise consumed; any other table
-/// is also kept as text, since its other columns are the author's.
+/// is also kept as text, since its other columns are the author's. A list
+/// item's path is its leading code span, else its first word; an item that
+/// says more than that is also kept as text.
 fn artifacts(body: &Body) -> (Vec<ArtifactRef>, Option<String>) {
     let mut out = Vec::new();
     let mut rest: Vec<&str> = Vec::new();
@@ -2082,7 +2288,18 @@ fn artifacts(body: &Body) -> (Vec<ArtifactRef>, Option<String>) {
             }
             first
         } else if is_list_item(t) {
-            strip_marker(t).to_string()
+            let item = strip_marker(t);
+            let (path, said) = match split_code_span(item) {
+                Some((span, after)) => (span, after),
+                None => {
+                    let word = item.split_whitespace().next().unwrap_or("");
+                    (word, &item[word.len()..])
+                }
+            };
+            if said.chars().any(char::is_alphanumeric) {
+                rest.push(line);
+            }
+            path.to_string()
         } else {
             rest.push(line);
             continue;
@@ -2102,14 +2319,9 @@ fn artifacts(body: &Body) -> (Vec<ArtifactRef>, Option<String>) {
     (out, kept(&rest))
 }
 
-/// A Provenance section's text, less its `Finding ID:` row: that is the
-/// record's own id.
+/// A Provenance section's text. Its id line was already taken out by
+/// [`take_id_lines`] when it said nothing but the id.
 fn provenance(body: &Body) -> Option<String> {
-    let lines: Vec<&str> = body
-        .lines()
-        .into_iter()
-        .filter(|(l, code)| *code || !matches!(labelled(l), Some((k, _)) if k == "finding id"))
-        .map(|(l, _)| l)
-        .collect();
+    let lines: Vec<&str> = body.lines().into_iter().map(|(l, _)| l).collect();
     kept(&lines)
 }

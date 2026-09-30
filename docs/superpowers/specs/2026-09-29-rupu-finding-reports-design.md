@@ -377,11 +377,14 @@ supported input path.
 - **Plan 4 (macOS parity) was dropped:** the macOS app is deprecated, so new
   features target the CLI and the control-plane web UI only.
 - **Plan 5** (`docs/superpowers/plans/2026-09-30-rupu-finding-reports-plan-5-import.md`)
-  shipped the importer above. It matches a report to its finding by the `fnd_`
-  id the report cites outside its Cross-References section, with `--id` as the
-  override for a single file. The rewrite is a single locked, backed-up, atomic
-  replacement of the ledger (`rupu_coverage::tools::attach_reports`), and a
-  finding that already has a report is never changed. Missing content follows
+  shipped the importer above. It matches a report to its finding by the id on
+  the report's labelled id line (`Finding ID:`, `Native Finding:` and similar;
+  never an id merely mentioned in prose), with `--id` naming the finding of a
+  single file that has no such line (an `--id` that disagrees with the line
+  fails). The rewrite is a single locked, backed-up, atomic replacement of the
+  ledger (`rupu_coverage::tools::attach_reports`), a finding that already has a
+  report is never changed, and imported evidence claims are stored unhashed
+  (they describe the code as it was when the report was written). Missing content follows
   the no-invention rules: a field or section the schema has no sentinel for
   fails the file; one it has a sentinel for gets `Unknown`, `None`, or `Not
   Provided — section missing from the imported report`; and a missing part of

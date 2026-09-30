@@ -4,13 +4,18 @@
 //! findings before the full profile existed (spec: "Backfill").
 //!
 //! A report attaches whole or not at all: it goes through the same
-//! validation, claim hashing and artifact store as `report_finding`, and a
-//! finding that already has a report is never touched. The ledger is
-//! replaced atomically under the ledger lock, after a byte-for-byte backup,
-//! and every other line is written back byte for byte (CRLF endings, a
-//! missing final newline, lines that are not UTF-8 or not JSON, and keys this
-//! version does not know all survive). The line that is replaced keeps its
-//! own line terminator.
+//! validation and artifact store as `report_finding`, and a finding that
+//! already has a report is never touched. Unlike `report_finding`, claim
+//! files are not hashed: an imported report's claims were made against the
+//! code as it was when the report was written, so a hash of today's file
+//! would present them as current. Its claims are stored unhashed (a viewer
+//! shows their evidence status as unknown). Artifacts are copied from the
+//! workspace as it is at import. The ledger is replaced atomically under
+//! the ledger lock, after a byte-for-byte backup, and every other line is
+//! written back byte for byte (CRLF endings, a missing final newline, lines
+//! that are not UTF-8 or not JSON, and keys this version does not know all
+//! survive). The line that is replaced keeps its own line terminator. A
+//! ledger that is a symlink is never replaced.
 //!
 //! A dry run reads the ledger and touches nothing else: it takes no lock and
 //! creates no file or directory, so it works on a read-only ledger directory.
@@ -21,7 +26,8 @@ use crate::report::{
     ArtifactError, ArtifactStore, FindingProfile, FindingReport, FindingWriteOptions,
 };
 use crate::tools::report_finding::{
-    check_full_report, derived_fields, lock_findings, prepare_full_report, ReportFindingError,
+    check_full_report, derived_fields, lock_findings, prepare_full_report, ClaimHashes,
+    ReportFindingError,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -49,6 +55,9 @@ pub enum AttachOutcome {
     Duplicate,
     /// The report failed validation, or its artifacts could not be stored.
     Rejected(ReportFindingError),
+    /// The report would have attached, but the ledger was not written (or,
+    /// on a dry run, could not be): [`AttachBatch::write_error`] says why.
+    NotWritten,
 }
 
 #[derive(Debug)]
@@ -56,8 +65,16 @@ pub struct AttachBatch {
     /// One outcome per item, in input order.
     pub outcomes: Vec<AttachOutcome>,
     /// A copy of the ledger as it was before the rewrite. `None` when
-    /// nothing was written (a dry run, or no item attached).
+    /// nothing was written (a dry run, no item attached, or the write
+    /// failed).
     pub backup: Option<PathBuf>,
+    /// Why the ledger was not written: it could not be locked, it is a
+    /// symlink, it changed during the import, or staging or replacing it
+    /// failed. When set, the ledger is as it was, every item that would have
+    /// attached is [`AttachOutcome::NotWritten`], and the other outcomes
+    /// (validation problems included) stand. A dry run sets it only for a
+    /// symlinked ledger, which a real run would refuse.
+    pub write_error: Option<std::io::Error>,
 }
 
 /// Attach each item's report to its finding. With `dry_run`, only report what
@@ -65,6 +82,10 @@ pub struct AttachBatch {
 /// created or written. A dry run's `Attached` means the report passed
 /// validation and every artifact it lists exists inside the workspace, within
 /// the count and size limits.
+///
+/// `Err` only when the ledger cannot be read: nothing was assessed or
+/// written. A failure to write it is [`AttachBatch::write_error`], alongside
+/// every item's outcome.
 pub fn attach_reports(
     paths: &CoveragePaths,
     items: Vec<AttachItem>,
@@ -78,8 +99,11 @@ pub fn attach_reports(
 /// staged and before it is renamed into place. It is a test seam: the hook is
 /// where a test can stand in for a writer that does not take the lock (an
 /// older worker, say) or check that the lock is held. The length check that
-/// catches such a writer is not limited to this window; an unlocked append at
-/// any point after the ledger was read is detected.
+/// catches such a writer is not limited to this window: an unlocked append
+/// anywhere between the read and that check (just before the rename) is
+/// detected. One that lands between the check and the rename, or a write
+/// through a handle opened on the old ledger that lands after the rename, is
+/// not.
 fn attach_reports_with(
     paths: &CoveragePaths,
     items: Vec<AttachItem>,
@@ -87,13 +111,24 @@ fn attach_reports_with(
     dry_run: bool,
     before_rename: &mut dyn FnMut(),
 ) -> std::io::Result<AttachBatch> {
+    // Checked on a dry run too, so the dry run predicts the refusal.
+    let mut write_error = refuse_symlinked_ledger(&paths.findings).err();
     // A dry run writes nothing, so it needs no exclusion (and taking the lock
     // would create the sidecar, and fail on a read-only directory).
-    let _lock = if dry_run {
+    let _lock = if dry_run || write_error.is_some() {
         None
     } else {
-        Some(lock_findings(paths)?)
+        match lock_findings(paths) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                write_error = Some(e);
+                None
+            }
+        }
     };
+    // A ledger that will not be written is only assessed, as a dry run
+    // assesses it, so each item still gets its own outcome.
+    let assess_only = dry_run || write_error.is_some();
     let raw = match std::fs::read(&paths.findings) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -115,12 +150,18 @@ fn attach_reports_with(
             records.insert(i, r);
         }
     }
-    let known: Vec<String> = at.keys().cloned().collect();
+    let mut known: Vec<String> = at.keys().cloned().collect();
 
     let mut claimed: HashSet<usize> = HashSet::new();
     let mut changed = false;
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
+        // A report may not cross-reference the finding it is attached to:
+        // its own id is left out of the known ids while it is checked.
+        let own = known
+            .iter()
+            .position(|k| *k == item.finding_id)
+            .map(|i| known.swap_remove(i));
         let outcome = match at.get(&item.finding_id).map(Vec::as_slice) {
             None => AttachOutcome::NotFound,
             Some([i]) if claimed.contains(i) => AttachOutcome::Duplicate,
@@ -135,7 +176,7 @@ fn attach_reports_with(
                     || has_raw_report(text)
                 {
                     AttachOutcome::AlreadyHasReport
-                } else if dry_run {
+                } else if assess_only {
                     match dry_run_check(paths, &item.report, &known, opts) {
                         Ok(()) => {
                             claimed.insert(*i);
@@ -146,7 +187,7 @@ fn attach_reports_with(
                 } else {
                     // Only a report that attaches claims the finding: a
                     // rejected one leaves it free for a later item.
-                    match prepare_full_report(paths, item.report, &known, opts)
+                    match prepare_full_report(paths, item.report, &known, opts, ClaimHashes::Skip)
                         .and_then(|report| Ok(upgraded_line(text, &report)?))
                     {
                         Ok(mut line) => {
@@ -162,15 +203,42 @@ fn attach_reports_with(
             }
             Some(_) => AttachOutcome::Duplicate,
         };
+        known.extend(own);
         outcomes.push(outcome);
     }
 
-    let backup = if changed {
-        Some(replace_ledger(paths, &segments, read_len, before_rename)?)
-    } else {
-        None
-    };
-    Ok(AttachBatch { outcomes, backup })
+    let mut backup = None;
+    if changed {
+        match replace_ledger(paths, &segments, read_len, before_rename) {
+            Ok(b) => backup = Some(b),
+            Err(e) => write_error = Some(e),
+        }
+    }
+    if write_error.is_some() {
+        for o in &mut outcomes {
+            if matches!(o, AttachOutcome::Attached) {
+                *o = AttachOutcome::NotWritten;
+            }
+        }
+    }
+    Ok(AttachBatch {
+        outcomes,
+        backup,
+        write_error,
+    })
+}
+
+/// Refuse a ledger that is a symlink: replacing it by rename would put a
+/// regular file where the link was, and the file it points to would silently
+/// stop receiving findings.
+fn refuse_symlinked_ledger(findings: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(findings) {
+        Ok(m) if m.file_type().is_symlink() => Err(std::io::Error::other(format!(
+            "{} is a symlink; import does not replace a symlinked ledger (it would replace the link, not the file it points to)",
+            findings.display()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The rejections a real run gives, minus the ones that need the artifact
@@ -275,7 +343,12 @@ fn replace_ledger(
 ) -> std::io::Result<PathBuf> {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let backup = backup_path(&paths.root, &stamp);
-    if let Err(e) = std::fs::copy(&paths.findings, &backup) {
+    // Synced before the swap: the backup is the only copy of what the
+    // rewrite overwrites, so it must not be lost where the new ledger
+    // survives (a crash soon after the rename, with delayed allocation).
+    let copied = std::fs::copy(&paths.findings, &backup)
+        .and_then(|_| std::fs::File::open(&backup)?.sync_all());
+    if let Err(e) = copied {
         // `backup` did not exist before the copy, so anything there is a
         // partial copy of ours.
         let _ = std::fs::remove_file(&backup);
@@ -381,17 +454,26 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(tmp.path(), "t");
         let id = seed_summary(&paths);
+        let other = seed_summary(&paths);
         let original = std::fs::read(&paths.findings).unwrap();
+        let mut invalid = report();
+        invalid.root_cause = String::new();
 
         // A writer that does not take the lock appends between the read and
         // the rename.
         let appended = b"{\"from\":\"a writer that ignores the lock\"}\n";
-        let err = attach_reports_with(
+        let batch = attach_reports_with(
             &paths,
-            vec![AttachItem {
-                finding_id: id,
-                report: report(),
-            }],
+            vec![
+                AttachItem {
+                    finding_id: other,
+                    report: invalid,
+                },
+                AttachItem {
+                    finding_id: id,
+                    report: report(),
+                },
+            ],
             &FindingWriteOptions::default().with_profile(FindingProfile::Full),
             false,
             &mut || {
@@ -404,9 +486,24 @@ mod tests {
                     .unwrap();
             },
         )
-        .expect_err("the import must be abandoned");
+        .expect("the ledger was read");
+        let err = batch.write_error.expect("the import must be abandoned");
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(err.to_string().contains("changed during import"), "{err}");
+        assert!(batch.backup.is_none());
+        // Each item keeps its own outcome: the invalid report its problems,
+        // the valid one "not written".
+        match &batch.outcomes[0] {
+            AttachOutcome::Rejected(ReportFindingError::Report(v)) => {
+                assert!(v.0.iter().any(|e| e.path == "report.root_cause"), "{v:?}")
+            }
+            o => panic!("expected the validation problems, got {o:?}"),
+        }
+        assert!(
+            matches!(batch.outcomes[1], AttachOutcome::NotWritten),
+            "{:?}",
+            batch.outcomes[1]
+        );
 
         // The other writer's line is intact and nothing of ours is written.
         let mut expected = original;

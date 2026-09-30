@@ -194,12 +194,17 @@ fn a_report_for_an_unknown_finding_fails_the_command() {
     assert!(out.contains("0 attached, 0 skipped, 1 failed"), "{out}");
 }
 
+/// PLAIN without its `Finding ID:` line.
+fn plain_unlabelled() -> String {
+    PLAIN.replace(&format!("Finding ID: {ID1}\n"), "")
+}
+
 #[test]
-fn id_overrides_the_cited_id_for_a_single_file() {
+fn id_names_the_finding_of_a_report_with_no_id_line() {
     let home = tempfile::tempdir().unwrap();
     let repo = seed(home.path(), &[summary_record(ID9)]);
     let file = home.path().join("NB-001.md");
-    std::fs::write(&file, PLAIN).unwrap();
+    std::fs::write(&file, plain_unlabelled()).unwrap();
     rupu(home.path())
         .args(["findings", "import", "--id", ID9])
         .arg(&file)
@@ -209,6 +214,96 @@ fn id_overrides_the_cited_id_for_a_single_file() {
         serde_json::from_str(ledger(&repo).lines().next().unwrap()).unwrap();
     assert_eq!(first["id"], ID9);
     assert_eq!(first["profile"], "full");
+}
+
+#[test]
+fn id_that_disagrees_with_the_reports_own_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1), summary_record(ID9)]);
+    let file = home.path().join("NB-001.md");
+    std::fs::write(&file, PLAIN).unwrap();
+    let before = ledger(&repo);
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import", "--id", ID9])
+            .arg(&file)
+            .assert()
+            .failure(),
+    );
+    assert!(
+        out.contains(&format!("the report says {ID1}; --id says {ID9}")),
+        "{out}"
+    );
+    assert_eq!(ledger(&repo), before);
+    // An `--id` that agrees is fine.
+    rupu(home.path())
+        .args(["findings", "import", "--id", ID1])
+        .arg(&file)
+        .assert()
+        .success();
+    assert_eq!(line_of(&ledger(&repo), ID1)["profile"], "full");
+}
+
+#[test]
+fn a_report_that_only_mentions_another_finding_in_prose_is_refused() {
+    // The final review's probe: with no id line, the one id the prose names
+    // (another finding) used to be taken for the report's own, and that
+    // finding was overwritten.
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1), summary_record(ID9)]);
+    let file = home.path().join("NB-001.md");
+    std::fs::write(
+        &file,
+        plain_unlabelled().replace(
+            "The get_note handler loads",
+            &format!("Like {ID9}, the get_note handler loads"),
+        ),
+    )
+    .unwrap();
+    let before = ledger(&repo);
+    for dry in [true, false] {
+        let mut cmd = rupu(home.path());
+        cmd.args(["findings", "import"]);
+        if dry {
+            cmd.arg("--dry-run");
+        }
+        let out = stdout_of(cmd.arg(&file).assert().failure());
+        assert!(
+            out.contains("no Finding ID line; import it alone with --id"),
+            "dry={dry}: {out}"
+        );
+        assert!(out.contains("0 skipped, 1 failed"), "dry={dry}: {out}");
+        assert_eq!(ledger(&repo), before, "dry={dry}");
+    }
+}
+
+#[test]
+fn a_native_finding_label_names_the_finding() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1), summary_record(ID9)]);
+    let file = home.path().join("NB-001.md");
+    std::fs::write(
+        &file,
+        PLAIN
+            .replace("Finding ID:", "Native Finding:")
+            // A prose mention of another finding changes nothing.
+            .replace(
+                "Root Cause\n",
+                &format!("Root Cause\nSee also {ID9} for the same store.\n"),
+            ),
+    )
+    .unwrap();
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&file)
+            .assert()
+            .success(),
+    );
+    assert!(out.contains(&format!("→ {ID1}")), "{out}");
+    let after = ledger(&repo);
+    assert_eq!(line_of(&after, ID1)["profile"], "full");
+    assert_eq!(line_of(&after, ID9)["profile"], "summary");
 }
 
 #[test]
@@ -250,11 +345,12 @@ fn a_finding_that_already_has_a_report_is_skipped_and_the_ledger_is_untouched() 
 }
 
 #[test]
-fn a_report_citing_no_finding_id_or_several_needs_id() {
+fn a_report_with_no_id_line_or_several_fails() {
     let home = tempfile::tempdir().unwrap();
-    seed(home.path(), &[summary_record(ID1), summary_record(ID9)]);
+    let repo = seed(home.path(), &[summary_record(ID1), summary_record(ID9)]);
+    let before = ledger(&repo);
     let none = home.path().join("none.md");
-    std::fs::write(&none, PLAIN.replace(&format!("Finding ID: {ID1}\n"), "")).unwrap();
+    std::fs::write(&none, plain_unlabelled()).unwrap();
     let out = stdout_of(
         rupu(home.path())
             .args(["findings", "import"])
@@ -262,27 +358,35 @@ fn a_report_citing_no_finding_id_or_several_needs_id() {
             .assert()
             .failure(),
     );
-    assert!(out.contains("cites no finding id"), "{out}");
-    assert!(out.contains("--id"), "{out}");
+    assert!(
+        out.contains("none.md: no Finding ID line; import it alone with --id"),
+        "{out}"
+    );
 
     let several = home.path().join("several.md");
     std::fs::write(
         &several,
         PLAIN.replace(
-            "Root Cause\n",
-            &format!("Root Cause\nSee also {ID9} for the same store.\n"),
+            "Owner: Unknown\n",
+            &format!("Owner: Unknown\nNative Finding: {ID9}\n"),
         ),
     )
     .unwrap();
-    let out = stdout_of(
-        rupu(home.path())
-            .args(["findings", "import"])
-            .arg(&several)
-            .assert()
-            .failure(),
-    );
-    assert!(out.contains("cites several finding ids"), "{out}");
-    assert!(out.contains(ID1) && out.contains(ID9), "{out}");
+    for flag in [None, Some(ID1)] {
+        let mut cmd = rupu(home.path());
+        cmd.args(["findings", "import"]);
+        if let Some(id) = flag {
+            cmd.args(["--id", id]);
+        }
+        let out = stdout_of(cmd.arg(&several).assert().failure());
+        assert!(
+            out.contains(&format!(
+                "cites several finding ids on Finding ID lines ({ID1}, {ID9})"
+            )),
+            "{flag:?}: {out}"
+        );
+    }
+    assert_eq!(ledger(&repo), before);
 }
 
 #[test]
@@ -407,7 +511,7 @@ fn a_self_cross_reference_is_dropped() {
     let file = home.path().join("x.md");
     std::fs::write(
         &file,
-        PLAIN.replace(
+        plain_unlabelled().replace(
             "Cross-References\nNone\n",
             &format!("Cross-References\n{ID9} is this finding itself.\n"),
         ),
@@ -499,6 +603,80 @@ fn a_ledger_that_cannot_be_updated_fails_its_files_and_the_rest_go_on() {
         std::fs::read_to_string(&locked.findings).unwrap(),
         locked_before
     );
+}
+
+/// A ledger that cannot be written still has each report assessed: one with
+/// problems lists them, and only one that would have attached fails with the
+/// write error.
+#[cfg(unix)]
+#[test]
+fn a_ledger_that_cannot_be_updated_still_lists_each_reports_problems() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1), summary_record(ID9)]);
+    let paths = CoveragePaths::new(&repo, "tgt1");
+    let before = ledger(&repo);
+    let dir = home.path().join("reports");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), PLAIN).unwrap();
+    std::fs::write(
+        dir.join("b.md"),
+        format!("{}\nArtifacts\n- ../secrets.txt\n", PLAIN.replace(ID1, ID9)),
+    )
+    .unwrap();
+
+    let _restore = Restrict::new(&paths.root, 0o555);
+    if !creation_is_denied(&paths.root) {
+        eprintln!("skipped: directory permissions are not enforced for this user");
+        return;
+    }
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&dir)
+            .assert()
+            .failure(),
+    );
+    assert!(
+        out.contains(&format!(
+            "a.md: cannot update {}:",
+            paths.findings.display()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("b.md: 1 problem(s) in the report"), "{out}");
+    assert!(
+        out.contains("report.artifacts[0].path: must not contain `..`"),
+        "{out}"
+    );
+    assert!(out.contains("0 attached, 0 skipped, 2 failed"), "{out}");
+    assert_eq!(ledger(&repo), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_named_file_that_cannot_be_read_is_a_failed_line_and_the_rest_go_on() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let good = home.path().join("NB-001.md");
+    std::fs::write(&good, PLAIN).unwrap();
+    let locked = home.path().join("locked.md");
+    std::fs::write(&locked, PLAIN.replace(ID1, ID9)).unwrap();
+    let _restore = Restrict::new(&locked, 0o000);
+    if std::fs::File::open(&locked).is_ok() {
+        eprintln!("skipped: file permissions are not enforced for this user");
+        return;
+    }
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&good)
+            .arg(&locked)
+            .assert()
+            .failure(),
+    );
+    assert!(out.contains("locked.md: Permission denied"), "{out}");
+    assert!(out.contains("1 attached, 0 skipped, 1 failed"), "{out}");
+    assert_eq!(line_of(&ledger(&repo), ID1)["profile"], "full");
 }
 
 #[cfg(unix)]
