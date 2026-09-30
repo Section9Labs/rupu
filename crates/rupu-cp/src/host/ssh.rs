@@ -927,6 +927,25 @@ async fn pump_catch_up_usage_ledger(
     }
 }
 
+/// The tail can still be behind when the run turns terminal. Replace the
+/// mirrored coverage stream with the host's file, which is complete by then.
+/// An older host has no file: the `cat` fails and whatever the tail delivered
+/// (nothing) stays, so the coordinator reports that unit's coverage as not
+/// collected.
+async fn pump_catch_up_coverage(
+    exec: &dyn RemoteExec,
+    mirror: &NodeMirror,
+    run_id: &str,
+    host_id: &str,
+) {
+    let cmd = format!("cat $HOME/.rupu/runs/{run_id}/coverage.jsonl");
+    if let Ok(out) = exec.run(&cmd).await {
+        if out.success {
+            let _ = mirror.replace_coverage(run_id, host_id, &out.stdout);
+        }
+    }
+}
+
 /// Spec §6.1 step 3: one ssh invocation that prints the pump's own
 /// `==> <path> <==` header, the file, then a synthetic newline + `==> end <==`
 /// for every path. The synthetic newline guarantees the end marker starts a
@@ -1110,6 +1129,7 @@ async fn pump_finalize_if_terminal(
     // Before `finish`, so the synthesized step-result row sees the complete
     // transcript on disk.
     pump_catch_up_transcript(exec, mirror, run_id, host_id, cat_transcript_cmd).await;
+    pump_catch_up_coverage(exec, mirror, run_id, host_id).await;
     pump_pull_step_transcripts(exec, mirror, lazy, run_id, host_id).await;
     let _ = mirror.finish(run_id, host_id, &status);
     PumpProbe::Finalized
@@ -1584,7 +1604,7 @@ impl SshHostConnector {
         // every token (as build_remote_command does) would prevent $HOME from
         // expanding, producing a literal path that never exists on the remote.
         // run_id contains only [A-Za-z0-9_] (ULID prefix), so unquoted
-        // concatenation is safe. That invariant covers ALL FIVE tailed paths
+        // concatenation is safe. That invariant covers ALL SIX tailed paths
         // and both cat commands below: run_id is their only variable component.
         //
         // The last path is the run's agent transcript, which lives OUTSIDE
@@ -1600,6 +1620,7 @@ impl SshHostConnector {
              $HOME/.rupu/runs/{run_id}/step_results.jsonl \
              $HOME/.rupu/runs/{run_id}/unit_checkpoints.jsonl \
              $HOME/.rupu/runs/{run_id}/usage.jsonl \
+             $HOME/.rupu/runs/{run_id}/coverage.jsonl \
              $HOME/.rupu/transcripts/{run_id}.jsonl"
         );
         let cat_cmd = format!("cat $HOME/.rupu/runs/{run_id}/run.json");
@@ -1609,7 +1630,7 @@ impl SshHostConnector {
         // impossible: none of the `runs/<run_id>/*.jsonl` artifacts can end
         // with `transcripts/<run_id>.jsonl`, and the transcript can't end
         // with `events.jsonl` / `step_results.jsonl` / `unit_checkpoints.jsonl` /
-        // `usage.jsonl`.
+        // `usage.jsonl` / `coverage.jsonl`.
         let transcript_suffix = format!("transcripts/{run_id}.jsonl");
 
         // Register the dispatcher-facing handle BEFORE spawning, so a caller
@@ -1691,6 +1712,8 @@ impl SshHostConnector {
                                                 // with the remote's (see
                                                 // `pump_catch_up_usage_ledger`).
                                                 Some(ArtifactFile::Usage)
+                                            } else if path.ends_with("coverage.jsonl") {
+                                                Some(ArtifactFile::Coverage)
                                             } else if path.ends_with(&transcript_suffix) {
                                                 if !transcript_replayed {
                                                     transcript_replayed = true;
@@ -1879,6 +1902,7 @@ impl SshHostConnector {
                         &cat_transcript_cmd,
                     )
                     .await;
+                    pump_catch_up_coverage(exec.as_ref(), &mirror, &run_id, &host_id).await;
                     // The host is still reachable here too — pull every
                     // recorded step transcript before finishing the run.
                     pump_pull_step_transcripts(exec.as_ref(), &mirror, &lazy, &run_id, &host_id)
@@ -3411,6 +3435,10 @@ mod tests {
         /// `cat …/runs/<id>/usage.jsonl` (the authoritative ledger pull).
         /// `None` → empty stdout, which the pump treats as "no ledger".
         cat_usage_stdout: Option<String>,
+        /// If set, returned as stdout for a `cat …/runs/<id>/coverage.jsonl`
+        /// command (the pump's terminal coverage catch-up). `None` → the `cat`
+        /// fails ("No such file"), i.e. an older host with no coverage stream.
+        cat_coverage_stdout: Option<String>,
         /// If set, returned as stdout for the pump's batched terminal pull
         /// (`for p in …; do printf '==> %s <==' …; cat …; done`, Task 6).
         batch_cat_stdout: Option<String>,
@@ -3442,6 +3470,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3461,6 +3490,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3482,6 +3512,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3503,6 +3534,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3523,6 +3555,7 @@ mod tests {
                 cat_transcript_stdout: None,
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
+                cat_coverage_stdout: None,
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -3543,6 +3576,21 @@ mod tests {
                     stderr: self.fail_stderr.clone(),
                     success: false,
                 })
+            } else if remote.starts_with("cat ") && remote.contains("/coverage.jsonl") {
+                // Before the generic `cat ` arm below: the pump's terminal
+                // coverage catch-up. A host without the file fails the `cat`.
+                match &self.cat_coverage_stdout {
+                    Some(s) => Ok(RemoteOutput {
+                        stdout: s.clone(),
+                        stderr: String::new(),
+                        success: true,
+                    }),
+                    None => Ok(RemoteOutput {
+                        stdout: String::new(),
+                        stderr: "No such file".into(),
+                        success: false,
+                    }),
+                }
             } else {
                 // Return the canned stdout for the two `cat` shapes the pump
                 // issues: `cat …/transcripts/<id>.jsonl` (terminal transcript
@@ -6008,6 +6056,54 @@ mod tests {
             tail.contains("$HOME/.rupu/runs/run_01TESTPUMP01/usage.jsonl"),
             "tail must include the usage ledger path, got: {tail}"
         );
+    }
+
+    /// The pump tails the run's coverage stream and, at terminal, replaces the
+    /// tailed copy with the host's file: the tail can still be behind when the
+    /// run turns terminal, the host's file is complete by then.
+    #[test]
+    fn tail_pump_mirrors_the_coverage_stream_and_replaces_it_at_terminal() {
+        let run_id = "run_01COVPUMP";
+        let mut fake = FakeExec::with_cat_stdout(
+            vec![
+                format!("==> $HOME/.rupu/runs/{run_id}/coverage.jsonl <=="),
+                r#"{"ledger":"begin","v":1,"run_id":"run_01COVPUMP"}"#.to_string(),
+            ],
+            r#"{"status":"completed","final_output":"done."}"#,
+        );
+        fake.cat_coverage_stdout = Some(
+            "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVPUMP\"}\n{\"late\":true}\n"
+                .to_string(),
+        );
+        let fake = std::sync::Arc::new(fake);
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                agent: "sec".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: Some(run_id.into()),
+                findings_profile: None,
+            })
+            .await
+            .unwrap();
+            conn.await_run_mirror(run_id).await;
+            let body = conn.unit_coverage(run_id).await.unwrap();
+            assert_eq!(
+                String::from_utf8(body).unwrap(),
+                "{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_01COVPUMP\"}\n{\"late\":true}\n",
+                "terminal catch-up must replace the tailed copy with the host's file"
+            );
+        });
+        let cmds = fake.commands.lock().unwrap();
+        assert!(cmds.iter().any(|c| c.starts_with("tail ")
+            && c.contains(&format!("$HOME/.rupu/runs/{run_id}/coverage.jsonl"))));
     }
 
     /// Wait, on the PAUSED virtual clock, for the pump to move `run_id` out of
