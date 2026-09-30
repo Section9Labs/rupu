@@ -6,6 +6,10 @@ describe('codename', () => {
     expect(parseCodename('cobalt-harbor/heron#412>lynx#3')).toEqual({ crew: 'cobalt-harbor', leaf: 'heron#412>lynx#3', role: 'lynx' });
     expect(parseCodename('cobalt-harbor/heron#4.2').role).toBe('heron');
   });
+  it('strips trailing digits from the role', () => {
+    expect(parseCodename('jade-reef/heron2').role).toBe('heron');
+    expect(roleBadge('heron', 'light')).toBeDefined();
+  });
   it('looks up tints and badges by theme', () => {
     expect(crewTint('cobalt-harbor', 'light')).toBe('#1d4ed8');
     expect(crewTint('cobalt-harbor', 'dark')).toBe('#93b4fd');
