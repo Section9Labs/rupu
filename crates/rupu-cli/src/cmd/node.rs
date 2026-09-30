@@ -445,6 +445,10 @@ async fn connect_and_run(
     // CP can't parse the `usage` artifact kind and would log-and-drop every
     // line. (Bucket hosts need no gate — an older poller just skips the key.)
     let usage_ok = welcome_advertises(&welcome_frame, CAP_USAGE_LEDGER);
+    // Only a CP that advertised it can parse `ArtifactFile::Coverage` frames.
+    // Task 8 wires this into the artifact pump and drops the underscore.
+    let _mirror_coverage =
+        welcome_advertises(&welcome_frame, rupu_cp::node::protocol::CAP_MIRROR_COVERAGE);
     eprintln!("connected ✓ (authenticated as {node_id})");
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
 

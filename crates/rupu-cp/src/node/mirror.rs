@@ -156,6 +156,7 @@ impl NodeMirror {
     /// - [`ArtifactFile::Usage`] → append to `usage.jsonl` (the run's usage
     ///   ledger; the CP fold dedups rows by their ULID `id`, so a replayed
     ///   line is harmless).
+    /// - [`ArtifactFile::Coverage`] → append to `coverage.jsonl`.
     /// - [`ArtifactFile::RunJson`] → parse `line` as [`RunRecord`], reapply
     ///   `id` and `worker_id`, then overwrite `run.json` via
     ///   [`RunStore::update`].
@@ -213,6 +214,11 @@ impl NodeMirror {
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
+                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+                writeln!(f, "{line}")?;
+            }
+            ArtifactFile::Coverage => {
+                let path = self.coverage_path(run_id);
                 let mut f = OpenOptions::new().create(true).append(true).open(path)?;
                 writeln!(f, "{line}")?;
             }
@@ -340,6 +346,32 @@ impl NodeMirror {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        Ok(())
+    }
+
+    /// `<global>/runs/<run_id>/coverage.jsonl` — the mirrored run stream.
+    pub fn coverage_path(&self, run_id: &str) -> PathBuf {
+        rupu_coverage::stream_path(&self.run_store.root, run_id)
+    }
+
+    /// Replace the mirrored stream with `body` — the host's complete file,
+    /// read once the run is terminal (the tail may still have been behind).
+    /// Same ownership check as [`Self::append`].
+    pub fn replace_coverage(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        body: &str,
+    ) -> Result<(), MirrorError> {
+        validate_run_id(run_id)?;
+        let existing = self.run_store.load(run_id)?;
+        if existing.worker_id.as_deref() != Some(node_id) {
+            return Err(MirrorError::WrongNode(run_id.to_string()));
+        }
+        let path = self.coverage_path(run_id);
+        let tmp = path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -478,5 +510,47 @@ fn parse_status(s: &str) -> RunStatus {
         "cancelled" => RunStatus::Cancelled,
         "rejected" => RunStatus::Rejected,
         _ => RunStatus::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_lines_append_and_replace_is_authoritative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(
+            tmp.path().join("runs"),
+        ));
+        let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "a".into(),
+            inputs: Default::default(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+        };
+        mirror.create_run("run_C1", "node-1", &spec).unwrap();
+        mirror
+            .append("run_C1", "node-1", ArtifactFile::Coverage, "line-1")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mirror.coverage_path("run_C1")).unwrap(),
+            "line-1\n"
+        );
+        mirror
+            .replace_coverage("run_C1", "node-1", "a\nb\n")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mirror.coverage_path("run_C1")).unwrap(),
+            "a\nb\n"
+        );
+        assert!(matches!(
+            mirror.replace_coverage("run_C1", "node-2", "x"),
+            Err(MirrorError::WrongNode(_))
+        ));
     }
 }
