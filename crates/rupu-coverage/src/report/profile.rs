@@ -34,8 +34,14 @@ mod tests {
 
     #[test]
     fn resolve_prefers_the_most_specific_setting() {
-        assert_eq!(FindingProfile::resolve(Some(Summary), Some(Full), Some(Full)), Summary);
-        assert_eq!(FindingProfile::resolve(None, Some(Summary), Some(Full)), Summary);
+        assert_eq!(
+            FindingProfile::resolve(Some(Summary), Some(Full), Some(Full)),
+            Summary
+        );
+        assert_eq!(
+            FindingProfile::resolve(None, Some(Summary), Some(Full)),
+            Summary
+        );
         assert_eq!(FindingProfile::resolve(None, None, Some(Summary)), Summary);
         assert_eq!(FindingProfile::resolve(None, None, None), Full);
     }
@@ -43,6 +49,9 @@ mod tests {
     #[test]
     fn serializes_lowercase() {
         assert_eq!(serde_json::to_string(&Full).unwrap(), "\"full\"");
-        assert_eq!(serde_json::from_str::<FindingProfile>("\"summary\"").unwrap(), Summary);
+        assert_eq!(
+            serde_json::from_str::<FindingProfile>("\"summary\"").unwrap(),
+            Summary
+        );
     }
 }

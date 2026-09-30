@@ -43,6 +43,6 @@ pub use ledger::{
     Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord, FindingScope, RunManifest,
     Surface,
 };
-pub use rerun::{plan_rerun, RerunError, RerunInvocation};
 pub use report::{FindingProfile, FindingReport};
+pub use rerun::{plan_rerun, RerunError, RerunInvocation};
 pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};

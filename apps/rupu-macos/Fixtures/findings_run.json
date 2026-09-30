@@ -28,7 +28,8 @@
         "model": "claude-sonnet-4-6",
         "surface": "workflow"
       },
-      "declared_at": "2026-08-20T12:00:00Z"
+      "declared_at": "2026-08-20T12:00:00Z",
+      "profile": "summary"
     },
     {
       "ws_id": "ws1",
@@ -52,7 +53,8 @@
         "model": "claude-sonnet-4-6",
         "surface": "workflow"
       },
-      "declared_at": "2026-08-20T11:00:00Z"
+      "declared_at": "2026-08-20T11:00:00Z",
+      "profile": "summary"
     }
   ],
   "summary": {
