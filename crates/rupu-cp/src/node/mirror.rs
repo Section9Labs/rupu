@@ -303,6 +303,42 @@ impl NodeMirror {
         Ok(())
     }
 
+    /// Atomically REPLACE the mirrored usage ledger for `run_id` with `content`.
+    ///
+    /// Used by the SSH tail pump's terminal pull: a one-shot `cat` of the
+    /// remote `usage.jsonl` is the authoritative ledger, whereas the tailed
+    /// copy can miss rows written in the last poll interval before the run
+    /// went terminal. The content is written to a temp file in the run
+    /// directory and renamed over [`RunStore::usage_ledger_path`], so a
+    /// reader never sees a torn ledger and the file gets a fresh inode (the
+    /// live usage fold treats that as a reset and rebuilds, deduping rows by
+    /// their ULID `id`). Ownership rules match [`NodeMirror::append`].
+    ///
+    /// # Errors
+    /// [`MirrorError::InvalidRunId`], [`MirrorError::Store`],
+    /// [`MirrorError::WrongNode`] as for `append`; [`MirrorError::Io`] when
+    /// the temp file cannot be written or renamed (the temp file is removed).
+    pub fn replace_usage_ledger(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        content: &str,
+    ) -> Result<(), MirrorError> {
+        validate_run_id(run_id)?;
+        let existing = self.run_store.load(run_id)?;
+        if existing.worker_id.as_deref() != Some(node_id) {
+            return Err(MirrorError::WrongNode(run_id.to_string()));
+        }
+        let path = self.run_store.usage_ledger_path(run_id);
+        let tmp = path.with_file_name(format!("usage.jsonl.{}.tmp", ulid::Ulid::new()));
+        std::fs::write(&tmp, content)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
     /// Transition `run_id` to `status` and set `finished_at = now()`.
     ///
     /// Only the node that created the run (identified by `node_id`) may

@@ -493,13 +493,24 @@ async fn connect_and_run(
             ) {
                 send_artifact(&mut sink, rid, ArtifactFile::UnitCheckpoints, line).await;
             }
-            // usage.jsonl — drained before the terminal run.json check below
-            // so a finishing run's last ledger rows go out before RunFinished.
+            // usage.jsonl — the routine incremental drain.
             for line in drain_usage_ledger(&run_dir, &mut state.offsets, usage_ok) {
                 send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
             }
             // run.json — check for terminal status.
             if let Some((status, body)) = read_terminal_status(&run_dir.join("run.json")) {
+                // A ledger row can land between the drain above and this
+                // terminal read, and the run leaves `active` this pass — so
+                // one more drain, now that the run is known terminal (the
+                // runner writes its ledger rows before the terminal status).
+                // It goes BEFORE the terminal `run.json` and `RunFinished`
+                // frames: the CP flips the run terminal on those, and a
+                // reader that sees it terminal must see the whole ledger.
+                // Offsets make it exact-once: rows the earlier drain sent are
+                // never re-sent.
+                for line in drain_usage_ledger(&run_dir, &mut state.offsets, usage_ok) {
+                    send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
+                }
                 send_artifact(&mut sink, rid, ArtifactFile::RunJson, body).await;
                 let frame = Frame::RunFinished {
                     run_id: rid.clone(),
@@ -1330,6 +1341,45 @@ mod tests {
         assert!(more[0].contains("USG3"));
         // The other artifacts' offsets are independent.
         assert_eq!(off.events, 0);
+    }
+
+    /// The terminal pass of the tunnel loop drains the ledger a SECOND time
+    /// (a row can land between the routine drain and the terminal `run.json`
+    /// read, and the run leaves `active` that pass). The loop itself is inline
+    /// in `connect_and_run` and needs a live WebSocket, so what is testable —
+    /// and load-bearing — is the helper sequence it runs: the second drain
+    /// returns exactly the late row, never the ones the first already sent,
+    /// and a gated (old-CP) connection still sends nothing on either pass.
+    #[test]
+    fn terminal_pass_second_drain_sends_only_the_late_row() {
+        let dir = tempdir().unwrap();
+        let ledger = dir.path().join("usage.jsonl");
+        std::fs::write(&ledger, "{\"id\":\"USG1\"}\n{\"id\":\"USG2\"}\n").unwrap();
+
+        let mut off = offsets();
+        // Routine drain earlier in the pass.
+        let first = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(first.len(), 2, "{first:?}");
+
+        // The runner appends a final row, then writes the terminal run.json.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        writeln!(f, r#"{{"id":"USG3"}}"#).unwrap();
+        drop(f);
+
+        // Terminal pass: exactly the late row, once.
+        let last = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(last.len(), 1, "{last:?}");
+        assert!(last[0].contains("USG3"));
+        assert!(drain_usage_ledger(dir.path(), &mut off, true).is_empty());
+
+        // Same ledger, old CP: neither pass sends anything or moves the offset.
+        let mut gated = offsets();
+        assert!(drain_usage_ledger(dir.path(), &mut gated, false).is_empty());
+        assert!(drain_usage_ledger(dir.path(), &mut gated, false).is_empty());
+        assert_eq!(gated.usage, 0);
     }
 
     /// A run with no usage ledger yet (or never) drains to nothing.

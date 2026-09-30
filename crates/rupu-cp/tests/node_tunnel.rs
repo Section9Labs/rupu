@@ -344,6 +344,96 @@ fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     );
 }
 
+/// `replace_usage_ledger` swaps the mirrored ledger wholesale by rename: the
+/// content is exactly the given body, the inode changes, no temp file is left,
+/// and node ownership / run-id validation still apply.
+#[cfg(unix)]
+#[test]
+fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
+    use rupu_cp::node::mirror::{MirrorError, NodeMirror};
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::MetadataExt as _;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "smoke-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRUSAGE02";
+    let node_id = "node-42";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    // Replacing works even when no ledger exists yet.
+    let row_a = r#"{"id":"01J0000000000000000000USGA"}"#;
+    let row_b = r#"{"id":"01J0000000000000000000USGB"}"#;
+    mirror
+        .replace_usage_ledger(run_id, node_id, &format!("{row_a}\n"))
+        .expect("replace into a missing ledger");
+    let path = store.usage_ledger_path(run_id);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{row_a}\n")
+    );
+
+    let inode_before = std::fs::metadata(&path).unwrap().ino();
+    mirror
+        .replace_usage_ledger(run_id, node_id, &format!("{row_a}\n{row_b}\n"))
+        .expect("replace");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{row_a}\n{row_b}\n")
+    );
+    assert_ne!(
+        std::fs::metadata(&path).unwrap().ino(),
+        inode_before,
+        "a replace is a rename over the old file"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+    // Appends after a replace continue the new file.
+    mirror
+        .append(
+            run_id,
+            node_id,
+            ArtifactFile::Usage,
+            r#"{"id":"01J0000000000000000000USGC"}"#,
+        )
+        .expect("append after replace");
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+
+    // Ownership and run-id validation are enforced before any I/O.
+    assert!(matches!(
+        mirror.replace_usage_ledger(run_id, "intruder", "x\n"),
+        Err(MirrorError::WrongNode(_))
+    ));
+    assert!(matches!(
+        mirror.replace_usage_ledger("../evil", node_id, "x\n"),
+        Err(MirrorError::InvalidRunId(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().lines().count(),
+        3,
+        "rejected replaces must not touch the ledger"
+    );
+}
+
 /// After `create_run` + `append(RunJson, <node record with bogus paths>)`,
 /// the loaded record must carry the CP-side `transcript_dir` and
 /// `workspace_path` (not the node's paths), while run-state fields
