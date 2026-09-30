@@ -6,6 +6,11 @@
 // `cost_usd: None` on the wire means "unknown", not "free", and the backend
 // excludes them from both the baseline and the results.
 //
+// Standalone agent runs and session turns are outlier candidates too, baselined
+// per agent: they carry `workflow_name: ""` plus `kind` (`"agent"`/`"session"`)
+// and `agent`, so the name column falls back to the agent and a small kind tag
+// says what sort of row it is.
+//
 // `excludedRunIds`/`onToggleRun` (Task U3, the interactive `/usage` page) add
 // a per-row exclude checkbox that toggles the run's `run_id` in the caller's
 // `TimelineFilter.excludedRunIds` — this is how a real ~1000x-cost outlier
@@ -39,6 +44,10 @@ export function OutlierPanel({
     <ul className="divide-y divide-border">
       {outliers.map((o) => {
         const excluded = !!excludedRunIds?.has(o.run_id);
+        // `workflow_name` is `""` for standalone/session outliers — name the
+        // agent instead. `kind` is absent on older servers (a workflow run).
+        const name = o.workflow_name || o.agent || o.run_id;
+        const kind = o.kind ?? 'workflow';
         return (
           <li key={o.run_id} className="flex items-center gap-3 px-3 py-2 text-sm">
             {onToggleRun && (
@@ -53,8 +62,16 @@ export function OutlierPanel({
               to={`/runs/${o.run_id}`}
               className={`font-medium text-ink ${excluded ? 'line-through opacity-50' : ''}`}
             >
-              {o.workflow_name}
+              {name}
             </Link>
+            {kind !== 'workflow' && (
+              <span
+                className={`rounded border border-border px-1 py-px text-[10px] uppercase tracking-wide text-ink-mute ${excluded ? 'opacity-50' : ''}`}
+                title={kind === 'session' ? 'A session turn' : 'A standalone agent run'}
+              >
+                {kind}
+              </span>
+            )}
             <span className={`text-xs text-ink-mute ${excluded ? 'opacity-50' : ''}`}>
               {o.run_id}
             </span>

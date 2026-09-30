@@ -58,4 +58,33 @@ describe('OutlierPanel', () => {
     expect(checkbox.checked).toBe(false);
     expect(screen.getByText('nightly-review')).toHaveClass('line-through');
   });
+
+  it('names a workflow outlier by its workflow and shows no kind tag', () => {
+    renderPanel({ outliers: [outlier({ kind: 'workflow' })] });
+    expect(screen.getByText('nightly-review')).toBeInTheDocument();
+    expect(screen.queryByText('agent')).not.toBeInTheDocument();
+    expect(screen.queryByText('session')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the agent name and tags a standalone agent run', () => {
+    renderPanel({
+      outliers: [outlier({ run_id: 'run-a', kind: 'agent', workflow_name: '', agent: 'reviewer' })],
+    });
+    expect(screen.getByText('reviewer')).toBeInTheDocument();
+    expect(screen.getByText('agent')).toBeInTheDocument();
+  });
+
+  it('falls back to the agent name and tags a session turn', () => {
+    renderPanel({
+      outliers: [outlier({ run_id: 'run-s', kind: 'session', workflow_name: '', agent: 'assistant' })],
+    });
+    expect(screen.getByText('assistant')).toBeInTheDocument();
+    expect(screen.getByText('session')).toBeInTheDocument();
+  });
+
+  it('tolerates a server that omits kind/agent (older API): workflow name, no tag', () => {
+    renderPanel({ outliers: [outlier()] });
+    expect(screen.getByText('nightly-review')).toBeInTheDocument();
+    expect(screen.queryByText('agent')).not.toBeInTheDocument();
+  });
 });

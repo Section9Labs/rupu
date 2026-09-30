@@ -67,6 +67,9 @@ import { Spinner } from '../components/ui/Spinner';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
+/** How often a preset ("ends now") window is re-derived and its data refetched. */
+const USAGE_REFRESH_MS = 30_000;
+
 function toggleInSet(set: Set<string>, key: string): Set<string> {
   const next = new Set(set);
   if (next.has(key)) next.delete(key);
@@ -186,6 +189,23 @@ export default function Usage() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment on the effect above.
   }, [usageWindow.since, usageWindow.until]);
+
+  // Live refresh: a preset window ends at "now", so its `until` goes stale the
+  // moment it is built — new runs (and a still-running run's growing usage)
+  // land after it. While a preset is active, re-derive the window every 30s;
+  // the new `until` re-fires the three fetches above (and `UsageTimeline`'s
+  // own run-rows fetch) through their normal primitive-keyed effects. A
+  // drag-selected custom window is a fixed historical span and never ticks.
+  // Hidden tabs skip the tick (the next visible one catches up), and the timer
+  // is cleared on unmount / range change.
+  useEffect(() => {
+    if (isCustomWindow) return;
+    const t = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      setUsageWindow(presetWindow(range));
+    }, USAGE_REFRESH_MS);
+    return () => window.clearInterval(t);
+  }, [range, isCustomWindow]);
 
   const filter = useMemo<TimelineFilter>(
     () => ({ excludedKeys, excludedRunIds }),

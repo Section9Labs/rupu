@@ -47,7 +47,9 @@
  *     with no preceding `tool_call` to attach to in this snapshot) render as
  *     a standalone `tool` block instead of vanishing.
  *   • a header is surfaced from `run_start`; a footer from `run_complete`,
- *     falling back to the last `usage` event when the run hasn't completed.
+ *     falling back to the running sum of `usage` events while the run is in
+ *     flight (each provider call appends one `usage` event, so the sum is the
+ *     run's token total so far).
  *
  * No React, no DOM — a deterministic function over the event list.
  */
@@ -289,6 +291,9 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   let header: TranscriptHeader | null = null;
   let footer: TranscriptFooter | null = null;
   let sawRunComplete = false;
+  // Running total of `usage` events (input + output) — the footer's token
+  // count until `run_complete` supplies the authoritative figure.
+  let usageSum = 0;
 
   const turns: TurnView[] = [];
   // The turn new blocks currently attach to. Created lazily (via `ensureTurn`)
@@ -584,12 +589,12 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
       }
 
       case 'usage': {
-        const input = asNumber(data.input_tokens) ?? 0;
-        const output = asNumber(data.output_tokens) ?? 0;
-        if (!footer) {
-          footer = { status: null, totalTokens: input + output, durationMs: null, error: null };
-        } else if (footer.totalTokens === null) {
-          footer.totalTokens = input + output;
+        usageSum += (asNumber(data.input_tokens) ?? 0) + (asNumber(data.output_tokens) ?? 0);
+        if (!sawRunComplete) {
+          footer = {
+            ...(footer ?? { status: null, durationMs: null, error: null }),
+            totalTokens: usageSum,
+          };
         }
         break;
       }

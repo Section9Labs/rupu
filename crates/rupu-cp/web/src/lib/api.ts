@@ -804,7 +804,15 @@ export interface UsageResponse extends UsageOverview {
  */
 export interface OutlierRun {
   run_id: string;
+  /** What produced the run: an orchestrator `workflow` run, a standalone
+   *  `agent` run, or a `session` turn. Absent on servers that predate
+   *  standalone/session outliers (treat as `"workflow"`). */
+  kind?: 'workflow' | 'agent' | 'session';
+  /** `""` for a standalone agent run or session turn — read `agent` instead. */
   workflow_name: string;
+  /** The agent a standalone run / session turn ran (the baseline agent);
+   *  absent for a workflow run. */
+  agent?: string | null;
   cost_usd: number;
   baseline_usd: number;
   ratio: number;

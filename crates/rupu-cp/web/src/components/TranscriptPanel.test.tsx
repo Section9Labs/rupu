@@ -12,11 +12,11 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../lib/api';
-import type { TranscriptResponse } from '../lib/transcript';
-import TranscriptPanel from './TranscriptPanel';
+import type { TranscriptEvent, TranscriptResponse } from '../lib/transcript';
+import TranscriptPanel, { mergeSnapshotAndStream } from './TranscriptPanel';
 
 // `useNavigate` is what `openTranscript` reaches for; spy on it so the
 // sub-run URL it builds can be asserted directly.
@@ -178,5 +178,94 @@ describe('TranscriptPanel sub-run links', () => {
         encodeURIComponent('/home/ci/.rupu/runs/run_01P/sub/sub_01X/transcript.jsonl') +
         '&live=0',
     );
+  });
+});
+
+describe('mergeSnapshotAndStream', () => {
+  it('prefers the snapshot while the stream replay is still shorter', () => {
+    expect(mergeSnapshotAndStream([1, 2, 3], [1, 2])).toEqual([1, 2, 3]);
+  });
+
+  it('prefers the stream once it has replayed past the snapshot', () => {
+    expect(mergeSnapshotAndStream([1, 2], [1, 2, 3, 4])).toEqual([1, 2, 3, 4]);
+  });
+
+  it('uses whichever side has events when the other is empty', () => {
+    expect(mergeSnapshotAndStream([], [1])).toEqual([1]);
+    expect(mergeSnapshotAndStream([1], [])).toEqual([1]);
+  });
+
+  it('keeps the equal-length case on the stream (no duplication, same content)', () => {
+    expect(mergeSnapshotAndStream([1, 2], [1, 2])).toEqual([1, 2]);
+  });
+});
+
+describe('TranscriptPanel live backlog', () => {
+  const RUN_START: TranscriptEvent = {
+    type: 'run_start',
+    data: {
+      run_id: 'run-1',
+      agent: 'reviewer-agent',
+      provider: 'anthropic',
+      model: 'opus',
+      started_at: '2026-06-01T00:00:00Z',
+      mode: 'ask',
+    },
+  };
+  const FIRST: TranscriptEvent = { type: 'assistant_message', data: { content: 'first message body' } };
+  const SECOND: TranscriptEvent = { type: 'assistant_message', data: { content: 'second message body' } };
+
+  /** Mount a live panel and hand back the SSE `onEvent` / `onError` callbacks. */
+  async function mountLive(snapshot: TranscriptEvent[]) {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue({ events: snapshot, summary: null });
+    let onEvent: (e: TranscriptEvent) => void = () => {};
+    let onError: () => void = () => {};
+    vi.spyOn(api, 'subscribeTranscript').mockImplementation((_path, cb, err) => {
+      onEvent = cb;
+      onError = () => err?.(new Event('error'));
+      return () => {};
+    });
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/t/run-1.jsonl" live />
+      </MemoryRouter>,
+    );
+    await screen.findAllByText('first message body');
+    return {
+      emit: (e: TranscriptEvent) => act(() => onEvent(e)),
+      fail: () => act(() => onError()),
+    };
+  }
+
+  it('does not render the backlog twice when the stream replays what the snapshot has', async () => {
+    const { emit } = await mountLive([RUN_START, FIRST]);
+    const before = screen.getAllByText('first message body').length;
+
+    // The tailer replays from byte 0: the same events the snapshot already has.
+    emit(RUN_START);
+    emit(FIRST);
+    expect(screen.getAllByText('first message body')).toHaveLength(before);
+
+    // …then follows the file with genuinely new events.
+    emit(SECOND);
+    expect(screen.getAllByText('first message body')).toHaveLength(before);
+    expect(screen.getAllByText('second message body').length).toBeGreaterThan(0);
+  });
+
+  it('does not duplicate the backlog when the stream reconnects and replays from the start', async () => {
+    const { emit, fail } = await mountLive([RUN_START, FIRST]);
+    emit(RUN_START);
+    emit(FIRST);
+    emit(SECOND);
+    const firstBefore = screen.getAllByText('first message body').length;
+    const secondBefore = screen.getAllByText('second message body').length;
+
+    // Connection drop, EventSource reconnects, the server replays from byte 0.
+    fail();
+    emit(RUN_START);
+    emit(FIRST);
+    emit(SECOND);
+    expect(screen.getAllByText('first message body')).toHaveLength(firstBefore);
+    expect(screen.getAllByText('second message body')).toHaveLength(secondBefore);
   });
 });
