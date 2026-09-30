@@ -4,7 +4,7 @@
 //! containment primitive the run-scoped source endpoint uses — no path here
 //! ever escapes the workspace root.
 
-use crate::api::source::{detect_language, SourceLine};
+use crate::api::source::{detect_language, read_workspace_text, PreviewError, SourceLine};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::{
@@ -152,25 +152,19 @@ impl FileContent {
 /// Read a workspace-relative file whole (up to `MAX_FILE_BYTES`). Missing,
 /// oversized, non-file, or non-UTF-8 targets return `available:false` with a
 /// reason (HTTP 200) — only path-safety violations are hard errors.
+/// Blocking: [`get_source`] runs it under `spawn_blocking`.
 fn read_whole_file(workspace: &FsPath, rel: &str) -> Result<FileContent, ApiError> {
     let file = crate::api::source::resolve_under_workspace(workspace, rel)?;
-    if !file.is_file() {
-        return Ok(FileContent::unavailable("file not found"));
-    }
-    let meta = match std::fs::metadata(&file) {
-        Ok(m) => m,
-        Err(_) => return Ok(FileContent::unavailable("file not found")),
-    };
-    if meta.len() > MAX_FILE_BYTES {
-        return Ok(FileContent::unavailable("file too large to display"));
-    }
-    let bytes = match std::fs::read(&file) {
-        Ok(b) => b,
-        Err(e) => return Ok(FileContent::unavailable(e.to_string())),
-    };
-    let text = match String::from_utf8(bytes) {
+    let text = match read_workspace_text(&file, MAX_FILE_BYTES) {
         Ok(t) => t,
-        Err(_) => return Ok(FileContent::unavailable("binary or non-UTF-8 file")),
+        Err(e) => {
+            return Ok(FileContent::unavailable(match e {
+                PreviewError::NotFound => "file not found".to_string(),
+                PreviewError::TooLarge => "file too large to display".to_string(),
+                PreviewError::NotUtf8 => "binary or non-UTF-8 file".to_string(),
+                PreviewError::Io(e) => e.to_string(),
+            }))
+        }
     };
     let lines: Vec<SourceLine> = text
         .lines()
@@ -196,7 +190,9 @@ async fn get_source(
     State(s): State<AppState>,
 ) -> ApiResult<Json<FileContent>> {
     let w = load_workspace(&s, &ws_id)?;
-    let fc = read_whole_file(FsPath::new(&w.path), &q.path)?;
+    let fc = tokio::task::spawn_blocking(move || read_whole_file(FsPath::new(&w.path), &q.path))
+        .await
+        .map_err(|e| ApiError::internal(format!("file read task panicked: {e}")))??;
     Ok(Json(fc))
 }
 
@@ -402,6 +398,19 @@ mod tests {
         std::fs::write(d.path().join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
         let fc = read_whole_file(d.path(), "bin.dat").unwrap();
         assert!(!fc.available);
+    }
+
+    #[test]
+    fn source_soft_fails_on_a_fifo_without_blocking() {
+        use crate::api::fs_open::test_support::{mkfifo, within_deadline};
+        let d = tmp_ws();
+        if !mkfifo(&d.path().join("src/pipe.rs")) {
+            return;
+        }
+        let root = d.path().to_path_buf();
+        let fc = within_deadline(move || read_whole_file(&root, "src/pipe.rs")).unwrap();
+        assert!(!fc.available);
+        assert_eq!(fc.reason.as_deref(), Some("file not found"));
     }
 
     #[test]

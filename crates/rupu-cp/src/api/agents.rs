@@ -829,6 +829,7 @@ async fn run_agent_with(
 ) -> Result<String, ApiError> {
     let findings_profile = parse_findings_profile(body.findings_profile.as_deref())?;
     let req = AgentLaunchRequest {
+        codename: None,
         agent: name.to_string(),
         prompt: body.prompt,
         mode: body.mode,
@@ -969,6 +970,7 @@ async fn run_agent(
         let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
+            codename: None,
             agent: name.clone(),
             prompt: b.prompt,
             mode: b.mode,
@@ -2782,6 +2784,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            codename: None,
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');
@@ -2836,6 +2839,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         s.run_store.create(record, "name: wf\n").unwrap();
         write_agent_transcript(transcript_path, agent);
@@ -2859,6 +2863,7 @@ mod tests {
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();

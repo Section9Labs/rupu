@@ -33,6 +33,26 @@ export interface UnitView {
   key: string;
   state: StepState;
   transcriptPath?: string;
+  /** The agent this unit runs, from its unit_started / agent_started event
+   *  (panel units each run their own panelist / fixer agent). */
+  agent?: string;
+  /** Server-minted agent codename for this unit (checkpoint / unit_started / agent_started). */
+  codename?: string;
+  /** Provider + model from the unit's `agent_started` (absent for placed units). */
+  provider?: string;
+  model?: string;
+}
+
+/** One `parallel:` sub-step. `agent` comes from the DAG; codename from the
+ *  step_result's per-sub item; codename/provider/model from `agent_started`
+ *  whose `unit_index` is the sub-step's declared position. */
+export interface ParallelSubView {
+  id: string;
+  state: StepState;
+  agent?: string;
+  codename?: string;
+  provider?: string;
+  model?: string;
 }
 
 export interface FanoutState {
@@ -45,11 +65,17 @@ export interface GraphNode {
   id: string;
   kind: StepNodeDto['kind'];
   agent?: string;
+  /** Server-minted codename for a linear step's agent. Fan-out / panel /
+   *  parallel steps carry none — their instances live on `fanout.units`. */
+  codename?: string;
+  /** Provider + model from the step's `agent_started` event. */
+  provider?: string;
+  model?: string;
   state: StepState;
   /** Path to this step's agent transcript JSONL, when one was recorded. */
   transcriptPath?: string;
   fanout?: FanoutState;
-  parallel?: { id: string; state: StepState }[];
+  parallel?: ParallelSubView[];
   /** For panel/gate steps — current iteration / max. Task 9 populates `current`. */
   round?: { current: number; max: number };
   gate?: StepNodeDto['gate'];
@@ -82,6 +108,33 @@ function coerceItem(item: unknown): string {
   // strings pass through; everything else stringifies, falling back to
   // `String(item)` when stringify yields undefined (e.g. `item === undefined`).
   return typeof item === 'string' ? item : (JSON.stringify(item) ?? String(item));
+}
+
+interface AgentIdentity {
+  agent?: string;
+  codename?: string;
+  provider?: string;
+  model?: string;
+}
+
+/** Layer `later` over `base` field-by-field (later wins where it has a value). */
+function mergeIdentity(base: AgentIdentity | undefined, later: AgentIdentity): AgentIdentity {
+  const out: AgentIdentity = { ...base };
+  if (later.agent) out.agent = later.agent;
+  if (later.codename) out.codename = later.codename;
+  if (later.provider) out.provider = later.provider;
+  if (later.model) out.model = later.model;
+  return out;
+}
+
+/** Overlay an agent_started identity; absent fields leave existing values. */
+function applyIdentity(
+  target: { codename?: string; provider?: string; model?: string },
+  id: AgentIdentity,
+): void {
+  if (id.codename) target.codename = id.codename;
+  if (id.provider) target.provider = id.provider;
+  if (id.model) target.model = id.model;
 }
 
 /** Zero-fill a byState counter object. */
@@ -124,7 +177,11 @@ export function buildRunGraphModel(
 
     // Parallel sub-steps: initialise each to pending.
     if (dto.kind === 'parallel' && dto.parallel != null) {
-      node.parallel = dto.parallel.map((sub) => ({ id: sub.id, state: 'pending' as StepState }));
+      node.parallel = dto.parallel.map((sub) => {
+        const view: ParallelSubView = { id: sub.id, state: 'pending' };
+        if (sub.agent) view.agent = sub.agent;
+        return view;
+      });
     }
 
     nodeMap.set(dto.id, node);
@@ -138,6 +195,18 @@ export function buildRunGraphModel(
     if (!node) continue;
 
     if (result.transcript_path != null) node.transcriptPath = result.transcript_path;
+    if (result.codename) node.codename = result.codename;
+    // Parallel steps persist one item per sub-step (`sub_id`) carrying the
+    // instance's codename.
+    if (node.parallel && Array.isArray(result.items)) {
+      for (const item of result.items) {
+        if (item == null || typeof item !== 'object') continue;
+        const rec = item as Record<string, unknown>;
+        if (typeof rec.sub_id !== 'string' || typeof rec.codename !== 'string' || !rec.codename) continue;
+        const sub = node.parallel.find((s) => s.id === rec.sub_id);
+        if (sub) sub.codename = rec.codename;
+      }
+    }
 
     if (result.skipped === true) {
       node.state = 'skipped';
@@ -168,6 +237,10 @@ export function buildRunGraphModel(
       state: unitState,
       transcriptPath: cp.transcript_path,
     };
+    if (cp.codename) unit.codename = cp.codename;
+    if (cp.agent) unit.agent = cp.agent;
+    if (cp.provider) unit.provider = cp.provider;
+    if (cp.model) unit.model = cp.model;
     units.set(cp.index, unit);
   }
 
@@ -177,6 +250,25 @@ export function buildRunGraphModel(
   // Events are processed in array order; later events overwrite earlier
   // ones for the same step/unit (last-event-wins within the events slice).
   // ------------------------------------------------------------------
+  // `agent_started` identities are applied after the loop: a unit's
+  // agent_started can precede (or race) its unit_started, so deferring lets
+  // it land on the unit whichever arrives first. `unit_index` absent ⇒ the
+  // step itself; present ⇒ that unit. Last event wins per target.
+  //
+  // Seeded from the graph response's server-side fold (the WHOLE
+  // events.jsonl), so identities survive the capped live-event window; the
+  // live events below layer on top, field by field (live wins).
+  const stepIdentities = new Map<string, AgentIdentity>(Object.entries(g.step_identities ?? {}));
+  const unitIdentities = new Map<string, Map<number, AgentIdentity>>();
+  for (const [stepId, byIndex] of Object.entries(g.unit_identities ?? {})) {
+    const m = new Map<number, AgentIdentity>();
+    for (const [idx, id] of Object.entries(byIndex)) {
+      const n = Number(idx);
+      if (Number.isInteger(n)) m.set(n, id);
+    }
+    unitIdentities.set(stepId, m);
+  }
+
   for (const ev of events) {
     if (!isKnownRunEvent(ev)) continue;
 
@@ -186,6 +278,7 @@ export function buildRunGraphModel(
         const node = nodeMap.get(ev.step_id);
         if (node) {
           node.state = 'running';
+          if (ev.type === 'step_started' && ev.codename) node.codename = ev.codename;
           // A running linear step has no persisted step_result yet, so its
           // transcript path arrives live on step_working — adopt it so the
           // panel can select and tail the file in real time.
@@ -226,13 +319,37 @@ export function buildRunGraphModel(
         const existing = units.get(ev.index);
         if (existing) {
           existing.state = 'running';
+          if (ev.codename) existing.codename = ev.codename;
+          if (ev.agent) existing.agent = ev.agent;
         } else {
-          units.set(ev.index, {
+          const unit: UnitView = {
             index: ev.index,
             key: ev.unit_key,
             state: 'running',
             transcriptPath: ev.transcript_path,
-          });
+          };
+          if (ev.codename) unit.codename = ev.codename;
+          if (ev.agent) unit.agent = ev.agent;
+          units.set(ev.index, unit);
+        }
+        break;
+      }
+      case 'agent_started': {
+        const id: AgentIdentity = {
+          agent: ev.agent,
+          codename: ev.codename,
+          provider: ev.provider,
+          model: ev.model,
+        };
+        if (ev.unit_index == null) {
+          stepIdentities.set(ev.step_id, mergeIdentity(stepIdentities.get(ev.step_id), id));
+        } else {
+          let m = unitIdentities.get(ev.step_id);
+          if (!m) {
+            m = new Map<number, AgentIdentity>();
+            unitIdentities.set(ev.step_id, m);
+          }
+          m.set(ev.unit_index, mergeIdentity(m.get(ev.unit_index), id));
         }
         break;
       }
@@ -270,6 +387,28 @@ export function buildRunGraphModel(
         // in-flight step's own `step_paused`/`step_resumed` event, above,
         // carries the per-node transition).
         break;
+    }
+  }
+
+  // Apply deferred agent_started identities. A unit key matches the unit
+  // list's `index` (== the unit_started index; panel/parallel units use
+  // their own view/declared index). Never fabricates a node or unit.
+  for (const [stepId, id] of stepIdentities) {
+    const node = nodeMap.get(stepId);
+    if (node) applyIdentity(node, id);
+  }
+  for (const [stepId, byIndex] of unitIdentities) {
+    const units = unitsByStep.get(stepId);
+    const subs = nodeMap.get(stepId)?.parallel;
+    for (const [idx, id] of byIndex) {
+      const unit = units?.get(idx);
+      if (unit) {
+        applyIdentity(unit, id);
+        if (id.agent) unit.agent = id.agent;
+      }
+      // Parallel sub-steps: unit_index is the sub-step's declared position.
+      const sub = subs?.[idx];
+      if (sub) applyIdentity(sub, id);
     }
   }
 

@@ -9,6 +9,7 @@ import type { StepState, UnitView } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from '../graph/stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import TranscriptPanel from '../TranscriptPanel';
+import { AgentName } from '../codename/AgentName';
 
 const ROW_CAP = 300;
 
@@ -32,9 +33,13 @@ export default function StepTranscriptBrowser({
   initialUnitIndex,
   runId,
   host,
+  agent,
 }: {
   stepId: string;
   units: UnitView[];
+  /** The agent every unit runs (for_each). Omit for panel/parallel steps
+   *  whose units each run their own agent. */
+  agent?: string;
   /**
    * Seed the initially-selected unit (e.g. the unit-square the user clicked in
    * the graph). Falls back to the first visible unit if this index isn't in the
@@ -137,9 +142,30 @@ export default function StepTranscriptBrowser({
                       >
                         {st.glyph}
                       </span>
-                      <span className="truncate font-mono text-ink" title={u.key}>
-                        {u.key}
-                      </span>
+                      {/* Identity first (who), item key second (context) — spec §9. */}
+                      {u.codename ? (
+                        <>
+                          <span data-testid="unit-identity" className="min-w-0 shrink truncate text-ink">
+                            <AgentName
+                              codename={u.codename}
+                              agent={u.agent ?? agent}
+                              provider={u.provider}
+                              model={u.model}
+                            />
+                          </span>
+                          <span
+                            data-testid="unit-key"
+                            className="min-w-0 truncate font-mono text-ink-dim"
+                            title={u.key}
+                          >
+                            {u.key}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="truncate font-mono text-ink" title={u.key}>
+                          {u.key}
+                        </span>
+                      )}
                       <span
                         className="ml-auto shrink-0 text-meta font-medium uppercase tracking-wide"
                         style={{ color: st.color }}

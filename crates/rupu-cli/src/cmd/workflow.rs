@@ -593,6 +593,8 @@ struct WorkflowRunsRow {
     total_tokens: u64,
     cost_usd: Option<f64>,
     workflow: String,
+    /// Crew codename (stored, else derived for legacy runs).
+    codename: String,
 }
 
 #[derive(Serialize)]
@@ -907,6 +909,7 @@ impl CollectionOutput for WorkflowRunsOutput {
             "total_tokens",
             "cost_usd",
             "workflow",
+            "codename",
         ])
     }
 
@@ -941,7 +944,8 @@ fn render_workflow_runs_table(
         prefs,
         opts,
         vec![
-            "RUN ID", "STATUS", "STARTED", "DURATION", "EXPIRES", "TOKENS", "COST", "WORKFLOW",
+            "RUN ID", "NAME", "STATUS", "STARTED", "DURATION", "EXPIRES", "TOKENS", "COST",
+            "WORKFLOW",
         ],
     )
     .with_summary("run");
@@ -963,6 +967,7 @@ fn render_workflow_runs_table(
             .unwrap_or_else(|_| CellValue::Text(row.started_at.clone()));
         table = table.row(vec![
             CellValue::Id(row.run_id.clone()),
+            CellValue::Name(row.codename.clone()),
             CellValue::Status(row.status.clone()),
             started,
             match row.duration_seconds {
@@ -2402,6 +2407,11 @@ async fn runs(
             let agg = aggregate_run_usage_from_store(&store, &run.id);
             WorkflowRunsRow {
                 run_id: run.id.clone(),
+                codename: crate::output::codename::display_codename(
+                    run.codename.as_deref(),
+                    &run.id,
+                    None,
+                ),
                 status: run.status.as_str().to_string(),
                 started_at: run.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
                 duration_seconds: run
@@ -2494,6 +2504,8 @@ fn layered_config_workflow(
 struct RunCandidate {
     id: String,
     workflow_name: String,
+    /// Crew part of the run's codename (stored or legacy-derived).
+    crew: String,
     status: rupu_orchestrator::RunStatus,
     started_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2508,6 +2520,20 @@ fn resolve_run_id(candidates: &[RunCandidate], fragment: &str) -> anyhow::Result
     use crate::output::ids::{resolve, Resolution};
 
     let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+    if ids.iter().any(|i| i == fragment) {
+        return Ok(fragment.to_string());
+    }
+    let crews: Vec<crate::output::codename::CrewCandidate> = candidates
+        .iter()
+        .map(|c| crate::output::codename::CrewCandidate {
+            id: c.id.clone(),
+            crew: c.crew.clone(),
+            started_at: c.started_at,
+        })
+        .collect();
+    if let Some(id) = crate::output::codename::resolve_codename_fragment(&crews, fragment) {
+        return Ok(id);
+    }
     match resolve(&ids, fragment) {
         Resolution::Unique(id) => Ok(id),
         Resolution::NotFound => anyhow::bail!("unknown run: {fragment}"),
@@ -2580,6 +2606,7 @@ pub(crate) fn resolve_run_fragment(
     let candidates: Vec<RunCandidate> = records
         .into_iter()
         .map(|r| RunCandidate {
+            crew: crate::output::codename::display_codename(r.codename.as_deref(), &r.id, None),
             id: r.id,
             workflow_name: r.workflow_name,
             status: r.status,
@@ -3117,6 +3144,7 @@ pub(crate) async fn resume_run(
                     output: cp.output.clone(),
                     success: true,
                     is_fixer: false,
+                    codename: cp.codename.clone(),
                 },
             );
         } else {
@@ -3228,6 +3256,16 @@ pub(crate) async fn resume_run(
         kinds.clone(),
         crate::findings_opts::base_options(&global, &cfg.findings),
     );
+    // One codename namer for the whole run, shared by the orchestrator
+    // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
+    // the same `<runs>/<run_id>` dir `run_workflow` would use, so both
+    // read and persist the one `codenames.json`.
+    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
+        &workflow,
+        run_id,
+        Some(&store.root.join(run_id)),
+    ));
+    dispatcher.set_namer(naming.namer());
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
@@ -3245,6 +3283,8 @@ pub(crate) async fn resume_run(
                     None,
                 ),
             ),
+            codename: Some(rupu_codename::crew_for(run_id)),
+            provider: cfg.default_provider.clone(),
         }),
     );
     let mode_str_for_policy = mode_str.clone();
@@ -3356,6 +3396,7 @@ pub(crate) async fn resume_run(
         unit_dispatcher,
         action_dispatcher: Some(action_dispatcher),
         pause: Some(pause_token.clone()),
+        naming: Some(naming),
     };
 
     println!("rupu: resuming run {run_id}");
@@ -4782,6 +4823,17 @@ async fn execute_workflow_invocation(
         kinds.clone(),
         crate::findings_opts::base_options(&global, &cfg.findings),
     );
+    // One codename namer for the whole run — shared by the orchestrator
+    // (static slots), the sub-agent dispatcher (`>role#n`), and the inline
+    // approve-resume below. Built over the same `<runs>/<run_id>` dir
+    // `run_workflow` would use, so all read and persist one
+    // `codenames.json`.
+    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
+        &workflow,
+        &run_id,
+        Some(&runs_dir.join(&run_id)),
+    ));
+    dispatcher.set_namer(naming.namer());
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
     // approve-resume `resume_opts` built further down this function —
@@ -4804,6 +4856,8 @@ async fn execute_workflow_invocation(
                     None,
                 ),
             ),
+            codename: Some(rupu_codename::crew_for(&run_id)),
+            provider: cfg.default_provider.clone(),
         }),
     );
 
@@ -4881,6 +4935,7 @@ async fn execute_workflow_invocation(
         unit_dispatcher,
         action_dispatcher: Some(Arc::clone(&action_dispatcher)),
         pause: Some(pause_token.clone()),
+        naming: Some(Arc::clone(&naming)),
     };
 
     // Opt-in live three-zone view (dashboard + git-graph spine + focus
@@ -5066,6 +5121,9 @@ async fn execute_workflow_invocation(
                         unit_dispatcher: resume_unit_dispatcher,
                         action_dispatcher: Some(Arc::clone(&action_dispatcher)),
                         pause: Some(pause_token.clone()),
+                        // Same run, same namer: the resumed half keeps the
+                        // static-slot words and dispatch counters.
+                        naming: Some(Arc::clone(&naming)),
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));
                     current_run_id = result.run_id.clone();
@@ -5449,6 +5507,7 @@ mod tests {
             active_step_transcript_path: Some(PathBuf::from("/tmp/transcripts/step.jsonl")),
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 
@@ -6166,22 +6225,33 @@ steps:
             RunCandidate {
                 id: "run_01KYSMDNG84N9Z8XXHQZP3GKYJ".to_string(),
                 workflow_name: "nightly-health".to_string(),
+                crew: String::new(),
                 status: rupu_orchestrator::RunStatus::Completed,
                 started_at: now,
             },
             RunCandidate {
                 id: "run_01KYSM3KE60KM2P2EDJR1V1BCP".to_string(),
                 workflow_name: "pr-code-review".to_string(),
+                crew: String::new(),
                 status: rupu_orchestrator::RunStatus::Failed,
                 started_at: now,
             },
             RunCandidate {
                 id: "run_01KYPASX18NYRER5NQPDWB2HZV".to_string(),
                 workflow_name: "issue-triage".to_string(),
+                crew: String::new(),
                 status: rupu_orchestrator::RunStatus::Running,
                 started_at: now,
             },
         ]
+    }
+
+    #[test]
+    fn resolve_run_id_accepts_a_crew_codename() {
+        let mut c = run_candidates();
+        c[0].crew = "jade-reef".into();
+        assert_eq!(resolve_run_id(&c, "jade-reef").expect("resolves"), c[0].id);
+        assert!(resolve_run_id(&c, "amber-lake").is_err());
     }
 
     #[test]
@@ -6246,6 +6316,7 @@ steps:
     ) -> WorkflowRunsRow {
         WorkflowRunsRow {
             run_id: run_id.to_string(),
+            codename: "cobalt-harbor".to_string(),
             status: status.to_string(),
             started_at: started_at.to_string(),
             duration_seconds: Some(194),

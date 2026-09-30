@@ -26,6 +26,7 @@ const LOCAL_HOST: HostView = {
 };
 
 const ROW: RunListRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   id: 'run_1',
   workflow_name: 'deploy-prod',
   status: 'completed',

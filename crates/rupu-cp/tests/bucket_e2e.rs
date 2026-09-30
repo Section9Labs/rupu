@@ -314,6 +314,7 @@ async fn bucket_dead_drop_e2e() {
         kind: StepKind::Linear,
         agent: Some("test-agent".into()),
         host: None,
+        codename: None,
     };
     let event_line = serde_json::to_string(&event).expect("Event::StepStarted must serialize");
     shared_bucket

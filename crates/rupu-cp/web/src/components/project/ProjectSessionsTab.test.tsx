@@ -37,6 +37,7 @@ function usage(): NonNullable<SessionSummary['usage']> {
 
 const ROWS: SessionSummary[] = [
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     session_id: 'sess-active-1',
     agent_name: 'fix-bug',
     model: 'claude-3-5-sonnet',
@@ -48,6 +49,7 @@ const ROWS: SessionSummary[] = [
     usage: usage(),
   },
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     session_id: 'sess-archived-1',
     agent_name: 'review-pr',
     model: 'claude-3-5-sonnet',

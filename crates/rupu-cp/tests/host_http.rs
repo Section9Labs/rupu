@@ -614,6 +614,7 @@ fn profiled_agent_req(
         working_dir: None,
         run_id: None,
         findings_profile: profile,
+        codename: None,
     }
 }
 

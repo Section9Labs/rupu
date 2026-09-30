@@ -23,6 +23,7 @@ function renderPage() {
 const SUMMARY: FindingsSummary = { total: 1, critical: 0, high: 1, medium: 0, low: 0, info: 0 };
 
 const FINDING: FindingOut = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   id: 'f1',
   scope: null,
   summary: 'SQL injection in the billing query builder',

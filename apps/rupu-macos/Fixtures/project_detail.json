@@ -26,6 +26,8 @@
   },
   "recent_runs": [
     {
+      "codename": "cobalt-harbor",
+      "codename_derived": false,
       "duration_ms": 360000,
       "finished_at": "2026-08-20T12:06:00Z",
       "id": "run-01",
@@ -45,6 +47,8 @@
       "workflow_name": "nightly-health"
     },
     {
+      "codename": "cobalt-harbor",
+      "codename_derived": false,
       "duration_ms": null,
       "finished_at": null,
       "id": "run-02",

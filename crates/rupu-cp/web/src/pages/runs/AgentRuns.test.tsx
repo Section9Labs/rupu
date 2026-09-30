@@ -38,6 +38,7 @@ const REMOTE_HOST: HostView = {
 };
 
 const REMOTE_ROW: AgentRunRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   run_id: 'run-abc123',
   source: 'standalone',
   agent: 'fix-bug',
@@ -49,6 +50,7 @@ const REMOTE_ROW: AgentRunRow = {
 };
 
 const SESSION_ROW: AgentRunRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   run_id: 'run-def456',
   source: 'session',
   agent: 'review-pr',
@@ -225,7 +227,7 @@ describe('AgentRuns — agent subject cell', () => {
     // session-sourced fixture row.
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
     expect(screen.getByText('session_turn')).toBeInTheDocument();
     // Operator decision (table-standardization Task 4): the row itself
     // navigates to the transcript/workflow view, so this competing
@@ -247,9 +249,11 @@ describe('AgentRuns — agent subject cell', () => {
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
-    const name = await screen.findByText('review-pr');
-    expect(name).toHaveAttribute('title', 'review-pr');
-    expect(name.className).toMatch(/truncate/);
+    const name = await screen.findByText(/review-pr/);
+    // AgentName's inner span carries the full identity tooltip; the
+    // subject wrapper still truncates.
+    expect(name.parentElement).toHaveAttribute('title', 'cobalt-harbor/heron#1 · review-pr');
+    expect(name.closest('[class*="truncate"]')).not.toBeNull();
   });
 
   it('falls back to an em-dash when the row has no agent name', async () => {
@@ -369,8 +373,8 @@ describe('AgentRuns — Source filter', () => {
 
     renderPage();
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-    expect(screen.queryByText('review-pr')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    expect(screen.queryByText(/review-pr/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Standalone' })).toHaveAttribute('aria-pressed', 'true');
   });
 
@@ -379,12 +383,12 @@ describe('AgentRuns — Source filter', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: 'Session' }));
 
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
-    expect(screen.queryByText('fix-bug')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
+    expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument();
   });
 
   it('clicking "All" shows both standalone and session rows', async () => {
@@ -392,12 +396,12 @@ describe('AgentRuns — Source filter', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: 'All' }));
 
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
-    expect(screen.getByText('fix-bug')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
+    expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
   });
 
   it('regression: no run_id appears twice in the rendered table (the dedupe payload shape)', async () => {
@@ -413,7 +417,7 @@ describe('AgentRuns — Source filter', () => {
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
     // One header row + exactly one data row.
     expect(screen.getAllByRole('row')).toHaveLength(2);
   });
@@ -428,12 +432,12 @@ describe('AgentRuns — Find', () => {
 
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
 
-    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
-    expect(screen.getByText('review-pr')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
+    expect(screen.getByText(/review-pr/)).toBeInTheDocument();
   });
 
   it('footer shows "N matches of M loaded" while a query is active', async () => {
@@ -442,7 +446,7 @@ describe('AgentRuns — Find', () => {
 
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
 
@@ -455,16 +459,16 @@ describe('AgentRuns — Find', () => {
 
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     const input = screen.getByPlaceholderText('Find agents…') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'review' } });
-    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
 
     fireEvent.keyDown(input, { key: 'Escape' });
 
     await waitFor(() => expect(input.value).toBe(''));
-    expect(screen.getByText('fix-bug')).toBeInTheDocument();
+    expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
   });
 
   it('composes with the Source pill: searching within Standalone narrows just that subset', async () => {
@@ -474,12 +478,12 @@ describe('AgentRuns — Find', () => {
     renderPage();
     // Default Source is Standalone — fix-bug (standalone) is visible,
     // review-pr (session) is not, regardless of the query below.
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
 
-    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
-    expect(screen.queryByText('review-pr')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
+    expect(screen.queryByText(/review-pr/)).not.toBeInTheDocument();
   });
 });
 
@@ -505,8 +509,8 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-    const link = screen.getByText('fix-bug').closest('a');
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    const link = screen.getByText(/fix-bug/).closest('a');
     // REMOTE_ROW's host_id ('host_prod') isn't local, so &host= is appended
     // (parity with the pre-existing usage-chart `to` computation).
     expect(link).toHaveAttribute(
@@ -521,8 +525,8 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
 
     renderPage();
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-    const tr = screen.getByText('fix-bug').closest('tr')!;
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    const tr = screen.getByText(/fix-bug/).closest('tr')!;
     expect(tr.className).toMatch(/hover:bg-bg/);
   });
 
@@ -543,8 +547,8 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
 
     renderPage();
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-    expect(screen.getByText('fix-bug').closest('a')).toBeNull();
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    expect(screen.getByText(/fix-bug/).closest('a')).toBeNull();
   });
 
   // M5 (whole-branch-review): a dead (unlinked) row must not still show the
@@ -557,8 +561,8 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
 
     renderPage();
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-    const tr = screen.getByText('fix-bug').closest('tr')!;
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
+    const tr = screen.getByText(/fix-bug/).closest('tr')!;
     expect(tr.className).not.toMatch(/hover:bg-bg/);
   });
 
@@ -577,7 +581,7 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
       </MemoryRouter>,
     );
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     // Exact match — see the sibling "agent subject cell" test's comment for
     // why a loose /sess-01h/i regex is now ambiguous (Task 3 row actions).
@@ -597,7 +601,7 @@ describe('AgentRuns — Turns/Duration column order (table-standardization Task 
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW]);
 
     const { container } = renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     const headers = Array.from(container.querySelectorAll('thead th')).map(
       (th) => th.textContent?.trim() ?? '',
@@ -606,5 +610,42 @@ describe('AgentRuns — Turns/Duration column order (table-standardization Task 
     const durationIdx = headers.indexOf('Duration');
     expect(turnsIdx).toBeGreaterThanOrEqual(0);
     expect(durationIdx).toBeGreaterThan(turnsIdx);
+  });
+});
+
+describe('AgentRuns — codenames', () => {
+  it('renders the crew chip and Find matches by codename', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([
+      { ...REMOTE_ROW, codename: 'cobalt-harbor/heron#1' },
+      { ...SESSION_ROW, codename: 'amber-fjord/kite#1' },
+    ]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'cobalt' } });
+    await waitFor(() => expect(screen.queryByText('amber-fjord')).not.toBeInTheDocument());
+    expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
+  });
+
+  it('shows the run provider/model next to the agent name', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([
+      { ...SESSION_ROW, provider: 'anthropic', model: 'claude-sonnet-4-6' },
+    ]);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    expect(
+      await screen.findByText('heron#1 · review-pr · anthropic/claude-sonnet-4-6'),
+    ).toBeInTheDocument();
+  });
+
+  it('a row with no codename still names its agent + provider/model', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([
+      { ...SESSION_ROW, codename: '', provider: 'openai', model: 'gpt-5' },
+    ]);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    expect(await screen.findByText('review-pr · openai/gpt-5')).toBeInTheDocument();
   });
 });

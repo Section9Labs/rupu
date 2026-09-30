@@ -75,6 +75,7 @@ impl AgentDispatcher for FakeDispatcher {
         prompt: String,
         _parent_run_id: &str,
         _parent_depth: u32,
+        _parent_codename: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.calls
             .lock()
@@ -98,6 +99,7 @@ impl AgentDispatcher for FakeDispatcher {
                 mode: rupu_transcript::RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             })
             .unwrap();
         writer
@@ -119,6 +121,7 @@ impl AgentDispatcher for FakeDispatcher {
 
         Ok(DispatchOutcome {
             agent: agent_name.to_string(),
+            codename: None,
             sub_run_id,
             transcript_path: path,
             output: format!("{agent_name}: review complete"),
@@ -194,6 +197,9 @@ impl StepFactory for ParallelFactory {
                 run_id: None,
                 model: None,
                 tool_mappings: None,
+                codename: None,
+                agent: None,
+                provider: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -222,6 +228,7 @@ impl StepFactory for ParallelFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -265,6 +272,7 @@ async fn parent_step_fans_out_two_children_and_aggregates() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -325,6 +333,7 @@ async fn one_child_failure_marks_all_succeeded_false_but_parent_continues() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -377,6 +386,7 @@ async fn allowlist_violation_blocks_dispatch_at_the_parallel_layer() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     run_workflow(opts).await.expect("workflow runs");

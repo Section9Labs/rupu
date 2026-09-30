@@ -58,6 +58,7 @@ async fn happy_path_one_turn_no_tools() {
         context_window_tokens: None,
         compact_at_percent: None,
         pause: None,
+        codename: None,
     };
 
     let res = run_agent(opts).await.unwrap();

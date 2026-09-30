@@ -1,6 +1,6 @@
 // Shared findings list rendered as a SortableTable. Used by the global Findings
 // page, the per-project Findings tab, and the coverage-detail Overview. Columns:
-// Severity | Summary | File:Line | CWE | Concern, plus Project | Target when
+// Severity | Summary | File:Line | CWE | Concern | Agent, plus Project | Target when
 // `showProvenance` is set (the cross-project / project-scoped variants). Each
 // row expands (via `renderDetail`) to its evidence panel.
 //
@@ -18,7 +18,9 @@ import {
 import { cweFromFinding } from '../../lib/cwe';
 import SeverityChip from '../coverage/SeverityChip';
 import SortableTable, { type Column } from '../lists/SortableTable';
+import { AgentName } from '../codename/AgentName';
 import { FindingEvidence } from './FindingEvidence';
+import { findingCodename } from './findingCodename';
 
 function location(f: FindingRecord): string {
   const parts: string[] = [];
@@ -125,6 +127,30 @@ export function FindingsTable({
         ) : (
           <span className="text-ink-mute">—</span>
         ),
+    },
+    {
+      key: 'agent',
+      header: 'Agent',
+      fit: true,
+      sortable: true,
+      sortValue: (f) => findingCodename(f)?.codename ?? null,
+      render: (f) => {
+        const n = findingCodename(f);
+        return n ? (
+          <span className="text-note">
+            <AgentName
+              codename={n.codename}
+              agent={n.agent}
+              provider={n.provider}
+              model={n.model}
+              showCrew
+              derived={n.derived}
+            />
+          </span>
+        ) : (
+          <span className="text-ink-mute">—</span>
+        );
+      },
     },
   ];
 

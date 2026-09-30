@@ -259,6 +259,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         store
             .create(record.clone(), "name: test\nsteps: []\n")
@@ -273,6 +274,7 @@ mod tests {
             kind: rupu_orchestrator::runs::StepKind::Linear,
             agent: None,
             host: None,
+            codename: None,
         };
         let mut f = std::fs::OpenOptions::new()
             .create(true)

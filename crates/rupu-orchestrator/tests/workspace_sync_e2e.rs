@@ -197,6 +197,7 @@ impl StepFactory for ReadingFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -362,6 +363,7 @@ async fn synced_placed_step_edit_is_visible_to_downstream_local_step() {
         unit_dispatcher: Some(dispatcher.clone()),
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -455,6 +457,7 @@ async fn fanout_sync_disjoint_edits_merge() {
         unit_dispatcher: Some(dispatcher.clone()),
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)

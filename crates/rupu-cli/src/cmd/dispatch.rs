@@ -76,6 +76,12 @@ pub struct CliAgentDispatcher {
     /// dispatched child's `ToolContext`; the child's own resolved profile
     /// (`spec.findings_profile`, else `full`) is set on a clone per dispatch.
     findings_base: rupu_coverage::FindingWriteOptions,
+    /// The run's codename namer, shared with the orchestrator's
+    /// `RunNaming` (see [`Self::set_namer`]) so sub-agent role words and
+    /// `#n` counters come from — and persist to — the same
+    /// `codenames.json` as the run's static slots. `None` until installed;
+    /// [`Self::namer_for`] then falls back to an in-memory namer.
+    namer: std::sync::Mutex<Option<rupu_codename::SharedNamer>>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -129,10 +135,35 @@ impl CliAgentDispatcher {
             provider_tuning,
             kinds,
             findings_base,
+            namer: std::sync::Mutex::new(None),
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
         arc
+    }
+
+    /// Install the run's codename namer (`RunNaming::namer()`), so
+    /// sub-agents are named from the same allocator + counters as the
+    /// run's static slots.
+    pub fn set_namer(&self, namer: rupu_codename::SharedNamer) {
+        if let Ok(mut g) = self.namer.lock() {
+            *g = Some(namer);
+        }
+    }
+
+    /// The run's namer, or — when none was installed (a dispatcher whose
+    /// caller had no RunNaming) — an in-memory one for the parent's crew, so
+    /// sub-agents are always named.
+    fn namer_for(&self, parent: &rupu_codename::Codename) -> Option<rupu_codename::SharedNamer> {
+        let mut g = self.namer.lock().ok()?;
+        Some(
+            g.get_or_insert_with(|| {
+                rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new(
+                    parent.crew.clone(),
+                ))
+            })
+            .clone(),
+        )
     }
 
     fn self_arc_dyn(&self) -> Arc<dyn AgentDispatcher> {
@@ -177,6 +208,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         prompt: String,
         parent_run_id: &str,
         parent_depth: u32,
+        parent_codename: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError> {
         // KNOWN LIMITATION (tool_audit design §4/review IMPORTANT 4): the
         // `AgentDispatcher::dispatch` trait (rupu-tools) takes no narrowed
@@ -232,17 +264,13 @@ impl AgentDispatcher for CliAgentDispatcher {
             .create_sub_run(parent_run_id, agent_name)
             .map_err(|e| DispatchError::RunStore(e.to_string()))?;
 
-        if let Some(sink) = &self.event_sink {
-            sink.emit(
-                parent_run_id,
-                &OrchEvent::DispatchStarted {
-                    run_id: parent_run_id.to_string(),
-                    sub_run_id: sub_run_id.clone(),
-                    agent: Some(agent_name.to_string()),
-                    transcript_path: transcript_path.clone(),
-                },
-            );
-        }
+        // `<parent>><role>#n`, from the run's shared namer. A parent with
+        // no (or an unparseable) codename leaves the child unnamed.
+        let codename = parent_codename.and_then(|p| {
+            let parent: rupu_codename::Codename = p.parse().ok()?;
+            let namer = self.namer_for(&parent)?;
+            child_codename(&namer, p, agent_name)
+        });
 
         // Netflow capture for the CHILD run this dispatch is about to
         // start — its own sink, scoped to `sub_run_id`, not the parent's.
@@ -282,7 +310,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             tuning: self.provider_tuning.get(&provider_name).cloned(),
             kind: self.kinds.get(&provider_name).cloned(),
         };
-        let provider = match provider_factory::build_for_provider_with_config(
+        let built = provider_factory::build_for_provider_with_config(
             &provider_name,
             &model,
             spec.auth,
@@ -290,8 +318,28 @@ impl AgentDispatcher for CliAgentDispatcher {
             &provider_config,
             netflow_sink,
         )
-        .await
-        {
+        .await;
+
+        // Emitted once the provider build has been attempted, so it can
+        // carry who (codename) runs on what (provider · model). Emitted on
+        // the build-failure path too, so the live view still shows the
+        // failed child node that the `DispatchCompleted` below closes.
+        if let Some(sink) = &self.event_sink {
+            sink.emit(
+                parent_run_id,
+                &OrchEvent::DispatchStarted {
+                    run_id: parent_run_id.to_string(),
+                    sub_run_id: sub_run_id.clone(),
+                    agent: Some(agent_name.to_string()),
+                    transcript_path: transcript_path.clone(),
+                    codename: codename.clone(),
+                    provider: Some(provider_name.clone()),
+                    model: Some(model.clone()),
+                },
+            );
+        }
+
+        let provider = match built {
             Ok((_resolved, p)) => p,
             Err(e) => {
                 self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
@@ -324,6 +372,9 @@ impl AgentDispatcher for CliAgentDispatcher {
             run_id: None,
             model: None,
             tool_mappings: None,
+            codename: codename.clone(),
+            agent: None,
+            provider: None,
         };
 
         let opts = AgentRunOpts {
@@ -373,6 +424,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
             pause: None,
+            codename: codename.clone(),
         };
 
         let started = std::time::Instant::now();
@@ -436,6 +488,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         Ok(DispatchOutcome {
             agent: agent_name.to_string(),
             sub_run_id,
+            codename,
             transcript_path,
             output,
             success,
@@ -443,6 +496,22 @@ impl AgentDispatcher for CliAgentDispatcher {
             duration_ms,
         })
     }
+}
+
+/// Mint a dispatched child's codename: `<parent>><role>#n`, where `role`
+/// is the agent def's canonical word in the crew and `n` the next
+/// per-(parent, role) instance. `None` when `parent` is not a codename.
+pub(crate) fn child_codename(
+    namer: &rupu_codename::SharedNamer,
+    parent: &str,
+    agent: &str,
+) -> Option<String> {
+    let parent: rupu_codename::Codename = parent.parse().ok()?;
+    Some(namer.with(|n| {
+        let role = n.canonical_role(agent);
+        let k = n.next_instance(&parent, &role);
+        parent.child(&role, Some(k)).to_string()
+    }))
 }
 
 /// Append a transcript-visible notice to the CHILD's OWN transcript
@@ -548,6 +617,7 @@ mod tests {
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
         w.write(&Event::AssistantMessage {
@@ -658,7 +728,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -710,6 +780,185 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_codename_numbers_per_parent_and_role() {
+        let namer =
+            rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
+        let a = child_codename(&namer, "jade-reef/hedgehog", "security-reviewer").unwrap();
+        let b = child_codename(&namer, "jade-reef/hedgehog", "security-reviewer").unwrap();
+        let c = child_codename(&namer, "jade-reef/heron", "security-reviewer").unwrap();
+        assert_eq!(a, "jade-reef/hedgehog>ferret#1");
+        assert_eq!(b, "jade-reef/hedgehog>ferret#2");
+        assert_eq!(c, "jade-reef/heron>ferret#1");
+        assert!(child_codename(&namer, "garbage", "x").is_none());
+    }
+
+    /// End to end: a dispatch whose parent has a codename mints the
+    /// child's `<parent>><role>#n` from the INSTALLED run namer (so a
+    /// second dispatch of the same role climbs to `#2`), stamps it on
+    /// `DispatchStarted` together with the resolved provider + model,
+    /// returns it on `DispatchOutcome`, and threads it into the child's
+    /// own transcript (`RunStart.codename`). A parent with no codename
+    /// leaves the child unnamed.
+    #[tokio::test]
+    async fn dispatch_mints_child_codename_and_stamps_dispatch_started() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/security-reviewer.md"),
+            "---\nname: security-reviewer\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou review.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let sink = Arc::new(CapturingSink::default());
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            "bypass".into(),
+            Arc::new(rupu_scm::Registry::default()),
+            run_store,
+            Some(sink.clone() as Arc<dyn EventSink>),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+        );
+        let namer =
+            rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
+        dispatcher.set_namer(namer.clone());
+
+        let script = r#"[{ "AssistantText": { "text": "done", "stop": "end_turn" } }]"#;
+        let mut outcomes = Vec::new();
+        for parent in [Some("jade-reef/heron"), Some("jade-reef/heron"), None] {
+            std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", script);
+            let r = dispatcher
+                .dispatch("security-reviewer", "go".into(), "parent_run_1", 0, parent)
+                .await;
+            std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+            outcomes.push(r.expect("dispatch should succeed against the mock provider"));
+        }
+
+        assert_eq!(
+            outcomes[0].codename.as_deref(),
+            Some("jade-reef/heron>ferret#1")
+        );
+        assert_eq!(
+            outcomes[1].codename.as_deref(),
+            Some("jade-reef/heron>ferret#2")
+        );
+        assert_eq!(outcomes[2].codename, None, "no parent codename => unnamed");
+        // The installed namer is the one that was advanced.
+        let parent: rupu_codename::Codename = "jade-reef/heron".parse().unwrap();
+        assert_eq!(namer.with(|n| n.next_instance(&parent, "ferret")), 3);
+
+        let started: Vec<_> = sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, ev)| match ev {
+                OrchEvent::DispatchStarted {
+                    codename,
+                    provider,
+                    model,
+                    ..
+                } => Some((codename.clone(), provider.clone(), model.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 3);
+        assert_eq!(
+            started[0],
+            (
+                Some("jade-reef/heron>ferret#1".to_string()),
+                Some("anthropic".to_string()),
+                Some("claude-sonnet-4-6".to_string())
+            )
+        );
+        assert_eq!(started[2].0, None);
+
+        let run_start_codename = JsonlReader::iter(&outcomes[0].transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|ev| match ev {
+                TxEvent::RunStart { codename, .. } => Some(codename),
+                _ => None,
+            })
+            .expect("child transcript has a RunStart");
+        assert_eq!(
+            run_start_codename.as_deref(),
+            Some("jade-reef/heron>ferret#1")
+        );
+    }
+
+    /// A dispatcher with no namer installed (its caller had no
+    /// `RunNaming`) still names sub-agents, from an in-memory namer for
+    /// the parent's crew.
+    #[tokio::test]
+    async fn dispatch_without_installed_namer_still_names_child() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            "bypass".into(),
+            Arc::new(rupu_scm::Registry::default()),
+            Arc::new(RunStore::new(runs_dir)),
+            None,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+        );
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "done", "stop": "end_turn" } }]"#,
+        );
+        let r = dispatcher
+            .dispatch(
+                "child",
+                "go".into(),
+                "parent_run_1",
+                0,
+                Some("amber-lantern/otter"),
+            )
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let role = rupu_codename::role_word("child");
+        assert_eq!(
+            r.unwrap().codename,
+            Some(format!("amber-lantern/otter>{role}#1"))
+        );
+    }
+
     /// `event_sink: None` (the harness other dispatch tests already use)
     /// must not change `dispatch()`'s behavior — it's a pure no-op path.
     #[tokio::test]
@@ -757,7 +1006,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -825,7 +1074,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -903,7 +1152,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -988,7 +1237,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1078,7 +1327,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1153,7 +1402,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 

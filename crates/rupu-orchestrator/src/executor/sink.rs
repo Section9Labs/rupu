@@ -66,6 +66,7 @@ mod tests {
             kind: crate::runs::StepKind::Linear,
             agent: None,
             host: None,
+            codename: None,
         };
         fan.emit("r", &ev);
         fan.emit("r", &ev);

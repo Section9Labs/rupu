@@ -73,6 +73,7 @@ fn events_fixture_is_current() {
             kind: StepKind::Linear,
             agent: Some("rupuso".into()),
             host: None,
+            codename: None,
         },
         Event::StepWorking {
             run_id: "run-01".into(),
@@ -110,6 +111,7 @@ fn events_fixture_is_current() {
             agent: None,
             transcript_path: "t/u0.jsonl".into(),
             host: None,
+            codename: None,
         },
         Event::UnitCompleted {
             run_id: "run-01".into(),
@@ -157,6 +159,9 @@ fn events_fixture_is_current() {
             sub_run_id: "run-02".into(),
             agent: Some("reviewer".into()),
             transcript_path: "t/d.jsonl".into(),
+            codename: None,
+            model: None,
+            provider: None,
         },
         Event::DispatchCompleted {
             run_id: "run-01".into(),
@@ -188,6 +193,7 @@ fn assert_events_cover_every_variant(events: &[Event]) {
             Event::RunStarted { .. } => {}
             Event::StepStarted { .. } => {}
             Event::StepWorking { .. } => {}
+            Event::AgentStarted { .. } => {}
             Event::StepAwaitingApproval { .. } => {}
             Event::StepCompleted { .. } => {}
             Event::StepFailed { .. } => {}
@@ -250,6 +256,7 @@ fn sample_run_record(id: &str, started_at: chrono::DateTime<chrono::Utc>) -> Run
         permission_mode: Some("ask".into()),
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     }
 }
 
@@ -258,6 +265,8 @@ fn run_list_row_fixture_is_current() {
     let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
 
     let mut row1 = serde_json::to_value(RunListRow {
+        codename: "cobalt-harbor".into(),
+        codename_derived: false,
         id: "run-01".into(),
         workflow_name: "nightly-health".into(),
         status: RunStatus::Running,
@@ -280,6 +289,8 @@ fn run_list_row_fixture_is_current() {
     row1["host_id"] = serde_json::json!("local");
 
     let mut row2 = serde_json::to_value(RunListRow {
+        codename: "cobalt-harbor".into(),
+        codename_derived: false,
         id: "run-02".into(),
         workflow_name: "nightly-health".into(),
         status: RunStatus::AwaitingApproval,
@@ -349,6 +360,7 @@ fn transcript_events_fixture_is_current() {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            codename: None,
         },
         rupu_transcript::Event::TurnStart { turn_idx: 0 },
         rupu_transcript::Event::AssistantDelta {
@@ -691,6 +703,7 @@ fn run_detail_fixture_is_current() {
         loop_iteration: None,
         run_outcome: None,
         host: None,
+        codename: None,
     };
     let step_panel = StepResultRecord {
         step_id: "review".into(),
@@ -707,6 +720,7 @@ fn run_detail_fixture_is_current() {
             severity: "high".into(),
             title: "Missing null check".into(),
             body: "Potential panic on None".into(),
+            codename: None,
         }],
         iterations: 2,
         resolved: true,
@@ -714,6 +728,7 @@ fn run_detail_fixture_is_current() {
         loop_iteration: None,
         run_outcome: None,
         host: None,
+        codename: None,
     };
 
     let usage = UsageSummary {
@@ -891,6 +906,7 @@ fn run_graph_fixture_is_current() {
         loop_iteration: None,
         run_outcome: None,
         host: None,
+        codename: None,
     };
 
     // One durable checkpoint (`success: true`) plus one events-only
@@ -908,6 +924,7 @@ fn run_graph_fixture_is_current() {
         success: true,
         finished_at: t,
         host: None,
+        codename: None,
     };
     let synthesized_unit = serde_json::json!({
         "step_id": "fan",
@@ -1301,6 +1318,8 @@ fn project_detail_fixture_is_current() {
 
     let recent_runs = vec![
         RunListRow {
+            codename: "cobalt-harbor".into(),
+            codename_derived: false,
             id: "run-01".into(),
             workflow_name: "nightly-health".into(),
             status: RunStatus::Completed,
@@ -1320,6 +1339,8 @@ fn project_detail_fixture_is_current() {
             duration_ms: Some(360_000),
         },
         RunListRow {
+            codename: "cobalt-harbor".into(),
+            codename_derived: false,
             id: "run-02".into(),
             workflow_name: "issue-triage".into(),
             status: RunStatus::Running,
@@ -1373,6 +1394,8 @@ fn project_runs_fixture_is_current() {
     // local-only).
     let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
     let rows = vec![RunListRow {
+        codename: "cobalt-harbor".into(),
+        codename_derived: false,
         id: "run-01".into(),
         workflow_name: "nightly-health".into(),
         status: RunStatus::Completed,
@@ -1479,6 +1502,9 @@ fn coverage_attribution(run_id: &str) -> CoverageAttribution {
         run_id: run_id.into(),
         model: "claude-sonnet-4-6".into(),
         surface: CoverageSurface::Workflow,
+        codename: None,
+        agent: None,
+        provider: None,
     }
 }
 
@@ -1492,6 +1518,8 @@ fn findings_global_fixture_is_current() {
 
     let findings = vec![
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-1".into(),
             project: "rupu".into(),
             target_id: "auth-core".into(),
@@ -1526,6 +1554,8 @@ fn findings_global_fixture_is_current() {
             },
         },
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-1".into(),
             project: "rupu".into(),
             target_id: "web-api".into(),
@@ -1552,6 +1582,8 @@ fn findings_global_fixture_is_current() {
             },
         },
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-2".into(),
             project: "phi-cell".into(),
             target_id: "ml-pipeline".into(),
@@ -1583,6 +1615,8 @@ fn findings_global_fixture_is_current() {
             },
         },
         FindingOut {
+            codename: "cobalt-harbor/heron#3".into(),
+            codename_derived: false,
             ws_id: "ws-2".into(),
             project: "phi-cell".into(),
             target_id: "ml-pipeline".into(),

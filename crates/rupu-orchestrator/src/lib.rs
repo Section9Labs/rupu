@@ -10,6 +10,7 @@
 //! `{{ steps.<id>.output }}` in the next step's prompt template
 //! (rendered with minijinja).
 
+pub mod codenames;
 pub mod cron_schedule;
 pub mod event_match;
 pub mod event_vocab;

@@ -80,6 +80,7 @@ fn opts(
         context_window_tokens: None,
         compact_at_percent: None,
         pause: None,
+        codename: None,
     }
 }
 

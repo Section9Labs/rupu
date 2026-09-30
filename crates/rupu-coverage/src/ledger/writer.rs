@@ -10,7 +10,9 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
 enum WriteRequest {
-    File(FileTouchEvent),
+    // Boxed: `Attribution` grew `agent`/`provider`, tipping clippy's
+    // large_enum_variant against the 8-byte `Flush`.
+    File(Box<FileTouchEvent>),
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -48,7 +50,7 @@ impl CoverageWriterHandle {
 
 impl CoverageWriter {
     pub async fn record_file_touch(&self, event: FileTouchEvent) {
-        let _ = self.tx.send(WriteRequest::File(event)).await;
+        let _ = self.tx.send(WriteRequest::File(Box::new(event))).await;
     }
 }
 
@@ -94,6 +96,9 @@ mod tests {
             run_id: "run_test".to_string(),
             model: "mock".to_string(),
             surface: Surface::Workflow,
+            codename: None,
+            agent: None,
+            provider: None,
         }
     }
 

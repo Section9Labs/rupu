@@ -3425,6 +3425,7 @@ dependencies = [
  "predicates",
  "pty-process",
  "rupu-auth",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-mcp",
@@ -3530,6 +3531,7 @@ dependencies = [
  "rupu-agent",
  "rupu-app-canvas",
  "rupu-auth",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-cp",
@@ -3563,6 +3565,17 @@ dependencies = [
  "ulid",
  "which",
  "whoami",
+]
+
+[[package]]
+name = "rupu-codename"
+version = "0.81.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -3618,6 +3631,7 @@ dependencies = [
  "reqwest-middleware",
  "rupu-agent",
  "rupu-ast",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-mcp",
@@ -3628,6 +3642,7 @@ dependencies = [
  "rupu-transcript",
  "rupu-workspace",
  "rust-embed",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serial_test",
@@ -3705,6 +3720,7 @@ dependencies = [
  "predicates",
  "rupu-agent",
  "rupu-auth",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-mcp",

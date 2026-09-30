@@ -64,6 +64,15 @@ function toolResult(callId: string, output: string, durationMs = 10): Transcript
 // ---------------------------------------------------------------------------
 
 describe('buildTranscriptView — header / footer', () => {
+  it('carries run_start.codename into the header', () => {
+    const ev: TranscriptEvent = {
+      type: 'run_start',
+      data: { ...(RUN_START.data as Extract<TranscriptEvent, { type: 'run_start' }>['data']), codename: 'otter-3/lead' },
+    };
+    const view = buildTranscriptView([ev]);
+    expect(view.header?.codename).toBe('otter-3/lead');
+  });
+
   it('builds the header from run_start', () => {
     const view = buildTranscriptView([RUN_START]);
     expect(view.header).not.toBeNull();
@@ -72,6 +81,7 @@ describe('buildTranscriptView — header / footer', () => {
     expect(view.header?.provider).toBe('oracle-assessor');
     expect(view.header?.mode).toBe('ask');
     expect(view.header?.startedAt).toBe('2026-06-18T00:00:00Z');
+    expect(view.header?.codename).toBeUndefined();
   });
 
   it('builds the footer from run_complete', () => {

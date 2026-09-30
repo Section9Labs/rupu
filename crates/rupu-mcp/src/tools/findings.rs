@@ -34,6 +34,15 @@ pub struct FindingsContext {
     /// `findings_profile` reaches `findings.record` per call through
     /// `ToolDispatcher::call_with_findings_profile`.
     pub options: rupu_coverage::FindingWriteOptions,
+    /// The run's **crew** codename (e.g. `jade-reef`), stamped on
+    /// `Attribution.codename`. Crew only, never a per-agent instance: one
+    /// `FindingsContext` is built per workflow run, not per step, so it
+    /// cannot know which agent instance made the call. `None` for callers
+    /// with no codename.
+    pub codename: Option<String>,
+    /// Provider paired with `model`, stamped on `Attribution.provider`.
+    /// There is no `agent`: an `action:` step is not an agent.
+    pub provider: Option<String>,
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -124,6 +133,9 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         run_id: ctx.run_id.clone(),
         model: ctx.model.clone(),
         surface: ctx.surface,
+        codename: ctx.codename.clone(),
+        agent: None,
+        provider: ctx.provider.clone(),
     };
     // Under the full profile the excerpt and references belong inside
     // `report`. `report_finding` refuses summary/severity/evidence there, but

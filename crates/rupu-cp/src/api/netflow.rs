@@ -3109,6 +3109,7 @@ mod tests {
                     finished_at: chrono::Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -3389,6 +3390,7 @@ mod tests {
             active_step_transcript_path: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 

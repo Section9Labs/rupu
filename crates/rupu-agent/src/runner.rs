@@ -591,8 +591,25 @@ impl PermissionDecider for ReadonlyDecider {
     }
 }
 
+/// `\n\nYour call sign in this run is `heron#3` (crew `jade-reef`). ...` --
+/// `None` for anything that isn't a member codename.
+pub(crate) fn call_sign_line(codename: &str) -> Option<String> {
+    let c: rupu_codename::Codename = codename.parse().ok()?;
+    if c.segments.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\nYour call sign in this run is `{}` (crew `{}`). Sign any comments, issues or PR notes you post with it.",
+        c.leaf(),
+        c.crew
+    ))
+}
+
 /// Inputs to a single agent run.
 pub struct AgentRunOpts {
+    /// Human codename for this instance. Written to `RunStart`, announced in
+    /// the system prompt, and copied onto `tool_context` for attribution.
+    pub codename: Option<String>,
     pub agent_name: String,
     pub agent_system_prompt: String,
     /// `None` = use all six tools; `Some(list)` = filter the registry.
@@ -925,6 +942,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         }
     }
 
+    if let Some(line) = opts.codename.as_deref().and_then(call_sign_line) {
+        opts.agent_system_prompt.push_str(&line);
+    }
+
     writer.write(&Event::RunStart {
         run_id: opts.run_id.clone(),
         workspace_id: opts.workspace_id.clone(),
@@ -935,6 +956,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         mode: parse_mode_for_event(&opts.mode_str),
         schema: Some(2),
         system_prompt: Some(opts.agent_system_prompt.clone()),
+        codename: opts.codename.clone(),
     })?;
     writer.flush()?;
 
@@ -956,6 +978,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     );
     opts.tool_context.run_id = Some(opts.run_id.clone());
     opts.tool_context.model = Some(opts.model.clone());
+    opts.tool_context.codename = opts.codename.clone();
+    opts.tool_context.agent = Some(opts.agent_name.clone());
+    opts.tool_context.provider = Some(opts.provider_name.clone());
 
     // Register coverage tools when coverage is enabled.
     if let Some(bundle) = &coverage {
@@ -1817,6 +1842,7 @@ mod on_tool_call_tests {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");
@@ -1917,6 +1943,7 @@ mod on_tool_call_tests {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         };
 
         let result = run_agent(opts)
@@ -2031,6 +2058,7 @@ mod on_tool_call_tests {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         };
 
         let result = run_agent(opts)
@@ -2045,6 +2073,94 @@ mod on_tool_call_tests {
             ("s1".to_string(), "issues.create".to_string(), true),
             "readonly-mode write denial must report blocked: true, got {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_start_records_codename_and_prompt_carries_call_sign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("t.jsonl");
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let opts = AgentRunOpts {
+            codename: Some("jade-reef/heron#3".into()),
+            seed_source: None,
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_codename".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_path: transcript.clone(),
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "go".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            pause: None,
+        };
+        let result = run_agent(opts).await.unwrap();
+        assert_eq!(result.status, RunStatus::Ok);
+
+        let first = rupu_transcript::JsonlReader::iter(&transcript)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        match first {
+            rupu_transcript::Event::RunStart {
+                codename,
+                system_prompt,
+                ..
+            } => {
+                assert_eq!(codename.as_deref(), Some("jade-reef/heron#3"));
+                let sp = system_prompt.unwrap();
+                assert!(
+                    sp.contains("Your call sign in this run is `heron#3` (crew `jade-reef`)"),
+                    "{sp}"
+                );
+            }
+            other => panic!("first event must be RunStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_sign_line_ignores_garbage() {
+        assert!(call_sign_line("not a codename").is_none());
+        assert!(call_sign_line("jade-reef").is_none());
     }
 
     #[tokio::test]
@@ -2114,6 +2230,7 @@ mod on_tool_call_tests {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         };
 
         let result = run_agent(opts)
@@ -2190,6 +2307,7 @@ mod on_tool_call_tests {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");
@@ -2287,6 +2405,7 @@ mod on_tool_call_tests {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             };
 
             let result = run_agent(opts).await.expect("agent run succeeds");
@@ -3075,6 +3194,7 @@ mod compaction_tests {
             context_window_tokens: Some(1_000_000),
             compact_at_percent: Some(75),
             pause: None,
+            codename: None,
         };
 
         let mut messages = vec![
@@ -3338,6 +3458,7 @@ mod pause_tests {
             context_window_tokens: None,
             compact_at_percent: None,
             pause,
+            codename: None,
         }
     }
 
@@ -3676,6 +3797,7 @@ mod reasoning_tests {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 

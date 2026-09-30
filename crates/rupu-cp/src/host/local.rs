@@ -651,6 +651,7 @@ mod pause_resume_tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         }
     }
 
@@ -910,6 +911,7 @@ mod launch_agent_tests {
                 working_dir: None,
                 run_id: None,
                 findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+                codename: None,
             })
             .await
             .unwrap();

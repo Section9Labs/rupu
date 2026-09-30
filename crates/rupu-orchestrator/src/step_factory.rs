@@ -449,6 +449,9 @@ impl StepFactory for DefaultStepFactory {
                 run_id: None,
                 model: None,
                 tool_mappings: None,
+                codename: None,
+                agent: None,
+                provider: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -495,6 +498,7 @@ impl StepFactory for DefaultStepFactory {
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
             pause: None,
+            codename: None,
         }
     }
 
@@ -1554,6 +1558,7 @@ steps:
             workflow: wf,
             inputs: Default::default(),
             workspace_id: "ws_profile".into(),
+            naming: None,
             workspace_path: dir.to_path_buf(),
             transcript_dir: dir.join("transcripts"),
             factory,

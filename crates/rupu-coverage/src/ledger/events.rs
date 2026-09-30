@@ -7,6 +7,19 @@ pub struct Attribution {
     pub run_id: String,
     pub model: String,
     pub surface: Surface,
+    /// Codename of the declaring agent instance. `None` for legacy records
+    /// and for the per-workflow MCP `findings.record` path (crew only there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
+    /// Name of the declaring agent (its `.md` definition). `None` for legacy
+    /// records and for the MCP `findings.record` path (an action step, not
+    /// an agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Provider that served `model` (e.g. `anthropic`). `None` for legacy
+    /// records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +334,26 @@ impl From<FindingRecordWire> for FindingRecord {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attribution_agent_provider_optional_on_the_wire() {
+        // A legacy record (no agent/provider) still parses, as None.
+        let legacy: Attribution =
+            serde_json::from_str(r#"{"run_id":"r","model":"m","surface":"workflow"}"#).unwrap();
+        assert_eq!(legacy.agent, None);
+        assert_eq!(legacy.provider, None);
+        // None is omitted; Some round-trips.
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("agent").is_none() && v.get("provider").is_none());
+        let named = Attribution {
+            agent: Some("rev".into()),
+            provider: Some("anthropic".into()),
+            ..legacy
+        };
+        let v = serde_json::to_value(&named).unwrap();
+        assert_eq!(v["agent"], "rev");
+        assert_eq!(v["provider"], "anthropic");
+    }
+
     use super::*;
 
     fn attribution() -> Attribution {
@@ -328,6 +361,9 @@ mod tests {
             run_id: "run_01KS19A4MQXP".to_string(),
             model: "claude-sonnet-4-6".to_string(),
             surface: Surface::Workflow,
+            codename: None,
+            agent: None,
+            provider: None,
         }
     }
 

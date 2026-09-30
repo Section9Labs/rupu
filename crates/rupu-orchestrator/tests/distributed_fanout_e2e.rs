@@ -118,6 +118,7 @@ impl StepFactory for EchoFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -226,6 +227,7 @@ async fn distributed_fanout_round_robin_results_and_host_persisted() {
         unit_dispatcher: Some(dispatcher.clone()),
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -319,6 +321,7 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -375,4 +378,157 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
         assert_eq!(cp.step_id, "process");
         assert!(cp.success, "local unit {i} should succeed");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — codenames on placed fan-out units: each unit's coordinator-minted
+// `crew/role#n` rides `UnitDispatch.codename`, a retry on the fallback host
+// becomes `…#n.2`, and every placed `AgentStarted` has provider/model None.
+// ---------------------------------------------------------------------------
+
+/// Records `(index, codename)` per dispatch; the FIRST dispatch of
+/// `fail_index` errors so the runner retries it on the fallback host.
+struct FlakyCodenameDispatcher {
+    seen: Mutex<Vec<(usize, Option<String>)>>,
+    fail_index: usize,
+}
+
+#[async_trait]
+impl UnitDispatcher for FlakyCodenameDispatcher {
+    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
+        let first_try = {
+            let mut seen = self.seen.lock().unwrap();
+            let first = !seen.iter().any(|(i, _)| *i == unit.index);
+            seen.push((unit.index, unit.codename.clone()));
+            first
+        };
+        if unit.index == self.fail_index && first_try {
+            return Err(RunError::Provider("host down".into()));
+        }
+        Ok(UnitOutcome {
+            output: format!("out-{}-on-{host}", unit.index),
+            success: true,
+            error: None,
+            workspace_delta: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct CollectSink(Mutex<Vec<rupu_orchestrator::executor::Event>>);
+
+impl rupu_orchestrator::executor::EventSink for CollectSink {
+    fn emit(&self, _run_id: &str, ev: &rupu_orchestrator::executor::Event) {
+        self.0.lock().unwrap().push(ev.clone());
+    }
+}
+
+#[tokio::test]
+async fn placed_fanout_units_carry_minted_codenames_and_retry_is_attempt_two() {
+    use rupu_orchestrator::executor::{Event, EventSink};
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let dispatcher = Arc::new(FlakyCodenameDispatcher {
+        seen: Mutex::new(Vec::new()),
+        fail_index: 1,
+    });
+    let sink = Arc::new(CollectSink::default());
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: Workflow::parse(WF_DISTRIBUTED).unwrap(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_e2e_names".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_DISTRIBUTED.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+        unit_dispatcher: Some(dispatcher.clone()),
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    let res = run_workflow(opts).await.expect("retry recovers the unit");
+    let crew = store.load(&res.run_id).unwrap().codename.expect("crew");
+
+    let mut seen = dispatcher.seen.lock().unwrap().clone();
+    seen.sort_by_key(|(i, c)| (*i, c.clone()));
+    let names: Vec<(usize, String)> = seen
+        .into_iter()
+        .map(|(i, c)| (i, c.expect("UnitDispatch carries a codename")))
+        .collect();
+    let role = {
+        let first: rupu_codename::Codename = names[0].1.parse().unwrap();
+        assert_eq!(first.crew, crew);
+        first.segments[0].role.clone()
+    };
+    assert_eq!(
+        names,
+        vec![
+            (0, format!("{crew}/{role}#1")),
+            (1, format!("{crew}/{role}#2")),
+            (1, format!("{crew}/{role}#2.2")),
+            (2, format!("{crew}/{role}#3")),
+            (3, format!("{crew}/{role}#4")),
+        ],
+        "one role per step, #n per unit, the retry is attempt .2"
+    );
+
+    // The recorded item carries the name of the attempt that produced it.
+    let items: Vec<_> = res.step_results[0]
+        .items
+        .iter()
+        .map(|i| i.codename.clone().unwrap())
+        .collect();
+    assert_eq!(
+        items,
+        vec![
+            format!("{crew}/{role}#1"),
+            format!("{crew}/{role}#2.2"),
+            format!("{crew}/{role}#3"),
+            format!("{crew}/{role}#4"),
+        ]
+    );
+    assert_eq!(
+        res.step_results[0].codename, None,
+        "the fan-out step record itself names no single member"
+    );
+
+    // Every placed AgentStarted: minted codename, provider/model unknown.
+    let events = sink.0.lock().unwrap();
+    let mut announced: Vec<(Option<usize>, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStarted {
+                unit_index,
+                codename,
+                provider,
+                model,
+                ..
+            } => {
+                assert_eq!(
+                    provider, &None,
+                    "placed provider is not the coordinator's to know"
+                );
+                assert_eq!(model, &None);
+                Some((*unit_index, codename.clone().unwrap()))
+            }
+            _ => None,
+        })
+        .collect();
+    announced.sort();
+    assert_eq!(
+        announced,
+        names
+            .iter()
+            .map(|(i, c)| (Some(*i), c.clone()))
+            .collect::<Vec<_>>()
+    );
 }

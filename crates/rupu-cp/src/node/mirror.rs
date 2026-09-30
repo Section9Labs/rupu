@@ -134,6 +134,7 @@ impl NodeMirror {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
 
         // Empty workflow YAML: node runs don't carry a local workflow snapshot.
@@ -409,6 +410,7 @@ impl NodeMirror {
             loop_iteration: None,
             run_outcome: None,
             host: None,
+            codename: None,
         };
         if let Err(e) = self.run_store.append_step_result(&record.id, &row) {
             tracing::warn!(

@@ -291,6 +291,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
         // workspace sync is active).
         let run_id = match conn
             .launch_agent(AgentLaunchRequest {
+                codename: unit.codename.clone(),
                 agent: unit.agent,
                 prompt: Some(unit.rendered_prompt),
                 mode: None,
@@ -960,6 +961,7 @@ mod tests {
             run_id: "r".to_string(),
             workspace: None,
             findings_profile: None,
+            codename: None,
         }
     }
 

@@ -204,6 +204,8 @@ fn one_line_preview(s: &str, max: usize) -> String {
 #[derive(Serialize)]
 struct TranscriptListRow {
     run_id: String,
+    /// Codename from `run_start`; legacy transcripts derive one.
+    codename: String,
     scope: String,
     title: Option<String>,
     agent: String,
@@ -221,6 +223,7 @@ struct TranscriptListCsvRow {
     status: String,
     total_tokens: u64,
     started_at: String,
+    codename: String,
 }
 
 #[derive(Serialize)]
@@ -322,6 +325,7 @@ impl CollectionOutput for TranscriptListOutput {
             "status",
             "total_tokens",
             "started_at",
+            "codename",
         ])
     }
 
@@ -370,7 +374,7 @@ fn build_transcript_list_table<'a>(
         prefs,
         prefs.render_opts(),
         vec![
-            "RUN ID", "SCOPE", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
+            "RUN ID", "NAME", "SCOPE", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
         ],
     )
     .with_summary("transcript");
@@ -393,6 +397,7 @@ fn build_transcript_list_table<'a>(
             .unwrap_or_else(|_| CellValue::Text(row.started_at.clone()));
         table = table.row(vec![
             CellValue::Id(row.run_id.clone()),
+            CellValue::Name(row.codename.clone()),
             CellValue::Status(row.scope.clone()),
             row.title
                 .clone()
@@ -1349,10 +1354,16 @@ pub(crate) fn render_pretty_transcript_event(
             model,
             started_at,
             mode,
+            codename,
             ..
         } => {
             if context == TranscriptPrettyContext::Standalone {
-                printer.agent_header(agent, provider, model, run_id);
+                let display = crate::output::codename::display_codename(
+                    codename.as_deref(),
+                    run_id,
+                    Some(agent),
+                );
+                printer.agent_header(agent, Some(&display), provider, model, run_id);
             }
             let detail = format!(
                 "{}  ·  workspace {workspace_id}  ·  mode {}  ·  {}",
@@ -1768,6 +1779,7 @@ async fn list(
 
     struct Row {
         run_id: String,
+        codename: Option<String>,
         scope: TranscriptScope,
         title: Option<String>,
         agent: String,
@@ -1825,6 +1837,7 @@ async fn list(
         match JsonlReader::summary(path) {
             Ok(s) => rows.push(Row {
                 run_id: s.run_id,
+                codename: s.codename,
                 scope: *scope,
                 title: s.first_assistant_text,
                 agent: s.agent,
@@ -1868,6 +1881,11 @@ async fn list(
         .iter()
         .map(|row| TranscriptListRow {
             run_id: row.run_id.clone(),
+            codename: crate::output::codename::display_codename(
+                row.codename.as_deref(),
+                &row.run_id,
+                Some(&row.agent),
+            ),
             scope: row.scope.as_str().to_string(),
             title: row.title.clone(),
             agent: row.agent.clone(),
@@ -1884,6 +1902,7 @@ async fn list(
         .iter()
         .map(|row| TranscriptListCsvRow {
             run_id: row.run_id.clone(),
+            codename: row.codename.clone(),
             scope: row.scope.clone(),
             title: row.title.clone().unwrap_or_default(),
             agent: row.agent.clone(),
@@ -2163,11 +2182,18 @@ fn locate_transcript(fragment: &str) -> anyhow::Result<TranscriptLocation> {
         return Ok(location);
     }
 
+    if let Some(location) = locate_transcript_by_codename(fragment)? {
+        return Ok(location);
+    }
+
     use crate::output::ids::{resolve, Resolution};
     let candidates = transcript_ids_present();
     match resolve(&candidates, fragment) {
         Resolution::Unique(id) => locate_transcript_exact(&id)?
             .ok_or_else(|| anyhow::anyhow!("transcript not found: {id}")),
+        Resolution::NotFound if fragment.parse::<rupu_codename::Codename>().is_ok() => Err(
+            anyhow::anyhow!("no run or agent named `{fragment}` (see `rupu workflow runs`)"),
+        ),
         Resolution::NotFound => Err(anyhow::anyhow!("unknown transcript: {fragment}")),
         Resolution::Ambiguous(matches) => {
             let mut msg = format!(
@@ -2180,6 +2206,95 @@ fn locate_transcript(fragment: &str) -> anyhow::Result<TranscriptLocation> {
             Err(anyhow::anyhow!(msg))
         }
     }
+}
+
+/// Resolve a codename (`crew` or `crew/role#n>…`) to a transcript. A crew
+/// name picks the most recent matching workflow run. A full instance
+/// codename is searched across the crew's runs newest-first and resolves to
+/// the first run that contains that agent instance (via
+/// [`rupu_orchestrator::RunStore::find_instance`]). `Ok(None)` when the
+/// fragment is not a codename or names no known run/instance.
+fn locate_transcript_by_codename(fragment: &str) -> anyhow::Result<Option<TranscriptLocation>> {
+    let Ok(cn) = fragment.parse::<rupu_codename::Codename>() else {
+        return Ok(None);
+    };
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let mut cands: Vec<(crate::output::codename::CrewCandidate, bool)> = Vec::new();
+    for (records, archived) in [
+        (store.list().unwrap_or_default(), false),
+        (store.list_archived().unwrap_or_default(), true),
+    ] {
+        for r in records {
+            cands.push((
+                crate::output::codename::CrewCandidate {
+                    crew: crate::output::codename::display_codename(
+                        r.codename.as_deref(),
+                        &r.id,
+                        None,
+                    ),
+                    id: r.id,
+                    started_at: r.started_at,
+                },
+                archived,
+            ));
+        }
+    }
+    if cn.segments.is_empty() {
+        let crews: Vec<_> = cands.into_iter().map(|(c, _)| c).collect();
+        let Some(run_id) = crate::output::codename::resolve_codename_fragment(&crews, fragment)
+        else {
+            return Ok(None);
+        };
+        return locate_transcript_exact(&run_id)?.map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "run `{run_id}` has no single transcript; name an agent instance (`{fragment}/<role>#<n>`)"
+            )
+        });
+    }
+    locate_instance(&store, &cands, &cn.crew, fragment, chrono::Utc::now())
+}
+
+/// Search the runs of `crew` newest-first for the agent instance named
+/// `fragment`. The ambiguity note is printed only on a hit.
+fn locate_instance(
+    store: &rupu_orchestrator::RunStore,
+    cands: &[(crate::output::codename::CrewCandidate, bool)],
+    crew: &str,
+    fragment: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Option<TranscriptLocation>> {
+    let mut runs: Vec<&(crate::output::codename::CrewCandidate, bool)> =
+        cands.iter().filter(|(c, _)| c.crew == crew).collect();
+    runs.sort_by_key(|(c, _)| std::cmp::Reverse(c.started_at));
+    for (cand, archived) in runs.iter().copied() {
+        let Some((agent_run_id, transcript_path)) = store.find_instance(&cand.id, fragment)? else {
+            continue;
+        };
+        let cutoff = now - chrono::Duration::days(30);
+        let others: Vec<String> = runs
+            .iter()
+            .filter(|(c, _)| c.id != cand.id && c.started_at >= cutoff)
+            .map(|(c, _)| c.id.clone())
+            .collect();
+        if !others.is_empty() {
+            eprintln!(
+                "{}",
+                crate::output::codename::ambiguity_note(crew, &cand.id, &others)
+            );
+        }
+        let dir = transcript_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        return Ok(Some(TranscriptLocation {
+            metadata_path: metadata_path_for_run(&dir, &agent_run_id),
+            run_id: agent_run_id,
+            transcript_path,
+            archived: *archived,
+        }));
+    }
+    Ok(None)
 }
 
 /// Every transcript id (`.jsonl` stem) present across the project-local
@@ -2416,6 +2531,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instance_codename_resolves_in_an_older_run_of_the_same_crew() {
+        use crate::output::codename::CrewCandidate;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        let now = chrono::Utc::now();
+        let cand = |id: &str, days: i64| {
+            (
+                CrewCandidate {
+                    id: id.into(),
+                    crew: "jade-reef".into(),
+                    started_at: now - chrono::Duration::days(days),
+                },
+                id == "run_old",
+            )
+        };
+        // Instances exist only under the OLDER run, in the real layout: the
+        // step agent (`run_step_old`) is recorded in step_results.jsonl, its
+        // dispatched sub-agent lives under the STEP's agent run id, and the
+        // grandchild under its dispatching sub-run's id.
+        std::fs::create_dir_all(tmp.path().join("run_old")).unwrap();
+        let step: rupu_orchestrator::StepResultRecord = serde_json::from_value(serde_json::json!({
+            "step_id": "review",
+            "run_id": "run_step_old",
+            "transcript_path": "/t/run_step_old.jsonl",
+            "output": "",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "",
+            "finished_at": now,
+            "codename": "jade-reef/heron",
+        }))
+        .unwrap();
+        store.append_step_result("run_old", &step).unwrap();
+        let write_sub = |parent: &str, sub: &str, codename: &str| {
+            let dir = tmp.path().join(parent).join("sub").join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            let tp = dir.join("transcript.jsonl");
+            let start = TranscriptEvent::RunStart {
+                run_id: sub.into(),
+                workspace_id: "w".into(),
+                agent: "numbat".into(),
+                provider: "p".into(),
+                model: "m".into(),
+                started_at: now,
+                mode: rupu_transcript::RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
+                codename: Some(codename.into()),
+            };
+            std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
+            tp
+        };
+        let tp = write_sub("run_step_old", "sub_A", "jade-reef/heron>numbat#2");
+        let gc = write_sub("sub_A", "sub_B", "jade-reef/heron>numbat#2>lynx#1");
+        std::fs::create_dir_all(tmp.path().join("run_new")).unwrap();
+
+        let cands = vec![cand("run_new", 1), cand("run_old", 5)];
+        let loc = locate_instance(&store, &cands, "jade-reef", "jade-reef/heron>numbat#2", now)
+            .unwrap()
+            .expect("found in older run");
+        assert_eq!(loc.run_id, "sub_A");
+        assert_eq!(loc.transcript_path, tp);
+        assert!(loc.archived, "carries the matched run's archived state");
+        let loc = locate_instance(
+            &store,
+            &cands,
+            "jade-reef",
+            "jade-reef/heron>numbat#2>lynx#1",
+            now,
+        )
+        .unwrap()
+        .expect("grandchild found");
+        assert_eq!(loc.run_id, "sub_B");
+        assert_eq!(loc.transcript_path, gc);
+        assert!(
+            locate_instance(&store, &cands, "jade-reef", "jade-reef/ferret#9", now)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn thinking_event_renders_full_body_in_full_view_and_redacted_marker() {
         let prefs = transcript_list_test_prefs();
         let long = "x".repeat(300);
@@ -2625,6 +2822,7 @@ mod tests {
     ) -> TranscriptListRow {
         TranscriptListRow {
             run_id: run_id.to_string(),
+            codename: "cobalt-harbor/heron".to_string(),
             scope: scope.to_string(),
             title: title.map(str::to_string),
             agent: agent.to_string(),
@@ -2839,11 +3037,40 @@ mod tests {
             &transcript_list_test_prefs(),
             transcript_list_test_now(),
         )
-        .render_at_width(transcript_list_test_now(), 80);
+        // 100 cols, not 80: the NAME column (fixed-width, no-wrap, ~19
+        // chars) added alongside RUN ID leaves 80 too cramped for ANY
+        // wrapping column to fit; 100 keeps the same squeeze pressure
+        // from the 63-char AGENT that this guard is about.
+        .render_at_width(transcript_list_test_now(), 100);
         assert!(
             out.contains("1200"),
             "TOKENS column collapsed under a long AGENT name: {out}"
         );
+    }
+
+    #[test]
+    fn transcript_list_80_cols_keeps_run_id_and_name_unbroken() {
+        let mut row = transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            Some("fix the flaky test"),
+            "triage",
+            "completed",
+            "2026-07-30 13:00:00",
+        );
+        row.codename = "jade-reef/numbat".to_string();
+        let out = build_transcript_list_table(
+            &[row],
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        )
+        .render_at_width(transcript_list_test_now(), 80);
+        // Id and Name cells never wrap; lower-value columns may.
+        let line = out
+            .lines()
+            .find(|l| l.contains("run_01KYSMDN"))
+            .unwrap_or_else(|| panic!("RUN ID cell broken: {out}"));
+        assert!(line.contains("jade-reef/numbat"), "NAME cell broken: {out}");
     }
 
     fn prune_row(

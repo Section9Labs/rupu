@@ -53,6 +53,7 @@ fn write_usage_transcript(
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
     writer
@@ -154,6 +155,7 @@ fn sample_run_record(
         active_step_transcript_path: None,
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     }
 }
 
@@ -221,6 +223,7 @@ fn sample_step_result(run_id: &str, transcript_path: &Path) -> StepResultRecord 
         finished_at: Utc::now(),
         loop_iteration: None,
         host: None,
+        codename: None,
     }
 }
 
@@ -617,6 +620,7 @@ fn usage_backfill_creates_sidecars_for_old_standalone_transcripts() {
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
     for event in events.into_iter().skip(1) {

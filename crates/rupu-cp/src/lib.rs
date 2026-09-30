@@ -4,6 +4,8 @@
 
 pub mod agent_launcher;
 pub mod api;
+pub mod codename;
+pub mod codename_palette;
 pub mod config_write;
 pub mod definition_generator;
 pub mod embed;

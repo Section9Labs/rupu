@@ -139,6 +139,14 @@ struct SessionForRunsDto {
     agent_name: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    /// Stored session codename; absent on legacy sessions (derived on read).
+    #[serde(default)]
+    codename: Option<String>,
+    /// Provider + model the session's turns run on (`session.json`).
+    #[serde(default)]
+    provider_name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     runs: Vec<SessionRunRecordDto>,
 }
@@ -159,6 +167,16 @@ struct AgentRunRow {
     duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_id: Option<String>,
+    /// Stored codename (standalone: `RunStart.codename`; session turn: the
+    /// session's), or derived for a legacy record (`codename_derived`).
+    codename: String,
+    codename_derived: bool,
+    /// Provider + model the run used (standalone: `RunStart`; session turn:
+    /// the session's). `None` when neither source could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 /// One actionable autoflow *event* — a single launched run or awaiting/failed
@@ -229,20 +247,38 @@ fn stringify_status(v: &serde_json::Value) -> Option<String> {
 /// merge them with a plain LEXICOGRAPHIC string compare. `'+'` (0x2B) sorts
 /// before `'Z'` (0x5A), so a `+00:00`-suffixed row silently sorts as older
 /// than it is. Do not "tidy" this back into `.to_rfc3339()`.
-fn read_transcript_run_start(path: &std::path::Path) -> (Option<String>, Option<String>) {
+fn read_transcript_run_start(path: &std::path::Path) -> TranscriptRunStart {
     let mut iter = match rupu_transcript::JsonlReader::iter(path) {
         Ok(it) => it,
-        Err(_) => return (None, None),
+        Err(_) => return TranscriptRunStart::default(),
     };
     match iter.next() {
         Some(Ok(rupu_transcript::Event::RunStart {
-            agent, started_at, ..
-        })) => (
-            Some(agent),
-            Some(started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
-        ),
-        _ => (None, None),
+            agent,
+            provider,
+            model,
+            started_at,
+            codename,
+            ..
+        })) => TranscriptRunStart {
+            agent: Some(agent),
+            started_at: Some(started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+            codename,
+            provider: Some(provider).filter(|p| !p.is_empty()),
+            model: Some(model).filter(|m| !m.is_empty()),
+        },
+        _ => TranscriptRunStart::default(),
     }
+}
+
+/// What `read_transcript_run_start` recovers from a transcript's first line.
+#[derive(Default)]
+struct TranscriptRunStart {
+    agent: Option<String>,
+    started_at: Option<String>,
+    codename: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
 }
 
 /// Resolve `session_id`'s `agent_name` by loading its `session.json` from
@@ -343,9 +379,15 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
 
         // The standalone meta.json genuinely has no `agent`/`started_at`
         // fields — recover them from the transcript's first line.
-        let (mut agent, started_at) = match &transcript_path {
+        let TranscriptRunStart {
+            mut agent,
+            started_at,
+            codename: stored_codename,
+            provider,
+            model,
+        } = match &transcript_path {
             Some(tp) => read_transcript_run_start(std::path::Path::new(tp)),
-            None => (None, None),
+            None => TranscriptRunStart::default(),
         };
 
         // For session-turn runs whose transcript didn't yield an agent
@@ -357,8 +399,12 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             }
         }
 
+        let (codename, codename_derived) =
+            crate::codename::named(stored_codename.as_deref(), &dto.run_id, agent.as_deref());
         drafts.push((
             AgentRunRow {
+                codename,
+                codename_derived,
                 run_id: dto.run_id,
                 source: "standalone",
                 agent,
@@ -371,6 +417,8 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
                 turns: 0,
                 duration_ms: None,
                 host_id: None,
+                provider,
+                model,
             },
             dto.pid,
         ));
@@ -470,8 +518,15 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
         }
         let session_file = dir.join("session.json");
         if let Some(dto) = try_load_session_for_runs(&session_file) {
+            let (codename, codename_derived) = crate::codename::named(
+                dto.codename.as_deref(),
+                dto.session_id.as_deref().unwrap_or_default(),
+                dto.agent_name.as_deref(),
+            );
             for run in dto.runs {
                 out.push(AgentRunRow {
+                    codename: codename.clone(),
+                    codename_derived,
                     run_id: run.run_id,
                     source: "session",
                     agent: dto.agent_name.clone(),
@@ -484,6 +539,8 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                     turns: 0,
                     duration_ms: None,
                     host_id: None,
+                    provider: dto.provider_name.clone().filter(|p| !p.is_empty()),
+                    model: dto.model.clone().filter(|m| !m.is_empty()),
                 });
             }
         }
@@ -596,6 +653,14 @@ fn merge_agent_run_rows(a: AgentRunRow, b: AgentRunRow) -> AgentRunRow {
         turns: 0,
         duration_ms: session.duration_ms.or(standalone.duration_ms),
         host_id: session.host_id.or(standalone.host_id),
+        // The session's codename is the row's identity when the run is a
+        // session turn; a plain merge collision keeps the session side too.
+        codename: session.codename,
+        codename_derived: session.codename_derived,
+        // Standalone's comes from the turn's own `RunStart` — the provider /
+        // model that actually served it — so it wins over the session's.
+        provider: standalone.provider.or(session.provider),
+        model: standalone.model.or(session.model),
     }
 }
 
@@ -739,6 +804,7 @@ async fn list_agent_runs(
                 .into_iter()
                 .map(|mut row| {
                     row["host_id"] = serde_json::json!(host);
+                    crate::codename::inject_codename_row(&mut row, "run_id", Some("agent"));
                     row
                 })
                 .collect(),
@@ -788,6 +854,11 @@ async fn list_agent_runs(
     .await;
 
     sort_values_newest_first(&mut all_values, "started_at");
+    // Rows from older remotes carry no codename; local rows already do (a
+    // no-op for them, flag preserved).
+    for row in &mut all_values {
+        crate::codename::inject_codename_row(row, "run_id", Some("agent"));
+    }
 
     // Lifecycle filter after merge
     let lifecycle = q.lifecycle.as_deref();
@@ -1229,6 +1300,10 @@ mod tests {
                 turns: 3,
                 duration_ms: Some(12_500),
                 host_id: Some("local".into()),
+                codename: "cobalt-harbor/heron".into(),
+                codename_derived: false,
+                provider: Some("anthropic".into()),
+                model: Some("claude-sonnet-4-6".into()),
             },
             AgentRunRow {
                 run_id: "run-11".into(),
@@ -1243,6 +1318,10 @@ mod tests {
                 turns: 0,
                 duration_ms: None,
                 host_id: None,
+                codename: "jade-reef".into(),
+                codename_derived: true,
+                provider: None,
+                model: None,
             },
         ];
         check_fixture("agent_run_rows.json", &rows);
@@ -1601,6 +1680,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            codename: None,
         };
         let line = serde_json::to_string(&ev).unwrap();
         fs::write(dir.join(format!("{run_id}.jsonl")), format!("{line}\n")).unwrap();
@@ -1654,6 +1734,116 @@ mod tests {
             serde_json::to_string(&session).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn standalone_row_codename_stored_else_derived() {
+        // Legacy transcript (no codename) -> derived from (run_id, agent).
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", None, None);
+        write_transcript_run_start(
+            tmp.path(),
+            "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W",
+            "triage",
+            "2026-01-01T00:00:00Z",
+        );
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows[0].codename, "jade-reef/numbat");
+        assert!(rows[0].codename_derived);
+
+        // Stored RunStart.codename wins.
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_named", None, None);
+        let ev = rupu_transcript::Event::RunStart {
+            run_id: "run_named".into(),
+            workspace_id: "ws".into(),
+            agent: "triage".into(),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            started_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            mode: rupu_transcript::RunMode::Ask,
+            schema: None,
+            system_prompt: None,
+            codename: Some("cobalt-harbor/heron".into()),
+        };
+        let dir = tmp.path().join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("run_named.jsonl"),
+            format!("{}\n", serde_json::to_string(&ev).unwrap()),
+        )
+        .unwrap();
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows[0].codename, "cobalt-harbor/heron");
+        assert!(!rows[0].codename_derived);
+    }
+
+    #[test]
+    fn standalone_row_carries_run_start_provider_and_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_pm", None, None);
+        write_transcript_run_start(tmp.path(), "run_pm", "triage", "2026-01-01T00:00:00Z");
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows[0].provider.as_deref(), Some("anthropic"));
+        assert_eq!(rows[0].model.as_deref(), Some("claude"));
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(v["provider"], "anthropic");
+        assert_eq!(v["model"], "claude");
+    }
+
+    #[test]
+    fn session_row_carries_session_provider_and_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions").join("ses_pm");
+        fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "agent_name": "session-agent",
+            "session_id": "ses_pm",
+            "provider_name": "openai",
+            "model": "gpt-5",
+            "runs": [{ "run_id": "run_s", "started_at": "2026-03-01T10:05:00Z" }],
+        });
+        fs::write(dir.join("session.json"), session.to_string()).unwrap();
+        let mut out = Vec::new();
+        collect_session_runs_from_dir(&tmp.path().join("sessions"), &mut out);
+        assert_eq!(out[0].provider.as_deref(), Some("openai"));
+        assert_eq!(out[0].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn session_row_codename_stored_else_derived() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "ses_01J9ZQ3K4M5N6P7Q8R9S0T1V2W",
+            "run_s1",
+            "2026-03-01T10:05:00Z",
+        );
+        let mut out = Vec::new();
+        collect_session_runs_from_dir(&tmp.path().join("sessions"), &mut out);
+        assert_eq!(
+            out[0].codename,
+            rupu_codename::derive_legacy("ses_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", Some("session-agent"))
+        );
+        assert!(out[0].codename_derived);
+
+        // Stored session codename wins.
+        let dir = tmp.path().join("sessions2").join("ses_x");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("session.json"),
+            serde_json::json!({
+                "agent_name": "a", "session_id": "ses_x", "codename": "cobalt-harbor/heron",
+                "runs": [{"run_id": "r", "started_at": "2026-03-01T10:05:00Z"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        collect_session_runs_from_dir(&tmp.path().join("sessions2"), &mut out);
+        assert_eq!(out[0].codename, "cobalt-harbor/heron");
+        assert!(!out[0].codename_derived);
     }
 
     #[test]
@@ -1927,6 +2117,10 @@ mod tests {
                 turns: 0,
                 duration_ms: None,
                 host_id: None,
+                codename: format!("{source}-name"),
+                codename_derived: false,
+                provider: None,
+                model: None,
             }
         }
 
@@ -1950,6 +2144,7 @@ mod tests {
         assert_eq!(merged.trigger_source.as_deref(), Some("session_turn")); // standalone wins
         assert_eq!(merged.status.as_deref(), Some("ok")); // session wins
         assert_eq!(merged.agent.as_deref(), Some("session-agent")); // session wins (default)
+        assert_eq!(merged.codename, "session-name"); // session's codename is the identity
     }
 
     // ── A2: autoflow event DTO forwards detail + issue_ref fallback ────────────
@@ -2091,6 +2286,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
+            codename: None,
         };
         s.run_store.create(record, "name: wf\n").unwrap();
 
@@ -2106,6 +2302,7 @@ mod tests {
                 mode: rupu_transcript::RunMode::Ask,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),
@@ -2158,6 +2355,7 @@ mod tests {
                     finished_at: Utc::now(),
                     loop_iteration: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -2328,6 +2526,67 @@ mod tests {
         .await
         .expect("a malformed since must degrade, never error");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_agent_run_rows_get_derived_codename_on_single_host_and_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: "host_fake".into(),
+                name: "fake".into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let registry = std::sync::Arc::new(crate::host::registry::HostRegistry::new(
+            host_store,
+            std::sync::Arc::new(crate::api::runs::tests::FakeHostConnector {
+                run_json: serde_json::json!({ "agent_runs": [
+                    {"run_id": "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", "agent": "triage",
+                     "started_at": "2026-08-01T00:00:00Z", "status": "ok"},
+                    {"run_id": "run_named", "agent": "triage",
+                     "started_at": "2026-08-02T00:00:00Z", "status": "ok",
+                     "codename": "cobalt-harbor/heron", "codename_derived": false},
+                ]}),
+            }),
+        ));
+        for host in ["host_fake", "all"] {
+            let s = crate::state::AppState::new(
+                tmp.path().to_path_buf(),
+                rupu_config::PricingConfig::default(),
+            )
+            .with_hosts(registry.clone());
+            let Json(rows) = list_agent_runs(
+                State(s),
+                Query(AgentRunsQuery {
+                    offset: None,
+                    limit: None,
+                    lifecycle: None,
+                    host: Some(host.into()),
+                    since: None,
+                    until: None,
+                }),
+            )
+            .await
+            .expect("ok");
+            let by = |id: &str| rows.iter().find(|r| r["run_id"] == id).cloned().unwrap();
+            let legacy = by("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W");
+            assert_eq!(
+                legacy["codename"],
+                rupu_codename::derive_legacy("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", Some("triage")),
+                "host={host}"
+            );
+            assert_eq!(legacy["codename_derived"], true, "host={host}");
+            let named = by("run_named");
+            assert_eq!(named["codename"], "cobalt-harbor/heron", "host={host}");
+            assert_eq!(named["codename_derived"], false, "host={host}");
+        }
     }
 
     #[tokio::test]

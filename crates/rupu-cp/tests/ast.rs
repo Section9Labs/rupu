@@ -51,6 +51,7 @@ fn seed_run(id: &str, workspace: &std::path::Path) -> RunRecord {
         active_step_transcript_path: None,
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     }
 }
 
@@ -222,4 +223,44 @@ async fn get_ast_returns_404_for_unknown_run() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_ast_soft_fails_on_a_fifo_without_blocking() {
+    use axum::http::StatusCode;
+
+    let global = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // An agent can plant a FIFO at a parsed path; with no writer, a
+    // blocking open would never return.
+    let made = std::process::Command::new("mkfifo")
+        .arg(workspace.path().join("pipe.rs"))
+        .status();
+    if !made.is_ok_and(|s| s.success()) {
+        eprintln!("mkfifo unavailable; skipping");
+        return;
+    }
+
+    let run_store = RunStore::new(global.path().join("runs"));
+    run_store
+        .create(
+            seed_run("run_ast_fifo", workspace.path()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = spawn_server(global.path()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/runs/run_ast_fifo/ast"))
+        .query(&[("path", "pipe.rs"), ("line", "1"), ("col", "1")])
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .expect("a FIFO must not park the handler");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["available"], false);
+    assert_eq!(body["reason"], "file not found");
 }

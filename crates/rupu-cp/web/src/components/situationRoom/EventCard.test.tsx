@@ -19,6 +19,7 @@ function renderCard(ui: React.ReactNode) {
 }
 
 const finding: FindingOut = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   id: 'f1', ws_id: 'ws1', project: 'billing-api', target_id: 't1',
   file_path: 'src/routes/billing.ts', line_range: [16, 18], scope: null,
   summary: 'Broken org-scoping on GET /invoice/:id', severity: 'high', concern_id: null,

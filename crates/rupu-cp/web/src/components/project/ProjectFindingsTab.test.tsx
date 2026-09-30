@@ -19,6 +19,7 @@ afterEach(() => {
 
 function finding(id: string, severity: string, summary: string): FindingOut {
   return {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id,
     ws_id: 'x',
     project: 'proj',

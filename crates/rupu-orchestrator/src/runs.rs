@@ -126,6 +126,9 @@ pub struct RunRecord {
     /// Set when the run reaches a terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
+    /// Crew codename (`adjective-noun`) minted for this run. Absent on legacy runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -606,6 +609,9 @@ pub struct StepResultRecord {
     /// record written before the field existed (mirrors `UnitCheckpoint::host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Codename of the singleton member that ran this step. `None` for fan-out/panel/parallel steps (instances live on `items`) and legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 /// Captured process outcome for a `run:` step. `None` for every other
@@ -642,6 +648,9 @@ pub struct FindingRecord {
     pub severity: String,
     pub title: String,
     pub body: String,
+    /// Codename of the agent instance that emitted this finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,6 +680,9 @@ pub struct ItemResultRecord {
     /// restate it as "impossible": it is merely unreachable in practice.
     #[serde(default)]
     pub is_fixer: bool,
+    /// Codename of the agent instance that ran this unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 /// One durable per-unit checkpoint for a fan-out (`for_each`) step,
@@ -702,6 +714,9 @@ pub struct UnitCheckpoint {
     /// was added; serde default restores `None` on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Codename of the agent instance that ran this unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 impl From<&StepResult> for StepResultRecord {
@@ -725,6 +740,7 @@ impl From<&StepResult> for StepResultRecord {
                     severity: f.severity.as_str().to_string(),
                     title: f.title.clone(),
                     body: f.body.clone(),
+                    codename: f.codename.clone(),
                 })
                 .collect(),
             iterations: sr.iterations,
@@ -732,6 +748,7 @@ impl From<&StepResult> for StepResultRecord {
             finished_at: Utc::now(),
             loop_iteration: sr.loop_iteration,
             host: sr.host.clone(),
+            codename: sr.codename.clone(),
         }
     }
 }
@@ -748,6 +765,7 @@ impl From<&ItemResult> for ItemResultRecord {
             output: i.output.clone(),
             success: i.success,
             is_fixer: i.is_fixer,
+            codename: i.codename.clone(),
         }
     }
 }
@@ -773,12 +791,14 @@ impl From<&StepResultRecord> for StepResult {
                     severity: crate::workflow::Severity::parse_lossy(&f.severity),
                     title: f.title.clone(),
                     body: f.body.clone(),
+                    codename: f.codename.clone(),
                 })
                 .collect(),
             iterations: rec.iterations,
             resolved: rec.resolved,
             loop_iteration: rec.loop_iteration,
             host: rec.host.clone(),
+            codename: rec.codename.clone(),
         }
     }
 }
@@ -795,6 +815,7 @@ impl From<&ItemResultRecord> for ItemResult {
             output: rec.output.clone(),
             success: rec.success,
             is_fixer: rec.is_fixer,
+            codename: rec.codename.clone(),
         }
     }
 }
@@ -1093,6 +1114,108 @@ impl RunStore {
             }
         }
         out
+    }
+
+    /// Find the agent instance named `codename` (`crew/role#n>…`) inside a
+    /// run. Returns `(agent_run_id, transcript_path)`.
+    ///
+    /// Search order:
+    /// 1. step records, then fan-out item records (`step_results.jsonl`) —
+    ///    the static-slot instances;
+    /// 2. the run's `events.jsonl`: `AgentStarted` (`agent_run_id`) and
+    ///    `DispatchStarted` (`sub_run_id`) carry the minted codename and the
+    ///    transcript path, which covers dispatched sub-agents at any depth
+    ///    in a workflow run;
+    /// 3. a walk of the sub-run tree for runs with no event log (standalone
+    ///    `rupu run`, or a torn `events.jsonl`): sub-runs live under the
+    ///    DISPATCHING agent's run id — `<root>/<parent>/sub/<sub_id>/` where
+    ///    `<parent>` is the run itself, a step/unit agent run id, or another
+    ///    sub-run id (grandchildren: `<root>/sub_X/sub/sub_Y/`) — so the walk
+    ///    starts from the run id plus every step/item run id and recurses,
+    ///    matching each transcript's first-line `RunStart.codename`.
+    pub fn find_instance(
+        &self,
+        run_id: &str,
+        codename: &str,
+    ) -> Result<Option<(String, PathBuf)>, RunStoreError> {
+        let steps = self.read_step_results(run_id)?;
+        for rec in &steps {
+            if rec.codename.as_deref() == Some(codename) {
+                return Ok(Some((rec.run_id.clone(), rec.transcript_path.clone())));
+            }
+        }
+        for rec in &steps {
+            for item in &rec.items {
+                if item.codename.as_deref() == Some(codename) {
+                    return Ok(Some((item.run_id.clone(), item.transcript_path.clone())));
+                }
+            }
+        }
+        if let Some(hit) = self.find_instance_in_events(run_id, codename) {
+            return Ok(Some(hit));
+        }
+        let mut roots = vec![run_id.to_string()];
+        for rec in &steps {
+            roots.push(rec.run_id.clone());
+            roots.extend(rec.items.iter().map(|i| i.run_id.clone()));
+        }
+        roots.retain(|id| !id.is_empty());
+        Ok(self.find_instance_in_sub_tree(&roots, codename))
+    }
+
+    /// `events.jsonl` scan for [`Self::find_instance`]. Unparseable lines
+    /// (a torn tail, a future event variant) are skipped.
+    fn find_instance_in_events(&self, run_id: &str, codename: &str) -> Option<(String, PathBuf)> {
+        let file = File::open(self.events_path(run_id)).ok()?;
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            let Ok(ev) = serde_json::from_str::<crate::executor::Event>(&line) else {
+                continue;
+            };
+            match ev {
+                crate::executor::Event::AgentStarted {
+                    codename: Some(c),
+                    agent_run_id,
+                    transcript_path,
+                    ..
+                } if c == codename => return Some((agent_run_id, transcript_path)),
+                crate::executor::Event::DispatchStarted {
+                    codename: Some(c),
+                    sub_run_id,
+                    transcript_path,
+                    ..
+                } if c == codename => return Some((sub_run_id, transcript_path)),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Sub-run tree walk for [`Self::find_instance`], rooted at every id in
+    /// `roots`. Cycle- and depth-guarded like [`Self::sub_run_ids_recursive`].
+    fn find_instance_in_sub_tree(
+        &self,
+        roots: &[String],
+        codename: &str,
+    ) -> Option<(String, PathBuf)> {
+        let mut visited: std::collections::HashSet<String> = roots.iter().cloned().collect();
+        let mut frontier: Vec<(String, u32)> = roots.iter().map(|r| (r.clone(), 0)).collect();
+        while let Some((parent, depth)) = frontier.pop() {
+            if depth >= MAX_SUB_RUN_RECURSION_DEPTH {
+                continue;
+            }
+            for child in self.sub_run_ids(&parent) {
+                if !visited.insert(child.clone()) {
+                    continue;
+                }
+                let path = self.sub_run_transcript(&parent, &child);
+                if transcript_codename(&path).as_deref() == Some(codename) {
+                    return Some((child, path));
+                }
+                frontier.push((child, depth + 1));
+            }
+        }
+        None
     }
 
     /// Load a run by id.
@@ -2785,6 +2908,15 @@ fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The codename stamped on a transcript's first-line `RunStart`, if any.
+fn transcript_codename(path: &Path) -> Option<String> {
+    let mut events = rupu_transcript::JsonlReader::iter(path).ok()?;
+    match events.next() {
+        Some(Ok(rupu_transcript::Event::RunStart { codename, .. })) => codename,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2846,6 +2978,7 @@ mod tests {
             permission_mode: None,
             final_output: None,
             loop_progress: BTreeMap::new(),
+            codename: None,
         }
     }
 
@@ -2867,6 +3000,7 @@ mod tests {
             finished_at: Utc::now(),
             loop_iteration: None,
             host: None,
+            codename: None,
         }
     }
 
@@ -3056,6 +3190,180 @@ mod tests {
     }
 
     #[test]
+    fn find_instance_matches_items_and_sub_runs() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_fi");
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
+        let mut step = sample_step_result("a");
+        step.codename = Some("jade-reef/heron".into());
+        step.items.push(ItemResultRecord {
+            index: 0,
+            item: serde_json::Value::Null,
+            sub_id: "s0".into(),
+            rendered_prompt: String::new(),
+            run_id: "run_U".into(),
+            transcript_path: PathBuf::from("/u.jsonl"),
+            output: String::new(),
+            success: true,
+            is_fixer: false,
+            codename: Some("jade-reef/numbat#2".into()),
+        });
+        store.append_step_result(&rec.id, &step).unwrap();
+        assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/heron").unwrap(),
+            Some(("run_step_a".to_string(), PathBuf::from("/tmp/a.jsonl")))
+        );
+        assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/numbat#2").unwrap(),
+            Some(("run_U".to_string(), PathBuf::from("/u.jsonl")))
+        );
+        assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/ferret#9").unwrap(),
+            None
+        );
+
+        // Real layout, no events.jsonl: a sub-agent dispatched by the STEP
+        // agent lives under the step's agent run id, a grandchild under
+        // its dispatching sub-run's id, and one dispatched by a fan-out
+        // unit under that unit's run id.
+        let child = write_sub_transcript(
+            tmp.path(),
+            "run_step_a",
+            "sub_A",
+            "jade-reef/heron>ferret#1",
+        );
+        let grandchild = write_sub_transcript(
+            tmp.path(),
+            "sub_A",
+            "sub_B",
+            "jade-reef/heron>ferret#1>lynx#1",
+        );
+        let unit_child =
+            write_sub_transcript(tmp.path(), "run_U", "sub_C", "jade-reef/numbat#2>lynx#1");
+        assert!(!store.events_path(&rec.id).exists());
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>ferret#1")
+                .unwrap(),
+            Some(("sub_A".to_string(), child))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>ferret#1>lynx#1")
+                .unwrap(),
+            Some(("sub_B".to_string(), grandchild))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/numbat#2>lynx#1")
+                .unwrap(),
+            Some(("sub_C".to_string(), unit_child))
+        );
+    }
+
+    /// With an `events.jsonl`, a `DispatchStarted` / `AgentStarted` codename
+    /// resolves straight to the event's own id + transcript path — no
+    /// directory walk needed (the path here exists nowhere on disk).
+    #[test]
+    fn find_instance_reads_dispatch_and_agent_started_events() {
+        use crate::executor::{Event as OrchEvent, EventSink, JsonlSink};
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_ev");
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
+        let sink = JsonlSink::create(&store.events_path(&rec.id)).unwrap();
+        sink.emit(
+            &rec.id,
+            &OrchEvent::AgentStarted {
+                run_id: rec.id.clone(),
+                step_id: "a".into(),
+                unit_index: None,
+                codename: Some("jade-reef/heron".into()),
+                agent: "a".into(),
+                provider: None,
+                model: None,
+                agent_run_id: "run_step_a".into(),
+                transcript_path: PathBuf::from("/x/a.jsonl"),
+            },
+        );
+        sink.emit(
+            &rec.id,
+            &OrchEvent::DispatchStarted {
+                run_id: rec.id.clone(),
+                sub_run_id: "sub_Z".into(),
+                agent: Some("lynx".into()),
+                transcript_path: PathBuf::from("/x/sub_Z.jsonl"),
+                codename: Some("jade-reef/heron>lynx#1>ferret#2".into()),
+                provider: None,
+                model: None,
+            },
+        );
+        assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/heron").unwrap(),
+            Some(("run_step_a".to_string(), PathBuf::from("/x/a.jsonl")))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>lynx#1>ferret#2")
+                .unwrap(),
+            Some(("sub_Z".to_string(), PathBuf::from("/x/sub_Z.jsonl")))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>lynx#2")
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A standalone run (no step records, no events.jsonl): its
+    /// grandchild nests under the child's own id.
+    #[test]
+    fn find_instance_walks_standalone_grandchildren() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        write_sub_transcript(tmp.path(), "run_solo", "sub_A", "moss-fen/otter>lynx#1");
+        let gc = write_sub_transcript(tmp.path(), "sub_A", "sub_B", "moss-fen/otter>lynx#1>wren#1");
+        assert_eq!(
+            store
+                .find_instance("run_solo", "moss-fen/otter>lynx#1>wren#1")
+                .unwrap(),
+            Some(("sub_B".to_string(), gc))
+        );
+    }
+
+    fn write_sub_transcript(root: &Path, parent: &str, sub: &str, codename: &str) -> PathBuf {
+        let dir = root.join(parent).join("sub").join(sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tp = dir.join("transcript.jsonl");
+        let start = rupu_transcript::Event::RunStart {
+            run_id: sub.into(),
+            workspace_id: "w".into(),
+            agent: "x".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            started_at: Utc::now(),
+            mode: rupu_transcript::RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
+            codename: Some(codename.into()),
+        };
+        std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
+        tp
+    }
+
+    #[test]
     fn append_and_read_step_results_round_trip() {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
@@ -3172,6 +3480,7 @@ mod tests {
             success: true,
             finished_at: Utc::now(),
             host: None,
+            codename: None,
         };
         let cp1 = UnitCheckpoint {
             step_id: "review_each".into(),
@@ -3183,6 +3492,7 @@ mod tests {
             success: false,
             finished_at: Utc::now(),
             host: None,
+            codename: None,
         };
         store.append_unit_checkpoint(&rec.id, &cp0).unwrap();
         store.append_unit_checkpoint(&rec.id, &cp1).unwrap();
@@ -5232,6 +5542,7 @@ mod tests {
             success: true,
             finished_at: Utc::now(),
             host: Some("h1".into()),
+            codename: None,
         };
 
         // Serializes with the host field present.
@@ -5462,6 +5773,36 @@ mod tests {
             ids.len() < 500,
             "recursion must stop well short of the full pathological chain: {} ids",
             ids.len()
+        );
+    }
+
+    #[test]
+    fn legacy_records_round_trip_without_codename_keys() {
+        let legacy = r#"{"step_id":"s","index":0,"item":1,"run_id":"run_X","transcript_path":"/t","output":"","success":true,"finished_at":"2026-09-29T00:00:00Z"}"#;
+        let cp: UnitCheckpoint = serde_json::from_str(legacy).unwrap();
+        assert!(cp.codename.is_none());
+        assert_eq!(serde_json::to_string(&cp).unwrap(), legacy);
+    }
+
+    #[test]
+    fn codename_survives_step_result_conversion() {
+        let item = crate::runner::ItemResult {
+            index: 0,
+            item: serde_json::json!(1),
+            sub_id: "0".into(),
+            rendered_prompt: String::new(),
+            run_id: "run_U".into(),
+            transcript_path: "/t".into(),
+            output: String::new(),
+            success: true,
+            is_fixer: false,
+            codename: Some("jade-reef/heron#1".into()),
+        };
+        let rec = ItemResultRecord::from(&item);
+        assert_eq!(rec.codename.as_deref(), Some("jade-reef/heron#1"));
+        assert_eq!(
+            crate::runner::ItemResult::from(&rec).codename,
+            item.codename
         );
     }
 }

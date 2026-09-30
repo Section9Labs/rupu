@@ -28,6 +28,7 @@ const LOCAL_HOST: HostView = {
 };
 
 const ROW: AgentRunRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   run_id: 'run-abc123',
   source: 'standalone',
   agent: 'fix-bug',
@@ -57,7 +58,7 @@ describe('AgentRuns — canonical column order', () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     const headers = Array.from(container.querySelectorAll('thead th')).map(
       (th) => th.textContent?.trim() ?? '',

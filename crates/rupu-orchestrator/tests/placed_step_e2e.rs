@@ -84,6 +84,7 @@ impl StepFactory for FakeFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -193,6 +194,7 @@ async fn placed_steps_run_remotely_and_chain() {
         unit_dispatcher: Some(dispatcher.clone()),
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -293,6 +295,7 @@ async fn no_host_control_runs_locally() {
         unit_dispatcher: None,
         action_dispatcher: None,
         pause: None,
+        naming: None,
     };
 
     let res = run_workflow(opts)
@@ -324,5 +327,128 @@ async fn no_host_control_runs_locally() {
             .contains("step gather agent gatherer echo"),
         "summarize prompt should reference gather's local FakeFactory output; got: {}",
         res.step_results[1].rendered_prompt
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — codenames: the coordinator mints each placed step's `crew/role`,
+// hands it to the remote on `UnitDispatch.codename`, and announces it with
+// `AgentStarted` whose provider/model are unknown to the coordinator (None).
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct CodenameDispatcher {
+    seen: Mutex<Vec<(String, Option<String>)>>,
+}
+
+#[async_trait]
+impl UnitDispatcher for CodenameDispatcher {
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        _host: &str,
+    ) -> Result<UnitOutcome, RunError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((unit.step_id.clone(), unit.codename.clone()));
+        Ok(UnitOutcome {
+            output: "ok".into(),
+            success: true,
+            error: None,
+            workspace_delta: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct CollectSink(Mutex<Vec<rupu_orchestrator::executor::Event>>);
+
+impl rupu_orchestrator::executor::EventSink for CollectSink {
+    fn emit(&self, _run_id: &str, ev: &rupu_orchestrator::executor::Event) {
+        self.0.lock().unwrap().push(ev.clone());
+    }
+}
+
+#[tokio::test]
+async fn placed_steps_carry_coordinator_minted_codenames() {
+    use rupu_orchestrator::executor::{Event, EventSink};
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let dispatcher = Arc::new(CodenameDispatcher::default());
+    let sink = Arc::new(CollectSink::default());
+    let mut inputs = BTreeMap::new();
+    inputs.insert("topic".to_string(), "rust".to_string());
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: Workflow::parse(WF_PLACED).unwrap(),
+        inputs,
+        workspace_id: "ws_placed_names".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_PLACED.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+        unit_dispatcher: Some(dispatcher.clone()),
+        action_dispatcher: None,
+        pause: None,
+        naming: None,
+    };
+    let res = run_workflow(opts).await.expect("placed workflow succeeds");
+    let crew = store.load(&res.run_id).unwrap().codename.expect("crew");
+
+    let seen = dispatcher.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let mut roles = Vec::new();
+    for ((step_id, codename), result) in seen.iter().zip(&res.step_results) {
+        let codename = codename
+            .as_deref()
+            .expect("UnitDispatch carries a codename");
+        let parsed: rupu_codename::Codename = codename.parse().unwrap();
+        assert_eq!(parsed.crew, crew, "{codename}");
+        assert_eq!(parsed.segments.len(), 1, "{codename}");
+        assert_eq!(parsed.segments[0].n, None, "a linear step is a singleton");
+        roles.push(parsed.segments[0].role.clone());
+        assert_eq!(&result.step_id, step_id);
+        assert_eq!(
+            result.codename.as_deref(),
+            Some(codename),
+            "step record = dispatched name"
+        );
+    }
+    assert_ne!(roles[0], roles[1], "distinct agents get distinct roles");
+
+    let events = sink.0.lock().unwrap();
+    let announced: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStarted {
+                step_id,
+                codename,
+                provider,
+                model,
+                ..
+            } => Some((
+                step_id.clone(),
+                codename.clone(),
+                provider.clone(),
+                model.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        announced,
+        seen.iter()
+            .map(|(s, c)| (s.clone(), c.clone(), None, None))
+            .collect::<Vec<_>>(),
+        "placed AgentStarted: coordinator-minted name, provider/model unknown"
     );
 }

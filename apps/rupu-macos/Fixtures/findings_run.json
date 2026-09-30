@@ -6,6 +6,8 @@
       "target_id": "tgt1",
       "workflow_name": "nightly-health",
       "permalink": "https://github.com/o/r/blob/main/src/a.rs#L17-L19",
+      "codename": "cobalt-harbor/heron#3",
+      "codename_derived": false,
       "id": "fnd_1",
       "file_path": "src/a.rs",
       "line_range": [
@@ -36,6 +38,8 @@
       "project": "rupu",
       "target_id": "tgt1",
       "workflow_name": null,
+      "codename": "jade-reef",
+      "codename_derived": true,
       "id": "fnd_2",
       "file_path": null,
       "line_range": null,

@@ -29,6 +29,12 @@ pub struct AgentLaunchRequest {
     /// (e.g. a tunnel node too old to advertise support) must refuse the
     /// launch rather than run the agent under a different profile.
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Codename minted by a placed unit's coordinator. Forwarded to the
+    /// remote `rupu run` as `RUPU_CODENAME` (an env var, so an older remote
+    /// binary ignores it instead of rejecting an unknown flag). SSH only this
+    /// arc; other connectors ignore it and the coordinator's records still
+    /// carry the name.
+    pub codename: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

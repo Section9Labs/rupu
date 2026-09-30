@@ -62,6 +62,9 @@ struct SessionDto {
     target: Option<String>,
     #[serde(default)]
     workspace_id: String,
+    /// Stored crew/role codename; absent on legacy sessions (derived on read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codename: Option<String>,
 }
 
 /// Try to load and parse `session.json` inside `dir`.
@@ -204,6 +207,11 @@ fn scan_session_dir(
                             map.insert("usage".to_string(), u);
                         }
                     }
+                    crate::codename::inject_codename(
+                        &mut val,
+                        &dto.session_id,
+                        Some(&dto.agent_name),
+                    );
                     out.push(val);
                 }
                 Err(e) => {
@@ -305,6 +313,11 @@ async fn list_sessions(
                 .into_iter()
                 .map(|mut row| {
                     row["host_id"] = serde_json::json!(host);
+                    crate::codename::inject_codename_row(
+                        &mut row,
+                        "session_id",
+                        Some("agent_name"),
+                    );
                     row
                 })
                 .collect(),
@@ -377,6 +390,7 @@ async fn get_session(
             other => ApiError::internal(other.to_string()),
         })?;
         ensure_usage_block(&mut detail, &s.pricing);
+        crate::codename::inject_codename_row(&mut detail, "session_id", Some("agent_name"));
         return Ok(Json(detail));
     }
 
@@ -411,6 +425,7 @@ async fn get_session(
             map.insert("usage".to_string(), u);
         }
     }
+    crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
     Ok(Json(val))
 }
 
@@ -869,6 +884,7 @@ mod tests {
             last_error: None,
             target: Some("main".into()),
             workspace_id: "ws-1".into(),
+            codename: Some("cobalt-harbor/heron".into()),
         };
         let usage = session_usage(&dto, &rupu_config::PricingConfig::default());
         let mut v = serde_json::to_value(&dto).expect("serialize SessionDto");
@@ -928,6 +944,40 @@ mod tests {
     }
 
     #[test]
+    fn session_rows_codename_stored_else_derived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        for (id, codename) in [
+            ("ses_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", None),
+            ("ses_named", Some("cobalt-harbor/heron")),
+        ] {
+            let dir = root.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut j = serde_json::json!({"session_id": id, "agent_name": "triage"});
+            if let Some(c) = codename {
+                j["codename"] = c.into();
+            }
+            std::fs::write(dir.join("session.json"), j.to_string()).unwrap();
+        }
+        let rows = collect_sessions(tmp.path(), &rupu_config::PricingConfig::default());
+        let by = |id: &str| {
+            rows.iter()
+                .find(|r| r["session_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let legacy = by("ses_01J9ZQ3K4M5N6P7Q8R9S0T1V2W");
+        assert_eq!(
+            legacy["codename"],
+            rupu_codename::derive_legacy("ses_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", Some("triage"))
+        );
+        assert_eq!(legacy["codename_derived"], true);
+        let named = by("ses_named");
+        assert_eq!(named["codename"], "cobalt-harbor/heron");
+        assert_eq!(named["codename_derived"], false);
+    }
+
+    #[test]
     fn session_usage_from_dto_prices_known_model() {
         let dto = SessionDto {
             session_id: "s1".into(),
@@ -945,6 +995,7 @@ mod tests {
             last_error: None,
             target: None,
             workspace_id: "w".into(),
+            codename: None,
         };
         let u = session_usage(&dto, &rupu_config::PricingConfig::default());
         assert_eq!(u.input_tokens, 1_000_000);

@@ -1151,7 +1151,12 @@ impl SshHostConnector {
 
     /// Build the remote argv for an agent run.
     fn agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<String> {
-        let mut a = vec!["rupu".into(), "run".into(), req.agent.clone()];
+        let mut a: Vec<String> = Vec::new();
+        if let Some(c) = &req.codename {
+            a.push("env".into());
+            a.push(format!("RUPU_CODENAME={c}"));
+        }
+        a.extend(["rupu".to_string(), "run".into(), req.agent.clone()]);
         if let Some(t) = &req.target {
             a.push(t.clone());
         }
@@ -2904,6 +2909,31 @@ impl HostConnector for SshHostConnector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_argv_prefixes_codename_env() {
+        let req = crate::agent_launcher::AgentLaunchRequest {
+            agent: "triage".into(),
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: None,
+            codename: Some("cobalt-harbor/heron#412".into()),
+        };
+        let argv = SshHostConnector::agent_argv(&req, "run_1");
+        assert_eq!(
+            &argv[..3],
+            &[
+                "env".to_string(),
+                "RUPU_CODENAME=cobalt-harbor/heron#412".into(),
+                "rupu".into()
+            ]
+        );
+        assert!(build_remote_command(&argv)
+            .starts_with("'env' 'RUPU_CODENAME=cobalt-harbor/heron#412' 'rupu' 'run'"));
+    }
+
     use super::*;
 
     #[test]
@@ -4488,6 +4518,7 @@ mod tests {
                     loop_iteration: None,
                     run_outcome: None,
                     host: None,
+                    codename: None,
                 },
             )
             .unwrap();
@@ -5850,6 +5881,7 @@ mod tests {
         let run_id = rt.block_on(async {
             let run_id = conn
                 .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                    codename: None,
                     agent: "reviewer".into(),
                     prompt: Some("go".into()),
                     mode: None,
@@ -6143,6 +6175,7 @@ mod tests {
 
         let run_id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                codename: None,
                 agent: "reviewer".into(),
                 prompt: Some("go".into()),
                 mode: None,
@@ -6177,6 +6210,7 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                codename: None,
                 agent: "reviewer".into(),
                 prompt: Some("go".into()),
                 mode: None,
@@ -6213,6 +6247,7 @@ mod tests {
                 working_dir: None,
                 run_id: Some("run_01PROFILED".into()),
                 findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+                codename: None,
             })
             .await
             .unwrap();
@@ -6240,6 +6275,7 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: None,
+            codename: None,
         };
         let argv = SshHostConnector::agent_argv(&req, "run_X");
         assert!(!argv.iter().any(|a| a == "--findings-profile"), "{argv:?}");
@@ -6251,6 +6287,7 @@ mod tests {
         let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let err = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                codename: None,
                 agent: "reviewer".into(),
                 prompt: None,
                 mode: None,

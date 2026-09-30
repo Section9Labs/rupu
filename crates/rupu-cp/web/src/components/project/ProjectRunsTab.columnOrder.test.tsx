@@ -18,6 +18,7 @@ afterEach(() => {
 });
 
 const ROW: RunListRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   id: 'r-run-manual',
   workflow_name: 'wf-running-manual',
   status: 'running',

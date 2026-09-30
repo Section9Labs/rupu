@@ -102,6 +102,7 @@ async fn run(yaml: &str, dispatcher: Arc<ProfileRecorder>) {
         workflow: Workflow::parse(yaml).expect("workflow must parse"),
         inputs: BTreeMap::new(),
         workspace_id: "ws_remote_profile".into(),
+        naming: None,
         workspace_path: tmp.path().to_path_buf(),
         transcript_dir: tmp.path().join("transcripts"),
         factory: Arc::new(PanicFactory),

@@ -38,6 +38,7 @@ const REMOTE_HOST: HostView = {
 };
 
 const REMOTE_SESSION: SessionSummary = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   session_id: 'sess-abc123',
   agent_name: 'fix-bug',
   model: 'claude-3-5-sonnet',
@@ -195,9 +196,9 @@ describe('Sessions — agent subject cell (table rules)', () => {
     vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
-    const subjectCell = screen.getByText('fix-bug').closest('td');
+    const subjectCell = screen.getByText(/fix-bug/).closest('td');
     expect(subjectCell?.className).toMatch(/max-w-0/);
     // Title tooltip carries the untruncated value.
     expect(subjectCell?.querySelector('[title="fix-bug"]')).toBeInTheDocument();
@@ -275,7 +276,7 @@ describe('Sessions — canonical run-table column order', () => {
     vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
 
     const { container } = renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     const headers = Array.from(container.querySelectorAll('thead th')).map(
       (th) => th.textContent?.trim() ?? '',
@@ -308,7 +309,7 @@ describe('Sessions — canonical run-table column order', () => {
     ]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     expect(screen.getByText('3m ago')).toBeInTheDocument();
   });
@@ -323,7 +324,7 @@ describe('Sessions — status cell uses the shared SessionStatusPill', () => {
     vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     const pill = screen.getByText('Running');
     expect(pill).toHaveAttribute('data-motion', 'rg-pulse-run');
@@ -336,7 +337,7 @@ describe('Sessions — status cell uses the shared SessionStatusPill', () => {
 
     renderPage();
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
     // Never coerced onto "Stopped" (or any of the four real states) — the raw
     // wire value renders as-is, honestly reporting that the status is unknown.
     const pill = screen.getByText('zzz-not-a-real-status');
@@ -354,9 +355,9 @@ describe('Sessions — whole-row navigation (rowHref)', () => {
     vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
-    const link = screen.getByText('fix-bug').closest('a');
+    const link = screen.getByText(/fix-bug/).closest('a');
     expect(link).toHaveAttribute('href', `/sessions/${REMOTE_SESSION.session_id}?host=host_prod`);
   });
 
@@ -371,7 +372,7 @@ describe('Sessions — whole-row navigation (rowHref)', () => {
         <LocationProbe />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive session ${REMOTE_SESSION.session_id}`));
 
@@ -393,7 +394,7 @@ describe('Sessions — whole-row navigation (rowHref)', () => {
         <LocationProbe />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByText('active run'));
 
@@ -416,12 +417,12 @@ describe('Sessions — Find', () => {
     vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
 
-    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
-    expect(screen.getByText('review-pr')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
+    expect(screen.getByText(/review-pr/)).toBeInTheDocument();
   });
 
   it('footer shows "N matches of M loaded" while a query is active', async () => {
@@ -429,7 +430,7 @@ describe('Sessions — Find', () => {
     vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
 
@@ -441,16 +442,16 @@ describe('Sessions — Find', () => {
     vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     const input = screen.getByPlaceholderText('Find sessions…') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'review' } });
-    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
 
     fireEvent.keyDown(input, { key: 'Escape' });
 
     await waitFor(() => expect(input.value).toBe(''));
-    expect(screen.getByText('fix-bug')).toBeInTheDocument();
+    expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
   });
 
   it('composes with the Active/Archived pill: query narrows within the active tab only', async () => {
@@ -458,7 +459,7 @@ describe('Sessions — Find', () => {
     const activeSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'zzz-no-match' } });
 
@@ -466,5 +467,20 @@ describe('Sessions — Find', () => {
     // The query does not itself trigger a new server fetch — it stays
     // client-side (Active/host params only).
     expect(activeSpy).toHaveBeenCalledWith(expect.objectContaining({ scope: 'active' }));
+  });
+});
+
+describe('Sessions — codenames', () => {
+  it('renders the crew chip and Find matches by codename', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([
+      { ...REMOTE_SESSION, codename: 'cobalt-harbor/heron#1' },
+      { ...REMOTE_SESSION, session_id: 'sess-zzz', agent_name: 'other', codename: 'amber-fjord/kite#1' },
+    ]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'cobalt' } });
+    await waitFor(() => expect(screen.queryByText('amber-fjord')).not.toBeInTheDocument());
+    expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
   });
 });

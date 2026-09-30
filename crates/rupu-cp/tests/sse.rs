@@ -59,6 +59,7 @@ fn seed_run(id: &str, status: RunStatus) -> RunRecord {
         active_step_transcript_path: None,
         final_output: None,
         loop_progress: Default::default(),
+        codename: None,
     }
 }
 
@@ -76,6 +77,7 @@ fn make_events() -> Vec<Event> {
             kind: StepKind::Linear,
             agent: Some("rupu-agent".into()),
             host: None,
+            codename: None,
         },
     ]
 }
