@@ -1,0 +1,8 @@
+---
+source: crates/rupu-cli/src/output/run_summary.rs
+expression: s
+---
+✓ assess-services · mint-tundra    Completed · 1h 47m
+steps   ✓ preflight
+tokens  ⇡6100000 ⇣420000  $18.40
+view    rupu workflow show-run run_01M1SSABCDEFG
