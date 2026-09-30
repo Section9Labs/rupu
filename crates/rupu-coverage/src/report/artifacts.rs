@@ -295,7 +295,7 @@ impl ArtifactStore {
     /// Returns the hash and the number of bytes copied. Cleans up the temp
     /// file on any error via RAII guard.
     fn copy_hashing(&self, src: &Path) -> std::io::Result<(String, u64)> {
-        fs::create_dir_all(&self.root)?;
+        create_store_dir(&self.root)?;
         let tmp_path = self.root.join(format!("{}.tmp", ulid::Ulid::new()));
         let tmp = TempFile::new(tmp_path.clone());
 
@@ -330,6 +330,26 @@ impl ArtifactStore {
         }
         Ok((sha, total))
     }
+}
+
+/// Create the store root (and its parents). On unix the root itself is
+/// private to the user (0700): it holds proof-of-concept material from every
+/// project. An existing directory's mode is left alone.
+fn create_store_dir(root: &Path) -> std::io::Result<()> {
+    if root.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = root.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(root)
 }
 
 const WORKSPACE_ROOT_REASON: &str =
@@ -414,6 +434,20 @@ mod tests {
         assert_eq!(a.stored, Some(ArtifactStorage::Copied));
         assert_eq!(a.sha256.len(), 64);
         assert_eq!(fs::read(s.blob_path(&a.sha256)).unwrap(), b"rc=0\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_store_root_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let (ws, parent) = setup();
+        fs::write(ws.path().join("out.txt"), "rc=0\n").unwrap();
+        let root = parent.path().join("findings").join("artifacts");
+        ArtifactStore::new(&root)
+            .ingest(ws.path(), &[req("out.txt")], limits(1024))
+            .unwrap();
+        let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "store root mode {mode:o}");
     }
 
     #[test]
