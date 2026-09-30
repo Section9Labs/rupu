@@ -271,6 +271,8 @@ A workflow step's `findings_profile` or the workflow's `defaults.findings_profil
 
 **Upgrade note:** because the built-in default is `full`, an existing agent that records thin findings (a `concerns:` block, or `report_finding` in `tools:`) is now rejected unless it sets `findingsProfile: summary` (or its workflow sets `findings_profile: summary`), or its prompt is updated to send a complete `report`.
 
+**Remote hosts:** agent frontmatter rejects unknown keys, so a rupu release that predates `findingsProfile` refuses to load an agent file that sets it. A workflow step placed on a remote host (`host:` / `distribute:`) resolves its profile from the agent file on that host, so upgrade rupu on every remote host before adding `findingsProfile` to agents they run.
+
 ```yaml
 ---
 name: quick-scanner

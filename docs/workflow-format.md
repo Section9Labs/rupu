@@ -382,7 +382,7 @@ Rules:
 - `findings.record` needs different `with:` keys per profile, and a missing key is a parse error naming the step, the profile, and the keys: `full` needs `scope` and `report`; `summary` needs `scope`, `summary`, `severity`, and `rationale`. Only key presence is checked, so a value may be a `{{ … }}` template.
 - Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
 - The field must never be silently ignored, so these are parse errors:
-  - `findings_profile` on a remote step (`host:` / `distribute:`) — remote units resolve their profile from the agent file, so set `findingsProfile` in that agent's frontmatter instead;
+  - `findings_profile` on a remote step (`host:` / `distribute:`) — remote units resolve their profile from the agent file, so set `findingsProfile` in that agent's frontmatter instead (upgrade rupu on the remote host first: an older release rejects agent files that contain `findingsProfile`, because agent frontmatter does not accept unknown keys);
   - `defaults.findings_profile` in a workflow that has any remote step, for the same reason;
   - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`). An `action:` step is the exception above: its profile decides what `findings.record` accepts.
 
