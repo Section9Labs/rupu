@@ -8058,6 +8058,34 @@ fn resolve_session_fragment(
         }
     }
 
+    // Codename (`crew` or `crew/role`) → the most recent session of that crew.
+    if fragment.parse::<rupu_codename::Codename>().is_ok() {
+        let mut crews = Vec::new();
+        for scope in [SessionScope::Active, SessionScope::Archived] {
+            for rec in load_sessions_in_scope(global, scope).unwrap_or_default() {
+                let shown = crate::output::codename::display_codename(
+                    rec.codename.as_deref(),
+                    &rec.session_id,
+                    Some(&rec.agent_name),
+                );
+                let crew = shown
+                    .parse::<rupu_codename::Codename>()
+                    .map(|c| c.crew)
+                    .unwrap_or_else(|_| shown.split('/').next().unwrap_or("").to_string());
+                crews.push(crate::output::codename::CrewCandidate {
+                    id: rec.session_id,
+                    crew,
+                    started_at: rec.created_at,
+                });
+            }
+        }
+        if let Some(id) = crate::output::codename::resolve_codename_fragment(&crews, fragment) {
+            if let Some(scope) = scope_of.get(&id).copied() {
+                return Ok((id, scope));
+            }
+        }
+    }
+
     match resolve(&candidates, fragment) {
         Resolution::Unique(id) => {
             let scope = scope_of
@@ -10609,6 +10637,29 @@ mod tests {
             serde_json::to_vec(&record).expect("serialize"),
         )
         .expect("write session.json");
+    }
+
+    #[test]
+    fn read_session_resolves_a_crew_codename_to_the_most_recent() {
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let global = tmp.path();
+        for (id, days) in [("ses_old", 5), ("ses_new", 1)] {
+            let mut record = test_session_record();
+            record.session_id = id.to_string();
+            record.codename = Some("jade-reef/numbat".into());
+            record.created_at = chrono::Utc::now() - chrono::Duration::days(days);
+            let dir = session_dir(global, SessionScope::Active, id);
+            std::fs::create_dir_all(&dir).expect("create session dir");
+            std::fs::write(
+                dir.join("session.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .expect("write");
+        }
+        let (rec, _) = read_session(global, "jade-reef").expect("resolves");
+        assert_eq!(rec.session_id, "ses_new");
+        let (rec, _) = read_session(global, "jade-reef/numbat").expect("resolves");
+        assert_eq!(rec.session_id, "ses_new");
     }
 
     #[test]

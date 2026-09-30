@@ -2182,11 +2182,18 @@ fn locate_transcript(fragment: &str) -> anyhow::Result<TranscriptLocation> {
         return Ok(location);
     }
 
+    if let Some(location) = locate_transcript_by_codename(fragment)? {
+        return Ok(location);
+    }
+
     use crate::output::ids::{resolve, Resolution};
     let candidates = transcript_ids_present();
     match resolve(&candidates, fragment) {
         Resolution::Unique(id) => locate_transcript_exact(&id)?
             .ok_or_else(|| anyhow::anyhow!("transcript not found: {id}")),
+        Resolution::NotFound if fragment.parse::<rupu_codename::Codename>().is_ok() => Err(
+            anyhow::anyhow!("no run or agent named `{fragment}` (see `rupu workflow runs`)"),
+        ),
         Resolution::NotFound => Err(anyhow::anyhow!("unknown transcript: {fragment}")),
         Resolution::Ambiguous(matches) => {
             let mut msg = format!(
@@ -2198,6 +2205,54 @@ fn locate_transcript(fragment: &str) -> anyhow::Result<TranscriptLocation> {
             }
             Err(anyhow::anyhow!(msg))
         }
+    }
+}
+
+/// Resolve a codename (`crew` or `crew/role#n>…`) to a transcript. The crew
+/// part picks the most recent matching workflow run; a full instance
+/// codename then resolves to that agent instance's transcript via
+/// [`rupu_orchestrator::RunStore::find_instance`]. `Ok(None)` when the
+/// fragment is not a codename or names no known run.
+fn locate_transcript_by_codename(fragment: &str) -> anyhow::Result<Option<TranscriptLocation>> {
+    let Ok(cn) = fragment.parse::<rupu_codename::Codename>() else {
+        return Ok(None);
+    };
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let mut records = store.list().unwrap_or_default();
+    records.extend(store.list_archived().unwrap_or_default());
+    let crews: Vec<crate::output::codename::CrewCandidate> = records
+        .into_iter()
+        .map(|r| crate::output::codename::CrewCandidate {
+            crew: crate::output::codename::display_codename(r.codename.as_deref(), &r.id, None),
+            id: r.id,
+            started_at: r.started_at,
+        })
+        .collect();
+    let Some(run_id) = crate::output::codename::resolve_codename_fragment(&crews, fragment) else {
+        return Ok(None);
+    };
+    if cn.segments.is_empty() {
+        return locate_transcript_exact(&run_id)?.map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "run `{run_id}` has no single transcript; name an agent instance (`{fragment}/<role>#<n>`)"
+            )
+        });
+    }
+    match store.find_instance(&run_id, fragment)? {
+        Some((agent_run_id, transcript_path)) => {
+            let dir = transcript_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
+            Ok(Some(TranscriptLocation {
+                metadata_path: metadata_path_for_run(&dir, &agent_run_id),
+                run_id: agent_run_id,
+                transcript_path,
+                archived: false,
+            }))
+        }
+        None => Ok(None),
     }
 }
 

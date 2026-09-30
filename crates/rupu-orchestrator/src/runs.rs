@@ -1116,6 +1116,48 @@ impl RunStore {
         out
     }
 
+    /// Find the agent instance named `codename` (`crew/role#n>…`) inside a
+    /// run. Returns `(agent_run_id, transcript_path)`. Looks at step
+    /// records, then fan-out item records, then the first line of each
+    /// sub-run transcript (dispatched sub-agents).
+    pub fn find_instance(
+        &self,
+        run_id: &str,
+        codename: &str,
+    ) -> Result<Option<(String, PathBuf)>, RunStoreError> {
+        let steps = self.read_step_results(run_id)?;
+        for rec in &steps {
+            if rec.codename.as_deref() == Some(codename) {
+                return Ok(Some((rec.run_id.clone(), rec.transcript_path.clone())));
+            }
+        }
+        for rec in &steps {
+            for item in &rec.items {
+                if item.codename.as_deref() == Some(codename) {
+                    return Ok(Some((item.run_id.clone(), item.transcript_path.clone())));
+                }
+            }
+        }
+        for sub_id in self.sub_run_ids(run_id) {
+            let path = self.sub_run_transcript(run_id, &sub_id);
+            if !path.is_file() {
+                continue;
+            }
+            let matched = match rupu_transcript::JsonlReader::iter(&path) {
+                Ok(mut events) => matches!(
+                    events.next(),
+                    Some(Ok(rupu_transcript::Event::RunStart { codename: Some(ref c), .. }))
+                        if c == codename
+                ),
+                Err(_) => false,
+            };
+            if matched {
+                return Ok(Some((sub_id, path)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Load a run by id.
     pub fn load(&self, run_id: &str) -> Result<RunRecord, RunStoreError> {
         let path = self.run_json(run_id);
@@ -3076,6 +3118,64 @@ mod tests {
         assert_eq!(loaded.status, RunStatus::Completed);
         assert!(loaded.finished_at.is_some());
         assert!(loaded.status.is_terminal());
+    }
+
+    #[test]
+    fn find_instance_matches_items_and_sub_runs() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_fi");
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
+        let mut step = sample_step_result("a");
+        step.items.push(ItemResultRecord {
+            index: 0,
+            item: serde_json::Value::Null,
+            sub_id: "s0".into(),
+            rendered_prompt: String::new(),
+            run_id: "run_U".into(),
+            transcript_path: PathBuf::from("/u.jsonl"),
+            output: String::new(),
+            success: true,
+            is_fixer: false,
+            codename: Some("jade-reef/numbat#2".into()),
+        });
+        store.append_step_result(&rec.id, &step).unwrap();
+        assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/numbat#2").unwrap(),
+            Some(("run_U".to_string(), PathBuf::from("/u.jsonl")))
+        );
+        assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/ferret#9").unwrap(),
+            None
+        );
+
+        let sub = tmp.path().join(&rec.id).join("sub").join("sub_A");
+        std::fs::create_dir_all(&sub).unwrap();
+        let tp = sub.join("transcript.jsonl");
+        let start = rupu_transcript::Event::RunStart {
+            run_id: "sub_A".into(),
+            workspace_id: "w".into(),
+            agent: "ferret".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            started_at: Utc::now(),
+            mode: rupu_transcript::RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
+            codename: Some("jade-reef/numbat#2>ferret#1".into()),
+        };
+        std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/numbat#2>ferret#1")
+                .unwrap(),
+            Some(("sub_A".to_string(), tp))
+        );
     }
 
     #[test]

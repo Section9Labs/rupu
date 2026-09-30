@@ -2504,6 +2504,8 @@ fn layered_config_workflow(
 struct RunCandidate {
     id: String,
     workflow_name: String,
+    /// Crew part of the run's codename (stored or legacy-derived).
+    crew: String,
     status: rupu_orchestrator::RunStatus,
     started_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2518,6 +2520,20 @@ fn resolve_run_id(candidates: &[RunCandidate], fragment: &str) -> anyhow::Result
     use crate::output::ids::{resolve, Resolution};
 
     let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+    if ids.iter().any(|i| i == fragment) {
+        return Ok(fragment.to_string());
+    }
+    let crews: Vec<crate::output::codename::CrewCandidate> = candidates
+        .iter()
+        .map(|c| crate::output::codename::CrewCandidate {
+            id: c.id.clone(),
+            crew: c.crew.clone(),
+            started_at: c.started_at,
+        })
+        .collect();
+    if let Some(id) = crate::output::codename::resolve_codename_fragment(&crews, fragment) {
+        return Ok(id);
+    }
     match resolve(&ids, fragment) {
         Resolution::Unique(id) => Ok(id),
         Resolution::NotFound => anyhow::bail!("unknown run: {fragment}"),
@@ -2590,6 +2606,7 @@ pub(crate) fn resolve_run_fragment(
     let candidates: Vec<RunCandidate> = records
         .into_iter()
         .map(|r| RunCandidate {
+            crew: crate::output::codename::display_codename(r.codename.as_deref(), &r.id, None),
             id: r.id,
             workflow_name: r.workflow_name,
             status: r.status,
@@ -6188,22 +6205,33 @@ steps:
             RunCandidate {
                 id: "run_01KYSMDNG84N9Z8XXHQZP3GKYJ".to_string(),
                 workflow_name: "nightly-health".to_string(),
+                crew: String::new(),
                 status: rupu_orchestrator::RunStatus::Completed,
                 started_at: now,
             },
             RunCandidate {
                 id: "run_01KYSM3KE60KM2P2EDJR1V1BCP".to_string(),
                 workflow_name: "pr-code-review".to_string(),
+                crew: String::new(),
                 status: rupu_orchestrator::RunStatus::Failed,
                 started_at: now,
             },
             RunCandidate {
                 id: "run_01KYPASX18NYRER5NQPDWB2HZV".to_string(),
                 workflow_name: "issue-triage".to_string(),
+                crew: String::new(),
                 status: rupu_orchestrator::RunStatus::Running,
                 started_at: now,
             },
         ]
+    }
+
+    #[test]
+    fn resolve_run_id_accepts_a_crew_codename() {
+        let mut c = run_candidates();
+        c[0].crew = "jade-reef".into();
+        assert_eq!(resolve_run_id(&c, "jade-reef").expect("resolves"), c[0].id);
+        assert!(resolve_run_id(&c, "amber-lake").is_err());
     }
 
     #[test]

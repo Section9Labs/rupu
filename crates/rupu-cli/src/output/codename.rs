@@ -1,6 +1,7 @@
 //! Codename rendering for CLI output (spec §7).
 
 use super::palette;
+use chrono::{DateTime, Utc};
 use rupu_codename::{crew_tint, derive_legacy, role_badge, Codename, Tint};
 
 /// The stored codename, else the legacy-derived one.
@@ -72,9 +73,103 @@ pub fn member_label(
     parts.join(" · ")
 }
 
+/// One run/session that a crew name might refer to.
+#[derive(Debug, Clone)]
+pub struct CrewCandidate {
+    pub id: String,
+    pub crew: String,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrewResolution {
+    NotFound,
+    /// The most recent match, plus other matches from the last 30 days.
+    Resolved {
+        id: String,
+        others: Vec<String>,
+    },
+}
+
+/// Resolve a crew name to its most recent candidate. Crew names repeat over
+/// time, so this never fails on ambiguity; `others` lists the additional
+/// matches from the last 30 days (newest first) for a stderr note.
+pub fn resolve_crew(
+    candidates: &[CrewCandidate],
+    crew: &str,
+    now: DateTime<Utc>,
+) -> CrewResolution {
+    let mut hits: Vec<&CrewCandidate> = candidates.iter().filter(|c| c.crew == crew).collect();
+    hits.sort_by_key(|c| std::cmp::Reverse(c.started_at));
+    let Some(first) = hits.first() else {
+        return CrewResolution::NotFound;
+    };
+    let cutoff = now - chrono::Duration::days(30);
+    let others = hits[1..]
+        .iter()
+        .filter(|c| c.started_at >= cutoff)
+        .map(|c| c.id.clone())
+        .collect();
+    CrewResolution::Resolved {
+        id: first.id.clone(),
+        others,
+    }
+}
+
+/// The stderr note printed when a crew name matched more than one recent run.
+pub fn ambiguity_note(crew: &str, chosen: &str, others: &[String]) -> String {
+    format!(
+        "note: `{crew}` also named {} in the last 30 days; using the most recent ({chosen})",
+        others.join(", ")
+    )
+}
+
+/// Resolve `fragment` as a codename against `candidates`, printing the
+/// ambiguity note to stderr. `None` when it is not a codename or no crew matches.
+pub fn resolve_codename_fragment(candidates: &[CrewCandidate], fragment: &str) -> Option<String> {
+    let cn = fragment.parse::<Codename>().ok()?;
+    match resolve_crew(candidates, &cn.crew, Utc::now()) {
+        CrewResolution::NotFound => None,
+        CrewResolution::Resolved { id, others } => {
+            if !others.is_empty() {
+                eprintln!("{}", ambiguity_note(&cn.crew, &id, &others));
+            }
+            Some(id)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crew_resolves_to_most_recent_and_lists_recent_others() {
+        use chrono::{Duration, TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+        let c = |id: &str, crew: &str, days: i64| CrewCandidate {
+            id: id.into(),
+            crew: crew.into(),
+            started_at: now - Duration::days(days),
+        };
+        let cands = vec![
+            c("run_old", "jade-reef", 90),
+            c("run_mid", "jade-reef", 10),
+            c("run_new", "jade-reef", 1),
+            c("run_x", "olive-pine", 0),
+        ];
+        match resolve_crew(&cands, "jade-reef", now) {
+            CrewResolution::Resolved { id, others } => {
+                assert_eq!(id, "run_new");
+                assert_eq!(others, vec!["run_mid".to_string()]);
+            }
+            CrewResolution::NotFound => panic!(),
+        }
+        assert!(matches!(
+            resolve_crew(&cands, "amber-lake", now),
+            CrewResolution::NotFound
+        ));
+    }
 
     #[test]
     fn display_prefers_stored_then_derives() {
