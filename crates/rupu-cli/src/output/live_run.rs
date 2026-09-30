@@ -80,6 +80,12 @@ pub struct UnitState {
     /// `None` — only `apply`'s `Dispatch*` arms set it, to find the right
     /// slot on `DispatchCompleted` without relying on index/order.
     pub sub_run_id: Option<String>,
+    /// The fan-out unit's own index (`UnitStarted`/`UnitCompleted.index`,
+    /// the ledger's `unit_index`) — its identity. `None` for a
+    /// dispatch-child slot. Dispatch children are appended to the same
+    /// vec, so a unit's vec position is NOT its index: every lookup by
+    /// unit index goes through this field ([`fanout_unit_mut`]).
+    pub index: Option<usize>,
 }
 
 /// One line in the active agent's rolling activity feed.
@@ -462,8 +468,7 @@ impl LiveRunState {
                     if !matches!(step.status, NodeStatus::Complete | NodeStatus::Failed) {
                         step.status = NodeStatus::Working;
                     }
-                    ensure_unit_slot(&mut step.units, *index);
-                    let unit = &mut step.units[*index];
+                    let unit = fanout_unit_mut(&mut step.units, *index);
                     unit.key = unit_key.clone();
                     unit.status = NodeStatus::Working;
                     unit.transcript_path = Some(transcript_path.clone());
@@ -479,8 +484,7 @@ impl LiveRunState {
                 ..
             } => {
                 if let Some(step) = self.step_mut(step_id) {
-                    ensure_unit_slot(&mut step.units, *index);
-                    let unit = &mut step.units[*index];
+                    let unit = fanout_unit_mut(&mut step.units, *index);
                     if unit.key.is_empty() {
                         unit.key = unit_key.clone();
                     }
@@ -498,8 +502,8 @@ impl LiveRunState {
                     unit.tokens = unit.tokens.max(tokens_in + tokens_out);
                     // Keep the collapsed `done/total` summary coherent: at
                     // minimum the step has as many units as the highest
-                    // index seen so far.
-                    let seen = step.units.len();
+                    // index seen so far (dispatch-child slots aside).
+                    let seen = step.units.iter().filter(|u| u.index.is_some()).count();
                     step.fanout_total = Some(step.fanout_total.unwrap_or(0).max(seen));
                 }
             }
@@ -589,6 +593,7 @@ impl LiveRunState {
                                 elapsed_secs: 0,
                                 transcript_path: Some(transcript_path.clone()),
                                 sub_run_id: Some(sub_run_id.clone()),
+                                index: None,
                             });
                         }
                     }
@@ -679,11 +684,16 @@ impl LiveRunState {
             step.tokens_in = tokens_in;
             step.tokens_out = tokens_out;
         }
+        // Matched by unit identity, never vec position: a dispatch-child
+        // slot (`index: None`) never receives a unit's figure — a
+        // `parallel` step's rows are ALL child slots, while the ledger
+        // tags its sub-steps `(step, idx)`.
         for ((step_id, index), t) in &u.by_unit {
-            if let Some(unit) = self
-                .step_mut(step_id)
-                .and_then(|step| step.units.get_mut(*index))
-            {
+            if let Some(unit) = self.step_mut(step_id).and_then(|step| {
+                step.units
+                    .iter_mut()
+                    .find(|unit| unit.index == Some(*index))
+            }) {
                 unit.tokens = t.input + t.output;
             }
         }
@@ -710,21 +720,34 @@ impl LiveRunState {
     }
 }
 
-/// Grow `units` so that `index` is addressable, filling any gap with
-/// `Waiting` placeholder units. Fan-out events arrive per-unit (in real
-/// start/finish order under concurrency), so the vector may be sparse
-/// until every unit has started.
-fn ensure_unit_slot(units: &mut Vec<UnitState>, index: usize) {
-    if units.len() <= index {
-        units.resize_with(index + 1, || UnitState {
+/// The row of fan-out unit `index`, found by its identity
+/// ([`UnitState::index`]) — never by vec position, which dispatch-child
+/// slots appended to the same vec shift. When absent, the step grows
+/// `Waiting` placeholder rows for every unit index up to `index` not yet
+/// seen: fan-out events arrive per-unit (in real start/finish order under
+/// concurrency), so the unit rows fill in sparsely, but the indices present
+/// are always contiguous from 0.
+fn fanout_unit_mut(units: &mut Vec<UnitState>, index: usize) -> &mut UnitState {
+    let next = units
+        .iter()
+        .filter_map(|u| u.index)
+        .max()
+        .map_or(0, |max| max + 1);
+    for missing in next..=index {
+        units.push(UnitState {
             key: String::new(),
             status: NodeStatus::Waiting,
             tokens: 0,
             elapsed_secs: 0,
             transcript_path: None,
             sub_run_id: None,
+            index: Some(missing),
         });
     }
+    units
+        .iter_mut()
+        .find(|u| u.index == Some(index))
+        .expect("indices 0..=index are present after the growth above")
 }
 
 /// Overall run progress in `[0, 1]`, blending completed whole steps with
@@ -1798,6 +1821,7 @@ mod tests {
                 elapsed_secs: 12,
                 transcript_path: Some(std::path::PathBuf::from("/runs/conf-manager.jsonl")),
                 sub_run_id: None,
+                index: Some(0),
             },
             UnitState {
                 key: "tlb-agent".into(),
@@ -1806,6 +1830,7 @@ mod tests {
                 elapsed_secs: 11,
                 transcript_path: Some(std::path::PathBuf::from("/runs/tlb-agent.jsonl")),
                 sub_run_id: None,
+                index: Some(1),
             },
             UnitState {
                 key: "app-gw".into(),
@@ -1814,6 +1839,7 @@ mod tests {
                 elapsed_secs: 8,
                 transcript_path: Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
                 sub_run_id: None,
+                index: Some(2),
             },
             UnitState {
                 key: "rtc".into(),
@@ -1822,6 +1848,7 @@ mod tests {
                 elapsed_secs: 0,
                 transcript_path: None,
                 sub_run_id: None,
+                index: Some(3),
             },
             UnitState {
                 key: "auth".into(),
@@ -1830,6 +1857,7 @@ mod tests {
                 elapsed_secs: 0,
                 transcript_path: None,
                 sub_run_id: None,
+                index: Some(4),
             },
         ];
         let assess = StepState {
@@ -2614,6 +2642,90 @@ mod tests {
         assert_eq!(report(&state), step_before);
     }
 
+    #[test]
+    fn apply_run_usage_never_writes_onto_a_dispatch_child_row() {
+        // A `parallel` step emits no `UnitStarted`, so its only rows are
+        // dispatch-child slots — while the ledger tags each sub-step with
+        // `unit_index: Some(idx)`, and a sub-step's children attribute to
+        // its `(step, idx)`. Sub-step 0's total must not land on child 0.
+        let mut state = dispatch_state();
+        state.steps[3].kind = StepKind::Parallel;
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
+        });
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            success: true,
+            tokens_in: 500,
+            tokens_out: 120,
+        });
+        let mut u = rupu_cp::usage_index::RunUsage::default();
+        u.by_unit.insert(("report".into(), 0), tok(5_000, 500));
+        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
+
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.units.len(), 1);
+        assert_eq!(step.units[0].sub_run_id.as_deref(), Some("sub_child"));
+        assert_eq!(step.units[0].tokens, 620, "the child keeps its own figure");
+    }
+
+    #[test]
+    fn fanout_units_keep_their_rows_and_values_with_an_interleaved_dispatch_child() {
+        // Unit 0 starts and dispatches a sub-agent (its slot lands at vec
+        // position 1) before unit 1 starts: unit 1 must get its own row,
+        // not the child's, and the fold's per-unit figures must land on
+        // the rows of the units they belong to.
+        let mut state = fanout_state(true);
+        state.steps[1].units.clear();
+        let unit_started = |index: usize, key: &str| WfEvent::UnitStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index,
+            unit_key: key.into(),
+            agent: Some("oracle-assessor".into()),
+            transcript_path: std::path::PathBuf::from(format!("/runs/{key}.jsonl")),
+            host: None,
+        };
+        state.apply(&unit_started(0, "u0"));
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
+        });
+        state.apply(&unit_started(1, "u1"));
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            success: true,
+            tokens_in: 500,
+            tokens_out: 120,
+        });
+        let mut u = rupu_cp::usage_index::RunUsage::default();
+        u.by_unit.insert(("assess".into(), 0), tok(100, 10));
+        u.by_unit.insert(("assess".into(), 1), tok(300, 30));
+        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
+
+        let units = &state.steps[1].units;
+        assert_eq!(units.len(), 3, "{units:?}");
+        let row = |key: &str| units.iter().find(|u| u.key == key).unwrap();
+        assert_eq!(row("u0").tokens, 110);
+        assert_eq!(row("u1").tokens, 330);
+        assert_eq!(
+            row("u1").sub_run_id,
+            None,
+            "u1 did not take over the child's slot"
+        );
+        let child = row("security-reviewer");
+        assert_eq!(child.sub_run_id.as_deref(), Some("sub_child"));
+        assert_eq!(child.status, NodeStatus::Complete);
+        assert_eq!(child.tokens, 620);
+    }
+
     /// One ledger row for the run-store round trip below.
     fn ledger_row(
         id: &str,
@@ -2744,6 +2856,7 @@ mod tests {
                     elapsed_secs: 8,
                     transcript_path: None,
                     sub_run_id: None,
+                    index: Some(u),
                 });
             }
             steps.push(StepState {
