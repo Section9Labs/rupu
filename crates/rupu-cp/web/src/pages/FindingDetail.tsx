@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, apiErrorMessage, type FindingDetail as Detail } from '../lib/api';
+import { api, apiErrorMessage, findingExportUrl, type FindingDetail as Detail, type FindingExportFormat } from '../lib/api';
 import { completeness, UNREADABLE_REPORT_NOTE } from '../lib/findingReport';
 import Markdown from '../components/transcript/Markdown';
 import { FindingEvidence } from '../components/findings/FindingEvidence';
@@ -30,6 +30,38 @@ const RAIL: [string, string][] = [
 function BackLink() {
   return (
     <Link to="/findings" className="inline-block text-ui text-ink-mute hover:text-ink hover:underline">← Findings</Link>
+  );
+}
+
+const EXPORT_FORMATS: [FindingExportFormat, string][] = [['md', 'Markdown'], ['html', 'HTML'], ['pdf', 'PDF']];
+
+/** Download links for this finding's report in each format (served as
+ *  attachments by `GET /api/findings/:id/export`). */
+function ExportLinks({ id }: { id: string }) {
+  return (
+    <div role="group" aria-label="Export finding" className="flex items-center gap-1.5 text-ui">
+      <span className="text-ink-mute">Export</span>
+      {EXPORT_FORMATS.map(([fmt, label]) => (
+        <a
+          key={fmt}
+          href={findingExportUrl(id, fmt)}
+          download
+          className="rounded bg-surface px-1.5 py-0.5 text-note font-medium text-ink ring-1 ring-border hover:bg-surface-hover"
+        >
+          {label}
+        </a>
+      ))}
+    </div>
+  );
+}
+
+/** The top row of both layouts: back to the list, and the export links. */
+function TopBar({ id }: { id: string }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+      <BackLink />
+      <ExportLinks id={id} />
+    </div>
   );
 }
 
@@ -87,7 +119,7 @@ export default function FindingDetail() {
   if (!report) {
     return (
       <div className="mx-auto max-w-4xl space-y-6 p-8">
-        <BackLink />
+        <TopBar id={detail.id} />
         <h1 className="text-2xl font-semibold text-ink">{detail.summary}</h1>
         <p className="text-ui text-ink-mute">
           {detail.profile === 'full'
@@ -120,7 +152,7 @@ export default function FindingDetail() {
         </ul>
       </nav>
       <article className="min-w-0 max-w-4xl space-y-7">
-        <BackLink />
+        <TopBar id={detail.id} />
         <ReportHeader finding={detail} report={report} />
         {/* The rail (and its meter) only shows from `lg` up; below that this
             compact line carries the completeness instead. */}

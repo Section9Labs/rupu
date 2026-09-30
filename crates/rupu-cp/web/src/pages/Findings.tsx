@@ -9,6 +9,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, normFindingSeverity, type FindingOut, type FindingsSummary } from '../lib/api';
 import { type Severity } from '../lib/severity';
 import { findingCweIds } from '../lib/cwe';
+import { ExportReportButton } from '../components/findings/ExportReportButton';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
 import { FindingsTable } from '../components/findings/FindingsTable';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -118,34 +119,40 @@ export default function Findings() {
         <div className="space-y-6">
           <FindingMetrics summary={summary} active={activeSev} onSelect={setActiveSev} />
 
-          <FilterBar
-            filters={
-              <>
-                <FilterPills
-                  label="Profile"
-                  options={PROFILE_OPTIONS}
-                  value={profile}
-                  onChange={(v) => setProfile(v as ProfileFilter)}
-                />
-                <Select aria-label="Owner filter" value={owner} onChange={(e) => setOwner(e.target.value)}>
-                  <option value="">All owners</option>
-                  {owners.map((o) => (
-                    <option key={o} value={o}>
-                      {o}
-                    </option>
-                  ))}
-                </Select>
-                <Select aria-label="CWE filter" value={cwe} onChange={(e) => setCwe(e.target.value)}>
-                  <option value="">All CWEs</option>
-                  {cwes.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </Select>
-              </>
-            }
-          />
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div className="min-w-0 flex-1">
+              <FilterBar
+                filters={
+                  <>
+                    <FilterPills
+                      label="Profile"
+                      options={PROFILE_OPTIONS}
+                      value={profile}
+                      onChange={(v) => setProfile(v as ProfileFilter)}
+                    />
+                    <Select aria-label="Owner filter" value={owner} onChange={(e) => setOwner(e.target.value)}>
+                      <option value="">All owners</option>
+                      {owners.map((o) => (
+                        <option key={o} value={o}>
+                          {o}
+                        </option>
+                      ))}
+                    </Select>
+                    <Select aria-label="CWE filter" value={cwe} onChange={(e) => setCwe(e.target.value)}>
+                      <option value="">All CWEs</option>
+                      {cwes.map((c) => (
+                        <option key={c} value={c}>
+                          {c}
+                        </option>
+                      ))}
+                    </Select>
+                  </>
+                }
+              />
+            </div>
+            {/* The report covers exactly the rows the filters leave. */}
+            <ExportReportButton findings={rows} defaultTitle="Findings report" />
+          </div>
 
           {rows.length === 0 ? (
             <EmptyState title="No matches" hint={noMatchHint} />

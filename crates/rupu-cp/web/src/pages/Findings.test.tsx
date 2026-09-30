@@ -6,7 +6,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type FindingOut, type FindingsSummary } from '../lib/api';
 
@@ -197,5 +197,56 @@ describe('Findings — profile / owner / CWE filters', () => {
     fireEvent.change(screen.getByLabelText('Owner filter'), { target: { value: 'Team A' } });
     fireEvent.change(screen.getByLabelText('CWE filter'), { target: { value: 'CWE-862' } });
     expect(screen.getByText('No matches')).toBeInTheDocument();
+  });
+});
+
+describe('Findings — export report', () => {
+  const full = (id: string, summary: string, severity = 'high'): FindingOut => ({
+    ...FINDING, id, summary, severity, profile: 'full',
+  });
+  const ROWS: FindingOut[] = [
+    full('a', 'Full alpha'),
+    full('b', 'Full beta', 'critical'),
+    { ...FINDING, id: 'c', summary: 'Summary gamma', profile: 'summary' },
+  ];
+  const SUM: FindingsSummary = { total: 3, critical: 1, high: 2, medium: 0, low: 0, info: 0 };
+
+  async function loaded() {
+    vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: ROWS, summary: SUM });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Full alpha')).toBeInTheDocument());
+  }
+
+  it('exports exactly the rows the filters leave, not the whole list', async () => {
+    const exportSpy = vi.spyOn(api, 'exportFindings').mockResolvedValue(new Blob(['x']));
+    await loaded();
+    fireEvent.click(screen.getByRole('button', { name: /critical/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Export report' }));
+
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Export' }));
+    await waitFor(() => expect(exportSpy).toHaveBeenCalled());
+    expect(exportSpy.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ format: 'md', ids: ['b'], include_summaries: false }),
+    );
+    expect(exportSpy.mock.calls[0][0]).not.toHaveProperty('ws_id');
+  });
+
+  it('is disabled when the filters leave nothing to export', async () => {
+    await loaded();
+    fireEvent.change(screen.getByLabelText('Owner filter'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: /medium/i }));
+    await waitFor(() => expect(screen.getByText('No matches')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Export report' })).toBeDisabled();
+  });
+
+  it('is not offered while there are no findings at all', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue({
+      findings: [],
+      summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('No findings')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();
   });
 });

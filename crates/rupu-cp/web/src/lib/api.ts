@@ -1367,6 +1367,51 @@ export interface FindingsResponse {
   summary: FindingsSummary;
 }
 
+/** A finding-report export format — `?format=` on the per-finding endpoint and
+ *  `format` in the project-report body. */
+export type FindingExportFormat = 'md' | 'html' | 'pdf';
+
+/** Body of `POST /api/findings/export`. The server refuses unknown fields, and
+ *  an empty `ids` means "no restriction" (everything), so callers narrowing to
+ *  a chosen set must send at least one id — or omit the field on purpose. */
+export interface FindingsExportBody {
+  format: FindingExportFormat;
+  title?: string;
+  ids?: string[];
+  ws_id?: string;
+  run_id?: string;
+  min_severity?: string;
+  owner?: string;
+  cwe?: string;
+  include_summaries?: boolean;
+  split?: boolean;
+}
+
+/** The file name a `Content-Disposition` header offers (`filename*=UTF-8''…`
+ *  first, else `filename="…"`, else an unquoted token), reduced to its base
+ *  name so a path can never steer the save location. `null` when there is no
+ *  usable name. */
+export function parseContentDispositionFilename(header: string | null | undefined): string | null {
+  if (!header) return null;
+  const clean = (raw: string): string | null => {
+    const base = (raw.split(/[\\/]/).pop() ?? '').trim();
+    return base && base !== '.' && base !== '..' ? base : null;
+  };
+  const star = /\bfilename\*\s*=\s*[^']*'[^']*'([^;]+)/i.exec(header);
+  if (star) {
+    try {
+      const name = clean(decodeURIComponent(star[1].trim()));
+      if (name) return name;
+    } catch {
+      // malformed percent-encoding: fall through to the plain filename
+    }
+  }
+  const quoted = /\bfilename\s*=\s*"([^"]*)"/i.exec(header);
+  if (quoted) return clean(quoted[1]);
+  const token = /\bfilename\s*=\s*([^;\s"]+)/i.exec(header);
+  return token ? clean(token[1]) : null;
+}
+
 /** Touch strength, strongest last — matches rupu-coverage's `TouchStrength`. */
 export type TouchStrength = 'glob' | 'cmd' | 'grep' | 'read' | 'edit';
 
@@ -2489,6 +2534,30 @@ export const api = {
   getFinding(id: string): Promise<FindingDetail> {
     return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}`);
   },
+  /**
+   * Render a project report over the findings `body` selects
+   * (`POST /api/findings/export`) and return the bytes: one file, or with
+   * `split` a zip. The response is binary, so this cannot go through
+   * `request<T>` (which parses JSON). When the server names the download
+   * (`Content-Disposition`) the Blob comes back as a `File` carrying that
+   * name; `File` is a `Blob`, so callers that only want the bytes are
+   * unaffected. Errors are `ApiError`s — use `apiErrorMessage` to show them.
+   */
+  async exportFindings(body: FindingsExportBody): Promise<Blob> {
+    const res = await fetch('/api/findings/export', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new ApiError(res.status, text || res.statusText, text);
+    }
+    const blob = await res.blob();
+    const name = parseContentDispositionFilename(res.headers.get('Content-Disposition'));
+    return name ? new File([blob], name, { type: blob.type }) : blob;
+  },
 
   /**
    * Subscribe to the JSONL event stream for a single run.
@@ -2743,4 +2812,10 @@ export const api = {
 
 export function findingArtifactUrl(id: string, sha256: string): string {
   return `/api/findings/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(sha256)}`;
+}
+
+/** Download link for one finding's report (`GET /api/findings/:id/export`),
+ *  served as an attachment. */
+export function findingExportUrl(id: string, format: FindingExportFormat): string {
+  return `/api/findings/${encodeURIComponent(id)}/export?format=${format}`;
 }

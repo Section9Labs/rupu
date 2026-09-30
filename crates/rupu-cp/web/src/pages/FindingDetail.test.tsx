@@ -171,6 +171,36 @@ describe('FindingDetail page', () => {
     expect(back.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it('offers Markdown / HTML / PDF export links on a full report', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
+    renderAt();
+    const group = await screen.findByRole('group', { name: 'Export finding' });
+    for (const [name, fmt] of [['Markdown', 'md'], ['HTML', 'html'], ['PDF', 'pdf']] as const) {
+      const link = within(group).getByRole('link', { name });
+      expect(link).toHaveAttribute('href', `/api/findings/fnd_1/export?format=${fmt}`);
+      expect(link).toHaveAttribute('download');
+    }
+  });
+
+  it('offers the same export links on the summary layout', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'summary', report: null }));
+    renderAt();
+    const group = await screen.findByRole('group', { name: 'Export finding' });
+    for (const [name, fmt] of [['Markdown', 'md'], ['HTML', 'html'], ['PDF', 'pdf']] as const) {
+      const link = within(group).getByRole('link', { name });
+      expect(link).toHaveAttribute('href', `/api/findings/fnd_1/export?format=${fmt}`);
+      expect(link).toHaveAttribute('download');
+    }
+  });
+
+  it('keeps the export links above the report header', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
+    renderAt();
+    const group = await screen.findByRole('group', { name: 'Export finding' });
+    const h1 = screen.getByRole('heading', { level: 1 });
+    expect(group.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it('shows an alert with the error text when the API fails', async () => {
     vi.spyOn(api, 'getFinding').mockRejectedValue(new Error('404 finding not found'));
     renderAt('missing');
