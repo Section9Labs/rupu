@@ -44,6 +44,52 @@ struct FindingCardModelTests {
         #expect(fields.references == ["https://cwe.mitre.org/data/definitions/798.html"])
     }
 
+    /// The full profile (the default) sends `{scope, report}` with no
+    /// top-level summary/severity/evidence — the card must derive them from
+    /// the report the way the ledger record does, not render an empty
+    /// "info" card.
+    @Test func mapsAFullProfileReportInput() {
+        let input = obj([
+            "scope": .string("line"),
+            "file_path": .string("src/routes/notes.rs"),
+            "line_range": .array([.number(40), .number(52)]),
+            "report": obj([
+                "title": .string("Note lookup skips the ownership check"),
+                "rating": obj([
+                    "impact": .string("High"), "likelihood": .string("High"),
+                    "risk_rating": .string("Critical"), "risk_factor": .string("High"),
+                    "cvss_v3": .string("Unknown"),
+                ]),
+                "root_cause": .string("`get_note` loads by id without comparing the owner."),
+                "evidence": .array([
+                    obj(["claim": .string("No owner comparison")]),
+                    obj(["claim": .string("Query by id only"), "excerpt": .string("SELECT * FROM notes WHERE id = $1")]),
+                ]),
+            ]),
+        ])
+
+        let fields = parseFinding(input)
+
+        #expect(fields.summary == "Note lookup skips the ownership check")
+        #expect(fields.severityWire == "critical")
+        #expect(Severity(wireString: fields.severityWire) == .crit)
+        #expect(fields.rationale == "`get_note` loads by id without comparing the owner.")
+        #expect(fields.codeExcerpt == "SELECT * FROM notes WHERE id = $1")
+        #expect(fields.scope == "line")
+        #expect(fields.filePath == "src/routes/notes.rs")
+        #expect(fields.lineRange == FindingFields.LineRange(start: 40, end: 52))
+        #expect(fields.references.isEmpty)
+    }
+
+    @Test func aMalformedReportDegradesToDefaultsRatherThanCrashing() {
+        let fields = parseFinding(obj(["scope": .string("repo"), "report": obj(["tickets": .string("TBD")])]))
+        #expect(fields.severityWire == "info")
+        #expect(fields.summary.isEmpty)
+        #expect(fields.rationale.isEmpty)
+        #expect(fields.codeExcerpt == nil)
+        #expect(fields.scope == "repo")
+    }
+
     @Test func severityWireStringsMapToTheExpectedDesignSeverity() {
         for (wire, expected) in [
             ("info", Severity.info), ("low", .low), ("medium", .med), ("high", .high), ("critical", .crit),

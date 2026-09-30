@@ -154,6 +154,61 @@ describe('buildTranscriptView — findings from report_finding', () => {
     expect(tools[0].finding?.severity).toBe('high');
     expect(view.turns[0].summary.findingCount).toBe(1);
   });
+
+  // The full profile (the default) sends `{ scope, report }` with no
+  // top-level summary/severity/evidence; the card is derived from the report
+  // the same way the ledger record is.
+  const FULL_FINDING_CALL: TranscriptEvent = {
+    type: 'tool_call',
+    data: {
+      call_id: 'f2',
+      tool: 'report_finding',
+      input: {
+        scope: 'line',
+        file_path: 'src/routes/notes.rs',
+        line_range: [40, 52],
+        report: {
+          title: 'Note lookup skips the ownership check',
+          rating: { impact: 'High', likelihood: 'High', risk_rating: 'Critical', risk_factor: 'High', cvss_v3: 'Unknown' },
+          root_cause: '`get_note` loads by id without comparing `note.owner_id` to the caller.',
+          evidence: [
+            { claim: 'No owner comparison', file: 'src/routes/notes.rs', lines: [40, 52] },
+            { claim: 'Query by id only', excerpt: 'SELECT * FROM notes WHERE id = $1' },
+          ],
+        },
+      },
+    },
+  };
+
+  it('maps a full-profile {scope, report} call from the report', () => {
+    const view = buildTranscriptView([RUN_START, ASSISTANT, FULL_FINDING_CALL]);
+    const tools = toolsOf(view.turns);
+    expect(tools).toHaveLength(1);
+    const f = tools[0].finding;
+    expect(tools[0].kind).toBe('finding');
+    expect(f).toBeDefined();
+    expect(f?.summary).toBe('Note lookup skips the ownership check');
+    expect(f?.severity).toBe('critical');
+    expect(f?.rationale).toBe(
+      '`get_note` loads by id without comparing `note.owner_id` to the caller.',
+    );
+    expect(f?.codeExcerpt).toBe('SELECT * FROM notes WHERE id = $1');
+    expect(f?.scope).toBe('line');
+    expect(f?.filePath).toBe('src/routes/notes.rs');
+    expect(f?.lineRange).toEqual([40, 52]);
+    expect(f?.references).toEqual([]);
+  });
+
+  it('leaves no finding (but keeps the finding kind) for an unparseable report', () => {
+    const malformed: TranscriptEvent = {
+      type: 'tool_call',
+      data: { call_id: 'f3', tool: 'report_finding', input: { scope: 'repo', report: { tickets: 'x' } } },
+    };
+    const tools = toolsOf(buildTranscriptView([RUN_START, ASSISTANT, malformed]).turns);
+    expect(tools).toHaveLength(1);
+    expect(tools[0].kind).toBe('finding');
+    expect(tools[0].finding).toBeUndefined();
+  });
 });
 
 describe('buildTranscriptView — terminal / diff pairing', () => {
