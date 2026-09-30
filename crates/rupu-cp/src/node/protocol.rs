@@ -59,6 +59,26 @@ pub struct RunSpec {
     pub prompt: Option<String>,
     pub mode: Option<String>,
     pub target: Option<String>,
+    /// Agent runs only: `rupu run --findings-profile`. Absent on the wire when
+    /// `None`, so a job without an override is byte-identical to before.
+    ///
+    /// An executor predating this field would silently drop it, so a sender
+    /// must only set it for an executor known to honour it — see
+    /// [`CAP_AGENT_FINDINGS_PROFILE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
+}
+
+/// `Hello.capabilities` entry: this node's executor passes
+/// [`RunSpec::findings_profile`] through to `rupu run --findings-profile`.
+/// A tunnel that has not seen it refuses a launch that carries a profile
+/// rather than let an older node run the agent under a different one.
+pub const CAP_AGENT_FINDINGS_PROFILE: &str = "agent.findings_profile";
+
+/// Every capability this build's node executor supports — what `rupu node`
+/// advertises in `Hello`.
+pub fn node_capabilities() -> Vec<String> {
+    vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -98,6 +118,7 @@ mod tests {
                 prompt: None,
                 mode: None,
                 target: None,
+                findings_profile: None,
             },
         };
 

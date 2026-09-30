@@ -17,6 +17,7 @@ use crate::{
         RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
+    node::protocol::CAP_AGENT_FINDINGS_PROFILE,
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
 };
@@ -38,6 +39,10 @@ struct HostInfoBody {
     version: Option<String>,
     #[serde(default)]
     capabilities: HostCapabilities,
+    /// What the remote's launch endpoints honour (e.g.
+    /// [`CAP_AGENT_FINDINGS_PROFILE`]). Absent on a remote predating it.
+    #[serde(default)]
+    features: Vec<String>,
 }
 
 impl HttpHostConnector {
@@ -145,6 +150,36 @@ impl HttpHostConnector {
             }
         }
     }
+
+    /// Refuse unless the remote's `/api/host/info` lists `feature`. A remote
+    /// predating a request field ignores it (its body structs don't deny
+    /// unknown fields), so an unadvertised feature — including a remote with
+    /// no `/api/host/info` at all — is a refusal, not a best-effort send.
+    async fn require_feature(&self, feature: &str, what: &str) -> Result<(), HostConnectorError> {
+        let resp = match self.send(self.client.get(self.url("/api/host/info"))).await {
+            Ok(resp) => resp,
+            Err(HostConnectorError::NotFound(_)) => {
+                return Err(HostConnectorError::Unsupported(format!(
+                    "{what}: remote host {} predates /api/host/info, so it cannot \
+                     advertise support; upgrade rupu there",
+                    self.base_url
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        let body: HostInfoBody = resp
+            .json()
+            .await
+            .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+        if body.features.iter().any(|f| f == feature) {
+            return Ok(());
+        }
+        Err(HostConnectorError::Unsupported(format!(
+            "{what}: remote host {} (rupu {}) does not support it; upgrade rupu there",
+            self.base_url,
+            body.version.as_deref().unwrap_or("unknown version"),
+        )))
+    }
 }
 
 // ── Trait impl ────────────────────────────────────────────────────────────────
@@ -201,11 +236,19 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
+        if let Some(profile) = req.findings_profile {
+            self.require_feature(
+                CAP_AGENT_FINDINGS_PROFILE,
+                &format!("this run cannot be held to the `{profile}` findings profile"),
+            )
+            .await?;
+        }
         let body = serde_json::json!({
             "prompt": req.prompt,
             "mode": req.mode,
             "target": req.target,
             "working_dir": req.working_dir,
+            "findings_profile": req.findings_profile,
         });
         let resp = self
             .send(

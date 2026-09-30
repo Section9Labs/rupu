@@ -45,16 +45,34 @@ pub struct NodeConn {
     tx: Sender<Frame>,
     pub connected_at: DateTime<Utc>,
     pub last_seen: Mutex<DateTime<Utc>>,
+    /// What the node advertised in `Hello.capabilities` for THIS connection
+    /// (a reconnect after an upgrade/downgrade replaces the whole `NodeConn`).
+    capabilities: Vec<String>,
+    /// The node's `Hello.rupu_version`, for refusal messages.
+    rupu_version: Option<String>,
 }
 
 impl NodeConn {
-    fn new(tx: Sender<Frame>) -> Self {
+    fn new(tx: Sender<Frame>, capabilities: Vec<String>, rupu_version: Option<String>) -> Self {
         let now = Utc::now();
         Self {
             tx,
             connected_at: now,
             last_seen: Mutex::new(now),
+            capabilities,
+            rupu_version,
         }
+    }
+
+    /// Whether the node advertised `capability` (e.g.
+    /// [`crate::node::protocol::CAP_AGENT_FINDINGS_PROFILE`]) in its `Hello`.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+
+    /// The node's self-reported rupu version, when it sent one.
+    pub fn rupu_version(&self) -> Option<&str> {
+        self.rupu_version.as_deref()
     }
 
     /// Send a frame down the tunnel.
@@ -96,7 +114,20 @@ impl NodeRegistry {
     ///
     /// Returns the freshly created `Arc<NodeConn>`.
     pub fn register(&self, node_id: &str, tx: Sender<Frame>) -> Arc<NodeConn> {
-        let conn = Arc::new(NodeConn::new(tx));
+        self.register_with_hello(node_id, tx, Vec::new(), None)
+    }
+
+    /// [`Self::register`], recording what the node's `Hello` advertised —
+    /// the tunnel server's path. A node registered without capabilities
+    /// supports none, so a launch needing one is refused (fail closed).
+    pub fn register_with_hello(
+        &self,
+        node_id: &str,
+        tx: Sender<Frame>,
+        capabilities: Vec<String>,
+        rupu_version: Option<String>,
+    ) -> Arc<NodeConn> {
+        let conn = Arc::new(NodeConn::new(tx, capabilities, rupu_version));
         let mut map = self.conns.lock().expect("NodeRegistry lock poisoned");
         // The old Arc is dropped here, closing the sender side of the old channel.
         map.insert(node_id.to_owned(), Arc::clone(&conn));
@@ -252,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn send_errors_offline_when_receiver_dropped() {
         let (tx, rx) = mpsc::channel::<Frame>(8);
-        let conn = Arc::new(NodeConn::new(tx));
+        let conn = Arc::new(NodeConn::new(tx, Vec::new(), None));
         drop(rx);
         let result = conn.send(Frame::Ping {}).await;
         assert!(matches!(result, Err(NodeError::Offline)));
