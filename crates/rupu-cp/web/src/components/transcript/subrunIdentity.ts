@@ -23,12 +23,18 @@ export type SubrunIdentityMap = ReadonlyMap<string, SubrunIdentity>;
 
 export const SubrunIdentityContext = createContext<SubrunIdentityMap>(new Map());
 
-/** Fold `dispatch_started` events into `sub_run_id → identity` (last wins). */
-export function buildSubrunIdentities(events: readonly RunEvent[]): Map<string, SubrunIdentity> {
+/** Fold `dispatch_started` events into `sub_run_id → identity`, layered over
+ *  `seed` (the graph response's server-side `subrun_identities`, folded from
+ *  the whole events.jsonl). Live events win field by field. */
+export function buildSubrunIdentities(
+  events: readonly RunEvent[],
+  seed?: Readonly<Record<string, SubrunIdentity>>,
+): Map<string, SubrunIdentity> {
   const map = new Map<string, SubrunIdentity>();
+  for (const [subRunId, id] of Object.entries(seed ?? {})) map.set(subRunId, { ...id });
   for (const ev of events) {
     if (!isKnownRunEvent(ev) || ev.type !== 'dispatch_started') continue;
-    const id: SubrunIdentity = {};
+    const id: SubrunIdentity = { ...map.get(ev.sub_run_id) };
     if (ev.codename) id.codename = ev.codename;
     if (ev.agent) id.agent = ev.agent;
     if (ev.provider) id.provider = ev.provider;
@@ -36,4 +42,21 @@ export function buildSubrunIdentities(events: readonly RunEvent[]): Map<string, 
     map.set(ev.sub_run_id, id);
   }
   return map;
+}
+
+function sameIdentity(a: SubrunIdentity, b: SubrunIdentity): boolean {
+  return a.codename === b.codename && a.agent === b.agent && a.provider === b.provider && a.model === b.model;
+}
+
+/** True when two identity maps hold the same entries — lets a page keep the
+ *  previous Map reference (and so skip re-rendering every context consumer)
+ *  when an event tick didn't change any sub-run identity. */
+export function sameSubrunIdentities(a: SubrunIdentityMap, b: SubrunIdentityMap): boolean {
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) {
+    const w = b.get(k);
+    if (!w || !sameIdentity(v, w)) return false;
+  }
+  return true;
 }

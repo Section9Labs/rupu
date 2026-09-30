@@ -30,9 +30,13 @@ function tsOf(ev: SeqEvent['event']): number {
 export default function RunEventFeed({
   events,
   connection,
+  crewByRun,
 }: {
   events: SeqEvent[];
   connection: ConnectionState;
+  /** run_id → run codename; gives run-level cards (no codename of their own)
+   *  the crew tint stripe. */
+  crewByRun?: ReadonlyMap<string, string>;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // Newest-first: follow=true pins to the TOP (new events prepend visually).
@@ -42,14 +46,14 @@ export default function RunEventFeed({
   // note-less step_working heartbeat → cardFromEvent returns null).
   const cards = useMemo<StreamCard[]>(() => {
     const out: StreamCard[] = [];
-    const ctx = { unitKeys: unitKeyIndex(events.map((e) => e.event)) };
+    const ctx = { unitKeys: unitKeyIndex(events.map((e) => e.event)), crewByRun };
     for (let i = events.length - 1; i >= 0; i--) {
       const { seq, event } = events[i];
       const c = cardFromEvent(event, tsOf(event), `run-ev-${seq}`, ctx);
       if (c) out.push(c);
     }
     return out;
-  }, [events]);
+  }, [events, crewByRun]);
 
   useLayoutEffect(() => {
     if (!follow) return;

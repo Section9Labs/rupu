@@ -117,6 +117,16 @@ interface AgentIdentity {
   model?: string;
 }
 
+/** Layer `later` over `base` field-by-field (later wins where it has a value). */
+function mergeIdentity(base: AgentIdentity | undefined, later: AgentIdentity): AgentIdentity {
+  const out: AgentIdentity = { ...base };
+  if (later.agent) out.agent = later.agent;
+  if (later.codename) out.codename = later.codename;
+  if (later.provider) out.provider = later.provider;
+  if (later.model) out.model = later.model;
+  return out;
+}
+
 /** Overlay an agent_started identity; absent fields leave existing values. */
 function applyIdentity(
   target: { codename?: string; provider?: string; model?: string },
@@ -228,6 +238,9 @@ export function buildRunGraphModel(
       transcriptPath: cp.transcript_path,
     };
     if (cp.codename) unit.codename = cp.codename;
+    if (cp.agent) unit.agent = cp.agent;
+    if (cp.provider) unit.provider = cp.provider;
+    if (cp.model) unit.model = cp.model;
     units.set(cp.index, unit);
   }
 
@@ -241,8 +254,20 @@ export function buildRunGraphModel(
   // agent_started can precede (or race) its unit_started, so deferring lets
   // it land on the unit whichever arrives first. `unit_index` absent ⇒ the
   // step itself; present ⇒ that unit. Last event wins per target.
-  const stepIdentities = new Map<string, AgentIdentity>();
+  //
+  // Seeded from the graph response's server-side fold (the WHOLE
+  // events.jsonl), so identities survive the capped live-event window; the
+  // live events below layer on top, field by field (live wins).
+  const stepIdentities = new Map<string, AgentIdentity>(Object.entries(g.step_identities ?? {}));
   const unitIdentities = new Map<string, Map<number, AgentIdentity>>();
+  for (const [stepId, byIndex] of Object.entries(g.unit_identities ?? {})) {
+    const m = new Map<number, AgentIdentity>();
+    for (const [idx, id] of Object.entries(byIndex)) {
+      const n = Number(idx);
+      if (Number.isInteger(n)) m.set(n, id);
+    }
+    unitIdentities.set(stepId, m);
+  }
 
   for (const ev of events) {
     if (!isKnownRunEvent(ev)) continue;
@@ -317,14 +342,14 @@ export function buildRunGraphModel(
           model: ev.model,
         };
         if (ev.unit_index == null) {
-          stepIdentities.set(ev.step_id, id);
+          stepIdentities.set(ev.step_id, mergeIdentity(stepIdentities.get(ev.step_id), id));
         } else {
           let m = unitIdentities.get(ev.step_id);
           if (!m) {
             m = new Map<number, AgentIdentity>();
             unitIdentities.set(ev.step_id, m);
           }
-          m.set(ev.unit_index, id);
+          m.set(ev.unit_index, mergeIdentity(m.get(ev.unit_index), id));
         }
         break;
       }

@@ -445,6 +445,18 @@ export interface UnitCheckpoint {
   success: boolean | null;
   finished_at: string;      // ISO-8601
   codename?: string;
+  /** Folded server-side from the unit's `agent_started` (graph endpoint). */
+  agent?: string;
+  provider?: string;
+  model?: string;
+}
+
+/** An agent instance's identity, folded server-side from `events.jsonl`. */
+export interface AgentIdentityDto {
+  codename?: string;
+  agent?: string;
+  provider?: string;
+  model?: string;
 }
 
 export interface RunGraphResponse {
@@ -457,6 +469,14 @@ export interface RunGraphResponse {
   step_results: StepResultRecord[];
   units: UnitCheckpoint[];
   usage?: UsageSummary;
+  /** Identities folded from the WHOLE events.jsonl (the live window is capped,
+   *  so early `agent_started`s fall out of it on large runs). Absent on older
+   *  backends. `step_identities`: step-level agent_started by step id.
+   *  `unit_identities`: step id → unit_index (stringified) → identity (also
+   *  covers parallel sub-steps). `subrun_identities`: dispatch sub_run_id. */
+  step_identities?: Record<string, AgentIdentityDto>;
+  unit_identities?: Record<string, Record<string, AgentIdentityDto>>;
+  subrun_identities?: Record<string, AgentIdentityDto>;
 }
 
 // ---------------------------------------------------------------------------

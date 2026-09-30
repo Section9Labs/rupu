@@ -908,3 +908,50 @@ describe('parallel sub-step identities + unit agents', () => {
     expect(buildRunGraphModel(g, events).nodeById('b')!.fanout!.units[0].agent).toBe('sec-reviewer');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Server-folded identities (graph response) — survive the capped live window
+// ---------------------------------------------------------------------------
+
+describe('seeded identities from the graph response', () => {
+  const PAR: StepNodeDto = {
+    id: 'p', kind: 'parallel', parallel: [{ id: 'x', agent: 'ax' }, { id: 'y', agent: 'ay' }],
+  };
+
+  it('names step, unit and parallel sub-step with NO live events', () => {
+    const g: RunGraphResponse = {
+      ...makeGraph({
+        steps: [STEP_A, STEP_B, PAR],
+        units: [{
+          step_id: 'b', index: 2, item: 'crates/db', run_id: 'u', transcript_path: 't', output: '',
+          success: true, finished_at: 'x', codename: 'jade-reef/lynx#3',
+          agent: 'agent-b', provider: 'anthropic', model: 'claude-sonnet-4-6',
+        }],
+      }),
+      step_identities: { a: { codename: 'jade-reef/heron', agent: 'agent-a', provider: 'openai', model: 'gpt-5' } },
+      unit_identities: { p: { '1': { codename: 'jade-reef/owl.b', agent: 'ay', provider: 'anthropic', model: 'opus' } } },
+    };
+    const model = buildRunGraphModel(g, []);
+    const a = model.nodes.find((n) => n.id === 'a')!;
+    expect(a).toMatchObject({ codename: 'jade-reef/heron', provider: 'openai', model: 'gpt-5' });
+    const unit = model.nodes.find((n) => n.id === 'b')!.fanout!.units[0];
+    expect(unit).toMatchObject({ codename: 'jade-reef/lynx#3', agent: 'agent-b', provider: 'anthropic', model: 'claude-sonnet-4-6' });
+    const sub = model.nodes.find((n) => n.id === 'p')!.parallel![1];
+    expect(sub).toMatchObject({ codename: 'jade-reef/owl.b', provider: 'anthropic', model: 'opus' });
+  });
+
+  it('live agent_started layers over the seed field by field (live wins)', () => {
+    const g: RunGraphResponse = {
+      ...makeGraph(),
+      step_identities: { a: { codename: 'jade-reef/heron', agent: 'agent-a', provider: 'openai', model: 'gpt-5' } },
+    };
+    const events: RunEvent[] = [{
+      type: 'agent_started', run_id: runId(), step_id: 'a', agent: 'agent-a',
+      model: 'gpt-5.1', agent_run_id: 'ar', transcript_path: 't',
+    } as RunEvent];
+    const a = buildRunGraphModel(g, events).nodes.find((n) => n.id === 'a')!;
+    expect(a.model).toBe('gpt-5.1');
+    expect(a.provider).toBe('openai'); // absent on the live event → seed kept
+    expect(a.codename).toBe('jade-reef/heron');
+  });
+});

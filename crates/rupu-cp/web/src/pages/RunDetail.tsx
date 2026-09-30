@@ -46,7 +46,12 @@ import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { CrewChip } from '../components/codename/CrewChip';
 import { AgentName } from '../components/codename/AgentName';
-import { SubrunIdentityContext, buildSubrunIdentities } from '../components/transcript/subrunIdentity';
+import {
+  SubrunIdentityContext,
+  buildSubrunIdentities,
+  sameSubrunIdentities,
+  type SubrunIdentityMap,
+} from '../components/transcript/subrunIdentity';
 import { parseCodename } from '../lib/codename';
 
 const MAX_EVENTS = 2000;
@@ -401,7 +406,16 @@ export default function RunDetail() {
   const rawEvents = useMemo<RunEvent[]>(() => events.map((e) => e.event), [events]);
   // sub_run_id → codename/agent/provider/model from dispatch_started, so the
   // transcript's dispatch tool cards can name their sub-agents fully.
-  const subrunIdentities = useMemo(() => buildSubrunIdentities(rawEvents), [rawEvents]);
+  // Seeded from the graph response's server-side fold so sub-agents dispatched
+  // before the capped live window still resolve. The previous Map is kept
+  // when a tick changed nothing, so context consumers don't re-render per event.
+  const subrunIdentitiesRef = useRef<SubrunIdentityMap>(new Map());
+  const subrunIdentities = useMemo(() => {
+    const next = buildSubrunIdentities(rawEvents, graph?.subrun_identities);
+    if (sameSubrunIdentities(subrunIdentitiesRef.current, next)) return subrunIdentitiesRef.current;
+    subrunIdentitiesRef.current = next;
+    return next;
+  }, [rawEvents, graph]);
 
   // Merge skeleton + checkpoints + live events into the render model. Cheap;
   // recompute on every event so the graph reflects live state.
@@ -444,6 +458,14 @@ export default function RunDetail() {
 
   // The effective run record from the graph.
   const run = graph?.run ?? null;
+  // run_id → run codename, so run-level cards in the Events feed (run_started,
+  // awaiting, completed …) get the crew tint stripe too.
+  const runId = run?.id;
+  const runCodename = run?.codename;
+  const crewByRun = useMemo<ReadonlyMap<string, string>>(
+    () => new Map(runId && runCodename ? [[runId, runCodename]] : []),
+    [runId, runCodename],
+  );
   // Usage for the header row from the graph.
   const displayUsage = graph?.usage;
 
@@ -1261,7 +1283,7 @@ export default function RunDetail() {
         )}
         {tab === 'events' && (
           <div className="h-full min-h-0">
-            <RunEventFeed events={feedEvents} connection={connection} />
+            <RunEventFeed events={feedEvents} connection={connection} crewByRun={crewByRun} />
           </div>
         )}
         {tab === 'findings' && (
