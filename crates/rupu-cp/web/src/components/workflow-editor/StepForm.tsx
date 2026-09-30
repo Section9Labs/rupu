@@ -8,6 +8,7 @@
 import { useRef, useState } from 'react';
 import type { AgentSummary, ToolSpec } from '../../lib/api';
 import {
+  acceptsFindingsProfile,
   canConnect,
   hasInlineApproval,
   type GraphEdge,
@@ -135,6 +136,16 @@ export default function StepForm({
     // has no way to see or clear, and save would 400 with `ActionsOnActionStep`.
     if (d.actions !== undefined && kind !== 'action') base.actions = d.actions;
     if (d.raw_passthrough !== undefined) base.raw_passthrough = d.raw_passthrough;
+    // `findings_profile` only means something on a step that runs an agent —
+    // carry it into step/for_each/parallel/panel; drop it for branch/gate/
+    // split/join, and for `action` (whose tool starts empty, so it isn't
+    // `findings.record` yet and the server would reject the field).
+    if (
+      d.findings_profile !== undefined &&
+      (kind === 'step' || kind === 'for_each' || kind === 'parallel' || kind === 'panel')
+    ) {
+      base.findings_profile = d.findings_profile;
+    }
     // `next` is a GENERAL field (a node's outgoing successor edge), not
     // kind-specific — carry it across the switch EXCEPT to `branch` (its
     // successors are the then/else arms, not `next`) or `split` (its
@@ -237,6 +248,16 @@ export default function StepForm({
       {d.kind === 'split' && <SplitFields d={d} allNodeIds={allNodeIds} edges={edges} patch={patch} />}
       {d.kind === 'join' && <JoinFields d={d} patch={patch} />}
 
+      {/* ── findings profile ────────────────────────────────────────── */}
+      {/* Rendered wherever the server accepts `findings_profile` (agent-running
+         kinds incl. panel — which the common block below hides — and a local
+         `action: findings.record` step). It ALSO renders when a value is
+         already set on a step that can't take one, so the user can clear the
+         field the validation alert above is complaining about. */}
+      {(acceptsFindingsProfile(d) || d.findings_profile !== undefined) && (
+        <FindingsProfileField d={d} patch={patch} />
+      )}
+
       {/* ── common: when / continue_on_error / approval ─────────────── */}
       {/* branch/panel/approval_gate/split/join hide this block: nodeToStepObject
          never reads when/continue_on_error for branch/panel/split/join, a gate
@@ -281,6 +302,38 @@ export default function StepForm({
         </>
       )}
     </div>
+  );
+}
+
+// ── findings_profile <select> ────────────────────────────────────────────────
+
+/** Per-step findings profile. Unset ("Inherit") omits the key, so the step
+ *  falls back to `defaults.findings_profile` -> the agent's frontmatter ->
+ *  `full`. */
+function FindingsProfileField({
+  d,
+  patch,
+}: {
+  d: StepNodeData;
+  patch: (p: Partial<StepNodeData>) => void;
+}) {
+  return (
+    <label className="block">
+      <span className={labelCls}>Findings</span>
+      <select
+        aria-label="Findings profile"
+        value={d.findings_profile ?? ''}
+        onChange={(e) => {
+          const v = e.target.value;
+          patch({ findings_profile: v === 'full' || v === 'summary' ? v : undefined });
+        }}
+        className={fieldCls}
+      >
+        <option value="">Inherit (workflow default → agent → full)</option>
+        <option value="full">Full report</option>
+        <option value="summary">Summary</option>
+      </select>
+    </label>
   );
 }
 

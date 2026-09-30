@@ -2,14 +2,16 @@
 // top-level keys (trigger / inputs / autoflow / contracts / …) live in
 // `meta.rest`; they are preserved verbatim on every emit.
 //
-// `trigger`/`inputs` get dedicated authoring cards (TriggerCard / InputsCard,
-// under `./settings/`) instead of chips; `autoflow` gets an authoring card
-// (AutoflowCard) plus a read-only lifecycle viz below it (LifecycleRibbon).
+// `trigger`/`inputs`/`defaults` get dedicated authoring cards (TriggerCard /
+// InputsCard / DefaultsCard, under `./settings/`) instead of chips; `autoflow`
+// gets an authoring card (AutoflowCard) plus a read-only lifecycle viz below it
+// (LifecycleRibbon).
 // Any OTHER advanced key still surfaces as a read-only chip below the cards.
 
 import type { WorkflowMeta } from '../../lib/workflowGraph';
 import TriggerCard from './settings/TriggerCard';
 import InputsCard from './settings/InputsCard';
+import DefaultsCard from './settings/DefaultsCard';
 import AutoflowCard from './settings/AutoflowCard';
 import LifecycleRibbon from './settings/LifecycleRibbon';
 
@@ -34,7 +36,9 @@ export default function WorkflowSettingsForm({
   const onRest = (rest: Record<string, unknown>): void => {
     patch({ rest });
   };
-  const restKeys = Object.keys(meta.rest).filter((k) => k !== 'trigger' && k !== 'inputs' && k !== 'autoflow');
+  const restKeys = Object.keys(meta.rest).filter(
+    (k) => k !== 'trigger' && k !== 'inputs' && k !== 'autoflow' && k !== 'defaults',
+  );
 
   return (
     <div className="space-y-4" data-ui="next">
@@ -62,6 +66,7 @@ export default function WorkflowSettingsForm({
 
       <TriggerCard rest={meta.rest} onRest={onRest} />
       <InputsCard rest={meta.rest} onRest={onRest} />
+      <DefaultsCard rest={meta.rest} onRest={onRest} />
       <AutoflowCard rest={meta.rest} onRest={onRest} />
       <LifecycleRibbon rest={meta.rest} />
 

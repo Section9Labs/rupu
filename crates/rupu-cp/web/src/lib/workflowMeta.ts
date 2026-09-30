@@ -1,6 +1,7 @@
-// workflowMeta — typed read/write of the `trigger`, `inputs`, and `autoflow`
-// top-level workflow blocks over a `WorkflowMeta.rest` passthrough bag (see
-// `workflowGraph.ts`). Pure, framework-free: no React, no DOM.
+// workflowMeta — typed read/write of the `trigger`, `inputs`, `autoflow`, and
+// `defaults` (findings_profile) top-level workflow blocks over a
+// `WorkflowMeta.rest` passthrough bag (see `workflowGraph.ts`). Pure,
+// framework-free: no React, no DOM.
 //
 // `rest` carries every top-level workflow key that isn't `name` /
 // `description` / `steps`, verbatim, in the order it arrived from YAML. The
@@ -423,6 +424,41 @@ export function writeAutoflow(rest: Record<string, unknown>, model: AutoflowMode
   if (model.outcome !== undefined) raw.outcome = { output: model.outcome.output };
 
   return setOrDeleteKey(rest, 'autoflow', raw);
+}
+
+// ── Defaults ─────────────────────────────────────────────────────────────────
+// Mirrors `Defaults` in workflow.rs. Only `findings_profile` is authored by the
+// editor; every other `defaults` key (`continue_on_error`, `workspace`, …) is
+// preserved verbatim, in its original position, and edited in the YAML tab.
+
+export type FindingsProfile = 'full' | 'summary';
+
+export interface DefaultsModel {
+  findings_profile?: FindingsProfile;
+}
+
+/** Read the editable slice of the `defaults:` block. Absent / malformed
+ *  `defaults`, or an unknown `findings_profile` value, reads as unset. */
+export function readDefaults(rest: Record<string, unknown>): DefaultsModel {
+  const raw = asRecord(rest.defaults);
+  if (!raw) return {};
+  const model: DefaultsModel = {};
+  const fp = asString(raw.findings_profile);
+  if (fp === 'full' || fp === 'summary') model.findings_profile = fp;
+  return model;
+}
+
+/** Write the editable slice of `defaults:` back. Sibling `defaults` keys and
+ *  their order survive; an unset model field removes its key; `defaults` is
+ *  deleted entirely when nothing is left. A non-map `defaults` value is left
+ *  untouched unless there is something to set. */
+export function writeDefaults(rest: Record<string, unknown>, model: DefaultsModel): Record<string, unknown> {
+  const existing = asRecord(rest.defaults);
+  if (rest.defaults !== undefined && !existing && model.findings_profile === undefined) {
+    return { ...rest };
+  }
+  const next = setOrDeleteKey(existing ?? {}, 'findings_profile', model.findings_profile);
+  return setOrDeleteKey(rest, 'defaults', Object.keys(next).length > 0 ? next : undefined);
 }
 
 // ── Contracts (read-only lookup) ──────────────────────────────────────────────
