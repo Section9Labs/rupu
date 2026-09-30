@@ -1,0 +1,172 @@
+// @vitest-environment jsdom
+import '@testing-library/jest-dom/vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+import fixture from '../../../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
+import { codeHref, type ArtifactRef, type FindingReport } from '../../../lib/findingReport';
+import { findingArtifactUrl, type FindingOut } from '../../../lib/api';
+import CallChain from './CallChain';
+import EvidenceClaims from './EvidenceClaims';
+import FixSections from './FixSections';
+import CommandBlock from './CommandBlock';
+import ArtifactBrowser from './ArtifactBrowser';
+import ReportHeader from './ReportHeader';
+import CrossReferences from './CrossReferences';
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+const report = fixture as unknown as FindingReport;
+const WS = 'ws_1';
+
+function withRouter(ui: React.ReactElement) {
+  return render(<MemoryRouter>{ui}</MemoryRouter>);
+}
+
+describe('CallChain', () => {
+  it('renders hops in source to sink order with the sink marked', () => {
+    const { container } = withRouter(<CallChain chain={report.call_chain} wsId={WS} />);
+    const items = Array.from(container.querySelectorAll('li'));
+    expect(items).toHaveLength(3);
+    expect(items[0]).toHaveTextContent('router: GET /api/notes/{id}');
+    expect(items[1]).toHaveTextContent('get_note()');
+    expect(items[2]).toHaveTextContent('NoteStore::find_by_id()');
+    expect(items[0].querySelector('[aria-label="source"]')).not.toBeNull();
+    expect(items[2].querySelector('[aria-label="sink"]')).not.toBeNull();
+    expect(container.querySelectorAll('[aria-label="sink"]')).toHaveLength(1);
+  });
+
+  it('links each hop with a file to the code viewer at its first line', () => {
+    withRouter(<CallChain chain={report.call_chain} wsId={WS} />);
+    const link = screen.getByRole('link', { name: 'src/routes/notes.rs:40-58' });
+    expect(link).toHaveAttribute('href', codeHref(WS, 'src/routes/notes.rs', 40));
+    const sink = screen.getByRole('link', { name: 'src/store/notes.rs:88-97' });
+    expect(sink).toHaveAttribute('href', codeHref(WS, 'src/store/notes.rs', 88));
+  });
+
+  it('renders a sentinel chain as a label with no list', () => {
+    const { container } = withRouter(<CallChain chain="Not Provided — n/a" wsId={WS} />);
+    expect(screen.getByText('Not provided: n/a')).toBeInTheDocument();
+    expect(container.querySelector('ol')).toBeNull();
+    expect(container.querySelector('li')).toBeNull();
+  });
+});
+
+describe('EvidenceClaims', () => {
+  it('flags a claim whose code changed since it was recorded', () => {
+    withRouter(<EvidenceClaims claims={report.evidence} states={['changed']} wsId={WS} />);
+    expect(screen.getByText('Code changed since recorded')).toBeInTheDocument();
+  });
+
+  it('shows no badge for a current claim, and renders the excerpt in a <pre>', () => {
+    const { container } = withRouter(<EvidenceClaims claims={report.evidence} states={['current']} wsId={WS} />);
+    expect(screen.queryByText('Code changed since recorded')).toBeNull();
+    expect(screen.queryByText('File no longer present')).toBeNull();
+    const pre = container.querySelector('pre');
+    expect(pre).not.toBeNull();
+    expect(pre).toHaveTextContent('store.find_by_id(id)');
+  });
+});
+
+describe('FixSections', () => {
+  it('renders the recommended patch as a diff', () => {
+    render(<FixSections report={report} />);
+    expect(screen.getByText(/find_by_id_for_owner/)).toBeInTheDocument();
+  });
+
+  it('renders a regression_test sentinel as its label', () => {
+    render(<FixSections report={{ ...report, regression_test: 'Not Provided — no harness' }} />);
+    expect(screen.getByText('Not provided: no harness')).toBeInTheDocument();
+    expect(screen.queryByText('Vulnerable build')).toBeNull();
+  });
+
+  it('shows both regression expectations', () => {
+    render(<FixSections report={report} />);
+    expect(screen.getByText('Vulnerable build')).toBeInTheDocument();
+    expect(screen.getByText('Patched build')).toBeInTheDocument();
+    expect(screen.getByText(/fails: got 200/)).toBeInTheDocument();
+    expect(screen.getByText(/passes: got 404/)).toBeInTheDocument();
+  });
+});
+
+describe('CommandBlock', () => {
+  it('copies the command and confirms', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<CommandBlock label="Command" command="cargo test --test notes_access" />);
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith('cargo test --test notes_access');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument());
+  });
+});
+
+describe('ArtifactBrowser', () => {
+  const sha = 'a'.repeat(64);
+  const textArt: ArtifactRef = { path: 'poc/request.http', sha256: sha, size: 20, kind: 'text', stored: 'copied' };
+  const binArt: ArtifactRef = { path: 'poc/capture.pcap', sha256: 'b'.repeat(64), size: 2048, kind: 'binary', stored: 'copied' };
+  const extArt: ArtifactRef = { path: 'poc/huge.bin', sha256: 'c'.repeat(64), size: 9_999_999, kind: 'binary', stored: 'external', host: 'kuki' };
+
+  it('fetches and previews a text artifact in a <pre>', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('GET /api/notes/42'));
+    const { container } = render(<ArtifactBrowser findingId="fnd_1" artifacts={[textArt]} />);
+    fireEvent.click(screen.getByRole('button', { name: /poc\/request\.http/ }));
+    await waitFor(() => expect(container.querySelector('pre')).toHaveTextContent('GET /api/notes/42'));
+    expect(fetchSpy).toHaveBeenCalledWith(findingArtifactUrl('fnd_1', sha), expect.anything());
+  });
+
+  it('offers a binary artifact as a download and never fetches it', () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    render(<ArtifactBrowser findingId="fnd_1" artifacts={[binArt]} />);
+    fireEvent.click(screen.getByRole('button', { name: /poc\/capture\.pcap/ }));
+    const link = screen.getByRole('link', { name: 'Download' });
+    expect(link).toHaveAttribute('href', findingArtifactUrl('fnd_1', binArt.sha256));
+    expect(link).toHaveAttribute('download');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('says where an external artifact is stored', () => {
+    render(<ArtifactBrowser findingId="fnd_1" artifacts={[extArt]} />);
+    fireEvent.click(screen.getByRole('button', { name: /poc\/huge\.bin/ }));
+    expect(screen.getByText(/on host kuki/)).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Download' })).toBeNull();
+  });
+});
+
+describe('ReportHeader', () => {
+  const finding = {
+    id: 'fnd_1', ws_id: WS, project: 'notebin', target_id: 't', workflow_name: 'audit',
+    severity: 'critical', summary: 's',
+  } as unknown as FindingOut;
+
+  it('renders title, severity chip, gap-styled owner, and CWE links', () => {
+    render(<ReportHeader finding={finding} report={report} />);
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(report.title);
+    expect(screen.getByText('critical')).toBeInTheDocument();
+    const owner = screen.getAllByText('Unknown').find((el) => el.tagName === 'DD' && el.previousElementSibling?.textContent === 'Owner');
+    expect(owner).toHaveAttribute('data-gap', 'true');
+    expect(screen.getByText('Notebin (sample app)')).toHaveAttribute('data-gap', 'false');
+    expect(screen.getByRole('link', { name: 'CWE-639' })).toHaveAttribute('href', 'https://cwe.mitre.org/data/definitions/639.html');
+    expect(screen.getByRole('link', { name: 'CWE-862' })).toHaveAttribute('href', 'https://cwe.mitre.org/data/definitions/862.html');
+  });
+});
+
+describe('CrossReferences', () => {
+  it('renders the None sentinel', () => {
+    withRouter(<CrossReferences refs="None" references={report.references} />);
+    expect(screen.getByText(/Related findings:/).parentElement).toHaveTextContent(/Related findings:\s*None$/);
+  });
+
+  it('links related findings to their detail page', () => {
+    withRouter(
+      <CrossReferences
+        refs={[{ finding_id: 'fnd_9', relation: 'sibling', note: 'same handler' }]}
+        references="CWE-639"
+      />,
+    );
+    expect(screen.getByRole('link', { name: 'fnd_9' })).toHaveAttribute('href', '/findings/fnd_9');
+    expect(screen.getByText(/same handler/)).toBeInTheDocument();
+  });
+});
