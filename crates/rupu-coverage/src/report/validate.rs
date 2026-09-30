@@ -70,12 +70,18 @@ struct Check {
 
 impl Check {
     fn err(&mut self, path: impl Into<String>, message: impl Into<String>) {
-        self.errors.push(FieldError { path: path.into(), message: message.into() });
+        self.errors.push(FieldError {
+            path: path.into(),
+            message: message.into(),
+        });
     }
 
     fn text(&mut self, path: &str, v: &str) {
         if v.trim().is_empty() {
-            self.err(path, "must not be empty (use the field's sentinel if it is genuinely unknown)");
+            self.err(
+                path,
+                "must not be empty (use the field's sentinel if it is genuinely unknown)",
+            );
         }
     }
 
@@ -108,17 +114,25 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
     c.text("report.title", &r.title);
     c.text("report.ownership.owner", &r.ownership.owner);
     c.text("report.ownership.product", &r.ownership.product);
-    c.text("report.ownership.affected_component", &r.ownership.affected_component);
-    c.text("report.ownership.source_repository", &r.ownership.source_repository);
+    c.text(
+        "report.ownership.affected_component",
+        &r.ownership.affected_component,
+    );
+    c.text(
+        "report.ownership.source_repository",
+        &r.ownership.source_repository,
+    );
 
     match &r.tickets {
         OrSentinel::Sentinel(s) if s == "None Provided" || s == "Unknown" => {}
-        OrSentinel::Sentinel(_) => {
-            c.err("report.tickets", "must be `None Provided`, `Unknown`, or a list of tickets")
-        }
-        OrSentinel::Value(list) if list.is_empty() => {
-            c.err("report.tickets", "an empty list is not allowed; use `None Provided`")
-        }
+        OrSentinel::Sentinel(_) => c.err(
+            "report.tickets",
+            "must be `None Provided`, `Unknown`, or a list of tickets",
+        ),
+        OrSentinel::Value(list) if list.is_empty() => c.err(
+            "report.tickets",
+            "an empty list is not allowed; use `None Provided`",
+        ),
         OrSentinel::Value(list) => {
             for (i, t) in list.iter().enumerate() {
                 c.text(&format!("report.tickets[{i}].type"), &t.kind);
@@ -191,7 +205,10 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
         OrSentinel::Value(t) => {
             c.text("report.regression_test.body", &t.body);
             c.text("report.regression_test.command", &t.command);
-            c.text("report.regression_test.expect_vulnerable", &t.expect_vulnerable);
+            c.text(
+                "report.regression_test.expect_vulnerable",
+                &t.expect_vulnerable,
+            );
             c.text("report.regression_test.expect_patched", &t.expect_patched);
         }
     }
@@ -205,12 +222,14 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
 
     match &r.cross_references {
         OrSentinel::Sentinel(s) if s == "None" => {}
-        OrSentinel::Sentinel(_) => {
-            c.err("report.cross_references", "must be `None` or a list of related findings")
-        }
-        OrSentinel::Value(list) if list.is_empty() => {
-            c.err("report.cross_references", "an empty list is not allowed; use `None`")
-        }
+        OrSentinel::Sentinel(_) => c.err(
+            "report.cross_references",
+            "must be `None` or a list of related findings",
+        ),
+        OrSentinel::Value(list) if list.is_empty() => c.err(
+            "report.cross_references",
+            "an empty list is not allowed; use `None`",
+        ),
         OrSentinel::Value(list) => {
             for (i, x) in list.iter().enumerate() {
                 if !ctx.known_finding_ids.iter().any(|k| k == &x.finding_id) {
@@ -268,7 +287,10 @@ mod tests {
     }
 
     fn ctx() -> ValidateCtx<'static> {
-        ValidateCtx { known_finding_ids: &[], max_bytes: 262_144 }
+        ValidateCtx {
+            known_finding_ids: &[],
+            max_bytes: 262_144,
+        }
     }
 
     fn problems(r: &FindingReport) -> Vec<String> {
@@ -302,7 +324,11 @@ mod tests {
         r.ci_cd_detection = OrSentinel::Sentinel("Unknown".into());
         r.regression_test = OrSentinel::Sentinel("Unknown".into());
         let p = problems(&r);
-        for f in ["report.recommended_patch", "report.ci_cd_detection", "report.regression_test"] {
+        for f in [
+            "report.recommended_patch",
+            "report.ci_cd_detection",
+            "report.regression_test",
+        ] {
             assert!(p.contains(&f.to_string()), "{f} missing from {p:?}");
         }
     }
@@ -339,10 +365,19 @@ mod tests {
             relation: Relation::Sibling,
             note: None,
         }]);
-        assert_eq!(problems(&r), vec!["report.cross_references[0].finding_id".to_string()]);
+        assert_eq!(
+            problems(&r),
+            vec!["report.cross_references[0].finding_id".to_string()]
+        );
 
         let known = vec!["fnd_UNKNOWN".to_string()];
-        let ok = validate_report(&r, &ValidateCtx { known_finding_ids: &known, max_bytes: 262_144 });
+        let ok = validate_report(
+            &r,
+            &ValidateCtx {
+                known_finding_ids: &known,
+                max_bytes: 262_144,
+            },
+        );
         assert!(ok.is_ok());
     }
 
@@ -364,7 +399,10 @@ mod tests {
         let p = problems(&r);
         assert!(p.contains(&"report.evidence[0].file".to_string()), "{p:?}");
         assert!(p.contains(&"report.evidence[0].lines".to_string()), "{p:?}");
-        assert!(p.contains(&"report.call_chain[0].file".to_string()), "{p:?}");
+        assert!(
+            p.contains(&"report.call_chain[0].file".to_string()),
+            "{p:?}"
+        );
     }
 
     #[test]
@@ -374,7 +412,11 @@ mod tests {
         r.replication_steps.clear();
         r.call_chain = OrSentinel::Value(vec![]);
         let p = problems(&r);
-        for f in ["report.evidence", "report.replication_steps", "report.call_chain"] {
+        for f in [
+            "report.evidence",
+            "report.replication_steps",
+            "report.call_chain",
+        ] {
             assert!(p.contains(&f.to_string()), "{f} missing from {p:?}");
         }
     }
