@@ -100,8 +100,7 @@ async fn events_stream(
             RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
             other => ApiError::internal(other.to_string()),
         })?;
-        let events_path = s.run_store.events_path(id);
-        let sse = crate::sse::tail_events_sse(events_path)
+        let sse = crate::sse::tail_events_sse(s.run_store.clone(), id)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
         return Ok(sse.into_response());
@@ -265,6 +264,11 @@ fn collect_recent_events(
     // later (newer) event; `run_id` only matters when two *different* runs'
     // fallback `ts` happen to collide exactly.
     let mut candidates: Vec<(i64, String, usize, serde_json::Value)> = Vec::new();
+    // Legacy (pre-codename) runs' step/unit/dispatch events get a derived
+    // name; one cached derivation per run, opened only on first need.
+    let mut namers = crate::codename_legacy::EventNamers::new(std::sync::Arc::new(RunStore::new(
+        run_store.root.clone(),
+    )));
 
     for run in runs.iter().take(MAX_RUNS_SCANNED) {
         let path = run_store.events_path(&run.id);
@@ -293,6 +297,9 @@ fn collect_recent_events(
             let Ok(mut row) = serde_json::to_value(&event) else {
                 continue;
             };
+            if crate::codename_legacy::event_needs_name(&event) {
+                namers.fill_row(&run.id, &mut row);
+            }
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("ts".to_string(), serde_json::json!(ts));
                 obj.insert("pos".to_string(), serde_json::json!(pos));

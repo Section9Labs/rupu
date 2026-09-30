@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -15,22 +14,32 @@ use rupu_orchestrator::executor::{Event, FileTailRunSource};
 use rupu_orchestrator::runs::{RunStatus, RunStore};
 use tokio::sync::mpsc;
 
-/// Tail a run's `events.jsonl` as an SSE stream. Each rupu [`Event`] becomes
-/// one SSE `data:` line of JSON. The stream is live — it stays open and emits
-/// events as the run progresses, never terminating on its own.
+/// Tail run `run_id`'s `events.jsonl` in `store` as an SSE stream. Each rupu
+/// [`Event`] becomes one SSE `data:` line of JSON. The stream is live — it
+/// stays open and emits events as the run progresses, never terminating on
+/// its own. A legacy (pre-codename) run's step/unit/dispatch events get a
+/// derived codename (see [`sse_frame`]).
 ///
 /// [`Event`]: rupu_orchestrator::executor::Event
 pub async fn tail_events_sse(
-    events_path: PathBuf,
+    store: Arc<RunStore>,
+    run_id: &str,
 ) -> std::io::Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
-    let source = FileTailRunSource::open(&events_path).await?;
-    let stream = source.map(|ev| {
-        let sse = SseEvent::default()
-            .json_data(&ev)
-            .unwrap_or_else(|_| SseEvent::default().comment("event serialize error"));
-        Ok::<_, Infallible>(sse)
-    });
+    let source = FileTailRunSource::open(&store.events_path(run_id)).await?;
+    let mut namers = crate::codename_legacy::EventNamers::new(store);
+    let stream = source.map(move |ev| Ok::<_, Infallible>(sse_frame(&mut namers, &ev)));
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// One SSE frame for `ev`. An agent-announcing event without a codename (a
+/// legacy run) is re-serialized with a derived one + `codename_derived: true`;
+/// every other event is serialized exactly as before.
+fn sse_frame(namers: &mut crate::codename_legacy::EventNamers, ev: &Event) -> SseEvent {
+    let framed = match namers.fill_typed(ev) {
+        Some(row) => SseEvent::default().json_data(&row),
+        None => SseEvent::default().json_data(ev),
+    };
+    framed.unwrap_or_else(|_| SseEvent::default().comment("event serialize error"))
 }
 
 /// An already-closed SSE stream for a run with no `events.jsonl` anywhere
@@ -90,14 +99,11 @@ pub async fn tail_all_events_sse(
     run_store: Arc<RunStore>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(256);
+    let mut namers = crate::codename_legacy::EventNamers::new(run_store.clone());
     let _coordinator = spawn_firehose_coordinator(run_store, tx, TERMINAL_FORWARDER_GRACE);
 
-    let stream = MergedEvents { rx }.map(|ev| {
-        let sse = SseEvent::default()
-            .json_data(&ev)
-            .unwrap_or_else(|_| SseEvent::default().comment("event serialize error"));
-        Ok::<_, Infallible>(sse)
-    });
+    let stream =
+        MergedEvents { rx }.map(move |ev| Ok::<_, Infallible>(sse_frame(&mut namers, &ev)));
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
@@ -218,6 +224,7 @@ mod tests {
     use rupu_orchestrator::runs::RunRecord;
     use std::collections::BTreeMap;
     use std::io::Write as _;
+    use std::path::PathBuf;
 
     fn seed_run(store: &RunStore, id: &str, status: RunStatus) -> RunRecord {
         let record = RunRecord {
