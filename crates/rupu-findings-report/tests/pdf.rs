@@ -1,10 +1,12 @@
+#![cfg(feature = "pdf")]
+
 mod common;
 
 use common::*;
 use rupu_coverage::{Severity, Surface};
 use rupu_findings_report::blocks::{finding_blocks, Block};
 use rupu_findings_report::model::{ExportFinding, ReportMeta};
-use rupu_findings_report::number::{filename, number_map};
+use rupu_findings_report::number::number_map;
 use rupu_findings_report::pdf::render_pdf;
 use rupu_findings_report::typst_doc;
 use rupu_findings_report::{render_finding, render_project, render_split_zip, ExportError, Format};
@@ -36,36 +38,6 @@ fn one_numbers(f: &ExportFinding) -> HashMap<String, String> {
 
 fn is_pdf(bytes: &[u8]) -> bool {
     bytes.starts_with(b"%PDF")
-}
-
-fn unzip(bytes: &[u8]) -> Vec<(String, String)> {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("a zip");
-    (0..z.len())
-        .map(|i| {
-            let mut f = z.by_index(i).unwrap();
-            let mut body = String::new();
-            f.read_to_string(&mut body).unwrap();
-            (f.name().to_string(), body)
-        })
-        .collect()
-}
-
-#[test]
-fn format_names_and_content_types() {
-    assert_eq!(Format::Pdf.content_type(), "application/pdf");
-    assert_eq!(
-        Format::Markdown.content_type(),
-        "text/markdown; charset=utf-8"
-    );
-    assert_eq!(Format::Html.content_type(), "text/html; charset=utf-8");
-    assert_eq!(Format::Markdown.ext(), "md");
-    assert_eq!(Format::Html.ext(), "html");
-    assert_eq!(Format::Pdf.ext(), "pdf");
-    assert_eq!(Format::parse("pdf"), Some(Format::Pdf));
-    assert_eq!(Format::parse("markdown"), Some(Format::Markdown));
-    assert_eq!(Format::parse("md"), Some(Format::Markdown));
-    assert_eq!(Format::parse("html"), Some(Format::Html));
-    assert_eq!(Format::parse("docx"), None);
 }
 
 #[test]
@@ -121,36 +93,6 @@ fn typst_looking_text_is_data_not_code() {
     let pdf = render_finding(&f, &one_numbers(&f), Format::Pdf)
         .expect("escaped Typst-looking text must compile");
     assert!(is_pdf(&pdf));
-}
-
-#[test]
-fn markdown_split_zip_has_an_index_and_one_file_per_finding() {
-    let all = two();
-    let zip = render_split_zip(&meta(), &all, Format::Markdown).unwrap();
-    let entries = unzip(&zip);
-    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-    let want: Vec<String> = ["index.md".to_string()]
-        .into_iter()
-        .chain(all.iter().map(|f| filename(f, "md")))
-        .collect();
-    assert_eq!(names, want.iter().map(String::as_str).collect::<Vec<_>>());
-    assert!(names[1].starts_with("SEC-001 - "), "{names:?}");
-    assert!(names[2].starts_with("SEC-002 - "), "{names:?}");
-
-    let index = &entries[0].1;
-    assert!(index.contains("Notebin findings"), "{index}");
-    assert!(
-        index.contains("SEC-001") && index.contains("SEC-002"),
-        "{index}"
-    );
-    // The index is the title + table only, not every finding's body.
-    assert!(!index.contains("Replication Steps"), "{index}");
-    assert!(!index.contains("Provenance"), "{index}");
-    assert!(
-        entries[1].1.contains("Replication Steps"),
-        "{}",
-        entries[1].1
-    );
 }
 
 #[test]

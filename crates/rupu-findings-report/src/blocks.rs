@@ -377,10 +377,13 @@ fn full_blocks(
         heading("Impact"),
         prose(r.impact.clone()),
         heading("Location"),
-        Block::Fields(vec![
-            kv("Input", r.location.input.clone()),
-            kv("Output", r.location.output.clone()),
-        ]),
+        // Markdown per the report schema (both are usually code spans), so
+        // prose, not plain-text fields.
+        prose(format!(
+            "**Input:** {}\n\n**Output:** {}",
+            r.location.input.trim(),
+            r.location.output.trim()
+        )),
         heading("Root Cause"),
         prose(r.root_cause.clone()),
         heading("Call Chain / Attack Flow"),

@@ -531,3 +531,22 @@ fn a_hop_cannot_start_a_block_from_its_label_gate_or_reason() {
     );
     assert!(!steps[0].contains('\n'));
 }
+
+#[test]
+fn location_is_markdown_prose_not_plain_text_fields() {
+    let blocks = with_report(|r| {
+        r.location.input = "  `GET /api/notes/{id}` path parameter `id`.\n".into();
+        r.location.output = "The JSON body, including `title`.".into();
+    });
+    assert_eq!(
+        after_heading(&blocks, "Location"),
+        [Block::Prose(
+            "**Input:** `GET /api/notes/{id}` path parameter `id`.\n\n\
+             **Output:** The JSON body, including `title`."
+                .into()
+        )]
+    );
+    // No plain-text Fields block carries the Input/Output labels any more.
+    assert_eq!(fields(&blocks, "Input"), None);
+    assert_eq!(fields(&blocks, "Output"), None);
+}

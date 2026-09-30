@@ -111,12 +111,12 @@ pub fn md_to_html(md: &str) -> String {
     out
 }
 
-/// Nesting the Typst converter will actually emit. Typst refuses a document
-/// whose show rules or parse tree nest too deep ("maximum show rule depth
-/// exceeded" at roughly 4 block quotes per 16 levels of `>`, or ~100 nested
-/// emphasis runs), so a pathological `> > > …` or `*_*_…` would make the
-/// whole report fail to compile. Past these budgets the wrapper is dropped
-/// and its text is kept: the words survive, only the extra styling is lost.
+/// How deep the Typst converter lets quotes and emphasis nest. Typst refuses
+/// a document whose show rules or parse tree nest too deep ("maximum show rule
+/// depth exceeded" / "maximum parsing depth exceeded"): measured, that starts
+/// at about 13-16 nested block quotes, or 60-100 nested emphasis runs, and it
+/// fails the whole report. Past these budgets the wrapper is dropped and its
+/// text is kept, so the words survive and only the extra styling is lost.
 const MAX_QUOTE_DEPTH: usize = 4;
 const MAX_INLINE_DEPTH: usize = 24;
 
@@ -487,12 +487,9 @@ mod tests {
 
         let em = format!("{}deepem{}", "*a _b ".repeat(100), " b_ a*".repeat(100));
         let t = md_to_typst(&em);
-        assert!(
-            t.matches("#emph[").count() <= MAX_INLINE_DEPTH,
-            "{}",
-            t.matches("#emph[").count()
-        );
-        assert_eq!(t.matches('[').count(), t.matches(']').count(), "{t}");
+        assert_eq!(t.matches("#emph[").count(), MAX_INLINE_DEPTH, "{t}");
+        assert_eq!(t.matches('[').count(), MAX_INLINE_DEPTH, "{t}");
+        assert_eq!(t.matches(']').count(), MAX_INLINE_DEPTH, "{t}");
         assert!(t.contains("deepem"), "{t}");
     }
 }

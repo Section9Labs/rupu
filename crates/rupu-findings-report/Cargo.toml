@@ -15,10 +15,17 @@ serde_json.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 pulldown-cmark.workspace = true
-typst.workspace = true
-typst-pdf.workspace = true
-typst-layout.workspace = true
-typst-assets.workspace = true
 zip.workspace = true
+typst = { workspace = true, optional = true }
+typst-pdf = { workspace = true, optional = true }
+typst-layout = { workspace = true, optional = true }
+typst-assets = { workspace = true, optional = true }
+
+[features]
+# In-process PDF export (embeds Typst and its bundled fonts, roughly +50 MB in
+# a release binary). Without it every other export still works and
+# `Format::Pdf` returns `ExportError::PdfUnavailable`.
+default = ["pdf"]
+pdf = ["dep:typst", "dep:typst-pdf", "dep:typst-layout", "dep:typst-assets"]
 
 [dev-dependencies]

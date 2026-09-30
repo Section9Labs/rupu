@@ -65,8 +65,12 @@ fn is_bidi_control(c: char) -> bool {
     )
 }
 
-pub fn filename(f: &ExportFinding, ext: &str) -> String {
-    let cleaned: String = title(f)
+/// `s` as one safe file-name component: whitespace runs (including newlines)
+/// become a single space, and path separators, Windows-reserved characters,
+/// control characters and bidi controls are dropped. A dropped `/` or `\`
+/// means no `..` segment can survive as a path component.
+fn clean_component(s: &str) -> String {
+    let cleaned: String = s
         .chars()
         // Whitespace (including newlines/tabs) becomes a space *before* control
         // characters are stripped, so "a\nb" reads "a b", not "ab".
@@ -77,9 +81,28 @@ pub fn filename(f: &ExportFinding, ext: &str) -> String {
                 && !is_bidi_control(*c)
         })
         .collect();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Longest finding number (in chars) a file name will carry.
+const MAX_NUMBER_CHARS: usize = 40;
+
+/// The suggested file name: `<number> - <title>.<ext>`. Both the title and
+/// the number are cleaned: the number is caller-supplied, so it must not be
+/// able to smuggle a path (`../../x`) into a download or zip entry name.
+pub fn filename(f: &ExportFinding, ext: &str) -> String {
+    let number: String = clean_component(&f.number)
+        .trim_start_matches('.')
+        .chars()
+        .take(MAX_NUMBER_CHARS)
+        .collect();
+    let number = match number.trim() {
+        "" => "finding",
+        n => n,
+    };
+    let collapsed = clean_component(title(f));
     let short: String = collapsed.chars().take(80).collect();
-    format!("{} - {}.{ext}", f.number, short.trim_end())
+    format!("{number} - {}.{ext}", short.trim_end())
 }
 
 #[cfg(test)]
@@ -187,6 +210,35 @@ mod tests {
         assert_eq!(
             filename(&f, "md"),
             format!("SEC-001 - {}.md", "x".repeat(80))
+        );
+    }
+
+    #[test]
+    fn filename_cleans_a_hostile_number_like_the_title() {
+        let mut f = assign_numbers(
+            vec![input(
+                "a",
+                rec("fnd_x", Severity::High, "2026-01-01T00:00:00Z"),
+            )],
+            "SEC",
+        )
+        .remove(0);
+        for (number, want) in [
+            ("../../evil", "evil - Summary of fnd_x.md"),
+            ("a/b\\c", "abc - Summary of fnd_x.md"),
+            ("C:\\win\\x", "Cwinx - Summary of fnd_x.md"),
+            ("..", "finding - Summary of fnd_x.md"),
+            ("", "finding - Summary of fnd_x.md"),
+            ("  SEC \n 7 \u{202e}", "SEC 7 - Summary of fnd_x.md"),
+            ("SEC.001", "SEC.001 - Summary of fnd_x.md"),
+        ] {
+            f.number = number.to_string();
+            assert_eq!(filename(&f, "md"), want, "number {number:?}");
+        }
+        f.number = "N".repeat(500);
+        assert_eq!(
+            filename(&f, "md"),
+            format!("{} - Summary of fnd_x.md", "N".repeat(MAX_NUMBER_CHARS))
         );
     }
 }
