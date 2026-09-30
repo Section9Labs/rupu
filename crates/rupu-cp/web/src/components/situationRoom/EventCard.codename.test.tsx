@@ -8,7 +8,7 @@ import { afterEach, describe, it, expect } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import EventCard from './EventCard';
-import { cardFromEvent } from '../../lib/situationRoom/cards';
+import { agentUnitIndex, cardFromEvent, unitKeyIndex } from '../../lib/situationRoom/cards';
 import { crewTint } from '../../lib/codename';
 import type { AgentStartedEvent, StepStartedEvent, UnitStartedEvent } from '../../lib/api';
 
@@ -77,6 +77,30 @@ describe('EventCard — codenames', () => {
     const stored: StepStartedEvent = { ...derived, codename_derived: undefined };
     render(<MemoryRouter><EventCard card={cardFromEvent(stored, 1000, 'k')!} /></MemoryRouter>);
     expect((screen.getByText('heron · oracle').closest('[title]') as HTMLElement).className).not.toMatch(/opacity-60/);
+  });
+
+  it('pre-codename run with BOTH a derived unit_started and agent_started renders one card per unit', () => {
+    const unit: UnitStartedEvent = {
+      type: 'unit_started', run_id: 'run_L', step_id: 'fan', index: 0,
+      unit_key: 'a.rs', agent: 'triage', transcript_path: '/t/u0.jsonl',
+      codename: 'jade-reef/numbat#1', codename_derived: true,
+    };
+    const agent: AgentStartedEvent = {
+      type: 'agent_started', run_id: 'run_L', step_id: 'fan', unit_index: 0,
+      codename: 'jade-reef/numbat#1', codename_derived: true, agent: 'triage',
+      agent_run_id: 'ar', transcript_path: '/t/u0.jsonl',
+    };
+    const other: UnitStartedEvent = { ...unit, index: 1, codename: 'jade-reef/numbat#2' };
+    const evs = [unit, agent, other];
+    const ctx = { unitKeys: unitKeyIndex(evs), agentUnits: agentUnitIndex(evs) };
+    const cards = evs.map((e, i) => cardFromEvent(e, 1000, `k${i}`, ctx)).filter(Boolean);
+    // unit 0: only the agent_started card (muted, carrying the unit key);
+    // unit 1 has no agent_started, so its unit_started card stays.
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.badge).toBe('Agent');
+    expect(cards[0]!.codenameDerived).toBe(true);
+    expect(cards[0]!.unitKey).toBe('a.rs');
+    expect(cards[1]!.codename).toBe('jade-reef/numbat#2');
   });
 
   it('a stored-name unit_started stays suppressed (agent_started carries it)', () => {

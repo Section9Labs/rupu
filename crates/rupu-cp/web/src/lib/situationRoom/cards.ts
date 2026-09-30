@@ -138,6 +138,11 @@ export interface CardContext {
    *  agent_started card show the fan-out target its (suppressed, named)
    *  unit_started carried. */
   unitKeys?: ReadonlyMap<string, string>;
+  /** (run, step, unit index) of every unit-scoped agent_started, from
+   *  {@link agentUnitIndex}. A pre-codename run whose unit has BOTH a
+   *  unit_started and an agent_started (both named on read) renders only the
+   *  agent_started card — the same one-card-per-unit rule as a named run. */
+  agentUnits?: ReadonlySet<string>;
 }
 
 function unitKeyId(runId: string, stepId: string, index: number): string {
@@ -154,12 +159,32 @@ export function unitKeyIndex(events: Iterable<RunEvent>): Map<string, string> {
   return out;
 }
 
+/** Keys (see {@link CardContext.agentUnits}) of every unit-scoped
+ *  agent_started in `events`. */
+export function agentUnitIndex(events: Iterable<RunEvent>): Set<string> {
+  const out = new Set<string>();
+  for (const ev of events) {
+    if (!isKnownRunEvent(ev) || ev.type !== 'agent_started' || ev.unit_index == null) continue;
+    out.add(unitKeyId(ev.run_id, ev.step_id, ev.unit_index));
+  }
+  return out;
+}
+
 export function cardFromEvent(
   ev: RunEvent,
   ts: number,
   key: string,
   ctx?: CardContext,
 ): StreamCard | null {
+  if (
+    ctx?.agentUnits &&
+    isKnownRunEvent(ev) &&
+    ev.type === 'unit_started' &&
+    ev.codename_derived &&
+    ctx.agentUnits.has(unitKeyId(ev.run_id, ev.step_id, ev.index))
+  ) {
+    return null;
+  }
   let card = cardFromEventInner(ev, ts, key);
   if (!card || !ctx) return card;
   if (ctx.unitKeys && isKnownRunEvent(ev) && ev.type === 'agent_started' && ev.unit_index != null) {
