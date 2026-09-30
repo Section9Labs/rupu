@@ -1,0 +1,10 @@
+---
+source: crates/rupu-cli/src/output/live_view/layout.rs
+expression: render_plain(&rows)
+---
+  ✓ report · heron#1 · reporter · anthropic/claude-opus-5-5 ···· ✓ 18s
+  ◐ approve · gate ···· ◐ running
+  ◐ review · panel iter 2/5 ···· ◐ running
+▸ ◐ scan · otter#2 · scanner · openai/gpt-5 ···· ◐ running
+    ┣━ ✓ wren#1 · triage · anthropic/claude-haiku-4-5
+    ┗━ ◐ lynx#3 · prober · anthropic/claude-sonnet-5-5
