@@ -29,6 +29,7 @@ chrono.workspace = true
 ulid.workspace = true
 glob.workspace = true
 sha2.workspace = true
+rustix.workspace = true
 quick-xml = { workspace = true, optional = true }
 
 [dev-dependencies]

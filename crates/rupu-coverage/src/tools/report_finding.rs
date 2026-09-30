@@ -244,32 +244,23 @@ fn append_line(
 
 /// Whether a lock error means the filesystem cannot lock at all, rather than
 /// a failure to report: `ErrorKind::Unsupported` (`ENOSYS`, `EOPNOTSUPP`),
-/// `ENOLCK`, and `ENOTSUP` where it differs from `EOPNOTSUPP`.
+/// or one of [`no_lock_errnos`].
 fn lock_unsupported(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::Unsupported
         || e.raw_os_error()
-            .is_some_and(|n| NO_LOCK_ERRNOS.contains(&n))
+            .is_some_and(|n| no_lock_errnos().contains(&n))
 }
 
-/// `ENOLCK`, `ENOTSUP` and `EOPNOTSUPP`: on Apple platforms, and on Linux
-/// for the architectures that use the generic errno table. Other targets
-/// rely on `ErrorKind::Unsupported` alone.
-const NO_LOCK_ERRNOS: &[i32] = if cfg!(target_vendor = "apple") {
-    &[77, 45, 102]
-} else if cfg!(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64"
-    )
-)) {
-    &[37, 95]
-} else {
-    &[]
-};
+/// `ENOLCK`, `ENOTSUP` and `EOPNOTSUPP` on this platform (the last two are
+/// the same number on Linux).
+fn no_lock_errnos() -> [i32; 3] {
+    use rustix::io::Errno;
+    [
+        Errno::NOLCK.raw_os_error(),
+        Errno::NOTSUP.raw_os_error(),
+        Errno::OPNOTSUPP.raw_os_error(),
+    ]
+}
 
 /// Whether [`prepare_full_report`] records the SHA-256 of each evidence
 /// claim's file.
@@ -1116,7 +1107,7 @@ mod tests {
         })
         .expect("unsupported locking falls back to an unlocked append");
         let mut expected = "{\"n\":1}\n".to_string();
-        for &errno in NO_LOCK_ERRNOS {
+        for errno in no_lock_errnos() {
             append_line(&paths, b"{\"n\":2}\n", |_| {
                 Err(Error::from_raw_os_error(errno))
             })
