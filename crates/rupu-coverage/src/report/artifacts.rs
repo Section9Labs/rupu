@@ -87,7 +87,7 @@ impl Drop for TempFile {
 }
 
 /// SHA-256 of a file's contents, streamed.
-pub(crate) fn sha256_file(p: &Path) -> std::io::Result<String> {
+pub fn sha256_file(p: &Path) -> std::io::Result<String> {
     sha256_file_counted(p).map(|(sha, _)| sha)
 }
 
@@ -128,6 +128,16 @@ impl ArtifactStore {
 
     pub fn blob_path(&self, sha256: &str) -> PathBuf {
         self.root.join(&sha256[..2.min(sha256.len())]).join(sha256)
+    }
+
+    /// Like `blob_path`, but only for a well-formed sha256 (64 lowercase hex).
+    /// Use this for any caller-supplied digest (e.g. an HTTP path segment).
+    pub fn blob_path_checked(&self, sha256: &str) -> Option<PathBuf> {
+        let ok = sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        ok.then(|| self.blob_path(sha256))
     }
 
     /// Resolve every requested path (expanding directories), check the whole
@@ -778,6 +788,20 @@ mod tests {
         assert!(
             matches!(&err, ArtifactError::Path { reason, .. } if reason.contains("workspace root")),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn blob_path_checked_rejects_non_hex_and_wrong_length() {
+        let s = ArtifactStore::new("/tmp/store");
+        assert!(s.blob_path_checked("").is_none());
+        assert!(s.blob_path_checked("../etc/passwd").is_none());
+        assert!(s.blob_path_checked(&"A".repeat(64)).is_none()); // uppercase
+        assert!(s.blob_path_checked(&"a".repeat(63)).is_none());
+        let ok = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            s.blob_path_checked(&ok).unwrap(),
+            std::path::PathBuf::from("/tmp/store").join("01").join(&ok)
         );
     }
 
