@@ -1,7 +1,7 @@
 # rupu agent codenames — design
 
 **Date:** 2026-09-29
-**Status:** Plan 1 (core + CLI) complete; Plan 2 (CP) pending
+**Status:** Plan 1 + Plan 2 complete
 **Scope:** `rupu-cli` + `rupu-cp` (web). The macOS app is deprecated and out of scope; all serde changes are additive so it keeps decoding.
 
 ## 1. Problem
