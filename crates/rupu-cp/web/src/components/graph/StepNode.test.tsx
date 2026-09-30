@@ -64,4 +64,16 @@ describe('StepNode', () => {
     expect(screen.getByText('security-reviewer')).toBeInTheDocument();
     expect(screen.queryByTestId('agent-pm')).toBeNull();
   });
+
+  it('renders a derived (legacy) codename muted, with the derived tooltip', () => {
+    renderNode({ agent: 'security-reviewer', codename: 'jade-reef/heron', codenameDerived: true });
+    const ident = screen.getByTestId('agent-identity');
+    expect(ident).toHaveClass('opacity-60');
+    expect(ident.getAttribute('title')).toMatch(/derived for a run recorded before codenames/);
+  });
+
+  it('renders a stored codename at full strength', () => {
+    renderNode({ agent: 'security-reviewer', codename: 'jade-reef/heron' });
+    expect(screen.getByTestId('agent-identity')).not.toHaveClass('opacity-60');
+  });
 });

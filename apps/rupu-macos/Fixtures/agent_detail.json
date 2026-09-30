@@ -19,10 +19,12 @@
     "input_tokens": 0,
     "output_tokens": 0,
     "cached_tokens": 0,
+    "cache_write_tokens": 0,
     "total_tokens": 0,
     "cost_usd": null,
     "priced": false,
-    "runs": 0
+    "runs": 0,
+    "partial": false
   },
   "run_count": 0,
   "last_run": null,

@@ -1229,6 +1229,7 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         into: None,
         tmp: false,
         run_id: None,
+        findings_profile: None,
     };
     let code = match crate::cmd::run::run_inner(args).await {
         Ok(()) => ExitCode::from(0),
@@ -1989,6 +1990,8 @@ mod tests {
                 provider: None,
             },
             declared_at: Utc::now(),
+            profile: rupu_coverage::FindingProfile::Summary,
+            report: None,
         }
     }
 

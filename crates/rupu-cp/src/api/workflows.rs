@@ -361,10 +361,19 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
     // the first row for that name in the already-sorted order — rather than
     // showing the same combined usage on every same-named row across
     // different repos. See the doc comment on `WorkflowDto::usage`.
-    let runs = s.run_store.list().unwrap_or_default();
-    let rollups = crate::usage::rollup_by(&s.run_store, &runs, &s.pricing, |r| {
-        Some(r.workflow_name.clone())
-    });
+    // The usage fold runs on the blocking pool; a failed fold leaves the rows
+    // without usage rather than failing the list.
+    let store = std::sync::Arc::clone(&s.run_store);
+    let pricing = s.pricing.clone();
+    let rollups = crate::usage::usage_blocking(
+        "workflow rollups",
+        move || {
+            let runs = store.list().unwrap_or_default();
+            crate::usage::rollup_by(&store, &runs, &pricing, |r| Some(r.workflow_name.clone()))
+        },
+        std::collections::BTreeMap::new,
+    )
+    .await;
     let mut canonical_row_for_name: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for (i, row) in rows.iter().enumerate() {
@@ -400,17 +409,26 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
 /// `DELETE /api/workflows/:name` independently resolves the SAME way (see
 /// [`resolve_workflow_scoped`]), so Delete always removes the file this page
 /// is actually showing when no explicit scope is passed.
-fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
+async fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
     let (path, _dir, scope, scope_kind, scope_id) = resolve_workflow_scoped(s, name)
         .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
     let yaml = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
     let workflow = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
 
     let runs = s.run_store.list().unwrap_or_default();
+    let run_ids: Vec<String> = runs
+        .into_iter()
+        .filter(|r| r.workflow_name == name)
+        .map(|r| r.id)
+        .collect();
     let usage = crate::usage::rollup(
-        runs.iter()
-            .filter(|r| r.workflow_name == name)
-            .map(|r| crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing)),
+        crate::usage::summarize_runs_blocking(
+            std::sync::Arc::clone(&s.run_store),
+            run_ids,
+            s.pricing.clone(),
+        )
+        .await
+        .into_iter(),
     );
 
     Ok(Json(serde_json::json!({
@@ -427,7 +445,7 @@ async fn get_workflow(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    load_detail(&s, &name)
+    load_detail(&s, &name).await
 }
 
 /// Request body for `PUT /api/workflows/:name` and `POST /api/workflows`: the
@@ -510,7 +528,7 @@ async fn write_workflow(
     // checked identifier joined onto a trusted directory, so this can never
     // actually fire today; see `fs_safety::validate_within`'s doc comment.
     fs_safety::validate_within(&target, &dir)?;
-    load_detail(&s, &name)
+    load_detail(&s, &name).await
 }
 
 /// `POST /api/workflows` — create a new workflow. The name is taken from the
@@ -536,7 +554,7 @@ async fn create_workflow(
     std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
     fs_safety::write_atomic(&target, body.raw.as_bytes())
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    load_detail(&s, &name)
+    load_detail(&s, &name).await
 }
 
 /// `POST /api/workflows/validate` — stateless parse-check of a raw workflow
@@ -2516,10 +2534,12 @@ mod tests {
                 input_tokens: 5000,
                 output_tokens: 1200,
                 cached_tokens: 300,
+                cache_write_tokens: 0,
                 total_tokens: 6500,
                 cost_usd: Some(0.42),
                 priced: true,
                 runs: 5,
+                partial: false,
             },
             run_count: 5,
             last_run: Some("2026-08-20T12:00:00+00:00".into()),
@@ -2551,10 +2571,12 @@ mod tests {
             input_tokens: 5000,
             output_tokens: 1200,
             cached_tokens: 300,
+            cache_write_tokens: 0,
             total_tokens: 6500,
             cost_usd: Some(0.42),
             priced: true,
             runs: 5,
+            partial: false,
         };
         // Mirrors `load_detail`'s `json!` shape exactly.
         let value = serde_json::json!({

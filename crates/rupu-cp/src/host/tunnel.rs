@@ -19,13 +19,13 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
-        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        RunListQuery,
+        blocking_host, mirror_get_run, mirror_list_runs, mirror_stream_run_events,
+        read_transcript_file, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
+        HostInfo, RunListQuery,
     },
     launcher::LaunchRequest,
     node::{
-        protocol::{Frame, RunSpec, RunSpecKind},
+        protocol::{Frame, RunSpec, RunSpecKind, CAP_AGENT_FINDINGS_PROFILE},
         NodeMirror, NodeRegistry,
     },
     session_sender::SendMessageRequest,
@@ -109,6 +109,7 @@ impl HostConnector for TunnelHostConnector {
             prompt: None,
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: None,
         };
 
         // Verify the node is reachable BEFORE creating the mirror run.
@@ -151,12 +152,28 @@ impl HostConnector for TunnelHostConnector {
             prompt: req.prompt.clone(),
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: req.findings_profile,
         };
 
         // Verify the node is reachable BEFORE creating the mirror run.
         // This prevents an offline node from leaving an uncancellable Running
         // record with no executor attached.
         let conn = self.live_conn()?;
+
+        // A node that predates `RunSpec.findings_profile` would deserialize
+        // the frame, drop the field, and run the agent under its own
+        // frontmatter profile. Refuse before creating the mirror run instead.
+        if let Some(profile) = req.findings_profile {
+            if !conn.supports(CAP_AGENT_FINDINGS_PROFILE) {
+                return Err(HostConnectorError::Unsupported(format!(
+                    "node {} (rupu {}) does not support findings_profile on agent \
+                     launches, so this run cannot be held to the `{profile}` profile; \
+                     upgrade rupu on that node",
+                    self.node_id,
+                    conn.rupu_version().unwrap_or("unknown version"),
+                )));
+            }
+        }
 
         self.mirror
             .create_run(&run_id, &self.node_id, &spec)
@@ -205,11 +222,22 @@ impl HostConnector for TunnelHostConnector {
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        mirror_list_runs(&self.run_store, &self.node_id, &params, &self.pricing)
+        let (store, id, pricing) = (
+            Arc::clone(&self.run_store),
+            self.node_id.clone(),
+            self.pricing.clone(),
+        );
+        blocking_host(move || mirror_list_runs(&store, &id, &params, &pricing)).await
     }
 
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-        mirror_get_run(&self.run_store, &self.node_id, run_id, &self.pricing)
+        let (store, id, pricing) = (
+            Arc::clone(&self.run_store),
+            self.node_id.clone(),
+            self.pricing.clone(),
+        );
+        let run_id = run_id.to_string();
+        blocking_host(move || mirror_get_run(&store, &id, &run_id, &pricing)).await
     }
 
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {

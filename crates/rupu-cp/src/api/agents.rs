@@ -491,6 +491,53 @@ struct AgentDetailDto {
     raw: String,
 }
 
+/// Every local spend source's usage rows, for the per-agent rollup, plus
+/// each agent's most recent contributing start (RFC-3339). Blocking IO.
+///
+/// Workflow runs come from the one fold (`crate::usage::run_usage` —
+/// ledger-first, cached process-wide); standalone agent runs and session
+/// turns from [`crate::usage_sources::unclaimed_extra_sources`] (each
+/// transcript once: a transcript a workflow run claims is never also a
+/// standalone source). Each `UsageRow` (one per `(provider, model, agent)`)
+/// names the agent its transcript ran — for a standalone run, its own
+/// agent, and each dispatched child's agent for the child's share. `last_run`
+/// is folded from the SAME rows, the run's start as the candidate time.
+fn agent_usage_rows(
+    store: &rupu_orchestrator::runs::RunStore,
+    global: &std::path::Path,
+) -> (
+    Vec<rupu_transcript::UsageRow>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
+    let mut last_runs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut add = |rows: Vec<rupu_transcript::UsageRow>, at: Option<String>| {
+        if let Some(at) = at {
+            for row in rows.iter().filter(|r| !r.agent.is_empty()) {
+                last_runs
+                    .entry(row.agent.clone())
+                    .and_modify(|cur| {
+                        if *cur < at {
+                            *cur = at.clone();
+                        }
+                    })
+                    .or_insert_with(|| at.clone());
+            }
+        }
+        all_rows.extend(rows);
+    };
+    for r in store.list().unwrap_or_default() {
+        let rows = crate::usage::run_usage(store, &r.id).rows.clone();
+        add(rows, Some(r.started_at.to_rfc3339()));
+    }
+    for src in crate::usage_sources::unclaimed_extra_sources(global, store) {
+        let rows = crate::usage::transcripts_usage(&src.paths).rows.clone();
+        add(rows, src.started_at.map(|t| t.to_rfc3339()));
+    }
+    (all_rows, last_runs)
+}
+
 /// `GET /api/agents` — global agent definitions plus one representative
 /// workspace per distinct repo among the registered projects'
 /// `<path>/.rupu/agents/*.md` (see [`distinct_repo_workspaces`]), sorted by
@@ -564,44 +611,16 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     // already-sorted order) rather than duplicating it onto every same-named
     // row. See the doc comment on `AgentDto::usage`.
     //
-    // Single pass over the run store: each run's own transcripts are
-    // aggregated exactly once. The resulting `UsageRow`s feed straight into
-    // `all_rows` for `breakdown` (which re-groups by agent name and sums —
-    // whether the rows arrive pre-merged from one combined `aggregate` call
-    // over every path, or concatenated from one `aggregate` call per run, the
-    // per-key sums `breakdown` produces are identical, since token/run counts
-    // are strictly additive and every transcript still lands in exactly one
-    // run's batch). `last_run` is folded from the SAME per-run rows (their
-    // `agent` field names who the run's usage attributes to; `run.started_at`
-    // is the candidate timestamp) instead of a second re-aggregation pass
-    // that re-walks every run's transcripts a second time over the exact
-    // same files `all_rows` had just read.
-    let runs = s.run_store.list().unwrap_or_default();
-    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
-    let mut last_runs: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for r in &runs {
-        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
-        if paths.is_empty() {
-            continue;
-        }
-        let rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
-        let at = r.started_at.to_rfc3339();
-        for row in &rows {
-            if row.agent.is_empty() {
-                continue;
-            }
-            last_runs
-                .entry(row.agent.clone())
-                .and_modify(|cur| {
-                    if *cur < at {
-                        *cur = at.clone();
-                    }
-                })
-                .or_insert_with(|| at.clone());
-        }
-        all_rows.extend(rows);
-    }
+    // Every local spend source feeds `breakdown` (see `agent_usage_rows`),
+    // which re-groups by agent name — the same rows `/api/usage` groups, so
+    // an agent's usage here matches `/api/usage?group_by=agent`.
+    let (all_rows, last_runs) = {
+        let store = Arc::clone(&s.run_store);
+        let global = s.global_dir.clone();
+        tokio::task::spawn_blocking(move || agent_usage_rows(&store, &global))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     let breakdown = crate::usage::breakdown(&all_rows, &s.pricing, crate::usage::GroupBy::Agent);
 
     let mut canonical_dto_for_name: std::collections::HashMap<String, usize> =
@@ -623,10 +642,12 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 input_tokens: b.input_tokens,
                 output_tokens: b.output_tokens,
                 cached_tokens: b.cached_tokens,
+                cache_write_tokens: b.cache_write_tokens,
                 total_tokens: b.total_tokens,
                 cost_usd: b.cost_usd,
                 priced: b.priced,
                 runs: b.runs,
+                partial: false,
             };
             dto.run_count = b.runs;
             dto.last_run = last_runs.get(&name).cloned();
@@ -806,6 +827,19 @@ struct AgentRunBody {
     scope_kind: Option<String>,
     #[serde(default)]
     scope_id: Option<String>,
+    /// Optional `full` | `summary` — `rupu run --findings-profile`, overriding
+    /// the agent's `findingsProfile`. Honoured on both the local and the
+    /// remote-proxy path. `String` for the same reason as `scope_kind`: an
+    /// unknown value is a handler-controlled 400.
+    #[serde(default)]
+    findings_profile: Option<String>,
+}
+
+fn parse_findings_profile(
+    raw: Option<&str>,
+) -> Result<Option<rupu_coverage::FindingProfile>, ApiError> {
+    raw.map(|s| s.parse().map_err(ApiError::bad_request))
+        .transpose()
 }
 
 /// Testable core: map the body + a concrete launcher to a run id.
@@ -814,6 +848,7 @@ async fn run_agent_with(
     body: AgentRunBody,
     launcher: Arc<dyn AgentLauncher>,
 ) -> Result<String, ApiError> {
+    let findings_profile = parse_findings_profile(body.findings_profile.as_deref())?;
     let req = AgentLaunchRequest {
         codename: None,
         agent: name.to_string(),
@@ -822,6 +857,7 @@ async fn run_agent_with(
         target: body.target,
         working_dir: body.working_dir,
         run_id: None,
+        findings_profile,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -952,6 +988,7 @@ async fn run_agent(
         // Remote: scope fields, if present, are silently ignored — see this
         // function's doc comment. The request proceeds exactly as it would
         // with no scope fields at all.
+        let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
             codename: None,
@@ -961,10 +998,13 @@ async fn run_agent(
             target: b.target,
             working_dir: b.working_dir,
             run_id: None,
+            findings_profile,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            // e.g. the host can't honour `findings_profile` — refused, not failed.
+            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
             other => ApiError::internal(other.to_string()),
         })?;
         return Ok(Json(
@@ -1195,6 +1235,7 @@ mod tests {
             host: None,
             scope_kind: None,
             scope_id: None,
+            findings_profile: None,
         };
         let run_id = run_agent_with("triage", body, mock.clone())
             .await
@@ -1204,6 +1245,40 @@ mod tests {
         assert_eq!(got.agent, "triage");
         assert_eq!(got.prompt.as_deref(), Some("do it"));
         assert_eq!(got.working_dir.as_deref(), Some("/tmp/p"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_the_findings_profile() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body = AgentRunBody {
+            findings_profile: Some("summary".into()),
+            ..AgentRunBody::default()
+        };
+        run_agent_with("sec", body, mock.clone()).await.expect("ok");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            got.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_an_unknown_findings_profile_before_launching() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body = AgentRunBody {
+            findings_profile: Some("verbose".into()),
+            ..AgentRunBody::default()
+        };
+        let err = run_agent_with("sec", body, mock.clone())
+            .await
+            .expect_err("unknown profile must be refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("`full` or `summary`"), "{}", err.1);
+        assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
     }
 
     #[tokio::test]
@@ -1263,6 +1338,7 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
+            findings_profile: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1300,6 +1376,7 @@ mod tests {
             host: None,
             scope_kind: None,
             scope_id: None,
+            findings_profile: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1338,6 +1415,7 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1380,6 +1458,7 @@ mod tests {
             host: Some(host.id.clone()),
             scope_kind: Some("project".into()),
             scope_id: Some("ws_unknown_locally".into()),
+            findings_profile: None,
         };
         let resp = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1430,6 +1509,7 @@ mod tests {
             host: None,
             scope_kind: Some("global".into()),
             scope_id: None,
+            findings_profile: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1471,6 +1551,7 @@ mod tests {
             host: None,
             scope_kind: Some("global".into()),
             scope_id: None,
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1500,6 +1581,7 @@ mod tests {
             host: None,
             scope_kind: Some("bogus".into()),
             scope_id: None,
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1530,6 +1612,7 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_missing".into()),
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -2708,8 +2791,8 @@ mod tests {
     }
 
     /// Write a single-event transcript (`RunStart` only, no `Usage` events) so
-    /// `rupu_transcript::aggregate` emits exactly one zero-token row for
-    /// `agent`, bumping that row's `runs` by 1.
+    /// the usage fold emits exactly one zero-token row for `agent`, bumping
+    /// that row's `runs` by 1.
     fn write_agent_transcript(path: &std::path::Path, agent: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let ev = rupu_transcript::Event::RunStart {
@@ -3000,10 +3083,12 @@ mod tests {
                 input_tokens: 5000,
                 output_tokens: 1200,
                 cached_tokens: 300,
+                cache_write_tokens: 0,
                 total_tokens: 6500,
                 cost_usd: Some(0.42),
                 priced: true,
                 runs: 3,
+                partial: false,
             },
             run_count: 3,
             last_run: Some("2026-08-20T12:00:00+00:00".into()),

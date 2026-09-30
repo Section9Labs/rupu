@@ -21,7 +21,7 @@ use object_store::{
 
 use super::{
     BucketError, Bucket,
-    key_claim, key_control, key_finished, key_job, key_result,
+    key_claim, key_control, key_finished, key_job, key_result, key_worker_info,
     prefix_control, prefix_results,
 };
 
@@ -269,6 +269,25 @@ impl Bucket for ObjectStoreBucket {
             .map_err(|e| BucketError::Io(e.to_string()))?;
         Ok(())
     }
+
+    async fn put_worker_info(&self, worker_id: &str, body: &[u8]) -> Result<(), BucketError> {
+        let path = self.path(&key_worker_info(worker_id));
+        self.put_bytes(&path, body).await
+    }
+
+    async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
+        let mut metas = self.list_all(&self.path("nodes")).await?;
+        metas.sort_by(|a, b| a.location.cmp(&b.location));
+        let mut out = Vec::with_capacity(metas.len());
+        for m in metas {
+            if m.location.filename().is_some_and(|f| f.ends_with(".json")) {
+                if let Some(body) = self.get_bytes(&m.location).await? {
+                    out.push(body);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -314,6 +333,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(b.list_results("run_1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_info_put_list_roundtrip() {
+        let b = mem_bucket();
+        assert!(b.list_worker_info().await.unwrap().is_empty());
+        b.put_worker_info("node_b", b"{\"b\":1}").await.unwrap();
+        b.put_worker_info("node_a", b"{\"a\":1}").await.unwrap();
+        // Overwrite, not append.
+        b.put_worker_info("node_a", b"{\"a\":2}").await.unwrap();
+        assert_eq!(
+            b.list_worker_info().await.unwrap(),
+            vec![b"{\"a\":2}".to_vec(), b"{\"b\":1}".to_vec()]
+        );
+        // Worker markers are not jobs.
+        assert!(b.list_jobs().await.unwrap().is_empty());
     }
 
     #[tokio::test]

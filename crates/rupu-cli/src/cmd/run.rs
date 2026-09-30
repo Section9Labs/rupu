@@ -60,6 +60,26 @@ pub struct Args {
     /// Pre-assign the run id (so a caller can reference the run before it starts).
     #[arg(long)]
     pub run_id: Option<String>,
+    /// Findings contract for this run (`full` | `summary`), overriding the
+    /// agent's `findingsProfile`. A placed workflow unit's coordinator
+    /// passes its step's resolved profile this way.
+    #[arg(long, value_name = "PROFILE", value_parser = parse_findings_profile)]
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
+}
+
+fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
+    s.parse()
+}
+
+/// The standalone run's findings profile: `--findings-profile` → the agent's
+/// `findingsProfile` → `full`. The flag sits in the step slot of
+/// [`rupu_coverage::FindingProfile::resolve`] — it is how a placed unit's
+/// step/workflow-default override reaches the host that runs the agent.
+fn resolve_findings_profile(
+    flag: Option<rupu_coverage::FindingProfile>,
+    agent: Option<rupu_coverage::FindingProfile>,
+) -> rupu_coverage::FindingProfile {
+    rupu_coverage::FindingProfile::resolve(flag, None, agent)
 }
 
 /// `rupu run <agent> [target] [prompt] …` — OR `rupu run pause|resume
@@ -645,6 +665,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let auth_hint = spec.auth;
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+            anthropic_prompt_cache: spec.anthropic_prompt_cache,
             openai_compatible: oai_params,
             tuning: Some(provider_factory::provider_tuning(
                 &provider_name,
@@ -790,6 +811,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // through — bare `rupu run` uses the `LineStreamPrinter`, which
         // renders dispatch children post-hoc from the parent transcript's
         // tool_call/tool_result entries rather than tailing `events.jsonl`.
+        let findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
         let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
             global.clone(),
             project_root.clone(),
@@ -805,6 +827,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             provider_factory::openai_compatible_map(&cfg.providers),
             provider_factory::provider_tuning_map(&cfg.providers),
             provider_factory::resolve_kind_map(&cfg.providers),
+            findings_base.clone(),
+            // Standalone `rupu run` has no workflow run ledger to charge;
+            // dispatched children are counted by the CP's fallback over
+            // sub-run transcripts.
+            None,
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -819,6 +846,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
         let tool_context = ToolContext {
+            findings: Some(findings_base.with_profile(resolve_findings_profile(
+                args.findings_profile,
+                spec.findings_profile,
+            ))),
             workspace_path: workspace_path.clone(),
             bash_env_allowlist: bash_allowlist,
             bash_timeout_secs: bash_timeout,
@@ -918,6 +949,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: spec.concerns.clone(),
             max_tokens: spec
                 .max_tokens
@@ -952,11 +984,25 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         {
             printer.step_start(&spec_name_for_printer, None, None, None);
             let mut tailer = crate::output::TranscriptTailer::new(&transcript_path_for_printer);
-            let mut total_tokens = 0u64;
+            // Live `⇡in ⇣out · $cost` status from the transcript's `Usage`
+            // events (TTY only — `usage_live` prints nothing to a pipe),
+            // then a priced closing footer.
+            let mut usage = LiveUsageTally::default();
+            let mut footer_printed = false;
 
             loop {
-                let events = tailer.drain();
-                for ev in events {
+                // Sampled BEFORE draining, so the drain below sees every
+                // event the finished task wrote — the closing `RunComplete`
+                // included — before the loop exits.
+                let finished = agent_task.is_finished();
+                for ev in tailer.drain() {
+                    if footer_printed {
+                        continue;
+                    }
+                    if usage.add(&cfg.pricing, &spec_name_for_printer, &ev) {
+                        printer.usage_live(usage.input, usage.output, usage.cost);
+                        continue;
+                    }
                     match &ev {
                         rupu_transcript::Event::AssistantMessage { content, .. }
                             if !content.trim().is_empty() =>
@@ -970,16 +1016,20 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                         }
                         rupu_transcript::Event::RunComplete {
                             status,
-                            total_tokens: tokens,
+                            total_tokens,
                             duration_ms,
                             error,
                             ..
                         } => {
-                            total_tokens = *tokens;
+                            footer_printed = true;
                             let dur = std::time::Duration::from_millis(*duration_ms);
                             match status {
                                 rupu_transcript::RunStatus::Ok => {
-                                    printer.step_done(&run_id_for_printer, dur, *tokens);
+                                    printer.step_done_priced(
+                                        &run_id_for_printer,
+                                        dur,
+                                        usage.footer(*total_tokens),
+                                    );
                                 }
                                 _ => {
                                     let reason = error.as_deref().unwrap_or("unknown");
@@ -989,26 +1039,18 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                         }
                         _ => {}
                     }
-                    // Once we see RunComplete, we can stop tailing.
-                    if matches!(ev, rupu_transcript::Event::RunComplete { .. }) {
-                        break;
-                    }
                 }
 
-                // Check if the agent task has finished.
-                if agent_task.is_finished() {
-                    // Drain any remaining events.
-                    let tail_events = tailer.drain();
-                    for ev in tail_events {
-                        if let rupu_transcript::Event::AssistantMessage { content, .. } = &ev {
-                            if !content.trim().is_empty() {
-                                render_assistant_output(&mut printer, content, prefs.live_view);
-                            }
-                        }
-                    }
-                    if total_tokens == 0 {
-                        // RunComplete wasn't seen yet; print a plain done.
-                        printer.step_done(&run_id_for_printer, std::time::Duration::ZERO, 0);
+                if finished {
+                    if !footer_printed {
+                        // The task ended without a `RunComplete` (an error
+                        // before the loop wrote one): close the frame with
+                        // whatever spend was seen.
+                        printer.step_done_priced(
+                            &run_id_for_printer,
+                            std::time::Duration::ZERO,
+                            usage.footer(0),
+                        );
                     }
                     break;
                 }
@@ -1299,6 +1341,69 @@ impl PermissionDecider for ReadonlyDecider {
     }
 }
 
+/// A `rupu run` agent's running spend, accumulated from the transcript
+/// `Usage` events the tail loop already reads — compaction summariser calls
+/// included, since they are billed. Each event is priced on its own
+/// provider/model (a mid-run model swap prices correctly) and cache read /
+/// write counts, with the agent as the pricing fallback key.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct LiveUsageTally {
+    input: u64,
+    output: u64,
+    /// Sum over priced events; `None` until one has a price.
+    cost: Option<f64>,
+}
+
+impl LiveUsageTally {
+    /// Fold `ev` in when it is a `Usage` event; `true` when it was.
+    fn add(
+        &mut self,
+        pricing: &rupu_config::PricingConfig,
+        agent: &str,
+        ev: &rupu_transcript::Event,
+    ) -> bool {
+        let rupu_transcript::Event::Usage {
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            cache_write_tokens,
+            ..
+        } = ev
+        else {
+            return false;
+        };
+        let (input, output, cached, cache_write) = (
+            u64::from(*input_tokens),
+            u64::from(*output_tokens),
+            u64::from(*cached_tokens),
+            u64::from(*cache_write_tokens),
+        );
+        self.input += input;
+        self.output += output;
+        if let Some(price) = rupu_config::pricing::lookup(pricing, provider, model, agent) {
+            self.cost =
+                Some(self.cost.unwrap_or(0.0) + price.cost_usd(input, output, cached, cache_write));
+        }
+        true
+    }
+
+    /// The closing footer's spend. `run_complete_tokens` (the transcript's
+    /// own total) stands in only when no `Usage` event was seen.
+    fn footer(&self, run_complete_tokens: u64) -> crate::output::printer::StepUsage {
+        let tokens = self.input + self.output;
+        crate::output::printer::StepUsage {
+            tokens: if tokens > 0 {
+                tokens
+            } else {
+                run_complete_tokens
+            },
+            cost: self.cost,
+        }
+    }
+}
+
 /// Ask: stdin-driven prompt for writers; readers always allowed.
 ///
 /// Prompts via [`rupu_agent::PermissionPrompt::for_stdio`], which writes
@@ -1370,6 +1475,138 @@ pub(crate) fn standalone_codename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn launch_args(argv: &[&str]) -> Result<Args, clap::Error> {
+        parse_launch_args(argv.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn findings_profile_flag_parses_in_either_position() {
+        use rupu_coverage::FindingProfile::{Full, Summary};
+        let args = launch_args(&["sec", "--findings-profile", "summary", "--prompt", "p"]).unwrap();
+        assert_eq!(args.findings_profile, Some(Summary));
+        let args = launch_args(&["--findings-profile", "full", "sec"]).unwrap();
+        assert_eq!(args.findings_profile, Some(Full));
+        assert_eq!(args.agent, "sec");
+        assert_eq!(launch_args(&["sec"]).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn findings_profile_flag_rejects_an_unknown_profile() {
+        let err = launch_args(&["sec", "--findings-profile", "brief"]).unwrap_err();
+        assert!(err.to_string().contains("`full` or `summary`"), "{err}");
+    }
+
+    #[test]
+    fn findings_profile_flag_beats_the_agent_frontmatter() {
+        use rupu_coverage::FindingProfile::{Full, Summary};
+        assert_eq!(resolve_findings_profile(Some(Full), Some(Summary)), Full);
+        assert_eq!(resolve_findings_profile(Some(Summary), Some(Full)), Summary);
+        assert_eq!(resolve_findings_profile(None, Some(Summary)), Summary);
+        assert_eq!(resolve_findings_profile(None, None), Full);
+    }
+
+    fn usage_event(
+        model: &str,
+        input: u32,
+        output: u32,
+        purpose: Option<&str>,
+    ) -> rupu_transcript::Event {
+        rupu_transcript::Event::Usage {
+            provider: "anthropic".into(),
+            model: model.into(),
+            served_model: None,
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            purpose: purpose.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn live_usage_tally_sums_every_usage_event_and_prices_each() {
+        // Built-in price: $3 in / $15 out per Mtok.
+        let pricing = rupu_config::PricingConfig::default();
+        let mut tally = LiveUsageTally::default();
+        assert!(tally.add(
+            &pricing,
+            "coder",
+            &usage_event("claude-sonnet-4-6", 1_000_000, 0, None)
+        ));
+        // A compaction summariser call is billed spend: it counts too.
+        assert!(tally.add(
+            &pricing,
+            "coder",
+            &usage_event("claude-sonnet-4-6", 0, 1_000_000, Some("compaction"))
+        ));
+        assert_eq!((tally.input, tally.output), (1_000_000, 1_000_000));
+        assert_eq!(tally.cost, Some(18.0));
+        assert_eq!(
+            tally.footer(0),
+            crate::output::printer::StepUsage {
+                tokens: 2_000_000,
+                cost: Some(18.0)
+            }
+        );
+    }
+
+    #[test]
+    fn live_usage_tally_prices_cache_writes_at_the_write_rate() {
+        // Sonnet 4.6 built-in: $3 in / $15 out, $0.30 read, $3.75 write.
+        // 1M prompt = 500k read + 300k write + 200k uncached; 100k output.
+        let pricing = rupu_config::PricingConfig::default();
+        let mut tally = LiveUsageTally::default();
+        let ev = rupu_transcript::Event::Usage {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            served_model: None,
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cached_tokens: 500_000,
+            cache_write_tokens: 300_000,
+            purpose: None,
+        };
+        assert!(tally.add(&pricing, "coder", &ev));
+        let want = 0.2 * 3.0 + 0.5 * 0.30 + 0.3 * 3.75 + 0.1 * 15.0;
+        assert!(
+            (tally.cost.unwrap() - want).abs() < 1e-9,
+            "{:?}",
+            tally.cost
+        );
+    }
+
+    #[test]
+    fn live_usage_tally_unpriced_model_is_dash_not_zero() {
+        let pricing = rupu_config::PricingConfig::default();
+        let mut tally = LiveUsageTally::default();
+        tally.add(
+            &pricing,
+            "coder",
+            &usage_event("nonesuch-model-9", 500, 20, None),
+        );
+        assert_eq!(tally.cost, None);
+        assert_eq!(tally.footer(0).tokens, 520);
+        // Non-usage events are ignored.
+        let other = rupu_transcript::Event::AssistantDelta {
+            content: "hi".into(),
+        };
+        assert!(!tally.add(&pricing, "coder", &other));
+    }
+
+    #[test]
+    fn live_usage_tally_footer_falls_back_to_run_complete_total() {
+        // A transcript that carried no `Usage` events still reports the
+        // `RunComplete` total — unpriced, never a made-up `$0.00`.
+        let tally = LiveUsageTally::default();
+        assert_eq!(
+            tally.footer(321),
+            crate::output::printer::StepUsage {
+                tokens: 321,
+                cost: None
+            }
+        );
+    }
 
     #[test]
     fn standalone_codename_derives_or_honours_env() {

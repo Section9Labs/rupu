@@ -38,6 +38,8 @@ export interface UnitView {
   agent?: string;
   /** Server-minted agent codename for this unit (checkpoint / unit_started / agent_started). */
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename run (render muted). */
+  codenameDerived?: boolean;
   /** Provider + model from the unit's `agent_started` (absent for placed units). */
   provider?: string;
   model?: string;
@@ -51,6 +53,7 @@ export interface ParallelSubView {
   state: StepState;
   agent?: string;
   codename?: string;
+  codenameDerived?: boolean;
   provider?: string;
   model?: string;
 }
@@ -68,6 +71,8 @@ export interface GraphNode {
   /** Server-minted codename for a linear step's agent. Fan-out / panel /
    *  parallel steps carry none — their instances live on `fanout.units`. */
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename run. */
+  codenameDerived?: boolean;
   /** Provider + model from the step's `agent_started` event. */
   provider?: string;
   model?: string;
@@ -113,6 +118,7 @@ function coerceItem(item: unknown): string {
 interface AgentIdentity {
   agent?: string;
   codename?: string;
+  codename_derived?: boolean;
   provider?: string;
   model?: string;
 }
@@ -121,18 +127,35 @@ interface AgentIdentity {
 function mergeIdentity(base: AgentIdentity | undefined, later: AgentIdentity): AgentIdentity {
   const out: AgentIdentity = { ...base };
   if (later.agent) out.agent = later.agent;
-  if (later.codename) out.codename = later.codename;
+  if (later.codename) {
+    out.codename = later.codename;
+    out.codename_derived = later.codename_derived;
+  }
   if (later.provider) out.provider = later.provider;
   if (later.model) out.model = later.model;
   return out;
 }
 
+interface Named {
+  codename?: string;
+  codenameDerived?: boolean;
+}
+
+/** Set a codename together with its derived flag (a stored name clears a
+ *  previously derived one). An absent codename leaves the target as is. */
+function setCodename(target: Named, codename: unknown, derived: unknown): void {
+  if (typeof codename !== 'string' || !codename) return;
+  target.codename = codename;
+  if (derived === true) target.codenameDerived = true;
+  else delete target.codenameDerived;
+}
+
 /** Overlay an agent_started identity; absent fields leave existing values. */
 function applyIdentity(
-  target: { codename?: string; provider?: string; model?: string },
+  target: Named & { provider?: string; model?: string },
   id: AgentIdentity,
 ): void {
-  if (id.codename) target.codename = id.codename;
+  setCodename(target, id.codename, id.codename_derived);
   if (id.provider) target.provider = id.provider;
   if (id.model) target.model = id.model;
 }
@@ -195,7 +218,7 @@ export function buildRunGraphModel(
     if (!node) continue;
 
     if (result.transcript_path != null) node.transcriptPath = result.transcript_path;
-    if (result.codename) node.codename = result.codename;
+    setCodename(node, result.codename, result.codename_derived);
     // Parallel steps persist one item per sub-step (`sub_id`) carrying the
     // instance's codename.
     if (node.parallel && Array.isArray(result.items)) {
@@ -204,7 +227,7 @@ export function buildRunGraphModel(
         const rec = item as Record<string, unknown>;
         if (typeof rec.sub_id !== 'string' || typeof rec.codename !== 'string' || !rec.codename) continue;
         const sub = node.parallel.find((s) => s.id === rec.sub_id);
-        if (sub) sub.codename = rec.codename;
+        if (sub) setCodename(sub, rec.codename, rec.codename_derived);
       }
     }
 
@@ -237,7 +260,7 @@ export function buildRunGraphModel(
       state: unitState,
       transcriptPath: cp.transcript_path,
     };
-    if (cp.codename) unit.codename = cp.codename;
+    setCodename(unit, cp.codename, cp.codename_derived);
     if (cp.agent) unit.agent = cp.agent;
     if (cp.provider) unit.provider = cp.provider;
     if (cp.model) unit.model = cp.model;
@@ -278,7 +301,7 @@ export function buildRunGraphModel(
         const node = nodeMap.get(ev.step_id);
         if (node) {
           node.state = 'running';
-          if (ev.type === 'step_started' && ev.codename) node.codename = ev.codename;
+          if (ev.type === 'step_started') setCodename(node, ev.codename, ev.codename_derived);
           // A running linear step has no persisted step_result yet, so its
           // transcript path arrives live on step_working — adopt it so the
           // panel can select and tail the file in real time.
@@ -319,7 +342,7 @@ export function buildRunGraphModel(
         const existing = units.get(ev.index);
         if (existing) {
           existing.state = 'running';
-          if (ev.codename) existing.codename = ev.codename;
+          setCodename(existing, ev.codename, ev.codename_derived);
           if (ev.agent) existing.agent = ev.agent;
         } else {
           const unit: UnitView = {
@@ -328,7 +351,7 @@ export function buildRunGraphModel(
             state: 'running',
             transcriptPath: ev.transcript_path,
           };
-          if (ev.codename) unit.codename = ev.codename;
+          setCodename(unit, ev.codename, ev.codename_derived);
           if (ev.agent) unit.agent = ev.agent;
           units.set(ev.index, unit);
         }
@@ -338,6 +361,7 @@ export function buildRunGraphModel(
         const id: AgentIdentity = {
           agent: ev.agent,
           codename: ev.codename,
+          codename_derived: ev.codename_derived,
           provider: ev.provider,
           model: ev.model,
         };

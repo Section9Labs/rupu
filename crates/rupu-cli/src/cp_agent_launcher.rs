@@ -12,7 +12,7 @@ pub struct SubprocessAgentLauncher {
 
 /// Build the argv (after the executable) for a `rupu run` invocation.
 ///
-/// Order: `run <agent> [<target>] --run-id <id> [--mode m] [--prompt <p>] [--tmp]`.
+/// Order: `run <agent> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--prompt <p>] [--tmp]`.
 /// The prompt is always passed via `--prompt` (never positionally) so it cannot
 /// be mis-parsed as a RunTarget when no target is present.
 /// `--tmp` is added when a target is present so a repo/PR clone lands in an
@@ -27,6 +27,10 @@ pub(crate) fn build_agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<St
     if let Some(m) = &req.mode {
         argv.push("--mode".to_string());
         argv.push(m.clone());
+    }
+    if let Some(f) = req.findings_profile {
+        argv.push("--findings-profile".to_string());
+        argv.push(f.as_str().to_string());
     }
     if let Some(p) = &req.prompt {
         argv.push("--prompt".to_string());
@@ -76,6 +80,7 @@ mod tests {
             target: Some("github:o/r".into()),
             working_dir: None,
             run_id: None,
+            findings_profile: None,
         };
         let argv = build_agent_argv(&req, "run_X");
         assert_eq!(
@@ -96,6 +101,40 @@ mod tests {
     }
 
     #[test]
+    fn argv_carries_the_findings_profile() {
+        let req = AgentLaunchRequest {
+            agent: "sec".into(),
+            prompt: Some("audit".into()),
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+            codename: None,
+        };
+        let argv = build_agent_argv(&req, "run_X");
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "sec",
+                "--run-id",
+                "run_X",
+                "--findings-profile",
+                "summary",
+                "--prompt",
+                "audit"
+            ]
+        );
+        // The argv must round-trip through the real `rupu run` parser.
+        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
+        assert_eq!(
+            args.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+    }
+
+    #[test]
     fn argv_minimal() {
         let req = AgentLaunchRequest {
             codename: None,
@@ -105,6 +144,7 @@ mod tests {
             target: None,
             working_dir: None,
             run_id: None,
+            findings_profile: None,
         };
         assert_eq!(
             build_agent_argv(&req, "run_X"),
@@ -122,6 +162,7 @@ mod tests {
             target: None,
             working_dir: None,
             run_id: None,
+            findings_profile: None,
         };
         assert_eq!(
             build_agent_argv(&req, "run_X"),

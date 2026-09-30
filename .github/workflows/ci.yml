@@ -114,6 +114,20 @@ jobs:
   # Now they are three parallel jobs, each with its own warm cache. Wall
   # clock is the slowest one rather than the sum.
   #
+  # Second pass (Sept 2026), measured on a warm cache:
+  #
+  #   3. `test` spent 16m20s compiling and ~70s running. The compile was
+  #      dominated by LINKING ~190 test binaries (every tests/*.rs file is
+  #      its own static binary) with full debuginfo through GNU ld. It now
+  #      links with mold, builds without debuginfo, and actually receives
+  #      CARGO_INCREMENTAL=0 — rust-cache exports that on the runner, but
+  #      it never reached the container.
+  #   4. release.yml had no cache at all and rebuilt every dependency cold
+  #      on every tag. `build` now doubles as the release cache warmer: it
+  #      runs the release's exact command in the release's exact target
+  #      dir, for both Linux architectures, under a key release.yml
+  #      restores. See the note on its rust-cache step.
+  #
   # Building the docker image is NOT the problem — measured at 20-25s, under
   # 1% of the job. It stays inline so the Dockerfile remains the single
   # source of truth. Publishing it to ghcr would buy ~20s and is not worth
@@ -124,9 +138,23 @@ jobs:
   # job at the bottom — renaming or removing it would silently un-gate main.
 
   linux-musl-build:
-    name: linux musl · build
-    runs-on: ubuntu-latest
+    name: linux musl · build (${{ matrix.platform }})
+    # Both architectures release.yml ships. arm64 used to be built for the
+    # first time at release, so an arch-specific break surfaced only there —
+    # and release.yml had no warm arm64 cache to restore.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    # NO job- or workflow-level CARGO*/RUST*/CC*/CFLAGS*/CXX*/CMAKE* env
+    # here: rust-cache hashes those into the key, and release.yml's linux job
+    # must compute the identical key to restore this cache.
     steps:
       - uses: actions/checkout@v5
 
@@ -140,12 +168,22 @@ jobs:
       # cached.
       #
       # `save-if` restricts writes to main. GitHub scopes caches so that a
-      # cache written on the default branch is readable from every branch,
-      # but not vice versa — so PRs restore main's cache and never thrash it.
+      # cache written on the default branch is readable from every branch —
+      # and from every tag — but not vice versa. So PRs restore main's cache
+      # and never thrash it, and release.yml's tag runs restore it too.
+      #
+      # This block is the RELEASE CACHE WARMER. release.yml's `linux` job has
+      # the same rust-cache inputs (prefix-key, shared-key, workspaces,
+      # cache-directories) and runs the same build command into the same
+      # target dir. `shared-key` rather than `key` is what makes that work:
+      # `key` is combined with the job id, which differs between the two
+      # workflows; `shared-key` replaces it. The runner OS + arch are
+      # appended automatically, so x64 and arm64 never collide. Change one
+      # side and the release silently goes back to building cold.
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: musl-build
-          key: ${{ hashFiles('docker/linux-build.Dockerfile', 'rust-toolchain.toml') }}
+          prefix-key: musl-release
+          shared-key: ${{ hashFiles('docker/linux-build.Dockerfile', 'rust-toolchain.toml') }}
           # This job builds into target/linux-musl, not target/. Pointing the
           # action at the wrong directory would let its pruning pass discard
           # precisely the artifacts we are trying to keep.
@@ -207,8 +245,36 @@ jobs:
     name: linux musl · test
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Set here rather than only on `docker run` so rust-cache hashes them
+    # into its key: each one changes every compiled artifact, and restoring
+    # a cache built without them would be restoring garbage. Passed through
+    # to the container by name (`-e NAME`) in the Test step.
+    #
+    #   RUSTFLAGS               link with mold (installed in the image). CI
+    #                           test binaries only — release binaries keep
+    #                           the default linker.
+    #   CARGO_PROFILE_DEV_DEBUG no debuginfo in test binaries. Nothing reads
+    #                           it in CI (RUST_BACKTRACE is unset), and it is
+    #                           most of what the linker has to chew through.
+    #   CARGO_INCREMENTAL       rust-cache exports 0 on the runner, but the
+    #                           container never saw it — so every run wrote
+    #                           incremental state that was then thrown away.
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
+      # Every test binary that links rupu-findings-report carries Typst and
+      # its bundled fonts, and with full debug info the target dir outgrows
+      # the runner's free disk. Reclaim the preinstalled SDKs this job never
+      # uses (the build runs in the musl container).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
 
       - name: Build the pinned musl image
         run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
@@ -221,11 +287,14 @@ jobs:
           cache-directories: ".cargo-musl"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Line tables only: panics and backtraces still name file:line, but
+      # the dozens of test binaries stop carrying full debug info.
       - name: Test
         run: |
           mkdir -p .cargo-musl
           docker run --rm -v "$PWD":/work -w /work \
             -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            -e RUSTFLAGS -e CARGO_PROFILE_DEV_DEBUG -e CARGO_INCREMENTAL \
             rupu-linux-build \
             cargo test --workspace --locked
 
@@ -237,6 +306,10 @@ jobs:
     name: linux musl · lint
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Same reason as the test job: rust-cache exports this on the runner
+    # only. Set at job level so it keys the cache; passed by name below.
+    env:
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
 
@@ -288,8 +361,19 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/work -w /work \
             -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            -e CARGO_INCREMENTAL \
             rupu-linux-build \
             cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # PDF export is a default-on `pdf` feature; everything above builds with
+      # it. This keeps the build without it (no Typst, no bundled fonts)
+      # compiling too.
+      - name: Check the CLI without PDF support
+        run: |
+          docker run --rm -v "$PWD":/work -w /work \
+            -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            rupu-linux-build \
+            cargo check -p rupu-cli --no-default-features --locked
 
       # Informational only: `main` carries a large number of rustfmt diff
       # sites predating this workflow. Promote to blocking once a dedicated
@@ -333,6 +417,38 @@ jobs:
             fi
           done
           echo "All linux musl jobs succeeded."
+
+  # ── darwin release-cache warmer ───────────────────────────────────────
+  #
+  # release.yml's darwin-arm64 build had no cache and compiled every
+  # dependency cold on every tag (~14 min). A tag run can restore a cache
+  # written on main, so this job writes one: the release's exact toolchain
+  # setup and build command, under the same rust-cache inputs as release.yml's
+  # `macos` job. Keep the two in lockstep — the steps before rust-cache too,
+  # since rust-cache hashes every installed toolchain and any CARGO*/RUST*
+  # env var into its key.
+  #
+  # Not run on pull requests: it would add a macOS runner (the scarce pool)
+  # to every PR to warm a cache PRs never write. On main it doubles as the
+  # first macOS compile of the Rust workspace, ahead of any release — and
+  # like every job here, a failure blocks release-beta.yml's green-CI gate.
+  darwin-release-build:
+    name: darwin-arm64 · release build
+    if: github.event_name != 'pull_request'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: darwin-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the CLI (release)
+        run: cargo build --release -p rupu-cli
+
   release-scripts:
     name: release cadence scripts
     runs-on: ubuntu-latest

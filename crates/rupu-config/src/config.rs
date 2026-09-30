@@ -71,6 +71,8 @@ pub struct Config {
     #[serde(default)]
     pub workflow: crate::policy_config::WorkflowConfig,
     #[serde(default)]
+    pub findings: crate::findings_config::FindingsConfig,
+    #[serde(default)]
     pub runtime: crate::runtime_config::RuntimeConfig,
 }
 

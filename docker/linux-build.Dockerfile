@@ -33,6 +33,10 @@ FROM rust:1.95-alpine3.21
 # bash: test fixtures write `#!/bin/sh` scripts, but a real shell makes
 #   debugging a failing build far easier.
 # nodejs, npm: `make cp-web` builds the embedded CP UI before a release.
+# mold: a fast linker, opted into ONLY by CI's test job (via RUSTFLAGS).
+#   `cargo test --workspace` links ~190 static test binaries, and GNU ld
+#   was most of that job's wall clock. Release binaries deliberately keep
+#   the default linker — nothing that ships is linked by mold.
 #
 # Deliberately NOT installed: dbus-dev. `keyring` was removed from the
 # workspace (PR #554) precisely so the Linux graph has no D-Bus
@@ -40,7 +44,7 @@ FROM rust:1.95-alpine3.21
 # `keyring` — fix that, do not add the package.
 RUN apk add --no-cache \
       musl-dev gcc g++ make perl cmake clang clang-dev \
-      pkgconf git file ripgrep bash nodejs npm
+      pkgconf git file ripgrep bash nodejs npm mold
 
 ENV CARGO_TERM_COLOR=always
 WORKDIR /work

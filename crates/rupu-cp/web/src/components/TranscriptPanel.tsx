@@ -20,6 +20,30 @@ import { AgentName } from './codename/AgentName';
 
 type LoadState = 'loading' | 'ready' | 'error';
 
+/**
+ * Combine the REST snapshot with the live SSE stream into one event list.
+ *
+ * The CP tailer replays the transcript file from byte 0 once per connection
+ * (then follows it), so the snapshot and the stream are each a PREFIX of the
+ * same event sequence — the stream is not "the events after the snapshot".
+ * Appending one to the other would render the whole backlog twice, so the
+ * longer prefix wins: the snapshot paints immediately, and once the stream has
+ * replayed past it the stream takes over (and keeps growing).
+ *
+ * ASSUMES the tailed transcript is append-only. "Longer wins" (and the
+ * reconnect replay buffer in the live-tail effect, which swaps a replay in
+ * only once it is at least as long as what is shown) is only right while
+ * every copy is a prefix of one growing file. If the file were REPLACED by
+ * shorter content (e.g. a mirror's authoritative rewrite that drops lines),
+ * both would keep showing the old, longer stream: the view freezes on stale
+ * events until the new file outgrows them. Today's rewrite (a host mirror's
+ * terminal pull) replaces a transcript with a superset of what was tailed, so
+ * this holds; a writer that could shrink one must also reset this view.
+ */
+export function mergeSnapshotAndStream<T>(snapshot: T[], stream: T[]): T[] {
+  return stream.length >= snapshot.length ? stream : snapshot;
+}
+
 export default function TranscriptPanel({
   path,
   live,
@@ -54,14 +78,18 @@ export default function TranscriptPanel({
    *  event. Allows the parent to trigger a reload on turn completion. */
   onComplete?: () => void;
 }) {
-  const [events, setEvents] = useState<TranscriptEvent[]>([]);
+  // The REST snapshot and the live SSE stream are kept apart: both start at
+  // byte 0 of the same file, so each is a prefix of the other (see
+  // `mergeSnapshotAndStream`). Rendering appends neither to the other.
+  const [snapshot, setSnapshot] = useState<TranscriptEvent[]>([]);
+  const [stream, setStream] = useState<TranscriptEvent[]>([]);
   const [state, setState] = useState<LoadState>('loading');
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [connected, setConnected] = useState(false);
   // Lines the server couldn't parse in the REST snapshot (absent on older
-  // servers, or when there were none). Live-tail SSE events append to the
-  // same event list but don't affect this count — the badge covers the
-  // snapshot only; torn tails are excluded server-side.
+  // servers, or when there were none). Live-tail SSE events don't affect this
+  // count — the badge covers the snapshot only; torn tails are excluded
+  // server-side.
   const [unparsed, setUnparsed] = useState<number | undefined>(undefined);
   // The coordinator could not collect the rest of this transcript from its
   // host (spec §4.2). Snapshot-only, like `unparsed` — live-tail SSE events
@@ -88,7 +116,8 @@ export default function TranscriptPanel({
   useEffect(() => {
     let cancelled = false;
     setState('loading');
-    setEvents([]);
+    setSnapshot([]);
+    setStream([]);
     setConnected(false);
     setUnparsed(undefined);
     setPartial(false);
@@ -97,7 +126,7 @@ export default function TranscriptPanel({
       .getTranscript(path, { host, run: runId })
       .then((res) => {
         if (cancelled) return;
-        setEvents(res.events);
+        setSnapshot(res.events);
         setUnparsed(res.unparsed);
         setPartial(res.partial === true);
         setState('ready');
@@ -113,8 +142,9 @@ export default function TranscriptPanel({
     };
   }, [path, host, runId]);
 
-  // Live tail: append new events; close on unmount / path change. Kept in a ref
-  // so the cleanup always closes the EventSource we actually opened.
+  // Live tail: accumulate the stream's own copy of the transcript; close on
+  // unmount / path change. Kept in a ref so the cleanup always closes the
+  // EventSource we actually opened.
   const unsubRef = useRef<(() => void) | null>(null);
   // Guard so onComplete fires at most once per live session (even if duplicate
   // run_complete / run_failed events arrive).
@@ -128,10 +158,40 @@ export default function TranscriptPanel({
     completedRef.current = false;
     if (!live) return;
     setConnected(true);
+    // A fresh subscription replays the file from byte 0, so start its copy
+    // empty (covers `live` flipping off and back on for the same path).
+    setStream([]);
+    // `shown` mirrors what `stream` state holds. EventSource auto-reconnects
+    // after an error and the server replays from byte 0 again; extending the
+    // shown copy would duplicate the backlog, and restarting it would rewind
+    // the view (the merge falls back to the shorter snapshot) until the replay
+    // caught up. So a post-error replay is buffered in `replay` and swapped in
+    // only once it is at least as long as what is already on screen — the
+    // previous stream stays visible until then, and the view never shrinks.
+    // Like `mergeSnapshotAndStream`, this assumes the file is append-only: a
+    // replay of a SHORTER replacement never reaches `shown.length`, so the old
+    // stream would stay on screen (see that function's note).
+    let shown: TranscriptEvent[] = [];
+    let replay: TranscriptEvent[] | null = null;
+    let reconnected = false;
     const unsub = api.subscribeTranscript(
       path,
       (e) => {
-        setEvents((prev) => [...prev, e]);
+        if (reconnected) {
+          reconnected = false;
+          replay = [];
+        }
+        if (replay) {
+          replay.push(e);
+          if (replay.length >= shown.length) {
+            shown = replay;
+            replay = null;
+            setStream(shown);
+          }
+        } else {
+          shown = [...shown, e];
+          setStream(shown);
+        }
         if (
           !completedRef.current &&
           (e.type === 'run_complete' || e.type === 'run_failed')
@@ -140,7 +200,10 @@ export default function TranscriptPanel({
           onCompleteRef.current?.();
         }
       },
-      () => setConnected(false),
+      () => {
+        setConnected(false);
+        reconnected = true;
+      },
       { host, run: runId },
     );
     unsubRef.current = unsub;
@@ -150,7 +213,7 @@ export default function TranscriptPanel({
     };
   }, [path, live, host, runId]);
 
-  const view = buildTranscriptView(events);
+  const view = buildTranscriptView(mergeSnapshotAndStream(snapshot, stream));
 
   // ---- non-ready states ----------------------------------------------------
 

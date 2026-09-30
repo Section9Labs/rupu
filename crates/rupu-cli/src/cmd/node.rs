@@ -33,7 +33,7 @@ use anyhow::Context as _;
 use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
 use rupu_cp::host::bucket::{Bucket, ControlEnvelope, ObjectStoreBucket};
-use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind};
+use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, CAP_USAGE_LEDGER};
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -136,6 +136,9 @@ struct FileOffsets {
     events: u64,
     step_results: u64,
     unit_checkpoints: u64,
+    /// `usage.jsonl` — the run's usage ledger. Only ever advanced on a
+    /// tunnel connection whose CP advertised [`CAP_USAGE_LEDGER`].
+    usage: u64,
 }
 
 /// Per-run state for the bucket pull agent.  Extends [`FileOffsets`] with
@@ -147,6 +150,7 @@ struct BucketRunState {
     events_seq: u64,
     step_results_seq: u64,
     unit_checkpoints_seq: u64,
+    usage_seq: u64,
     /// Highest control seq we've already applied (`None` = none applied yet).
     last_ctrl_seq: Option<u64>,
 }
@@ -418,7 +422,7 @@ async fn connect_and_run(
             token: token.to_string(),
         },
         rupu_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: vec![],
+        capabilities: rupu_cp::node::protocol::node_capabilities(),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?))
         .await
@@ -431,12 +435,16 @@ async fn connect_and_run(
         .ok_or_else(|| anyhow::anyhow!("server closed before Welcome"))?
         .context("recv Welcome")?;
     let welcome_frame = parse_frame(&welcome_msg)?;
-    if !matches!(welcome_frame, Frame::Welcome {}) {
+    if !matches!(welcome_frame, Frame::Welcome { .. }) {
         anyhow::bail!(
             "expected Welcome from server, got: {}",
             serde_json::to_string(&welcome_frame).unwrap_or_else(|_| "?".into())
         );
     }
+    // Only forward the usage ledger to a CP that said it mirrors it: an older
+    // CP can't parse the `usage` artifact kind and would log-and-drop every
+    // line. (Bucket hosts need no gate — an older poller just skips the key.)
+    let usage_ok = welcome_advertises(&welcome_frame, CAP_USAGE_LEDGER);
     eprintln!("connected ✓ (authenticated as {node_id})");
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
 
@@ -485,8 +493,24 @@ async fn connect_and_run(
             ) {
                 send_artifact(&mut sink, rid, ArtifactFile::UnitCheckpoints, line).await;
             }
+            // usage.jsonl — the routine incremental drain.
+            for line in drain_usage_ledger(&run_dir, &mut state.offsets, usage_ok) {
+                send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
+            }
             // run.json — check for terminal status.
             if let Some((status, body)) = read_terminal_status(&run_dir.join("run.json")) {
+                // A ledger row can land between the drain above and this
+                // terminal read, and the run leaves `active` this pass — so
+                // one more drain, now that the run is known terminal (the
+                // runner writes its ledger rows before the terminal status).
+                // It goes BEFORE the terminal `run.json` and `RunFinished`
+                // frames: the CP flips the run terminal on those, and a
+                // reader that sees it terminal must see the whole ledger.
+                // Offsets make it exact-once: rows the earlier drain sent are
+                // never re-sent.
+                for line in drain_usage_ledger(&run_dir, &mut state.offsets, usage_ok) {
+                    send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
+                }
                 send_artifact(&mut sink, rid, ArtifactFile::RunJson, body).await;
                 let frame = Frame::RunFinished {
                     run_id: rid.clone(),
@@ -518,6 +542,7 @@ async fn connect_and_run(
                                     events: 0,
                                     step_results: 0,
                                     unit_checkpoints: 0,
+                                    usage: 0,
                                 },
                             },
                         );
@@ -593,7 +618,7 @@ async fn connect_and_run(
                 }
             }
             Frame::Hello { .. }
-            | Frame::Welcome {}
+            | Frame::Welcome { .. }
             | Frame::Pong {}
             | Frame::Artifact { .. }
             | Frame::RunFinished { .. } => {
@@ -665,6 +690,7 @@ fn spawn_control(exe: &Path, argv: &[String]) -> anyhow::Result<tokio::process::
 }
 
 fn spawn_run(exe: &Path, run_id: &str, spec: &RunSpec) -> anyhow::Result<tokio::process::Child> {
+    check_spec(spec)?;
     let argv = build_argv(run_id, spec);
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(&argv)
@@ -679,15 +705,28 @@ fn spawn_run(exe: &Path, run_id: &str, spec: &RunSpec) -> anyhow::Result<tokio::
     cmd.spawn().context("spawn rupu child")
 }
 
+/// Refuse a spec whose fields `build_argv` could not honour, rather than
+/// launch without them. `findings_profile` is an agent-run flag; `rupu
+/// workflow run` resolves profiles per step from the workflow file.
+fn check_spec(spec: &RunSpec) -> anyhow::Result<()> {
+    if spec.kind == RunSpecKind::Workflow && spec.findings_profile.is_some() {
+        anyhow::bail!(
+            "run spec for workflow `{}` carries a findings_profile, which applies to agent runs only",
+            spec.name
+        );
+    }
+    Ok(())
+}
+
 /// Build the argv (after the executable) for a local `rupu workflow run`
 /// or `rupu run` invocation dispatched by the node agent.
 ///
 /// Workflow: `workflow run <name> [<target>] --run-id <id> --plain [--input k=v]… [--mode m]`
-/// Agent:    `run <name> [<target>] --run-id <id> [--mode m] [--prompt p] [--tmp (if target)]`
+/// Agent:    `run <name> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--prompt p] [--tmp (if target)]`
 ///
 /// Flag names are verified against the clap definitions in `cmd/workflow.rs`
 /// (`--run-id`, `--plain`, `--input`, `--mode`) and `cmd/run.rs`
-/// (`--run-id`, `--mode`, `--prompt`, `--tmp`).
+/// (`--run-id`, `--mode`, `--findings-profile`, `--prompt`, `--tmp`).
 pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
     match spec.kind {
         RunSpecKind::Workflow => {
@@ -718,6 +757,10 @@ pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
             if let Some(m) = &spec.mode {
                 argv.push("--mode".to_string());
                 argv.push(m.clone());
+            }
+            if let Some(f) = spec.findings_profile {
+                argv.push("--findings-profile".to_string());
+                argv.push(f.as_str().to_string());
             }
             if let Some(p) = &spec.prompt {
                 argv.push("--prompt".to_string());
@@ -767,6 +810,23 @@ pub fn drain_new_lines(path: &Path, offset: &mut u64) -> Vec<String> {
         .lines()
         .map(|l| l.to_string())
         .collect()
+}
+
+/// Drain the run's usage ledger (`<run_dir>/usage.jsonl`) when `enabled`.
+///
+/// `enabled` is the tunnel capability gate (the CP advertised
+/// [`CAP_USAGE_LEDGER`]); when it is `false` the ledger is left untouched and
+/// `offsets.usage` does not move, so nothing is sent or consumed.
+fn drain_usage_ledger(run_dir: &Path, offsets: &mut FileOffsets, enabled: bool) -> Vec<String> {
+    if !enabled {
+        return Vec::new();
+    }
+    drain_new_lines(&run_dir.join("usage.jsonl"), &mut offsets.usage)
+}
+
+/// True when `frame` is a `Welcome` that lists `capability`.
+fn welcome_advertises(frame: &Frame, capability: &str) -> bool {
+    matches!(frame, Frame::Welcome { capabilities } if capabilities.iter().any(|c| c == capability))
 }
 
 // ---------------------------------------------------------------------------
@@ -859,6 +919,52 @@ pub(crate) fn next_control_seq(existing: &[(u64, Vec<u8>)]) -> u64 {
     existing.iter().map(|(s, _)| *s + 1).max().unwrap_or(0)
 }
 
+/// Drain the run's usage ledger and upload its new rows as the next
+/// `usage.<seq>` result object, bumping `usage_seq` once the put lands.
+/// Nothing new → no object. No capability gate: an older CP's poller skips the
+/// unknown `usage.*` key.
+async fn upload_usage_ledger(
+    bucket: &dyn Bucket,
+    rid: &str,
+    run_dir: &Path,
+    offsets: &mut FileOffsets,
+    usage_seq: &mut u64,
+) {
+    let lines = drain_usage_ledger(run_dir, offsets, true);
+    if lines.is_empty() {
+        return;
+    }
+    let body = lines.join("\n") + "\n";
+    let key = result_key("usage", *usage_seq);
+    if let Err(e) = bucket.put_result(rid, &key, body.as_bytes()).await {
+        warn!(run_id = %rid, key = %key, error = %e, "node pull: put usage result failed");
+    } else {
+        *usage_seq += 1;
+    }
+}
+
+/// The bucket loop's terminal pass for a run whose `run.json` reads terminal:
+/// drain the usage ledger ONE more time, then write the `finished` marker.
+///
+/// The routine drain earlier in the same pass awaits a network `put_result`
+/// before `run.json` is read, so a row the runner appended in that window
+/// would otherwise never be uploaded — the run leaves `active` this pass — and
+/// the CP's total would stay short for good. Uploading it BEFORE `finished`
+/// also means a CP that sees the marker already has every row.
+async fn finish_bucket_run(
+    bucket: &dyn Bucket,
+    rid: &str,
+    run_dir: &Path,
+    offsets: &mut FileOffsets,
+    usage_seq: &mut u64,
+    status: &str,
+) {
+    upload_usage_ledger(bucket, rid, run_dir, offsets, usage_seq).await;
+    if let Err(e) = bucket.put_finished(rid, status).await {
+        warn!(run_id = %rid, status = %status, error = %e, "node pull: put_finished failed");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bucket pull agent loop
 // ---------------------------------------------------------------------------
@@ -883,6 +989,20 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
         interval = args.interval,
         "node pull: starting"
     );
+
+    // Advertise what this worker honours: the bucket has no handshake, so the
+    // CP reads these markers before putting a job that needs a newer worker
+    // (e.g. one carrying `findings_profile`). A worker that can't write here
+    // can't upload results either, so fail startup rather than run unseen.
+    let info = rupu_cp::host::bucket::WorkerInfo {
+        worker_id: host_id.clone(),
+        rupu_version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: rupu_cp::node::protocol::node_capabilities(),
+    };
+    bucket
+        .put_worker_info(&host_id, &serde_json::to_vec(&info)?)
+        .await
+        .context("advertise worker capabilities (nodes/<worker>.json)")?;
 
     let mut active: HashMap<String, BucketRunState> = HashMap::new();
     let mut once_iters: u32 = 0;
@@ -913,10 +1033,12 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                                 events: 0,
                                 step_results: 0,
                                 unit_checkpoints: 0,
+                                usage: 0,
                             },
                             events_seq: 0,
                             step_results_seq: 0,
                             unit_checkpoints_seq: 0,
+                            usage_seq: 0,
                             last_ctrl_seq: None,
                         },
                     );
@@ -978,6 +1100,17 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                     state.unit_checkpoints_seq += 1;
                 }
             }
+
+            // Drain usage.jsonl (the run's usage ledger). No capability gate:
+            // an older CP's poller skips the unknown `usage.*` key.
+            upload_usage_ledger(
+                &bucket,
+                rid,
+                &run_dir,
+                &mut state.offsets,
+                &mut state.usage_seq,
+            )
+            .await;
 
             // Upload run.json (always — reflects current in-progress status).
             let run_json_path = run_dir.join("run.json");
@@ -1073,12 +1206,19 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                 }
             }
 
-            // Check for terminal status → put_finished + remove from active.
+            // Check for terminal status → final ledger drain + put_finished +
+            // remove from active.
             if let Some((status, _body)) = read_terminal_status(&run_json_path) {
                 info!(run_id = %rid, status = %status, "node pull: run finished");
-                if let Err(e) = bucket.put_finished(rid, &status).await {
-                    warn!(run_id = %rid, status = %status, error = %e, "node pull: put_finished failed");
-                }
+                finish_bucket_run(
+                    &bucket,
+                    rid,
+                    &run_dir,
+                    &mut state.offsets,
+                    &mut state.usage_seq,
+                    &status,
+                )
+                .await;
                 finished.push(rid.clone());
             }
         }
@@ -1216,6 +1356,268 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // usage ledger forwarding: capability gate + drain
+    // ------------------------------------------------------------------
+
+    fn offsets() -> FileOffsets {
+        FileOffsets {
+            events: 0,
+            step_results: 0,
+            unit_checkpoints: 0,
+            usage: 0,
+        }
+    }
+
+    #[test]
+    fn welcome_advertises_reads_the_capability_list() {
+        let none = Frame::Welcome {
+            capabilities: vec![],
+        };
+        let other = Frame::Welcome {
+            capabilities: vec!["something_else".to_string()],
+        };
+        let usage = Frame::Welcome {
+            capabilities: vec!["something_else".to_string(), CAP_USAGE_LEDGER.to_string()],
+        };
+        // An old CP's bare `{"type":"welcome"}` parses to an empty list.
+        let old: Frame = serde_json::from_str(r#"{"type":"welcome"}"#).unwrap();
+        assert!(!welcome_advertises(&none, CAP_USAGE_LEDGER));
+        assert!(!welcome_advertises(&old, CAP_USAGE_LEDGER));
+        assert!(!welcome_advertises(&other, CAP_USAGE_LEDGER));
+        assert!(welcome_advertises(&usage, CAP_USAGE_LEDGER));
+        // Not a Welcome at all.
+        assert!(!welcome_advertises(&Frame::Pong {}, CAP_USAGE_LEDGER));
+    }
+
+    /// The usage ledger is drained incrementally into the frames' lines when
+    /// the CP advertised the capability, and is left completely untouched
+    /// (no lines, offset unmoved) when it did not.
+    #[test]
+    fn drain_usage_ledger_honours_the_capability_gate() {
+        let dir = tempdir().unwrap();
+        let ledger = dir.path().join("usage.jsonl");
+        std::fs::write(
+            &ledger,
+            "{\"id\":\"01J0000000000000000000USG1\"}\n{\"id\":\"01J0000000000000000000USG2\"}\n",
+        )
+        .unwrap();
+
+        // Gate closed (old CP): nothing sent, nothing consumed.
+        let mut off = offsets();
+        assert!(drain_usage_ledger(dir.path(), &mut off, false).is_empty());
+        assert_eq!(off.usage, 0, "a gated ledger must not be consumed");
+
+        // Gate open: both rows, then nothing until the ledger grows.
+        let lines = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("USG1") && lines[1].contains("USG2"));
+        assert!(drain_usage_ledger(dir.path(), &mut off, true).is_empty());
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        writeln!(f, r#"{{"id":"01J0000000000000000000USG3"}}"#).unwrap();
+        drop(f);
+        let more = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(more.len(), 1);
+        assert!(more[0].contains("USG3"));
+        // The other artifacts' offsets are independent.
+        assert_eq!(off.events, 0);
+    }
+
+    /// The terminal pass of the tunnel loop drains the ledger a SECOND time
+    /// (a row can land between the routine drain and the terminal `run.json`
+    /// read, and the run leaves `active` that pass). The loop itself is inline
+    /// in `connect_and_run` and needs a live WebSocket, so what is testable —
+    /// and load-bearing — is the helper sequence it runs: the second drain
+    /// returns exactly the late row, never the ones the first already sent,
+    /// and a gated (old-CP) connection still sends nothing on either pass.
+    #[test]
+    fn terminal_pass_second_drain_sends_only_the_late_row() {
+        let dir = tempdir().unwrap();
+        let ledger = dir.path().join("usage.jsonl");
+        std::fs::write(&ledger, "{\"id\":\"USG1\"}\n{\"id\":\"USG2\"}\n").unwrap();
+
+        let mut off = offsets();
+        // Routine drain earlier in the pass.
+        let first = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(first.len(), 2, "{first:?}");
+
+        // The runner appends a final row, then writes the terminal run.json.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        writeln!(f, r#"{{"id":"USG3"}}"#).unwrap();
+        drop(f);
+
+        // Terminal pass: exactly the late row, once.
+        let last = drain_usage_ledger(dir.path(), &mut off, true);
+        assert_eq!(last.len(), 1, "{last:?}");
+        assert!(last[0].contains("USG3"));
+        assert!(drain_usage_ledger(dir.path(), &mut off, true).is_empty());
+
+        // Same ledger, old CP: neither pass sends anything or moves the offset.
+        let mut gated = offsets();
+        assert!(drain_usage_ledger(dir.path(), &mut gated, false).is_empty());
+        assert!(drain_usage_ledger(dir.path(), &mut gated, false).is_empty());
+        assert_eq!(gated.usage, 0);
+    }
+
+    use rupu_cp::host::bucket::BucketError;
+
+    /// A [`Bucket`] that records the order of the writes the terminal pass
+    /// makes (`put_result` key / `put_finished` status + the body), so a test
+    /// can assert the late ledger row lands BEFORE the finished marker.
+    #[derive(Default)]
+    struct RecordingBucket {
+        ops: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Bucket for RecordingBucket {
+        async fn put_job(&self, _: &str, _: &[u8]) -> Result<(), BucketError> {
+            unreachable!("the terminal pass never writes jobs")
+        }
+        async fn list_jobs(&self) -> Result<Vec<String>, BucketError> {
+            unreachable!()
+        }
+        async fn claim_job(&self, _: &str, _: &str) -> Result<bool, BucketError> {
+            unreachable!()
+        }
+        async fn get_job(&self, _: &str) -> Result<Vec<u8>, BucketError> {
+            unreachable!()
+        }
+        async fn put_control(&self, _: &str, _: u64, _: &[u8]) -> Result<(), BucketError> {
+            unreachable!()
+        }
+        async fn list_control(&self, _: &str) -> Result<Vec<(u64, Vec<u8>)>, BucketError> {
+            unreachable!()
+        }
+        async fn put_result(
+            &self,
+            _run_id: &str,
+            key: &str,
+            body: &[u8],
+        ) -> Result<(), BucketError> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push((key.to_string(), String::from_utf8_lossy(body).into_owned()));
+            Ok(())
+        }
+        async fn list_results(&self, _: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+            unreachable!()
+        }
+        async fn put_finished(&self, _run_id: &str, status: &str) -> Result<(), BucketError> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(("finished".to_string(), status.to_string()));
+            Ok(())
+        }
+        async fn get_finished(&self, _: &str) -> Result<Option<String>, BucketError> {
+            unreachable!()
+        }
+        async fn put_worker_info(&self, _: &str, _: &[u8]) -> Result<(), BucketError> {
+            unreachable!("the terminal pass never writes worker info")
+        }
+        async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
+            unreachable!()
+        }
+        async fn probe(&self) -> Result<(), BucketError> {
+            unreachable!()
+        }
+    }
+
+    /// The bucket loop's terminal pass (same race as the tunnel's, above): a
+    /// row appended after the routine drain is uploaded as the next `usage.*`
+    /// object, exactly once and BEFORE the `finished` marker; with no late row
+    /// the pass writes no empty usage object.
+    #[tokio::test]
+    async fn bucket_terminal_pass_uploads_the_late_row_before_finished() {
+        let dir = tempdir().unwrap();
+        let ledger = dir.path().join("usage.jsonl");
+        std::fs::write(&ledger, "{\"id\":\"USGA\"}\n{\"id\":\"USGB\"}\n").unwrap();
+        let bucket = RecordingBucket::default();
+        let mut off = offsets();
+        let mut seq = 0u64;
+
+        // Routine drain earlier in the pass.
+        upload_usage_ledger(&bucket, "run_BKT", dir.path(), &mut off, &mut seq).await;
+        // The runner appends a final row, then writes the terminal run.json.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        writeln!(f, r#"{{"id":"USGC"}}"#).unwrap();
+        drop(f);
+        finish_bucket_run(
+            &bucket,
+            "run_BKT",
+            dir.path(),
+            &mut off,
+            &mut seq,
+            "completed",
+        )
+        .await;
+
+        let ops = bucket.ops.lock().unwrap().clone();
+        let keys: Vec<&str> = ops.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["usage.0000.jsonl", "usage.0001.jsonl", "finished"],
+            "{ops:?}"
+        );
+        assert!(ops[0].1.contains("USGA") && ops[0].1.contains("USGB"));
+        assert!(!ops[0].1.contains("USGC"));
+        assert_eq!(ops[1].1, "{\"id\":\"USGC\"}\n", "only the late row");
+        assert_eq!(ops[2].1, "completed");
+        assert_eq!(seq, 2);
+
+        // Nothing late: the terminal pass is just the marker.
+        let quiet = RecordingBucket::default();
+        let mut off = offsets();
+        let mut seq = 0u64;
+        upload_usage_ledger(&quiet, "run_QUIET", dir.path(), &mut off, &mut seq).await;
+        finish_bucket_run(
+            &quiet,
+            "run_QUIET",
+            dir.path(),
+            &mut off,
+            &mut seq,
+            "failed",
+        )
+        .await;
+        let keys: Vec<String> = quiet
+            .ops
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(keys, ["usage.0000.jsonl", "finished"]);
+        assert_eq!(seq, 1);
+    }
+
+    /// A run with no usage ledger yet (or never) drains to nothing.
+    #[test]
+    fn drain_usage_ledger_missing_file_is_empty() {
+        let dir = tempdir().unwrap();
+        let mut off = offsets();
+        assert!(drain_usage_ledger(dir.path(), &mut off, true).is_empty());
+        assert_eq!(off.usage, 0);
+    }
+
+    #[test]
+    fn result_key_usage_matches_the_poller_classifier() {
+        // The CP's bucket poller classifies by the `usage` prefix + `.jsonl`.
+        assert_eq!(result_key("usage", 0), "usage.0000.jsonl");
+        assert_eq!(result_key("usage", 7), "usage.0007.jsonl");
+    }
+
+    // ------------------------------------------------------------------
     // build_argv: argv builders
     // ------------------------------------------------------------------
 
@@ -1231,6 +1633,7 @@ mod tests {
             prompt: None,
             mode: Some("bypass".to_string()),
             target: Some("github:o/r".to_string()),
+            findings_profile: None,
         };
         let argv = build_argv("run_X", &spec);
         assert_eq!(
@@ -1262,6 +1665,7 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         let argv = build_argv("run_Y", &spec);
         assert_eq!(
@@ -1279,6 +1683,7 @@ mod tests {
             prompt: Some("look at this PR".to_string()),
             mode: Some("bypass".to_string()),
             target: Some("github:o/r".to_string()),
+            findings_profile: None,
         };
         let argv = build_argv("run_Z", &spec);
         assert_eq!(
@@ -1307,9 +1712,66 @@ mod tests {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         };
         let argv = build_argv("run_W", &spec);
         assert_eq!(argv, vec!["run", "check", "--run-id", "run_W"]);
+    }
+
+    #[test]
+    fn build_argv_agent_carries_the_findings_profile() {
+        let spec = RunSpec {
+            kind: RunSpecKind::Agent,
+            name: "sec".to_string(),
+            inputs: BTreeMap::new(),
+            prompt: Some("audit".to_string()),
+            mode: None,
+            target: None,
+            findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+        };
+        let argv = build_argv("run_P", &spec);
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "sec",
+                "--run-id",
+                "run_P",
+                "--findings-profile",
+                "summary",
+                "--prompt",
+                "audit"
+            ]
+        );
+        // Round-trips through the real `rupu run` parser.
+        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
+        assert_eq!(
+            args.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+        check_spec(&spec).expect("an agent spec may carry a profile");
+    }
+
+    #[test]
+    fn a_workflow_spec_carrying_a_findings_profile_is_refused() {
+        let spec = RunSpec {
+            kind: RunSpecKind::Workflow,
+            name: "audit".to_string(),
+            inputs: BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: Some(rupu_coverage::FindingProfile::Full),
+        };
+        let err = check_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("agent runs only"), "{err}");
+    }
+
+    #[test]
+    fn the_node_advertises_findings_profile_support() {
+        assert!(rupu_cp::node::protocol::node_capabilities()
+            .iter()
+            .any(|c| c == rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE));
     }
 
     // ------------------------------------------------------------------

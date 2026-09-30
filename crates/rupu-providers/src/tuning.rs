@@ -32,9 +32,11 @@ pub const DEFAULT_MAX_RETRIES: u32 = 1;
 /// Initial backoff before the first retry; doubles per attempt.
 pub const DEFAULT_INITIAL_BACKOFF_MS: u64 = 2_000;
 
-/// Resolved knobs for one provider. Always fully populated — `None` in config
-/// has already been collapsed into the documented default here, so consumers
-/// never re-implement defaulting.
+/// Resolved knobs for one provider. Fully populated except `prompt_cache` —
+/// for every other knob, `None` in config has already been collapsed into the
+/// documented default here, so consumers never re-implement defaulting.
+/// `prompt_cache` stays an `Option` on purpose (agent frontmatter must be able
+/// to override an explicit config value); see its field doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTuning {
     /// Connect + read (inactivity) timeout for this provider's HTTP client.
@@ -48,6 +50,13 @@ pub struct ProviderTuning {
     /// Vertex region. Accepted and carried, but no shipped Gemini client
     /// targets a regional Vertex endpoint — see `docs/providers.md`.
     pub region: Option<String>,
+    /// Anthropic explicit prompt-cache breakpoints (`[providers.<name>]
+    /// prompt_cache`). Deliberately NOT collapsed to its default here, unlike
+    /// the knobs above: agent frontmatter `anthropicPromptCache` must be able
+    /// to override an explicit config value, so the factory resolves
+    /// `agent.or(this).unwrap_or(true)`. `None` ⇒ on. Ignored by every other
+    /// provider.
+    pub prompt_cache: Option<bool>,
 }
 
 impl Default for ProviderTuning {
@@ -58,6 +67,7 @@ impl Default for ProviderTuning {
             max_concurrency: crate::concurrency::default_permits(""),
             org_id: None,
             region: None,
+            prompt_cache: None,
         }
     }
 }

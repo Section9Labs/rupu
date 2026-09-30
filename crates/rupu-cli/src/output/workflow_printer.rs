@@ -25,7 +25,7 @@ use super::{
 use crate::cmd::transcript::truncate_single_line;
 use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::output::palette::{self, BRAND, DIM};
-use crate::output::printer::{visible_len, wrap_with_ansi};
+use crate::output::printer::{usage_tally, visible_len, wrap_with_ansi, StepUsage};
 use crate::output::rich_payload::{
     render_assistant_content, render_payload, render_payload_preview_lines, render_tool_input,
     RenderedPayload,
@@ -131,9 +131,13 @@ struct WorkflowInteractiveState {
     active_transcript_indent: usize,
     lines: Vec<WorkflowViewLine>,
     line_row_cache: Vec<Option<CachedWorkflowRows>>,
+    /// `RunComplete` token sum of the transcripts this view replayed —
+    /// the static snapshot's total, where no run store is attached.
     total_tokens: u64,
     dispatches: BTreeMap<String, InFlightDispatch>,
     viewport: ViewportState,
+    /// The live attach's spend source; `None` for the static snapshot.
+    spend: Option<Arc<RunSpend>>,
 }
 
 impl WorkflowInteractiveState {
@@ -150,7 +154,20 @@ impl WorkflowInteractiveState {
             total_tokens: 0,
             dispatches: BTreeMap::new(),
             viewport: ViewportState::default(),
+            spend: None,
         }
+    }
+
+    fn with_spend(mut self, spend: Option<Arc<RunSpend>>) -> Self {
+        self.spend = spend;
+        self
+    }
+
+    /// The fold's `N tokens · $X.XX` for `step_id`, live attach only.
+    fn step_tally(&self, step_id: &str) -> Option<String> {
+        self.spend
+            .as_ref()
+            .and_then(|spend| spend.step_tally(step_id))
     }
 
     fn push_line(&mut self, status: UiStatus, text: impl Into<String>) {
@@ -280,6 +297,61 @@ pub struct AttachOpts {
     /// run's `error:` text, which the summary does not. Default `false`
     /// preserves the terse line for `rupu watch` and shared-printer callers.
     pub suppress_done_line: bool,
+    /// Prices the run's spend for the step and run footers (the operator's
+    /// layered `[pricing]`; the default still carries the built-in table).
+    pub pricing: rupu_config::PricingConfig,
+}
+
+/// An attached run's spend, read from the shared usage fold
+/// ([`rupu_cp::usage::run_usage`]: every usage-ledger row — units and
+/// dispatched children included — plus a fold of any known transcript
+/// without rows) and priced with the operator's config. The one source for
+/// the step and run footers (spec 2026-09-29 §8); summing the followed
+/// transcripts' `RunComplete.total_tokens` missed dispatch children and
+/// compaction calls. `run_usage` is incremental, so asking at every step
+/// close costs only the bytes appended since the last ask.
+struct RunSpend {
+    store: rupu_orchestrator::RunStore,
+    run_id: String,
+    pricing: rupu_config::PricingConfig,
+}
+
+impl RunSpend {
+    fn new(runs_root: &Path, run_id: &str, pricing: &rupu_config::PricingConfig) -> Arc<Self> {
+        Arc::new(Self {
+            store: rupu_orchestrator::RunStore::new(runs_root.to_path_buf()),
+            run_id: run_id.to_string(),
+            pricing: pricing.clone(),
+        })
+    }
+
+    /// `step_id`'s spend so far: every loop iteration, unit and dispatched
+    /// child of that step.
+    fn step(&self, step_id: &str) -> StepUsage {
+        let usage = rupu_cp::usage::run_usage(&self.store, &self.run_id);
+        let rows = usage.by_step.get(step_id).map_or(&[][..], Vec::as_slice);
+        priced(rows, &self.pricing)
+    }
+
+    /// The whole run's spend.
+    fn run(&self) -> StepUsage {
+        let usage = rupu_cp::usage::run_usage(&self.store, &self.run_id);
+        priced(&usage.rows, &self.pricing)
+    }
+
+    /// `N tokens · $X.XX` for a step line, `None` when it spent nothing.
+    fn step_tally(&self, step_id: &str) -> Option<String> {
+        let usage = self.step(step_id);
+        (usage.tokens > 0).then(|| usage_tally(usage.tokens, usage.cost))
+    }
+}
+
+fn priced(rows: &[rupu_transcript::UsageRow], pricing: &rupu_config::PricingConfig) -> StepUsage {
+    let summary = rupu_cp::usage::summarize(rows, pricing);
+    StepUsage {
+        tokens: summary.total_tokens,
+        cost: summary.cost_usd,
+    }
 }
 
 /// Drive `printer` from a live or recently-finished workflow run.
@@ -372,7 +444,7 @@ pub fn attach_and_print_with(
 
     let mut seen_step_results: usize = opts.skip_count;
     let mut steps: Vec<StepState> = Vec::new();
-    let mut total_tokens: u64 = 0;
+    let spend = RunSpend::new(&run_store.root, run_id, &opts.pricing);
     // For the rendered phase separators: start at the same count so
     // resumed steps don't get an extra leading separator.
     let mut step_count: usize = opts.skip_count;
@@ -394,6 +466,7 @@ pub fn attach_and_print_with(
             printer,
             &mut step_count,
             opts.view_mode,
+            &spend,
         );
 
         for step in &mut steps {
@@ -403,7 +476,7 @@ pub fn attach_and_print_with(
                     ev,
                     step,
                     printer,
-                    &mut total_tokens,
+                    &spend,
                     opts.live_event_hook.as_ref(),
                     opts.view_mode,
                 );
@@ -427,7 +500,7 @@ pub fn attach_and_print_with(
 
         match record.status {
             rupu_orchestrator::RunStatus::AwaitingApproval => {
-                flush_all_tailers(&mut steps, printer, &mut total_tokens, opts.view_mode);
+                flush_all_tailers(&mut steps, printer, &spend, opts.view_mode);
 
                 let step_id = record
                     .awaiting_step_id
@@ -502,8 +575,9 @@ pub fn attach_and_print_with(
                     printer,
                     &mut step_count,
                     opts.view_mode,
+                    &spend,
                 );
-                flush_all_tailers(&mut steps, printer, &mut total_tokens, opts.view_mode);
+                flush_all_tailers(&mut steps, printer, &spend, opts.view_mode);
 
                 printer.stop_ticker();
                 if !opts.suppress_done_line {
@@ -512,13 +586,13 @@ pub fn attach_and_print_with(
                         .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
                         .unwrap_or(0);
                     let dur = Duration::from_millis(duration_ms);
-                    printer.workflow_done(workflow_name, run_id, dur, total_tokens);
+                    printer.workflow_done_priced(workflow_name, run_id, dur, spend.run());
                 }
                 return Ok(AttachOutcome::Done);
             }
             rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
-                flush_all_tailers(&mut steps, printer, &mut total_tokens, opts.view_mode);
+                flush_all_tailers(&mut steps, printer, &spend, opts.view_mode);
 
                 let err = record.error_message.as_deref().unwrap_or("unknown error");
                 printer.stop_ticker();
@@ -572,7 +646,8 @@ pub fn attach_and_render_interactive_with(
             .unwrap_or_else(|_| chrono::Utc::now())
     };
 
-    let (final_outcome, final_record, final_tokens) = {
+    let spend = RunSpend::new(&run_store.root, run_id, &opts.pricing);
+    let (final_outcome, final_record) = {
         let _raw_mode = WorkflowRawModeGuard::enter()?;
         let _screen = WorkflowScreenGuard::enter()?;
         let prefs = retained_workflow_ui_prefs().unwrap_or_else(|_| {
@@ -585,7 +660,8 @@ pub fn attach_and_render_interactive_with(
             )
         });
         let mut view_mode = opts.view_mode;
-        let mut state = WorkflowInteractiveState::new(opts.skip_count);
+        let mut state =
+            WorkflowInteractiveState::new(opts.skip_count).with_spend(Some(Arc::clone(&spend)));
         let mut last_rows: Vec<String> = Vec::new();
 
         loop {
@@ -625,15 +701,12 @@ pub fn attach_and_render_interactive_with(
                                                 opts.skip_count,
                                                 view_mode,
                                                 &prefs,
+                                                Some(Arc::clone(&spend)),
                                             );
                                             state.viewport = viewport;
                                         }
                                         WorkflowNavAction::Cancel => {
-                                            break (
-                                                AttachOutcome::Cancelled,
-                                                Some(record),
-                                                state.total_tokens,
-                                            );
+                                            break (AttachOutcome::Cancelled, Some(record));
                                         }
                                     }
                                     continue;
@@ -646,7 +719,7 @@ pub fn attach_and_render_interactive_with(
                                     &mut state,
                                     key,
                                 )? {
-                                    break (outcome, Some(record), state.total_tokens);
+                                    break (outcome, Some(record));
                                 }
                             }
                             _ => {}
@@ -676,7 +749,7 @@ pub fn attach_and_render_interactive_with(
                     if final_rows != last_rows {
                         render_workflow_screen_rows(&final_rows)?;
                     }
-                    break (AttachOutcome::Done, Some(record), state.total_tokens);
+                    break (AttachOutcome::Done, Some(record));
                 }
                 _ => {
                     if event::poll(Duration::from_millis(POLL_MS))? {
@@ -697,15 +770,12 @@ pub fn attach_and_render_interactive_with(
                                                 opts.skip_count,
                                                 view_mode,
                                                 &prefs,
+                                                Some(Arc::clone(&spend)),
                                             );
                                             state.viewport = viewport;
                                         }
                                         WorkflowNavAction::Cancel => {
-                                            break (
-                                                AttachOutcome::Cancelled,
-                                                Some(record),
-                                                state.total_tokens,
-                                            );
+                                            break (AttachOutcome::Cancelled, Some(record));
                                         }
                                     }
                                 }
@@ -728,11 +798,11 @@ pub fn attach_and_render_interactive_with(
                             .finished_at
                             .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
                             .unwrap_or(0);
-                        printer.workflow_done(
+                        printer.workflow_done_priced(
                             workflow_name,
                             run_id,
                             Duration::from_millis(duration_ms),
-                            final_tokens,
+                            spend.run(),
                         );
                     }
                 }
@@ -763,8 +833,9 @@ fn rebuild_workflow_interactive_state(
     skip_count: usize,
     view_mode: LiveViewMode,
     prefs: &UiPrefs,
+    spend: Option<Arc<RunSpend>>,
 ) -> WorkflowInteractiveState {
-    let mut state = WorkflowInteractiveState::new(skip_count);
+    let mut state = WorkflowInteractiveState::new(skip_count).with_spend(spend);
     replay_step_results_interactive(step_results_log, &mut state, view_mode, prefs);
     follow_active_transcript(record, &mut state, view_mode, prefs);
     drain_workflow_transcript_events(&mut state, view_mode, prefs);
@@ -878,21 +949,34 @@ fn replay_linear_step_history(
         UiStatus::Failed
     };
     state.total_tokens += summary.total_tokens;
-    state.push_tree_item(
-        status,
-        0,
-        retained_tree_item_text(
-            status,
-            &rec.step_id,
-            &compact_child_detail(
+    // Live attach: the step's spend from the fold (dispatch children and
+    // compaction included, priced); the static snapshot keeps the
+    // transcript's own `RunComplete` count.
+    let detail = match state.step_tally(&rec.step_id) {
+        Some(tally) => format!(
+            "{}  ·  {tally}",
+            compact_child_detail(
                 status,
                 &summary.provider,
                 &summary.model,
                 summary.duration_ms,
-                summary.total_tokens,
+                0,
                 None,
-            ),
+            )
         ),
+        None => compact_child_detail(
+            status,
+            &summary.provider,
+            &summary.model,
+            summary.duration_ms,
+            summary.total_tokens,
+            None,
+        ),
+    };
+    state.push_tree_item(
+        status,
+        0,
+        retained_tree_item_text(status, &rec.step_id, &detail),
     );
     if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) {
         for event in &events {
@@ -1068,18 +1152,19 @@ fn append_step_result_lines(
             } else {
                 UiStatus::Failed
             };
+            let closure = if rec.success {
+                "step complete"
+            } else {
+                "step failed"
+            };
+            let detail = match state.step_tally(&rec.step_id) {
+                Some(tally) => format!("{closure}  ·  {tally}"),
+                None => closure.to_string(),
+            };
             state.push_tree_item(
                 status,
                 0,
-                retained_tree_item_text(
-                    status,
-                    &rec.step_id,
-                    if rec.success {
-                        "step complete"
-                    } else {
-                        "step failed"
-                    },
-                ),
+                retained_tree_item_text(status, &rec.step_id, &detail),
             );
             if !rec.output.trim().is_empty() {
                 match view_mode {
@@ -1143,23 +1228,24 @@ fn append_step_result_lines(
                 // ForEach/Parallel/Panel.
                 StepKind::Unknown => unreachable!(),
             };
+            let mut detail = format!(
+                "{}  ·  {} {}",
+                kind,
+                rec.items.len(),
+                if rec.items.len() == 1 {
+                    "item"
+                } else {
+                    "items"
+                }
+            );
+            if let Some(tally) = state.step_tally(&rec.step_id) {
+                detail.push_str("  ·  ");
+                detail.push_str(&tally);
+            }
             state.push_tree_item(
                 status,
                 0,
-                retained_tree_item_text(
-                    status,
-                    &rec.step_id,
-                    &format!(
-                        "{}  ·  {} {}",
-                        kind,
-                        rec.items.len(),
-                        if rec.items.len() == 1 {
-                            "item"
-                        } else {
-                            "items"
-                        }
-                    ),
-                ),
+                retained_tree_item_text(status, &rec.step_id, &detail),
             );
             append_fanout_item_lines(state, rec, view_mode, prefs);
         }
@@ -2415,7 +2501,7 @@ pub(crate) fn render_workflow_snapshot_body(
     width: usize,
 ) -> String {
     let mut state =
-        rebuild_workflow_interactive_state(record, step_results_log, 0, view_mode, prefs);
+        rebuild_workflow_interactive_state(record, step_results_log, 0, view_mode, prefs, None);
     build_workflow_snapshot_rows_for_size(workflow_name, record, &mut state, view_mode, width)
         .join("\n")
 }
@@ -2940,6 +3026,7 @@ fn drain_step_results(
     printer: &mut LineStreamPrinter,
     step_count: &mut usize,
     view_mode: LiveViewMode,
+    spend: &RunSpend,
 ) {
     let Ok(bytes) = std::fs::read(log) else {
         return;
@@ -2973,7 +3060,7 @@ fn drain_step_results(
         };
         match render_kind {
             StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
-                render_fanout_step(&rec, printer, view_mode);
+                render_fanout_step(&rec, printer, view_mode, spend);
             }
             StepKind::Linear
             | StepKind::Branch
@@ -2999,7 +3086,11 @@ fn drain_step_results(
                         printer.step_start(&rec.step_id, rec_label.as_deref(), None, None);
                     spinner.stop();
                     if rec.success {
-                        printer.step_done(&rec.step_id, Duration::ZERO, 0);
+                        printer.step_done_priced(
+                            &rec.step_id,
+                            Duration::ZERO,
+                            spend.step(&rec.step_id),
+                        );
                     } else {
                         printer.step_failed(&rec.step_id, "no transcript");
                     }
@@ -3043,6 +3134,7 @@ fn render_fanout_step(
     rec: &StepResultRecord,
     printer: &mut LineStreamPrinter,
     view_mode: LiveViewMode,
+    spend: &RunSpend,
 ) {
     // Parent header — emit the same `╭─ … ────  (kind · count)` shape
     // the linear-step header uses, with kind-specific meta. Reuse
@@ -3081,6 +3173,7 @@ fn render_fanout_step(
                 rec.success,
                 rec.findings.len(),
                 Duration::ZERO,
+                Some(spend.step(&rec.step_id)),
             );
         }
         StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
@@ -3092,6 +3185,7 @@ fn render_fanout_step(
                 success_count,
                 total,
                 Duration::ZERO,
+                Some(spend.step(&rec.step_id)),
             );
         }
         StepKind::Linear => unreachable!(),
@@ -3279,7 +3373,7 @@ fn process_event(
     ev: TxEvent,
     step: &mut StepState,
     printer: &mut LineStreamPrinter,
-    total_tokens: &mut u64,
+    spend: &RunSpend,
     live_event_hook: Option<&LiveWorkflowEventHook>,
     view_mode: LiveViewMode,
 ) {
@@ -3366,7 +3460,6 @@ fn process_event(
         }
         TxEvent::RunComplete {
             status,
-            total_tokens: tokens,
             duration_ms,
             error,
             ..
@@ -3374,11 +3467,14 @@ fn process_event(
             if let Some(spinner) = step.spinner.take() {
                 spinner.stop();
             }
-            *total_tokens += tokens;
             let dur = Duration::from_millis(duration_ms);
             match status {
                 rupu_transcript::RunStatus::Ok => {
-                    printer.step_done(&step.step_id, dur, tokens);
+                    // The step's spend from the fold — the step transcript's
+                    // own `total_tokens` misses its dispatched children and
+                    // compaction calls. Ledger rows land before
+                    // `RunComplete` is written, so this is final.
+                    printer.step_done_priced(&step.step_id, dur, spend.step(&step.step_id));
                 }
                 rupu_transcript::RunStatus::Error | rupu_transcript::RunStatus::Aborted => {
                     let reason = error.as_deref().unwrap_or("unknown");
@@ -3533,13 +3629,13 @@ fn render_one_child(
 fn flush_all_tailers(
     steps: &mut [StepState],
     printer: &mut LineStreamPrinter,
-    total_tokens: &mut u64,
+    spend: &RunSpend,
     view_mode: LiveViewMode,
 ) {
     for step in steps.iter_mut() {
         let events = step.tailer.drain();
         for ev in events {
-            process_event(ev, step, printer, total_tokens, None, view_mode);
+            process_event(ev, step, printer, spend, None, view_mode);
         }
         if let Some(spinner) = step.spinner.take() {
             spinner.stop();
@@ -4106,6 +4202,140 @@ mod tests {
         );
     }
 
+    /// A run in `<dir>/runs` whose usage ledger bills 1M input tokens to
+    /// `understand` and 1M output tokens to `implement` on a model with a
+    /// built-in price ($3 in / $15 out per Mtok).
+    fn spend_fixture(dir: &Path) -> Arc<RunSpend> {
+        use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, UsageLedger, LEDGER_VERSION};
+        let store = rupu_orchestrator::RunStore::new(dir.join("runs"));
+        store
+            .create(sample_run_record(), "name: demo\nsteps: []\n")
+            .unwrap();
+        let ledger = UsageLedger::for_run(&store, "run_test");
+        for (id, step, input, output) in [
+            ("r1", "understand", 1_000_000, 0),
+            ("r2", "implement", 0, 1_000_000),
+        ] {
+            ledger.append(&LedgerRow {
+                v: LEDGER_VERSION,
+                id: id.into(),
+                at: Utc::now(),
+                kind: LedgerKind::Turn,
+                step_id: Some(step.into()),
+                unit_index: None,
+                unit_key: None,
+                agent_run_id: format!("ag_{step}"),
+                parent_agent_run_id: None,
+                transcript: dir.join(format!("absent/{step}.jsonl")),
+                agent: "planner".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                input_tokens: input,
+                output_tokens: output,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            });
+        }
+        RunSpend::new(
+            &store.root,
+            "run_test",
+            &rupu_config::PricingConfig::default(),
+        )
+    }
+
+    #[test]
+    fn run_spend_prices_each_step_and_the_run_from_the_fold() {
+        let dir = tempdir().unwrap();
+        let spend = spend_fixture(dir.path());
+        assert_eq!(
+            spend.step("understand"),
+            StepUsage {
+                tokens: 1_000_000,
+                cost: Some(3.0)
+            }
+        );
+        assert_eq!(
+            spend.step("implement"),
+            StepUsage {
+                tokens: 1_000_000,
+                cost: Some(15.0)
+            }
+        );
+        assert_eq!(
+            spend.step("never-ran"),
+            StepUsage {
+                tokens: 0,
+                cost: None
+            }
+        );
+        assert_eq!(
+            spend.run(),
+            StepUsage {
+                tokens: 2_000_000,
+                cost: Some(18.0)
+            }
+        );
+    }
+
+    fn linear_step_record(step_id: &str) -> StepResultRecord {
+        StepResultRecord {
+            codename: None,
+            run_outcome: None,
+            step_id: step_id.into(),
+            run_id: format!("run_{step_id}"),
+            transcript_path: PathBuf::new(),
+            output: String::new(),
+            success: true,
+            skipped: false,
+            rendered_prompt: String::new(),
+            kind: StepKind::Linear,
+            items: Vec::new(),
+            findings: Vec::new(),
+            iterations: 0,
+            resolved: true,
+            finished_at: Utc::now(),
+            loop_iteration: None,
+            host: None,
+        }
+    }
+
+    #[test]
+    fn live_retained_step_line_carries_the_folds_tokens_and_cost() {
+        let dir = tempdir().unwrap();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state =
+            WorkflowInteractiveState::new(0).with_spend(Some(spend_fixture(dir.path())));
+        append_step_result_lines(
+            &mut state,
+            &linear_step_record("implement"),
+            LiveViewMode::Focused,
+            &prefs,
+        );
+        let texts: Vec<&str> = state.lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("implement") && t.contains("1000000 tokens · $15.00")),
+            "{texts:?}"
+        );
+
+        // The static snapshot (no store attached) keeps its old detail.
+        let mut snapshot = WorkflowInteractiveState::new(0);
+        append_step_result_lines(
+            &mut snapshot,
+            &linear_step_record("implement"),
+            LiveViewMode::Focused,
+            &prefs,
+        );
+        assert!(snapshot.lines.iter().all(|l| !l.text.contains("tokens")));
+    }
+
     #[test]
     fn process_event_emits_live_hook_for_promoted_tool_success() {
         let dir = tempdir().unwrap();
@@ -4141,7 +4371,11 @@ mod tests {
             promoted_actions: BTreeMap::new(),
         };
         let mut printer = LineStreamPrinter::new();
-        let mut total_tokens = 0u64;
+        let spend = RunSpend::new(
+            &dir.path().join("runs"),
+            "run_live",
+            &rupu_config::PricingConfig::default(),
+        );
 
         process_event(
             TxEvent::ToolCall {
@@ -4155,7 +4389,7 @@ mod tests {
             },
             &mut step,
             &mut printer,
-            &mut total_tokens,
+            &spend,
             Some(&hook),
             LiveViewMode::Focused,
         );
@@ -4169,7 +4403,7 @@ mod tests {
             },
             &mut step,
             &mut printer,
-            &mut total_tokens,
+            &spend,
             Some(&hook),
             LiveViewMode::Focused,
         );
@@ -4423,6 +4657,7 @@ mod tests {
             0,
             LiveViewMode::Focused,
             &prefs,
+            None,
         );
         assert!(state
             .lines

@@ -1,18 +1,39 @@
-use crate::{error::ApiResult, state::AppState};
+use crate::{
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
 use axum::{
-    extract::{Query, State},
-    routing::get,
+    body::Body,
+    extract::{Path, Query, State},
+    http::{header, HeaderValue},
+    response::Response,
+    routing::{get, post},
     Json, Router,
 };
+use rupu_coverage::report::{
+    summarize, ArtifactKind, ArtifactStorage, ArtifactStore, ReportSummary,
+};
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
-use rupu_orchestrator::{executor::Event, runs::RunStore};
+use rupu_findings_report::model::{ExportFinding, ExportInput, ReportMeta};
+use rupu_findings_report::number::{
+    assign_numbers, filename, fit_file_name, is_valid_prefix, number_map, sanitize_title,
+    DEFAULT_PREFIX,
+};
+use rupu_findings_report::select::{describe, parse_cwe, select, Selection};
+use rupu_findings_report::{render_finding, render_project, render_split_zip, ExportError, Format};
+use rupu_orchestrator::runs::RunStore;
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/findings", get(list_findings))
+    Router::new()
+        .route("/api/findings", get(list_findings))
+        .route("/api/findings/export", post(export_findings))
+        .route("/api/findings/:id", get(get_finding))
+        .route("/api/findings/:id/export", get(export_finding))
+        .route("/api/findings/:id/artifacts/:sha256", get(get_artifact))
 }
 
 /// A single finding plus its provenance (which workspace / project / coverage
@@ -38,12 +59,102 @@ pub struct FindingOut {
     /// no `file_path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permalink: Option<String>,
+    /// Present for full-profile findings in LIST responses: the fields a row
+    /// needs, without the report body (which `GET /api/findings/:id` serves).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_summary: Option<ReportSummary>,
     /// Declaring agent instance's codename (`declared_by.codename`), or the
     /// crew derived from `declared_by.run_id` for a legacy finding.
     pub codename: String,
     pub codename_derived: bool,
     #[serde(flatten)]
     pub record: FindingRecord,
+}
+
+/// The one slimming rule for finding lists: the record without its report
+/// body, plus the summary a row needs (present only when the record had a
+/// report). Shared by `/api/findings` rows and `/api/coverage/:target`.
+pub(crate) fn slim(mut record: FindingRecord) -> (FindingRecord, Option<ReportSummary>) {
+    let summary = record.report.take().as_ref().map(summarize);
+    (record, summary)
+}
+
+impl FindingOut {
+    /// The list-endpoint shape: summary fields in, report body out.
+    pub(crate) fn into_list_row(mut self) -> Self {
+        let (record, summary) = slim(self.record);
+        self.record = record;
+        self.report_summary = summary;
+        self
+    }
+}
+
+/// How a report evidence claim's file compares with the copy on disk now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimState {
+    /// The file still hashes to the value recorded with the claim.
+    Current,
+    /// The file exists but its contents changed since the finding was recorded.
+    Changed,
+    /// The file is gone (or escapes the workspace).
+    Missing,
+    /// No file or no recorded hash to compare (binary targets, summary claims).
+    Unknown,
+}
+
+/// Largest file a detail request will hash to judge an evidence claim's
+/// staleness; a larger file reports [`ClaimState::Unknown`]. Evidence claims
+/// cite source files, so this is far below the 500 MiB artifact cap: every
+/// `GET /api/findings/:id` re-hashes every claim's file, and a request must not
+/// be able to make the server read hundreds of megabytes per claim.
+pub(crate) const CLAIM_HASH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One [`ClaimState`] per `report.evidence[i]`, comparing each claim's recorded
+/// `sha256` against the file's current contents under `workspace`. Files larger
+/// than [`CLAIM_HASH_MAX_BYTES`] are not hashed (`Unknown`). Synchronous and
+/// potentially slow: async callers must run it under `spawn_blocking`.
+pub(crate) fn claim_states(
+    workspace: &std::path::Path,
+    r: &rupu_coverage::FindingReport,
+) -> Vec<ClaimState> {
+    claim_states_capped(workspace, r, CLAIM_HASH_MAX_BYTES)
+}
+
+fn claim_states_capped(
+    workspace: &std::path::Path,
+    r: &rupu_coverage::FindingReport,
+    max_bytes: u64,
+) -> Vec<ClaimState> {
+    r.evidence
+        .iter()
+        .map(|c| match (&c.file, &c.sha256) {
+            (Some(file), Some(recorded)) => {
+                match crate::api::source::resolve_under_workspace(workspace, file) {
+                    Ok(p) if p.is_file() => match std::fs::metadata(&p) {
+                        Ok(m) if m.len() > max_bytes => ClaimState::Unknown,
+                        Ok(_) => match rupu_coverage::report::sha256_file(&p) {
+                            Ok(now) if &now == recorded => ClaimState::Current,
+                            Ok(_) => ClaimState::Changed,
+                            Err(_) => ClaimState::Missing,
+                        },
+                        Err(_) => ClaimState::Missing,
+                    },
+                    _ => ClaimState::Missing,
+                }
+            }
+            _ => ClaimState::Unknown,
+        })
+        .collect()
+}
+
+/// `GET /api/findings/:id` — one finding with its full report body and the
+/// staleness of each evidence claim.
+#[derive(Debug, Serialize)]
+pub struct FindingDetail {
+    #[serde(flatten)]
+    pub finding: FindingOut,
+    pub evidence_status: Vec<ClaimState>,
 }
 
 /// Optional query filters for `GET /api/findings`.
@@ -175,14 +286,15 @@ fn project_name(path: &str) -> String {
 /// WITHOUT the `RunStore` `workflow_name` join — `list_findings` does that
 /// join itself afterward, since it needs `AppState.run_store`.
 ///
-/// `pub(crate)`: this is the one workspace/target walk. `list_findings` and
+/// `pub`: this is the one workspace/target walk. `list_findings`,
 /// `LocalHostConnector::dashboard_summary`'s open-findings count
-/// (`host/local.rs`) both call it rather than each re-implementing the walk.
+/// (`host/local.rs`) and the report exports (here, and `rupu findings
+/// export`) all call it rather than each re-implementing the walk.
 ///
 /// Tolerant by design: a workspace whose path is gone, or a target whose
 /// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather
 /// than failing the caller.
-pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
+pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
 
     let mut out: Vec<FindingOut> = Vec::new();
@@ -231,6 +343,7 @@ pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingO
                     target_id: t.target_id.clone(),
                     workflow_name: None,
                     permalink,
+                    report_summary: None,
                     record,
                 });
             }
@@ -254,7 +367,7 @@ pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingO
 ///
 /// Without (2), the Findings tab shows nothing for an in-progress run even
 /// though the findings are already on disk.
-fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
+pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
     let mut set = HashSet::new();
     set.insert(parent.to_string());
     for cp in store.read_unit_checkpoints(parent).unwrap_or_default() {
@@ -273,46 +386,36 @@ fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
 /// (`.../<sub_id>/transcript.jsonl`) has a generic `transcript` stem, so fall
 /// back to the parent directory name there. Missing/garbled file → empty.
 fn sub_run_ids_from_events(store: &RunStore, parent: &str) -> Vec<String> {
-    let path = store.events_path(parent);
-    let Ok(file) = std::fs::File::open(&path) else {
+    let Ok(body) = std::fs::read_to_string(store.events_path(parent)) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
+    body.lines()
+        .filter_map(rupu_orchestrator::runs::known_transcript_from_event_line)
+        // Findings scope: step/unit transcripts only. A `dispatch_started`
+        // child has no step id and was never part of this scope.
+        .filter(|k| k.step_id.is_some())
+        .map(|k| k.key)
+        .collect()
+}
+
+/// `run_id → workflow_name` for each distinct, non-empty id in `run_ids` whose
+/// run the `RunStore` can load. Each id is loaded once; an id that can't be
+/// resolved (an agent/session-local id with no `run.json`) is simply absent.
+fn workflow_names_by_run<'a>(
+    store: &RunStore,
+    run_ids: impl IntoIterator<Item = &'a str>,
+) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for run_id in run_ids {
+        if run_id.is_empty() || !seen.insert(run_id) {
             continue;
         }
-        let Ok(event) = serde_json::from_str::<Event>(&line) else {
-            continue;
-        };
-        let tp = match event {
-            Event::UnitStarted {
-                transcript_path, ..
-            } => Some(transcript_path),
-            Event::StepWorking {
-                transcript_path: Some(p),
-                ..
-            } => Some(p),
-            _ => None,
-        };
-        if let Some(tp) = tp {
-            let id = match tp.file_stem().and_then(|s| s.to_str()) {
-                // Nested sub-run layout: `<parent>/sub/<sub_id>/transcript.jsonl`.
-                Some("transcript") => tp
-                    .parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|s| s.to_str())
-                    .map(str::to_string),
-                Some(stem) => Some(stem.to_string()),
-                None => None,
-            };
-            if let Some(id) = id {
-                out.push(id);
-            }
+        if let Ok(rec) = store.load(run_id) {
+            names.insert(run_id.to_string(), rec.workflow_name);
         }
     }
-    out
+    names
 }
 
 /// `GET /api/findings` — every finding across every registered workspace's
@@ -330,16 +433,10 @@ async fn list_findings(
     // Join `declared_by.run_id → workflow_name` via the RunStore. Load each
     // distinct run id once; a load error / NotFound leaves that id out of the
     // map (finding keeps `workflow_name: None`).
-    let mut wf_by_run: HashMap<String, String> = HashMap::new();
-    for f in &out {
-        let run_id = &f.record.declared_by.run_id;
-        if run_id.is_empty() || wf_by_run.contains_key(run_id) {
-            continue;
-        }
-        if let Ok(rec) = s.run_store.load(run_id) {
-            wf_by_run.insert(run_id.clone(), rec.workflow_name);
-        }
-    }
+    let wf_by_run = workflow_names_by_run(
+        &s.run_store,
+        out.iter().map(|f| f.record.declared_by.run_id.as_str()),
+    );
     for f in &mut out {
         f.workflow_name = wf_by_run.get(&f.record.declared_by.run_id).cloned();
     }
@@ -355,7 +452,735 @@ async fn list_findings(
         .as_ref()
         .map(|parent| resolve_run_scope(&s.run_store, parent));
 
-    Ok(Json(scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow)))
+    let mut resp = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow);
+    // List rows never carry the report body; full-profile rows get a summary.
+    resp.findings = resp
+        .findings
+        .into_iter()
+        .map(FindingOut::into_list_row)
+        .collect();
+    Ok(Json(resp))
+}
+
+/// Find one finding by id across every registered workspace. Synchronous and
+/// potentially slow (it reads every coverage ledger): async callers must run
+/// it under `spawn_blocking`.
+fn find_finding(global: &std::path::Path, id: &str) -> Option<FindingOut> {
+    collect_all_findings(global)
+        .into_iter()
+        .find(|f| f.record.id == id)
+}
+
+/// `GET /api/findings/:id` — the full finding (report body included) plus a
+/// per-claim staleness verdict against the owning workspace's current files.
+async fn get_finding(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<FindingDetail>> {
+    let global = s.global_dir.clone();
+    let id_for_lookup = id.clone();
+    let found = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut finding =
+        found.ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    if let Ok(run) = s.run_store.load(&finding.record.declared_by.run_id) {
+        finding.workflow_name = Some(run.workflow_name);
+    }
+    let evidence_status = match (
+        finding.record.report.clone(),
+        crate::api::code::load_workspace(&s, &finding.ws_id),
+    ) {
+        // Hashing reads arbitrary workspace files, so keep it off the runtime.
+        (Some(report), Ok(ws)) => {
+            let root = std::path::PathBuf::from(ws.path);
+            tokio::task::spawn_blocking(move || claim_states(&root, &report))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+        }
+        (Some(report), Err(_)) => vec![ClaimState::Unknown; report.evidence.len()],
+        (None, _) => Vec::new(),
+    };
+    Ok(Json(FindingDetail {
+        finding,
+        evidence_status,
+    }))
+}
+
+/// The `filename` an artifact is offered under: the last `/`-separated segment
+/// of its recorded path, with `"`, `\` and control characters replaced by `_`
+/// so the value can never break out of the quoted `Content-Disposition`
+/// parameter.
+fn safe_filename(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c == '"' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "artifact".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Read size for streaming an artifact body (tokio's default is 4 KiB, which
+/// is a syscall and an allocation per tiny chunk for multi-hundred-MB files).
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Open `path`, confirm the handle is a regular file whose contents hash to
+/// `expected_sha`, and return that SAME handle rewound to the start, so the
+/// path cannot be re-pointed between the hash and the stream. That is not a
+/// content guarantee: the file is streamed after it was hashed, and an
+/// in-place rewrite of the same inode while it streams is not prevented (the
+/// workspace is agent-writable). Synchronous and potentially slow (it reads the
+/// whole file): async callers must run it under `spawn_blocking`.
+///
+/// `recorded_size` (0 = not recorded) short-circuits an obviously changed file
+/// with a 409 before paying for the hash.
+fn open_verified(
+    path: &std::path::Path,
+    expected_sha: &str,
+    recorded_size: u64,
+) -> Result<std::fs::File, ApiError> {
+    use std::io::{Seek, SeekFrom};
+    let gone = || ApiError::not_found("artifact is no longer in the workspace");
+    let changed = || ApiError::conflict("artifact changed since the finding was recorded");
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            gone()
+        } else {
+            ApiError::internal(e.to_string())
+        }
+    })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(gone());
+    }
+    if recorded_size != 0 && meta.len() != recorded_size {
+        return Err(changed());
+    }
+    let now = rupu_coverage::report::sha256_reader(&mut file)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if now != expected_sha {
+        return Err(changed());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(file)
+}
+
+/// `GET /api/findings/:id/artifacts/:sha256` — the bytes of an artifact the
+/// finding's report references.
+///
+/// Only artifacts listed in the finding's own `report.artifacts` are served, so
+/// a request can reach only a blob some finding in the ledger references. That
+/// limits exposure, but it is not a hard boundary: the ledger lives in the
+/// agent-writable workspace, so a forged ledger line can list any blob in the
+/// store whose sha256 is already known. Artifacts are never rendered as HTML:
+/// text is `text/plain` inline, anything else an `application/octet-stream`
+/// attachment, always `nosniff` and `Content-Security-Policy: sandbox`.
+async fn get_artifact(
+    State(s): State<AppState>,
+    Path((id, sha)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let store = ArtifactStore::new(s.global_dir.join("findings").join("artifacts"));
+    let blob = store.blob_path_checked(&sha).ok_or_else(|| {
+        ApiError::bad_request("artifact id must be a 64-character lowercase sha256")
+    })?;
+    let global = s.global_dir.clone();
+    let id_for_lookup = id.clone();
+    let finding = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    let artifact = finding
+        .record
+        .report
+        .as_ref()
+        .and_then(|r| r.artifacts.iter().find(|a| a.sha256 == sha))
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("this finding does not reference that artifact"))?;
+
+    let file = match (artifact.stored, artifact.host.as_deref()) {
+        (Some(ArtifactStorage::External), Some(host)) => {
+            return Err(ApiError::not_found(format!(
+                "artifact is stored on host {host}; remote fetch is not supported yet"
+            )));
+        }
+        (Some(ArtifactStorage::External), None) => {
+            let ws = crate::api::code::load_workspace(&s, &finding.ws_id)?;
+            let gone = || ApiError::not_found("artifact is no longer in the workspace");
+            let p = crate::api::source::resolve_under_workspace(
+                std::path::Path::new(&ws.path),
+                &artifact.path,
+            )
+            .map_err(|_| gone())?;
+            // Cheap early refusal so a FIFO or directory is never opened.
+            if !p.is_file() {
+                return Err(gone());
+            }
+            // Open, verify and hash ONE handle off the runtime, then serve that
+            // same handle: a path in an agent-writable workspace can be
+            // re-pointed between a check and a later open, a handle cannot.
+            let (expected, recorded_size) = (sha.clone(), artifact.size);
+            let verified =
+                tokio::task::spawn_blocking(move || open_verified(&p, &expected, recorded_size))
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))??;
+            tokio::fs::File::from_std(verified)
+        }
+        _ => tokio::fs::File::open(&blob).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::not_found("artifact blob missing from the store")
+            } else {
+                ApiError::internal(e.to_string())
+            }
+        })?,
+    };
+
+    let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+        file,
+        STREAM_CHUNK_BYTES,
+    ));
+    let name = safe_filename(&artifact.path);
+    let (ctype, disposition) = match artifact.kind {
+        Some(ArtifactKind::Text) => (
+            "text/plain; charset=utf-8",
+            format!("inline; filename=\"{name}\""),
+        ),
+        _ => (
+            "application/octet-stream",
+            format!("attachment; filename=\"{name}\""),
+        ),
+    };
+    let mut resp = Response::new(body);
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // Belt and braces with `nosniff`: even if a client did render the bytes,
+    // `sandbox` gives them an opaque origin with no scripts, forms or plugins.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    Ok(resp)
+}
+
+// ── report exports ──────────────────────────────────────────────────────────
+
+/// Title of a project report when the request gives none.
+const DEFAULT_EXPORT_TITLE: &str = "Findings report";
+
+/// Longest report title accepted, in characters. The title lands in the
+/// document, its page header and the download's file name.
+const MAX_EXPORT_TITLE_CHARS: usize = 200;
+
+/// Query of `GET /api/findings/:id/export`.
+#[derive(Debug, Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
+/// Body of `POST /api/findings/export`. Unknown fields are refused: a
+/// misspelt filter (`severity` for `min_severity`) must not quietly widen the
+/// report to every finding.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportBody {
+    format: Option<String>,
+    title: Option<String>,
+    /// Only these finding ids (which also opts summary findings in).
+    #[serde(default)]
+    ids: Vec<String>,
+    ws_id: Option<String>,
+    /// A run and its sub-runs, resolved as the list endpoint does.
+    run_id: Option<String>,
+    /// `critical` | `high` | `medium` | `low` | `info`: this severity and worse.
+    min_severity: Option<String>,
+    owner: Option<String>,
+    cwe: Option<String>,
+    /// Keep summary-profile findings (off by default).
+    #[serde(default)]
+    include_summaries: bool,
+    /// One file per finding plus an index, as a zip.
+    #[serde(default)]
+    split: bool,
+}
+
+/// A rendered report on its way to a client or a file.
+#[derive(Debug)]
+pub struct ExportedReport {
+    pub bytes: Vec<u8>,
+    pub content_type: &'static str,
+    /// The file name (with extension) to offer it under.
+    pub name: String,
+    /// Rendered HTML: additionally served with a sandboxing CSP.
+    pub html: bool,
+}
+
+/// Why a report could not be produced. The HTTP handlers map it to a status
+/// (`ApiError`), `rupu findings export` prints it.
+#[derive(Debug, thiserror::Error)]
+pub enum ReportError {
+    /// The selection matched no finding (or the named finding does not exist).
+    #[error("{0}")]
+    NotFound(String),
+    #[error(transparent)]
+    Render(#[from] ExportError),
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<ReportError> for ApiError {
+    fn from(e: ReportError) -> Self {
+        match e {
+            ReportError::NotFound(msg) => ApiError::not_found(msg),
+            ReportError::Render(e) => export_error(e),
+            ReportError::Internal(msg) => ApiError::internal(msg),
+        }
+    }
+}
+
+/// The requested format, refused up front when it is unknown or this build
+/// cannot produce it (PDF without the `pdf` feature is 501).
+fn export_format(raw: Option<&str>) -> Result<Format, ApiError> {
+    let fmt = raw
+        .and_then(Format::parse)
+        .ok_or_else(|| ApiError::bad_request("format must be one of md, html, pdf"))?;
+    if !fmt.is_available() {
+        return Err(export_error(ExportError::PdfUnavailable));
+    }
+    Ok(fmt)
+}
+
+fn export_error(e: ExportError) -> ApiError {
+    match e {
+        ExportError::PdfUnavailable => ApiError::not_available(e.to_string()),
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
+/// A severity name (`critical` | `high` | `medium` | `low` | `info`, any
+/// case), or `None` for anything else.
+pub fn parse_min_severity(raw: &str) -> Option<Severity> {
+    serde_json::from_value(serde_json::Value::String(raw.to_lowercase())).ok()
+}
+
+fn min_severity_error() -> ApiError {
+    ApiError::bad_request("min_severity must be one of critical, high, medium, low, info")
+}
+
+/// The display-number prefix: `[findings].export_id_prefix` when it is a
+/// sane identifier, else `SEC`. The value ends up in file names and document
+/// text and the project layer of the config is repo-controlled, so an invalid
+/// one is refused (with a warning) rather than escaped.
+pub fn resolve_export_prefix(configured: Option<&str>) -> String {
+    match configured {
+        None => DEFAULT_PREFIX.to_string(),
+        Some(p) if is_valid_prefix(p) => p.to_string(),
+        Some(p) => {
+            tracing::warn!(
+                prefix = ?p.chars().take(32).collect::<String>(),
+                "ignoring invalid [findings].export_id_prefix (a letter, then up to 15 of \
+                 A-Z a-z 0-9 _ -); using {DEFAULT_PREFIX}"
+            );
+            DEFAULT_PREFIX.to_string()
+        }
+    }
+}
+
+fn export_prefix(s: &AppState) -> String {
+    let configured = s
+        .config
+        .read()
+        .ok()
+        .and_then(|c| c.findings.export_id_prefix.clone());
+    resolve_export_prefix(configured.as_deref())
+}
+
+/// The title of a project report: `raw` trimmed, or [`DEFAULT_EXPORT_TITLE`]
+/// when it is absent or blank. Refused when longer than
+/// [`MAX_EXPORT_TITLE_CHARS`] (the title lands in the document, its page
+/// header and the file name).
+pub fn normalize_export_title(raw: Option<&str>) -> Result<String, String> {
+    match raw.map(str::trim) {
+        Some(t) if t.chars().count() > MAX_EXPORT_TITLE_CHARS => Err(format!(
+            "title is longer than {MAX_EXPORT_TITLE_CHARS} characters"
+        )),
+        Some(t) if !t.is_empty() => Ok(t.to_string()),
+        _ => Ok(DEFAULT_EXPORT_TITLE.to_string()),
+    }
+}
+
+/// Resolve a project given as a workspace id or as a path to its checkout to
+/// the workspace id. A path is matched against the registered workspaces'
+/// (canonicalised) paths.
+pub fn resolve_project(global_dir: &std::path::Path, project: &str) -> Result<String, String> {
+    let workspaces = store_for(global_dir).list().unwrap_or_default();
+    if let Some(w) = workspaces.iter().find(|w| w.id == project) {
+        return Ok(w.id.clone());
+    }
+    let wanted = std::path::Path::new(project);
+    let wanted = wanted
+        .canonicalize()
+        .unwrap_or_else(|_| wanted.to_path_buf());
+    workspaces
+        .iter()
+        .find(|w| {
+            let p = std::path::Path::new(&w.path);
+            p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == wanted
+        })
+        .map(|w| w.id.clone())
+        .ok_or_else(|| {
+            format!("no project matches `{project}` (expected a workspace id or the path of a registered project)")
+        })
+}
+
+fn export_input(f: FindingOut) -> ExportInput {
+    ExportInput {
+        ws_id: f.ws_id,
+        project: f.project,
+        workflow_name: f.workflow_name,
+        record: f.record,
+    }
+}
+
+/// Fill in `workflow_name` (joined via `declared_by.run_id`, as the list
+/// endpoint does) on findings that are about to be rendered.
+fn attach_workflow_names(runs: &RunStore, findings: &mut [ExportFinding]) {
+    let names = workflow_names_by_run(
+        runs,
+        findings
+            .iter()
+            .map(|f| f.input.record.declared_by.run_id.as_str()),
+    );
+    for f in findings {
+        f.input.workflow_name = names.get(&f.input.record.declared_by.run_id).cloned();
+    }
+}
+
+/// A `Content-Disposition` value that always downloads `name`. The quoted
+/// `filename` is ASCII with `"`, `\` and anything unprintable replaced by
+/// `_`; a name that has more than that also gets the RFC 6266 `filename*`
+/// form so a UTF-8 title survives.
+fn attachment_disposition(name: &str) -> String {
+    let fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut out = format!("attachment; filename=\"{fallback}\"");
+    if fallback != name {
+        let mut encoded = String::new();
+        for b in name.bytes() {
+            if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+                encoded.push(b as char);
+            } else {
+                encoded.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out.push_str(&format!("; filename*=UTF-8''{encoded}"));
+    }
+    out
+}
+
+/// The download response: always an attachment (rendered HTML is never shown
+/// inline from this origin), `nosniff`, and for HTML a `sandbox` CSP as well.
+fn download_response(d: ExportedReport) -> Response {
+    let mut resp = Response::new(Body::from(d.bytes));
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(d.content_type),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if d.html {
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("sandbox"),
+        );
+    }
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&attachment_disposition(&d.name))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    resp
+}
+
+/// The file name (no extension) a project report is offered under: the
+/// title, cleaned as a finding title is for [`filename`]. A title that
+/// cleans to nothing, or would start a hidden file, falls back to the default.
+fn report_file_stem(title: &str) -> String {
+    match sanitize_title(title).trim_start_matches('.') {
+        "" => DEFAULT_EXPORT_TITLE.to_string(),
+        stem => stem.to_string(),
+    }
+}
+
+/// One finding rendered as a stand-alone report, numbered within its own
+/// project (so it carries the number it has in the project's full report).
+pub fn export_finding_report(
+    global: &std::path::Path,
+    runs: &RunStore,
+    id: &str,
+    prefix: &str,
+    fmt: Format,
+) -> Result<ExportedReport, ReportError> {
+    let all = collect_all_findings(global);
+    let ws_id = all
+        .iter()
+        .find(|f| f.record.id == id)
+        .map(|f| f.ws_id.clone())
+        .ok_or_else(|| ReportError::NotFound(format!("finding {id} not found")))?;
+    // Numbers are per project: number only the finding's own.
+    let project: Vec<ExportInput> = all
+        .into_iter()
+        .filter(|f| f.ws_id == ws_id)
+        .map(export_input)
+        .collect();
+    let mut numbered = assign_numbers(project, prefix);
+    let numbers = number_map(&numbered);
+    let pos = numbered
+        .iter()
+        .position(|f| f.input.record.id == id)
+        .ok_or_else(|| ReportError::Internal(format!("finding {id} was not numbered")))?;
+    let mut finding = numbered.swap_remove(pos);
+    attach_workflow_names(runs, std::slice::from_mut(&mut finding));
+    let bytes = render_finding(&finding, &numbers, fmt)?;
+    Ok(ExportedReport {
+        bytes,
+        content_type: fmt.content_type(),
+        name: filename(&finding, fmt.ext()),
+        html: fmt == Format::Html,
+    })
+}
+
+/// How many PDF renders `cp serve` runs at once. A Typst compile is CPU- and
+/// memory-heavy (fonts, layout, a whole project in one document), and `cp
+/// serve` is a long-running process: without a bound, a burst of export
+/// clicks would pin every blocking thread and grow the heap together.
+/// Markdown and HTML are cheap and are not gated.
+const MAX_CONCURRENT_PDF_RENDERS: usize = 2;
+
+static PDF_RENDERS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_PDF_RENDERS);
+
+/// A slot to render `fmt` in: for PDF, one of `gate`'s permits (waiting for
+/// one to free up), for everything else nothing. The permit is moved into the
+/// blocking render and released when the render ends, not when the request
+/// does: a client that disconnects does not cancel the compile.
+async fn render_slot(
+    gate: &'static tokio::sync::Semaphore,
+    fmt: Format,
+) -> Result<Option<tokio::sync::SemaphorePermit<'static>>, ApiError> {
+    if fmt != Format::Pdf {
+        return Ok(None);
+    }
+    gate.acquire()
+        .await
+        .map(Some)
+        .map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// `GET /api/findings/:id/export?format=md|html|pdf` — one finding as a
+/// downloadable report, numbered within its own project.
+async fn export_finding(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ExportQuery>,
+) -> Result<Response, ApiError> {
+    let fmt = export_format(q.format.as_deref())?;
+    let prefix = export_prefix(&s);
+    let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
+    let slot = render_slot(&PDF_RENDERS, fmt).await?;
+    let download = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        export_finding_report(&global, &runs, &id, &prefix, fmt)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(download_response(download))
+}
+
+/// What a project report covers. Every filter narrows the selection; unset
+/// ones keep everything.
+#[derive(Debug, Clone, Default)]
+pub struct ReportRequest {
+    /// The report's title (already through [`normalize_export_title`]).
+    pub title: String,
+    /// Only these finding ids (which also opts summary findings in).
+    pub ids: Vec<String>,
+    pub ws_id: Option<String>,
+    /// A run and its sub-runs, resolved as the list endpoint does.
+    pub run_id: Option<String>,
+    /// This severity and worse.
+    pub min_severity: Option<Severity>,
+    pub owner: Option<String>,
+    pub cwe: Option<String>,
+    /// Keep summary-profile findings (off by default).
+    pub include_summaries: bool,
+    /// One file per finding plus an index, as a zip.
+    pub split: bool,
+}
+
+/// A report over the findings `req` selects: one file, or with `req.split` a
+/// zip of one file per finding plus an index. Every finding is numbered
+/// within its project before any is dropped, so a number never depends on
+/// what else was left out. [`ReportError::NotFound`] when nothing matches.
+pub fn export_project_report(
+    global: &std::path::Path,
+    runs: &RunStore,
+    prefix: &str,
+    req: ReportRequest,
+    fmt: Format,
+) -> Result<ExportedReport, ReportError> {
+    let run_ids = req
+        .run_id
+        .as_deref()
+        .map(|parent| resolve_run_scope(runs, parent));
+    // Number everything first, then select: a finding keeps the number it has
+    // in the whole project whatever else is left out.
+    let numbered = assign_numbers(
+        collect_all_findings(global)
+            .into_iter()
+            .map(export_input)
+            .collect(),
+        prefix,
+    );
+    // Every finding's number, with its project, taken before selecting: a
+    // cross-reference to a finding the selection leaves out still prints the
+    // number its own export carries.
+    let all_numbers: Vec<(String, String, String)> = numbered
+        .iter()
+        .map(|f| {
+            (
+                f.input.ws_id.clone(),
+                f.input.record.id.clone(),
+                f.number.clone(),
+            )
+        })
+        .collect();
+    let sel = Selection {
+        ids: req.ids,
+        ws_id: req.ws_id,
+        run_ids,
+        min_severity: req.min_severity,
+        owner: req.owner,
+        cwe: req.cwe,
+        include_summaries: req.include_summaries,
+    };
+    let mut chosen = select(numbered, &sel);
+    if chosen.is_empty() {
+        return Err(ReportError::NotFound(
+            "no findings match this selection".to_string(),
+        ));
+    }
+    attach_workflow_names(runs, &mut chosen);
+    // Numbers are per project, so only the projects in the report lend theirs:
+    // another project's `SEC-004` would name a finding the reader cannot see.
+    let in_report: HashSet<&str> = chosen.iter().map(|f| f.input.ws_id.as_str()).collect();
+    let numbers: HashMap<String, String> = all_numbers
+        .into_iter()
+        .filter(|(ws_id, _, _)| in_report.contains(ws_id.as_str()))
+        .map(|(_, id, number)| (id, number))
+        .collect();
+    let meta = ReportMeta {
+        scope: describe(&sel, req.run_id.as_deref(), &chosen),
+        title: req.title,
+        generated_at: chrono::Utc::now(),
+    };
+    let stem = report_file_stem(&meta.title);
+    if req.split {
+        let bytes = render_split_zip(&meta, &chosen, &numbers, fmt)?;
+        Ok(ExportedReport {
+            bytes,
+            content_type: "application/zip",
+            name: fit_file_name(&stem, "zip"),
+            html: false,
+        })
+    } else {
+        let bytes = render_project(&meta, &chosen, &numbers, fmt)?;
+        Ok(ExportedReport {
+            bytes,
+            content_type: fmt.content_type(),
+            name: fit_file_name(&stem, fmt.ext()),
+            html: fmt == Format::Html,
+        })
+    }
+}
+
+/// `POST /api/findings/export` — a report over the findings the body selects:
+/// one file, or with `split` a zip of one file per finding plus an index.
+/// 404 when nothing matches.
+async fn export_findings(
+    State(s): State<AppState>,
+    Json(body): Json<ExportBody>,
+) -> Result<Response, ApiError> {
+    let fmt = export_format(body.format.as_deref())?;
+    let min_severity = body
+        .min_severity
+        .as_deref()
+        .map(|raw| parse_min_severity(raw).ok_or_else(min_severity_error))
+        .transpose()?;
+    let title = normalize_export_title(body.title.as_deref()).map_err(ApiError::bad_request)?;
+    // Compared by number (CWE-79 never selects CWE-798); an unreadable value
+    // is refused rather than matching nothing.
+    let cwe = body
+        .cwe
+        .as_deref()
+        .map(|raw| {
+            parse_cwe(raw)
+                .map(|n| format!("CWE-{n}"))
+                .ok_or_else(|| ApiError::bad_request("cwe must be a CWE id such as CWE-79"))
+        })
+        .transpose()?;
+    let prefix = export_prefix(&s);
+    let req = ReportRequest {
+        title,
+        ids: body.ids,
+        ws_id: body.ws_id,
+        run_id: body.run_id,
+        min_severity,
+        owner: body.owner,
+        cwe,
+        include_summaries: body.include_summaries,
+        split: body.split,
+    };
+    let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
+    let slot = render_slot(&PDF_RENDERS, fmt).await?;
+    let download = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        export_project_report(&global, &runs, &prefix, req, fmt)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(download_response(download))
 }
 
 #[cfg(test)]
@@ -363,6 +1188,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use rupu_coverage::{Attribution, FindingEvidence, FindingScope, Surface};
+    use rupu_orchestrator::executor::Event;
 
     fn attribution() -> Attribution {
         attribution_run("run_01KS19A4MQXP")
@@ -406,6 +1232,7 @@ mod tests {
             target_id: "tgt".to_string(),
             workflow_name: workflow_name.map(|s| s.to_string()),
             permalink: None,
+            report_summary: None,
             record: FindingRecord {
                 id: id.to_string(),
                 file_path: Some("src/a.rs".to_string()),
@@ -422,6 +1249,8 @@ mod tests {
                 },
                 declared_by: attribution(),
                 declared_at: at(declared_at),
+                profile: rupu_coverage::FindingProfile::Summary,
+                report: None,
             },
         }
     }
@@ -472,6 +1301,7 @@ mod tests {
                 target_id: "tgt1".into(),
                 workflow_name: Some("nightly-health".into()),
                 permalink: Some("https://github.com/o/r/blob/main/src/a.rs#L17-L19".into()),
+                report_summary: None,
                 record: FindingRecord {
                     id: "fnd_1".into(),
                     file_path: Some("src/a.rs".into()),
@@ -488,6 +1318,8 @@ mod tests {
                     },
                     declared_by: attribution(),
                     declared_at: at("2026-08-20T12:00:00Z"),
+                    profile: rupu_coverage::FindingProfile::Summary,
+                    report: None,
                 },
             },
             FindingOut {
@@ -498,6 +1330,7 @@ mod tests {
                 target_id: "tgt1".into(),
                 workflow_name: None,
                 permalink: None,
+                report_summary: None,
                 record: FindingRecord {
                     id: "fnd_2".into(),
                     file_path: None,
@@ -514,6 +1347,8 @@ mod tests {
                     },
                     declared_by: attribution(),
                     declared_at: at("2026-08-20T11:00:00Z"),
+                    profile: rupu_coverage::FindingProfile::Summary,
+                    report: None,
                 },
             },
         ]);
@@ -879,6 +1714,8 @@ mod tests {
             },
             declared_by: attribution(),
             declared_at: at("2026-01-01T00:00:00Z"),
+            profile: rupu_coverage::FindingProfile::Summary,
+            report: None,
         };
         let mut without_loc = with_loc.clone();
         without_loc.id = "fnd_no_loc".to_string();
@@ -930,5 +1767,1725 @@ mod tests {
         assert_eq!(q2.ws_id, None);
         assert_eq!(q2.workflow, None);
         assert_eq!(q2.run_id, None);
+    }
+
+    fn full_record(id: &str) -> FindingRecord {
+        let report: rupu_coverage::FindingReport = serde_json::from_str(include_str!(
+            "../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap();
+        let mut rec = finding(id, Severity::Critical, "2026-09-29T00:00:00Z").record;
+        rec.profile = rupu_coverage::FindingProfile::Full;
+        rec.summary = report.title.clone();
+        rec.report = Some(report);
+        rec
+    }
+
+    #[test]
+    fn list_rows_carry_report_summary_not_report() {
+        let mut out = finding("f1", Severity::Critical, "2026-09-29T00:00:00Z");
+        out.record = full_record("f1");
+        let row = out.into_list_row();
+        assert!(row.record.report.is_none());
+        let s = row
+            .report_summary
+            .clone()
+            .expect("summary for full-profile rows");
+        assert_eq!(s.completeness.total, 11);
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("report").is_none());
+        assert!(json["report_summary"]["root_cause"].is_string());
+    }
+
+    #[test]
+    fn summary_rows_have_no_report_summary_key() {
+        let row = finding("f2", Severity::High, "2026-09-29T00:00:00Z").into_list_row();
+        let json = serde_json::to_value(&row).unwrap();
+        assert!(json.get("report_summary").is_none());
+    }
+
+    #[test]
+    fn claim_states_compare_file_hashes() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/routes")).unwrap();
+        std::fs::write(ws.path().join("src/routes/notes.rs"), "fn a() {}\n").unwrap();
+        let mut report = full_record("f3").report.unwrap();
+        let current =
+            rupu_coverage::report::sha256_file(&ws.path().join("src/routes/notes.rs")).unwrap();
+        report.evidence[0].sha256 = Some(current.clone());
+        let mut changed = report.evidence[0].clone();
+        changed.sha256 = Some("0".repeat(64));
+        let mut missing = report.evidence[0].clone();
+        missing.file = Some("src/gone.rs".into());
+        let mut unknown = report.evidence[0].clone();
+        unknown.sha256 = None;
+        report.evidence = vec![report.evidence[0].clone(), changed, missing, unknown];
+        assert_eq!(
+            claim_states(ws.path(), &report),
+            vec![
+                ClaimState::Current,
+                ClaimState::Changed,
+                ClaimState::Missing,
+                ClaimState::Unknown
+            ]
+        );
+    }
+
+    /// Register a workspace at `<global>/repo` and write `records` as the
+    /// findings ledger of one coverage target under it.
+    fn seed_workspace_findings(
+        global: &std::path::Path,
+        records: &[FindingRecord],
+    ) -> std::path::PathBuf {
+        let repo = global.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws = rupu_workspace::Workspace {
+            id: "ws1".to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: None,
+            initial_branch: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        let workspaces_dir = global.join("workspaces");
+        std::fs::create_dir_all(&workspaces_dir).unwrap();
+        std::fs::write(
+            workspaces_dir.join("ws1.toml"),
+            toml::to_string(&ws).unwrap(),
+        )
+        .unwrap();
+        let paths = CoveragePaths::new(&repo, "tgt1");
+        paths.ensure_dir().unwrap();
+        let jsonl: String = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.findings, jsonl).unwrap();
+        repo
+    }
+
+    async fn get_json(app: Router, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn get_finding_serves_report_and_evidence_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut rec = full_record("fnd_detail");
+        // Pin the first claim's hash to a real file so it reports `current`.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src/routes")).unwrap();
+        std::fs::write(repo.join("src/routes/notes.rs"), "fn a() {}\n").unwrap();
+        {
+            let report = rec.report.as_mut().unwrap();
+            let file = report.evidence[0].file.clone().unwrap();
+            let sha = rupu_coverage::report::sha256_file(&repo.join(&file)).unwrap();
+            report.evidence[0].sha256 = Some(sha);
+        }
+        let evidence_len = rec.report.as_ref().unwrap().evidence.len();
+        seed_workspace_findings(tmp.path(), &[rec, full_record("fnd_other")]);
+
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let app = routes().with_state(state);
+
+        let (status, json) = get_json(app.clone(), "/api/findings/fnd_detail").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["id"], "fnd_detail");
+        assert!(json["report"]["title"].is_string());
+        let ev = json["evidence_status"].as_array().unwrap();
+        assert_eq!(ev.len(), evidence_len);
+        assert_eq!(ev[0], "current");
+        // The detail endpoint serves the body, not the list-row summary.
+        assert!(json.get("report_summary").is_none());
+
+        let (status, json) = get_json(app.clone(), "/api/findings/fnd_nope").await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "finding fnd_nope not found");
+
+        // The list endpoint slims the same finding to a summary.
+        let (status, json) = get_json(app, "/api/findings").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let rows = json["findings"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row.get("report").is_none());
+            assert!(row["report_summary"]["root_cause"].is_string());
+        }
+    }
+
+    #[test]
+    fn claim_states_reject_paths_that_escape_the_workspace() {
+        let root = tempfile::TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = root.path().join("outside.rs");
+        std::fs::write(&outside, "fn secret() {}\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&outside).unwrap();
+
+        let mut report = full_record("f4").report.unwrap();
+        let mut dotdot = report.evidence[0].clone();
+        dotdot.file = Some("../outside.rs".into());
+        dotdot.sha256 = Some(sha.clone());
+        let mut absolute = report.evidence[0].clone();
+        absolute.file = Some(outside.to_str().unwrap().to_string());
+        absolute.sha256 = Some(sha);
+        report.evidence = vec![dotdot, absolute];
+        // The files exist and hash correctly: only the escape check can
+        // explain a `Missing` (never `Current`).
+        assert_eq!(
+            claim_states(&ws, &report),
+            vec![ClaimState::Missing, ClaimState::Missing]
+        );
+    }
+
+    #[test]
+    fn claim_states_skip_hashing_files_over_the_size_cap() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("big.bin"), vec![7u8; 64]).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&ws.path().join("big.bin")).unwrap();
+        let mut report = full_record("f5").report.unwrap();
+        report.evidence[0].file = Some("big.bin".into());
+        report.evidence[0].sha256 = Some(sha);
+        report.evidence.truncate(1);
+        assert_eq!(
+            claim_states_capped(ws.path(), &report, 63),
+            vec![ClaimState::Unknown]
+        );
+        assert_eq!(
+            claim_states_capped(ws.path(), &report, 64),
+            vec![ClaimState::Current]
+        );
+    }
+
+    // Claims cite source files: far below the 500 MiB artifact cap.
+    const _: () = assert!(CLAIM_HASH_MAX_BYTES < rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES);
+
+    #[test]
+    fn claim_states_use_the_dedicated_claim_hash_cap_not_the_artifact_cap() {
+        assert_eq!(CLAIM_HASH_MAX_BYTES, 64 * 1024 * 1024);
+        let ws = tempfile::TempDir::new().unwrap();
+        // A sparse file one byte over the cap: never read, so this stays cheap.
+        let big = std::fs::File::create(ws.path().join("big.log")).unwrap();
+        big.set_len(CLAIM_HASH_MAX_BYTES + 1).unwrap();
+        drop(big);
+        let mut report = full_record("f6").report.unwrap();
+        report.evidence[0].file = Some("big.log".into());
+        report.evidence[0].sha256 = Some("0".repeat(64));
+        report.evidence.truncate(1);
+        assert_eq!(claim_states(ws.path(), &report), vec![ClaimState::Unknown]);
+    }
+
+    #[tokio::test]
+    async fn get_finding_with_an_unloadable_workspace_reports_every_claim_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Every claim points at a real file with its real hash, so a loadable
+        // workspace would report `current` for all of them: `unknown` below can
+        // only come from the workspace failing to load.
+        let mut rec = full_record("fnd_orphan");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("src/a.rs")).unwrap();
+        {
+            let report = rec.report.as_mut().unwrap();
+            for c in &mut report.evidence {
+                c.file = Some("src/a.rs".into());
+                c.sha256 = Some(sha.clone());
+            }
+        }
+        let claims = rec.report.as_ref().unwrap().evidence.len();
+        assert!(claims > 0);
+        seed_workspace_findings(tmp.path(), &[rec]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+
+        let (status, ok) = get_json(
+            routes().with_state(state.clone()),
+            "/api/findings/fnd_orphan",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            ok["evidence_status"],
+            serde_json::json!(vec!["current"; claims])
+        );
+
+        // Rename the record so the store still LISTS the workspace (the
+        // finding stays discoverable through its ledger) but `load(ws_id)`,
+        // which reads `<id>.toml`, no longer finds it.
+        let dir = tmp.path().join("workspaces");
+        std::fs::rename(dir.join("ws1.toml"), dir.join("moved.toml")).unwrap();
+        let (status, json) = get_json(routes().with_state(state), "/api/findings/fnd_orphan").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["id"], "fnd_orphan");
+        assert_eq!(
+            json["evidence_status"],
+            serde_json::json!(vec!["unknown"; claims])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_finding_for_a_summary_finding_has_empty_evidence_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let summary = finding("fnd_summary", Severity::High, "2026-09-29T00:00:00Z").record;
+        seed_workspace_findings(tmp.path(), &[summary]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let (status, json) =
+            get_json(routes().with_state(state), "/api/findings/fnd_summary").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["id"], "fnd_summary");
+        assert_eq!(json["evidence_status"], serde_json::json!([]));
+        assert!(json.get("report").is_none());
+    }
+
+    // ---- GET /api/findings/:id/artifacts/:sha256 ----
+
+    use rupu_coverage::report::{ArtifactKind, ArtifactRef, ArtifactStorage, ArtifactStore};
+
+    fn artifact_ref(
+        path: &str,
+        sha: &str,
+        size: u64,
+        kind: Option<ArtifactKind>,
+        stored: Option<ArtifactStorage>,
+        host: Option<&str>,
+    ) -> ArtifactRef {
+        ArtifactRef {
+            path: path.to_string(),
+            sha256: sha.to_string(),
+            size,
+            kind,
+            stored,
+            host: host.map(str::to_string),
+        }
+    }
+
+    /// Copy `bytes` into the content-addressed store under
+    /// `<global>/findings/artifacts` and return its sha256.
+    fn store_blob(global: &std::path::Path, bytes: &[u8]) -> String {
+        let scratch = global.join("blob-scratch.tmp");
+        std::fs::write(&scratch, bytes).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&scratch).unwrap();
+        let dest = ArtifactStore::new(global.join("findings").join("artifacts")).blob_path(&sha);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(&scratch, &dest).unwrap();
+        std::fs::remove_file(&scratch).unwrap();
+        sha
+    }
+
+    /// Seed workspace `ws1` with one full-profile finding `fnd_art` whose
+    /// report lists exactly `artifacts`.
+    fn seed_artifact_finding(global: &std::path::Path, artifacts: Vec<ArtifactRef>) {
+        let mut rec = full_record("fnd_art");
+        rec.report.as_mut().unwrap().artifacts = artifacts;
+        seed_workspace_findings(global, &[rec]);
+    }
+
+    fn app_for(global: &std::path::Path) -> Router {
+        let state = AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default());
+        routes().with_state(state)
+    }
+
+    async fn get_raw(
+        app: Router,
+        uri: &str,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt as _;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    fn error_of(body: &[u8]) -> String {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    fn header_str<'a>(h: &'a axum::http::HeaderMap, name: &str) -> &'a str {
+        h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
+    }
+
+    #[tokio::test]
+    async fn artifact_copied_text_is_served_inline_as_plain_text() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = b"<html><script>alert(1)</script></html>\n";
+        let sha = store_blob(tmp.path(), body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "logs/notes.txt",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        // Even HTML-looking text is plain text, never rendered.
+        assert!(header_str(&headers, "content-type").starts_with("text/plain"));
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
+        let disp = header_str(&headers, "content-disposition");
+        assert!(disp.starts_with("inline"), "disposition: {disp}");
+        assert!(
+            disp.contains("filename=\"notes.txt\""),
+            "disposition: {disp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_copied_binary_is_an_octet_stream_attachment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body: &[u8] = &[0, 159, 146, 150, 1, 2, 255];
+        let sha = store_blob(tmp.path(), body);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "out/capture.pcap",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Binary),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        assert_eq!(
+            header_str(&headers, "content-type"),
+            "application/octet-stream"
+        );
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
+        let disp = header_str(&headers, "content-disposition");
+        assert!(disp.starts_with("attachment"), "disposition: {disp}");
+        assert!(
+            disp.contains("filename=\"capture.pcap\""),
+            "disposition: {disp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_not_listed_on_the_finding_is_404_even_if_the_blob_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let listed = store_blob(tmp.path(), b"listed\n");
+        // A blob that is in the store (e.g. another finding's artifact) but is
+        // not referenced by `fnd_art`.
+        let unlisted = store_blob(tmp.path(), b"someone else's secret\n");
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "a.txt",
+                &listed,
+                7,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{unlisted}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_of(&bytes),
+            "this finding does not reference that artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_unknown_finding_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = store_blob(tmp.path(), b"x\n");
+        seed_artifact_finding(tmp.path(), vec![]);
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_nope/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "finding fnd_nope not found");
+    }
+
+    #[tokio::test]
+    async fn artifact_malformed_sha_is_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = store_blob(tmp.path(), b"x\n");
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "x.txt",
+                &sha,
+                2,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let app = app_for(tmp.path());
+        for bad in [
+            sha.to_uppercase(),
+            sha[..63].to_string(),
+            format!("{sha}0"),
+            "z".repeat(64),
+            "abc".to_string(),
+        ] {
+            let (status, _, _) = get_raw(
+                app.clone(),
+                &format!("/api/findings/fnd_art/artifacts/{bad}"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "sha `{bad}` must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_copied_but_missing_from_the_store_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Listed, but no blob was ever written to the store.
+        let sha = "a".repeat(64);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "gone.txt",
+                &sha,
+                1,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "artifact blob missing from the store");
+    }
+
+    #[tokio::test]
+    async fn artifact_external_on_a_remote_host_is_404_naming_the_host() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = "b".repeat(64);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "/var/log/big.bin",
+                &sha,
+                9_999_999_999,
+                Some(ArtifactKind::Binary),
+                Some(ArtifactStorage::External),
+                Some("build-box-7"),
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        let msg = error_of(&bytes);
+        assert!(msg.contains("build-box-7"), "message: {msg}");
+        assert!(
+            msg.contains("remote fetch is not supported yet"),
+            "message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_streams_when_the_workspace_file_is_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("dumps")).unwrap();
+        let body = b"external but intact\n";
+        std::fs::write(repo.join("dumps/big.log"), body).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("dumps/big.log")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dumps/big.log",
+                &sha,
+                body.len() as u64,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(bytes, body);
+        assert!(header_str(&headers, "content-type").starts_with("text/plain"));
+        assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_changed_since_recording_is_409() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("dump.log"), b"as recorded\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("dump.log")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dump.log",
+                &sha,
+                12,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        // The workspace file is edited after the finding was recorded.
+        std::fs::write(repo.join("dump.log"), b"edited later\n").unwrap();
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error_of(&bytes),
+            "artifact changed since the finding was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_missing_from_the_workspace_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = "c".repeat(64);
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "deleted.log",
+                &sha,
+                3,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "artifact is no longer in the workspace");
+    }
+
+    /// Seed a finding whose only artifact is an EXTERNAL local one at
+    /// `artifact_path`, whose recorded hash is `outside`'s real hash (so a
+    /// refusal can only come from the containment checks), then request it.
+    /// Asserts a 404 that leaks none of `outside`'s bytes.
+    async fn assert_outside_file_is_refused(
+        global: &std::path::Path,
+        artifact_path: &str,
+        outside: &std::path::Path,
+    ) {
+        let secret = std::fs::read(outside).unwrap();
+        let sha = rupu_coverage::report::sha256_file(outside).unwrap();
+        seed_artifact_finding(
+            global,
+            vec![artifact_ref(
+                artifact_path,
+                &sha,
+                secret.len() as u64,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        let (status, headers, bytes) = get_raw(
+            app_for(global),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&bytes), "artifact is no longer in the workspace");
+        assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_slice()));
+        assert_ne!(
+            header_str(&headers, "content-type"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_relative_dotdot_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `<global>/outside.txt` sits next to the workspace at `<global>/repo`.
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"not yours\n").unwrap();
+        assert_outside_file_is_refused(tmp.path(), "../outside.txt", &outside).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_absolute_path_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"not yours\n").unwrap();
+        assert_outside_file_is_refused(tmp.path(), outside.to_str().unwrap(), &outside).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_external_local_symlink_pointing_outside_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"not yours\n").unwrap();
+        // A perfectly relative, `..`-free path that is a symlink INSIDE the
+        // workspace pointing OUTSIDE it: only canonicalize + starts_with can
+        // catch this one.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link.txt")).unwrap();
+        // The link really does reach the outside bytes.
+        assert_eq!(
+            std::fs::read(repo.join("link.txt")).unwrap(),
+            b"not yours\n"
+        );
+        assert_outside_file_is_refused(tmp.path(), "link.txt", &outside).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_same_size_edit_is_409() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("dump.log"), b"as recorded\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("dump.log")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dump.log",
+                &sha,
+                12,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        // Same length, different bytes: only the hash can tell.
+        std::fs::write(repo.join("dump.log"), b"AS recorded\n").unwrap();
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error_of(&bytes),
+            "artifact changed since the finding was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_filename_quotes_are_sanitized_in_the_disposition() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sha = store_blob(tmp.path(), b"hi\n");
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dir/evil\"; x=\"y.txt",
+                &sha,
+                3,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::Copied),
+                None,
+            )],
+        );
+        let (status, headers, _) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            header_str(&headers, "content-disposition"),
+            "inline; filename=\"evil_; x=_y.txt\""
+        );
+    }
+
+    #[test]
+    fn safe_filename_takes_the_basename_and_neutralizes_header_breakers() {
+        assert_eq!(safe_filename("a/b/notes.txt"), "notes.txt");
+        assert_eq!(safe_filename("notes.txt"), "notes.txt");
+        assert_eq!(safe_filename("we\"ird\\name.txt"), "we_ird_name.txt");
+        assert_eq!(safe_filename("x\r\ny\tz.txt"), "x__y_z.txt");
+        // A trailing slash leaves nothing to name the download with.
+        assert_eq!(safe_filename("dir/"), "artifact");
+        assert_eq!(safe_filename(""), "artifact");
+    }
+
+    #[test]
+    fn open_verified_hands_back_the_hashed_handle_rewound_to_the_start() {
+        use std::io::Read as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("a.log");
+        let body = b"hashed and served from one handle\n";
+        std::fs::write(&p, body).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&p).unwrap();
+        // Hashing leaves the cursor at EOF; the returned handle must serve the
+        // whole file, not the empty tail.
+        let mut f = open_verified(&p, &sha, body.len() as u64).unwrap();
+        let mut got = Vec::new();
+        f.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        // A recorded size of 0 means "not recorded": only the hash decides.
+        assert!(open_verified(&p, &sha, 0).is_ok());
+    }
+
+    #[test]
+    fn open_verified_refuses_changed_missing_and_non_regular_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("a.log");
+        std::fs::write(&p, b"as recorded\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&p).unwrap();
+
+        // Same size, different bytes: caught by the hash.
+        std::fs::write(&p, b"AS recorded\n").unwrap();
+        assert_eq!(
+            open_verified(&p, &sha, 12).unwrap_err().0,
+            axum::http::StatusCode::CONFLICT
+        );
+        // Different size: caught before hashing.
+        std::fs::write(&p, b"longer than recorded\n").unwrap();
+        assert_eq!(
+            open_verified(&p, &sha, 12).unwrap_err().0,
+            axum::http::StatusCode::CONFLICT
+        );
+        // Gone.
+        assert_eq!(
+            open_verified(&dir.path().join("nope.log"), &sha, 12)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        // Not a regular file (a directory opens fine on unix; the handle's own
+        // metadata is what refuses it).
+        assert_eq!(
+            open_verified(dir.path(), &sha, 0).unwrap_err().0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_verified_handle_keeps_the_hashed_bytes_if_the_path_is_repointed_after() {
+        use std::io::Read as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("a.log");
+        let elsewhere = dir.path().join("elsewhere.txt");
+        std::fs::write(&p, b"the hashed bytes\n").unwrap();
+        std::fs::write(&elsewhere, b"an arbitrary other file\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&p).unwrap();
+        let mut f = open_verified(&p, &sha, 17).unwrap();
+        // The swap an agent-writable workspace allows between check and stream.
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &p).unwrap();
+        let mut got = String::new();
+        f.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "the hashed bytes\n");
+    }
+
+    // ── report exports ────────────────────────────────────────────────────────
+
+    /// Like `seed_workspace_findings`, for any workspace id and directory.
+    fn seed_named_workspace(
+        global: &std::path::Path,
+        ws_id: &str,
+        dir: &str,
+        records: &[FindingRecord],
+    ) {
+        let repo = global.join(dir);
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws = rupu_workspace::Workspace {
+            id: ws_id.to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: None,
+            initial_branch: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        let workspaces_dir = global.join("workspaces");
+        std::fs::create_dir_all(&workspaces_dir).unwrap();
+        std::fs::write(
+            workspaces_dir.join(format!("{ws_id}.toml")),
+            toml::to_string(&ws).unwrap(),
+        )
+        .unwrap();
+        let paths = CoveragePaths::new(&repo, "tgt1");
+        paths.ensure_dir().unwrap();
+        let jsonl: String = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.findings, jsonl).unwrap();
+    }
+
+    /// A full-profile finding with a chosen severity and declaring run.
+    fn full_in_run(id: &str, sev: Severity, run: &str) -> FindingRecord {
+        let mut r = full_record(id);
+        r.severity = sev;
+        r.declared_by = attribution_run(run);
+        r
+    }
+
+    async fn post_raw(
+        app: Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt as _;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    async fn export_post(
+        app: Router,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+        let (status, headers, bytes) = post_raw(app, "/api/findings/export", body).await;
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// Three full findings in `ws1`: `crit` (SEC-001), `high` (SEC-002) and
+    /// `med` (SEC-003), declared by run_crit / run_high / run_med.
+    fn app_with_three_full(tmp: &tempfile::TempDir) -> Router {
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                full_in_run("fnd_med", Severity::Medium, "run_med"),
+                full_in_run("fnd_crit", Severity::Critical, "run_crit"),
+                full_in_run("fnd_high", Severity::High, "run_high"),
+            ],
+        );
+        app_for(tmp.path())
+    }
+
+    fn disposition(h: &axum::http::HeaderMap) -> &str {
+        header_str(h, "content-disposition")
+    }
+
+    #[tokio::test]
+    async fn export_md_is_a_named_attachment_starting_with_its_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, h, body) =
+            get_raw(app_for(tmp.path()), "/api/findings/fnd_a/export?format=md").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            header_str(&h, "content-type"),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        let d = disposition(&h);
+        assert!(d.starts_with("attachment; filename=\"SEC-001 - "), "{d}");
+        assert!(d.ends_with(".md\""), "{d}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.starts_with("Filename:"),
+            "{}",
+            &body[..40.min(body.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_html_is_an_attachment_never_inline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, h, body) = get_raw(
+            app_for(tmp.path()),
+            "/api/findings/fnd_a/export?format=html",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "text/html; charset=utf-8");
+        let d = disposition(&h);
+        assert!(d.starts_with("attachment;"), "{d}");
+        assert!(!d.contains("inline"), "{d}");
+        assert!(d.contains(".html"), "{d}");
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&h, "content-security-policy"), "sandbox");
+        assert!(String::from_utf8_lossy(&body).contains("<html"));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    async fn export_pdf_is_a_pdf_attachment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, h, body) =
+            get_raw(app_for(tmp.path()), "/api/findings/fnd_a/export?format=pdf").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "application/pdf");
+        assert!(disposition(&h).starts_with("attachment; filename=\"SEC-001 - "));
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert!(body.starts_with(b"%PDF"));
+    }
+
+    #[cfg(not(feature = "pdf"))]
+    #[tokio::test]
+    async fn export_pdf_without_pdf_support_is_501() {
+        // Another crate in the build graph can switch the renderer's `pdf`
+        // feature on even when this crate's is off (feature unification).
+        if Format::Pdf.is_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let app = app_for(tmp.path());
+        let (status, _, body) = get_raw(app.clone(), "/api/findings/fnd_a/export?format=pdf").await;
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(error_of(&body).contains("PDF"), "{}", error_of(&body));
+        // Fails before any lookup, even for an empty selection.
+        let (status, _, _) =
+            export_post(app, serde_json::json!({"format": "pdf", "ids": ["x"]})).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn export_rejects_an_unknown_or_missing_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let app = app_for(tmp.path());
+        for uri in [
+            "/api/findings/fnd_a/export?format=exe",
+            "/api/findings/fnd_a/export",
+            "/api/findings/fnd_a/export?format=",
+        ] {
+            let (status, _, body) = get_raw(app.clone(), uri).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri}");
+            assert!(error_of(&body).contains("format"), "{uri}");
+        }
+        for body in [
+            serde_json::json!({"format": "exe"}),
+            serde_json::json!({"ids": ["fnd_a"]}),
+        ] {
+            let (status, _, _) = export_post(app.clone(), body).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn export_of_an_unknown_finding_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, _, body) = get_raw(
+            app_for(tmp.path()),
+            "/api/findings/fnd_nope/export?format=md",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&body), "finding fnd_nope not found");
+    }
+
+    #[tokio::test]
+    async fn a_finding_is_numbered_within_its_own_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_named_workspace(
+            tmp.path(),
+            "ws_a",
+            "repo_a",
+            &[
+                full_in_run("fnd_crit", Severity::Critical, "r"),
+                full_in_run("fnd_high", Severity::High, "r"),
+            ],
+        );
+        seed_named_workspace(
+            tmp.path(),
+            "ws_b",
+            "repo_b",
+            &[full_in_run("fnd_other", Severity::Low, "r")],
+        );
+        let app = app_for(tmp.path());
+        for (id, number) in [
+            ("fnd_crit", "SEC-001"),
+            ("fnd_high", "SEC-002"),
+            ("fnd_other", "SEC-001"),
+        ] {
+            let (status, h, body) =
+                get_raw(app.clone(), &format!("/api/findings/{id}/export?format=md")).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let want = format!("attachment; filename=\"{number} - ");
+            assert!(
+                disposition(&h).starts_with(&want),
+                "{id}: {}",
+                disposition(&h)
+            );
+            let body = String::from_utf8(body).unwrap();
+            assert!(body.starts_with(&format!("Filename: {number} - ")), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_configured_prefix_replaces_sec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        state.config.write().unwrap().findings.export_id_prefix = Some("VULN".into());
+        let app = routes().with_state(state);
+        let (status, h, _) = get_raw(app.clone(), "/api/findings/fnd_a/export?format=md").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            disposition(&h).starts_with("attachment; filename=\"VULN-001 - "),
+            "{}",
+            disposition(&h)
+        );
+        let (_, _, body) = export_post(app, serde_json::json!({"format": "md"})).await;
+        assert!(body.contains("VULN-001") && !body.contains("SEC-001"));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_configured_prefix_falls_back_to_sec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        for bad in [
+            "../x",
+            "SEC 1",
+            "",
+            "1ABC",
+            "A23456789012345678",
+            "SEC\"",
+            "É",
+        ] {
+            let state = AppState::new(
+                tmp.path().to_path_buf(),
+                rupu_config::PricingConfig::default(),
+            );
+            state.config.write().unwrap().findings.export_id_prefix = Some(bad.into());
+            let (status, h, _) = get_raw(
+                routes().with_state(state),
+                "/api/findings/fnd_a/export?format=md",
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{bad:?}");
+            assert!(
+                disposition(&h).starts_with("attachment; filename=\"SEC-001 - "),
+                "{bad:?}: {}",
+                disposition(&h)
+            );
+        }
+    }
+
+    fn run_record(id: &str, workflow: &str) -> rupu_orchestrator::runs::RunRecord {
+        use rupu_orchestrator::runs::{RunRecord, RunStatus};
+        RunRecord {
+            id: id.into(),
+            workflow_name: workflow.into(),
+            codename: None,
+            status: RunStatus::Completed,
+            inputs: Default::default(),
+            event: None,
+            workspace_id: "ws1".into(),
+            workspace_path: "/tmp/x".into(),
+            transcript_dir: "/tmp/x/.rupu/transcripts".into(),
+            started_at: at("2026-09-29T00:00:00Z"),
+            finished_at: None,
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            resume_approver: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            final_output: None,
+            loop_progress: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn exports_carry_the_workflow_name_joined_from_the_run_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                full_in_run("fnd_wf", Severity::Critical, "run_wf"),
+                full_in_run("fnd_lost", Severity::High, "run_lost"),
+            ],
+        );
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        state
+            .run_store
+            .create(run_record("run_wf", "audit-flow"), "name: t\nsteps: []\n")
+            .unwrap();
+        let app = routes().with_state(state);
+        let (_, _, body) = get_raw(app.clone(), "/api/findings/fnd_wf/export?format=md").await;
+        assert!(String::from_utf8(body).unwrap().contains("audit-flow"));
+        let (_, _, body) = export_post(app, serde_json::json!({"format": "md"})).await;
+        assert!(body.contains("audit-flow"));
+    }
+
+    #[tokio::test]
+    async fn project_report_is_an_attachment_named_by_its_title() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, body) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "title": "Q3 / \"audit\"\n review"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            header_str(&h, "content-type"),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Q3 audit review.md\""
+        );
+        for n in ["SEC-001", "SEC-002", "SEC-003"] {
+            assert!(body.contains(n), "{n}");
+        }
+        // No title: the default.
+        let (_, h, _) = export_post(app.clone(), serde_json::json!({"format": "html"})).await;
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Findings report.html\""
+        );
+        let (_, h, _) =
+            export_post(app, serde_json::json!({"format": "md", "title": "  ... "})).await;
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Findings report.md\""
+        );
+    }
+
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    async fn project_report_as_pdf() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, bytes) = post_raw(
+            app,
+            "/api/findings/export",
+            serde_json::json!({"format": "pdf"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "application/pdf");
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Findings report.pdf\""
+        );
+        assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    #[tokio::test]
+    async fn split_export_of_two_ids_is_a_zip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, bytes) = post_raw(
+            app,
+            "/api/findings/export",
+            serde_json::json!({
+                "format": "md", "title": "Split set", "split": true,
+                "ids": ["fnd_crit", "fnd_med"],
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "application/zip");
+        assert_eq!(disposition(&h), "attachment; filename=\"Split set.zip\"");
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert!(bytes.starts_with(b"PK"));
+        // Zip entry names are stored uncompressed: the index, and the two
+        // chosen findings under their stable numbers (the high one is absent).
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(hay.contains("index.md"));
+        assert!(hay.contains("SEC-001 - "));
+        assert!(hay.contains("SEC-003 - "));
+        assert!(!hay.contains("SEC-002 - "));
+    }
+
+    #[tokio::test]
+    async fn a_selection_that_matches_nothing_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        for body in [
+            serde_json::json!({"format": "md", "ids": ["fnd_nope"]}),
+            serde_json::json!({"format": "md", "owner": "Nobody At All"}),
+            serde_json::json!({"format": "md", "cwe": "CWE-1"}),
+            serde_json::json!({"format": "md", "ws_id": "ws_missing"}),
+            serde_json::json!({"format": "md", "run_id": "run_missing"}),
+            serde_json::json!({"format": "md", "split": true, "ids": ["fnd_nope"]}),
+        ] {
+            let (status, h, text) = export_post(app.clone(), body.clone()).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(
+                error_of(text.as_bytes()),
+                "no findings match this selection",
+                "{body}"
+            );
+            assert!(!disposition(&h).contains("attachment"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_findings_at_all_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (status, _, text) =
+            export_post(app_for(tmp.path()), serde_json::json!({"format": "md"})).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_of(text.as_bytes()),
+            "no findings match this selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_filters_narrow_the_report_and_keep_numbers_stable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let sel = |v: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let (status, _, text) = export_post(app, v).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{text}");
+                text
+            }
+        };
+        // Severity floor: critical + high, not medium.
+        let text = sel(serde_json::json!({"format": "md", "min_severity": "high"})).await;
+        assert!(text.contains("SEC-001") && text.contains("SEC-002"));
+        assert!(!text.contains("SEC-003"));
+        // One id keeps its project-wide number (medium is SEC-003, not 001).
+        let text = sel(serde_json::json!({"format": "md", "ids": ["fnd_med"]})).await;
+        assert!(text.contains("SEC-003") && !text.contains("SEC-001"));
+        // One run.
+        let text = sel(serde_json::json!({"format": "md", "run_id": "run_high"})).await;
+        assert!(text.contains("SEC-002") && !text.contains("SEC-001") && !text.contains("SEC-003"));
+        // One workspace / a CWE from the report / its exact owner.
+        let text =
+            sel(serde_json::json!({"format": "md", "ws_id": "ws1", "min_severity": "critical"}))
+                .await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+        let text =
+            sel(serde_json::json!({"format": "md", "cwe": "cwe-639", "min_severity": "critical"}))
+                .await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+        let text = sel(
+            serde_json::json!({"format": "md", "owner": "Unknown", "min_severity": "critical"}),
+        )
+        .await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+    }
+
+    #[tokio::test]
+    async fn a_run_selection_includes_its_sub_runs_like_the_list_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                full_in_run("fnd_top", Severity::Critical, "run_parent"),
+                full_in_run("fnd_unit", Severity::High, "run_unit1"),
+                full_in_run("fnd_else", Severity::Medium, "run_other"),
+            ],
+        );
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        // A fan-out unit is its own sub-run; its id is only in the parent's
+        // live event stream (the transcript stem).
+        let ev_path = state.run_store.events_path("run_parent");
+        std::fs::create_dir_all(ev_path.parent().unwrap()).unwrap();
+        let ev = Event::UnitStarted {
+            run_id: "run_parent".into(),
+            step_id: "assess".into(),
+            index: 0,
+            unit_key: "u".into(),
+            agent: None,
+            codename: None,
+            transcript_path: tmp.path().join("transcripts/run_unit1.jsonl"),
+            host: None,
+        };
+        std::fs::write(&ev_path, serde_json::to_string(&ev).unwrap() + "\n").unwrap();
+        let (status, _, text) = export_post(
+            routes().with_state(state),
+            serde_json::json!({"format": "md", "run_id": "run_parent"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(text.contains("SEC-001") && text.contains("SEC-002"));
+        assert!(!text.contains("SEC-003"));
+    }
+
+    #[tokio::test]
+    async fn summary_findings_are_opt_in_except_when_listed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let summary = finding("fnd_sum", Severity::High, "2026-01-01T00:00:00Z").record;
+        seed_workspace_findings(
+            tmp.path(),
+            &[full_in_run("fnd_full", Severity::Critical, "r"), summary],
+        );
+        let app = app_for(tmp.path());
+        let (_, _, text) = export_post(app.clone(), serde_json::json!({"format": "md"})).await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+        let (_, _, text) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "include_summaries": true}),
+        )
+        .await;
+        assert!(text.contains("SEC-001") && text.contains("SEC-002"));
+        let (status, _, text) =
+            export_post(app, serde_json::json!({"format": "md", "ids": ["fnd_sum"]})).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(text.contains("SEC-002") && !text.contains("SEC-001"));
+    }
+
+    #[tokio::test]
+    async fn a_cross_reference_to_a_finding_left_out_prints_its_project_number() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut citing = full_in_run("fnd_crit", Severity::Critical, "run_crit");
+        citing.report.as_mut().unwrap().cross_references =
+            rupu_coverage::report::OrSentinel::Value(vec![rupu_coverage::report::CrossRef {
+                finding_id: "fnd_med".to_string(),
+                relation: rupu_coverage::report::Relation::Sibling,
+                note: None,
+            }]);
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                citing,
+                full_in_run("fnd_high", Severity::High, "run_high"),
+                full_in_run("fnd_med", Severity::Medium, "run_med"),
+            ],
+        );
+        let app = app_for(tmp.path());
+        // fnd_med (SEC-003) is left out by both selections.
+        for body in [
+            serde_json::json!({"format": "md", "min_severity": "high"}),
+            serde_json::json!({"format": "md", "ids": ["fnd_crit"]}),
+        ] {
+            let (status, _, text) = export_post(app.clone(), body.clone()).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert!(text.contains("- SEC-003 (sibling)"), "{body}\n{text}");
+            assert!(!text.contains("fnd_med"), "{body}\n{text}");
+        }
+        // The single-finding export of the same finding prints the same
+        // number. (The split archive is handed the same map; that path is
+        // covered by rupu-findings-report's
+        // `a_cross_reference_to_a_finding_left_out_keeps_its_project_number`.)
+        let (_, _, single) = get_raw(app, "/api/findings/fnd_crit/export?format=md").await;
+        assert!(String::from_utf8_lossy(&single).contains("- SEC-003 (sibling)"));
+    }
+
+    #[tokio::test]
+    async fn a_cwe_selection_compares_numbers_not_substrings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut xss = full_in_run("fnd_xss", Severity::Critical, "r");
+        xss.report.as_mut().unwrap().cwe = vec!["CWE-79".to_string()];
+        let mut creds = full_in_run("fnd_creds", Severity::High, "r");
+        creds.report.as_mut().unwrap().cwe = vec![];
+        creds.concern_id = Some("cwe-top25-2023:cwe-798-hardcoded-credentials".to_string());
+        seed_workspace_findings(tmp.path(), &[xss, creds]);
+        let app = app_for(tmp.path());
+        for cwe in ["CWE-79", "cwe-79", "79"] {
+            let (status, _, text) =
+                export_post(app.clone(), serde_json::json!({"format": "md", "cwe": cwe})).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{cwe}");
+            assert!(
+                text.contains("SEC-001") && !text.contains("SEC-002"),
+                "{cwe}"
+            );
+            // The scope line names the CWE in its canonical form.
+            assert!(text.contains("CWE CWE-79"), "{cwe}");
+        }
+        let (status, _, text) =
+            export_post(app, serde_json::json!({"format": "md", "cwe": "CWE-798"})).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(text.contains("SEC-002") && !text.contains("SEC-001"));
+    }
+
+    #[tokio::test]
+    async fn only_pdf_renders_wait_for_a_render_slot() {
+        static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let a = render_slot(&GATE, Format::Pdf).await.unwrap();
+        let b = render_slot(&GATE, Format::Pdf).await.unwrap();
+        assert!(a.is_some() && b.is_some());
+        // Both permits are out: a third PDF waits...
+        let third = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            render_slot(&GATE, Format::Pdf),
+        )
+        .await;
+        assert!(
+            third.is_err(),
+            "a third concurrent PDF render was let through"
+        );
+        // ...while Markdown and HTML never do.
+        assert!(render_slot(&GATE, Format::Markdown)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(render_slot(&GATE, Format::Html).await.unwrap().is_none());
+        // A finished render frees its slot.
+        drop(a);
+        assert!(render_slot(&GATE, Format::Pdf).await.unwrap().is_some());
+        drop(b);
+        assert_eq!(MAX_CONCURRENT_PDF_RENDERS, 2);
+    }
+
+    #[tokio::test]
+    async fn export_request_errors_are_client_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        // A severity outside the five words.
+        let (status, _, text) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "min_severity": "urgent"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error_of(text.as_bytes()).contains("min_severity"));
+        // A CWE that is not a CWE id.
+        let (status, _, text) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "cwe": "xss"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error_of(text.as_bytes()).contains("cwe"));
+        // A misspelt filter must not silently select everything.
+        let (status, _, _) = export_post(
+            app,
+            serde_json::json!({"format": "md", "severity": "critical"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn attachment_disposition_is_ascii_safe_and_carries_utf8_separately() {
+        assert_eq!(
+            attachment_disposition("SEC-001 - a.md"),
+            "attachment; filename=\"SEC-001 - a.md\""
+        );
+        // A header breaker can't leave the quotes, and non-ASCII moves to the
+        // RFC 6266 `filename*` form.
+        assert_eq!(
+            attachment_disposition("é \"日本\\\n.md"),
+            "attachment; filename=\"_ _____.md\"; \
+             filename*=UTF-8''%C3%A9%20%22%E6%97%A5%E6%9C%AC%5C%0A.md"
+        );
+    }
+
+    #[test]
+    fn report_file_stem_is_a_safe_non_hidden_name() {
+        assert_eq!(report_file_stem("Q3 review"), "Q3 review");
+        assert_eq!(report_file_stem("../../etc/passwd"), "etcpasswd");
+        for empty in ["", "   ", "...", "///", "\u{202e}"] {
+            assert_eq!(report_file_stem(empty), "Findings report", "{empty:?}");
+        }
+        assert_eq!(report_file_stem(&"x".repeat(500)).chars().count(), 80);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_title_cannot_break_out_of_the_content_disposition() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, _) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "title": "a\r\nX-Evil: 1\"; filename=\"x.exe"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // The quotes were dropped from the title, so the `;` stays inside the
+        // one quoted string and starts no second parameter.
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"a X-Evil 1; filename=x.exe.md\""
+        );
+        assert!(h.get("x-evil").is_none());
+        // A title that is UTF-8 keeps it, in `filename*`.
+        let (_, h, _) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "title": "Bericht Übersicht"}),
+        )
+        .await;
+        assert!(
+            disposition(&h).ends_with("filename*=UTF-8''Bericht%20%C3%9Cbersicht.md"),
+            "{}",
+            disposition(&h)
+        );
+        // Too long is refused rather than truncated.
+        let (status, _, _) = export_post(
+            app,
+            serde_json::json!({"format": "md", "title": "t".repeat(201)}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // ── the export pipeline as a library (used by `rupu findings export`) ────
+
+    #[test]
+    fn resolve_project_takes_a_workspace_id_or_a_checkout_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_named_workspace(tmp.path(), "ws_a", "repo_a", &[]);
+        seed_named_workspace(tmp.path(), "ws_b", "repo_b", &[]);
+        let global = tmp.path();
+        assert_eq!(resolve_project(global, "ws_b").unwrap(), "ws_b");
+        let repo_a = global.join("repo_a");
+        assert_eq!(
+            resolve_project(global, repo_a.to_str().unwrap()).unwrap(),
+            "ws_a"
+        );
+        // A path that reaches the same directory another way still matches.
+        let indirect = global.join("repo_b").join("..").join("repo_b");
+        assert_eq!(
+            resolve_project(global, indirect.to_str().unwrap()).unwrap(),
+            "ws_b"
+        );
+        let err = resolve_project(global, "nope").unwrap_err();
+        assert!(err.contains("`nope`"), "{err}");
+    }
+
+    #[test]
+    fn export_titles_are_trimmed_defaulted_and_bounded() {
+        assert_eq!(normalize_export_title(None).unwrap(), "Findings report");
+        assert_eq!(
+            normalize_export_title(Some("   ")).unwrap(),
+            "Findings report"
+        );
+        assert_eq!(normalize_export_title(Some(" Q3 ")).unwrap(), "Q3");
+        assert!(normalize_export_title(Some(&"t".repeat(200))).is_ok());
+        assert!(normalize_export_title(Some(&"t".repeat(201))).is_err());
+    }
+
+    #[test]
+    fn export_prefix_is_the_configured_one_when_valid() {
+        assert_eq!(resolve_export_prefix(None), "SEC");
+        assert_eq!(resolve_export_prefix(Some("ACME")), "ACME");
+        for bad in ["", "1A", "A B", "../x"] {
+            assert_eq!(resolve_export_prefix(Some(bad)), "SEC", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn severity_names_parse_in_any_case() {
+        assert_eq!(parse_min_severity("High"), Some(Severity::High));
+        assert_eq!(parse_min_severity("info"), Some(Severity::Info));
+        assert_eq!(parse_min_severity("urgent"), None);
+    }
+
+    #[test]
+    fn the_report_pipeline_reports_what_it_could_not_find() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let runs = RunStore::new(tmp.path().join("runs"));
+        let missing = export_finding_report(tmp.path(), &runs, "fnd_zzz", "SEC", Format::Markdown);
+        assert!(matches!(missing, Err(ReportError::NotFound(m)) if m.contains("fnd_zzz")));
+        let nothing = export_project_report(
+            tmp.path(),
+            &runs,
+            "SEC",
+            ReportRequest {
+                title: "T".into(),
+                min_severity: Some(Severity::Info),
+                owner: Some("nobody".into()),
+                ..ReportRequest::default()
+            },
+            Format::Markdown,
+        );
+        assert!(matches!(nothing, Err(ReportError::NotFound(_))));
+        let ok =
+            export_finding_report(tmp.path(), &runs, "fnd_a", "SEC", Format::Markdown).unwrap();
+        assert!(ok.name.ends_with(".md"));
+        assert!(String::from_utf8(ok.bytes).unwrap().contains("SEC-001"));
     }
 }

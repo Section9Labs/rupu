@@ -9,6 +9,13 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# PDF finding-report export (embeds Typst and its fonts, roughly +50 MB in a
+# release binary). Without it the other export formats still work and a PDF
+# request answers 501.
+default = ["pdf"]
+pdf = ["rupu-findings-report/pdf"]
+
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
 chrono.workspace = true
@@ -24,6 +31,7 @@ thiserror.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 object_store = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
@@ -48,6 +56,7 @@ rupu-transcript = { path = "../rupu-transcript" }
 rupu-ast = { path = "../rupu-ast" }
 rupu-scm = { path = "../rupu-scm" }
 rupu-mcp = { path = "../rupu-mcp" }
+rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-codename = { workspace = true }
 
 [dev-dependencies]
@@ -59,7 +68,6 @@ rupu-config = { path = "../rupu-config" }
 rupu-transcript = { path = "../rupu-transcript" }
 httpmock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "test-util"] }
-tokio-util = { workspace = true, features = ["io"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 serde_json.workspace = true

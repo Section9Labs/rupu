@@ -12,8 +12,9 @@ use rupu_config::{KeyProvenance, KeySource};
 use rupu_coverage::{
     AssertionStatus, Attribution as CoverageAttribution, CatalogMode, Concern, ConcernAssertion,
     Evidence as CoverageEvidence, FileView, FindingEvidence as CoverageFindingEvidence,
-    FindingRecord as CoverageFindingRecord, FindingScope as CoverageFindingScope, FlatCatalog,
-    Severity as CoverageSeverity, Surface as CoverageSurface, TouchStrength,
+    FindingProfile as CoverageFindingProfile, FindingRecord as CoverageFindingRecord,
+    FindingScope as CoverageFindingScope, FlatCatalog, Severity as CoverageSeverity,
+    Surface as CoverageSurface, TouchStrength,
 };
 use rupu_cp::api::autoflow_claims::ClaimRow;
 use rupu_cp::api::code::{FileContent, FileListResult, TreeEntry, TreeResult};
@@ -276,10 +277,12 @@ fn run_list_row_fixture_is_current() {
             input_tokens: 1000,
             output_tokens: 200,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 1200,
             cost_usd: Some(0.12),
             priced: true,
             runs: 1,
+            partial: false,
         },
         turns: 4,
         duration_ms: None,
@@ -451,6 +454,8 @@ fn transcript_events_fixture_is_current() {
             input_tokens: 1000,
             output_tokens: 200,
             cached_tokens: 50,
+            cache_write_tokens: 0,
+            purpose: None,
         },
         rupu_transcript::Event::Usage {
             provider: "anthropic".into(),
@@ -459,6 +464,8 @@ fn transcript_events_fixture_is_current() {
             input_tokens: 10,
             output_tokens: 5,
             cached_tokens: 0,
+            cache_write_tokens: 0,
+            purpose: None,
         },
         rupu_transcript::Event::RunComplete {
             run_id: "run-01".into(),
@@ -734,10 +741,12 @@ fn run_detail_fixture_is_current() {
         input_tokens: 5000,
         output_tokens: 1200,
         cached_tokens: 300,
+        cache_write_tokens: 0,
         total_tokens: 6200,
         cost_usd: Some(0.85),
         priced: true,
         runs: 2,
+        partial: false,
     };
 
     let value = serde_json::json!({
@@ -937,10 +946,12 @@ fn run_graph_fixture_is_current() {
         input_tokens: 3000,
         output_tokens: 700,
         cached_tokens: 100,
+        cache_write_tokens: 0,
         total_tokens: 3700,
         cost_usd: Some(0.42),
         priced: true,
         runs: 1,
+        partial: false,
     };
 
     let value = serde_json::json!({
@@ -1039,10 +1050,12 @@ fn projects_fixture_is_current() {
             input_tokens: 5000,
             output_tokens: 1200,
             cached_tokens: 300,
+            cache_write_tokens: 0,
             total_tokens: 6200,
             cost_usd: Some(0.85),
             priced: true,
             runs: 2,
+            partial: false,
         },
         run_count: 14,
         last_active: Some("2026-08-20T12:00:00Z".into()),
@@ -1306,10 +1319,12 @@ fn project_detail_fixture_is_current() {
             input_tokens: 5000,
             output_tokens: 1200,
             cached_tokens: 300,
+            cache_write_tokens: 0,
             total_tokens: 6200,
             cost_usd: Some(0.85),
             priced: true,
             runs: 2,
+            partial: false,
         },
         run_count: 14,
         last_active: Some("2026-08-20T12:00:00Z".into()),
@@ -1329,10 +1344,12 @@ fn project_detail_fixture_is_current() {
                 input_tokens: 1000,
                 output_tokens: 200,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 total_tokens: 1200,
                 cost_usd: Some(0.12),
                 priced: true,
                 runs: 1,
+                partial: false,
             },
             turns: 4,
             duration_ms: Some(360_000),
@@ -1356,10 +1373,12 @@ fn project_detail_fixture_is_current() {
         input_tokens: 5000,
         output_tokens: 1200,
         cached_tokens: 300,
+        cache_write_tokens: 0,
         total_tokens: 6200,
         cost_usd: Some(0.85),
         priced: true,
         runs: 2,
+        partial: false,
     };
 
     let value = serde_json::json!({
@@ -1405,10 +1424,12 @@ fn project_runs_fixture_is_current() {
             input_tokens: 1000,
             output_tokens: 200,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 1200,
             cost_usd: Some(0.12),
             priced: true,
             runs: 1,
+            partial: false,
         },
         turns: 4,
         duration_ms: Some(360_000),
@@ -1526,6 +1547,7 @@ fn findings_global_fixture_is_current() {
             permalink: Some(
                 "https://github.com/section9labs/rupu/blob/main/src/auth/session.rs#L42-L58".into(),
             ),
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_critical_1".into(),
                 file_path: Some("src/auth/session.rs".into()),
@@ -1548,6 +1570,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_9k2f"),
                 declared_at: t,
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
         FindingOut {
@@ -1558,6 +1582,7 @@ fn findings_global_fixture_is_current() {
             target_id: "web-api".into(),
             workflow_name: Some("nightly-security".into()),
             permalink: None,
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_high_1".into(),
                 file_path: None,
@@ -1574,6 +1599,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_9k2f"),
                 declared_at: t - chrono::Duration::hours(1),
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
         FindingOut {
@@ -1586,6 +1613,7 @@ fn findings_global_fixture_is_current() {
             permalink: Some(
                 "https://github.com/section9labs/phi-cell/blob/main/src/train.rs#L100-L112".into(),
             ),
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_medium_1".into(),
                 file_path: Some("src/train.rs".into()),
@@ -1605,6 +1633,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_am4d"),
                 declared_at: t - chrono::Duration::days(1),
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
         FindingOut {
@@ -1615,6 +1645,7 @@ fn findings_global_fixture_is_current() {
             target_id: "ml-pipeline".into(),
             workflow_name: Some("weekly-audit".into()),
             permalink: None,
+            report_summary: None,
             record: CoverageFindingRecord {
                 id: "fnd_info_1".into(),
                 file_path: None,
@@ -1631,6 +1662,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_am4d"),
                 declared_at: t - chrono::Duration::days(2),
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
     ];
@@ -1741,6 +1774,8 @@ fn coverage_detail_fixture_is_current() {
         },
         declared_by: coverage_attribution("run_9k2f"),
         declared_at: t,
+        profile: CoverageFindingProfile::Summary,
+        report: None,
     }];
 
     let files = vec![FileView {
@@ -1825,10 +1860,12 @@ fn usage_fixture_is_current() {
         input_tokens: 1_505_000,
         output_tokens: 305_050,
         cached_tokens: 12_000,
+        cache_write_tokens: 0,
         total_tokens: 1_810_050,
         cost_usd: Some(12.71),
         priced: false, // at least one contributing model is unpriced
         runs: 6,
+        partial: false,
     };
 
     let breakdown = vec![
@@ -1842,6 +1879,7 @@ fn usage_fixture_is_current() {
             input_tokens: 1_000_000,
             output_tokens: 200_000,
             cached_tokens: 10_000,
+            cache_write_tokens: 0,
             total_tokens: 1_200_000,
             cost_usd: Some(6.0),
             priced: true,
@@ -1857,6 +1895,7 @@ fn usage_fixture_is_current() {
             input_tokens: 500_000,
             output_tokens: 100_000,
             cached_tokens: 2_000,
+            cache_write_tokens: 0,
             total_tokens: 600_000,
             cost_usd: Some(6.71),
             priced: true,
@@ -1872,6 +1911,7 @@ fn usage_fixture_is_current() {
             input_tokens: 5_000,
             output_tokens: 5_050,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 10_050,
             cost_usd: None,
             priced: false,
@@ -1911,16 +1951,18 @@ fn usage_fixture_is_current() {
 #[test]
 fn usage_runs_fixture_is_current() {
     // `GET /api/usage/runs` (`get_usage_runs`, api/usage.rs): `UsageRunRow`
-    // is private to that module — hand-built. 6 flat `(run × model)` rows
-    // spanning 2 days and 3 models (2 priced + 1 unpriced/nil-cost row, per
-    // the brief). `host_id` is always `"local"` — this endpoint is
-    // local-only, no host fan-out (see the doc comment on `get_usage_runs`).
+    // is private to that module — hand-built. 6 flat `(run × model)` workflow
+    // rows spanning 2 days and 3 models (2 priced + 1 unpriced/nil-cost row,
+    // per the brief), plus 1 standalone agent run (`kind: "agent"`,
+    // `workflow_name: ""`). `host_id` is always `"local"` — this endpoint
+    // is local-only, no host fan-out (see the doc comment on `get_usage_runs`).
     let day1 = Utc.with_ymd_and_hms(2026, 8, 19, 9, 0, 0).unwrap();
     let day2 = Utc.with_ymd_and_hms(2026, 8, 20, 9, 0, 0).unwrap();
 
     let rows = serde_json::json!([
         {
             "run_id": "run-01",
+            "kind": "workflow",
             "started_at": day1,
             "workflow_name": "nightly-health",
             "agent": "rupuso",
@@ -1937,6 +1979,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-02",
+            "kind": "workflow",
             "started_at": day1,
             "workflow_name": "nightly-health",
             "agent": "fixer",
@@ -1953,6 +1996,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-03",
+            "kind": "workflow",
             "started_at": day1,
             "workflow_name": "issue-triage",
             "agent": "rupuso",
@@ -1969,6 +2013,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-04",
+            "kind": "workflow",
             "started_at": day2,
             "workflow_name": "nightly-health",
             "agent": "rupuso",
@@ -1985,6 +2030,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-05",
+            "kind": "workflow",
             "started_at": day2,
             "workflow_name": "hotfix",
             "agent": "fixer",
@@ -2001,6 +2047,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-06",
+            "kind": "workflow",
             "started_at": day2,
             "workflow_name": "experimental",
             "agent": "explorer",
@@ -2015,6 +2062,23 @@ fn usage_runs_fixture_is_current() {
             "cost_usd": null,
             "priced": false,
         },
+        {
+            "run_id": "run-07",
+            "kind": "agent",
+            "started_at": day2,
+            "workflow_name": "",
+            "agent": "rupuso",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "workspace_id": "ws-1",
+            "host_id": "local",
+            "input_tokens": 4_000,
+            "output_tokens": 1_000,
+            "cached_tokens": 0,
+            "total_tokens": 5_000,
+            "cost_usd": 0.027,
+            "priced": true,
+        },
     ]);
     check_fixture("usage_runs.json", &rows);
 }
@@ -2022,13 +2086,19 @@ fn usage_runs_fixture_is_current() {
 #[test]
 fn usage_outliers_fixture_is_current() {
     // `GET /api/usage/outliers` (api/usage_outliers.rs): `OutlierRun` is
-    // `pub` — mirrored for real. 2 outliers across 2 workflows.
+    // `pub` — mirrored for real. 2 outliers across 2 workflows, plus 1
+    // standalone agent run (`kind: "agent"`, `workflow_name: ""`, baselined
+    // against its agent's other standalone runs).
     let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
 
     let outliers = vec![
         OutlierRun {
             run_id: "run-06".into(),
+            kind: "workflow",
             workflow_name: "nightly-health".into(),
+            agent: None,
+            session_id: None,
+            transcript_path: None,
             cost_usd: 12.50,
             baseline_usd: 1.20,
             ratio: 12.50 / 1.20,
@@ -2036,10 +2106,26 @@ fn usage_outliers_fixture_is_current() {
         },
         OutlierRun {
             run_id: "run-09".into(),
+            kind: "workflow",
             workflow_name: "hotfix".into(),
+            agent: None,
+            session_id: None,
+            transcript_path: None,
             cost_usd: 8.0,
             baseline_usd: 2.0,
             ratio: 4.0,
+            started_at: t + chrono::Duration::days(1),
+        },
+        OutlierRun {
+            run_id: "run-10".into(),
+            kind: "agent",
+            workflow_name: String::new(),
+            agent: Some("rupuso".into()),
+            session_id: None,
+            transcript_path: Some("/Users/dev/.rupu/transcripts/run-10.jsonl".into()),
+            cost_usd: 3.5,
+            baseline_usd: 1.0,
+            ratio: 3.5,
             started_at: t + chrono::Duration::days(1),
         },
     ];

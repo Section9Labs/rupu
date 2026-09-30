@@ -78,6 +78,7 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
               <AgentIdentity
                 className="pl-[18px] text-meta text-ink-dim"
                 codename={sub.codename}
+                derived={sub.codenameDerived}
                 agent={sub.agent}
                 provider={sub.provider}
                 model={sub.model}

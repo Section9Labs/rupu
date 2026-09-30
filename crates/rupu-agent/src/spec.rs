@@ -48,6 +48,14 @@ struct Frontmatter {
     /// resolved provider/auth is not Anthropic OAuth.
     #[serde(default, rename = "anthropicOauthPrefix")]
     anthropic_oauth_prefix: Option<bool>,
+    /// Anthropic prompt caching opt-out (default on). `false` disables the
+    /// explicit `cache_control` breakpoints for this agent — e.g. when its
+    /// provider is an Anthropic-compatible gateway that rejects them. `None`
+    /// (default) defers to `[providers.<name>] prompt_cache`; any explicit
+    /// value here wins over the provider config. No effect on non-Anthropic
+    /// providers.
+    #[serde(default, rename = "anthropicPromptCache")]
+    anthropic_prompt_cache: Option<bool>,
     /// Reasoning / thinking effort level. Accepts the canonical
     /// `auto|minimal|low|medium|high|max` plus aliases `adaptive`
     /// (= auto) and `xhigh` (= max). Each provider maps to its native
@@ -135,6 +143,10 @@ struct Frontmatter {
     /// omitted. Clamped to `[10, 95]`.
     #[serde(default, rename = "compactAtPercent")]
     compact_at_percent: Option<u8>,
+    /// Findings contract when no workflow step or workflow default overrides
+    /// it: `full` (a complete report) or `summary`. Absent => `full`.
+    #[serde(default, rename = "findingsProfile")]
+    findings_profile: Option<rupu_coverage::FindingProfile>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -149,6 +161,9 @@ pub struct AgentSpec {
     pub max_turns: Option<u32>,
     pub permission_mode: Option<String>,
     pub anthropic_oauth_prefix: Option<bool>,
+    /// Anthropic prompt caching opt-out — see the `anthropicPromptCache`
+    /// frontmatter doc comment on `Frontmatter`.
+    pub anthropic_prompt_cache: Option<bool>,
     pub effort: Option<ThinkingLevel>,
     pub context_window: Option<ContextWindow>,
     pub output_format: Option<OutputFormat>,
@@ -170,6 +185,8 @@ pub struct AgentSpec {
     pub context_window_tokens: Option<u32>,
     /// Compact-at percentage threshold. See `compactAtPercent` frontmatter.
     pub compact_at_percent: Option<u8>,
+    /// Findings contract for this agent. See `findingsProfile` frontmatter.
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
     pub system_prompt: String,
     /// The full original file text (frontmatter + body) verbatim. Lets the CP
     /// render the definition source with syntax highlighting; agents are
@@ -208,6 +225,7 @@ impl AgentSpec {
             max_turns: fm.max_turns,
             permission_mode: fm.permission_mode,
             anthropic_oauth_prefix: fm.anthropic_oauth_prefix,
+            anthropic_prompt_cache: fm.anthropic_prompt_cache,
             effort: fm.effort,
             context_window: fm.context_window,
             output_format: fm.output_format,
@@ -220,6 +238,7 @@ impl AgentSpec {
             max_tokens: fm.max_tokens,
             context_window_tokens: fm.context_window_tokens,
             compact_at_percent: fm.compact_at_percent,
+            findings_profile: fm.findings_profile,
             system_prompt: body.to_string(),
             raw,
         })
@@ -260,6 +279,18 @@ You are a test agent.
         let spec = AgentSpec::parse(src).expect("parse ok");
         assert_eq!(spec.context_window_tokens, None);
         assert_eq!(spec.compact_at_percent, None);
+    }
+
+    #[test]
+    fn parses_findings_profile() {
+        let s = "---\nname: a\nfindingsProfile: summary\n---\nbody\n";
+        let spec = AgentSpec::parse(s).unwrap();
+        assert_eq!(
+            spec.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+        let s = "---\nname: a\n---\nbody\n";
+        assert_eq!(AgentSpec::parse(s).unwrap().findings_profile, None);
     }
 
     #[test]

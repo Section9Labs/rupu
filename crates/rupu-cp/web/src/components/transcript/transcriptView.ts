@@ -47,7 +47,10 @@
  *     with no preceding `tool_call` to attach to in this snapshot) render as
  *     a standalone `tool` block instead of vanishing.
  *   • a header is surfaced from `run_start`; a footer from `run_complete`,
- *     falling back to the last `usage` event when the run hasn't completed.
+ *     falling back to the running sum of `usage` events while the run is in
+ *     flight (each provider call appends one `usage` event, so the sum is the
+ *     run's token total so far; `purpose: "compaction"` events are skipped,
+ *     matching `run_complete`'s turn-scoped total).
  *
  * No React, no DOM — a deterministic function over the event list.
  */
@@ -214,10 +217,21 @@ function asStringArray(v: unknown): string[] {
 /**
  * Parse a `report_finding` tool_call input into a FindingView.
  * Returns null when the shape isn't a recognisable finding.
+ *
+ * Two input shapes exist, one per findings profile:
+ *   • summary — `{ scope, summary, severity, evidence: { rationale, … } }`;
+ *   • full (the default) — `{ scope, file_path?, line_range?, report: {…} }`,
+ *     with no top-level summary/severity/evidence. Those are derived from the
+ *     report exactly as `report_finding` derives them for the ledger
+ *     (`crates/rupu-coverage/src/tools/report_finding.rs`): summary ← title,
+ *     severity ← rating.risk_rating, rationale ← root_cause, excerpt ← the
+ *     first evidence claim that carries one.
  */
 function asFinding(input: unknown): FindingView | null {
   const rec = asRecord(input);
   if (!rec) return null;
+  const report = asRecord(rec.report);
+  if (report) return asReportFinding(rec, report);
   const evidence = asRecord(rec.evidence) ?? {};
   const summary = asString(rec.summary);
   const rationale = asString(evidence.rationale);
@@ -239,6 +253,42 @@ function asFinding(input: unknown): FindingView | null {
   if (concernId !== null) finding.concernId = concernId;
   const codeExcerpt = asString(evidence.code_excerpt);
   if (codeExcerpt !== null) finding.codeExcerpt = codeExcerpt;
+  return finding;
+}
+
+/** The full-profile shape of {@link asFinding}. Locators stay top-level. */
+function asReportFinding(
+  rec: Record<string, unknown>,
+  report: Record<string, unknown>,
+): FindingView | null {
+  const title = asString(report.title);
+  const rootCause = asString(report.root_cause);
+  if (title === null && rootCause === null) return null;
+  const rating = asRecord(report.rating) ?? {};
+  const risk = asString(rating.risk_rating);
+
+  const finding: FindingView = {
+    severity: asSeverity(risk === null ? null : risk.toLowerCase()),
+    summary: title ?? '',
+    scope: asString(rec.scope) ?? '',
+    rationale: rootCause ?? '',
+    references: [],
+  };
+  const filePath = asString(rec.file_path);
+  if (filePath !== null) finding.filePath = filePath;
+  const lineRange = asLineRange(rec.line_range);
+  if (lineRange !== undefined) finding.lineRange = lineRange;
+  const concernId = asString(rec.concern_id);
+  if (concernId !== null) finding.concernId = concernId;
+  if (Array.isArray(report.evidence)) {
+    for (const claim of report.evidence) {
+      const excerpt = asString(asRecord(claim)?.excerpt);
+      if (excerpt !== null) {
+        finding.codeExcerpt = excerpt;
+        break;
+      }
+    }
+  }
   return finding;
 }
 
@@ -291,6 +341,10 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   let header: TranscriptHeader | null = null;
   let footer: TranscriptFooter | null = null;
   let sawRunComplete = false;
+  // Running total of turn `usage` events (input + output; compaction calls
+  // excluded, as in `run_complete.total_tokens`) — the footer's token count
+  // until `run_complete` supplies the authoritative figure.
+  let usageSum = 0;
 
   const turns: TurnView[] = [];
   // The turn new blocks currently attach to. Created lazily (via `ensureTurn`)
@@ -590,12 +644,17 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
       }
 
       case 'usage': {
-        const input = asNumber(data.input_tokens) ?? 0;
-        const output = asNumber(data.output_tokens) ?? 0;
-        if (!footer) {
-          footer = { status: null, totalTokens: input + output, durationMs: null, error: null };
-        } else if (footer.totalTokens === null) {
-          footer.totalTokens = input + output;
+        // A compaction summariser call is real spend but NOT part of
+        // `run_complete.total_tokens` (turn-scoped) — leaving it out keeps the
+        // live figure from dropping when the authoritative total lands.
+        if (asString(data.purpose) !== 'compaction') {
+          usageSum += (asNumber(data.input_tokens) ?? 0) + (asNumber(data.output_tokens) ?? 0);
+        }
+        if (!sawRunComplete) {
+          footer = {
+            ...(footer ?? { status: null, durationMs: null, error: null }),
+            totalTokens: usageSum,
+          };
         }
         break;
       }

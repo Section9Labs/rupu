@@ -6,29 +6,25 @@
 //! orchestrator's step-level event. The transcript file and the orchestrator's
 //! `events.jsonl` are different JSONL schemas, so they need separate tailers.
 //!
-//! Tailing is poll-based: an initial-drain task reads any pre-existing backlog,
-//! then a 250 ms poll loop emits newly-appended lines. Both share an
-//! `Arc<AtomicU64>` byte offset so events are never duplicated. (We deliberately
-//! do NOT use a `notify` filesystem watcher — the macOS kqueue backend it's
-//! pinned to panics a background thread on teardown when the stream is dropped,
-//! and the 250 ms poll already covers append-tailing reliably.)
-//!
-//! ## Double-emit prevention
-//!
-//! Two drain paths (initial-drain task, 250 ms poll) each do: load offset → read
-//! file → emit lines in `bytes[off..]` → store new offset. If they raced on the
-//! same `off` they would both emit the same range. The fix: each drainer
-//! atomically *claims* the byte range via `compare_exchange` **before** emitting.
-//! Only the drainer that wins the CAS emits; all others return immediately.
+//! Tailing is poll-based and single-owner: one spawned task owns a
+//! [`rupu_transcript::JsonlCursor`] and, every 250 ms, reads only the bytes
+//! appended since the previous tick (the first tick drains the whole backlog
+//! from offset 0, so there is no second drainer to race). The cursor holds
+//! back a partially written trailing line until its newline lands, decodes
+//! UTF-8 per whole line (a write boundary inside a multi-byte character can't
+//! drop a chunk), and restarts from 0 if the file shrinks or is replaced. A
+//! file that does not exist yet simply yields nothing until it appears; the
+//! task exits once the consumer drops the stream. (We deliberately do NOT use
+//! a `notify` filesystem watcher — the macOS kqueue backend it's pinned to
+//! panics a background thread on teardown when the stream is dropped, and the
+//! 250 ms poll already covers append-tailing reliably.)
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
-use rupu_transcript::Event;
+use rupu_transcript::{Event, JsonlCursor};
 use tokio::sync::mpsc;
 
 /// Live tail of a transcript JSONL file. Each newly-appended, parseable line
@@ -40,80 +36,51 @@ pub struct TranscriptTail {
 
 impl TranscriptTail {
     pub async fn open(path: &Path) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::channel::<Event>(64);
+        let (tx, rx) = mpsc::channel::<Event>(256);
         let path_buf: PathBuf = path.to_path_buf();
 
-        // Shared offset between the initial-drain task and the polling loop,
-        // so the two never emit the same byte range twice.
-        let offset = Arc::new(AtomicU64::new(0));
-
-        // --- initial-drain task ---
-        let tx_for_drain = tx.clone();
-        let path_for_drain = path_buf.clone();
-        let offset_for_drain = offset.clone();
         tokio::spawn(async move {
-            while !path_for_drain.exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            drain_and_emit_async(&path_for_drain, &offset_for_drain, &tx_for_drain).await;
-        });
-
-        // --- polling loop (250 ms) ---
-        // Emits newly-appended lines. This is the sole tailing mechanism
-        // (no notify watcher — see the module docs).
-        let tx_for_poll = tx.clone();
-        let path_for_poll = path_buf.clone();
-        let offset_for_poll = offset.clone();
-        tokio::spawn(async move {
+            let mut cursor = JsonlCursor::new();
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                if tx_for_poll.is_closed() {
+                // Nobody is listening any more (including the case where the
+                // file never appeared): stop polling instead of spinning for
+                // the rest of the process.
+                if tx.is_closed() {
                     return;
                 }
-                drain_and_emit_async(&path_for_poll, &offset_for_poll, &tx_for_poll).await;
+                // Blocking read of only the appended bytes; bounded work per
+                // tick. A drain I/O error is treated like "no data this
+                // tick" — the next tick retries from the same offset.
+                let p = path_buf.clone();
+                let mut c = std::mem::take(&mut cursor);
+                match tokio::task::spawn_blocking(move || {
+                    let mut lines = Vec::new();
+                    let _ = c.drain_with(&p, || {}, |l| lines.push(l.to_string()));
+                    (c, lines)
+                })
+                .await
+                {
+                    Ok((c, lines)) => {
+                        cursor = c;
+                        for line in lines {
+                            if let Ok(ev) = serde_json::from_str::<Event>(&line) {
+                                if tx.send(ev).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Only reachable if the blocking closure panicked; the
+                        // cursor was lost with it, so restart from offset 0.
+                        tracing::warn!(error = %e, "transcript tail drain failed; restarting cursor");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         });
 
-        Ok(Self {
-            rx,
-        })
-    }
-}
-
-/// Async drain called from the initial-drain task and the 250 ms polling loop.
-///
-/// Uses `tokio::fs::read` to avoid blocking the runtime. Atomically claims the
-/// new byte range via `compare_exchange` before emitting, so if the other
-/// drainer has already advanced the offset past `old_off` this call is a no-op
-/// — preventing double-emission when both drain paths fire concurrently.
-async fn drain_and_emit_async(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::Sender<Event>) {
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return;
-    };
-    let new_len = bytes.len() as u64;
-    let old_off = offset.load(Ordering::SeqCst);
-    if new_len <= old_off {
-        return;
-    }
-    // Claim [old_off, new_len): only the winner of this CAS emits.
-    if offset
-        .compare_exchange(old_off, new_len, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return; // another drainer already claimed this range
-    }
-    for line in std::str::from_utf8(&bytes[old_off as usize..])
-        .unwrap_or("")
-        .lines()
-    {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(ev) = serde_json::from_str::<Event>(line) {
-            if tx.send(ev).await.is_err() {
-                return;
-            }
-        }
+        Ok(Self { rx })
     }
 }
 
@@ -148,10 +115,9 @@ mod tests {
         out
     }
 
-    /// Writes `n` events to a file BEFORE `TranscriptTail::open` so that the
-    /// initial-drain task has a multi-line backlog and the first 250 ms poll
-    /// tick may fire concurrently with it. Asserts EXACTLY `n` events arrive
-    /// (no duplicates) within a generous timeout.
+    /// Writes `n` events to a file BEFORE `TranscriptTail::open` so the first
+    /// drain sees a multi-line backlog. Asserts EXACTLY `n` events arrive (no
+    /// duplicates) within a generous timeout.
     #[tokio::test]
     async fn no_duplicate_events_on_backlog_open() {
         const N: usize = 3;
@@ -230,5 +196,85 @@ mod tests {
             .expect("stream closed");
 
         assert_eq!(got, ev);
+    }
+    fn usage_line(model: &str) -> String {
+        serde_json::to_string(&Event::Usage {
+            provider: "anthropic".into(),
+            model: model.into(),
+            served_model: None,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            purpose: None,
+        })
+        .unwrap()
+            + "\n"
+    }
+
+    #[tokio::test]
+    async fn partial_line_is_delivered_once_completed_never_dropped() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("run.jsonl");
+        let full = usage_line("m-partial");
+        let (head, tail_part) = full.split_at(full.len() / 2);
+        std::fs::write(&p, head).unwrap();
+        let mut tail = TranscriptTail::open(&p).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(tail_part.as_bytes()).unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(3), tail.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(got, Event::Usage { ref model, .. } if model == "m-partial"));
+    }
+
+    #[tokio::test]
+    async fn large_backlog_is_emitted_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("run.jsonl");
+        let body: String = (0..5000).map(|i| usage_line(&format!("m{i}"))).collect();
+        std::fs::write(&p, body).unwrap();
+        let mut tail = TranscriptTail::open(&p).await.unwrap();
+        let mut n = 0;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(800), tail.next()).await
+        {
+            n += 1;
+        }
+        assert_eq!(n, 5000);
+    }
+
+    #[tokio::test]
+    async fn utf8_split_does_not_drop_chunk() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("run.jsonl");
+        let line = serde_json::to_string(&Event::AssistantMessage {
+            content: "build \u{2713} passed".into(),
+            thinking: None,
+        })
+        .unwrap()
+            + "\n";
+        // serde_json emits the check mark as raw UTF-8 (E2 9C 93); cut inside it.
+        let bytes = line.as_bytes();
+        let mark = bytes
+            .windows(3)
+            .position(|w| w == [0xE2, 0x9C, 0x93])
+            .unwrap();
+        let (head, rest) = bytes.split_at(mark + 1);
+        std::fs::write(&p, head).unwrap();
+        let mut tail = TranscriptTail::open(&p).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(rest).unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(3), tail.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(got, Event::AssistantMessage { ref content, .. } if content.contains('\u{2713}'))
+        );
     }
 }

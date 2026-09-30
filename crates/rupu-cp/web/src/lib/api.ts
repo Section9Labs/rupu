@@ -18,6 +18,7 @@ export type {
   UnpricedGap,
   UsageRunRow,
 } from './usage';
+import type { FindingReport, ReportSummary, ClaimState } from './findingReport';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -32,6 +33,28 @@ export class ApiError extends Error {
     this.status = status;
     this.body = body;
   }
+}
+
+/** A human-readable message for anything a fetch chain can throw. The CP
+ *  answers errors as `{"error": "…"}`, so an `ApiError` yields that message
+ *  rather than the raw JSON body; a non-JSON body is shown as text, and an
+ *  empty one falls back to the HTTP status. A plain `Error` yields its
+ *  message and anything else its string form. */
+export function apiErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    const raw = e.body.trim();
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string' && parsed.error.trim()) {
+        return parsed.error;
+      }
+    } catch {
+      // not JSON; fall through to the raw text
+    }
+    return raw || e.message.trim() || `Request failed (HTTP ${e.status})`;
+  }
+  if (e instanceof Error) return e.message;
+  return String(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +75,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const text = await res.text();
   if (!text) return undefined as T;
   return JSON.parse(text) as T;
+}
+
+/** The bytes of a finding-report export response. A non-2xx throws an
+ *  `ApiError`; a `Content-Disposition` filename comes back as the `File`'s
+ *  name (a `File` is a `Blob`). Lives beside `request` because these
+ *  responses are binary, not JSON. */
+async function exportBlob(res: Response): Promise<Blob> {
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new ApiError(res.status, text || res.statusText, text);
+  }
+  const blob = await res.blob();
+  const name = parseContentDispositionFilename(res.headers.get('Content-Disposition'));
+  return name ? new File([blob], name, { type: blob.type }) : blob;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,9 +162,12 @@ export interface StepResultRecord {
   rendered_prompt?: string;
   kind?: string;
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename record. */
+  codename_derived?: boolean;
   items?: unknown[];
   findings?: Array<{
     codename?: string;
+    codename_derived?: boolean;
     source: string;
     severity: string;
     title: string;
@@ -196,6 +236,8 @@ export interface StepStartedEvent extends RunEventBase {
   kind: string;
   agent?: string | null;
   codename?: string;
+  /** True when the CP derived `codename` for a pre-codename run's event. */
+  codename_derived?: boolean;
 }
 
 export interface StepWorkingEvent extends RunEventBase {
@@ -240,6 +282,7 @@ export interface UnitStartedEvent extends RunEventBase {
   unit_key: string;
   agent?: string | null;
   codename?: string;
+  codename_derived?: boolean;
   transcript_path: string;
 }
 
@@ -304,6 +347,7 @@ export interface DispatchStartedEvent extends RunEventBase {
   agent?: string | null;
   transcript_path: string;
   codename?: string;
+  codename_derived?: boolean;
   provider?: string;
   model?: string;
 }
@@ -314,6 +358,7 @@ export interface AgentStartedEvent extends RunEventBase {
   step_id: string;
   unit_index?: number;
   codename?: string;
+  codename_derived?: boolean;
   agent: string;
   provider?: string;
   model?: string;
@@ -445,6 +490,8 @@ export interface UnitCheckpoint {
   success: boolean | null;
   finished_at: string;      // ISO-8601
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename run. */
+  codename_derived?: boolean;
   /** Folded server-side from the unit's `agent_started` (graph endpoint). */
   agent?: string;
   provider?: string;
@@ -454,6 +501,8 @@ export interface UnitCheckpoint {
 /** An agent instance's identity, folded server-side from `events.jsonl`. */
 export interface AgentIdentityDto {
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename run. */
+  codename_derived?: boolean;
   agent?: string;
   provider?: string;
   model?: string;
@@ -867,7 +916,22 @@ export interface UsageResponse extends UsageOverview {
  */
 export interface OutlierRun {
   run_id: string;
+  /** What produced the run: an orchestrator `workflow` run, a standalone
+   *  `agent` run, or a `session` turn. Absent on servers that predate
+   *  standalone/session outliers (treat as `"workflow"`). */
+  kind?: 'workflow' | 'agent' | 'session';
+  /** `""` for a standalone agent run or session turn — read `agent` instead. */
   workflow_name: string;
+  /** The agent a standalone run / session turn ran (the baseline agent);
+   *  absent for a workflow run. */
+  agent?: string | null;
+  /** The session a `session` outlier belongs to — its link target. Absent for
+   *  workflow and standalone rows (and on older servers). */
+  session_id?: string | null;
+  /** The outlier's own transcript path — the link target of an `agent` (and
+   *  fallback for a `session`) outlier, which never enter the run store so
+   *  `/runs/:id` can't show them. Absent for workflow rows. */
+  transcript_path?: string | null;
   cost_usd: number;
   baseline_usd: number;
   ratio: number;
@@ -1163,6 +1227,27 @@ export interface UsageTimelinePoint {
   tokens_in: number;
   tokens_out: number;
   tokens_cached: number;
+  /** Cache writes; absent from CPs that predate the field. */
+  tokens_cache_write?: number;
+}
+
+/**
+ * `GET /api/runs/:id/usage` — a run's live usage (spec 2026-09-29 §5.3).
+ * `points` is an append-only tail of the per-turn series: `points_from` is the
+ * index of `points[0]` in the full series (0 unless the request's
+ * `since`+`epoch` matched the run's current epoch).
+ */
+export interface RunUsageResponse {
+  summary: UsageSummary;
+  /** Per step id (`""` = unattributed). */
+  steps: Record<string, UsageSummary>;
+  turns: number;
+  /** Some transcripts were not readable on this CP (remote host not yet mirrored). */
+  partial: boolean;
+  /** Decimal string — the server's u64 epoch exceeds JS's 2^53 safe-integer range. */
+  epoch: string;
+  points_from: number;
+  points: UsageTimelinePoint[];
 }
 
 export interface SessionSummary {
@@ -1371,6 +1456,10 @@ export interface FindingRecord {
    *  up in a later task — optional so consumers (`InlineFindingCard`) can
    *  guard it now and pick it up automatically once populated. */
   permalink?: string | null;
+  target_ref?: string | null;
+  profile?: 'full' | 'summary';
+  report_summary?: ReportSummary | null;
+  report?: FindingReport | null;
 }
 
 /** Severity rollup for a set of findings — matches the `GET /api/findings`
@@ -1395,11 +1484,61 @@ export interface FindingOut extends FindingRecord {
   workflow_name?: string | null;
 }
 
+/** Finding detail with evidence status — response from `GET /api/findings/:id`. */
+export interface FindingDetail extends FindingOut {
+  evidence_status: ClaimState[];
+}
+
 /** Response from `GET /api/findings` — the severity-sorted cross-project
  *  findings list plus the severity rollup. */
 export interface FindingsResponse {
   findings: FindingOut[];
   summary: FindingsSummary;
+}
+
+/** A finding-report export format — `?format=` on the per-finding endpoint and
+ *  `format` in the project-report body. */
+export type FindingExportFormat = 'md' | 'html' | 'pdf';
+
+/** Body of `POST /api/findings/export`. The server refuses unknown fields, and
+ *  an empty `ids` means "no restriction" (everything), so callers narrowing to
+ *  a chosen set must send at least one id — or omit the field on purpose. */
+export interface FindingsExportBody {
+  format: FindingExportFormat;
+  title?: string;
+  ids?: string[];
+  ws_id?: string;
+  run_id?: string;
+  min_severity?: string;
+  owner?: string;
+  cwe?: string;
+  include_summaries?: boolean;
+  split?: boolean;
+}
+
+/** The file name a `Content-Disposition` header offers (`filename*=UTF-8''…`
+ *  first, else `filename="…"`, else an unquoted token), reduced to its base
+ *  name so a path can never steer the save location. `null` when there is no
+ *  usable name. */
+export function parseContentDispositionFilename(header: string | null | undefined): string | null {
+  if (!header) return null;
+  const clean = (raw: string): string | null => {
+    const base = (raw.split(/[\\/]/).pop() ?? '').trim();
+    return base && base !== '.' && base !== '..' ? base : null;
+  };
+  const star = /\bfilename\*\s*=\s*[^']*'[^']*'([^;]+)/i.exec(header);
+  if (star) {
+    try {
+      const name = clean(decodeURIComponent(star[1].trim()));
+      if (name) return name;
+    } catch {
+      // malformed percent-encoding: fall through to the plain filename
+    }
+  }
+  const quoted = /\bfilename\s*=\s*"([^"]*)"/i.exec(header);
+  if (quoted) return clean(quoted[1]);
+  const token = /\bfilename\s*=\s*([^;\s"]+)/i.exec(header);
+  return token ? clean(token[1]) : null;
 }
 
 /** Touch strength, strongest last — matches rupu-coverage's `TouchStrength`. */
@@ -2082,6 +2221,23 @@ export const api = {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<UsageTimelinePoint[]>(`/api/runs/${encodeURIComponent(id)}/usage-timeline${qs}`);
   },
+  /**
+   * Live usage of one run. Pass `since` + `epoch` (from the previous response)
+   * to receive only the new tail of `points`; either alone is ignored.
+   */
+  getRunUsage(
+    id: string,
+    opts?: { host?: string; since?: number; epoch?: string },
+  ): Promise<RunUsageResponse> {
+    const q = new URLSearchParams();
+    if (opts?.host) q.set('host', opts.host);
+    if (opts?.since != null && opts?.epoch != null) {
+      q.set('since', String(opts.since));
+      q.set('epoch', opts.epoch);
+    }
+    const qs = q.toString() ? `?${q}` : '';
+    return request<RunUsageResponse>(`/api/runs/${encodeURIComponent(id)}/usage${qs}`);
+  },
   getSessionUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline${qs}`);
@@ -2521,6 +2677,47 @@ export const api = {
     const qs = q.toString();
     return request<FindingsResponse>(`/api/findings${qs ? `?${qs}` : ''}`);
   },
+  getFinding(id: string): Promise<FindingDetail> {
+    return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}`);
+  },
+  /**
+   * Render a project report over the findings `body` selects
+   * (`POST /api/findings/export`) and return the bytes: one file, or with
+   * `split` a zip. The response is binary, so this cannot go through
+   * `request<T>` (which parses JSON). When the server names the download
+   * (`Content-Disposition`) the Blob comes back as a `File` carrying that
+   * name; `File` is a `Blob`, so callers that only want the bytes are
+   * unaffected. Errors are `ApiError`s — use `apiErrorMessage` to show them.
+   * `opts.signal` aborts the request (the promise rejects with an
+   * `AbortError`).
+   */
+  async exportFindings(body: FindingsExportBody, opts?: { signal?: AbortSignal }): Promise<Blob> {
+    const res = await fetch('/api/findings/export', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: opts?.signal,
+    });
+    return exportBlob(res);
+  },
+  /**
+   * One finding's report in `format` (`GET /api/findings/:id/export`), as the
+   * same server-named `File`-or-`Blob` that `exportFindings` returns. A non-2xx
+   * (404 unknown finding, 501 no PDF support) throws an `ApiError` rather than
+   * handing back the JSON error as if it were the report.
+   */
+  async downloadFindingExport(
+    id: string,
+    format: FindingExportFormat,
+    opts?: { signal?: AbortSignal },
+  ): Promise<Blob> {
+    const res = await fetch(findingExportUrl(id, format), {
+      credentials: 'same-origin',
+      signal: opts?.signal,
+    });
+    return exportBlob(res);
+  },
 
   /**
    * Subscribe to the JSONL event stream for a single run.
@@ -2772,3 +2969,13 @@ export const api = {
     return request<AstResponse>(url);
   },
 };
+
+export function findingArtifactUrl(id: string, sha256: string): string {
+  return `/api/findings/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(sha256)}`;
+}
+
+/** Download link for one finding's report (`GET /api/findings/:id/export`),
+ *  served as an attachment. */
+export function findingExportUrl(id: string, format: FindingExportFormat): string {
+  return `/api/findings/${encodeURIComponent(id)}/export?format=${format}`;
+}

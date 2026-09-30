@@ -184,6 +184,7 @@ impl StepFactory for ParallelFactory {
             max_turns: 5,
             decider: Arc::new(BypassDecider),
             tool_context: ToolContext {
+                findings: None,
                 workspace_path,
                 bash_env_allowlist: Vec::new(),
                 bash_timeout_secs: 120,
@@ -220,6 +221,7 @@ impl StepFactory for ParallelFactory {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,

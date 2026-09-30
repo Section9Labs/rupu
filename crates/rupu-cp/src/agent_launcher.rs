@@ -16,6 +16,19 @@ pub struct AgentLaunchRequest {
     /// `HostConnector::honours_supplied_run_id` reports. `None` → the
     /// connector mints.
     pub run_id: Option<String>,
+    /// Findings contract override for this run — `rupu run --findings-profile`,
+    /// the highest-precedence input to the run's profile resolution. A placed
+    /// unit's coordinator sets it from the step's `findings_profile` /
+    /// the workflow's `defaults.findings_profile` (the part of the precedence
+    /// chain only the coordinator knows); `None` ⇒ the executing host resolves
+    /// from the agent file's `findingsProfile`, else `full`.
+    ///
+    /// Unlike `run_id`, EVERY connector honours this — local, HTTP, tunnel,
+    /// bucket and SSH all put it on the `rupu run` argv (directly or via the
+    /// peer that builds it). A connector that cannot deliver it to the host
+    /// (e.g. a tunnel node too old to advertise support) must refuse the
+    /// launch rather than run the agent under a different profile.
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
     /// Codename minted by a placed unit's coordinator. Forwarded to the
     /// remote `rupu run` as `RUPU_CODENAME` (an env var, so an older remote
     /// binary ignores it instead of rejecting an unknown flag). SSH only this

@@ -99,6 +99,7 @@
         42,
         58
       ],
+      "profile": "summary",
       "scope": "line",
       "severity": "critical",
       "summary": "Session token comparison uses non-constant-time equality"

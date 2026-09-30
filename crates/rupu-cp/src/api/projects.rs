@@ -101,13 +101,59 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/:ws_id/autoflows", get(project_autoflows))
 }
 
+/// Standalone agent runs and session turns that no workflow run claims
+/// ([`crate::usage_sources::unclaimed_extra_sources`] — each transcript
+/// once), priced and grouped by their transcript's workspace id; `only`
+/// keeps a single project. Each entry is `(usage, started_at RFC-3339)`.
+/// Blocking IO.
+fn extra_spend_by_workspace(
+    run_store: &rupu_orchestrator::runs::RunStore,
+    global: &std::path::Path,
+    pricing: &rupu_config::PricingConfig,
+    only: Option<&str>,
+) -> BTreeMap<String, Vec<(crate::usage::UsageSummary, Option<String>)>> {
+    let mut out: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for src in crate::usage_sources::unclaimed_extra_sources(global, run_store) {
+        if src.workspace_id.is_empty() || only.is_some_and(|w| src.workspace_id != w) {
+            continue;
+        }
+        let usage = crate::usage::summarize_run_usage(
+            &crate::usage::transcripts_usage(&src.paths),
+            pricing,
+        );
+        out.entry(src.workspace_id)
+            .or_default()
+            .push((usage, src.started_at.map(|t| t.to_rfc3339())));
+    }
+    out
+}
+
 async fn list_projects(State(s): State<AppState>) -> ApiResult<Json<Vec<ProjectRow>>> {
     let workspaces = store(&s).list().unwrap_or_default();
-    let runs = s.run_store.list().unwrap_or_default();
-    // Single pass over every run, grouped by owning workspace id.
-    let rollups = crate::usage::rollup_by(&s.run_store, &runs, &s.pricing, |r| {
-        Some(r.workspace_id.clone())
-    });
+    // Every workflow run grouped by owning workspace id, plus each project's
+    // standalone agent runs and session turns: they add spend and activity,
+    // not to `run_count` (the project's workflow-run count, as its runs tab
+    // lists). Blocking IO.
+    let rollups = {
+        let run_store = std::sync::Arc::clone(&s.run_store);
+        let global = s.global_dir.clone();
+        let pricing = s.pricing.clone();
+        tokio::task::spawn_blocking(move || {
+            let runs = run_store.list().unwrap_or_default();
+            let mut rollups = crate::usage::rollup_by(&run_store, &runs, &pricing, |r| {
+                Some(r.workspace_id.clone())
+            });
+            for (ws, spend) in extra_spend_by_workspace(&run_store, &global, &pricing, None) {
+                let roll = rollups.entry(ws).or_default();
+                for (usage, at) in spend {
+                    roll.add_spend(&usage, at);
+                }
+            }
+            rollups
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     let mut rows: Vec<ProjectRow> = workspaces.iter().map(project_row).collect();
     for row in &mut rows {
         if let Some(roll) = rollups.get(&row.ws_id) {
@@ -177,12 +223,36 @@ async fn get_project(
         "by_surface": { "workflow": workflow, "autoflow": autoflow },
     });
 
-    // ── sessions ──────────────────────────────────────────────────────────
-    let sessions = crate::api::sessions::collect_sessions(&s.global_dir, &s.pricing);
-    let scoped_sessions: Vec<&Value> = sessions
-        .iter()
-        .filter(|v| v["workspace_id"].as_str() == Some(ws_id.as_str()))
-        .collect();
+    // ── sessions + usage (blocking IO) ────────────────────────────────────
+    // Sessions are only counted here, so they are listed without folding
+    // their transcripts. Usage is the project's workflow runs plus its
+    // standalone agent runs and session turns, each transcript once.
+    let (scoped_sessions, usage) = {
+        let run_store = std::sync::Arc::clone(&s.run_store);
+        let global = s.global_dir.clone();
+        let pricing = s.pricing.clone();
+        let ws = ws_id.clone();
+        let run_ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            let sessions = crate::api::sessions::collect_sessions_with(
+                &global,
+                crate::api::sessions::SessionScan {
+                    pricing: None,
+                    workspace: Some(&ws),
+                },
+            );
+            let extra = extra_spend_by_workspace(&run_store, &global, &pricing, Some(&ws));
+            let usage = crate::usage::rollup(
+                run_ids
+                    .iter()
+                    .map(|id| crate::usage::summarize_run(&run_store, id, &pricing))
+                    .chain(extra.into_values().flatten().map(|(u, _)| u)),
+            );
+            (sessions, usage)
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     let sessions_active = scoped_sessions
         .iter()
         .filter(|v| session_is_active(v))
@@ -212,13 +282,6 @@ async fn get_project(
         "targets": targets.len(),
         "findings": findings_sum,
     });
-
-    // ── usage ─────────────────────────────────────────────────────────────
-    // Project-level token/cost rollup across every scoped run.
-    let usage = crate::usage::rollup(
-        runs.iter()
-            .map(|r| crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing)),
-    );
 
     Ok(Json(ProjectDetail {
         project: project_row(&w),
@@ -259,12 +322,17 @@ async fn project_runs(
     load_workspace(&s, &ws_id)?;
     let runs = scoped_runs(&s, &ws_id)?; // already sorted newest-first
     let page_runs = crate::pagination::paginate(runs, &page);
-    Ok(Json(
-        page_runs
+    // The usage fold runs on the blocking pool.
+    let store = std::sync::Arc::clone(&s.run_store);
+    let pricing = s.pricing.clone();
+    let rows = crate::api::runs::blocking(move || {
+        Ok(page_runs
             .iter()
-            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
-            .collect(),
-    ))
+            .map(|r| RunListRow::with_usage(r, &store, &pricing))
+            .collect())
+    })
+    .await?;
+    Ok(Json(rows))
 }
 
 /// `GET /api/projects/:ws_id/sessions` — session DTOs scoped to the project.
@@ -274,10 +342,22 @@ async fn project_sessions(
     Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<Value>>> {
     load_workspace(&s, &ws_id)?;
-    let scoped: Vec<Value> = crate::api::sessions::collect_sessions(&s.global_dir, &s.pricing)
-        .into_iter()
-        .filter(|v| v["workspace_id"].as_str() == Some(ws_id.as_str()))
-        .collect();
+    // Scoped BEFORE usage is folded; blocking IO.
+    let scoped: Vec<Value> = {
+        let global = s.global_dir.clone();
+        let pricing = s.pricing.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::api::sessions::collect_sessions_with(
+                &global,
+                crate::api::sessions::SessionScan {
+                    pricing: Some(&pricing),
+                    workspace: Some(&ws_id),
+                },
+            )
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     Ok(Json(crate::pagination::paginate(scoped, &page)))
 }
 

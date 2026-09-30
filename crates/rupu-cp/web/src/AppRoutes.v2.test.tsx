@@ -7,6 +7,9 @@
 // map — detail pages, `/events`) nothing changes. See Composite.test.tsx for
 // the tab-selection behavior those `?tab=` destinations rely on.
 //
+// `./pages/FindingDetail` is stubbed the same way (routing is all this file
+// asserts about it; its own behavior is covered by FindingDetail.test.tsx).
+//
 // `./pages/RunDetail` is mocked to a stub: it pulls in `@xyflow/react`, which
 // every other test that touches it (RunDetail.test.tsx, RunGraph.edges.test.tsx,
 // WorkflowEditorGraph.test.tsx) also mocks rather than mounting for real in
@@ -27,6 +30,11 @@ import { ThemeProvider } from './components/theme/ThemeProvider';
 vi.mock('./pages/RunDetail', () => ({
   __esModule: true,
   default: () => <div>run-detail-stub</div>,
+}));
+
+vi.mock('./pages/FindingDetail', () => ({
+  __esModule: true,
+  default: () => <div>finding-detail-stub</div>,
 }));
 
 import { AppRoutes } from './App';
@@ -154,6 +162,13 @@ describe('AppRoutes shell branch', () => {
     renderApp('v2', '/runs/abc123');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/runs/abc123'));
     expect(await screen.findByText('run-detail-stub')).toBeInTheDocument();
+  });
+
+  it('v2: /findings/:id (report page) is left untouched, not redirected to the list', async () => {
+    renderApp('v2', '/findings/fnd_1');
+    await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/findings/fnd_1'));
+    expect(screen.getByTestId('loc')).not.toHaveTextContent('/security');
+    expect(await screen.findByText('finding-detail-stub')).toBeInTheDocument();
   });
 
   it('v2: /events (wall display) survives untouched', async () => {

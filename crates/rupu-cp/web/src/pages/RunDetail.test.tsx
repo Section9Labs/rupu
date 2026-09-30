@@ -16,7 +16,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -95,7 +95,11 @@ vi.mock('../components/RunEventFeed', () => ({
 
 vi.mock('../components/charts/RunUsageTimeline', () => ({
   __esModule: true,
-  default: () => <div data-testid="usage-timeline-mock">chart</div>,
+  default: ({ series }: { series: unknown[] }) => (
+    <div data-testid="usage-timeline-mock" data-points={series.length}>
+      chart
+    </div>
+  ),
 }));
 
 afterEach(() => {
@@ -109,6 +113,11 @@ afterEach(() => {
 // need to know about it; the dedicated Autoflow-panel tests re-stub it.
 beforeEach(() => {
   vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
+  // GET /api/runs/:id/usage is polled by every run page; default it to "older
+  // remote CP" (404 → fall back to the graph's one-shot usage) so the tests
+  // that predate the live endpoint keep asserting the graph numbers. The live
+  // tests below re-stub it.
+  vi.spyOn(api, 'getRunUsage').mockRejectedValue(new ApiError(404, 'not found'));
 });
 
 // ---- Fixtures ------------------------------------------------------------
@@ -252,6 +261,7 @@ function renderRemotePage(hostId = 'h-abc') {
 // Imported here so the vi.mock factories above are hoisted before the module
 // graph resolves RunDetail's child imports.
 import RunDetailLoaded from './RunDetail';
+import { formatTokens } from '../lib/usage';
 
 // ---- Local run tests -----------------------------------------------------
 
@@ -1118,5 +1128,179 @@ describe('RunDetail selection label codenames', () => {
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
     fireEvent.click(screen.getByText('select-step-a'));
     expect(screen.getByTestId('transcript-panel')).toHaveAttribute('data-subruns', 'sub_9=anthropic/claude-opus-5-5');
+  });
+});
+
+// ---- Live usage (GET /api/runs/:id/usage) ---------------------------------
+
+describe('RunDetail — live usage', () => {
+  const LIVE_SUMMARY = {
+    input_tokens: 1_000_000,
+    output_tokens: 200_000,
+    cached_tokens: 34_567,
+    total_tokens: 1_234_567,
+    cost_usd: 1.5,
+    priced: true,
+    runs: 1,
+  };
+  const liveResp = (over: Record<string, unknown> = {}) => ({
+    summary: LIVE_SUMMARY,
+    steps: {},
+    turns: 2,
+    partial: false,
+    epoch: '17000000000000000001',
+    points_from: 0,
+    points: [
+      { turn: 1, label: 'step_a', tokens_in: 10, tokens_out: 1, tokens_cached: 0 },
+      { turn: 2, label: 'step_a', tokens_in: 20, tokens_out: 2, tokens_cached: 0 },
+    ],
+    ...over,
+  });
+
+  function stubBase(graph: RunGraphResponse) {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  it('renders the live summary in the header and the live points in the chart', async () => {
+    stubBase({ ...RUNNING_GRAPH, usage: EMPTY_USAGE });
+    const usageSpy = vi.spyOn(api, 'getRunUsage').mockResolvedValue(liveResp());
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText(formatTokens(1_234_567))).toBeInTheDocument());
+    expect(screen.getByText(formatTokens(1_000_000))).toBeInTheDocument();
+    expect(screen.getByText('$1.50')).toBeInTheDocument();
+    expect(screen.getByTestId('usage-timeline-mock')).toHaveAttribute('data-points', '2');
+    expect(usageSpy).toHaveBeenCalledWith('run-1', { host: undefined });
+    // No partial marker on a complete summary.
+    expect(screen.queryByText(/≥/)).not.toBeInTheDocument();
+  });
+
+  it('shows cache writes next to cached only when there are any', async () => {
+    stubBase({ ...RUNNING_GRAPH, usage: EMPTY_USAGE });
+    vi.spyOn(api, 'getRunUsage').mockResolvedValue(
+      liveResp({ summary: { ...LIVE_SUMMARY, cache_write_tokens: 45_678 } }),
+    );
+
+    renderPage();
+
+    const label = await screen.findByText('cache write');
+    expect(label.parentElement).toHaveTextContent(`cache write ${formatTokens(45_678)}`);
+    expect(screen.getByText('cached')).toBeInTheDocument();
+  });
+
+  it('hides cache writes when zero or absent', async () => {
+    stubBase({ ...RUNNING_GRAPH, usage: EMPTY_USAGE });
+    vi.spyOn(api, 'getRunUsage').mockResolvedValue(liveResp());
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText(formatTokens(1_234_567))).toBeInTheDocument());
+    expect(screen.queryByText('cache write')).not.toBeInTheDocument();
+  });
+
+  it('marks a partial total with a lower-bound sign and an explanatory title', async () => {
+    stubBase({ ...GRAPH, usage: EMPTY_USAGE });
+    vi.spyOn(api, 'getRunUsage').mockResolvedValue(
+      liveResp({ summary: { ...LIVE_SUMMARY, partial: true }, partial: true }),
+    );
+
+    renderPage();
+
+    const total = await screen.findByText(`≥${formatTokens(1_234_567)}`);
+    expect(total).toHaveAttribute(
+      'title',
+      'Some transcripts were not readable on this CP (remote host not yet mirrored)',
+    );
+  });
+
+  it('goes live after a new run\'s transient 404 (run.json not landed when the page mounted)', async () => {
+    stubBase({ ...RUNNING_GRAPH, usage: EMPTY_USAGE });
+    // The mount-time request races the launch: 404, then the run exists.
+    const usageSpy = vi
+      .spyOn(api, 'getRunUsage')
+      .mockRejectedValueOnce(new ApiError(404, 'not found'))
+      .mockResolvedValue(liveResp());
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText(formatTokens(1_234_567))).toBeInTheDocument());
+    expect(screen.getByTestId('usage-timeline-mock')).toHaveAttribute('data-points', '2');
+    expect(usageSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('keys liveness to the loaded run: navigating in-app to a just-launched run still goes live', async () => {
+    // Launching from a run page navigates /runs/run-a → /runs/run-b in place.
+    // For one render `graph` still holds run-a's (running) run; run-b's first
+    // usage request must not count as "run known", or its launch-race 404
+    // would read as an older CP and stop live usage for good.
+    const graphA = { ...RUNNING_GRAPH, run: { ...RUNNING_GRAPH.run, id: 'run-a' }, usage: EMPTY_USAGE };
+    const graphB = { ...RUNNING_GRAPH, run: { ...RUNNING_GRAPH.run, id: 'run-b' }, usage: EMPTY_USAGE };
+    let resolveB: (g: RunGraphResponse) => void = () => {};
+    vi.spyOn(api, 'getRunGraph').mockImplementation((id: string) =>
+      id === 'run-a'
+        ? Promise.resolve(graphA)
+        : new Promise<RunGraphResponse>((resolve) => {
+            resolveB = resolve;
+          }),
+    );
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    let bCalls = 0;
+    vi.spyOn(api, 'getRunUsage').mockImplementation(async (id: string) => {
+      if (id === 'run-a') {
+        return liveResp({ summary: { ...LIVE_SUMMARY, total_tokens: 111_111 } }) as never;
+      }
+      bCalls += 1;
+      // run-b's run.json has not landed yet when its page first renders.
+      if (bCalls === 1) throw new ApiError(404, 'not found');
+      return liveResp({ summary: { ...LIVE_SUMMARY, total_tokens: 7_654_321 } }) as never;
+    });
+
+    function GoToB() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/runs/run-b')}>navigate-to-run-b</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/runs/run-a']}>
+        <GoToB />
+        <Routes>
+          <Route path="/runs/:id" element={<RunDetailLoaded />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText(formatTokens(111_111))).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'navigate-to-run-b' }));
+    // run-b's first request goes out while its graph is still loading → 404.
+    await waitFor(() => expect(bCalls).toBe(1));
+    resolveB(graphB);
+
+    await waitFor(() => expect(screen.getByText(formatTokens(7_654_321))).toBeInTheDocument());
+    // …and it keeps polling (the 2 s interval), rather than being written off.
+    await waitFor(() => expect(bCalls).toBeGreaterThanOrEqual(3), { timeout: 3500 });
+  });
+
+  it('falls back to the graph usage + one-shot timeline when the endpoint 404s', async () => {
+    stubBase({
+      ...GRAPH,
+      usage: { ...EMPTY_USAGE, input_tokens: 42, total_tokens: 4242, priced: true },
+    });
+    const timelineSpy = vi
+      .spyOn(api, 'getRunUsageTimeline')
+      .mockResolvedValue([{ turn: 1, label: 'step_a', tokens_in: 1, tokens_out: 1, tokens_cached: 0 }]);
+    // beforeEach already rejects getRunUsage with a 404.
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText(formatTokens(4242))).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId('usage-timeline-mock')).toHaveAttribute('data-points', '1'),
+    );
+    expect(timelineSpy).toHaveBeenCalledWith('run-1', undefined);
   });
 });

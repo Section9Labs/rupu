@@ -15,16 +15,16 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::{
-        bucket::{Bucket, BucketError, ControlEnvelope},
+        bucket::{Bucket, BucketError, ControlEnvelope, WorkerInfo},
         connector::{
-            mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
-            EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-            RunListQuery,
+            blocking_host, mirror_get_run, mirror_list_runs, mirror_stream_run_events,
+            read_transcript_file, EventByteStream, HostCapabilities, HostConnector,
+            HostConnectorError, HostInfo, RunListQuery,
         },
     },
     launcher::LaunchRequest,
     node::{
-        protocol::{RunSpec, RunSpecKind},
+        protocol::{RunSpec, RunSpecKind, CAP_AGENT_FINDINGS_PROFILE},
         NodeMirror,
     },
     session_sender::SendMessageRequest,
@@ -94,6 +94,58 @@ impl BucketHostConnector {
     }
 }
 
+impl BucketHostConnector {
+    /// Refuse unless the pull workers on this bucket have advertised
+    /// `capability` in their [`WorkerInfo`] markers: at least one marker, and
+    /// every marker lists it. A worker predating the markers writes none and
+    /// would silently drop a [`RunSpec`] field it doesn't know, so no marker
+    /// ⇒ refuse.
+    ///
+    /// Residual gap, inherent to a handshake-free dead drop: an old worker
+    /// polling the SAME bucket alongside an upgraded one is invisible here
+    /// and can still claim the job.
+    async fn require_worker_capability(
+        &self,
+        capability: &str,
+        what: &str,
+    ) -> Result<(), HostConnectorError> {
+        let bodies = self
+            .bucket
+            .list_worker_info()
+            .await
+            .map_err(bucket_err_to_unreachable)?;
+        let infos: Vec<Option<WorkerInfo>> = bodies
+            .iter()
+            .map(|b| serde_json::from_slice(b).ok())
+            .collect();
+        let lacking: Vec<String> = infos
+            .iter()
+            .filter_map(|i| match i {
+                Some(i) if i.capabilities.iter().any(|c| c == capability) => None,
+                Some(i) => Some(format!("{} (rupu {})", i.worker_id, i.rupu_version)),
+                None => Some("an unreadable worker marker".to_string()),
+            })
+            .collect();
+        if infos.is_empty() {
+            return Err(HostConnectorError::Unsupported(format!(
+                "{what}: no pull worker on bucket host {} has advertised support \
+                 (none has written a nodes/<worker>.json marker); upgrade rupu on its \
+                 workers (`rupu node pull`)",
+                self.host_id
+            )));
+        }
+        if !lacking.is_empty() {
+            return Err(HostConnectorError::Unsupported(format!(
+                "{what}: pull worker(s) on bucket host {} do not support it: {}; \
+                 upgrade rupu on them",
+                self.host_id,
+                lacking.join(", ")
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn bucket_err_to_unreachable(e: BucketError) -> HostConnectorError {
     HostConnectorError::Unreachable(e.to_string())
 }
@@ -121,6 +173,7 @@ impl HostConnector for BucketHostConnector {
             prompt: None,
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: None,
         };
 
         self.mirror
@@ -143,6 +196,15 @@ impl HostConnector for BucketHostConnector {
     }
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
+        // Before the mirror run exists, so a refusal leaves nothing behind.
+        if let Some(profile) = req.findings_profile {
+            self.require_worker_capability(
+                CAP_AGENT_FINDINGS_PROFILE,
+                &format!("this run cannot be held to the `{profile}` findings profile"),
+            )
+            .await?;
+        }
+
         let run_id = format!("run_{}", Ulid::new());
 
         let spec = RunSpec {
@@ -152,6 +214,7 @@ impl HostConnector for BucketHostConnector {
             prompt: req.prompt.clone(),
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: req.findings_profile,
         };
 
         self.mirror
@@ -195,11 +258,22 @@ impl HostConnector for BucketHostConnector {
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        mirror_list_runs(&self.run_store, &self.host_id, &params, &self.pricing)
+        let (store, id, pricing) = (
+            Arc::clone(&self.run_store),
+            self.host_id.clone(),
+            self.pricing.clone(),
+        );
+        blocking_host(move || mirror_list_runs(&store, &id, &params, &pricing)).await
     }
 
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-        mirror_get_run(&self.run_store, &self.host_id, run_id, &self.pricing)
+        let (store, id, pricing) = (
+            Arc::clone(&self.run_store),
+            self.host_id.clone(),
+            self.pricing.clone(),
+        );
+        let run_id = run_id.to_string();
+        blocking_host(move || mirror_get_run(&store, &id, &run_id, &pricing)).await
     }
 
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
@@ -366,6 +440,7 @@ mod tests {
                 target: None,
                 working_dir: None,
                 run_id: None,
+                findings_profile: None,
             })
             .await
             .unwrap();
@@ -380,6 +455,96 @@ mod tests {
         assert_eq!(
             spec.get("name").and_then(|v| v.as_str()),
             Some("my-agent")
+        );
+    }
+
+    fn profile_req(profile: Option<rupu_coverage::FindingProfile>) -> AgentLaunchRequest {
+        AgentLaunchRequest {
+            agent: "sec".into(),
+            prompt: Some("audit".into()),
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: profile,
+            codename: None,
+        }
+    }
+
+    async fn put_worker(bucket: &Arc<dyn Bucket>, id: &str, caps: &[&str]) {
+        let info = WorkerInfo {
+            worker_id: id.into(),
+            rupu_version: "9.9.9".into(),
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+        };
+        bucket
+            .put_worker_info(id, &serde_json::to_vec(&info).unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_agent_carries_the_findings_profile_to_a_capable_worker() {
+        let (conn, _run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_a", &[CAP_AGENT_FINDINGS_PROFILE]).await;
+
+        let run_id = conn
+            .launch_agent(profile_req(Some(rupu_coverage::FindingProfile::Summary)))
+            .await
+            .unwrap();
+
+        let spec: RunSpec =
+            serde_json::from_slice(&bucket.get_job(&run_id).await.unwrap()).unwrap();
+        assert_eq!(
+            spec.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_agent_refuses_a_profile_when_no_worker_advertised_support() {
+        let (conn, run_store, bucket, _tmp) = make_conn();
+
+        let err = conn
+            .launch_agent(profile_req(Some(rupu_coverage::FindingProfile::Full)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m) if m.contains("`full`")),
+            "{err:?}"
+        );
+        // Refused before anything was written: no job, no orphaned mirror run.
+        assert!(bucket.list_jobs().await.unwrap().is_empty());
+        assert!(run_store.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_agent_refuses_a_profile_when_any_worker_lacks_support() {
+        let (conn, run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_new", &[CAP_AGENT_FINDINGS_PROFILE]).await;
+        put_worker(&bucket, "node_other", &[]).await;
+
+        let err = conn
+            .launch_agent(profile_req(Some(rupu_coverage::FindingProfile::Summary)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m) if m.contains("node_other")),
+            "{err:?}"
+        );
+        assert!(bucket.list_jobs().await.unwrap().is_empty());
+        assert!(run_store.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_agent_without_a_profile_needs_no_worker_marker() {
+        let (conn, _run_store, bucket, _tmp) = make_conn();
+        let run_id = conn.launch_agent(profile_req(None)).await.unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&bucket.get_job(&run_id).await.unwrap()).unwrap();
+        assert!(
+            raw.get("findings_profile").is_none(),
+            "no override ⇒ the envelope is byte-compatible with older workers: {raw}"
         );
     }
 
@@ -573,6 +738,12 @@ mod tests {
         }
         async fn probe(&self) -> Result<(), BucketError> {
             unimplemented!("FailingBucket::probe")
+        }
+        async fn put_worker_info(&self, _worker_id: &str, _body: &[u8]) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::put_worker_info")
+        }
+        async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
+            unimplemented!("FailingBucket::list_worker_info")
         }
     }
 

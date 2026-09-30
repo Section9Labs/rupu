@@ -7,7 +7,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type FindingOut, type FindingsResponse } from '../../lib/api';
 import ProjectFindingsTab from './ProjectFindingsTab';
@@ -78,5 +78,45 @@ describe('ProjectFindingsTab', () => {
     expect(screen.getByText('Critical SQL injection')).toBeInTheDocument();
     expect(screen.getByText('High auth bypass')).toBeInTheDocument();
     expect(screen.getByText('Medium info leak')).toBeInTheDocument();
+  });
+});
+
+describe('ProjectFindingsTab — export report', () => {
+  it('exports the severity-filtered rows, scoped to the project', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue({
+      ...RESP,
+      findings: RESP.findings.map((f) => ({ ...f, profile: 'full' as const })),
+    });
+    const exportSpy = vi.spyOn(api, 'exportFindings').mockResolvedValue(new Blob(['x']));
+    render(
+      <MemoryRouter>
+        <ProjectFindingsTab wsId="x" />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('High auth bypass')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by high' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Export report' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByLabelText('Title')).toHaveValue('proj findings report');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Export' }));
+
+    await waitFor(() => expect(exportSpy).toHaveBeenCalled());
+    expect(exportSpy.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ ids: ['f-high'], ws_id: 'x', format: 'md' }),
+    );
+  });
+
+  it('is disabled when the severity filter leaves no rows', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(RESP);
+    render(
+      <MemoryRouter>
+        <ProjectFindingsTab wsId="x" />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('High auth bypass')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by low' }));
+    expect(screen.getByText('No low findings.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Export report' })).toBeDisabled();
   });
 });

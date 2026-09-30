@@ -62,6 +62,7 @@ Everything after the closing `---` is the system prompt.
 | `maxTurns` | integer | no | `50` | Hard cap on model turns |
 | `permissionMode` | `ask` \| `bypass` \| `readonly` | no | `ask` | CLI `--mode` overrides the file |
 | `anthropicOauthPrefix` | bool | no | provider default | Anthropic SSO only |
+| `anthropicPromptCache` | bool | no | `[providers.<name>] prompt_cache`, else on | Anthropic only; `false` disables prompt caching for this agent |
 | `effort` | string | no | provider default | Cross-provider reasoning level |
 | `contextWindow` | string | no | model default | Cross-provider context tier |
 | `outputFormat` | `text` \| `json` | no | free-form text | Hint for structured outputs |
@@ -71,6 +72,7 @@ Everything after the closing `---` is the system prompt.
 | `outputSchema` | object (inline YAML) | no | none | JSON Schema for Anthropic structured outputs; only takes effect with `outputFormat: json` |
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
+| `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
 | `maxTokens` | integer | no | `8192` | Per-request output-token budget (`max_tokens` in the LLM request); extended thinking (`effort`) draws from this same budget |
 | `contextWindowTokens` | integer | no | none (compaction disabled) | Model context-window size in tokens; when set, enables proactive LLM context compaction |
 | `compactAtPercent` | integer | no | `80` when `contextWindowTokens` is set | Percentage of `contextWindowTokens` at which compaction triggers; clamped to `[10, 95]` |
@@ -259,6 +261,30 @@ Allowlist of agent names this agent may hand work to via the `dispatch_agent` / 
 
 Coverage-concerns block (see `docs/coverage.md`). When present, the runner flattens the concern catalog, writes a snapshot to `.rupu/coverage/<target>/catalog.yaml`, injects the four coverage tools, and prepends the catalog to the system prompt. A workflow step's own `concerns:` block takes precedence over the agent's when both are set.
 
+### `findingsProfile`
+
+Selects the contract an agent's findings are recorded under. It governs the agent's `report_finding` builtin, whether the tool comes from a `concerns:` block (which injects the coverage tools) or from an explicit `tools: [report_finding]` grant.
+
+- `full` (default) — findings must include a complete `report` (see `rupu findings schema`). The tool rejects `summary`, `severity`, and `evidence` as separate arguments: rupu derives them from the report (`summary` from `title`, `severity` from `rating.risk_rating`, `evidence.rationale` from `root_cause`). A rejected call lists every validation problem at once so the agent can fix them all in one retry. When the run can record findings (a `concerns:` block or `report_finding` in `tools:`), finding-writing guidance is appended to the system prompt. rupu generates the Markdown, HTML and PDF reports from the stored report (see [coverage.md](coverage.md#exporting-reports)), so an agent should not also write a report file.
+- `summary` — the lightweight `summary` / `severity` / `evidence` record. A `report` sent under `summary` is refused rather than silently dropped.
+
+A workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides this value. The order is step → workflow defaults → agent `findingsProfile` → `full`; see [workflow-format.md](workflow-format.md#findings_profile). A standalone `rupu run <agent>` uses `--findings-profile full|summary` when given, then the agent's value, then `full`. The flag is also how a remote workflow step's profile reaches the host that runs the agent. Sub-agents started through `dispatch_agent` resolve only from their own agent file.
+
+**Upgrade note:** because the built-in default is `full`, an existing agent that records thin findings (a `concerns:` block, or `report_finding` in `tools:`) is now rejected unless it sets `findingsProfile: summary` (or its workflow sets `findings_profile: summary`), or its prompt is updated to send a complete `report`.
+
+**Remote hosts:** agent frontmatter rejects unknown keys, so a rupu release that predates `findingsProfile` refuses to load an agent file that sets it. A workflow step placed on a remote host (`host:` / `distribute:`) resolves its profile from the agent file on that host, so upgrade rupu on every remote host before adding `findingsProfile` to agents they run.
+
+```yaml
+---
+name: quick-scanner
+concerns:
+  - include: secrets-in-source
+findingsProfile: summary   # lightweight findings; set to full for complete reports
+---
+```
+
+See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty) and `artifacts`. `verification` is set by verification runs, not by the reporting agent, and a call that supplies it is rejected.
+
 ### `maxTokens`
 
 Per-request output-token budget (the LLM request's `max_tokens`). Defaults to `8192` when omitted. Extended thinking (`effort`) draws from this same budget, so raise it for agents that both reason heavily and produce long output.
@@ -272,11 +298,42 @@ Per-request output-token budget (the LLM request's `max_tokens`). Defaults to `8
 | Key | Valid values | Purpose |
 | --- | --- | --- |
 | `anthropicOauthPrefix` | `true` / `false` | Enables or disables Anthropic's OAuth system prefix |
+| `anthropicPromptCache` | `true` / `false` | Enables or disables explicit prompt caching (default on) |
 | `anthropicTaskBudget` | positive integer | Soft output budget, separate from `maxTurns` |
 | `anthropicContextManagement` | `tool_clearing` | Server-side pruning of older tool blocks |
 | `anthropicSpeed` | `fast` | Account-gated fast mode |
 
 If an agent needs to stay portable across providers, avoid Anthropic-only fields.
+
+#### `anthropicPromptCache`
+
+Anthropic requests use prompt caching by default. Each request carries two
+explicit `cache_control: {"type": "ephemeral"}` breakpoints (5-minute TTL):
+
+- one on the last system block, which caches the tool definitions and the
+  system prompt together (on the last tool definition when there is no system
+  prompt);
+- one on the last content block of the final message, which moves forward
+  each turn so every turn re-reads the prior conversation from the cache.
+
+Thinking blocks, empty text blocks, and empty tool results are never marked.
+When the final message has nothing markable (for example the empty result of a
+silent `bash` command), the second marker moves to the last eligible block of
+the nearest earlier message — typically the preceding `tool_use` — at most
+three messages back. A prefix below the
+model's minimum cacheable length (512–4096 tokens, depending on the model) is
+simply not cached — there is no error. Cache reads and writes show up as
+`cached_tokens` and `cache_write_tokens` in usage and cost.
+
+`anthropicPromptCache: false` turns the breakpoints off for this agent. It
+overrides `[providers.<name>] prompt_cache` in either direction, so `true`
+re-enables caching for one agent on a provider whose config turns it off. Use
+`false` when the agent's provider is an Anthropic-compatible gateway that
+rejects `cache_control`. For a whole provider, prefer
+`[providers.<name>] prompt_cache = false` (see
+[providers.md](providers.md#field-reference), including its caveat that
+Anthropic gateway routing is currently process-wide). Omitted, the agent follows the
+provider config, and caching is on when neither sets it.
 
 ---
 

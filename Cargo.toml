@@ -5,6 +5,7 @@ members = [
     "crates/rupu-codename",
     "crates/rupu-app-canvas",
     "crates/rupu-coverage",
+    "crates/rupu-findings-report",
     "crates/rupu-transcript",
     "crates/rupu-runtime",
     "crates/rupu-config",
@@ -40,6 +41,8 @@ tokio-util = "0.7"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Field paths (`report.call_chain[0].role`) on tool-input parse errors.
+serde_path_to_error = "0.1.20"
 serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["chrono"] }
 jsonschema = "0.18"
@@ -80,6 +83,19 @@ reqwest-middleware = { version = "0.4", features = ["json"] }
 
 # Compression
 flate2 = "1"
+
+# Markdown parsing for finding-report exports (rupu-findings-report). The
+# `html` feature gives `html::push_html`; `getopts` only serves the CLI bin.
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+
+# PDF export for finding reports (rupu-findings-report): Typst compiled
+# in-process against the fonts bundled by typst-assets — no external binary,
+# no font discovery. `zip` backs the per-finding split archive.
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-layout = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # Crypto (lifted)
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }

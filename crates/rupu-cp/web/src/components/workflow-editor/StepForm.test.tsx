@@ -1115,6 +1115,97 @@ describe('StepForm — panel gate severity select + max_parallel guard (Task 1)'
   });
 });
 
+describe('StepForm — findings_profile (Plan 2 Task 9)', () => {
+  const sel = () => screen.queryByLabelText('Findings profile') as HTMLSelectElement | null;
+
+  it('agent step: offers Inherit / Full report / Summary, and choosing Summary emits findings_profile: summary', () => {
+    const spy = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} />);
+    const select = sel();
+    expect(select).not.toBeNull();
+    const labels = Array.from(select!.options).map((o) => o.textContent);
+    expect(labels[0]).toMatch(/^Inherit/);
+    expect(labels.slice(1)).toEqual(['Full report', 'Summary']);
+    expect(select!.value).toBe('');
+
+    fireEvent.change(select!, { target: { value: 'summary' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'step', findings_profile: 'summary' }));
+    expect(sel()!.value).toBe('summary');
+  });
+
+  it('choosing Inherit clears the field (no findings_profile key survives)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', findings_profile: 'full' })}
+        spy={spy}
+      />,
+    );
+    expect(sel()!.value).toBe('full');
+    fireEvent.change(sel()!, { target: { value: '' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.findings_profile).toBeUndefined();
+    expect(last.agent).toBe('planner');
+  });
+
+  it.each([
+    ['for_each', { kind: 'for_each', agent: 'planner', prompt: 'go', for_each: '{{ inputs.xs }}' }],
+    ['parallel', { kind: 'parallel', parallel: [] }],
+    ['panel', { kind: 'panel', panel: { panelists: [], subject: '' } }],
+    ['findings.record action', { kind: 'action', action: 'findings.record' }],
+  ] as [string, Partial<StepNodeData>][])('renders for a %s step', (_name, data) => {
+    render(<Harness initial={nodeWith(data)} spy={vi.fn()} />);
+    expect(sel()).not.toBeNull();
+  });
+
+  it.each([
+    ['branch', { kind: 'branch', condition: 'c', thenTargets: [], elseTargets: [] }],
+    ['approval gate', { kind: 'approval_gate', approvalRequired: true }],
+    ['split', { kind: 'split', split: [] }],
+    ['join', { kind: 'join' }],
+    ['non-findings action', { kind: 'action', action: 'issues.comment' }],
+    ['remote (host:) agent step', { kind: 'step', agent: 'planner', prompt: 'go', raw_passthrough: { host: 'box' } }],
+  ] as [string, Partial<StepNodeData>][])('does not render for a %s step', (_name, data) => {
+    render(<Harness initial={nodeWith(data)} spy={vi.fn()} />);
+    expect(sel()).toBeNull();
+  });
+
+  it('still renders (so it can be cleared) when a value is already set on a step that does not accept it', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'branch', condition: 'c', thenTargets: [], elseTargets: [], findings_profile: 'summary' })}
+        spy={spy}
+      />,
+    );
+    expect(sel()!.value).toBe('summary');
+    fireEvent.change(sel()!, { target: { value: '' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.findings_profile).toBeUndefined();
+    expect(last.kind).toBe('branch');
+  });
+
+  it('switchKind carries findings_profile only into kinds that accept it', () => {
+    const initial = nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', findings_profile: 'summary' });
+    const switchTo = (kind: string): StepNodeData => {
+      const spy = vi.fn();
+      const { unmount } = render(<Harness initial={initial} spy={spy} />);
+      fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: kind } });
+      const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+      unmount();
+      return last;
+    };
+    expect(switchTo('for_each').findings_profile).toBe('summary');
+    expect(switchTo('parallel').findings_profile).toBe('summary');
+    expect(switchTo('panel').findings_profile).toBe('summary');
+    expect(switchTo('branch').findings_profile).toBeUndefined();
+    expect(switchTo('action').findings_profile).toBeUndefined();
+    expect(switchTo('approval_gate').findings_profile).toBeUndefined();
+    expect(switchTo('split').findings_profile).toBeUndefined();
+    expect(switchTo('join').findings_profile).toBeUndefined();
+  });
+});
+
 describe('WorkflowSettingsForm', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();
@@ -1123,6 +1214,34 @@ describe('WorkflowSettingsForm', () => {
     fireEvent.change(screen.getByLabelText('Workflow name'), { target: { value: 'new' } });
     expect(spy).toHaveBeenCalledWith(
       expect.objectContaining({ name: 'new', rest: { trigger: { cron: '* * * * *' } } }),
+    );
+  });
+
+  it('renders the Defaults card after Inputs, and no longer lists `defaults` as a preserved-key chip', () => {
+    const meta: WorkflowMeta = {
+      name: 'wf',
+      rest: { defaults: { findings_profile: 'summary' }, contracts: {} },
+    };
+    render(<WorkflowSettingsForm meta={meta} onChange={() => {}} />);
+    const select = screen.getByLabelText('Default findings profile') as HTMLSelectElement;
+    expect(select.value).toBe('summary');
+    const inputsCard = screen.getByTestId('defaults-card').previousElementSibling;
+    expect(inputsCard).not.toBeNull();
+    // `contracts` remains a chip; `defaults` (now authored by its card) does not.
+    const chips = screen.getByText(/Preserved advanced keys/).parentElement!;
+    expect(chips).toHaveTextContent('contracts');
+    expect(chips).not.toHaveTextContent('defaults');
+  });
+
+  it('choosing a default findings profile emits a meta with the rest updated and siblings preserved', () => {
+    const spy = vi.fn();
+    const meta: WorkflowMeta = { name: 'wf', rest: { trigger: { on: 'cron', cron: '* * * * *' } } };
+    render(<WorkflowSettingsForm meta={meta} onChange={spy} />);
+    fireEvent.change(screen.getByLabelText('Default findings profile'), { target: { value: 'full' } });
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        rest: { trigger: { on: 'cron', cron: '* * * * *' }, defaults: { findings_profile: 'full' } },
+      }),
     );
   });
 

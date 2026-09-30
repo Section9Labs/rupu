@@ -600,3 +600,154 @@ async fn http_dashboard_summary_accepts_body_when_hosts_shows_ok() {
         .expect("a hosts[] entry reporting ok must parse normally");
     assert_eq!(summary.active.running, 2);
 }
+
+// ── findings_profile over HTTP ────────────────────────────────────────────────
+
+fn profiled_agent_req(
+    profile: Option<rupu_coverage::FindingProfile>,
+) -> rupu_cp::agent_launcher::AgentLaunchRequest {
+    rupu_cp::agent_launcher::AgentLaunchRequest {
+        agent: "sec".into(),
+        prompt: Some("audit".into()),
+        mode: None,
+        target: None,
+        working_dir: None,
+        run_id: None,
+        findings_profile: profile,
+        codename: None,
+    }
+}
+
+struct CapturingAgentLauncher {
+    last: std::sync::Mutex<Option<rupu_cp::agent_launcher::AgentLaunchRequest>>,
+}
+
+#[async_trait::async_trait]
+impl rupu_cp::agent_launcher::AgentLauncher for CapturingAgentLauncher {
+    async fn launch(
+        &self,
+        req: rupu_cp::agent_launcher::AgentLaunchRequest,
+    ) -> Result<String, rupu_cp::agent_launcher::AgentLaunchError> {
+        *self.last.lock().unwrap() = Some(req);
+        Ok("run_REMOTE".into())
+    }
+}
+
+/// End to end against a real remote CP: the coordinator's connector sees the
+/// remote advertise the feature on `/api/host/info`, posts the profile, and
+/// the remote hands it to its own agent launcher (which puts it on the
+/// `rupu run` argv — `cp_agent_launcher`'s tests cover that last hop).
+#[tokio::test]
+async fn launch_agent_delivers_the_findings_profile_to_a_real_remote_cp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launcher = std::sync::Arc::new(CapturingAgentLauncher {
+        last: std::sync::Mutex::new(None),
+    });
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    )
+    .with_agent_launcher(Some(launcher.clone()));
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let id = c
+        .launch_agent(profiled_agent_req(Some(
+            rupu_coverage::FindingProfile::Summary,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(id, "run_REMOTE");
+    let got = launcher
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("remote launched");
+    assert_eq!(
+        got.findings_profile,
+        Some(rupu_coverage::FindingProfile::Summary)
+    );
+    assert_eq!(got.agent, "sec");
+}
+
+/// A remote predating the field ignores unknown body keys, so the connector
+/// must not post a profile to one that does not advertise the feature.
+#[tokio::test]
+async fn launch_agent_refuses_a_profile_when_the_remote_does_not_advertise_it() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.70.0",
+            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []}
+        }));
+    });
+    let post = server.mock(|when, then| {
+        when.method("POST").path("/api/agents/sec/run");
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c
+        .launch_agent(profiled_agent_req(Some(
+            rupu_coverage::FindingProfile::Full,
+        )))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m) if m.contains("0.70.0") && m.contains("`full`")),
+        "{err:?}"
+    );
+    post.assert_hits(0);
+}
+
+#[tokio::test]
+async fn launch_agent_refuses_a_profile_when_the_remote_has_no_host_info() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(404);
+    });
+    let post = server.mock(|when, then| {
+        when.method("POST").path("/api/agents/sec/run");
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c
+        .launch_agent(profiled_agent_req(Some(
+            rupu_coverage::FindingProfile::Summary,
+        )))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err:?}");
+    post.assert_hits(0);
+}
+
+/// No profile ⇒ no pre-check: an old remote keeps working exactly as before.
+#[tokio::test]
+async fn launch_agent_without_a_profile_skips_the_feature_check() {
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(404);
+    });
+    let post = server.mock(|when, then| {
+        when.method("POST").path("/api/agents/sec/run");
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    assert_eq!(
+        c.launch_agent(profiled_agent_req(None)).await.unwrap(),
+        "run_X"
+    );
+    info.assert_hits(0);
+    post.assert();
+}

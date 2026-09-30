@@ -45,6 +45,11 @@ fn opts_for(
         decider: Arc::new(BypassDecider),
         tool_context: ToolContext {
             workspace_path: workspace.to_path_buf(),
+            // These tests exercise the lightweight record.
+            findings: Some(
+                rupu_coverage::FindingWriteOptions::default()
+                    .with_profile(rupu_coverage::FindingProfile::Summary),
+            ),
             ..Default::default()
         },
         user_message: "Assess the endpoint.".into(),
@@ -67,6 +72,7 @@ fn opts_for(
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        on_usage: None,
         // The whole point: no coverage harness.
         concerns: None,
         scope_name: None,

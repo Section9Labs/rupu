@@ -169,6 +169,7 @@ impl StepFactory for DispatchFactory {
             max_turns: 5,
             decider: Arc::new(BypassDecider),
             tool_context: ToolContext {
+                findings: None,
                 workspace_path,
                 bash_env_allowlist: Vec::new(),
                 bash_timeout_secs: 120,
@@ -205,6 +206,7 @@ impl StepFactory for DispatchFactory {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
@@ -344,6 +346,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 max_turns: 5,
                 decider: Arc::new(BypassDecider),
                 tool_context: ToolContext {
+                    findings: None,
                     workspace_path,
                     bash_env_allowlist: Vec::new(),
                     bash_timeout_secs: 120,
@@ -380,6 +383,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 step_id: String::new(),
                 on_tool_call: None,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
                 scope_name: None,

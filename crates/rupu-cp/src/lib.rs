@@ -5,6 +5,7 @@
 pub mod agent_launcher;
 pub mod api;
 pub mod codename;
+pub mod codename_legacy;
 pub mod codename_palette;
 pub mod config_write;
 pub mod definition_generator;
@@ -26,6 +27,8 @@ pub mod state;
 pub mod transcript_mutator;
 pub mod transcript_tail;
 pub mod usage;
+pub mod usage_index;
+pub mod usage_sources;
 
 use anyhow::Context as _;
 use rupu_config::PricingConfig;

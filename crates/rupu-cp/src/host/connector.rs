@@ -104,6 +104,12 @@ pub enum HostConnectorError {
     /// A non-2xx HTTP response from a remote host (status code, body).
     #[error("remote error {0}: {1}")]
     Remote(u16, String),
+    /// A 2xx reply whose complete body is not JSON — e.g. an older rupu-cp
+    /// whose SPA fallback answers an `/api/*` path it has no route for with
+    /// its HTML index. Distinct from a body that could not be READ (a
+    /// transport failure mid-response), which stays `Remote(0, _)`.
+    #[error("remote reply is not JSON: {0}")]
+    NotJson(String),
     /// A bad request or a local precondition failure (no launcher, wrong mode).
     #[error("invalid: {0}")]
     Invalid(String),
@@ -354,9 +360,10 @@ pub trait HostConnector: Send + Sync {
     /// Whether this transport's runs are mirrored into the coordinator's own
     /// `RunStore` (by `NodeMirror`) rather than living only on the remote.
     ///
-    /// `true` means run-scoped detail endpoints (`graph`, `usage-timeline`)
-    /// must build from the local mirror: the artifacts are already here, and
-    /// these transports have no generic-GET surface to proxy to anyway.
+    /// `true` means run-scoped detail endpoints (`graph`, `usage-timeline`,
+    /// `usage`) must build from the local mirror: the artifacts are already
+    /// here, and these transports have no generic-GET surface to proxy to
+    /// anyway.
     /// `false` — the default, and the HTTP connector's answer — means the
     /// run's artifacts live on the remote and must be fetched over the wire.
     fn serves_runs_from_local_mirror(&self) -> bool {
@@ -746,17 +753,43 @@ pub(crate) async fn open_run_events_tail(
         .await
         .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
 
-    let stream = source.map(|ev| {
-        let json = serde_json::to_string(&ev)
+    // Legacy (pre-codename) runs' step/unit/dispatch events get a derived
+    // name; every other event is serialized exactly as before.
+    // Classified once at attach, off the executor (`None` for a codename-era
+    // run); any per-event disk work runs on the blocking pool.
+    let namers = crate::codename_legacy::namers_for_run(Arc::clone(run_store), run_id).await;
+    let stream = source.then(move |ev| {
+        let namers = namers.clone();
+        async move {
+            let row = match &namers {
+                Some(n) => crate::codename_legacy::name_event(n, &ev).await,
+                None => None,
+            };
+            let json = match row {
+                Some(row) => serde_json::to_string(&row),
+                None => serde_json::to_string(&ev),
+            }
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let frame = format!("data: {json}\n\n");
-        Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
+            let frame = format!("data: {json}\n\n");
+            Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
+        }
     });
 
     Ok(Box::pin(stream))
 }
 
 // ── Mirror-backed observation helpers ────────────────────────────────────────
+
+/// Run a synchronous connector body — run-store reads plus the usage fold,
+/// which does file IO under a per-run `std::sync::Mutex` — on tokio's
+/// blocking pool instead of an executor thread. Only a panicked body errors.
+pub(crate) async fn blocking_host<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, HostConnectorError> + Send + 'static,
+) -> Result<T, HostConnectorError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| HostConnectorError::Invalid(format!("connector task failed: {e}")))?
+}
 
 /// List runs from the central [`RunStore`] filtered to `worker_id`.
 ///
@@ -953,6 +986,7 @@ pub(crate) mod testing {
                     HostConnectorError::NotFound(m) => HostConnectorError::NotFound(m.clone()),
                     HostConnectorError::Unauthorized => HostConnectorError::Unauthorized,
                     HostConnectorError::Remote(c, m) => HostConnectorError::Remote(*c, m.clone()),
+                    HostConnectorError::NotJson(m) => HostConnectorError::NotJson(m.clone()),
                 }),
                 None => Err(HostConnectorError::Unsupported("run netflow".into())),
             }

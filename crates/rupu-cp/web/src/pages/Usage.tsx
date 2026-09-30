@@ -67,6 +67,9 @@ import { Spinner } from '../components/ui/Spinner';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
+/** How often a preset ("ends now") window is re-derived and its data refetched. */
+const USAGE_REFRESH_MS = 30_000;
+
 function toggleInSet(set: Set<string>, key: string): Set<string> {
   const next = new Set(set);
   if (next.has(key)) next.delete(key);
@@ -87,6 +90,12 @@ export default function Usage() {
   // "custom" chip and the preset-button highlighting agree.
   const [usageWindow, setUsageWindow] = useState<UsageWindow>(() => presetWindow('30d'));
   const [isCustomWindow, setIsCustomWindow] = useState(false);
+  // Why `usageWindow` last changed: an operator action (`'user'`: preset
+  // button, drag-select, clearing the custom chip) or the periodic live
+  // refresh below (`'tick'`). A tick refetch is background work — it keeps
+  // the last good data on failure and shows no "updating" cue; a user change
+  // keeps both. Always set in the same batch as `setUsageWindow`.
+  const [windowSource, setWindowSource] = useState<'user' | 'tick'>('user');
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   // Task loading-ux: pivot switches and filter-exclusion toggles trigger a
@@ -100,6 +109,7 @@ export default function Usage() {
     setRange(r);
     setUsageWindow(presetWindow(r));
     setIsCustomWindow(false);
+    setWindowSource('user');
   }, []);
 
   // Task W3: a drag-select on the graph narrows the whole page to an
@@ -109,6 +119,7 @@ export default function Usage() {
   const handleSelectRange = useCallback((startDay: string, endDay: string) => {
     setUsageWindow(windowFromDayRange(startDay, endDay));
     setIsCustomWindow(true);
+    setWindowSource('user');
   }, []);
 
   // "custom · ×" chip's clear: return to the currently-highlighted preset's
@@ -116,6 +127,7 @@ export default function Usage() {
   const clearCustomWindow = useCallback(() => {
     setUsageWindow(presetWindow(range));
     setIsCustomWindow(false);
+    setWindowSource('user');
   }, [range]);
 
   const [data, setData] = useState<UsageResponse | null>(null);
@@ -179,13 +191,32 @@ export default function Usage() {
         if (!cancelled) setOutliers(rows);
       })
       .catch(() => {
-        if (!cancelled) setOutliers([]);
+        // A failed tick-driven refresh keeps the last good outliers.
+        if (!cancelled && windowSource !== 'tick') setOutliers([]);
       });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment on the effect above.
   }, [usageWindow.since, usageWindow.until]);
+
+  // Live refresh: a preset window ends at "now", so its `until` goes stale the
+  // moment it is built — new runs (and a still-running run's growing usage)
+  // land after it. While a preset is active, re-derive the window every 30s;
+  // the new `until` re-fires the three fetches above (and `UsageTimeline`'s
+  // own run-rows fetch) through their normal primitive-keyed effects. A
+  // drag-selected custom window is a fixed historical span and never ticks.
+  // Hidden tabs skip the tick (the next visible one catches up), and the timer
+  // is cleared on unmount / range change.
+  useEffect(() => {
+    if (isCustomWindow) return;
+    const t = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      setWindowSource('tick');
+      setUsageWindow(presetWindow(range));
+    }, USAGE_REFRESH_MS);
+    return () => window.clearInterval(t);
+  }, [range, isCustomWindow]);
 
   const filter = useMemo<TimelineFilter>(
     () => ({ excludedKeys, excludedRunIds }),
@@ -283,6 +314,7 @@ export default function Usage() {
             onRunsLoaded={setRuns}
             onSelectRange={handleSelectRange}
             pending={isPending}
+            background={windowSource === 'tick'}
             hosts={data.hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),

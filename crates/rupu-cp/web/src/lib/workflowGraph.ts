@@ -109,6 +109,12 @@ export interface StepNodeData {
   depends_on?: string[];
   split?: string[];
   joinWait?: 'all' | 'any' | { count: number };
+  // `Step.findings_profile` (workflow.rs) — the findings contract this step's
+  // agent (or an `action: findings.record` call) records under. Any step kind
+  // may carry it in the model; `validateGraph` mirrors the server's rules for
+  // where it is actually allowed (see `findingsProfileProblem`). Unset means
+  // the key is omitted (inherit: defaults -> agent frontmatter -> full).
+  findings_profile?: 'full' | 'summary';
   // Any step-level keys we don't model (e.g. `contract:`) are captured verbatim
   // here on load and spread back on emit, so unmodeled config is never dropped.
   raw_passthrough?: Record<string, unknown>;
@@ -315,6 +321,11 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   if (coe !== undefined) data.continue_on_error = coe;
   const actions = asStringArray(o.actions);
   if (actions && actions.length > 0) data.actions = actions;
+  // Only the two schema values are modelled; any other value is kept verbatim
+  // in `raw_passthrough` (see the capture loop below) so the server's own parse
+  // error surfaces instead of the editor silently dropping it.
+  const fp = asString(o.findings_profile);
+  if (fp === 'full' || fp === 'summary') data.findings_profile = fp;
   if (forEach !== undefined) data.for_each = forEach;
   const mp = asNumber(o.max_parallel);
   if (mp !== undefined) data.max_parallel = mp;
@@ -360,6 +371,9 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   const passthrough: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(o)) {
     if (!MODELLED_STEP_KEYS.has(k)) passthrough[k] = v;
+    // A findings_profile that isn't `full`/`summary` wasn't modelled above —
+    // keep it verbatim rather than dropping it.
+    else if (k === 'findings_profile' && data.findings_profile === undefined) passthrough[k] = v;
   }
   if (Object.keys(passthrough).length > 0) data.raw_passthrough = passthrough;
 
@@ -387,6 +401,7 @@ const MODELLED_STEP_KEYS = new Set<string>([
   'depends_on',
   'split',
   'join',
+  'findings_profile',
 ]);
 
 // Keys this module models on a `branch:` block. Everything else is captured
@@ -1117,6 +1132,10 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
   // survives a load->save round-trip for a hand-authored `depends_on:`.
   if (d.depends_on && d.depends_on.length > 0) o.depends_on = d.depends_on;
 
+  // `findings_profile` is kind-independent in the model (validateGraph, not
+  // the serializer, decides where it is legal) — omitted when unset.
+  if (d.findings_profile) o.findings_profile = d.findings_profile;
+
   // Approval applies to any step kind. A gate NODE ALWAYS emits an `approval:`
   // block (it is the node's identity); other kinds emit only when there's an
   // inline approval to say. The gate-only fields (auto_approve / on_timeout /
@@ -1242,6 +1261,61 @@ export function canConnect(
   return { ok: true };
 }
 
+// ── findings_profile placement rules ──────────────────────────────────────────
+// Mirror workflow.rs `validate_step_shape` (the `step.findings_profile` block)
+// and `validate_findings_profile_default`. `host:` / `distribute:` aren't
+// modelled fields, so they ride in `raw_passthrough`.
+
+/** True when the step is remote (`host:` or `distribute:` set) — workflow.rs
+ *  `step.host.is_some() || step.distribute.is_some()`. */
+export function isRemoteStep(d: StepNodeData): boolean {
+  const raw = d.raw_passthrough;
+  if (!raw) return false;
+  return (raw.host !== undefined && raw.host !== null) || (raw.distribute !== undefined && raw.distribute !== null);
+}
+
+/** True when the step runs no agent (workflow.rs `runs_no_agent`): a branch,
+ *  a standalone approval gate, a `run:` step, or a bare split/join node. */
+function runsNoAgent(d: StepNodeData): boolean {
+  if (d.kind === 'branch' || d.kind === 'approval_gate' || d.kind === 'run') return true;
+  if (d.kind === 'split' || d.kind === 'join') return true;
+  return d.raw_passthrough?.run !== undefined && d.raw_passthrough.run !== null;
+}
+
+/** The single problem (if any) with `d.findings_profile`, in the server's
+ *  check order: an `action:` step on any tool but `findings.record`, then a
+ *  step that runs no agent, then a remote step. `undefined` when the field is
+ *  unset or legal. */
+function findingsProfileProblem(d: StepNodeData): string | undefined {
+  if (d.findings_profile === undefined) return undefined;
+  if (d.kind === 'action' && d.action !== 'findings.record') {
+    return `findings_profile only applies to \`action: findings.record\` (this step calls \`${d.action ?? ''}\`); remove it`;
+  }
+  if (runsNoAgent(d)) return 'findings_profile has no effect on a step that runs no agent; remove it';
+  if (isRemoteStep(d)) {
+    return "findings_profile is not supported on a remote step; set findingsProfile in the agent's frontmatter";
+  }
+  return undefined;
+}
+
+/** Whether the server would accept `findings_profile` on this step: an
+ *  agent-running local step (linear / for_each / parallel / panel) or a local
+ *  `action: findings.record` step. */
+export function acceptsFindingsProfile(d: StepNodeData): boolean {
+  if (runsNoAgent(d) || isRemoteStep(d)) return false;
+  switch (d.kind) {
+    case 'step':
+    case 'for_each':
+    case 'parallel':
+    case 'panel':
+      return true;
+    case 'action':
+      return d.action === 'findings.record';
+    default:
+      return false;
+  }
+}
+
 // ── validateGraph ─────────────────────────────────────────────────────────────
 
 /** Return a map of nodeId → human-readable problems. Only nodes that HAVE
@@ -1296,6 +1370,9 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
     if (d.max_parallel !== undefined && d.max_parallel < 1) add(n.id, '`max_parallel` must be at least 1');
     if ((counts.get(n.id) ?? 0) > 1) add(n.id, 'duplicate step id');
 
+    const fpProblem = findingsProfileProblem(d);
+    if (fpProblem !== undefined) add(n.id, fpProblem);
+
     // A `notify` row with no `action` (backend `NotifyAction.action` is
     // required) 400s on save rather than failing validation up-front.
     if (d.approvalNotify) {
@@ -1313,6 +1390,26 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
           add(n.id, `on_reject entry ${i + 1} needs an action`);
         }
       });
+    }
+  }
+
+  // `defaults.findings_profile` is resolved per local step; a remote step never
+  // sees it (workflow.rs `validate_findings_profile_default`). The server names
+  // the first remote step; the editor attaches the problem to each one so it
+  // shows inline on every affected node.
+  const defaultsRec = g.meta.rest.defaults;
+  const defaultProfile =
+    typeof defaultsRec === 'object' && defaultsRec !== null && !Array.isArray(defaultsRec)
+      ? (defaultsRec as Record<string, unknown>).findings_profile
+      : undefined;
+  if (defaultProfile !== undefined && defaultProfile !== null) {
+    for (const n of g.nodes) {
+      if (isRemoteStep(n.data)) {
+        add(
+          n.id,
+          `defaults.findings_profile does not reach remote step ${n.id}; set findings_profile on the local steps and findingsProfile in the remote agent's frontmatter instead`,
+        );
+      }
     }
   }
 

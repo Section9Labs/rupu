@@ -148,6 +148,7 @@ export default function StepTranscriptBrowser({
                           <span data-testid="unit-identity" className="min-w-0 shrink truncate text-ink">
                             <AgentName
                               codename={u.codename}
+                              derived={u.codenameDerived}
                               agent={u.agent ?? agent}
                               provider={u.provider}
                               model={u.model}

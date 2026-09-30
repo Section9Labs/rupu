@@ -8,6 +8,8 @@ import {
   readAutoflow,
   writeAutoflow,
   contractOutputKeys,
+  readDefaults,
+  writeDefaults,
   type TriggerModel,
   type InputModel,
   type AutoflowModel,
@@ -324,6 +326,72 @@ describe('contractOutputKeys', () => {
     const rest = { contracts: { outputs: { verdict: {} } } };
     const frozen = JSON.parse(JSON.stringify(rest));
     contractOutputKeys(rest);
+    expect(rest).toEqual(frozen);
+  });
+});
+
+// ── defaults (findings_profile) ───────────────────────────────────────────────
+
+describe('readDefaults', () => {
+  it('returns {} when defaults is absent or malformed', () => {
+    expect(readDefaults({})).toEqual({});
+    expect(readDefaults({ defaults: 'nope' })).toEqual({});
+    expect(readDefaults({ defaults: ['full'] })).toEqual({});
+  });
+
+  it('reads findings_profile full / summary', () => {
+    expect(readDefaults({ defaults: { findings_profile: 'full' } })).toEqual({ findings_profile: 'full' });
+    expect(readDefaults({ defaults: { findings_profile: 'summary' } })).toEqual({ findings_profile: 'summary' });
+  });
+
+  it('ignores unknown findings_profile values and unrelated keys', () => {
+    expect(readDefaults({ defaults: { findings_profile: 'verbose' } })).toEqual({});
+    expect(readDefaults({ defaults: { findings_profile: 3 } })).toEqual({});
+    expect(readDefaults({ defaults: { continue_on_error: true } })).toEqual({});
+  });
+});
+
+describe('writeDefaults', () => {
+  it('adds findings_profile while preserving the other defaults keys', () => {
+    const out = writeDefaults({ defaults: { continue_on_error: true } }, { findings_profile: 'summary' });
+    expect(out).toEqual({ defaults: { continue_on_error: true, findings_profile: 'summary' } });
+  });
+
+  it('preserves key order inside defaults and at the top level', () => {
+    const rest = {
+      trigger: { on: 'cron', cron: '0 * * * *' },
+      defaults: { findings_profile: 'full', workspace: 'sync', continue_on_error: true },
+      inputs: {},
+    };
+    const out = writeDefaults(rest, { findings_profile: 'summary' });
+    expect(Object.keys(out)).toEqual(['trigger', 'defaults', 'inputs']);
+    expect(Object.keys(out.defaults as object)).toEqual(['findings_profile', 'workspace', 'continue_on_error']);
+    expect((out.defaults as Record<string, unknown>).findings_profile).toBe('summary');
+  });
+
+  it('removes findings_profile but keeps defaults when other keys remain', () => {
+    const out = writeDefaults({ defaults: { findings_profile: 'full', workspace: 'sync' } }, {});
+    expect(out).toEqual({ defaults: { workspace: 'sync' } });
+  });
+
+  it('deletes defaults entirely when it ends up empty', () => {
+    expect(writeDefaults({ defaults: { findings_profile: 'full' }, name_x: 1 }, {})).toEqual({ name_x: 1 });
+  });
+
+  it('is a no-op (no defaults key) when nothing is set', () => {
+    expect(writeDefaults({ inputs: {} }, {})).toEqual({ inputs: {} });
+  });
+
+  it('creates defaults (appended last) when absent', () => {
+    const out = writeDefaults({ inputs: {} }, { findings_profile: 'full' });
+    expect(Object.keys(out)).toEqual(['inputs', 'defaults']);
+    expect(out.defaults).toEqual({ findings_profile: 'full' });
+  });
+
+  it('does not mutate its input', () => {
+    const rest = { defaults: { continue_on_error: true, findings_profile: 'full' } };
+    const frozen = JSON.parse(JSON.stringify(rest));
+    writeDefaults(rest, {});
     expect(rest).toEqual(frozen);
   });
 });

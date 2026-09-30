@@ -125,6 +125,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
                 <AgentIdentity
                   className="flex-1"
                   codename={u.codename}
+                  derived={u.codenameDerived}
                   agent={u.agent}
                   provider={u.provider}
                   model={u.model}

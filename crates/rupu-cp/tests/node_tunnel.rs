@@ -233,6 +233,7 @@ fn mirror_create_append_finish_round_trip() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
 
     let run_id = "run_NODEMIRRTEST001";
@@ -287,6 +288,207 @@ fn mirror_create_append_finish_round_trip() {
     );
 }
 
+/// A node's usage ledger lines land verbatim in the run's `usage.jsonl`
+/// (`RunStore::usage_ledger_path`) — the file the CP's live usage fold reads.
+#[test]
+fn mirror_usage_lines_land_in_the_run_usage_ledger() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        findings_profile: None,
+        kind: RunSpecKind::Workflow,
+        name: "smoke-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRUSAGE01";
+    let node_id = "node-42";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    let row1 = r#"{"id":"01J0000000000000000000USG1","step_id":"s1","input_tokens":10}"#;
+    let row2 = r#"{"id":"01J0000000000000000000USG2","step_id":"s2","input_tokens":20}"#;
+    mirror
+        .append(run_id, node_id, ArtifactFile::Usage, row1)
+        .expect("append usage 1");
+    mirror
+        .append(run_id, node_id, ArtifactFile::Usage, row2)
+        .expect("append usage 2");
+
+    let path = store.usage_ledger_path(run_id);
+    assert!(path.ends_with(format!("{run_id}/usage.jsonl")));
+    let content = std::fs::read_to_string(&path).expect("read usage.jsonl");
+    assert_eq!(content.lines().collect::<Vec<_>>(), vec![row1, row2]);
+
+    // Ownership is still enforced for the new artifact kind.
+    let err = mirror
+        .append(run_id, "intruder", ArtifactFile::Usage, row1)
+        .expect_err("a different node must not append to this run's ledger");
+    assert!(
+        matches!(err, rupu_cp::node::mirror::MirrorError::WrongNode(_)),
+        "expected WrongNode, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().lines().count(),
+        2,
+        "rejected append must not touch the ledger"
+    );
+}
+
+/// `replace_usage_ledger` swaps the mirrored ledger wholesale by rename: the
+/// content is exactly the given body, the inode changes, no temp file is left,
+/// and node ownership / run-id validation still apply.
+#[cfg(unix)]
+#[test]
+fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
+    use rupu_cp::node::mirror::{MirrorError, NodeMirror};
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::MetadataExt as _;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+    let spec = RunSpec {
+        findings_profile: None,
+        kind: RunSpecKind::Workflow,
+        name: "smoke-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRUSAGE02";
+    let node_id = "node-42";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    // Replacing works even when no ledger exists yet.
+    let row_a = r#"{"id":"01J0000000000000000000USGA"}"#;
+    let row_b = r#"{"id":"01J0000000000000000000USGB"}"#;
+    mirror
+        .replace_usage_ledger(run_id, node_id, &format!("{row_a}\n"))
+        .expect("replace into a missing ledger");
+    let path = store.usage_ledger_path(run_id);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{row_a}\n")
+    );
+
+    let inode_before = std::fs::metadata(&path).unwrap().ino();
+    mirror
+        .replace_usage_ledger(run_id, node_id, &format!("{row_a}\n{row_b}\n"))
+        .expect("replace");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{row_a}\n{row_b}\n")
+    );
+    assert_ne!(
+        std::fs::metadata(&path).unwrap().ino(),
+        inode_before,
+        "a replace is a rename over the old file"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+    // Appends after a replace continue the new file.
+    mirror
+        .append(
+            run_id,
+            node_id,
+            ArtifactFile::Usage,
+            r#"{"id":"01J0000000000000000000USGC"}"#,
+        )
+        .expect("append after replace");
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+
+    // Ownership and run-id validation are enforced before any I/O.
+    assert!(matches!(
+        mirror.replace_usage_ledger(run_id, "intruder", "x\n"),
+        Err(MirrorError::WrongNode(_))
+    ));
+    assert!(matches!(
+        mirror.replace_usage_ledger("../evil", node_id, "x\n"),
+        Err(MirrorError::InvalidRunId(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().lines().count(),
+        3,
+        "rejected replaces must not touch the ledger"
+    );
+}
+
+/// A failed replace leaves no temp file behind and the existing ledger path
+/// untouched. The rename is made to fail by occupying the ledger path with a
+/// non-empty directory; the write-failure path shares the same cleanup branch.
+#[cfg(unix)]
+#[test]
+fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
+    use rupu_cp::node::mirror::{MirrorError, NodeMirror};
+    use rupu_cp::node::protocol::{RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+    let spec = RunSpec {
+        findings_profile: None,
+        kind: RunSpecKind::Workflow,
+        name: "smoke-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRUSAGE03";
+    let node_id = "node-43";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+    let path = store.usage_ledger_path(run_id);
+    std::fs::create_dir_all(path.join("occupied")).unwrap();
+
+    let err = mirror
+        .replace_usage_ledger(run_id, node_id, "{\"id\":\"01J0000000000000000000USGD\"}\n")
+        .expect_err("a file cannot be renamed over a non-empty directory");
+    assert!(
+        matches!(err, MirrorError::Io(_)),
+        "expected Io, got {err:?}"
+    );
+    assert!(
+        path.join("occupied").is_dir(),
+        "the ledger path is untouched"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
+
 /// After `create_run` + `append(RunJson, <node record with bogus paths>)`,
 /// the loaded record must carry the CP-side `transcript_dir` and
 /// `workspace_path` (not the node's paths), while run-state fields
@@ -311,6 +513,7 @@ fn mirror_run_json_repins_cp_local_paths() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
 
     let run_id = "run_REPINTEST001";
@@ -411,6 +614,7 @@ fn mirror_run_json_nulls_resume_fields() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
 
     let run_id = "run_RESUMENULLTEST01";
@@ -484,6 +688,7 @@ fn mirror_run_json_preserves_final_output() {
         prompt: Some("do the thing".to_string()),
         mode: None,
         target: None,
+        findings_profile: None,
     };
 
     let run_id = "run_FINALOUTPUTTEST1";
@@ -581,6 +786,7 @@ fn mirror_traversal_run_id_rejected_before_io() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
     for bad in &[
         "run_../escape",
@@ -623,6 +829,7 @@ fn mirror_wrong_node_id_rejected() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
 
     // Run created by owner_node.
@@ -686,6 +893,7 @@ fn mirror_legitimate_owner_can_append_and_finish() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
 
     mirror
@@ -847,7 +1055,7 @@ async fn ws_node_connect_exempt_from_bearer() {
         .expect("connection closed before Welcome");
 
     assert!(
-        matches!(response, Frame::Welcome {}),
+        matches!(response, Frame::Welcome { .. }),
         "expected Welcome, got {response:?}"
     );
 
@@ -856,6 +1064,50 @@ async fn ws_node_connect_exempt_from_bearer() {
         registry.is_online(&node_id),
         "node should be online in the registry after bearer-exempt WS Hello"
     );
+}
+
+/// The capabilities a node sends in `Hello` are recorded on its live
+/// connection — what `TunnelHostConnector` consults before a launch that
+/// needs one.
+#[tokio::test]
+async fn ws_hello_capabilities_are_recorded_on_the_connection() {
+    use rupu_workspace::{enroll_node, HostStore};
+    use tempfile::tempdir;
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempdir().unwrap();
+    let host_store = HostStore {
+        root: dir.path().join("hosts"),
+    };
+    let (host, token) = enroll_node(&host_store, "test-node-caps").unwrap();
+    let nid = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport"),
+    };
+    let (addr, registry) = spawn_cp_with_state(dir.path()).await;
+    let (mut ws, _) = connect_async(format!("ws://{addr}/api/node/connect"))
+        .await
+        .expect("WS connect failed");
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: nid.clone(),
+            auth: rupu_cp::node::Auth::Token { token },
+            rupu_version: "9.9.9".to_string(),
+            capabilities: rupu_cp::node::protocol::node_capabilities(),
+        },
+    )
+    .await;
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut ws))
+        .await
+        .expect("timed out waiting for Welcome")
+        .expect("connection closed before Welcome");
+    assert!(matches!(welcome, Frame::Welcome { .. }), "{welcome:?}");
+
+    let conn = registry.get(&nid).expect("node registered");
+    assert!(conn.supports(rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE));
+    assert!(!conn.supports("something.else"));
+    assert_eq!(conn.rupu_version(), Some("9.9.9"));
 }
 
 /// A valid `Hello` with an enrolled token → CP replies `Welcome` and node is online.
@@ -905,8 +1157,17 @@ async fn ws_valid_hello_receives_welcome_and_is_online() {
         .expect("connection closed before Welcome");
 
     assert!(
-        matches!(response, Frame::Welcome {}),
+        matches!(response, Frame::Welcome { .. }),
         "expected Welcome, got {response:?}"
+    );
+    // The CP mirrors `ArtifactFile::Usage`, so it must say so — a node only
+    // forwards its usage ledger to a CP that advertised this.
+    assert!(
+        matches!(
+            &response,
+            Frame::Welcome { capabilities } if capabilities.iter().any(|c| c == rupu_cp::node::protocol::CAP_USAGE_LEDGER)
+        ),
+        "Welcome must advertise usage_ledger, got {response:?}"
     );
 
     // Node must be online in the registry.
@@ -940,6 +1201,7 @@ mod tunnel_connector {
             prompt: None,
             mode: None,
             target: None,
+            findings_profile: None,
         }
     }
 
@@ -962,6 +1224,7 @@ mod tunnel_connector {
             target: None,
             working_dir: None,
             run_id: None,
+            findings_profile: None,
         }
     }
 
@@ -1301,6 +1564,86 @@ mod tunnel_connector {
             }
             other => panic!("expected Frame::Run, got {other:?}"),
         }
+    }
+
+    /// `setup`, but the node registered through the Hello path with
+    /// `capabilities`.
+    fn setup_with_capabilities(
+        node_id: &str,
+        dir: &std::path::Path,
+        capabilities: Vec<String>,
+    ) -> (TunnelHostConnector, mpsc::Receiver<Frame>, Arc<RunStore>) {
+        let (tx, rx) = mpsc::channel(16);
+        let run_store = Arc::new(RunStore::new(dir.join("runs")));
+        let registry = Arc::new(NodeRegistry::new());
+        registry.register_with_hello(node_id, tx, capabilities, Some("0.0.1-test".into()));
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let conn = TunnelHostConnector::new(
+            node_id,
+            registry,
+            mirror,
+            Arc::clone(&run_store),
+            rupu_config::PricingConfig::default(),
+        );
+        (conn, rx, run_store)
+    }
+
+    /// A placed unit's findings profile reaches the node in the Run frame.
+    #[tokio::test]
+    async fn launch_agent_carries_the_findings_profile_to_a_capable_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _run_store) = setup_with_capabilities(
+            "node-fp-1",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let mut req = make_agent_req("sec");
+        req.findings_profile = Some(rupu_coverage::FindingProfile::Summary);
+        let run_id = conn.launch_agent(req).await.expect("launch_agent");
+
+        match rx.recv().await.expect("should receive a frame") {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id);
+                assert_eq!(
+                    spec.findings_profile,
+                    Some(rupu_coverage::FindingProfile::Summary)
+                );
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+
+    /// A node that never advertised support (an older `rupu node`) would drop
+    /// the field and run under the agent's own profile — refuse instead, and
+    /// leave no mirror run or frame behind.
+    #[tokio::test]
+    async fn launch_agent_refuses_a_profile_for_a_node_without_the_capability() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, run_store) = setup("node-fp-old", dir.path());
+        let mut req = make_agent_req("sec");
+        req.findings_profile = Some(rupu_coverage::FindingProfile::Full);
+
+        let err = conn.launch_agent(req).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m) if m.contains("node-fp-old")),
+            "{err:?}"
+        );
+        assert!(
+            run_store.list().unwrap().is_empty(),
+            "no orphaned mirror run"
+        );
+        assert!(rx.try_recv().is_err(), "no frame sent");
+    }
+
+    /// Without a profile an old node is fine — nothing changes for it.
+    #[tokio::test]
+    async fn launch_agent_without_a_profile_still_works_on_an_old_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _run_store) = setup("node-fp-old-2", dir.path());
+        conn.launch_agent(make_agent_req("sec"))
+            .await
+            .expect("launch_agent");
+        assert!(matches!(rx.recv().await, Some(Frame::Run { .. })));
     }
 }
 
@@ -1651,7 +1994,7 @@ async fn tunnel_e2e_dispatch_mirror_observe_cancel() {
         .expect("timed out waiting for Welcome")
         .expect("WS closed before Welcome");
     assert!(
-        matches!(welcome, Frame::Welcome {}),
+        matches!(welcome, Frame::Welcome { .. }),
         "expected Welcome, got {welcome:?}"
     );
 
@@ -1993,7 +2336,7 @@ async fn e2e_approve_over_tunnel() {
         .expect("timed out waiting for Welcome")
         .expect("WS closed before Welcome");
     assert!(
-        matches!(welcome, Frame::Welcome {}),
+        matches!(welcome, Frame::Welcome { .. }),
         "expected Welcome, got {welcome:?}"
     );
 
@@ -2254,7 +2597,7 @@ async fn e2e_reject_over_tunnel() {
         .expect("timed out waiting for Welcome")
         .expect("WS closed before Welcome");
     assert!(
-        matches!(welcome, Frame::Welcome {}),
+        matches!(welcome, Frame::Welcome { .. }),
         "expected Welcome, got {welcome:?}"
     );
 
@@ -2466,6 +2809,7 @@ fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
     let run_id = "run_NODEMIRRTRANS01";
     let node_id = "node-42";
@@ -2536,6 +2880,7 @@ fn mirror_reset_transcript_makes_replay_idempotent() {
         prompt: None,
         mode: None,
         target: None,
+        findings_profile: None,
     };
     let run_id = "run_NODEMIRRTRANS02";
     let node_id = "node-42";

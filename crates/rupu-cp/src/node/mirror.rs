@@ -151,6 +151,9 @@ impl NodeMirror {
     /// - [`ArtifactFile::Events`] → append to `events.jsonl`.
     /// - [`ArtifactFile::StepResults`] → append to `step_results.jsonl`.
     /// - [`ArtifactFile::UnitCheckpoints`] → append to `unit_checkpoints.jsonl`.
+    /// - [`ArtifactFile::Usage`] → append to `usage.jsonl` (the run's usage
+    ///   ledger; the CP fold dedups rows by their ULID `id`, so a replayed
+    ///   line is harmless).
     /// - [`ArtifactFile::RunJson`] → parse `line` as [`RunRecord`], reapply
     ///   `id` and `worker_id`, then overwrite `run.json` via
     ///   [`RunStore::update`].
@@ -195,6 +198,11 @@ impl NodeMirror {
                     .root
                     .join(run_id)
                     .join("unit_checkpoints.jsonl");
+                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+                writeln!(f, "{line}")?;
+            }
+            ArtifactFile::Usage => {
+                let path = self.run_store.usage_ledger_path(run_id);
                 let mut f = OpenOptions::new().create(true).append(true).open(path)?;
                 writeln!(f, "{line}")?;
             }
@@ -293,6 +301,43 @@ impl NodeMirror {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Atomically REPLACE the mirrored usage ledger for `run_id` with `content`.
+    ///
+    /// Used by the SSH tail pump's terminal pull: a one-shot `cat` of the
+    /// remote `usage.jsonl` is the authoritative ledger, whereas the tailed
+    /// copy can miss rows written in the last poll interval before the run
+    /// went terminal. The content is written to a temp file in the run
+    /// directory and renamed over [`RunStore::usage_ledger_path`], so a
+    /// reader never sees a torn ledger and the file gets a fresh inode (the
+    /// live usage fold treats that as a reset and rebuilds, deduping rows by
+    /// their ULID `id`). Ownership rules match [`NodeMirror::append`].
+    ///
+    /// # Errors
+    /// [`MirrorError::InvalidRunId`], [`MirrorError::Store`],
+    /// [`MirrorError::WrongNode`] as for `append`; [`MirrorError::Io`] when
+    /// the temp file cannot be written or renamed. Either way the (possibly
+    /// partly written) temp file is removed and the existing ledger is left
+    /// untouched.
+    pub fn replace_usage_ledger(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        content: &str,
+    ) -> Result<(), MirrorError> {
+        validate_run_id(run_id)?;
+        let existing = self.run_store.load(run_id)?;
+        if existing.worker_id.as_deref() != Some(node_id) {
+            return Err(MirrorError::WrongNode(run_id.to_string()));
+        }
+        let path = self.run_store.usage_ledger_path(run_id);
+        let tmp = path.with_file_name(format!("usage.jsonl.{}.tmp", ulid::Ulid::new()));
+        if let Err(e) = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
