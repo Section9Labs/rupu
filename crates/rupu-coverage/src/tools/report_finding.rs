@@ -99,13 +99,39 @@ pub fn report_finding(
                 .into_iter()
                 .map(|f| f.id)
                 .collect();
-            crate::report::validate_report(
-                &report,
-                &ValidateCtx {
-                    known_finding_ids: &known,
-                    max_bytes: opts.report_max_bytes,
-                },
-            )?;
+            // `verification` is part of a stored record, but it is the
+            // verdict of a later verification run: the agent that wrote the
+            // finding cannot confirm its own work. Reported alongside every
+            // other problem so the agent still fixes them all in one retry.
+            let mut problems = Vec::new();
+            if report.verification.is_some() {
+                problems.push(crate::report::FieldError {
+                    path: "report.verification".into(),
+                    message: "set by verification runs, not by the reporting agent; omit it".into(),
+                });
+            }
+            if let Err(crate::report::ReportValidationError(errors)) =
+                crate::report::validate_report(
+                    &report,
+                    &ValidateCtx {
+                        known_finding_ids: &known,
+                        max_bytes: opts.report_max_bytes,
+                    },
+                )
+            {
+                problems.extend(errors);
+            }
+            if !problems.is_empty() {
+                return Err(ReportFindingError::Report(
+                    crate::report::ReportValidationError(problems),
+                ));
+            }
+            // A claim's hash is rupu's record of the file at write time, not
+            // something the agent can assert: drop whatever it sent, then
+            // hash what is actually there (or leave it unset).
+            for claim in &mut report.evidence {
+                claim.sha256 = None;
+            }
             if !report.artifacts.is_empty() {
                 let store = opts
                     .artifact_root
@@ -177,8 +203,8 @@ pub fn report_finding(
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a
 /// viewer can later flag a claim whose code has changed. Claims whose file
-/// is not in the workspace (binary targets, other trees) keep whatever the
-/// agent supplied.
+/// is not in the workspace (binary targets, other trees) are left unhashed;
+/// the caller has already cleared anything the agent supplied.
 fn hash_claim_files(workspace: &std::path::Path, report: &mut crate::report::FindingReport) {
     for claim in &mut report.evidence {
         if let Some(file) = &claim.file {
@@ -594,6 +620,56 @@ mod tests {
             Some(crate::report::ArtifactStorage::Copied)
         );
         assert_eq!(rep.evidence[0].sha256.as_ref().map(String::len), Some(64));
+    }
+
+    #[test]
+    fn agent_supplied_verification_is_rejected_with_the_other_problems() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut r = fixture_report();
+        r.verification = Some(crate::report::Verification {
+            status: crate::report::VerificationStatus::Confirmed,
+            by_run: None,
+            notes: None,
+        });
+        r.root_cause = String::new();
+        let err = report_finding(&paths, attribution(), full_input(r), &full_opts(ws.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.verification"), "{err}");
+        assert!(err.contains("set by verification runs"), "{err}");
+        assert!(err.contains("report.root_cause"), "{err}");
+        assert!(!paths.findings.exists(), "nothing written on rejection");
+    }
+
+    #[test]
+    fn agent_supplied_claim_hashes_are_never_stored() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/routes")).unwrap();
+        std::fs::write(ws.path().join("src/routes/notes.rs"), "fn get_note() {}\n").unwrap();
+        let mut r = fixture_report();
+        let forged = "0".repeat(64);
+        // Claim 0's file exists: rupu's hash replaces the forged one.
+        r.evidence[0].file = Some("src/routes/notes.rs".into());
+        r.evidence[0].sha256 = Some(forged.clone());
+        // Claim 1's file is not in the workspace: the forged hash is dropped.
+        let mut other = r.evidence[0].clone();
+        other.file = Some("not/here.rs".into());
+        r.evidence.push(other);
+        let paths = CoveragePaths::new(ws.path(), "t");
+        report_finding(
+            &paths,
+            attribution(),
+            full_input(r),
+            &full_opts(store.path()),
+        )
+        .unwrap();
+        let rep = only_record(&paths).report.unwrap();
+        let h0 = rep.evidence[0].sha256.clone().expect("hashed by rupu");
+        assert_ne!(h0, forged);
+        assert_eq!(h0.len(), 64);
+        assert_eq!(rep.evidence[1].sha256, None);
     }
 
     #[test]

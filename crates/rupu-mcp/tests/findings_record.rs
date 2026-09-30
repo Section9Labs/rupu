@@ -292,3 +292,32 @@ async fn summary_profile_refuses_a_report() {
         .expect_err("report under summary must be refused");
     assert!(err.to_string().contains("summary profile"), "{err}");
 }
+
+#[tokio::test]
+async fn full_profile_refuses_an_agent_supplied_verification() {
+    // Verification is the verdict of a later verification run; a step cannot
+    // confirm the finding it is recording.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let mut report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    report["verification"] = serde_json::json!({ "status": "confirmed" });
+    let err = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("self-verification must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("report.verification"), "{msg}");
+    assert!(msg.contains("set by verification runs"), "{msg}");
+    let paths = rupu_coverage::CoveragePaths::new(
+        tmp.path(),
+        &rupu_coverage::target_id(tmp.path(), "chimera-campaign"),
+    );
+    assert!(!paths.findings.exists(), "nothing written on rejection");
+}

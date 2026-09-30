@@ -280,7 +280,7 @@ findingsProfile: summary   # lightweight findings; set to full for complete repo
 ---
 ```
 
-See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty), `artifacts`, and the optional `verification`.
+See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty) and `artifacts`. `verification` is set by verification runs, not by the reporting agent, and a call that supplies it is rejected.
 
 ### `maxTokens`
 

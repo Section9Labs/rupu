@@ -130,8 +130,8 @@ back as `summary`.
 
 ### What `full` requires
 
-Every field of the report is required except `cwe` (it may be an empty list),
-`artifacts`, and `verification`. The rules below are enforced at write time; a
+Every field of the report is required except `cwe` (it may be an empty list)
+and `artifacts`. The rules below are enforced at write time; a
 rejected call returns **every** problem at once, each with its field path, so
 the agent can fix them all in one retry. (A structurally malformed JSON argument
 surfaces as a single parse error instead.) When a full-profile run can record
@@ -139,10 +139,20 @@ findings (the agent has a `concerns:` block or `report_finding` in `tools:`),
 finding-writing guidance is also appended to its system prompt, so the agent
 needs no external reporting-standard file.
 
-`artifacts` is described under [Artifacts](#artifacts) below. `verification` is
-optional and is normally left to rupu or a verifier rather than the agent that
-wrote the finding: `{status: unverified|confirmed|disputed|inconclusive,
-by_run?, notes?}`.
+`artifacts` is described under [Artifacts](#artifacts) below.
+
+Some fields of a stored report are set by rupu, never by the reporting agent,
+and are left out of the schema the agent is shown:
+
+- `verification` (`{status: unverified|confirmed|disputed|inconclusive,
+  by_run?, notes?}`) is set by verification runs, not by the agent that wrote
+  the finding. A `report_finding` / `findings.record` call that supplies it is
+  rejected at `report.verification`.
+- Each evidence claim's `sha256` is the hash rupu takes of the claim's `file`
+  at write time. Anything the agent sends there is discarded; a claim whose
+  file is not in the workspace is stored without a hash.
+- An artifact's `sha256`, `size`, `kind`, `stored`, and `host` are filled in
+  when rupu stores it; the agent supplies only `path`.
 
 - Required strings must be non-empty after trimming.
 - Ratings (`impact`, `risk_rating`, `risk_factor`) are `Low`/`Medium`/`High`/`Critical`;
