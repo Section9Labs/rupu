@@ -525,6 +525,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = build_chat_request_body(&request, true);
@@ -561,6 +562,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = build_chat_request_body(&request, false);
@@ -588,6 +590,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = build_chat_request_body(&request, false);
@@ -612,6 +615,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = build_chat_request_body(&request, false);
@@ -838,6 +842,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = build_chat_request_body(&request, false);

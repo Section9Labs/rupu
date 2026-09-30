@@ -30,6 +30,8 @@ function base(over: Partial<Detail>): Detail {
     evidence: { rationale: 'The lookup ignores the owner id.' },
     declared_by: { run_id: 'run_42', model: 'claude-x', surface: 'agent' },
     declared_at: '2026-08-01T00:00:00Z',
+    codename: 'amber-delta/heron',
+    codename_derived: false,
     evidence_status: [],
     ...over,
   };

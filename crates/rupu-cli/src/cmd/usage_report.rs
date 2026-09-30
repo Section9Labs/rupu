@@ -1,10 +1,10 @@
 use chrono::{DateTime, Utc};
-use rupu_orchestrator::{RunRecord, RunStore, StepResultRecord};
+use rupu_orchestrator::{RunRecord, RunStore};
 use rupu_runtime::RunEnvelope;
 use rupu_transcript::{JsonlReader, TimeWindow, UsageRow};
 use rupu_workspace::WorkspaceStore;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -32,6 +32,8 @@ pub struct UsageFact {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    /// Prompt-cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +51,7 @@ pub struct UsageRun {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
     pub providers: Vec<String>,
     pub models: Vec<String>,
     pub agents: Vec<String>,
@@ -59,6 +62,7 @@ pub struct UsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
     pub runs: u64,
 }
 
@@ -180,23 +184,27 @@ impl UsageDataset {
     ) -> anyhow::Result<Self> {
         let run_store = RunStore::new(global_root.join("runs"));
         let workflow_runs = run_store.list()?;
-        let referenced_paths = referenced_transcript_paths(&run_store, &workflow_runs);
+        let claimed = claimed_transcript_paths(&run_store, &workflow_runs);
 
         let mut facts = Vec::new();
 
         for run in workflow_runs {
-            let metadata = WorkflowUsageMetadata::from_run_record(&run, &run_store);
-            let transcript_paths = transcript_paths_for_run(&run_store, &run.id);
-            let rows = rupu_transcript::aggregate(&transcript_paths, TimeWindow::default());
-            if window_contains(window, run.started_at) {
-                facts.extend(rows.iter().map(|row| metadata.to_fact(row)));
+            if !window_contains(window, run.started_at) {
+                continue;
             }
+            let metadata = WorkflowUsageMetadata::from_run_record(&run, &run_store);
+            // The run's usage fold: every ledger row (units, panelists,
+            // dispatched sub-agents, running steps) plus a fold of any
+            // known transcript without rows — the control plane's
+            // definition, not just the completed steps' transcripts.
+            let usage = rupu_cp::usage::run_usage(&run_store, &run.id);
+            facts.extend(usage.rows.iter().map(|row| metadata.to_fact(row)));
         }
 
         let standalone_paths = standalone_transcript_paths(global_root, project_root);
 
         for path in standalone_paths {
-            if referenced_paths.contains(&path) {
+            if is_claimed(&claimed, &path) {
                 continue;
             }
             let Ok(summary) = JsonlReader::summary(&path) else {
@@ -224,6 +232,7 @@ impl UsageDataset {
             input_tokens: self.facts.iter().map(|fact| fact.input_tokens).sum(),
             output_tokens: self.facts.iter().map(|fact| fact.output_tokens).sum(),
             cached_tokens: self.facts.iter().map(|fact| fact.cached_tokens).sum(),
+            cache_write_tokens: self.facts.iter().map(|fact| fact.cache_write_tokens).sum(),
             runs: self
                 .facts
                 .iter()
@@ -253,7 +262,7 @@ pub fn backfill_standalone_metadata(
 ) -> anyhow::Result<StandaloneMetadataBackfillStats> {
     let run_store = RunStore::new(global_root.join("runs"));
     let workflow_runs = run_store.list()?;
-    let referenced_paths = referenced_transcript_paths(&run_store, &workflow_runs);
+    let claimed = claimed_transcript_paths(&run_store, &workflow_runs);
     let workspace_store = WorkspaceStore {
         root: global_root.join("workspaces"),
     };
@@ -261,7 +270,7 @@ pub fn backfill_standalone_metadata(
 
     for path in standalone_transcript_paths(global_root, project_root) {
         stats.scanned += 1;
-        if referenced_paths.contains(&path) {
+        if is_claimed(&claimed, &path) {
             stats.referenced_workflow_transcripts += 1;
             continue;
         }
@@ -302,6 +311,7 @@ fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
         input_tokens: u64,
         output_tokens: u64,
         cached_tokens: u64,
+        cache_write_tokens: u64,
         providers: BTreeSet<String>,
         models: BTreeSet<String>,
         agents: BTreeSet<String>,
@@ -327,6 +337,7 @@ fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
         entry.input_tokens += fact.input_tokens;
         entry.output_tokens += fact.output_tokens;
         entry.cached_tokens += fact.cached_tokens;
+        entry.cache_write_tokens += fact.cache_write_tokens;
         entry.providers.insert(fact.provider.clone());
         entry.models.insert(fact.model.clone());
         entry.agents.insert(fact.agent.clone());
@@ -349,6 +360,7 @@ fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
                 input_tokens: entry.input_tokens,
                 output_tokens: entry.output_tokens,
                 cached_tokens: entry.cached_tokens,
+                cache_write_tokens: entry.cache_write_tokens,
                 providers: entry.providers.into_iter().collect(),
                 models: entry.models.into_iter().collect(),
                 agents: entry.agents.into_iter().collect(),
@@ -357,32 +369,18 @@ fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
         .collect()
 }
 
-fn referenced_transcript_paths(store: &RunStore, runs: &[RunRecord]) -> BTreeSet<PathBuf> {
-    let mut paths = BTreeSet::new();
-    for run in runs {
-        for path in transcript_paths_for_run(store, &run.id) {
-            paths.insert(canonicalize_path(path));
-        }
-    }
-    paths
+/// Every transcript a workflow run (listed or archived) claims — its
+/// resolved known set (step results, live events, dispatched sub-runs)
+/// plus its ledger rows' transcripts — so the standalone scan never counts
+/// a run's transcript a second time. The control plane's own rule
+/// ([`rupu_cp::usage_sources::claimed_transcripts`]).
+fn claimed_transcript_paths(store: &RunStore, runs: &[RunRecord]) -> HashSet<PathBuf> {
+    rupu_cp::usage_sources::claimed_transcripts(store, runs)
 }
 
-fn transcript_paths_for_run(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
-    let Ok(records) = store.read_step_results(run_id) else {
-        return Vec::new();
-    };
-    transcript_paths_from_records(&records)
-}
-
-fn transcript_paths_from_records(records: &[StepResultRecord]) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for record in records {
-        paths.push(record.transcript_path.clone());
-        for item in &record.items {
-            paths.push(item.transcript_path.clone());
-        }
-    }
-    paths
+/// `path` (as given, or canonicalized) is a transcript a workflow run claims.
+fn is_claimed(claimed: &HashSet<PathBuf>, path: &Path) -> bool {
+    claimed.contains(path) || claimed.contains(&canonicalize_path(path.to_path_buf()))
 }
 
 fn collect_jsonl(dir: &Path, out: &mut BTreeSet<PathBuf>) {
@@ -494,6 +492,7 @@ impl WorkflowUsageMetadata {
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
             cached_tokens: row.cached_tokens,
+            cache_write_tokens: row.cache_write_tokens,
         }
     }
 }
@@ -548,6 +547,7 @@ impl StandaloneUsageMetadata {
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
             cached_tokens: row.cached_tokens,
+            cache_write_tokens: row.cache_write_tokens,
         }
     }
 }
@@ -698,6 +698,8 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
+                purpose: None,
             })
             .unwrap();
         writer
@@ -976,6 +978,105 @@ mod tests {
         assert_eq!(dataset.facts[0].provider, "openai");
         assert_eq!(dataset.facts[0].input_tokens, 30);
         assert_eq!(dataset.facts[0].output_tokens, 10);
+    }
+
+    #[test]
+    fn dataset_counts_a_runs_ledger_once_and_never_as_standalone_spend() {
+        use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, UsageLedger, LEDGER_VERSION};
+        // A still-running workflow run: no step has completed, so
+        // `step_results.jsonl` is empty — but its step agent and a sub-agent
+        // it dispatched both billed calls, recorded in the usage ledger.
+        // Their transcripts sit in the global transcripts dir, which the
+        // standalone scan also walks.
+        let temp = tempfile::tempdir().unwrap();
+        let global = temp.path().join(".rupu");
+        let transcripts = global.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let started_at = Utc::now();
+        let step_tx = write_usage_transcript(
+            &transcripts,
+            "run_step_agent",
+            "implementer",
+            "openai",
+            "gpt-5",
+            started_at,
+            40,
+            8,
+        );
+        let child_tx = write_usage_transcript(
+            &transcripts,
+            "run_child_agent",
+            "helper",
+            "openai",
+            "gpt-5",
+            started_at,
+            20,
+            2,
+        );
+
+        let store = RunStore::new(global.join("runs"));
+        let mut record = sample_run_record("run_live_01", started_at, &transcripts);
+        record.status = RunStatus::Running;
+        store
+            .create(record, "name: phase-delivery-cycle\nsteps: []\n")
+            .unwrap();
+        let ledger = UsageLedger::for_run(&store, "run_live_01");
+        for (id, step, agent_run, parent, transcript, agent, input, output) in [
+            (
+                "l1",
+                Some("implement"),
+                "run_step_agent",
+                None,
+                &step_tx,
+                "implementer",
+                40,
+                8,
+            ),
+            (
+                "l2",
+                None,
+                "run_child_agent",
+                Some("run_step_agent"),
+                &child_tx,
+                "helper",
+                20,
+                2,
+            ),
+        ] {
+            ledger.append(&LedgerRow {
+                v: LEDGER_VERSION,
+                id: id.into(),
+                at: started_at,
+                kind: LedgerKind::Turn,
+                step_id: step.map(str::to_string),
+                unit_index: None,
+                unit_key: None,
+                agent_run_id: agent_run.into(),
+                parent_agent_run_id: parent.map(str::to_string),
+                transcript: transcript.clone(),
+                agent: agent.into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                input_tokens: input,
+                output_tokens: output,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            });
+        }
+
+        let dataset = UsageDataset::load(&global, None, TimeWindow::default()).unwrap();
+        assert_eq!(dataset.runs.len(), 1, "{:?}", dataset.runs);
+        let run = &dataset.runs[0];
+        assert_eq!(run.run_id, "run_live_01");
+        assert_eq!(run.source, UsageSource::WorkflowRun);
+        assert_eq!((run.input_tokens, run.output_tokens), (60, 10));
+        assert!(
+            dataset
+                .facts
+                .iter()
+                .all(|f| f.source == UsageSource::WorkflowRun),
+            "a ledger transcript must not also count as a standalone run"
+        );
     }
 
     #[test]

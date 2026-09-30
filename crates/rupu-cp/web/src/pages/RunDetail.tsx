@@ -53,6 +53,7 @@ import {
   type SubrunIdentityMap,
 } from '../components/transcript/subrunIdentity';
 import { parseCodename } from '../lib/codename';
+import { useRunUsage } from '../lib/runUsage';
 
 const MAX_EVENTS = 2000;
 
@@ -466,8 +467,6 @@ export default function RunDetail() {
     () => new Map(runId && runCodename ? [[runId, runCodename]] : []),
     [runId, runCodename],
   );
-  // Usage for the header row from the graph.
-  const displayUsage = graph?.usage;
 
   // Live awaiting info: prefer a live awaiting node from the model, else the
   // persisted record.
@@ -543,6 +542,23 @@ export default function RunDetail() {
 
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
+
+  // Live usage (spec 2026-09-29 §7): polls GET /api/runs/:id/usage every 2s
+  // while the run is live (and once more when it turns terminal). `runKnown`
+  // gates liveness so a not-yet-loaded graph doesn't read as a running run,
+  // and says the run exists: a freshly launched run 404s here until its
+  // run.json lands (the same race fetchRunGraphWithRetry rides out), so a 404
+  // only means "older remote CP" once the graph has confirmed the run. Only a
+  // graph for THIS `id` confirms it — the graph reset is an effect, so for one
+  // render after an in-app `/runs/A → /runs/B` (e.g. launching from a run
+  // page) `graph` still holds A's run, and trusting it would turn B's launch
+  // race 404 into a permanent "unavailable". When the endpoint is unavailable
+  // `liveUsage` stays null and the header/chart fall back to the graph's
+  // one-shot usage + the timeline fetch.
+  const runKnown = run !== null && run.id === id;
+  const { usage: liveUsage } = useRunUsage(id, host, runKnown && isRunning, { runKnown });
+  // Usage for the header row: live summary, else the graph's one-shot numbers.
+  const displayUsage = liveUsage?.summary ?? graph?.usage;
   // Pause is only offered while the run is actively `running` (not merely
   // `pending`, and not `awaiting_approval` — those have their own gate).
   const isPausable = effectiveStatus === 'running';
@@ -799,7 +815,21 @@ export default function RunDetail() {
                 {displayUsage.cached_tokens > 0 && (
                   <span><span className="text-ink-mute">cached</span> {formatTokens(displayUsage.cached_tokens)}</span>
                 )}
-                <span><span className="text-ink-mute">total</span> {formatTokens(displayUsage.total_tokens)}</span>
+                {(displayUsage.cache_write_tokens ?? 0) > 0 && (
+                  <span>
+                    <span className="text-ink-mute">cache write</span> {formatTokens(displayUsage.cache_write_tokens ?? 0)}
+                  </span>
+                )}
+                <span
+                  title={
+                    displayUsage.partial
+                      ? 'Some transcripts were not readable on this CP (remote host not yet mirrored)'
+                      : undefined
+                  }
+                >
+                  <span className="text-ink-mute">total</span> {displayUsage.partial ? '≥' : ''}
+                  {formatTokens(displayUsage.total_tokens)}
+                </span>
                 <span className="font-medium text-ink">
                   {formatCost(displayUsage.cost_usd)}{displayUsage.cost_usd !== null && !displayUsage.priced ? '*' : ''}
                 </span>
@@ -1211,7 +1241,7 @@ export default function RunDetail() {
           <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
             Token usage by turn
           </h2>
-          <RunUsageTimeline series={series} separators />
+          <RunUsageTimeline series={liveUsage?.points ?? series} separators />
         </section>
 
         {/* Autoflow panel — only when this run has an autoflow-history trail. */}

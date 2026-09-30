@@ -1369,41 +1369,6 @@ struct AutoflowRunSummary {
 }
 
 #[derive(Debug, Clone, Default)]
-struct AutoflowCostTally {
-    sum_usd: f64,
-    priced_items: u64,
-    unpriced_items: u64,
-}
-
-impl AutoflowCostTally {
-    fn add(&mut self, cost_usd: Option<f64>) {
-        match cost_usd {
-            Some(value) => {
-                self.sum_usd += value;
-                self.priced_items += 1;
-            }
-            None => self.unpriced_items += 1,
-        }
-    }
-
-    fn cost_usd(&self) -> Option<f64> {
-        (self.priced_items > 0).then_some(self.sum_usd)
-    }
-
-    fn partial(&self) -> bool {
-        self.priced_items > 0 && self.unpriced_items > 0
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct TranscriptUsageAccumulator {
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_tokens: u64,
-    cost: AutoflowCostTally,
-}
-
-#[derive(Debug, Clone, Default)]
 struct TranscriptSummaryAccumulator {
     agents: BTreeSet<String>,
     providers: BTreeSet<String>,
@@ -1416,7 +1381,6 @@ struct TranscriptSummaryAccumulator {
     file_creates: u64,
     file_modifies: u64,
     file_deletes: u64,
-    usage: TranscriptUsageAccumulator,
 }
 
 #[derive(Debug, Clone)]
@@ -7157,9 +7121,12 @@ fn load_run_summary(
 ) -> Option<AutoflowRunSummary> {
     let record = run_store.load(run_id).ok()?;
     let rows = run_store.read_step_results(run_id).unwrap_or_default();
-    let transcript = summarize_run_transcripts(&rows, pricing);
+    let transcript = summarize_run_transcripts(&rows);
     let diff = summarize_workspace_diff(&record.workspace_path);
-    let usage = usage_summary_from_transcript(&transcript);
+    // Spend is the run's usage fold — every ledger row (units, dispatched
+    // sub-agents, compaction calls) plus a fold of any known transcript
+    // without rows — not just the completed steps' transcripts.
+    let usage = usage_summary_from_fold(&rupu_cp::usage::summarize_run(run_store, run_id, pricing));
     let duration_ms = run_duration_ms(&record);
     let workspace = Some(record.workspace_path.display().to_string());
     let run_id = record.id.clone();
@@ -7212,16 +7179,16 @@ fn load_run_summary(
     })
 }
 
-fn summarize_run_transcripts(
-    rows: &[StepResultRecord],
-    pricing: &rupu_config::PricingConfig,
-) -> TranscriptSummaryAccumulator {
+/// Activity counts (agents, models, messages, tool calls, edits) across a
+/// run's step transcripts. Token spend is NOT tallied here — it comes from
+/// the run's usage fold ([`usage_summary_from_fold`]).
+fn summarize_run_transcripts(rows: &[StepResultRecord]) -> TranscriptSummaryAccumulator {
     let mut out = TranscriptSummaryAccumulator::default();
     let mut seen = BTreeSet::new();
     for row in rows {
-        summarize_transcript_path(&row.transcript_path, pricing, &mut out, &mut seen);
+        summarize_transcript_path(&row.transcript_path, &mut out, &mut seen);
         for item in &row.items {
-            summarize_transcript_path(&item.transcript_path, pricing, &mut out, &mut seen);
+            summarize_transcript_path(&item.transcript_path, &mut out, &mut seen);
         }
     }
     out
@@ -7229,7 +7196,6 @@ fn summarize_run_transcripts(
 
 fn summarize_transcript_path(
     path: &Path,
-    pricing: &rupu_config::PricingConfig,
     out: &mut TranscriptSummaryAccumulator,
     seen: &mut BTreeSet<PathBuf>,
 ) {
@@ -7240,7 +7206,6 @@ fn summarize_transcript_path(
     let Ok(iter) = JsonlReader::iter(path) else {
         return;
     };
-    let mut transcript_agent = String::new();
     for event in iter.flatten() {
         match event {
             TranscriptEvent::RunStart {
@@ -7249,7 +7214,6 @@ fn summarize_transcript_path(
                 model,
                 ..
             } => {
-                transcript_agent = agent.clone();
                 out.agents.insert(agent);
                 out.providers.insert(provider);
                 out.models.insert(model);
@@ -7269,48 +7233,30 @@ fn summarize_transcript_path(
                 }
             }
             TranscriptEvent::Usage {
-                provider,
-                model,
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                ..
+                provider, model, ..
             } => {
-                out.providers.insert(provider.clone());
-                out.models.insert(model.clone());
-                out.usage.input_tokens += u64::from(input_tokens);
-                out.usage.output_tokens += u64::from(output_tokens);
-                out.usage.cached_tokens += u64::from(cached_tokens);
-                let cost =
-                    rupu_config::pricing::lookup(pricing, &provider, &model, &transcript_agent)
-                        .map(|price| {
-                            price.cost_usd(
-                                u64::from(input_tokens),
-                                u64::from(output_tokens),
-                                u64::from(cached_tokens),
-                            )
-                        });
-                out.usage.cost.add(cost);
+                out.providers.insert(provider);
+                out.models.insert(model);
             }
             _ => {}
         }
     }
 }
 
-fn usage_summary_from_transcript(
-    transcript: &TranscriptSummaryAccumulator,
-) -> Option<AutoflowUsageSummary> {
-    let total_tokens = transcript.usage.input_tokens + transcript.usage.output_tokens;
-    if total_tokens == 0 && transcript.usage.cached_tokens == 0 {
+/// A run's spend for the autoflow views, from its priced usage fold.
+/// `None` when the run spent nothing yet. `cost_partial` = some rows were
+/// priced and some were not.
+fn usage_summary_from_fold(usage: &rupu_cp::usage::UsageSummary) -> Option<AutoflowUsageSummary> {
+    if usage.total_tokens == 0 && usage.cached_tokens == 0 {
         return None;
     }
     Some(AutoflowUsageSummary {
-        input_tokens: transcript.usage.input_tokens,
-        output_tokens: transcript.usage.output_tokens,
-        cached_tokens: transcript.usage.cached_tokens,
-        total_tokens,
-        cost_usd: transcript.usage.cost.cost_usd(),
-        cost_partial: transcript.usage.cost.partial(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_tokens: usage.cached_tokens,
+        total_tokens: usage.total_tokens,
+        cost_usd: usage.cost_usd,
+        cost_partial: usage.cost_usd.is_some() && !usage.priced,
     })
 }
 
@@ -12524,6 +12470,100 @@ fn format_contenders(contenders: &[AutoflowContender]) -> String {
 mod tests {
     use super::*;
     use crate::cmd::autoflow_wake;
+
+    #[test]
+    fn load_run_summary_takes_usage_from_the_runs_fold() {
+        use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, UsageLedger, LEDGER_VERSION};
+        // A finished run whose step agent dispatched a sub-agent: both
+        // billed calls are in the usage ledger, but only the step's own
+        // transcript is in `step_results.jsonl`. The summary must count
+        // the child too (built-in price: $3 in / $15 out per Mtok).
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let now = chrono::Utc::now();
+        store
+            .create(
+                RunRecord {
+                    codename: None,
+                    id: "run_fold".into(),
+                    workflow_name: "controller".into(),
+                    status: RunStatus::Completed,
+                    inputs: BTreeMap::new(),
+                    event: None,
+                    workspace_id: "ws_1".into(),
+                    workspace_path: tmp.path().join("no-workspace"),
+                    transcript_dir: tmp.path().join("transcripts"),
+                    started_at: now,
+                    finished_at: Some(now),
+                    error_message: None,
+                    awaiting: Vec::new(),
+                    awaiting_step_id: None,
+                    approval_prompt: None,
+                    awaiting_since: None,
+                    expires_at: None,
+                    issue_ref: None,
+                    issue: None,
+                    parent_run_id: None,
+                    backend_id: None,
+                    worker_id: None,
+                    artifact_manifest_path: None,
+                    runner_pid: None,
+                    source_wake_id: None,
+                    active_step_id: None,
+                    active_step_kind: None,
+                    active_step_agent: None,
+                    resume_requested_at: None,
+                    resume_claimed_at: None,
+                    resume_claimed_by: None,
+                    resume_mode: None,
+                    resume_gate_id: None,
+                    resume_approver: None,
+                    reject_cleanup_pending: None,
+                    permission_mode: None,
+                    active_step_transcript_path: None,
+                    final_output: None,
+                    loop_progress: Default::default(),
+                },
+                "name: controller\nsteps: []\n",
+            )
+            .unwrap();
+        let ledger = UsageLedger::for_run(&store, "run_fold");
+        for (id, step, agent_run, parent, input, output) in [
+            ("u1", Some("decide"), "ag_step", None, 1_000_000, 0),
+            ("u2", None, "ag_child", Some("ag_step"), 0, 1_000_000),
+        ] {
+            ledger.append(&LedgerRow {
+                v: LEDGER_VERSION,
+                id: id.into(),
+                at: now,
+                kind: LedgerKind::Turn,
+                step_id: step.map(str::to_string),
+                unit_index: None,
+                unit_key: None,
+                agent_run_id: agent_run.into(),
+                parent_agent_run_id: parent.map(str::to_string),
+                transcript: tmp.path().join(format!("transcripts/{agent_run}.jsonl")),
+                agent: "controller-agent".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                input_tokens: input,
+                output_tokens: output,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            });
+        }
+
+        let summary =
+            load_run_summary(&store, "run_fold", &rupu_config::PricingConfig::default()).unwrap();
+        let usage = summary.usage.expect("the fold saw spend");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (1_000_000, 1_000_000)
+        );
+        assert_eq!(usage.total_tokens, 2_000_000);
+        assert_eq!(usage.cost_usd, Some(18.0));
+        assert!(!usage.cost_partial);
+    }
 
     fn wakes_table_test_now() -> chrono::DateTime<chrono::Utc> {
         use chrono::TimeZone;

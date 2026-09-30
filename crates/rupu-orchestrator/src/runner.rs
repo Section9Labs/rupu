@@ -5952,6 +5952,19 @@ pub async fn run_reject_cleanup(
         };
 
         let step_timer = std::time::Instant::now();
+        let on_usage = ledger_hook(
+            &opts,
+            &run_id,
+            crate::usage_ledger::LedgerTag {
+                step_id: Some(step.id.clone()),
+                unit_index: None,
+                unit_key: None,
+            },
+            &step_run_id,
+            &transcript_path,
+            agent_name,
+            None,
+        );
         let outcome = dispatch_one(
             &opts.factory,
             &step.id,
@@ -5970,6 +5983,7 @@ pub async fn run_reject_cleanup(
                 unit_index: None,
                 codename: Some(codename.clone()),
             },
+            on_usage,
         )
         .await;
         let duration_ms = step_timer.elapsed().as_millis() as u64;
@@ -6367,6 +6381,18 @@ async fn run_linear_step(
                 .filter(|ps| ps.step_id == step.id)
                 .map(|ps| split_seed_for_resume(ps.seed_messages.clone()));
 
+            let on_usage = ledger_hook(
+                opts,
+                workflow_run_id,
+                crate::usage_ledger::LedgerTag {
+                    step_id: Some(step.id.clone()),
+                    ..Default::default()
+                },
+                &run_id,
+                &transcript_path,
+                agent_name,
+                None,
+            );
             let outcome = dispatch_one(
                 &opts.factory,
                 &step.id,
@@ -6385,6 +6411,7 @@ async fn run_linear_step(
                     unit_index: None,
                     codename: codename.clone(),
                 },
+                on_usage,
             )
             .await;
 
@@ -6888,6 +6915,29 @@ async fn run_fanout_step(
         let workflow_run_id = workflow_run_id.to_string();
         let unit_key = fanout_unit_key(&item_value);
         let unit_agent = agent_name_root.clone();
+        // Usage accounting (spec 2026-09-29 §3.3–§3.4). Built here, before
+        // the spawn: the hook needs `opts`, and it is an `Arc` that moves
+        // into the task. Only a LOCAL unit runs `dispatch_one`, so only it
+        // gets a hook; a placed unit's totals are folded from its mirrored
+        // transcript after dispatch instead.
+        let unit_counters = Arc::new(crate::usage_ledger::UnitTokenCounters::default());
+        let unit_on_usage = if placement.is_none() {
+            ledger_hook(
+                opts,
+                &workflow_run_id,
+                crate::usage_ledger::LedgerTag {
+                    step_id: Some(step_id.clone()),
+                    unit_index: Some(idx),
+                    unit_key: Some(unit_key.clone()),
+                },
+                &run_id_clone,
+                &transcript_clone,
+                &agent_name,
+                Some(unit_counters.clone()),
+            )
+        } else {
+            None
+        };
         let dispatcher_for_task = unit_dispatcher.clone();
         let pause_for_task = unit_pause.clone();
         // The step's ONE packed workspace, shared with this unit when sync
@@ -7190,6 +7240,7 @@ async fn run_fanout_step(
                             unit_index: Some(idx),
                             codename: unit_codename.clone(),
                         },
+                        unit_on_usage,
                     )
                     .await;
                     match outcome {
@@ -7221,9 +7272,22 @@ async fn run_fanout_step(
 
             if !paused {
                 if let Some(sink) = event_sink.as_ref() {
-                    // Tokens are not available from the dispatch result
-                    // (`dispatch_one` returns `Result<()>`); emit 0 — the live
-                    // view still tails the unit transcript for token deltas.
+                    // Real totals from this unit's usage hook (spec 2026-09-29 §3.4).
+                    // A placed unit never ran the hook: fold its mirrored
+                    // transcript once instead (the retry path re-points
+                    // `transcript_path` at the fallback host's mirror).
+                    let (tokens_in, tokens_out) = if placement_host.is_some() {
+                        mirrored_unit_tokens(&transcript_path)
+                    } else {
+                        (
+                            unit_counters
+                                .input
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            unit_counters
+                                .output
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    };
                     sink.emit(
                         &workflow_run_id,
                         &crate::executor::Event::UnitCompleted {
@@ -7232,8 +7296,8 @@ async fn run_fanout_step(
                             index: idx,
                             unit_key: unit_key.clone(),
                             success,
-                            tokens_in: 0,
-                            tokens_out: 0,
+                            tokens_in,
+                            tokens_out,
                             host: placement_host.clone(),
                         },
                     );
@@ -7503,6 +7567,20 @@ async fn run_parallel_step(
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
         let parent_step_id = step.id.clone();
+        // Usage-ledger hook, built before the spawn (it needs `opts`).
+        let on_usage = ledger_hook(
+            opts,
+            workflow_run_id,
+            crate::usage_ledger::LedgerTag {
+                step_id: Some(parent_step_id.clone()),
+                unit_index: Some(idx),
+                unit_key: Some(sub_id.clone()),
+            },
+            &run_id_clone,
+            &transcript_clone,
+            &sub_agent_name,
+            None,
+        );
         let codename = opts
             .naming
             .as_ref()
@@ -7537,6 +7615,7 @@ async fn run_parallel_step(
                     unit_index: Some(idx),
                     codename: codename.clone(),
                 },
+                on_usage,
             )
             .await;
             let (success, error_str, raw_error) = match outcome {
@@ -7721,6 +7800,7 @@ async fn dispatch_one(
     pause: Option<CancellationToken>,
     resume_seed: Option<(Vec<Message>, String)>,
     announce: AgentAnnounce<'_>,
+    on_usage: Option<rupu_agent::OnUsageCallback>,
 ) -> Result<RunResult, RunError> {
     let mut agent_opts = factory
         .build_opts_for_step(
@@ -7756,6 +7836,8 @@ async fn dispatch_one(
             },
         );
     }
+    // Likewise the usage-ledger hook (see `ledger_hook`).
+    agent_opts.on_usage = on_usage;
     if let Some((initial_messages, user_message)) = resume_seed {
         agent_opts.initial_messages = initial_messages;
         agent_opts.user_message = user_message;
@@ -7765,6 +7847,43 @@ async fn dispatch_one(
         Some(err) => Err(err),
         None => Ok(result),
     }
+}
+
+/// Build the usage-ledger hook for one agent run (spec 2026-09-29 §3.3).
+/// `None` for in-memory runs (no store / empty run id).
+fn ledger_hook(
+    opts: &OrchestratorRunOpts,
+    workflow_run_id: &str,
+    tag: crate::usage_ledger::LedgerTag,
+    agent_run_id: &str,
+    transcript: &Path,
+    agent: &str,
+    counters: Option<Arc<crate::usage_ledger::UnitTokenCounters>>,
+) -> Option<rupu_agent::OnUsageCallback> {
+    let store = opts.run_store.as_ref()?;
+    if workflow_run_id.is_empty() {
+        return None;
+    }
+    let ledger = crate::usage_ledger::UsageLedger::for_run(store, workflow_run_id);
+    Some(ledger.hook(
+        tag,
+        agent_run_id.to_string(),
+        None,
+        transcript.to_path_buf(),
+        agent.to_string(),
+        counters,
+    ))
+}
+
+/// A remote (placed) unit's token totals, folded once from its mirrored
+/// transcript on the coordinator (spec 2026-09-29 §3.4). `(0, 0)` when the
+/// mirror never materialised locally — a missing file aggregates to nothing.
+fn mirrored_unit_tokens(transcript_path: &Path) -> (u64, u64) {
+    rupu_transcript::aggregate(&[transcript_path], Default::default())
+        .iter()
+        .fold((0u64, 0u64), |(i, o), r| {
+            (i + r.input_tokens, o + r.output_tokens)
+        })
 }
 
 /// Read the just-finished transcript to extract the final assistant
@@ -8291,6 +8410,20 @@ async fn dispatch_fixer(
             },
         );
     }
+    let counters = Arc::new(crate::usage_ledger::UnitTokenCounters::default());
+    let on_usage = ledger_hook(
+        opts,
+        workflow_run_id,
+        crate::usage_ledger::LedgerTag {
+            step_id: Some(step.id.clone()),
+            unit_index: Some(unit_index),
+            unit_key: Some(unit_key.clone()),
+        },
+        &run_id,
+        &transcript_path,
+        fixer_agent,
+        Some(counters.clone()),
+    );
     let outcome = dispatch_one(
         &opts.factory,
         &step.id,
@@ -8310,10 +8443,12 @@ async fn dispatch_fixer(
             unit_index: Some(unit_index),
             codename: codename.cloned(),
         },
+        on_usage,
     )
     .await;
     let success = outcome.is_ok();
     if let Some(sink) = opts.event_sink.as_ref() {
+        // Real totals from this unit's usage hook (spec 2026-09-29 §3.4).
         sink.emit(
             workflow_run_id,
             &crate::executor::Event::UnitCompleted {
@@ -8322,8 +8457,8 @@ async fn dispatch_fixer(
                 index: unit_index,
                 unit_key: unit_key.clone(),
                 success,
-                tokens_in: 0,
-                tokens_out: 0,
+                tokens_in: counters.input.load(std::sync::atomic::Ordering::Relaxed),
+                tokens_out: counters.output.load(std::sync::atomic::Ordering::Relaxed),
                 host: None,
             },
         );
@@ -8437,6 +8572,22 @@ async fn run_panel_iteration(
             });
             n.panelist(&step.id, &agent_name, occurrence)
         });
+        // Usage accounting, built before the spawn (it needs `opts`); the
+        // counters feed this panelist's `UnitCompleted` (spec 2026-09-29 §3.4).
+        let counters = Arc::new(crate::usage_ledger::UnitTokenCounters::default());
+        let on_usage = ledger_hook(
+            opts,
+            &workflow_run_id,
+            crate::usage_ledger::LedgerTag {
+                step_id: Some(parent_step_id.clone()),
+                unit_index: Some(view_index),
+                unit_key: Some(unit_key.clone()),
+            },
+            &run_id_clone,
+            &transcript_clone,
+            &agent_name_clone,
+            Some(counters.clone()),
+        );
 
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem
@@ -8477,6 +8628,7 @@ async fn run_panel_iteration(
                     unit_index: Some(view_index),
                     codename: codename.clone(),
                 },
+                on_usage,
             )
             .await;
             let (success, _err_str, raw_error) = match outcome {
@@ -8490,6 +8642,7 @@ async fn run_panel_iteration(
                 &parent_step_id,
             );
             if let Some(sink) = event_sink.as_ref() {
+                // Real totals from this unit's usage hook (spec 2026-09-29 §3.4).
                 sink.emit(
                     &workflow_run_id,
                     &crate::executor::Event::UnitCompleted {
@@ -8498,8 +8651,8 @@ async fn run_panel_iteration(
                         index: view_index,
                         unit_key: unit_key.clone(),
                         success,
-                        tokens_in: 0,
-                        tokens_out: 0,
+                        tokens_in: counters.input.load(std::sync::atomic::Ordering::Relaxed),
+                        tokens_out: counters.output.load(std::sync::atomic::Ordering::Relaxed),
                         host: None,
                     },
                 );
@@ -10050,6 +10203,7 @@ steps:
             step_id: String::new(),
             on_tool_call,
             on_stream_event: None,
+            on_usage: None,
             concerns: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             context_window_tokens: None,
@@ -11290,6 +11444,7 @@ mod dag_scheduler_golden {
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -11836,6 +11991,7 @@ steps:
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -12357,6 +12513,7 @@ loops:
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -12552,6 +12709,7 @@ loops:
                     step_id: step_id.to_string(),
                     on_tool_call,
                     on_stream_event: None,
+                    on_usage: None,
                     concerns: None,
                     max_tokens: DEFAULT_MAX_TOKENS,
                     scope_name: None,
@@ -12842,6 +13000,7 @@ loops:
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -13038,6 +13197,7 @@ loops:
                     step_id: step_id.to_string(),
                     on_tool_call,
                     on_stream_event: None,
+                    on_usage: None,
                     concerns: None,
                     max_tokens: DEFAULT_MAX_TOKENS,
                     scope_name: None,
@@ -13266,6 +13426,7 @@ loops:
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -13569,6 +13730,7 @@ loops:
                     step_id: step_id.to_string(),
                     on_tool_call,
                     on_stream_event: None,
+                    on_usage: None,
                     concerns: None,
                     max_tokens: DEFAULT_MAX_TOKENS,
                     scope_name: None,
@@ -13720,6 +13882,7 @@ loops:
                     step_id: step_id.to_string(),
                     on_tool_call,
                     on_stream_event: None,
+                    on_usage: None,
                     concerns: None,
                     max_tokens: DEFAULT_MAX_TOKENS,
                     scope_name: None,
@@ -14152,6 +14315,7 @@ mod join_and_prune {
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -15784,6 +15948,7 @@ mod resume_and_cancel {
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 scope_name: None,
@@ -16546,6 +16711,7 @@ mod agent_terminal_status {
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 context_window_tokens: None,

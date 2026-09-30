@@ -19,9 +19,9 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
-        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        RunListQuery,
+        blocking_host, mirror_get_run, mirror_list_runs, mirror_stream_run_events,
+        read_transcript_file, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
+        HostInfo, RunListQuery,
     },
     launcher::LaunchRequest,
     node::{
@@ -222,11 +222,22 @@ impl HostConnector for TunnelHostConnector {
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        mirror_list_runs(&self.run_store, &self.node_id, &params, &self.pricing)
+        let (store, id, pricing) = (
+            Arc::clone(&self.run_store),
+            self.node_id.clone(),
+            self.pricing.clone(),
+        );
+        blocking_host(move || mirror_list_runs(&store, &id, &params, &pricing)).await
     }
 
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-        mirror_get_run(&self.run_store, &self.node_id, run_id, &self.pricing)
+        let (store, id, pricing) = (
+            Arc::clone(&self.run_store),
+            self.node_id.clone(),
+            self.pricing.clone(),
+        );
+        let run_id = run_id.to_string();
+        blocking_host(move || mirror_get_run(&store, &id, &run_id, &pricing)).await
     }
 
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {

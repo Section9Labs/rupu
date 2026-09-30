@@ -20,6 +20,7 @@ fn test_full_request_response_type_flow() {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        disable_prompt_cache: false,
     };
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.model, "claude-sonnet-4-6");
@@ -65,6 +66,7 @@ fn test_tool_use_flow() {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        disable_prompt_cache: false,
     };
     assert_eq!(request.tools.len(), 1);
 
@@ -144,6 +146,7 @@ fn test_all_public_types_accessible() {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        disable_prompt_cache: false,
     };
     let _role = Role::User;
     let _stop = StopReason::EndTurn;

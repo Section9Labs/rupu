@@ -59,6 +59,9 @@ export default function RunUsageTimeline({
   if (series.length === 0) {
     return <div className="text-xs text-ink-mute py-6 text-center">No per-turn usage yet</div>;
   }
+  // Series/lines run with `isAnimationActive={false}`: a live run appends points
+  // every couple of seconds, and recharts would otherwise replay its draw-in
+  // animation on every append. A timeline gains nothing from it.
   const data = series.map(toChartPoint);
   // First turn of each new label group (skip index 0) — the step boundaries.
   const boundaries = separators
@@ -88,9 +91,9 @@ export default function RunUsageTimeline({
             <ReferenceLine key={`${b.label}-${b.turn}`} yAxisId="in" x={b.turn} stroke={colors.border} strokeDasharray="3 3"
               label={{ value: b.label, position: 'top', fontSize: 9, fill: colors.inkMute }} />
           ))}
-          <Area yAxisId="in" type="monotone" dataKey="in" name="In" stroke={COLOR_IN} fill={COLOR_IN} fillOpacity={0.18} />
-          <Line yAxisId="oc" type="monotone" dataKey="out" name="Out" stroke={COLOR_OUT} dot={false} strokeWidth={1.5} />
-          <Line yAxisId="oc" type="monotone" dataKey="cached" name="Cached" stroke={COLOR_CACHED} dot={false} strokeWidth={1.5} />
+          <Area yAxisId="in" type="monotone" dataKey="in" name="In" stroke={COLOR_IN} fill={COLOR_IN} fillOpacity={0.18} isAnimationActive={false} />
+          <Line yAxisId="oc" type="monotone" dataKey="out" name="Out" stroke={COLOR_OUT} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+          <Line yAxisId="oc" type="monotone" dataKey="cached" name="Cached" stroke={COLOR_CACHED} dot={false} strokeWidth={1.5} isAnimationActive={false} />
         </ComposedChart>
       </ResponsiveContainer>
     </div>

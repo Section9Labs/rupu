@@ -82,6 +82,15 @@ pub struct CliAgentDispatcher {
     /// `codenames.json` as the run's static slots. `None` until installed;
     /// [`Self::namer_for`] then falls back to an in-memory namer.
     namer: std::sync::Mutex<Option<rupu_codename::SharedNamer>>,
+    /// The ROOT workflow run's usage ledger (`<run>/usage.jsonl`), when this
+    /// dispatcher serves a workflow run. Every dispatched child (and its own
+    /// grandchildren, which reuse this dispatcher) appends its per-LLM-call
+    /// rows here, tagged with the child's own run id and the dispatching
+    /// agent's run id as parent — the CP fold attributes them to the
+    /// ancestor's step via `parent_agent_run_id`. `None` for standalone
+    /// `rupu run` (no workflow run to charge; those children are counted by
+    /// the CP's fallback over sub-run transcripts).
+    usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -117,6 +126,7 @@ impl CliAgentDispatcher {
         provider_tuning: std::collections::HashMap<String, rupu_providers::ProviderTuning>,
         kinds: std::collections::HashMap<String, String>,
         findings_base: rupu_coverage::FindingWriteOptions,
+        usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -136,6 +146,7 @@ impl CliAgentDispatcher {
             kinds,
             findings_base,
             namer: std::sync::Mutex::new(None),
+            usage_ledger,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -306,6 +317,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         );
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+            anthropic_prompt_cache: spec.anthropic_prompt_cache,
             openai_compatible: oai_params,
             tuning: self.provider_tuning.get(&provider_name).cloned(),
             kind: self.kinds.get(&provider_name).cloned(),
@@ -415,6 +427,19 @@ impl AgentDispatcher for CliAgentDispatcher {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
+            // Charge this child's LLM calls to the ROOT run's ledger. No
+            // step tag: the CP fold attributes it to its ancestor's step via
+            // `parent_agent_run_id` (the dispatching agent's run id).
+            on_usage: self.usage_ledger.as_ref().map(|l| {
+                l.hook(
+                    rupu_orchestrator::usage_ledger::LedgerTag::default(),
+                    sub_run_id.clone(),
+                    Some(parent_run_id.to_string()),
+                    transcript_path.clone(),
+                    agent_name.to_string(),
+                    None,
+                )
+            }),
             concerns: spec.concerns.clone(),
             max_tokens: spec
                 .max_tokens
@@ -705,6 +730,10 @@ mod tests {
         let resolver = Arc::new(rupu_auth::KeychainResolver::new());
         let mcp_registry = Arc::new(rupu_scm::Registry::default());
 
+        // Root workflow run's usage ledger. Nothing else creates this file, so
+        // any row in it was appended by the dispatched child's `on_usage`.
+        let ledger_path = dir.path().join("usage.jsonl");
+
         let dispatcher = CliAgentDispatcher::new(
             global,
             None,
@@ -721,6 +750,9 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            Some(rupu_orchestrator::usage_ledger::UsageLedger::open(
+                ledger_path.clone(),
+            )),
         );
 
         std::env::set_var(
@@ -778,6 +810,25 @@ mod tests {
             }
             other => panic!("expected DispatchCompleted second, got {other:?}"),
         }
+
+        // The child's LLM calls land in the ROOT run's ledger: no step_id
+        // (the CP fold attributes a dispatch child to its ancestor's step),
+        // the child's own run id, and the dispatching agent's run id as
+        // parent.
+        let body = std::fs::read_to_string(&ledger_path)
+            .expect("dispatched child should have appended to the root run's usage ledger");
+        let rows: Vec<rupu_orchestrator::usage_ledger::LedgerRow> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("ledger row parses"))
+            .collect();
+        assert!(!rows.is_empty(), "expected >=1 ledger row, got none");
+        for row in &rows {
+            assert_eq!(row.step_id, None);
+            assert_eq!(row.agent_run_id, outcome.sub_run_id);
+            assert_eq!(row.parent_agent_run_id.as_deref(), Some("parent_run_1"));
+            assert_eq!(row.agent, "child");
+            assert_eq!(row.transcript, outcome.transcript_path);
+        }
     }
 
     #[test]
@@ -834,6 +885,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
         let namer =
             rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
@@ -937,6 +989,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
         std::env::set_var(
             "RUPU_MOCK_PROVIDER_SCRIPT",
@@ -999,6 +1052,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1067,6 +1121,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1145,6 +1200,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1230,6 +1286,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1320,6 +1377,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
 
         std::env::set_var(
@@ -1395,6 +1453,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             rupu_coverage::FindingWriteOptions::default(),
+            None,
         );
 
         std::env::set_var(

@@ -469,6 +469,7 @@ mod tests {
                 step_id: step_id.to_string(),
                 on_tool_call,
                 on_stream_event: None,
+                on_usage: None,
                 concerns: None,
                 max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
                 scope_name: None,

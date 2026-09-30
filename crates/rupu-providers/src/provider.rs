@@ -164,6 +164,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let response = provider.send(&request).await.unwrap();
         assert_eq!(response.text(), Some("Hello"));
@@ -190,6 +191,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let mut events = Vec::new();
         let response = provider
@@ -248,6 +250,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let result = provider.send(&request).await;
         assert!(matches!(

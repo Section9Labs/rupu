@@ -1,19 +1,30 @@
 //! Token + dollar-cost aggregation for the control plane.
 //!
-//! Pure read-side composition of `rupu_transcript::aggregate` (tokens per
-//! provider/model/agent) and `rupu_config::pricing` (USD price lookup +
-//! `ModelPricing::cost_usd`). Cost is an estimate: when a model has no
-//! resolvable price we report tokens with `priced = false` and never
-//! fabricate a dollar figure.
+//! **A run's usage is ledger-first** (spec 2026-09-29 §4): the sum of its
+//! usage-ledger rows (`<runs>/<id>/usage.jsonl`, one row per LLM call made
+//! anywhere in the run, dispatch children included), plus — for every known
+//! transcript (step results ∪ live events ∪ dispatched sub-runs) that has no
+//! ledger row — a fold of that transcript file, resolved through the host
+//! mirror rules. A transcript that should exist but can't be read anywhere
+//! marks the result `partial`. That one definition lives in
+//! [`crate::usage_index`] (incremental, cached process-wide); this module's
+//! [`run_usage`] / [`transcripts_usage`] are its entry points, and
+//! [`summarize_run`] / [`run_metrics`] / [`run_transcript_paths`] are built
+//! on it.
+//!
+//! Pricing is `rupu_config::pricing` (USD price lookup +
+//! `ModelPricing::cost_usd`), applied here, never stored. Cost is an
+//! estimate: when a model has no resolvable price we report tokens with
+//! `priced = false` and never fabricate a dollar figure.
 
+use crate::usage_index::{RunUsage, UsageIndex};
 use rupu_config::PricingConfig;
 use rupu_orchestrator::runs::RunStore;
-use rupu_transcript::TimeWindow;
 use rupu_transcript::UsageRow;
-use rupu_transcript::{Event, JsonlReader};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Token + cost summary for a run, or any rollup of runs.
 ///
@@ -26,7 +37,12 @@ use std::path::PathBuf;
 pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache reads — a subset of `input_tokens`.
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    /// Defaulted so a remote CP that predates it still parses.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub total_tokens: u64,
     /// `None` when no contributing row was priced. Otherwise the sum of the
     /// priced rows' cost (a partial total when `priced == false`).
@@ -35,6 +51,11 @@ pub struct UsageSummary {
     pub priced: bool,
     /// Distinct runs contributing (for rollups).
     pub runs: u64,
+    /// `true` when a transcript that should exist could not be read anywhere
+    /// (a finished step's file is gone, or a mirrored run's transcript never
+    /// arrived), so the totals are a lower bound. ORed by [`rollup`].
+    #[serde(default)]
+    pub partial: bool,
 }
 
 /// Fold token rows into a single summary, pricing each row.
@@ -49,11 +70,17 @@ pub fn summarize(rows: &[UsageRow], pricing: &PricingConfig) -> UsageSummary {
         out.input_tokens += row.input_tokens;
         out.output_tokens += row.output_tokens;
         out.cached_tokens += row.cached_tokens;
+        out.cache_write_tokens += row.cache_write_tokens;
         out.runs += row.runs;
         match rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent) {
             Some(price) => {
                 any_priced = true;
-                cost_acc += price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens);
+                cost_acc += price.cost_usd(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                );
             }
             None => out.priced = false,
         }
@@ -63,64 +90,149 @@ pub fn summarize(rows: &[UsageRow], pricing: &PricingConfig) -> UsageSummary {
     out
 }
 
-/// Aggregate the given transcript files and summarize the result.
-pub fn summarize_paths(paths: &[PathBuf], pricing: &PricingConfig) -> UsageSummary {
-    let rows = rupu_transcript::aggregate(paths, TimeWindow::default());
-    summarize(&rows, pricing)
+/// A run's usage — the one definition (ledger-first, fallback over known
+/// transcripts without ledger rows). Incremental and cached process-wide in
+/// [`UsageIndex::global`].
+pub fn run_usage(store: &RunStore, run_id: &str) -> Arc<RunUsage> {
+    UsageIndex::global().run_usage(store, run_id)
+}
+
+/// Usage of explicit transcript files (standalone runs, session turns),
+/// each labelled by the caller, through the same per-file fold cache.
+pub fn transcripts_usage(labeled: &[(String, PathBuf)]) -> Arc<RunUsage> {
+    UsageIndex::global().transcripts_usage(labeled)
+}
+
+/// Run a synchronous usage computation on tokio's blocking pool. The fold
+/// reads files while holding a per-run (or per-file) `std::sync::Mutex`, so
+/// async handlers must not run it on an executor thread. Usage accounting
+/// never fails a request: if `f` panics the failure is logged and
+/// `fallback()` is returned instead.
+pub async fn usage_blocking<T: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> T + Send + 'static,
+    fallback: impl FnOnce() -> T,
+) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(what, error = %e, "usage computation failed; reporting it as partial");
+            fallback()
+        }
+    }
+}
+
+/// An empty result that says it is incomplete — what a failed fold reports.
+pub fn unknown_usage() -> Arc<RunUsage> {
+    Arc::new(RunUsage {
+        partial: true,
+        ..RunUsage::default()
+    })
+}
+
+/// [`run_usage`] off the async executor (see [`usage_blocking`]). Never
+/// fails: a panicked fold reads as an empty, `partial` result.
+pub async fn run_usage_blocking(store: Arc<RunStore>, run_id: String) -> Arc<RunUsage> {
+    usage_blocking(
+        "run_usage",
+        move || run_usage(&store, &run_id),
+        unknown_usage,
+    )
+    .await
+}
+
+/// [`transcripts_usage`] off the async executor (see [`usage_blocking`]).
+/// Never fails: a panicked fold reads as an empty, `partial` result.
+pub async fn transcripts_usage_blocking(labeled: Vec<(String, PathBuf)>) -> Arc<RunUsage> {
+    usage_blocking(
+        "transcripts_usage",
+        move || transcripts_usage(&labeled),
+        unknown_usage,
+    )
+    .await
+}
+
+/// [`summarize_run`] for each of `run_ids`, in order, off the async executor
+/// (see [`usage_blocking`]). Never fails: a panicked fold prices every run as
+/// an empty, `partial` result.
+pub async fn summarize_runs_blocking(
+    store: Arc<RunStore>,
+    run_ids: Vec<String>,
+    pricing: PricingConfig,
+) -> Vec<UsageSummary> {
+    let n = run_ids.len();
+    let fallback_pricing = pricing.clone();
+    usage_blocking(
+        "summarize_runs",
+        move || {
+            run_ids
+                .iter()
+                .map(|id| summarize_run(&store, id, &pricing))
+                .collect()
+        },
+        move || vec![summarize_run_usage(&unknown_usage(), &fallback_pricing); n],
+    )
+    .await
+}
+
+/// [`run_metrics`] for each of `run_ids`, in order, off the async executor
+/// (see [`usage_blocking`]). Never fails: a panicked fold reports every run
+/// as an empty, `partial` result.
+pub async fn run_metrics_blocking(
+    store: Arc<RunStore>,
+    run_ids: Vec<String>,
+    pricing: PricingConfig,
+) -> Vec<RunMetrics> {
+    let n = run_ids.len();
+    let fallback_pricing = pricing.clone();
+    usage_blocking(
+        "run_metrics",
+        move || {
+            run_ids
+                .iter()
+                .map(|id| run_metrics(&store, id, &pricing))
+                .collect()
+        },
+        move || {
+            let usage = summarize_run_usage(&unknown_usage(), &fallback_pricing);
+            vec![
+                RunMetrics {
+                    usage,
+                    ..RunMetrics::default()
+                };
+                n
+            ]
+        },
+    )
+    .await
+}
+
+/// Price a [`RunUsage`]; carries its `partial` flag through.
+pub fn summarize_run_usage(u: &RunUsage, pricing: &PricingConfig) -> UsageSummary {
+    let mut s = summarize(&u.rows, pricing);
+    s.partial = u.partial;
+    s
 }
 
 /// All transcript paths a run produced, resolved to the file that serves
-/// each one on this coordinator (spec §6.3): one per step result, plus one
-/// per fan-out / panel sub-unit. A path that does not exist locally and
-/// belongs to a run executed by a remote host (`worker_id`) is mapped to
-/// that host's mirror cache (`host::transcript_paths::cache_path`) when the
-/// cache file exists; otherwise the recorded path is kept unchanged
-/// (`rupu_transcript::aggregate` tolerates unreadable paths, so a still-open
-/// or never-mirrored transcript degrades to "no rows" rather than an
-/// error). A local run, or a `worker_id` this coordinator has no mirror
-/// directory for, is untouched — the existing-file check alone decides
-/// whether the recorded path is trusted.
+/// each one on this coordinator: the run's known transcripts (step results,
+/// live events, dispatched sub-runs) plus every usage-ledger row's
+/// transcript that exists. A recorded path that does not exist locally is
+/// mapped to the executing host's mirror cache (`worker_id`,
+/// `host::transcript_paths::cache_path`) or the agent mirror path when that
+/// file exists; otherwise the recorded path is kept unchanged (callers
+/// tolerate unreadable paths, so a still-open or never-mirrored transcript
+/// degrades to "no rows" rather than an error).
 ///
-/// Every caller of this function — `summarize_run`, `run_metrics`,
-/// `RunListRow::with_usage`, `query_run_detail`, `rupu-cli`'s `run show`/`run
-/// list`, and `LocalHostConnector` (which is what `GET /api/runs` and
-/// `GET /api/runs/:id` reach for a run mirrored from SSH, since the mirror
-/// lives in the LOCAL store) — gets this resolution for free, with no
-/// signature change and no `HostRegistry` dependency (which would be
-/// circular: the registry owns the local connector).
+/// This is the K-resolution helper of [`crate::usage_index`]; usage totals
+/// should come from [`run_usage`], not from re-aggregating these paths.
 pub fn run_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
-    let records = store.read_step_results(run_id).unwrap_or_default();
-    let mut paths = Vec::new();
-    for record in &records {
-        paths.push(record.transcript_path.clone());
-        for item in &record.items {
-            paths.push(item.transcript_path.clone());
-        }
-    }
-    let Ok(rec) = store.load(run_id) else {
-        return paths;
-    };
-    let Some(worker) = rec.worker_id.as_deref() else {
-        return paths;
-    };
-    let global = crate::host::transcript_paths::global_dir_of(store);
-    paths
-        .into_iter()
-        .map(|p| {
-            if p.exists() {
-                return p;
-            }
-            match crate::host::transcript_paths::cache_path(&global, worker, &p) {
-                Some(c) if c.exists() => c,
-                _ => p,
-            }
-        })
-        .collect()
+    UsageIndex::global().resolved_transcripts(store, run_id)
 }
 
 /// Token + cost summary for a single run.
 pub fn summarize_run(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> UsageSummary {
-    summarize_paths(&run_transcript_paths(store, run_id), pricing)
+    summarize_run_usage(&run_usage(store, run_id), pricing)
 }
 
 /// Token usage + turn count + duration for one run.
@@ -133,112 +245,16 @@ pub struct RunMetrics {
     pub duration_ms: Option<u64>,
 }
 
-/// Single-pass replacement for what used to be two independent full scans
-/// over the same transcripts: `summarize_paths` (via
-/// `rupu_transcript::aggregate`) to get token/cost usage, and a second
-/// `JsonlReader::iter` pass (the old `turns_and_duration`) to count turns and
-/// capture duration. Every path is now opened and parsed exactly once.
-///
-/// Reimplements `rupu_transcript::aggregate`'s private `aggregate_one`
-/// grouping rules (keyed by `(provider, model, agent)`, anchored on
-/// `RunStart`, with a `Usage` event's own `provider`/`model` overriding the
-/// run-start values for a mid-run model swap; a zero-token row is still
-/// emitted for a run with `RunStart` but no `Usage` events; a transcript with
-/// no `RunStart` contributes no row) at the same `TimeWindow::default()`
-/// (unfiltered) that every caller of `run_metrics_paths` already used, so
-/// `aggregate`'s time-window filtering isn't needed here. Alongside that
-/// grouping, every `Usage` event (including one seen before any `RunStart`,
-/// same as the old `turns_and_duration`) bumps the turn counter, and every
-/// `RunComplete` records its `duration_ms` — the last one seen across all
-/// paths wins, matching the old function's path-order behavior.
-fn aggregate_rows_and_metrics(paths: &[PathBuf]) -> (Vec<UsageRow>, u64, Option<u64>) {
-    let mut by_key: BTreeMap<(String, String, String), UsageRow> = BTreeMap::new();
-    let mut turns = 0u64;
-    let mut duration_ms = None;
-    for path in paths {
-        let Ok(iter) = JsonlReader::iter(path) else {
-            continue;
-        };
-        let mut start: Option<(String, String, String)> = None; // (provider, model, agent)
-        let mut file_rows: BTreeMap<(String, String, String), UsageRow> = BTreeMap::new();
-        for ev in iter.flatten() {
-            match ev {
-                Event::RunStart {
-                    provider,
-                    model,
-                    agent,
-                    ..
-                } => start = Some((provider, model, agent)),
-                Event::Usage {
-                    provider,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
-                    ..
-                } => {
-                    turns += 1;
-                    let Some((_, _, agent)) = &start else {
-                        continue; // no run-start yet; skip the orphan (matches aggregate_one)
-                    };
-                    let row = file_rows
-                        .entry((provider, model, agent.clone()))
-                        .or_default();
-                    row.input_tokens += u64::from(input_tokens);
-                    row.output_tokens += u64::from(output_tokens);
-                    row.cached_tokens += u64::from(cached_tokens);
-                }
-                Event::RunComplete { duration_ms: d, .. } => duration_ms = Some(d),
-                _ => {}
-            }
-        }
-        let Some((provider, model, agent)) = start else {
-            continue; // no RunStart; transcript skipped (matches aggregate_one)
-        };
-        if file_rows.is_empty() {
-            by_key
-                .entry((provider.clone(), model.clone(), agent.clone()))
-                .or_insert_with(|| UsageRow {
-                    provider,
-                    model,
-                    agent,
-                    ..UsageRow::default()
-                })
-                .runs += 1;
-        } else {
-            for ((p, m, a), r) in file_rows {
-                let entry = by_key
-                    .entry((p.clone(), m.clone(), a.clone()))
-                    .or_insert_with(|| UsageRow {
-                        provider: p,
-                        model: m,
-                        agent: a,
-                        ..UsageRow::default()
-                    });
-                entry.input_tokens += r.input_tokens;
-                entry.output_tokens += r.output_tokens;
-                entry.cached_tokens += r.cached_tokens;
-                entry.runs += 1;
-            }
-        }
-    }
-    (by_key.into_values().collect(), turns, duration_ms)
-}
-
-/// Full per-run metrics (usage + turns + duration) from transcript paths.
-/// Reads each path exactly once via [`aggregate_rows_and_metrics`].
-pub fn run_metrics_paths(paths: &[PathBuf], pricing: &PricingConfig) -> RunMetrics {
-    let (rows, turns, duration_ms) = aggregate_rows_and_metrics(paths);
-    RunMetrics {
-        usage: summarize(&rows, pricing),
-        turns,
-        duration_ms,
-    }
-}
-
-/// Full per-run metrics for a run in the store.
+/// Full per-run metrics for a run in the store: [`run_usage`]'s tokens and
+/// turns; the duration is the run record's wall clock once it has finished,
+/// else the longest transcript `RunComplete`.
 pub fn run_metrics(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> RunMetrics {
-    run_metrics_paths(&run_transcript_paths(store, run_id), pricing)
+    let (u, wall_clock) = UsageIndex::global().run_usage_and_wall_clock(store, run_id);
+    RunMetrics {
+        usage: summarize_run_usage(&u, pricing),
+        turns: u.turns,
+        duration_ms: wall_clock.or(u.duration_ms),
+    }
 }
 
 /// Combine many summaries into one. Token fields add; `priced` ANDs across
@@ -255,6 +271,7 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
         out.input_tokens += s.input_tokens;
         out.output_tokens += s.output_tokens;
         out.cached_tokens += s.cached_tokens;
+        out.cache_write_tokens += s.cache_write_tokens;
         out.runs += s.runs;
         if let Some(c) = s.cost_usd {
             any_cost = true;
@@ -263,6 +280,7 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
         if !s.priced {
             out.priced = false;
         }
+        out.partial |= s.partial;
     }
     out.total_tokens = out.input_tokens + out.output_tokens;
     out.cost_usd = if any_cost { Some(cost_acc) } else { None };
@@ -270,7 +288,7 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
 }
 
 /// Per-entity rollup: summed usage + run count + most-recent activity.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EntityRollup {
     pub usage: UsageSummary,
     pub run_count: u64,
@@ -278,11 +296,34 @@ pub struct EntityRollup {
     pub last_active: Option<String>,
 }
 
+/// An empty rollup is PRICED, matching `rollup(empty)`: `add_spend` ANDs
+/// `priced`, so a derived `Default` (`priced: false`) would latch every
+/// `rollup_by` entity to unpriced no matter what its runs cost.
+impl Default for EntityRollup {
+    fn default() -> Self {
+        Self {
+            usage: UsageSummary {
+                priced: true,
+                ..UsageSummary::default()
+            },
+            run_count: 0,
+            last_active: None,
+        }
+    }
+}
+
 impl EntityRollup {
     /// Fold one run's usage + timestamp into the rollup.
     pub fn add(&mut self, usage: &UsageSummary, at: Option<String>) {
-        self.usage = rollup([self.usage.clone(), usage.clone()].into_iter());
+        self.add_spend(usage, at);
         self.run_count += 1;
+    }
+
+    /// Fold spend + activity that is not a run-store run (a standalone agent
+    /// run or session turn): usage and `last_active` move, `run_count` —
+    /// the entity's workflow-run count — does not.
+    pub fn add_spend(&mut self, usage: &UsageSummary, at: Option<String>) {
+        self.usage = rollup([self.usage.clone(), usage.clone()].into_iter());
         if let Some(at) = at {
             match &self.last_active {
                 Some(cur) if *cur >= at => {}
@@ -382,6 +423,10 @@ pub struct UsageBreakdownRow {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`. Defaulted so a remote CP
+    /// that predates it still parses.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: Option<f64>,
     pub priced: bool,
@@ -441,6 +486,7 @@ pub fn breakdown(
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 0,
             cost_usd: None,
             priced: true,
@@ -449,10 +495,16 @@ pub fn breakdown(
         entry.input_tokens += row.input_tokens;
         entry.output_tokens += row.output_tokens;
         entry.cached_tokens += row.cached_tokens;
+        entry.cache_write_tokens += row.cache_write_tokens;
         entry.runs += row.runs;
         match rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent) {
             Some(price) => {
-                let c = price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens);
+                let c = price.cost_usd(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                );
                 entry.cost_usd = Some(entry.cost_usd.unwrap_or(0.0) + c);
             }
             None => entry.priced = false,
@@ -483,41 +535,12 @@ pub struct TurnPoint {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub tokens_cached: u64,
-}
-
-/// Build an ordered per-turn token series from labeled transcripts. Each
-/// `Usage` event becomes one point; transcripts are read in the given order
-/// and the `turn` counter is global across all of them. Unreadable/partial
-/// files are skipped.
-pub fn turn_series(labeled_paths: &[(String, PathBuf)]) -> Vec<TurnPoint> {
-    let mut out: Vec<TurnPoint> = Vec::new();
-    for (label, path) in labeled_paths {
-        let Ok(iter) = JsonlReader::iter(path) else {
-            continue;
-        };
-        for ev in iter.flatten() {
-            if let Event::Usage {
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                ..
-            } = ev
-            {
-                out.push(TurnPoint {
-                    turn: out.len() as u64 + 1,
-                    label: label.clone(),
-                    tokens_in: u64::from(input_tokens),
-                    tokens_out: u64::from(output_tokens),
-                    tokens_cached: u64::from(cached_tokens),
-                });
-            }
-        }
-    }
-    out
+    #[serde(default)]
+    pub tokens_cache_write: u64,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn row(provider: &str, model: &str, input: u64, output: u64, cached: u64) -> UsageRow {
@@ -552,6 +575,34 @@ mod tests {
         assert!(s.priced);
         // 1M*3.0 + 1M*15.0 = $18.00
         assert!((s.cost_usd.unwrap() - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summarize_and_breakdown_bill_cache_writes_at_the_write_rate() {
+        // Sonnet 4.6 built-in: $3 in / $15 out, $0.30 read, $3.75 write.
+        // 1M prompt = 500k read + 300k write + 200k uncached; 100k output.
+        let pricing = PricingConfig::default();
+        let rows = [UsageRow {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cached_tokens: 500_000,
+            cache_write_tokens: 300_000,
+            ..row("anthropic", "claude-sonnet-4-6", 0, 0, 0)
+        }];
+        let want = 0.2 * 3.0 + 0.5 * 0.30 + 0.3 * 3.75 + 0.1 * 15.0;
+
+        let s = summarize(&rows, &pricing);
+        assert!(
+            (s.cost_usd.unwrap() - want).abs() < 1e-9,
+            "{:?}",
+            s.cost_usd
+        );
+        assert_eq!(s.cache_write_tokens, 300_000);
+
+        let b = breakdown(&rows, &pricing, GroupBy::Model);
+        assert_eq!(b.len(), 1);
+        assert!((b[0].cost_usd.unwrap() - want).abs() < 1e-9);
+        assert_eq!(b[0].cache_write_tokens, 300_000);
     }
 
     #[test]
@@ -590,21 +641,21 @@ mod tests {
     }
 
     #[test]
-    fn summarize_run_reads_a_transcript() {
+    fn transcripts_usage_prices_a_transcript() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("rupu-cp-usage-run-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let tpath = dir.join("t.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let tpath = dir.path().join("t.jsonl");
         let mut f = std::fs::File::create(&tpath).unwrap();
         writeln!(f, r#"{{"type":"run_start","data":{{"run_id":"r1","workspace_id":"w","agent":"a","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
         writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":1000000,"output_tokens":0,"cached_tokens":0}}}}"#).unwrap();
         drop(f);
 
-        let s = summarize_paths(&[tpath], &PricingConfig::default());
+        let u = transcripts_usage(&[("r1".into(), tpath)]);
+        let s = summarize_run_usage(&u, &PricingConfig::default());
         assert_eq!(s.input_tokens, 1_000_000);
         assert!(s.priced);
+        assert!(!s.partial);
         assert!((s.cost_usd.unwrap() - 3.0).abs() < 1e-9);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -613,19 +664,23 @@ mod tests {
             input_tokens: 10,
             output_tokens: 5,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 15,
             cost_usd: Some(2.0),
             priced: true,
             runs: 1,
+            partial: false,
         };
         let unpriced = UsageSummary {
             input_tokens: 20,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 20,
             cost_usd: None,
             priced: false,
             runs: 1,
+            partial: false,
         };
         let r = rollup([priced, unpriced].into_iter());
         assert_eq!(r.input_tokens, 30);
@@ -634,6 +689,58 @@ mod tests {
         assert_eq!(r.runs, 2);
         assert!(!r.priced);
         assert!((r.cost_usd.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rollup_ors_partial_and_summarize_run_usage_carries_it() {
+        let whole = UsageSummary {
+            priced: true,
+            ..UsageSummary::default()
+        };
+        let short = UsageSummary {
+            priced: true,
+            partial: true,
+            ..UsageSummary::default()
+        };
+        assert!(!rollup([whole.clone(), whole.clone()].into_iter()).partial);
+        assert!(rollup([whole, short].into_iter()).partial);
+
+        let u = crate::usage_index::RunUsage {
+            rows: vec![row("anthropic", "claude-sonnet-4-6", 10, 5, 0)],
+            partial: true,
+            ..Default::default()
+        };
+        let s = summarize_run_usage(&u, &PricingConfig::default());
+        assert!(s.partial);
+        assert_eq!(s.total_tokens, 15);
+    }
+
+    #[test]
+    fn summarize_and_rollup_carry_cache_write_tokens() {
+        let pricing = PricingConfig::default();
+        let mut a = row("anthropic", "claude-sonnet-4-6", 1000, 10, 600);
+        a.cache_write_tokens = 30;
+        let mut b = row("anthropic", "claude-sonnet-4-6", 500, 5, 0);
+        b.cache_write_tokens = 5;
+        let s = summarize(&[a, b], &pricing);
+        assert_eq!(s.cache_write_tokens, 35);
+        assert_eq!(s.cached_tokens, 600);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["cache_write_tokens"], serde_json::json!(35), "{v}");
+
+        let r = rollup([s.clone(), s].into_iter());
+        assert_eq!(r.cache_write_tokens, 70);
+        let mut e = EntityRollup::default();
+        e.add(&r, None);
+        assert_eq!(e.usage.cache_write_tokens, 70);
+
+        // A remote CP that predates the field (host fan-out) parses as 0.
+        let old: UsageSummary = serde_json::from_value(serde_json::json!({
+            "input_tokens": 1, "output_tokens": 1, "cached_tokens": 0,
+            "total_tokens": 2, "cost_usd": null, "priced": false, "runs": 1
+        }))
+        .unwrap();
+        assert_eq!(old.cache_write_tokens, 0);
     }
 
     #[test]
@@ -657,78 +764,22 @@ mod tests {
     }
 
     #[test]
-    fn run_metrics_counts_turns_and_duration() {
+    fn transcripts_usage_counts_turns_and_duration() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("rupu-cp-metrics-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let tpath = dir.join("t.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let tpath = dir.path().join("t.jsonl");
         let mut f = std::fs::File::create(&tpath).unwrap();
         writeln!(f, r#"{{"type":"run_start","data":{{"run_id":"r1","workspace_id":"w","agent":"a","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
         writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":1000,"output_tokens":200,"cached_tokens":0}}}}"#).unwrap();
         writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":800,"output_tokens":150,"cached_tokens":50}}}}"#).unwrap();
         writeln!(f, r#"{{"type":"run_complete","data":{{"run_id":"r1","status":"ok","total_tokens":2150,"duration_ms":38000}}}}"#).unwrap();
         drop(f);
-        let m = run_metrics_paths(&[tpath], &PricingConfig::default());
-        assert_eq!(m.turns, 2);
-        assert_eq!(m.duration_ms, Some(38000));
-        assert_eq!(m.usage.input_tokens, 1800);
-        assert_eq!(m.usage.output_tokens, 350);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Pins the single-pass `run_metrics_paths` (via
-    /// `aggregate_rows_and_metrics`) against the old two-pass shape it
-    /// replaced: `summarize_paths` (`rupu_transcript::aggregate`, unchanged)
-    /// still computes usage the original way, so asserting the two agree —
-    /// across multiple transcripts with different agents/models, so the
-    /// `(provider, model, agent)` grouping actually exercises cross-file
-    /// merging — proves the single read produced byte-identical usage to the
-    /// old double read. Also checks turns (summed across both transcripts)
-    /// and duration (last `RunComplete` seen wins, same as the old
-    /// `turns_and_duration`).
-    #[test]
-    fn run_metrics_paths_usage_matches_old_two_pass_shape_across_transcripts() {
-        use std::io::Write;
-        let dir =
-            std::env::temp_dir().join(format!("rupu-cp-metrics-multi-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let p1 = dir.join("t1.jsonl");
-        let mut f1 = std::fs::File::create(&p1).unwrap();
-        writeln!(f1, r#"{{"type":"run_start","data":{{"run_id":"r1","workspace_id":"w","agent":"reviewer","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
-        writeln!(f1, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":1000,"output_tokens":200,"cached_tokens":0}}}}"#).unwrap();
-        writeln!(f1, r#"{{"type":"run_complete","data":{{"run_id":"r1","status":"ok","total_tokens":1200,"duration_ms":10000}}}}"#).unwrap();
-        drop(f1);
-
-        let p2 = dir.join("t2.jsonl");
-        let mut f2 = std::fs::File::create(&p2).unwrap();
-        writeln!(f2, r#"{{"type":"run_start","data":{{"run_id":"r2","workspace_id":"w","agent":"fixer","provider":"anthropic","model":"claude-opus-4-8","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
-        writeln!(f2, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-opus-4-8","input_tokens":50,"output_tokens":10,"cached_tokens":0}}}}"#).unwrap();
-        writeln!(f2, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-opus-4-8","input_tokens":25,"output_tokens":5,"cached_tokens":0}}}}"#).unwrap();
-        writeln!(f2, r#"{{"type":"run_complete","data":{{"run_id":"r2","status":"ok","total_tokens":90,"duration_ms":20000}}}}"#).unwrap();
-        drop(f2);
-
-        let paths = vec![p1, p2];
-        let pricing = PricingConfig::default();
-
-        // The old shape: usage computed independently via
-        // `rupu_transcript::aggregate` (through `summarize_paths`, which is
-        // untouched by this change).
-        let expected_usage = summarize_paths(&paths, &pricing);
-
-        let metrics = run_metrics_paths(&paths, &pricing);
-        assert_eq!(
-            metrics.usage, expected_usage,
-            "single-pass usage must be identical to the old two-pass (aggregate-based) usage"
-        );
-        assert_eq!(metrics.turns, 3, "3 Usage events across both transcripts");
-        assert_eq!(
-            metrics.duration_ms,
-            Some(20000),
-            "last RunComplete seen across paths wins"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let u = transcripts_usage(&[("r1".into(), tpath)]);
+        let s = summarize_run_usage(&u, &PricingConfig::default());
+        assert_eq!(u.turns, 2);
+        assert_eq!(u.duration_ms, Some(38000));
+        assert_eq!(s.input_tokens, 1800);
+        assert_eq!(s.output_tokens, 350);
     }
 
     #[test]
@@ -739,10 +790,12 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 total_tokens: 15,
                 cost_usd: Some(1.0),
                 priced: true,
                 runs: 1,
+                partial: false,
             },
             Some("2026-01-02T00:00:00Z".into()),
         );
@@ -751,10 +804,12 @@ mod tests {
                 input_tokens: 20,
                 output_tokens: 0,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 total_tokens: 20,
                 cost_usd: Some(2.0),
                 priced: true,
                 runs: 1,
+                partial: false,
             },
             Some("2026-01-01T00:00:00Z".into()),
         );
@@ -762,6 +817,7 @@ mod tests {
         assert_eq!(r.usage.input_tokens, 30);
         assert_eq!(r.usage.total_tokens, 35);
         assert!((r.usage.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+        assert!(r.usage.priced, "all-priced inputs keep the rollup priced");
         assert_eq!(r.last_active.as_deref(), Some("2026-01-02T00:00:00Z"));
     }
 
@@ -810,34 +866,45 @@ mod tests {
         assert_eq!(b[0].input_tokens, 2000);
     }
 
-    #[test]
-    fn turn_series_aggregates_labeled_transcripts_in_order() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("rupu-cp-turnseries-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mk = |name: &str, n: usize| {
-            let p = dir.join(name);
-            let mut f = std::fs::File::create(&p).unwrap();
-            for i in 0..n {
-                writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"m","input_tokens":{},"output_tokens":1,"cached_tokens":0}}}}"#, 100 + i).unwrap();
-            }
-            p
-        };
-        let a = mk("a.jsonl", 2);
-        let b = mk("b.jsonl", 1);
-        let series = turn_series(&[("step1".into(), a), ("step2".into(), b)]);
-        assert_eq!(series.len(), 3);
-        assert_eq!(series[0].turn, 1);
-        assert_eq!(series[0].label, "step1");
-        assert_eq!(series[0].tokens_in, 100);
-        assert_eq!(series[2].turn, 3);
-        assert_eq!(series[2].label, "step2");
-        let _ = std::fs::remove_dir_all(&dir);
+    // ── Off-executor wrappers ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_usage_blocking_matches_the_sync_fold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _) = seed_remote_run(tmp.path());
+        let cache = tmp.path().join("mirror/host_abc/transcripts/run_01A.jsonl");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cache,
+            concat!(
+                r#"{"type":"usage","data":{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":70,"output_tokens":7,"cached_tokens":0}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let sync = run_usage(&store, "run_01USAGE");
+        let off = run_usage_blocking(std::sync::Arc::clone(&store), "run_01USAGE".into()).await;
+        assert_eq!(off.rows, sync.rows);
+        assert_eq!(off.turns, sync.turns);
+        assert!(!off.partial);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_usage_computation_degrades_to_partial_never_an_error() {
+        let u = usage_blocking(
+            "test",
+            || -> Arc<RunUsage> { panic!("fold blew up") },
+            unknown_usage,
+        )
+        .await;
+        assert!(u.partial, "a failed fold is reported incomplete");
+        assert!(u.rows.is_empty());
+        assert_eq!(u.turns, 0);
     }
 
     // ── `run_transcript_paths`' host-mirror fallback (spec §6.3) ──────────
 
-    fn seed_remote_run(tmp: &std::path::Path) -> (std::sync::Arc<RunStore>, PathBuf) {
+    pub(crate) fn seed_remote_run(tmp: &std::path::Path) -> (std::sync::Arc<RunStore>, PathBuf) {
         let store = std::sync::Arc::new(RunStore::new(tmp.join("runs")));
         let mirror = crate::node::NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {

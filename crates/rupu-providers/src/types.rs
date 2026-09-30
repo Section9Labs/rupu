@@ -119,10 +119,25 @@ pub enum StopReason {
 /// Token usage for a request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// The WHOLE prompt, including cache reads and cache writes, for every
+    /// provider. Anthropic's wire `input_tokens` excludes both, so
+    /// `anthropic.rs` normalizes at the provider boundary.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt tokens served from the provider's prompt cache (cache reads) —
+    /// a SUBSET of `input_tokens`.
+    // The `cache_read_input_tokens` alias is legacy and harmless: Anthropic
+    // wire usage is now parsed by `anthropic::AnthropicWireUsage`, which
+    // normalizes at the provider boundary. Never normalize in this
+    // Deserialize — the broker also uses it for already-normalized values.
     #[serde(default, alias = "cache_read_input_tokens")]
     pub cached_tokens: u32,
+    /// Prompt tokens written to the provider's prompt cache on this call — a
+    /// SUBSET of `input_tokens`, like `cached_tokens` (cache reads). Only
+    /// Anthropic reports it (`cache_creation_input_tokens`); billed at the
+    /// cache-write rate (1.25x input for the 5-minute TTL).
+    #[serde(default)]
+    pub cache_write_tokens: u32,
     /// Reasoning/"thinking" tokens, billed separately from `output_tokens`.
     ///
     /// Only Gemini populates this (from `usageMetadata.thoughtsTokenCount`,
@@ -197,6 +212,15 @@ pub struct LlmRequest {
     /// enabled returns 400. Emitted as the top-level `speed: "fast"`
     /// body field. Ignored by other providers.
     pub anthropic_speed: Option<Speed>,
+    /// Per-request prompt-caching opt-out (spec 2026-09-29 §9). When `true`,
+    /// the Anthropic client emits no `cache_control` breakpoints for this
+    /// request even when caching is enabled on the client. For one-off
+    /// requests whose prefix nothing will ever re-read — e.g. the compaction
+    /// summary call, which has its own system prompt and no tools — where a
+    /// cache write would cost 1.25× input for no later read. Defaults to
+    /// `false` (the client-level setting decides). Ignored by other
+    /// providers.
+    pub disable_prompt_cache: bool,
 }
 
 /// Output-format hint passed to providers that support structured
@@ -542,6 +566,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 reasoning_tokens: 0,
             },
         }

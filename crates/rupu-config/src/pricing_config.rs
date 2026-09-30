@@ -47,9 +47,10 @@ pub struct PricingConfig {
 }
 
 /// USD per million tokens for one model (or one agent's fallback
-/// price). `cached_input_per_mtok` is optional — some vendors don't
-/// charge separately for cache hits, so leaving it absent makes the
-/// cost calculator treat cached tokens as fully-priced input.
+/// price). `cached_input_per_mtok` and `cache_write_per_mtok` are
+/// optional — some vendors don't charge separately for cache hits or
+/// writes, so leaving either absent makes the cost calculator treat those
+/// tokens as fully-priced input.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelPricing {
@@ -61,25 +62,44 @@ pub struct ModelPricing {
     /// are billed at the full `input_per_mtok` rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_per_mtok: Option<f64>,
+    /// USD per million cache-WRITE tokens (prompt-cache creation). When
+    /// `None`, cache writes are billed at the full `input_per_mtok` rate.
+    /// Anthropic is the vendor that bills writes at a premium (1.25x input
+    /// for the 5-minute TTL); OpenAI and Gemini bill no separate write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 impl ModelPricing {
-    /// Compute the USD cost for one (input, output, cached) tuple.
+    /// Compute the USD cost for one (input, output, cached, cache-write)
+    /// tuple.
     ///
-    /// `cached` is treated as a SUBSET of `input` — the convention all
-    /// three major vendors use (Anthropic prompt caching, OpenAI
-    /// `cached_tokens`, Gemini context-cache reads). Uncached input is
-    /// `input - cached`, so the formula is:
+    /// `input_tokens` is the WHOLE prompt, and `cached_tokens` (cache
+    /// reads) and `cache_write_tokens` (cache creations) are two disjoint
+    /// SUBSETS of it — the convention all three major vendors use
+    /// (Anthropic prompt caching, OpenAI `cached_tokens`, Gemini
+    /// context-cache reads). Anthropic's wire format reports the three
+    /// counts separately, but the provider layer normalizes them upstream
+    /// so `input_tokens` already includes reads and writes (see
+    /// `rupu_providers::anthropic::AnthropicWireUsage`). Uncached input is
+    /// therefore `input - cached - cache_write`, and the formula is:
     ///
     /// ```text
-    /// cost = (input - cached) * input_per_mtok / 1e6
-    ///      + cached           * cached_per_mtok / 1e6
-    ///      + output           * output_per_mtok / 1e6
+    /// cost = (input - cached - cache_write) * input_per_mtok       / 1e6
+    ///      + cached                         * cached_per_mtok      / 1e6
+    ///      + cache_write                    * cache_write_per_mtok / 1e6
+    ///      + output                         * output_per_mtok      / 1e6
     /// ```
     ///
-    /// When `cached_input_per_mtok` is unset, cached tokens fall back
-    /// to the full input rate (still correct, just less favorable —
-    /// over-estimates the bill rather than under-estimating).
+    /// When `cached_input_per_mtok` or `cache_write_per_mtok` is unset,
+    /// those tokens fall back to the full input rate: an over-estimate for
+    /// unset reads, and the exact bill for a vendor with no separate write
+    /// charge. (A user pricing Anthropic by hand should set both; the
+    /// built-in Anthropic entries do.)
+    ///
+    /// Malformed reports are clamped, never negative: reads claim their
+    /// share of `input` first (capped at `input`), writes then take at most
+    /// what remains, and the uncached remainder is whatever is left.
     ///
     /// **`output_tokens` must already be the BILLABLE output** (I-48).
     ///
@@ -97,14 +117,22 @@ impl ModelPricing {
     /// from the already-folded transcript, so such a function could only ever
     /// double-bill. The raw split stays visible on `Usage::reasoning_tokens`
     /// for anyone who needs it.
-    pub fn cost_usd(&self, input_tokens: u64, output_tokens: u64, cached_tokens: u64) -> f64 {
-        let cached = cached_tokens.min(input_tokens) as f64;
-        let uncached_input = (input_tokens.saturating_sub(cached_tokens)) as f64;
-        let output = output_tokens as f64;
-        let cached_rate = self.cached_input_per_mtok.unwrap_or(self.input_per_mtok);
-        (uncached_input * self.input_per_mtok
-            + cached * cached_rate
-            + output * self.output_per_mtok)
+    pub fn cost_usd(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        cache_write_tokens: u64,
+    ) -> f64 {
+        let cached = cached_tokens.min(input_tokens);
+        let write = cache_write_tokens.min(input_tokens - cached);
+        let uncached = input_tokens - cached - write;
+        let read_rate = self.cached_input_per_mtok.unwrap_or(self.input_per_mtok);
+        let write_rate = self.cache_write_per_mtok.unwrap_or(self.input_per_mtok);
+        (uncached as f64 * self.input_per_mtok
+            + cached as f64 * read_rate
+            + write as f64 * write_rate
+            + output_tokens as f64 * self.output_per_mtok)
             / 1_000_000.0
     }
 }
@@ -119,8 +147,9 @@ mod tests {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.30),
+            cache_write_per_mtok: None,
         };
-        assert_eq!(p.cost_usd(0, 0, 0), 0.0);
+        assert_eq!(p.cost_usd(0, 0, 0, 0), 0.0);
     }
 
     #[test]
@@ -130,8 +159,9 @@ mod tests {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.30),
+            cache_write_per_mtok: None,
         };
-        let c = p.cost_usd(1_000_000, 0, 0);
+        let c = p.cost_usd(1_000_000, 0, 0, 0);
         assert!((c - 3.0).abs() < 1e-9, "got {c}");
     }
 
@@ -146,8 +176,9 @@ mod tests {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.30),
+            cache_write_per_mtok: None,
         };
-        let c = p.cost_usd(1_000_000, 100_000, 800_000);
+        let c = p.cost_usd(1_000_000, 100_000, 800_000, 0);
         assert!((c - 2.34).abs() < 1e-9, "got {c}");
     }
 
@@ -159,8 +190,9 @@ mod tests {
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         };
-        let c = p.cost_usd(1_000_000, 100_000, 800_000);
+        let c = p.cost_usd(1_000_000, 100_000, 800_000, 0);
         assert!((c - 4.50).abs() < 1e-9, "got {c}");
     }
 
@@ -173,11 +205,70 @@ mod tests {
             input_per_mtok: 3.0,
             output_per_mtok: 0.0,
             cached_input_per_mtok: Some(0.30),
+            cache_write_per_mtok: None,
         };
         // 100 input, 500 cached → uncached clamps to 0, cached clamps to 100.
         // cost = 100 * 0.30 / 1e6 = 0.00003
-        let c = p.cost_usd(100, 0, 500);
+        let c = p.cost_usd(100, 0, 500, 0);
         assert!((c - 0.000_03).abs() < 1e-12, "got {c}");
+    }
+
+    #[test]
+    fn cost_bills_reads_writes_and_uncached_separately() {
+        let p = ModelPricing {
+            input_per_mtok: 4.0,
+            output_per_mtok: 20.0,
+            cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: Some(5.0),
+        };
+        // 1M prompt = 700k read + 200k write + 100k uncached; 10k output.
+        let c = p.cost_usd(1_000_000, 10_000, 700_000, 200_000);
+        let want = 0.1 * 4.0 + 0.7 * 0.20 + 0.2 * 5.0 + 0.01 * 20.0;
+        assert!((c - want).abs() < 1e-9, "{c} vs {want}");
+    }
+
+    #[test]
+    fn write_rate_defaults_to_input_rate() {
+        let p = ModelPricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
+        };
+        assert!((p.cost_usd(1_000_000, 0, 0, 1_000_000) - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reads_plus_writes_exceeding_input_are_clamped() {
+        let p = ModelPricing {
+            input_per_mtok: 1.0,
+            output_per_mtok: 0.0,
+            cached_input_per_mtok: Some(0.1),
+            cache_write_per_mtok: Some(1.25),
+        };
+        // Malformed report: read+write > input. Never negative uncached.
+        let c = p.cost_usd(100, 0, 80, 80);
+        assert!(c >= 0.0);
+        // Reads claim their 80 first, writes get the remaining 20, and
+        // nothing is left uncached: 80 * 0.1 + 20 * 1.25 = 33 (per 1e6).
+        assert!((c - 33.0 / 1_000_000.0).abs() < 1e-15, "got {c}");
+    }
+
+    #[test]
+    fn config_without_write_rate_still_deserializes_and_omits_it_on_write() {
+        // User configs written before the cache-write field existed keep
+        // parsing, and an unset write rate is not serialized back out.
+        let p: ModelPricing =
+            toml::from_str("input_per_mtok = 3.0\noutput_per_mtok = 15.0\n").unwrap();
+        assert_eq!(p.cache_write_per_mtok, None);
+        let out = toml::to_string(&p).unwrap();
+        assert!(!out.contains("cache_write_per_mtok"), "{out}");
+
+        let with: ModelPricing = toml::from_str(
+            "input_per_mtok = 3.0\noutput_per_mtok = 15.0\ncache_write_per_mtok = 3.75\n",
+        )
+        .unwrap();
+        assert_eq!(with.cache_write_per_mtok, Some(3.75));
     }
 
     #[test]

@@ -117,6 +117,8 @@ describe('FindingsTable — code href', () => {
       ws_id: 'ws 1',
       project: 'p',
       target_id: 't',
+      codename: 'amber-delta/heron',
+      codename_derived: false,
     };
     renderTable([f]);
     expect(screen.getByRole('button', { name: /src\/a b\.rs/ })).toBeInTheDocument();

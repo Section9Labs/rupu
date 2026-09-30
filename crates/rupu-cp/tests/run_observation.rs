@@ -908,6 +908,142 @@ async fn get_run_usage_timeline_proxies_to_remote_host() {
     );
 }
 
+// ── GET /api/runs/:id/usage?host= ─────────────────────────────────────────────
+
+/// `GET /api/runs/:id/usage?host=<remote>&since=&epoch=` proxies to the HTTP
+/// host, forwarding the incremental cursor, and returns its body verbatim.
+#[tokio::test]
+async fn get_run_usage_proxies_to_remote_host_with_the_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "summary": {"input_tokens": 40, "output_tokens": 1, "cached_tokens": 0,
+                    "total_tokens": 41, "cost_usd": null, "priced": false,
+                    "runs": 1, "partial": false},
+        "steps": {},
+        "turns": 4,
+        "partial": false,
+        "epoch": "1790000000000000001",
+        "points_from": 3,
+        "points": [{"turn": 4, "label": "b", "tokens_in": 40, "tokens_out": 1, "tokens_cached": 0}],
+    });
+    let mock_server = httpmock::MockServer::start_async().await;
+    let m = mock_server.mock(|when, then| {
+        when.method("GET")
+            .path("/api/runs/remote_usage_r2/usage")
+            .query_param("since", "3")
+            .query_param("epoch", "1790000000000000001");
+        then.status(200).json_body(body.clone());
+    });
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/remote_usage_r2/usage?host={host_id}&since=3&epoch=1790000000000000001"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(got, body);
+    m.assert();
+}
+
+/// A remote CP that predates the endpoint answers 404; the proxy must say
+/// 404 too (the web degrades on it), never a 500.
+#[tokio::test]
+async fn get_run_usage_older_remote_404_maps_to_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock_server = httpmock::MockServer::start_async().await;
+    let _m = mock_server.mock(|when, then| {
+        when.method("GET").path("/api/runs/remote_usage_r3/usage");
+        then.status(404);
+    });
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/remote_usage_r3/usage?host={host_id}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A real older CP has no `/usage` route: its SPA fallback answers the path
+/// with `200 text/html`. That too is "this host cannot serve live usage" —
+/// a 404, never a 500.
+#[tokio::test]
+async fn get_run_usage_older_remote_spa_fallback_maps_to_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock_server = httpmock::MockServer::start_async().await;
+    let _m = mock_server.mock(|when, then| {
+        when.method("GET").path("/api/runs/remote_usage_r4/usage");
+        then.status(200)
+            .header("content-type", "text/html")
+            .body("<!doctype html><html><head></head><body></body></html>");
+    });
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/remote_usage_r4/usage?host={host_id}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A reply cut off mid-body is a transport failure, not an older CP: it stays
+/// a 5xx rather than being mistaken for "this host has no such endpoint".
+#[tokio::test]
+async fn get_run_usage_truncated_remote_reply_stays_5xx() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      content-length: 100\r\n\r\n{\"summary\":",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &format!("http://{remote}")).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/remote_usage_r5/usage?host={host_id}"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        resp.status().is_server_error(),
+        "a truncated reply must stay 5xx, got {}",
+        resp.status()
+    );
+}
+
+/// `GET /api/runs/:id/usage?host=<unknown>` → 404.
+#[tokio::test]
+async fn get_run_usage_unknown_host_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/some_run/usage?host=host_DOESNOTEXIST"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 /// `GET /api/runs/:id/usage-timeline?host=<unknown>` → 404.
 #[tokio::test]
 async fn get_run_usage_timeline_unknown_host_returns_404() {
