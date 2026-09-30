@@ -7393,7 +7393,9 @@ async fn run_fanout_step(
         skipped: false,
         kind: crate::runs::StepKind::ForEach,
         items: items_vec,
-        codename: step_codename(opts, step).map(|c| c.to_string()),
+        // The instances (`crew/role#n`) live on the items; the step record
+        // itself names no single member (see `StepResultRecord::codename`).
+        codename: None,
         ..Default::default()
     }))
 }

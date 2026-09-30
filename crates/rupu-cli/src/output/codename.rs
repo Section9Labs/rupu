@@ -4,11 +4,23 @@ use super::palette;
 use chrono::{DateTime, Utc};
 use rupu_codename::{crew_tint, derive_legacy, role_badge, Codename, Tint};
 
-/// The stored codename, else the legacy-derived one.
+/// The stored codename, else the legacy-derived one. A stored value that
+/// is not a valid [`Codename`] (a malformed or remote-supplied string) is
+/// treated as absent, so it can never carry terminal escapes into a table
+/// or header.
 pub fn display_codename(stored: Option<&str>, id: &str, agent: Option<&str>) -> String {
     stored
-        .map(str::to_string)
+        .and_then(|s| s.parse::<Codename>().ok())
+        .map(|c| c.to_string())
         .unwrap_or_else(|| derive_legacy(id, agent))
+}
+
+/// `s` with control characters (ESC, CR, …) replaced, for the write_*
+/// fallbacks that print a string which did not parse as a codename.
+fn sanitized(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 fn rgb(t: Tint) -> owo_colors::Rgb {
@@ -21,16 +33,16 @@ pub fn write_crew(buf: &mut String, crew: &str) {
     if let Some(t) = crew_tint(crew) {
         let _ = palette::write_colored(buf, "●", rgb(t));
         buf.push(' ');
-        let _ = palette::write_bold_colored(buf, crew, rgb(t));
+        let _ = palette::write_bold_colored(buf, &sanitized(crew), rgb(t));
     } else {
-        buf.push_str(crew);
+        buf.push_str(&sanitized(crew));
     }
 }
 
 /// Role badge glyph in its hue + the leaf (`heron#4`).
 pub fn write_member(buf: &mut String, codename: &str) {
     let Ok(c) = codename.parse::<Codename>() else {
-        buf.push_str(codename);
+        buf.push_str(&sanitized(codename));
         return;
     };
     match c.segments.last() {
@@ -182,6 +194,26 @@ mod tests {
             d,
             rupu_codename::derive_legacy("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", None)
         );
+    }
+
+    #[test]
+    fn malformed_stored_codename_never_reaches_the_terminal() {
+        let id = "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W";
+        for bad in [
+            "\x1b[31mjade-reef",
+            "jade-reef/heron\x1b]0;x\x07",
+            "not a codename",
+        ] {
+            assert_eq!(
+                display_codename(Some(bad), id, None),
+                derive_legacy(id, None),
+                "{bad:?}"
+            );
+            let mut buf = String::new();
+            write_member(&mut buf, bad);
+            write_crew(&mut buf, bad);
+            assert!(!buf.chars().any(char::is_control), "{buf:?}");
+        }
     }
 
     #[test]

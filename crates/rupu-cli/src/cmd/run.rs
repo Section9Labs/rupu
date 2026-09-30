@@ -545,7 +545,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         .run_id
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
-    let codename = standalone_codename(&run_id, &spec.name, std::env::var("RUPU_CODENAME").ok());
+    let codename = standalone_codename(
+        &run_id,
+        &spec.name,
+        placed_codename_override(args.run_id.is_some(), std::env::var("RUPU_CODENAME").ok()),
+    );
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
@@ -1333,8 +1337,20 @@ impl PermissionDecider for AskDecider {
     }
 }
 
+/// `RUPU_CODENAME` counts only for a placed launch, which always passes
+/// the coordinator-minted `--run-id` too. A bare `rupu run` ignores it, so
+/// an ambient `RUPU_CODENAME` left in a user's shell can't stamp one name on
+/// every run they start.
+pub(crate) fn placed_codename_override(
+    run_id_supplied: bool,
+    env: Option<String>,
+) -> Option<String> {
+    env.filter(|_| run_id_supplied)
+}
+
 /// Codename for a standalone `rupu run`: a placed unit's coordinator passes
-/// its minted name via `RUPU_CODENAME`; otherwise the run is its own crew.
+/// its minted name via `RUPU_CODENAME` (see [`placed_codename_override`]);
+/// otherwise the run is its own crew.
 pub(crate) fn standalone_codename(
     run_id: &str,
     agent: &str,
@@ -1362,6 +1378,19 @@ mod tests {
         assert_eq!(placed.to_string(), "cobalt-harbor/heron#412");
         let junk = standalone_codename(id, "triage", Some("junk".into()));
         assert_eq!(junk.to_string(), "jade-reef/numbat");
+    }
+
+    #[test]
+    fn rupu_codename_env_is_honoured_only_with_an_explicit_run_id() {
+        let id = "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W";
+        let env = || Some("cobalt-harbor/heron#412".to_string());
+        // Ambient env, no --run-id: ignored, the run is its own crew.
+        let bare = standalone_codename(id, "triage", placed_codename_override(false, env()));
+        assert_eq!(bare.to_string(), "jade-reef/numbat");
+        // Placed launch (--run-id + RUPU_CODENAME): the coordinator's name.
+        let placed = standalone_codename(id, "triage", placed_codename_override(true, env()));
+        assert_eq!(placed.to_string(), "cobalt-harbor/heron#412");
+        assert_eq!(placed_codename_override(true, None), None);
     }
 
     #[test]
