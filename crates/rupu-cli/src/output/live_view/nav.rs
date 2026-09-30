@@ -192,15 +192,29 @@ impl NavState {
         let subs_len = self.sub_list(view).len();
         self.sub_idx = clamp_idx(self.sub_idx, subs_len);
 
-        if self.depth == Depth::SubAgent && subs_len == 0 {
-            self.depth = Depth::Unit;
+        // Clamp to the deepest level that is actually available. A level is
+        // only reachable through its parent, so this cascades: e.g. a
+        // sub-agent depth with no selectable unit drops all the way to Step,
+        // never leaving a parentless sub-agent selected.
+        let deepest = if view.steps.is_empty() {
+            Depth::Run
+        } else if units_len == 0 {
+            Depth::Step
+        } else if subs_len == 0 {
+            Depth::Unit
+        } else {
+            Depth::SubAgent
+        };
+        if self.depth.rank() > deepest.rank() {
+            self.depth = deepest;
         }
-        if self.depth == Depth::Unit && units_len == 0 {
-            self.depth = Depth::Step;
-        }
-        if self.depth == Depth::Step && view.steps.is_empty() {
-            self.depth = Depth::Run;
-        }
+    }
+
+    /// Reconcile depth/cursors against a possibly-changed view (call once per
+    /// render tick before reading `depth()` / `selected_*`). Same logic as the
+    /// internal settle applied on every [`NavState::apply`].
+    pub fn sync(&mut self, view: &RunView) {
+        self.settle(view);
     }
 
     /// The pure transition. Returns [`NavAction::Quit`] / [`NavAction::Pause`]
@@ -658,5 +672,72 @@ mod tests {
                 UnitFilter::Running
             ]
         );
+    }
+
+    #[test]
+    fn settle_demotes_subagent_when_units_empty() {
+        let mut v = fanout_view();
+        dispatch(&mut v, "sub1", "wren#1");
+        let mut nav = NavState::default();
+        for _ in 0..3 {
+            nav.apply(NavKey::In, &v);
+        }
+        assert_eq!(nav.depth(), Depth::SubAgent);
+
+        // Running: all three units still match, sub-agent stays selectable.
+        nav.apply(NavKey::Filter, &v);
+        assert_eq!(nav.filter(), UnitFilter::Running);
+        assert_eq!(nav.depth(), Depth::SubAgent);
+
+        // Failed: no unit matches while a sub-agent still exists. Depth must
+        // cascade all the way to Step, not stay on a parentless sub-agent.
+        nav.apply(NavKey::Filter, &v);
+        assert_eq!(nav.filter(), UnitFilter::Failed);
+        assert!(nav.selected_unit(&v).is_none());
+        assert_eq!(nav.depth(), Depth::Step);
+        assert_eq!(nav.breadcrumb(&v), vec!["mint-tundra", "hunt"]);
+
+        // Every running unit completing under filter=Running does the same
+        // without any keypress changing the filter.
+        let mut v = fanout_view();
+        dispatch(&mut v, "sub1", "wren#1");
+        let mut nav = NavState::default();
+        for _ in 0..3 {
+            nav.apply(NavKey::In, &v);
+        }
+        nav.apply(NavKey::Filter, &v); // Running
+        assert_eq!(nav.depth(), Depth::SubAgent);
+        for i in 0..3 {
+            complete_unit(&mut v, "hunt", i, true);
+        }
+        nav.sync(&v);
+        assert_eq!(nav.depth(), Depth::Step);
+        assert!(nav.selected_unit(&v).is_none());
+    }
+
+    #[test]
+    fn sync_reconciles_depth_on_view_change() {
+        let f = fanout_view();
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &f);
+        nav.apply(NavKey::In, &f);
+        assert_eq!(nav.depth(), Depth::Unit);
+
+        // Same step id, but the new view's step has no units.
+        let mut no_units = RunView::default();
+        start_step(&mut no_units, "hunt", StepKind::Linear);
+        nav.sync(&no_units);
+        assert_eq!(nav.depth(), Depth::Step);
+        assert!(nav.selected_unit(&no_units).is_none());
+
+        // A view with no steps at all pulls depth back to Run.
+        nav.sync(&RunView::default());
+        assert_eq!(nav.depth(), Depth::Run);
+
+        // sync never promotes: a consistent view leaves depth alone.
+        let mut nav = NavState::default();
+        nav.apply(NavKey::In, &f);
+        nav.sync(&f);
+        assert_eq!(nav.depth(), Depth::Step);
     }
 }
