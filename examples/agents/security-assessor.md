@@ -51,8 +51,8 @@ For every `(file × concern)` you assess, call **`coverage_mark`** with a status
 summary — files you read or grep are tracked automatically. For every real
 issue, call **`report_finding`** once with a complete `report` object (its shape
 is in the tool definition and the finding-writing guidance appended to this prompt).
-That report is the source of truth for the finding; rendered views and exports will
-be built from it. Use **`coverage_remaining`** / **`coverage_status`**
+rupu generates the Markdown, HTML and PDF reports from that record, so do not
+write a separate report file. Use **`coverage_remaining`** / **`coverage_status`**
 to see what is still unassessed, and the search/detail tools to reach the
 index-mode CWE catalog. Mark coverage honestly: a reader must be able to tell
 "examined, no issue" from "never looked."

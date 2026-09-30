@@ -329,6 +329,28 @@ A visual mockup was reviewed during brainstorming; it is not part of the repo.
   gets a smoke test only: it compiles, it's non-empty, and the page count is
   as expected.
 
+### Deviations as built (Plan 3)
+
+Plan 3 (`docs/superpowers/plans/2026-09-29-rupu-finding-reports-plan-3-exports.md`)
+shipped the export generation above, with these differences from the text:
+
+- **CLI flag is `--to`**, not `--format`: `--format` is rupu's global output flag
+  (`table`/`json`/`csv`), so the document format is `rupu findings export --to
+  md|html|pdf`.
+- **The display-number prefix is global-config only.** `[findings].export_id_prefix`
+  is read from `~/.rupu/config.toml`; a project's `.rupu/config.toml` never
+  changes it (it is repo-controlled and lands in file names and document text).
+  It is validated (`^[A-Za-z][A-Za-z0-9_-]{0,15}$`, else `SEC`).
+- **PDF is a default-on cargo feature `pdf`** (forwarded by `rupu-cp` and
+  `rupu-cli`), because Typst and its bundled fonts add roughly 45-55 MB to a
+  release binary. Without it, Markdown and HTML still export and PDF reports
+  "compiled without PDF support".
+- **HTML renders images as their alt text** and embeds a strict
+  Content-Security-Policy (`default-src 'none'`, no `<base>`, no form posts) and a
+  no-referrer policy, so an exported document loads nothing.
+- **PDF fonts are bundled but limited** to Libertinus Serif, New Computer Modern
+  and DejaVu Sans Mono: no CJK or emoji glyphs.
+
 ## Backfill (last, optional)
 
 `rupu findings import <dir>` parses finding reports written by the old

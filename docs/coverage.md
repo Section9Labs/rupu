@@ -106,9 +106,10 @@ list them in the agent's `tools:`):
 ## Finding reports
 
 A finding is recorded once, as structured data. That structured record is the
-source of truth for the finding: rendered views and exports are built on it (see
-"Viewing reports in the control plane" and "Not built yet" at the end of this
-section for what exists today).
+source of truth for the finding: rupu generates the rendered views and the
+Markdown, HTML and PDF exports from it, so an agent never writes a separate
+report file (see "Viewing reports in the control plane" and "Exporting reports"
+at the end of this section).
 
 ### Profiles
 
@@ -220,11 +221,13 @@ artifact_max_files = 500         # files per report's artifacts (default 500)
 artifact_total_max_bytes = 2147483648  # bytes copied into the store per report (default 2 GiB)
 report_max_bytes = 262144        # serialized report budget (default 256 KiB)
 ticket_patterns = ["ABC-[0-9]+"] # extra hints appended to the full-profile guidance
+export_id_prefix = "VULN"        # number prefix for exported reports (default "SEC"; global config only)
 ```
 
 `ticket_patterns` lets an organisation say which reference formats count as
 existing tickets. Nothing organisation-specific ships in rupu. The keys are also
-listed in [configuration.md](configuration.md#findings).
+listed in [configuration.md](configuration.md#findings). `export_id_prefix` is
+covered under [Exporting reports](#exporting-reports).
 
 ### `rupu findings schema`
 
@@ -232,6 +235,8 @@ listed in [configuration.md](configuration.md#findings).
 rupu findings schema                 Print the embedded draft-07 JSON Schema of a finding report
 rupu findings schema --advertised    Print the simplified copy used in tool definitions
 ```
+
+To write reports out of the store, see [`rupu findings export`](#rupu-findings-export).
 
 The schema is embedded in the binary and kept in lockstep with the validator by
 a test, so external prompts and tools can be generated from rupu rather than
@@ -296,11 +301,124 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
   endpoint answers `404` for it, because fetching from another host is not
   built (see `TODO.md`).
 
-### Not built yet
+### Exporting reports
 
-Markdown, HTML, and PDF export of a report arrives in a later plan. Today a
-`full` report is stored on the finding record, its artifacts are stored as
-described above, and the control-plane web UI is the rendered view.
+A stored finding can be exported as Markdown, self-contained HTML, or PDF, for
+one finding or for a whole project. The Markdown, HTML and PDF documents all
+carry the same sections in the same order, and every field of the report is in
+them: CWE, verification, ticket notes, claim-to-artifact links, artifact kind and
+host, and provenance (surface, concern, scope, location). Free-text fields that
+the report stores as Markdown (the location input and output among them) render
+as Markdown. A `summary`-profile finding exports as a short document built from
+its summary, severity, location, rationale and provenance, marked as a summary
+finding.
+
+**Numbering.** Exports number findings within their project: by severity
+(critical first), then by when the finding was declared, then by id, formatted
+`<PREFIX>-NNN` (`SEC-001`, `SEC-002`, …). Numbers are assigned across all of a
+project's findings before any filter is applied, so a finding keeps its number
+whatever else a report leaves out, and the CLI and the control plane agree on
+it. A number is a display label for a point in time, not a stored identifier:
+recording a new critical finding renumbers the ones after it. The `fnd_` id is
+the stable handle, and a project report's index lists number and id side by
+side.
+
+The prefix comes from `[findings].export_id_prefix`, default `SEC`. It is read
+from the **global** config (`~/.rupu/config.toml`) only: a project's
+`.rupu/config.toml` never changes it, because that file is repo-controlled and the
+prefix ends up in file names and document text. It must match
+`^[A-Za-z][A-Za-z0-9_-]{0,15}$`; anything else is ignored with a warning and the
+default is used.
+
+**File names.** A finding is named `<NUMBER> - <Short Title>.<ext>`, for example
+`SEC-003 - SQL injection in the search endpoint.pdf`. The title is shortened
+(80 characters), whitespace is collapsed, and path separators, Windows-reserved
+characters, control characters and bidirectional-override characters are
+removed. Entries in a split zip are cleaned the same way and de-duplicated. A
+project report is named after its title (default "Findings report").
+
+**Formats.**
+
+- **Markdown** (`md`): plain text in the standard section order, opening with
+  the standard's `Filename:` line.
+- **HTML** (`html`): one self-contained file with inline CSS. It loads nothing
+  from the network and runs no script; a strict Content-Security-Policy
+  (`default-src 'none'`, no `<base>`, no form posts) and a no-referrer policy are
+  embedded in the document as defence in depth. Report text is escaped or passed
+  through a Markdown converter that neutralises raw HTML and script-like URLs,
+  and images are rendered as their alt text rather than loaded.
+- **PDF** (`pdf`): generated in process with Typst, with no headless browser and
+  no external tools. Fonts are bundled (Libertinus Serif, New Computer Modern,
+  DejaVu Sans Mono), so output does not depend on the machine; the flip side is
+  that the bundle has no CJK or emoji glyphs, so those characters do not render
+  in a PDF (Markdown and HTML keep them). The Typst world can read no files, so a report cannot pull in a local
+  file or image. PDF export is behind the `pdf` cargo feature, on by default
+  and forwarded by `rupu-cp` and `rupu-cli`; it adds roughly 45-55 MB to a
+  release binary. A build without it (`--no-default-features`) still exports
+  Markdown and HTML, and asking for PDF fails with "compiled without PDF
+  support" (a non-zero exit from the CLI, `501` from the control plane).
+
+**Project reports.** A project report has a title, a summary of what it covers,
+an index (number, severity, title, project, finding id, profile), then each finding as its own section
+(its own page in the PDF). With **split**, the export is a zip holding
+`index.md` (always Markdown) and one file per finding in the chosen format.
+Summary-profile findings are left out unless asked for; naming one with `--id`
+counts as asking.
+
+#### `rupu findings export`
+
+```
+rupu findings export [--id <fnd_…>]… [--project <ws_id|path>] [--run <run_id>]
+                     [--severity <critical|high|medium|low|info>]
+                     [--owner <name>] [--cwe <CWE-n>] [--include-summaries]
+                     [--to md|html|pdf] [--split] [--title <text>] -o <path>
+```
+
+The document format is `--to` (default `md`), not `--format`: `--format` is
+rupu's global output flag (`table`, `json`, `csv`) and has nothing to shape here.
+Filters combine: a finding must pass all of them. `--severity` keeps that
+severity and worse. `--run` keeps findings declared by that run and its sub-runs.
+`--project` takes a workspace id or the path of a checkout.
+
+A single `--id` with no other selector writes that finding as a stand-alone
+document. Anything else (several `--id`s, or any filter, `--split`, or `--title`)
+writes a project report over the selection. `-o` is a file path, or an existing
+directory to receive the generated file name. A write failure reports the OS
+cause, and an `-o` extension that does not match the format (a zip written to
+`report.pdf`, say) produces a warning but is still written.
+
+```bash
+# One finding as a PDF, named SEC-003 - <title>.pdf, into the existing ./reports
+rupu findings export --id fnd_01J8… --to pdf -o ./reports
+
+# Everything high or worse in one project, as a single HTML report
+rupu findings export --project ~/src/service --severity high --to html \
+  --title "Service assessment" -o assessment.html
+
+# A finding per file plus an index, for one run's findings
+rupu findings export --run run_01J8… --to pdf --split -o run-findings.zip
+```
+
+#### In the control plane
+
+On a finding's report page, **Markdown**, **HTML** and **PDF** buttons download
+that one finding; a failure shows inline on the page. The global Findings page
+and a project's Findings tab have an **Export report** button that opens a
+dialog for exactly the rows currently listed (filters applied): choose the
+format, tick **One file per finding (zip)** to split, tick **Include summary
+findings** to add the `summary`-profile rows (off by default), and set the
+title. The download is named by the server.
+
+- `GET /api/findings/:id/export?format=md|html|pdf` returns one finding.
+- `POST /api/findings/export` takes `{format, title?, ids?, ws_id?, run_id?,
+  min_severity?, owner?, cwe?, include_summaries?, split?}`; unknown fields are
+  rejected (a misspelt filter must not widen the report), and a selection that
+  matches nothing is `404`.
+
+Both are attachments with `Content-Disposition: attachment` and
+`X-Content-Type-Options: nosniff`; an HTML response also carries
+`Content-Security-Policy: sandbox`. The control plane uses the same numbering
+and the same global-config prefix as the CLI.
 
 ## CLI
 
