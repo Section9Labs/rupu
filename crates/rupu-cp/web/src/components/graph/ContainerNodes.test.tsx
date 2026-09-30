@@ -7,6 +7,7 @@
 // `rgba(<r>, <g>, <b>, <alpha>)`), since `useThemeColors` reads the raw
 // channels directly off `document.documentElement`'s inline style (no
 // var()-resolution involved).
+import { nodeSize, PARALLEL_HEADER_H, PARALLEL_SUBROW_ID_H, PARALLEL_PAD_V } from '../../lib/nodeSize';
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
@@ -255,9 +256,15 @@ describe('codenames on container nodes', () => {
     } as GraphNode;
     renderParallel(node);
     expect(screen.getByText('lint')).toBeInTheDocument();
-    expect(screen.getByText('heron.a · linter · anthropic/claude-opus-5-5')).toBeInTheDocument();
+    expect(screen.getByText('heron.a · linter')).toBeInTheDocument();
+    // provider/model on its own line
+    expect(screen.getByText('anthropic/claude-opus-5-5')).toHaveAttribute('data-testid', 'agent-pm');
     // no codename → sub id row still renders, no identity
     expect(screen.getByText('test')).toBeInTheDocument();
+    // layout reserves the identity rows for every sub-step that runs an agent
+    expect(nodeSize(node).height).toBe(
+      PARALLEL_HEADER_H + 2 * PARALLEL_SUBROW_ID_H + PARALLEL_PAD_V,
+    );
   });
 
   it('PanelLoopNode unit title uses the unit agent, never the unit key', () => {
@@ -273,6 +280,9 @@ describe('codenames on container nodes', () => {
     } as GraphNode;
     const { container } = renderPanel(node);
     expect(container.querySelector('button[title^="lynx1 · sec-reviewer · openai/gpt-5"]')).not.toBeNull();
+    // the unit row shows provider/model in full, on its own line
+    expect(screen.getByText('openai/gpt-5')).toHaveAttribute('data-testid', 'agent-pm');
+    expect(screen.getByText('lynx1 · sec-reviewer')).toBeInTheDocument();
     expect(container.querySelector('button[title^="lynx2 · running"]')).not.toBeNull();
     expect(container.querySelector('button[title*="bob"]')).toBeNull();
   });

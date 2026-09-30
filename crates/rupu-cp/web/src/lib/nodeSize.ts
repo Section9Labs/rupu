@@ -23,11 +23,23 @@ export interface NodeBox {
 /** Plain step / panel-less step. */
 export const STEP_W = 170;
 export const STEP_H = 72;
+/** A step that runs an agent: STEP_H + the two-line identity block
+ *  (`leaf · agent` 15px + `provider/model` 13px + mt-1.5). Keyed off
+ *  `agent`/`codename` — `agent` comes from the DAG, so the box is stable
+ *  across the run instead of jumping when agent_started lands. */
+export const STEP_AGENT_H = 100;
+
+/** True when a node / sub-step / unit carries an agent identity to render. */
+export function hasIdentity(x: { agent?: string; codename?: string }): boolean {
+  return Boolean(x.agent || x.codename);
+}
 
 /** ParallelNode container. */
 export const PARALLEL_W = 210;
 export const PARALLEL_HEADER_H = 24; // uppercase roll-up header + mb-1.5
 export const PARALLEL_SUBROW_H = 22; // bordered chip row (py-1 + 12px text + border) + gap-1
+/** A sub-step row that also carries its agent identity (two extra lines). */
+export const PARALLEL_SUBROW_ID_H = 58;
 export const PARALLEL_PAD_V = 16; // px-2 py-1.5 (top+bottom) + slack
 
 /** FanoutNode — small inline grid (total ≤ INLINE_THRESHOLD). */
@@ -43,8 +55,10 @@ export const FANOUT_CARD_W = 250;
 export const FANOUT_CARD_H = 210;
 
 /** PanelLoopNode container. */
-export const PANEL_W = 200;
+export const PANEL_W = 220;
 export const PANEL_H = 120;
+/** One panelist / fixer unit row (two-line identity + py-0.5 + gap-1). */
+export const PANEL_UNIT_ROW_H = 36;
 
 // ---------------------------------------------------------------------------
 // nodeSize — the per-kind box used by dagre AND applied to the rendered root.
@@ -56,8 +70,14 @@ export function nodeSize(node: GraphNode): NodeBox {
       const subs = node.parallel?.length ?? 0;
       // Always reserve at least one row's worth of height so the "no sub-steps"
       // placeholder is bounded too.
-      const rows = Math.max(subs, 1);
-      const height = PARALLEL_HEADER_H + rows * PARALLEL_SUBROW_H + PARALLEL_PAD_V;
+      const rowsH =
+        subs === 0
+          ? PARALLEL_SUBROW_H
+          : (node.parallel ?? []).reduce(
+              (h, sub) => h + (hasIdentity(sub) ? PARALLEL_SUBROW_ID_H : PARALLEL_SUBROW_H),
+              0,
+            );
+      const height = PARALLEL_HEADER_H + rowsH + PARALLEL_PAD_V;
       return { width: PARALLEL_W, height };
     }
 
@@ -76,9 +96,16 @@ export function nodeSize(node: GraphNode): NodeBox {
     }
 
     case 'panel':
-      return { width: PANEL_W, height: PANEL_H };
+      return {
+        width: PANEL_W,
+        height: PANEL_H + (node.fanout?.units.length ?? 0) * PANEL_UNIT_ROW_H,
+      };
+
+    case 'gate':
+    case 'action':
+      return { width: STEP_W, height: STEP_H };
 
     default:
-      return { width: STEP_W, height: STEP_H };
+      return { width: STEP_W, height: hasIdentity(node) ? STEP_AGENT_H : STEP_H };
   }
 }

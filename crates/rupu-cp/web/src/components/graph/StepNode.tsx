@@ -1,7 +1,7 @@
 // StepNode — the atomic run-graph card (kind: 'step' / 'panel'-less step / gate).
 //
 // Anatomy (per the graph-pro mockup): colored top-bar · status glyph · name ·
-// duration · agent chip. A soft blue pulse ring while running. React Flow
+// duration · kind pill · agent identity (name line + provider/model line). A soft blue pulse ring while running. React Flow
 // source/target handles are present but visually minimal (read-only graph).
 
 import { memo } from 'react';
@@ -9,9 +9,9 @@ import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
-import { STEP_W, STEP_H } from '../../lib/nodeSize';
+import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent, runKindIcon, runKindLabel } from './kindBridge';
-import { AgentName } from '../codename/AgentName';
+import { AgentIdentity } from '../codename/AgentIdentity';
 
 export interface StepNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -32,6 +32,7 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
   const accent = runKindAccent(node.kind);
   const barColor = colors.get(accent);
   const KindIcon = runKindIcon(node.kind);
+  const box = nodeSize(node);
 
   return (
     <div
@@ -41,7 +42,7 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
         awaiting ? 'rg-pulse-await' : '',
         node.state === 'pending' ? 'opacity-75' : '',
       ].join(' ')}
-      style={{ width: STEP_W, minHeight: STEP_H }}
+      style={{ width: box.width, minHeight: box.height }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
@@ -74,23 +75,18 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
           <KindIcon size={10} aria-hidden />
           {runKindLabel(node.kind)}
         </span>
-        {node.codename ? (
-          <span className="min-w-0 truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
-            <AgentName
-              codename={node.codename}
-              agent={node.agent}
-              provider={node.provider}
-              model={node.model}
-            />
-          </span>
-        ) : (
-          node.agent && (
-            <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
-              {node.agent}
-            </span>
-          )
-        )}
       </div>
+
+      {/* Identity gets its own rows — `leaf · agent`, then provider/model on a
+          smaller second line — so the 170px card never clips provider/model
+          away (nodeSize reserves STEP_AGENT_H for this). */}
+      <AgentIdentity
+        className="mt-1.5 text-meta text-ink-dim"
+        codename={node.codename}
+        agent={node.agent}
+        provider={node.provider}
+        model={node.model}
+      />
 
       <Handle type="source" position={Position.Right} style={handleStyle} />
     </div>
