@@ -43,9 +43,14 @@ async fn run_graph_from_host(
     // graph is built from local artifacts — those transports have no
     // generic-GET surface to proxy to. Reaching for the wire here is what
     // used to 500 the whole run-detail page with "invalid: proxy_get_json
-    // is not supported for ssh hosts".
+    // is not supported for ssh hosts". Store reads + the usage fold run on
+    // the blocking pool, as in the local branches of `run_graph`.
     if conn.serves_runs_from_local_mirror() {
-        return build_run_graph_json(&s.run_store, &s.pricing, id);
+        let store = std::sync::Arc::clone(&s.run_store);
+        let pricing = s.pricing.clone();
+        let id = id.to_string();
+        return crate::api::runs::blocking(move || build_run_graph_json(&store, &pricing, &id))
+            .await;
     }
     conn.proxy_get_json(&format!("/api/runs/{id}/graph"))
         .await

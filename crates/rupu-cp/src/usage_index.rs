@@ -576,20 +576,26 @@ fn stat(path: &Path) -> Stat {
 
 /// What a terminal run's cached result was computed against.
 ///
-/// Known edge: a LOCAL run with no ledger (legacy) stats only its run files,
-/// not the transcripts it folded, so a transcript that gets one more `Usage`
-/// line after `run.json` turned terminal stays frozen at the sealed total
-/// until a run file changes. Ledger runs are safe — the late turn's ledger row
-/// changes `usage.jsonl` — and mirrored runs stat their folded files below.
+/// Known edge: on a LOCAL run, a fallback transcript folded at its recorded
+/// path is not statted (only the run files are), so one more `Usage` line
+/// after `run.json` turned terminal stays frozen at the sealed total until a
+/// run file changes. That covers a legacy (no-ledger) run's own transcripts,
+/// which are written before the run finishes; turns the coordinator ledgers
+/// change `usage.jsonl`. Placed units write no coordinator ledger rows and are
+/// served from the agent mirror, which a host pull may still grow after the
+/// run turned terminal — so every fallback that resolved away from its
+/// recorded path is statted in `mirrors`, as is every folded file of a
+/// mirrored run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Seal {
     /// `run.json`, `usage.jsonl`, `events.jsonl`, `step_results.jsonl`.
     files: [Stat; 4],
-    /// Extra files the result depends on: for mirrored runs the worker-cache /
-    /// agent-mirror files it folded (a host pull may still fill them after the
-    /// run turned terminal), and for every run each resolution candidate of a
-    /// transcript that resolved nowhere, at its absent stat — so a late pull
-    /// that creates any of them breaks the seal.
+    /// Extra files the result depends on: every folded fallback file of a
+    /// mirrored run, and on any run each folded fallback that resolved to a
+    /// worker-cache / agent-mirror file instead of its recorded path (a host
+    /// pull may still fill them after the run turned terminal); plus each
+    /// resolution candidate of a transcript that resolved nowhere, at its
+    /// absent stat — so a late pull that creates any of them breaks the seal.
     mirrors: Vec<(PathBuf, Stat)>,
 }
 
@@ -934,9 +940,12 @@ impl UsageIndex {
                 }
                 continue;
             };
-            // A local run's folded transcripts are not sealed over (see the
-            // legacy-run edge on `Seal`); a mirrored run's are.
-            if worker.is_some() {
+            // Seal over every folded file a host pull may still grow: all of a
+            // mirrored run's, and — on a local run — any that resolved
+            // somewhere other than its recorded path (a placed unit's agent
+            // mirror; placed units write no coordinator ledger rows). A local
+            // run's own on-disk transcripts are not (the legacy edge on `Seal`).
+            if worker.is_some() || path != k.kt.path {
                 mirrors.push((path.clone(), stat(&path)));
             }
             let fold = self.file_fold(&path);
@@ -1669,6 +1678,42 @@ mod tests {
         assert_eq!(total(&third), tok(30, 3));
         assert_eq!(step_total(&third, "b"), tok(20, 2));
         assert!(is_sealed(&idx, &store, "run_HALF"));
+    }
+
+    #[test]
+    fn sealed_local_run_revalidates_a_growing_placed_unit_mirror() {
+        // A LOCAL run (no worker) whose fan-out unit was placed on a host: the
+        // unit writes no coordinator ledger rows, its recorded path is the
+        // host's, and its transcript is served from the agent mirror — which
+        // a host pull may still grow after `run.json` turned terminal.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        let idx = UsageIndex::default();
+        create_run(&store, "run_PLACED", RunStatus::Completed);
+        let recorded = Path::new("/remote-host/.rupu/transcripts/run_UNIT7.jsonl");
+        assert!(!recorded.exists());
+        append(
+            &store.events_path("run_PLACED"),
+            &unit_started("run_PLACED", "fan", 0, recorded),
+        );
+        let mirror = agent_mirror_path(tmp.path(), "run_UNIT7");
+        append(
+            &mirror,
+            &transcript_lines("fanner", PROVIDER, MODEL, &[(10, 1)]),
+        );
+
+        let first = idx.run_usage(&store, "run_PLACED");
+        assert_eq!(total(&first), tok(10, 1));
+        assert!(is_sealed(&idx, &store, "run_PLACED"));
+
+        // The mirror grows (a late tail/pull): the seal re-validates and the
+        // new turn counts — no run file changed.
+        append(&mirror, &usage_line(PROVIDER, MODEL, 20, 2, None));
+        let second = idx.run_usage(&store, "run_PLACED");
+        assert_eq!(total(&second), tok(30, 3));
+        assert_eq!(step_total(&second, "fan"), tok(30, 3));
+        assert_extends(&first, &second);
+        assert!(is_sealed(&idx, &store, "run_PLACED"));
     }
 
     #[test]

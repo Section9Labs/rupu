@@ -148,7 +148,7 @@ pub fn claimed_transcripts(run_store: &RunStore, runs: &[RunRecord]) -> HashSet<
     for r in runs {
         claim(run_store, &r.id);
     }
-    let archive = RunStore::new(run_store.root.with_file_name("runs-archive"));
+    let archive = RunStore::new(run_store.archive_root());
     for r in archive.list().unwrap_or_default() {
         claim(&archive, &r.id);
     }

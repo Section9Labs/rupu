@@ -1098,9 +1098,11 @@ async fn usage_timeline_from_host(
     let conn = resolve_host(s, host_id)?;
     // Same mirror rule as `graph.rs`'s `run_graph_from_host`: a transport
     // whose runs live in our RunStore builds the series from those local
-    // artifacts rather than proxying a GET it cannot serve.
+    // artifacts (off the executor) rather than proxying a GET it cannot serve.
     if conn.serves_runs_from_local_mirror() {
-        return build_usage_timeline_json(&s.run_store, id);
+        let store = Arc::clone(&s.run_store);
+        let id = id.to_string();
+        return blocking(move || build_usage_timeline_json(&store, &id)).await;
     }
     conn.proxy_get_json(&format!("/api/runs/{id}/usage-timeline"))
         .await
@@ -1585,7 +1587,9 @@ async fn list_archived_runs(
     if q.kind.as_deref() == Some("workflow") {
         records.retain(|r| r.event.is_none() && r.source_wake_id.is_none());
     }
-    let store = Arc::clone(&s.run_store);
+    // An archived run's directory (ledger, events, step results) lives under
+    // the archive root, so fold it there — the active store has nothing left.
+    let store = RunStore::new(s.run_store.archive_root());
     let pricing = s.pricing.clone();
     let rows = blocking(move || {
         let mut rows = Vec::with_capacity(records.len());
@@ -2413,6 +2417,54 @@ mod tests {
             serde_json::json!("local"),
             "archived row must carry host_id=local to match list_runs wire shape"
         );
+    }
+
+    /// An archived run's usage lives under `runs-archive/<id>` (the run dir,
+    /// ledger included, moves on archive): the archived list must fold it
+    /// there, not against the active store where nothing is left.
+    #[tokio::test]
+    async fn list_archived_runs_reports_the_archived_runs_usage() {
+        use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_01ARCHIVEDUSE"), "name: x\n")
+            .unwrap();
+        let row = LedgerRow {
+            v: LEDGER_VERSION,
+            id: "u1".into(),
+            at: chrono::Utc::now(),
+            kind: LedgerKind::Turn,
+            step_id: Some("build".into()),
+            unit_index: None,
+            unit_key: None,
+            agent_run_id: "run_ARCHAGENT".into(),
+            parent_agent_run_id: None,
+            transcript: PathBuf::from("/nowhere/run_ARCHAGENT.jsonl"),
+            agent: "builder".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            input_tokens: 120,
+            output_tokens: 30,
+            cached_tokens: 0,
+        };
+        let mut line = serde_json::to_vec(&row).unwrap();
+        line.push(b'\n');
+        std::fs::write(s.run_store.usage_ledger_path("run_01ARCHIVEDUSE"), line).unwrap();
+        s.run_store.archive("run_01ARCHIVEDUSE").unwrap();
+
+        let rows = list_archived_runs(State(s), Query(ArchivedQuery { kind: None }))
+            .await
+            .expect("list_archived_runs should succeed")
+            .0;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["usage"]["total_tokens"],
+            serde_json::json!(150),
+            "{}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["turns"], serde_json::json!(1), "{}", rows[0]);
     }
 
     #[tokio::test]

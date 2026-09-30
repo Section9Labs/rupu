@@ -1493,8 +1493,9 @@ impl RunStore {
     }
 
     /// Directory holding archived runs — sibling of the active runs dir
-    /// (`<global>/runs` → `<global>/runs-archive`).
-    fn archive_root(&self) -> PathBuf {
+    /// (`<global>/runs` → `<global>/runs-archive`). `RunStore::new` over it
+    /// reads an archived run's own files (its ledger and logs move with it).
+    pub fn archive_root(&self) -> PathBuf {
         self.root.with_file_name("runs-archive")
     }
 
