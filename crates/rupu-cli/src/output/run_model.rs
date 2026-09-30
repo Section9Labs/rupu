@@ -245,7 +245,76 @@ impl RunView {
             }
             Event::RunPaused { .. } => self.status = RunStatus::Paused,
             Event::RunResumed { .. } => self.status = RunStatus::Running,
-            // Fan-out, dispatch, panel handled in Tasks 2-3.
+            Event::UnitStarted {
+                step_id,
+                index,
+                unit_key,
+                agent,
+                host,
+                codename,
+                ..
+            } => {
+                let s = self.step_mut(step_id);
+                let u = s.units.entry(*index).or_insert_with(|| UnitView {
+                    index: *index,
+                    unit_key: unit_key.clone(),
+                    agent: agent.clone(),
+                    codename: codename.clone(),
+                    provider: None,
+                    model: None,
+                    host: host.clone(),
+                    status: UnitStatus::Queued,
+                });
+                u.unit_key = unit_key.clone();
+                u.status = UnitStatus::Running;
+                if u.codename.is_none() {
+                    u.codename = codename.clone();
+                }
+                if u.host.is_none() {
+                    u.host = host.clone();
+                }
+            }
+            // `tokens_in`/`tokens_out` are deliberately ignored: they are
+            // always 0 on this event (see its doc comment). Real totals come
+            // from the usage fold (Task 4).
+            Event::UnitCompleted {
+                step_id,
+                index,
+                success,
+                ..
+            } => {
+                let s = self.step_mut(step_id);
+                if let Some(u) = s.units.get_mut(index) {
+                    u.status = if *success {
+                        UnitStatus::Done
+                    } else {
+                        UnitStatus::Failed
+                    };
+                }
+            }
+            Event::AgentStarted {
+                step_id,
+                unit_index: Some(i),
+                provider,
+                model,
+                codename,
+                ..
+            } => {
+                let s = self.step_mut(step_id);
+                if let Some(u) = s.units.get_mut(i) {
+                    if provider.is_some() {
+                        u.provider = provider.clone();
+                    }
+                    if model.is_some() {
+                        u.model = model.clone();
+                    }
+                    if u.codename.is_none() {
+                        u.codename = codename.clone();
+                    }
+                }
+            }
+            // Dispatch, panel handled in Task 3. A `DispatchStarted` must not
+            // touch any unit slot — it falls through here for now.
             _ => {}
         }
     }
@@ -300,5 +369,110 @@ mod tests {
         assert_eq!(v.steps[0].duration_ms, Some(18_000));
         assert_eq!(v.steps[1].state, StepState::Running);
         assert!(matches!(v.steps[0].kind, StepKind::Run));
+    }
+
+    #[test]
+    fn fanout_units_count_and_survive_a_dispatch() {
+        use rupu_orchestrator::executor::Event;
+        use rupu_orchestrator::runs::StepKind;
+        let mut v = RunView::default();
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            kind: StepKind::ForEach,
+            agent: None,
+            host: None,
+            codename: None,
+        });
+        for i in 0..3usize {
+            v.apply(&Event::UnitStarted {
+                run_id: "r".into(),
+                step_id: "hunt".into(),
+                index: i,
+                unit_key: format!("svc-{i}"),
+                agent: Some("breaker".into()),
+                transcript_path: format!("t{i}").into(),
+                host: None,
+                codename: Some(format!("otter#{}", i + 1)),
+            });
+        }
+        // A dispatch must NOT clobber unit slot 3 (== units.len()); it lives in
+        // its own map (Task 3), so units stay intact.
+        v.apply(&Event::DispatchStarted {
+            run_id: "r".into(),
+            sub_run_id: "sub1".into(),
+            agent: Some("scout".into()),
+            transcript_path: "ts".into(),
+            codename: Some("wren#1".into()),
+            provider: None,
+            model: None,
+        });
+        v.apply(&Event::UnitCompleted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            index: 0,
+            unit_key: "svc-0".into(),
+            success: true,
+            tokens_in: 0,
+            tokens_out: 0,
+            host: None,
+        });
+        v.apply(&Event::UnitCompleted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            index: 1,
+            unit_key: "svc-1".into(),
+            success: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            host: None,
+        });
+
+        let step = &v.steps[0];
+        assert_eq!(step.units.len(), 3);
+        assert_eq!(step.units[&0].status, UnitStatus::Done);
+        assert_eq!(step.units[&1].status, UnitStatus::Failed);
+        assert_eq!(step.units[&2].status, UnitStatus::Running);
+        assert_eq!(step.units[&2].unit_key, "svc-2");
+        let c = step.unit_counts();
+        assert_eq!((c.done, c.failed, c.running, c.total), (1, 1, 1, 3));
+    }
+
+    #[test]
+    fn agent_started_attaches_provider_model_to_unit() {
+        use rupu_orchestrator::executor::Event;
+        use rupu_orchestrator::runs::StepKind;
+        let mut v = RunView::default();
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            kind: StepKind::ForEach,
+            agent: None,
+            host: None,
+            codename: None,
+        });
+        v.apply(&Event::UnitStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            index: 0,
+            unit_key: "svc-0".into(),
+            agent: Some("breaker".into()),
+            transcript_path: "t0".into(),
+            host: None,
+            codename: None,
+        });
+        v.apply(&Event::AgentStarted {
+            run_id: "r".into(),
+            step_id: "hunt".into(),
+            unit_index: Some(0),
+            codename: None,
+            agent: "breaker".into(),
+            provider: Some("openai".into()),
+            model: Some("gpt-5".into()),
+            agent_run_id: "ar".into(),
+            transcript_path: "t0".into(),
+        });
+        assert_eq!(v.steps[0].units[&0].provider.as_deref(), Some("openai"));
+        assert_eq!(v.steps[0].units[&0].model.as_deref(), Some("gpt-5"));
     }
 }
