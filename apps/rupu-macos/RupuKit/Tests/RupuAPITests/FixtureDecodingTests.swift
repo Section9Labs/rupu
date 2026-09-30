@@ -246,7 +246,7 @@ import Foundation
 
 @Test func decodesUsageRunsFixtureAsFlatPerRunModelRows() throws {
     let rows = try JSONDecoder().decode([APIUsageRunRow].self, from: Fixtures.data("usage_runs.json"))
-    #expect(rows.count == 6)
+    #expect(rows.count == 7)
 
     let first = rows[0]
     #expect(first.runID == "run-01")
@@ -262,6 +262,13 @@ import Foundation
     #expect(unpriced.model == "llama-3-70b")
     #expect(unpriced.costUSD == nil)
     #expect(unpriced.priced == false)
+
+    // A standalone agent run has no workflow (`workflow_name: null`): it
+    // decodes as "", the breakdown's key for the same spend.
+    let standalone = rows[6]
+    #expect(standalone.runID == "run-07")
+    #expect(standalone.workflowName == "")
+    #expect(standalone.totalTokens == 5000)
 }
 
 @Test func decodesUsageOutliersFixture() throws {

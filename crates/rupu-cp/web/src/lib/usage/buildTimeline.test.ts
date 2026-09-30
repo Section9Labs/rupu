@@ -139,6 +139,25 @@ describe('buildTimeline', () => {
     expect(nightly!.model).toBe('');
   });
 
+  it("pivot='workflow' keys a standalone/session row (`workflow_name: null`) as '' — the breakdown's key for the same spend", () => {
+    const rows: UsageRunRow[] = [
+      row({ run_id: 'run_wf', kind: 'workflow', workflow_name: 'nightly-scan', total_tokens: 10, cost_usd: 1 }),
+      row({ run_id: 'run_solo', kind: 'agent', workflow_name: null, total_tokens: 20, cost_usd: 2 }),
+    ];
+
+    const all = buildTimeline(rows, 'workflow', noFilter(), 'day');
+    expect(all[0].rows.map((r) => r.workflow).sort()).toEqual(['', 'nightly-scan']);
+
+    // Excluding the '' key (as a breakdown toggle would) drops the standalone row.
+    const filtered = buildTimeline(
+      rows,
+      'workflow',
+      { excludedRunIds: new Set(), excludedKeys: new Set(['']) },
+      'day',
+    );
+    expect(filtered[0].rows.map((r) => r.workflow)).toEqual(['nightly-scan']);
+  });
+
   it("pivot='host' populates only `host_id`, not `model`", () => {
     const rows: UsageRunRow[] = [
       row({ run_id: 'run_a', host_id: 'local', total_tokens: 10, cost_usd: 1 }),

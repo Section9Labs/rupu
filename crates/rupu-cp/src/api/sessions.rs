@@ -62,6 +62,22 @@ struct SessionDto {
     target: Option<String>,
     #[serde(default)]
     workspace_id: String,
+    /// The recorded turns — read for [`session_usage`], never serialized
+    /// (the list/detail wire shape is unchanged; `/api/sessions/:id/runs`
+    /// serves the turns). Parsed leniently: an unexpected shape reads as no
+    /// turns, never as a session that fails to load.
+    #[serde(default, skip_serializing, deserialize_with = "lenient_runs")]
+    runs: Vec<SessionRunEntry>,
+}
+
+/// `runs` as recorded turns, or none when it has any other shape — usage
+/// accounting must never turn a readable session into a parse error.
+fn lenient_runs<'de, D>(d: D) -> Result<Vec<SessionRunEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
 /// Try to load and parse `session.json` inside `dir`.
@@ -115,7 +131,9 @@ fn ensure_usage_block(detail: &mut serde_json::Value, pricing: &rupu_config::Pri
         // on a body that isn't an object at all — nothing to price.
         Err(_) => return,
     };
-    if let Ok(u) = serde_json::to_value(session_usage(&dto, pricing)) {
+    // The remote's transcripts are not on this machine: price the token
+    // totals it reported.
+    if let Ok(u) = serde_json::to_value(session_usage_from_totals(&dto, pricing)) {
         map.insert("usage".to_string(), u);
     }
 }
@@ -140,9 +158,74 @@ fn try_load_session(dir: &std::path::Path) -> Option<SessionDto> {
     }
 }
 
-/// Token + cost summary for a session, derived from its on-disk token totals
-/// (sessions record their own totals; no transcript aggregation needed).
+/// A local session's recorded turns as labelled transcript paths (label =
+/// the turn's run id): each turn's own transcript plus its recursive
+/// dispatch sub-runs, for every turn whose transcript exists. The turns
+/// whose transcript is gone are returned separately.
+fn session_turn_transcripts<'a>(
+    runs: &'a [SessionRunEntry],
+    run_store: &rupu_orchestrator::runs::RunStore,
+) -> (Vec<(String, std::path::PathBuf)>, Vec<&'a SessionRunEntry>) {
+    let mut labeled = Vec::new();
+    let mut missing = Vec::new();
+    for r in runs {
+        match r.transcript_path.as_deref().filter(|t| !t.is_empty()) {
+            Some(tp) if std::path::Path::new(tp).is_file() => {
+                labeled.extend(crate::usage_sources::with_dispatch_children(
+                    run_store,
+                    &r.run_id,
+                    std::path::Path::new(tp),
+                ))
+            }
+            _ => missing.push(r),
+        }
+    }
+    (labeled, missing)
+}
+
+/// Token + cost summary for a local session: the live fold of every turn's
+/// transcript plus its dispatch sub-runs ([`crate::usage::transcripts_usage`]),
+/// so a turn still in flight counts as it streams — `session.json`'s own
+/// totals only move when a turn ends. A turn whose transcript is gone (e.g.
+/// archived) contributes the totals recorded for that turn, priced at the
+/// session's model; a session with no recorded turns at all falls back to
+/// [`session_usage_from_totals`]. `runs` stays 1 (one session).
 fn session_usage(
+    dto: &SessionDto,
+    run_store: &rupu_orchestrator::runs::RunStore,
+    pricing: &rupu_config::PricingConfig,
+) -> crate::usage::UsageSummary {
+    if dto.runs.is_empty() {
+        return session_usage_from_totals(dto, pricing);
+    }
+    let (labeled, missing) = session_turn_transcripts(&dto.runs, run_store);
+    let u = crate::usage::transcripts_usage(&labeled);
+    let mut rows = u.rows.clone();
+    rows.extend(
+        missing
+            .into_iter()
+            .filter(|r| r.total_tokens_in + r.total_tokens_out + r.total_tokens_cached > 0)
+            .map(|r| rupu_transcript::UsageRow {
+                provider: dto.provider_name.clone(),
+                model: dto.model.clone(),
+                agent: dto.agent_name.clone(),
+                input_tokens: r.total_tokens_in,
+                output_tokens: r.total_tokens_out,
+                cached_tokens: r.total_tokens_cached,
+                runs: 1,
+                ..rupu_transcript::UsageRow::default()
+            }),
+    );
+    let mut summary = crate::usage::summarize(&rows, pricing);
+    summary.partial = u.partial;
+    summary.runs = 1;
+    summary
+}
+
+/// Token + cost summary from a session's own token totals, priced at its
+/// model: a remote session (its transcripts are not here) or one with no
+/// recorded turns.
+fn session_usage_from_totals(
     dto: &SessionDto,
     pricing: &rupu_config::PricingConfig,
 ) -> crate::usage::UsageSummary {
@@ -174,6 +257,7 @@ fn session_usage(
 fn scan_session_dir(
     root: &std::path::Path,
     scope: &str,
+    run_store: &rupu_orchestrator::runs::RunStore,
     pricing: &rupu_config::PricingConfig,
     out: &mut Vec<serde_json::Value>,
 ) {
@@ -193,7 +277,7 @@ fn scan_session_dir(
             continue;
         }
         if let Some(dto) = try_load_session(&dir) {
-            let usage = session_usage(&dto, pricing);
+            let usage = session_usage(&dto, run_store, pricing);
             match serde_json::to_value(&dto) {
                 Ok(mut val) => {
                     if let serde_json::Value::Object(ref mut map) = val {
@@ -227,16 +311,20 @@ pub(crate) fn collect_sessions(
     global_dir: &std::path::Path,
     pricing: &rupu_config::PricingConfig,
 ) -> Vec<serde_json::Value> {
+    // Session turns' dispatch sub-runs live in the global run store.
+    let run_store = rupu_orchestrator::runs::RunStore::new(global_dir.join("runs"));
     let mut sessions = Vec::new();
     scan_session_dir(
         &global_dir.join("sessions"),
         "active",
+        &run_store,
         pricing,
         &mut sessions,
     );
     scan_session_dir(
         &global_dir.join("sessions-archive"),
         "archived",
+        &run_store,
         pricing,
         &mut sessions,
     );
@@ -313,7 +401,14 @@ async fn list_sessions(
     }
 
     // ── Collect local sessions ─────────────────────────────────────────────────
-    let local_sessions = collect_sessions(&s.global_dir, &s.pricing);
+    // Blocking IO (every session's turn transcripts are folded for usage).
+    let local_sessions = {
+        let global = s.global_dir.clone();
+        let pricing = s.pricing.clone();
+        tokio::task::spawn_blocking(move || collect_sessions(&global, &pricing))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
 
     let page = crate::pagination::PageQuery {
         offset: q.offset,
@@ -401,7 +496,7 @@ async fn get_session(
         None => return Err(ApiError::not_found(format!("session {id} not found"))),
     };
 
-    let usage = session_usage(&dto, &s.pricing);
+    let usage = session_usage(&dto, &s.run_store, &s.pricing);
     let mut val = serde_json::to_value(&dto).map_err(|e| ApiError::internal(e.to_string()))?;
     if let serde_json::Value::Object(ref mut map) = val {
         map.insert(
@@ -423,16 +518,25 @@ struct SessionRunsEnvelope {
     runs: Vec<SessionRunEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SessionRunEntry {
     #[serde(default)]
     run_id: String,
     #[serde(default)]
     transcript_path: Option<String>,
+    /// The turn's own recorded totals (written when it ends) — the fallback
+    /// when its transcript is gone.
+    #[serde(default)]
+    total_tokens_in: u64,
+    #[serde(default)]
+    total_tokens_out: u64,
+    #[serde(default)]
+    total_tokens_cached: u64,
 }
 
 /// `GET /api/sessions/:id/usage-timeline[?host=<id>]` — ordered per-turn token
-/// series across every run the session recorded (in order), labeled by run id.
+/// series across every run the session recorded (in order, each with its
+/// dispatch sub-runs), labeled by run id — live, from the usage fold.
 ///
 /// With `?host=<remote-id>`: proxies to the owning host and forwards the
 /// response verbatim. Local/absent: today's on-disk logic unchanged.
@@ -468,14 +572,9 @@ async fn get_session_usage_timeline(
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let env: SessionRunsEnvelope =
         serde_json::from_str(&text).unwrap_or(SessionRunsEnvelope { runs: vec![] });
-    let mut labeled: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for r in &env.runs {
-        if let Some(tp) = &r.transcript_path {
-            labeled.push((r.run_id.clone(), std::path::PathBuf::from(tp)));
-        }
-    }
-    let points = crate::usage::turn_series(&labeled);
-    let v = serde_json::to_value(points).map_err(|e| ApiError::internal(e.to_string()))?;
+    let (labeled, _) = session_turn_transcripts(&env.runs, &s.run_store);
+    let u = crate::usage::transcripts_usage(&labeled);
+    let v = serde_json::to_value(&u.points).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(v))
 }
 
@@ -870,8 +969,11 @@ mod tests {
             last_error: None,
             target: Some("main".into()),
             workspace_id: "ws-1".into(),
+            runs: Vec::new(),
         };
-        let usage = session_usage(&dto, &rupu_config::PricingConfig::default());
+        let store =
+            rupu_orchestrator::runs::RunStore::new(std::path::PathBuf::from("/nonexistent"));
+        let usage = session_usage(&dto, &store, &rupu_config::PricingConfig::default());
         let mut v = serde_json::to_value(&dto).expect("serialize SessionDto");
         if let serde_json::Value::Object(ref mut map) = v {
             map.insert(
@@ -946,11 +1048,95 @@ mod tests {
             last_error: None,
             target: None,
             workspace_id: "w".into(),
+            runs: Vec::new(),
         };
-        let u = session_usage(&dto, &rupu_config::PricingConfig::default());
+        let u = session_usage_from_totals(&dto, &rupu_config::PricingConfig::default());
         assert_eq!(u.input_tokens, 1_000_000);
         assert!(u.priced);
         assert!((u.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+    }
+
+    /// A `runs` field of an unexpected shape never fails the session parse
+    /// (it would turn a readable session into a 500, or drop a remote
+    /// body's usage block).
+    #[test]
+    fn an_odd_runs_shape_reads_as_no_turns() {
+        let dto: SessionDto =
+            serde_json::from_str(r#"{"session_id":"s1","runs":3}"#).expect("parses");
+        assert!(dto.runs.is_empty());
+        let dto: SessionDto =
+            serde_json::from_str(r#"{"session_id":"s1","runs":[{"run_id":7}]}"#).expect("parses");
+        assert!(dto.runs.is_empty());
+    }
+
+    /// A live turn counts from its transcript; a turn whose transcript is
+    /// gone still counts its own recorded totals — never silently zero.
+    #[test]
+    fn session_usage_folds_live_turns_and_keeps_recorded_totals_of_missing_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("run_live.jsonl");
+        let mut body = Vec::new();
+        for ev in [
+            rupu_transcript::Event::RunStart {
+                run_id: "run_live".into(),
+                workspace_id: "w".into(),
+                agent: "a".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                started_at: chrono::Utc::now(),
+                mode: rupu_transcript::RunMode::Ask,
+                schema: None,
+                system_prompt: None,
+            },
+            rupu_transcript::Event::Usage {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                served_model: None,
+                input_tokens: 70,
+                output_tokens: 7,
+                cached_tokens: 0,
+                purpose: None,
+            },
+        ] {
+            body.extend(serde_json::to_vec(&ev).unwrap());
+            body.push(b'\n');
+        }
+        std::fs::write(&live, body).unwrap();
+        let entry = |run_id: &str, tp: &std::path::Path, input: u64| SessionRunEntry {
+            run_id: run_id.into(),
+            transcript_path: Some(tp.to_string_lossy().into_owned()),
+            total_tokens_in: input,
+            total_tokens_out: 0,
+            total_tokens_cached: 0,
+        };
+        let dto = SessionDto {
+            session_id: "s1".into(),
+            agent_name: "a".into(),
+            model: "claude-sonnet-4-6".into(),
+            provider_name: "anthropic".into(),
+            status: serde_json::Value::Null,
+            total_turns: 2,
+            // Stale: only the finished turn is in the session totals.
+            total_tokens_in: 900,
+            total_tokens_out: 0,
+            total_tokens_cached: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            active_run_id: Some("run_live".into()),
+            last_error: None,
+            target: None,
+            workspace_id: "w".into(),
+            runs: vec![
+                entry("run_gone", &tmp.path().join("archived.jsonl"), 900),
+                entry("run_live", &live, 0),
+            ],
+        };
+        let store = rupu_orchestrator::runs::RunStore::new(tmp.path().join("runs"));
+        let u = session_usage(&dto, &store, &rupu_config::PricingConfig::default());
+        assert_eq!(u.input_tokens, 970);
+        assert_eq!(u.output_tokens, 7);
+        assert_eq!(u.runs, 1);
+        assert!(!u.partial);
     }
 
     #[test]

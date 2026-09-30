@@ -68,8 +68,12 @@ export interface UnpricedGap {
  */
 export interface UsageRunRow {
   run_id: string;
+  /** Which kind of run spent this: a workflow run, a standalone `rupu run`
+   *  (`agent`) or a session turn (`session`). Absent from CPs predating it. */
+  kind?: 'workflow' | 'agent' | 'session';
   started_at: string;
-  workflow_name: string;
+  /** `null` for a standalone agent run or session turn. */
+  workflow_name: string | null;
   agent: string;
   provider: string;
   model: string;

@@ -564,28 +564,20 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     // already-sorted order) rather than duplicating it onto every same-named
     // row. See the doc comment on `AgentDto::usage`.
     //
-    // Single pass over the run store: each run's own transcripts are
-    // aggregated exactly once. The resulting `UsageRow`s feed straight into
-    // `all_rows` for `breakdown` (which re-groups by agent name and sums —
-    // whether the rows arrive pre-merged from one combined `aggregate` call
-    // over every path, or concatenated from one `aggregate` call per run, the
-    // per-key sums `breakdown` produces are identical, since token/run counts
-    // are strictly additive and every transcript still lands in exactly one
-    // run's batch). `last_run` is folded from the SAME per-run rows (their
-    // `agent` field names who the run's usage attributes to; `run.started_at`
-    // is the candidate timestamp) instead of a second re-aggregation pass
-    // that re-walks every run's transcripts a second time over the exact
-    // same files `all_rows` had just read.
+    // Single pass over the run store: each run's usage comes from the one
+    // fold (`crate::usage::run_usage` — ledger-first, cached process-wide).
+    // Its `UsageRow`s (one per `(provider, model, agent)`) feed straight into
+    // `all_rows` for `breakdown`, which re-groups by agent name and sums —
+    // token/run counts are strictly additive and every transcript lands in
+    // exactly one run's rows. `last_run` is folded from the SAME per-run rows
+    // (their `agent` field names who the run's usage attributes to;
+    // `run.started_at` is the candidate timestamp).
     let runs = s.run_store.list().unwrap_or_default();
     let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
     let mut last_runs: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for r in &runs {
-        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
-        if paths.is_empty() {
-            continue;
-        }
-        let rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
+        let rows = crate::usage::run_usage(&s.run_store, &r.id).rows.clone();
         let at = r.started_at.to_rfc3339();
         for row in &rows {
             if row.agent.is_empty() {
@@ -2707,8 +2699,8 @@ mod tests {
     }
 
     /// Write a single-event transcript (`RunStart` only, no `Usage` events) so
-    /// `rupu_transcript::aggregate` emits exactly one zero-token row for
-    /// `agent`, bumping that row's `runs` by 1.
+    /// the usage fold emits exactly one zero-token row for `agent`, bumping
+    /// that row's `runs` by 1.
     fn write_agent_transcript(path: &std::path::Path, agent: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let ev = rupu_transcript::Event::RunStart {

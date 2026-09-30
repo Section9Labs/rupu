@@ -407,46 +407,134 @@ pub(crate) fn resolve_window(
     Ok((start, end))
 }
 
-/// Read the local run store and build this host's own usage contribution for
-/// `[start, end]`. Split out of `get_usage` so the fan-out loop below can call
-/// it for the `"local"` target without a network round trip — mirrors how
-/// `/api/dashboard` special-cases `host_id == "local"` by resolving straight
-/// to the in-process connector rather than proxying to itself.
-fn local_usage(
-    s: &AppState,
+/// One local spend source's usage, attributed: a workflow run from the run
+/// store, or a standalone agent run / session turn
+/// ([`crate::usage_sources::extra_sources`]).
+struct LocalSource {
+    kind: crate::usage_sources::SourceKind,
+    id: String,
+    started_at: DateTime<Utc>,
+    /// `None` for a standalone agent run or session turn.
+    workflow_name: Option<String>,
+    /// Stamped with `workflow` (empty when none), `workspace_id` and
+    /// `host_id = "local"`.
+    rows: Vec<rupu_transcript::UsageRow>,
+    partial: bool,
+}
+
+/// Every local spend source started in `[start, end]` (and in `workspace`,
+/// when given): workflow runs from the run store, then standalone agent
+/// runs and session turns, each transcript counted once — attributed
+/// workflow run > session > standalone (see [`crate::usage_sources`]).
+/// Usage comes from the one fold ([`crate::usage::run_usage`] /
+/// [`crate::usage::transcripts_usage`]). Also returns the earliest start
+/// across ALL sources, for the timeline's gap-fill.
+///
+/// Blocking IO — call through [`local_sources`].
+fn collect_local_sources(
+    store: &rupu_orchestrator::runs::RunStore,
+    global: &std::path::Path,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    group_by: crate::usage::GroupBy,
-) -> Result<HostUsage, ApiError> {
-    let runs = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
+    workspace: Option<&str>,
+) -> Result<(Vec<LocalSource>, Option<DateTime<Utc>>), String> {
+    use crate::usage_sources::{claimed_transcripts, extra_sources, SourceKind};
+    let runs = store.list().map_err(|e| e.to_string())?;
+    let in_scope =
+        |at: DateTime<Utc>, ws: &str| at >= start && at <= end && workspace.is_none_or(|w| ws == w);
+    let mut earliest = runs.iter().map(|r| r.started_at).min();
+    let mut out = Vec::new();
     for r in runs
         .iter()
-        .filter(|r| r.started_at >= start && r.started_at <= end)
+        .filter(|r| in_scope(r.started_at, &r.workspace_id))
     {
-        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
-        let mut rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
-        // Attribute each row to the run it came from: `r` is already in hand
-        // for this batch, so this is a free inline join — no re-load, no
-        // cache, no separate `attribute_rows` function needed. `host_id` is
-        // hardcoded "local" because this only ever reads the local run
-        // store; a REMOTE host's rows carry ITS OWN "local" tag from ITS
-        // point of view — see the `GroupBy::Host` override in the fan-out
-        // loop below, which is what keeps `group_by=host` meaningful across
-        // more than one host.
+        let u = crate::usage::run_usage(store, &r.id);
+        let mut rows = u.rows.clone();
+        // Attribute each row to the run it came from: `r` is already in
+        // hand, so this is a free inline join. `host_id` is "local" because
+        // this only ever reads the local run store; a REMOTE host's rows
+        // carry ITS OWN "local" tag from its point of view — see the
+        // `GroupBy::Host` override in `get_usage`'s fan-out loop, which is
+        // what keeps `group_by=host` meaningful across more than one host.
         for row in &mut rows {
             row.workflow = r.workflow_name.clone();
             row.workspace_id = r.workspace_id.clone();
             row.host_id = "local".to_string();
         }
-        all_rows.extend(rows);
+        out.push(LocalSource {
+            kind: SourceKind::Workflow,
+            id: r.id.clone(),
+            started_at: r.started_at,
+            workflow_name: Some(r.workflow_name.clone()),
+            rows,
+            partial: u.partial,
+        });
     }
 
-    let summary = crate::usage::summarize(&all_rows, &s.pricing);
+    let claimed = claimed_transcripts(store, &runs);
+    for src in extra_sources(global, store, &claimed) {
+        // An undatable source (no `RunStart` anywhere) can't be placed in a
+        // window; it also has no usage rows to contribute.
+        let Some(at) = src.started_at else { continue };
+        earliest = Some(earliest.map_or(at, |e| e.min(at)));
+        if !in_scope(at, &src.workspace_id) {
+            continue;
+        }
+        let u = crate::usage::transcripts_usage(&src.paths);
+        let mut rows = u.rows.clone();
+        for row in &mut rows {
+            row.workflow = String::new();
+            row.workspace_id = src.workspace_id.clone();
+            row.host_id = "local".to_string();
+        }
+        out.push(LocalSource {
+            kind: src.kind,
+            id: src.id,
+            started_at: at,
+            workflow_name: None,
+            rows,
+            partial: u.partial,
+        });
+    }
+    Ok((out, earliest))
+}
+
+/// [`collect_local_sources`] on the blocking pool.
+async fn local_sources(
+    s: &AppState,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    workspace: Option<String>,
+) -> Result<(Vec<LocalSource>, Option<DateTime<Utc>>), ApiError> {
+    let store = Arc::clone(&s.run_store);
+    let global = s.global_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        collect_local_sources(&store, &global, start, end, workspace.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::internal)
+}
+
+/// Build this host's own usage contribution for `[start, end]` from every
+/// local spend source. Split out of `get_usage` so the fan-out loop below
+/// can call it for the `"local"` target without a network round trip —
+/// mirrors how `/api/dashboard` special-cases `host_id == "local"` by
+/// resolving straight to the in-process connector rather than proxying to
+/// itself.
+async fn local_usage(
+    s: &AppState,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    group_by: crate::usage::GroupBy,
+) -> Result<HostUsage, ApiError> {
+    let (sources, _) = local_sources(s, start, end, None).await?;
+    let partial = sources.iter().any(|src| src.partial);
+    let all_rows: Vec<rupu_transcript::UsageRow> =
+        sources.into_iter().flat_map(|src| src.rows).collect();
+
+    let mut summary = crate::usage::summarize(&all_rows, &s.pricing);
+    summary.partial = partial;
     let breakdown = crate::usage::breakdown(&all_rows, &s.pricing, group_by);
     let unpriced = unpriced_gap(&all_rows, &s.pricing);
     Ok(HostUsage {
@@ -495,7 +583,7 @@ async fn get_usage(
         let (transport_kind, _base_url) = crate::api::hosts::transport_fields(&h.transport);
         async move {
             if host_id == "local" {
-                return match local_usage(&state, start, end, group_by) {
+                return match local_usage(&state, start, end, group_by).await {
                     Ok(usage) => (
                         HostFreshness {
                             host_id,
@@ -801,26 +889,17 @@ async fn get_usage_timeline(
         .map_err(ApiError::bad_request)?;
     let granularity = Granularity::parse(q.bucket.as_deref()).map_err(ApiError::bad_request)?;
 
-    let runs = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (sources, earliest_overall) = local_sources(&s, start, end, None).await?;
 
-    // Clamp the fill start to the first-ever run; no runs at all → empty series.
-    let earliest_overall = runs.iter().map(|r| r.started_at).min();
+    // Clamp the fill start to the first-ever source; none at all → empty series.
     let Some(fill_start) = timeline_fill_start(start, earliest_overall) else {
         return Ok(Json(Vec::new()));
     };
 
-    let mut runs_with_rows: Vec<(DateTime<Utc>, Vec<rupu_transcript::UsageRow>)> = Vec::new();
-    for r in runs
-        .iter()
-        .filter(|r| r.started_at >= start && r.started_at <= end)
-    {
-        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
-        let rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
-        runs_with_rows.push((r.started_at, rows));
-    }
+    let runs_with_rows: Vec<(DateTime<Utc>, Vec<rupu_transcript::UsageRow>)> = sources
+        .into_iter()
+        .map(|src| (src.started_at, src.rows))
+        .collect();
 
     Ok(Json(build_timeline(
         runs_with_rows,
@@ -834,9 +913,9 @@ async fn get_usage_timeline(
 /// One flat `(run × model)` usage row — the finest grain the client needs to
 /// filter the `/usage` spend graph interactively (exclude a run or a
 /// pivot-key and every bucket it fed instantly rescales, client-side, with no
-/// refetch). Local-only, like `/api/usage/timeline` and `/api/usage/outliers`
-/// above: reads `s.run_store` directly, no host fan-out — `host_id` is always
-/// `"local"`.
+/// refetch). Local-only, like `/api/usage/timeline` above: this host's own
+/// spend (workflow runs, standalone agent runs, session turns), no host
+/// fan-out — `host_id` is always `"local"`.
 ///
 /// `cost_usd` is priced HERE, server-side, with the SAME
 /// `rupu_config::pricing::lookup` path `summarize`/`breakdown` use — the
@@ -845,8 +924,12 @@ async fn get_usage_timeline(
 #[derive(Debug, Serialize)]
 struct UsageRunRow {
     run_id: String,
+    /// `"workflow"` | `"agent"` (a standalone `rupu run`) | `"session"` (a
+    /// session turn).
+    kind: &'static str,
     started_at: DateTime<Utc>,
-    workflow_name: String,
+    /// `None` (`null`) for a standalone agent run or session turn.
+    workflow_name: Option<String>,
     agent: String,
     provider: String,
     model: String,
@@ -870,15 +953,16 @@ struct UsageRunsQuery {
 
 /// `GET /api/usage/runs?since=&until=&workspace_id=` — flat per-`(run × model)` rows.
 ///
-/// **Local-only**: reads `s.run_store` directly, exactly like
-/// `/api/usage/timeline` and `/api/usage/outliers` — no host fan-out. A
-/// multi-host fleet view is a follow-up (see the `?host=` fan-out on
-/// `/api/usage` for the pattern), not silently faked here.
+/// **Local-only**: reads this host's own spend directly, exactly like
+/// `/api/usage/timeline` — no host fan-out. A multi-host fleet view is a
+/// follow-up (see the `?host=` fan-out on `/api/usage` for the pattern), not
+/// silently faked here.
 ///
-/// Reuses `local_usage`'s exact per-run join (attribute each `UsageRow` to
-/// its `RunRecord` inline, no re-load) rather than re-deriving it, then
-/// flattens: one `UsageRunRow` per `UsageRow` a run produced, carrying that
-/// run's `run_id`/`started_at` and a per-row price from the SAME
+/// Reuses `local_usage`'s exact source set and join ([`local_sources`]:
+/// workflow runs, standalone agent runs and session turns, each transcript
+/// once) rather than re-deriving it, then flattens: one `UsageRunRow` per
+/// `UsageRow` a source produced, carrying that source's `run_id`/`kind`/
+/// `started_at` and a per-row price from the SAME
 /// `rupu_config::pricing::lookup` path `summarize`/`breakdown` use.
 async fn get_usage_runs(
     State(s): State<AppState>,
@@ -887,38 +971,21 @@ async fn get_usage_runs(
     let (start, end) = resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
         .map_err(ApiError::bad_request)?;
 
-    let runs = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (sources, _) = local_sources(&s, start, end, q.workspace_id.clone()).await?;
 
     let mut out = Vec::new();
-    for r in runs.iter().filter(|r| {
-        r.started_at >= start
-            && r.started_at <= end
-            && q.workspace_id
-                .as_deref()
-                .is_none_or(|w| r.workspace_id == w)
-    }) {
-        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
-        let mut rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
-        // Same inline attribution `local_usage` does above: `r` is already in
-        // hand for this batch, so no re-load/cache/separate join function.
-        for row in &mut rows {
-            row.workflow = r.workflow_name.clone();
-            row.workspace_id = r.workspace_id.clone();
-            row.host_id = "local".to_string();
-        }
-        for row in rows {
+    for src in sources {
+        for row in src.rows {
             let priced_cost =
                 rupu_config::pricing::lookup(&s.pricing, &row.provider, &row.model, &row.agent)
                     .map(|price| {
                         price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens)
                     });
             out.push(UsageRunRow {
-                run_id: r.id.clone(),
-                started_at: r.started_at,
-                workflow_name: row.workflow,
+                run_id: src.id.clone(),
+                kind: src.kind.as_str(),
+                started_at: src.started_at,
+                workflow_name: src.workflow_name.clone(),
                 agent: row.agent,
                 provider: row.provider,
                 model: row.model,

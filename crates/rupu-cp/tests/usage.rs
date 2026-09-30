@@ -1008,3 +1008,401 @@ async fn usage_outliers_unparseable_until_returns_400() {
         "an unparseable `until` must 400, not silently fall back to now"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Part D: every usage surface reads the fold (live usage ledger, Plan 1
+// Task 9). Aggregates also count standalone agent runs and session turns —
+// each transcript exactly once — and single-entity surfaces (a run's
+// timeline, a session, an agent run) are live and include dispatch children.
+// ---------------------------------------------------------------------------
+
+const FOLD_PROVIDER: &str = "anthropic";
+const FOLD_MODEL: &str = "claude-sonnet-4-6";
+
+/// A transcript: `RunStart` for `agent` in `workspace_id`, then one `Usage`
+/// event per `(input, output)` pair. Built from serialized
+/// `rupu_transcript::Event` values.
+fn write_fold_transcript(
+    path: &std::path::Path,
+    agent: &str,
+    workspace_id: &str,
+    usages: &[(u32, u32)],
+) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut events = vec![rupu_transcript::Event::RunStart {
+        run_id: path.file_stem().unwrap().to_string_lossy().into_owned(),
+        workspace_id: workspace_id.into(),
+        agent: agent.into(),
+        provider: FOLD_PROVIDER.into(),
+        model: FOLD_MODEL.into(),
+        started_at: chrono::Utc::now(),
+        mode: rupu_transcript::RunMode::Ask,
+        schema: None,
+        system_prompt: None,
+    }];
+    for (input, output) in usages {
+        events.push(rupu_transcript::Event::Usage {
+            provider: FOLD_PROVIDER.into(),
+            model: FOLD_MODEL.into(),
+            served_model: None,
+            input_tokens: *input,
+            output_tokens: *output,
+            cached_tokens: 0,
+            purpose: None,
+        });
+    }
+    let mut buf = Vec::new();
+    for ev in &events {
+        buf.extend(serde_json::to_vec(ev).unwrap());
+        buf.push(b'\n');
+    }
+    std::fs::write(path, &buf).unwrap();
+}
+
+/// A standalone run's `<run_id>.meta.json` sidecar (the fields the CP reads).
+fn write_standalone_meta(
+    transcripts_dir: &std::path::Path,
+    run_id: &str,
+    session_id: Option<&str>,
+    trigger_source: &str,
+) {
+    std::fs::create_dir_all(transcripts_dir).unwrap();
+    let meta = serde_json::json!({
+        "run_id": run_id,
+        "session_id": session_id,
+        "trigger_source": trigger_source,
+    });
+    std::fs::write(
+        transcripts_dir.join(format!("{run_id}.meta.json")),
+        serde_json::to_vec(&meta).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A `session.json` under `<global>/sessions/<id>/` whose own token totals
+/// are zero (a turn still in flight) and whose `runs[]` name `turns`
+/// (`(run_id, transcript_path)`).
+fn write_session(global: &std::path::Path, id: &str, turns: &[(&str, &std::path::Path)]) {
+    let dir = global.join("sessions").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let runs: Vec<serde_json::Value> = turns
+        .iter()
+        .map(|(run_id, path)| {
+            serde_json::json!({
+                "run_id": run_id,
+                "prompt": "go",
+                "transcript_path": path.to_str().unwrap(),
+                "started_at": chrono::Utc::now(),
+                "total_tokens_in": 0,
+                "total_tokens_out": 0,
+                "total_tokens_cached": 0,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "session_id": id,
+        "agent_name": "chatter",
+        "model": FOLD_MODEL,
+        "provider_name": FOLD_PROVIDER,
+        "status": "active",
+        "total_turns": 0,
+        "total_tokens_in": 0,
+        "total_tokens_out": 0,
+        "total_tokens_cached": 0,
+        "created_at": chrono::Utc::now(),
+        "updated_at": chrono::Utc::now(),
+        "workspace_id": "ws_sess",
+        "runs": runs,
+    });
+    std::fs::write(
+        dir.join("session.json"),
+        serde_json::to_vec(&payload).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A workflow run record in `<global>/runs`, started now.
+fn create_workflow_run(
+    global: &std::path::Path,
+    run_id: &str,
+    status: rupu_orchestrator::RunStatus,
+) -> rupu_orchestrator::runs::RunStore {
+    let run_store = rupu_orchestrator::runs::RunStore::new(global.join("runs"));
+    let record = rupu_orchestrator::RunRecord {
+        id: run_id.into(),
+        workflow_name: "wf-fold".into(),
+        status,
+        inputs: std::collections::BTreeMap::new(),
+        event: None,
+        workspace_id: "ws_wf".into(),
+        workspace_path: std::path::PathBuf::from("/tmp/proj"),
+        transcript_dir: global.join("transcripts"),
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        error_message: None,
+        awaiting: Vec::new(),
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        issue_ref: None,
+        issue: None,
+        parent_run_id: None,
+        backend_id: None,
+        worker_id: None,
+        artifact_manifest_path: None,
+        runner_pid: None,
+        source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
+        resume_mode: None,
+        resume_gate_id: None,
+        resume_approver: None,
+        reject_cleanup_pending: None,
+        permission_mode: None,
+        final_output: None,
+        loop_progress: Default::default(),
+    };
+    run_store.create(record, "name: wf-fold\n").unwrap();
+    run_store
+}
+
+fn step_result(
+    run_id: &str,
+    step_id: &str,
+    transcript_path: std::path::PathBuf,
+) -> rupu_orchestrator::runs::StepResultRecord {
+    rupu_orchestrator::runs::StepResultRecord {
+        run_outcome: None,
+        step_id: step_id.into(),
+        run_id: run_id.into(),
+        transcript_path,
+        output: String::new(),
+        success: true,
+        skipped: false,
+        rendered_prompt: String::new(),
+        kind: rupu_orchestrator::runs::StepKind::Linear,
+        items: vec![],
+        findings: vec![],
+        iterations: 0,
+        resolved: true,
+        finished_at: chrono::Utc::now(),
+        loop_iteration: None,
+        host: None,
+    }
+}
+
+async fn get_json(url: String) -> serde_json::Value {
+    let resp = reqwest::get(&url).await.unwrap();
+    assert!(resp.status().is_success(), "GET {url}: {}", resp.status());
+    resp.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn usage_endpoint_counts_inflight_step_from_ledger() {
+    use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let store = create_workflow_run(global, "run_LIVE", rupu_orchestrator::RunStatus::Running);
+    // The step is still running: no step_results yet, and its transcript is
+    // not readable from here — the ledger alone carries its spend.
+    let unseen = global.join("elsewhere").join("run_LIVE_step.jsonl");
+    let row = |id: &str, input: u64, output: u64| LedgerRow {
+        v: LEDGER_VERSION,
+        id: id.into(),
+        at: chrono::Utc::now(),
+        kind: LedgerKind::Turn,
+        step_id: Some("build".into()),
+        unit_index: None,
+        unit_key: None,
+        agent_run_id: "run_LIVE_step".into(),
+        parent_agent_run_id: None,
+        transcript: unseen.clone(),
+        agent: "builder".into(),
+        provider: FOLD_PROVIDER.into(),
+        model: FOLD_MODEL.into(),
+        input_tokens: input,
+        output_tokens: output,
+        cached_tokens: 0,
+    };
+    let mut ledger = Vec::new();
+    for r in [row("u1", 1000, 100), row("u2", 2000, 200)] {
+        ledger.extend(serde_json::to_vec(&r).unwrap());
+        ledger.push(b'\n');
+    }
+    std::fs::write(store.usage_ledger_path("run_LIVE"), ledger).unwrap();
+
+    let srv = spawn_server(global).await;
+    let body = get_json(format!("{}/api/usage?host=local", srv.base_url)).await;
+    assert_eq!(
+        body["summary"]["total_tokens"].as_u64(),
+        Some(3300),
+        "the in-flight step's ledger rows are the run's spend: {body}"
+    );
+}
+
+#[tokio::test]
+async fn usage_endpoint_includes_standalone_and_session_transcripts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let tdir = global.join("transcripts");
+
+    // S: a standalone `rupu run`.
+    write_fold_transcript(&tdir.join("run_S.jsonl"), "solo", "ws_s", &[(100, 10)]);
+    write_standalone_meta(&tdir, "run_S", None, "run_cli");
+
+    // T: a session turn, recorded both as a standalone transcript (+ meta
+    // naming the session) and in the session's `runs[]`.
+    let t_path = tdir.join("run_T.jsonl");
+    write_fold_transcript(&t_path, "chatter", "ws_sess", &[(200, 20)]);
+    write_standalone_meta(&tdir, "run_T", Some("ses_T"), "session_turn");
+    write_session(global, "ses_T", &[("run_T", &t_path)]);
+
+    // W: a workflow run whose step transcript also sits in the global
+    // transcripts dir — it belongs to the workflow, never to "standalone".
+    let w_path = tdir.join("run_W.jsonl");
+    write_fold_transcript(&w_path, "reviewer", "ws_wf", &[(400, 40)]);
+    let store = create_workflow_run(global, "run_WF", rupu_orchestrator::RunStatus::Completed);
+    store
+        .append_step_result("run_WF", &step_result("run_WF", "review", w_path))
+        .unwrap();
+
+    let srv = spawn_server(global).await;
+    let body = get_json(format!("{}/api/usage?host=local", srv.base_url)).await;
+    assert_eq!(
+        body["summary"]["total_tokens"].as_u64(),
+        Some(110 + 220 + 440),
+        "S + T + W, each transcript counted once: {body}"
+    );
+
+    let rows = get_json(format!("{}/api/usage/runs", srv.base_url)).await;
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 3, "one row per source: {rows:?}");
+    let kind_of = |id: &str| {
+        rows.iter()
+            .find(|r| r["run_id"] == id)
+            .unwrap_or_else(|| panic!("row {id} missing: {rows:?}"))["kind"]
+            .clone()
+    };
+    assert_eq!(kind_of("run_WF"), "workflow");
+    assert_eq!(kind_of("run_S"), "agent");
+    assert_eq!(kind_of("run_T"), "session");
+    let s_row = rows.iter().find(|r| r["run_id"] == "run_S").unwrap();
+    assert!(
+        s_row["workflow_name"].is_null(),
+        "a standalone row has no workflow: {s_row}"
+    );
+    assert_eq!(s_row["total_tokens"].as_u64(), Some(110));
+    assert_eq!(s_row["host_id"], "local");
+    assert_eq!(s_row["workspace_id"], "ws_s");
+
+    // The timeline buckets the same three sources.
+    let buckets = get_json(format!("{}/api/usage/timeline", srv.base_url)).await;
+    let total: u64 = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|b| b["rows"].as_array().unwrap().clone())
+        .map(|r| r["total_tokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 770, "timeline includes S + T + W once: {buckets}");
+}
+
+#[tokio::test]
+async fn run_usage_timeline_includes_inflight_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let store = create_workflow_run(global, "run_TL", rupu_orchestrator::RunStatus::Running);
+    let t_path = global.join("proj").join("run_TL_build.jsonl");
+    write_fold_transcript(&t_path, "builder", "ws_wf", &[(10, 1), (20, 2)]);
+    let ev = rupu_orchestrator::executor::Event::StepWorking {
+        run_id: "run_TL".into(),
+        step_id: "build".into(),
+        note: None,
+        transcript_path: Some(t_path),
+    };
+    let mut line = serde_json::to_vec(&ev).unwrap();
+    line.push(b'\n');
+    std::fs::write(store.events_path("run_TL"), line).unwrap();
+
+    let srv = spawn_server(global).await;
+    let points = get_json(format!("{}/api/runs/run_TL/usage-timeline", srv.base_url)).await;
+    let points = points.as_array().expect("array");
+    assert_eq!(points.len(), 2, "both in-flight turns: {points:?}");
+    assert!(points.iter().all(|p| p["label"] == "build"), "{points:?}");
+    assert_eq!(points[1]["tokens_in"].as_u64(), Some(20));
+}
+
+#[tokio::test]
+async fn session_usage_is_live_from_transcripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let t_path = global
+        .join("proj")
+        .join(".rupu")
+        .join("transcripts")
+        .join("run_L.jsonl");
+    write_fold_transcript(&t_path, "chatter", "ws_sess", &[(300, 30), (5, 1)]);
+    write_session(global, "ses_L", &[("run_L", &t_path)]);
+
+    let srv = spawn_server(global).await;
+    let body = get_json(format!("{}/api/sessions/ses_L", srv.base_url)).await;
+    assert_eq!(
+        body["usage"]["total_tokens"].as_u64(),
+        Some(336),
+        "session usage is the transcripts' live sum, not session.json's zero totals: {body}"
+    );
+    assert_eq!(body["usage"]["runs"].as_u64(), Some(1));
+
+    let points = get_json(format!(
+        "{}/api/sessions/ses_L/usage-timeline",
+        srv.base_url
+    ))
+    .await;
+    assert_eq!(points.as_array().map(Vec::len), Some(2), "{points}");
+}
+
+#[tokio::test]
+async fn agent_run_usage_includes_dispatch_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let tdir = global.join("transcripts");
+    write_fold_transcript(&tdir.join("run_A.jsonl"), "lead", "ws_a", &[(1000, 100)]);
+    write_standalone_meta(&tdir, "run_A", None, "run_cli");
+    let child = global
+        .join("runs")
+        .join("run_A")
+        .join("sub")
+        .join("sub_1")
+        .join("transcript.jsonl");
+    write_fold_transcript(&child, "helper", "ws_a", &[(50, 5)]);
+
+    let srv = spawn_server(global).await;
+    let rows = get_json(format!("{}/api/runs/agents?host=local", srv.base_url)).await;
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["run_id"] == "run_A")
+        .unwrap_or_else(|| panic!("run_A row missing: {rows}"))
+        .clone();
+    assert_eq!(
+        row["usage"]["total_tokens"].as_u64(),
+        Some(1100 + 55),
+        "the agent run's usage includes its dispatched child: {row}"
+    );
+    assert_eq!(row["turns"].as_u64(), Some(2));
+
+    // The Usage page counts the child too.
+    let body = get_json(format!("{}/api/usage?host=local", srv.base_url)).await;
+    assert_eq!(
+        body["summary"]["total_tokens"].as_u64(),
+        Some(1155),
+        "{body}"
+    );
+}

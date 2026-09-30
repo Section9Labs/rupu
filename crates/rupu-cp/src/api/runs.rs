@@ -1082,27 +1082,23 @@ async fn usage_timeline_from_host(
         })
 }
 
-/// Build the per-turn usage-timeline series for a run in `store`. Shared by
-/// the `Global` and `ProjectLocal` branches of `get_run_usage_timeline`.
+/// Build the per-turn usage-timeline series for a run in `store`: the run's
+/// usage-fold points ([`crate::usage::run_usage`]) — every LLM call anywhere
+/// in the run, in-flight steps and mirrored/dispatched transcripts included.
+/// Shared by the `Global` and `ProjectLocal` branches of
+/// `get_run_usage_timeline`.
 fn build_usage_timeline_json(store: &RunStore, id: &str) -> ApiResult<serde_json::Value> {
     store
         .load(id)
         .map_err(|e| run_not_found_or_internal(id, e))?;
-    let steps = store.read_step_results(id).unwrap_or_default();
-    let mut labeled: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for st in &steps {
-        labeled.push((st.step_id.clone(), st.transcript_path.clone()));
-        for item in &st.items {
-            labeled.push((st.step_id.clone(), item.transcript_path.clone()));
-        }
-    }
-    let series = crate::usage::turn_series(&labeled);
-    serde_json::to_value(series).map_err(|e| ApiError::internal(e.to_string()))
+    serde_json::to_value(&crate::usage::run_usage(store, id).points)
+        .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 /// `GET /api/runs/:id/usage-timeline[?host=<id>]` — ordered per-turn token
-/// series across every transcript the run produced (step results + fan-out
-/// items), labeled by step id.
+/// series of every LLM call the run made (ledger rows, then transcripts with
+/// no ledger row: step results, fan-out items, in-flight steps, dispatched
+/// sub-runs), labeled by step id.
 ///
 /// An explicit `?host=<remote-id>` takes precedence over the resolver
 /// (unchanged proxy behavior). Otherwise dispatches on

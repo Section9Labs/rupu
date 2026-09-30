@@ -1888,16 +1888,18 @@ fn usage_fixture_is_current() {
 #[test]
 fn usage_runs_fixture_is_current() {
     // `GET /api/usage/runs` (`get_usage_runs`, api/usage.rs): `UsageRunRow`
-    // is private to that module — hand-built. 6 flat `(run × model)` rows
-    // spanning 2 days and 3 models (2 priced + 1 unpriced/nil-cost row, per
-    // the brief). `host_id` is always `"local"` — this endpoint is
-    // local-only, no host fan-out (see the doc comment on `get_usage_runs`).
+    // is private to that module — hand-built. 6 flat `(run × model)` workflow
+    // rows spanning 2 days and 3 models (2 priced + 1 unpriced/nil-cost row,
+    // per the brief), plus 1 standalone agent run (`kind: "agent"`,
+    // `workflow_name: null`). `host_id` is always `"local"` — this endpoint
+    // is local-only, no host fan-out (see the doc comment on `get_usage_runs`).
     let day1 = Utc.with_ymd_and_hms(2026, 8, 19, 9, 0, 0).unwrap();
     let day2 = Utc.with_ymd_and_hms(2026, 8, 20, 9, 0, 0).unwrap();
 
     let rows = serde_json::json!([
         {
             "run_id": "run-01",
+            "kind": "workflow",
             "started_at": day1,
             "workflow_name": "nightly-health",
             "agent": "rupuso",
@@ -1914,6 +1916,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-02",
+            "kind": "workflow",
             "started_at": day1,
             "workflow_name": "nightly-health",
             "agent": "fixer",
@@ -1930,6 +1933,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-03",
+            "kind": "workflow",
             "started_at": day1,
             "workflow_name": "issue-triage",
             "agent": "rupuso",
@@ -1946,6 +1950,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-04",
+            "kind": "workflow",
             "started_at": day2,
             "workflow_name": "nightly-health",
             "agent": "rupuso",
@@ -1962,6 +1967,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-05",
+            "kind": "workflow",
             "started_at": day2,
             "workflow_name": "hotfix",
             "agent": "fixer",
@@ -1978,6 +1984,7 @@ fn usage_runs_fixture_is_current() {
         },
         {
             "run_id": "run-06",
+            "kind": "workflow",
             "started_at": day2,
             "workflow_name": "experimental",
             "agent": "explorer",
@@ -1991,6 +1998,23 @@ fn usage_runs_fixture_is_current() {
             "total_tokens": 10_050,
             "cost_usd": null,
             "priced": false,
+        },
+        {
+            "run_id": "run-07",
+            "kind": "agent",
+            "started_at": day2,
+            "workflow_name": null,
+            "agent": "rupuso",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "workspace_id": "ws-1",
+            "host_id": "local",
+            "input_tokens": 4_000,
+            "output_tokens": 1_000,
+            "cached_tokens": 0,
+            "total_tokens": 5_000,
+            "cost_usd": 0.027,
+            "priced": true,
         },
     ]);
     check_fixture("usage_runs.json", &rows);

@@ -99,13 +99,13 @@ impl From<AutoflowCycleRecord> for AutoflowCycleRow {
 /// All fields use `#[serde(default)]` so that partial / evolving files still
 /// parse. We deliberately avoid depending on `rupu-cli`'s full struct.
 #[derive(Debug, Deserialize)]
-struct StandaloneMetaDto {
+pub(crate) struct StandaloneMetaDto {
     #[serde(default)]
-    run_id: String,
+    pub(crate) run_id: String,
     #[serde(default)]
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     #[serde(default)]
-    trigger_source: Option<String>,
+    pub(crate) trigger_source: Option<String>,
     /// The OS pid of the `rupu run`/`rupu session` process that owns this
     /// transcript (`StandaloneRunMetadata::pid`,
     /// `crates/rupu-cli/src/standalone_run_metadata.rs`), written BEFORE the
@@ -119,13 +119,13 @@ struct StandaloneMetaDto {
 
 /// Minimal CP-side projection of one entry in `session.json`'s `runs` array.
 #[derive(Debug, Deserialize)]
-struct SessionRunRecordDto {
+pub(crate) struct SessionRunRecordDto {
     #[serde(default)]
-    run_id: String,
+    pub(crate) run_id: String,
     #[serde(default)]
-    transcript_path: Option<String>,
+    pub(crate) transcript_path: Option<String>,
     #[serde(default)]
-    started_at: Option<String>,
+    pub(crate) started_at: Option<String>,
     /// `status` is serialised as `"ok"` / `"error"` / `"aborted"` by the CLI.
     #[serde(default)]
     status: Option<serde_json::Value>,
@@ -134,13 +134,13 @@ struct SessionRunRecordDto {
 /// Minimal CP-side projection of `session.json`, capturing only what we need
 /// for the runs list. `message_history` is not included (can be very large).
 #[derive(Debug, Deserialize)]
-struct SessionForRunsDto {
+pub(crate) struct SessionForRunsDto {
     #[serde(default)]
-    agent_name: Option<String>,
+    pub(crate) agent_name: Option<String>,
     #[serde(default)]
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     #[serde(default)]
-    runs: Vec<SessionRunRecordDto>,
+    pub(crate) runs: Vec<SessionRunRecordDto>,
 }
 
 /// Wire row returned by `GET /api/runs/agents`.
@@ -433,7 +433,7 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
 
 /// Try to load and parse `session.json` at `path` as a `SessionForRunsDto`.
 /// Returns `None` with a warning on any failure.
-fn try_load_session_for_runs(path: &std::path::Path) -> Option<SessionForRunsDto> {
+pub(crate) fn try_load_session_for_runs(path: &std::path::Path) -> Option<SessionForRunsDto> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -706,6 +706,28 @@ use crate::api::host_fanout::{fan_out_via, sort_values_newest_first};
 // `GET /api/runs/agents`
 // ---------------------------------------------------------------------------
 
+/// Usage + turns + duration of one local agent run — its own transcript plus
+/// its recursive dispatch sub-runs (`<runs>/<run_id>/sub/…`), through the
+/// shared usage fold. A missing transcript reads as `partial`, never an
+/// error.
+fn agent_run_metrics(
+    s: &AppState,
+    run_id: &str,
+    transcript_path: &str,
+) -> crate::usage::RunMetrics {
+    let labeled = crate::usage_sources::with_dispatch_children(
+        &s.run_store,
+        run_id,
+        std::path::Path::new(transcript_path),
+    );
+    let u = crate::usage::transcripts_usage(&labeled);
+    crate::usage::RunMetrics {
+        usage: crate::usage::summarize_run_usage(&u, &s.pricing),
+        turns: u.turns,
+        duration_ms: u.duration_ms,
+    }
+}
+
 /// `GET /api/runs/agents[?host=<id>]` — returns agent runs from both standalone
 /// transcripts and session invocations, merged and sorted newest-first by
 /// `started_at`.
@@ -758,8 +780,7 @@ async fn list_agent_runs(
         for row in &mut page_rows {
             row.host_id = Some("local".to_string());
             if let Some(tp) = &row.transcript_path {
-                let m =
-                    crate::usage::run_metrics_paths(&[std::path::PathBuf::from(tp)], &s.pricing);
+                let m = agent_run_metrics(&s, &row.run_id, tp);
                 row.usage = m.usage;
                 row.turns = m.turns;
                 row.duration_ms = m.duration_ms;
@@ -804,8 +825,8 @@ async fn list_agent_runs(
     for row in &mut page_values {
         if row["host_id"].as_str() == Some("local") {
             if let Some(tp) = row["transcript_path"].as_str() {
-                let m =
-                    crate::usage::run_metrics_paths(&[std::path::PathBuf::from(tp)], &s.pricing);
+                let run_id = row["run_id"].as_str().unwrap_or_default();
+                let m = agent_run_metrics(&s, run_id, tp);
                 row["usage"] = serde_json::to_value(m.usage).unwrap();
                 row["turns"] = serde_json::json!(m.turns);
                 row["duration_ms"] = serde_json::to_value(m.duration_ms).unwrap();
