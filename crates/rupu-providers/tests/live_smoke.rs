@@ -9,7 +9,7 @@
 //! them with secrets.
 
 use rupu_providers::auth::AuthCredentials;
-use rupu_providers::types::{LlmRequest, Message};
+use rupu_providers::types::{ContentBlock, LlmRequest, Message, Role, ToolDefinition, Usage};
 
 fn live_enabled() -> bool {
     std::env::var("RUPU_LIVE_TESTS").as_deref() == Ok("1")
@@ -98,6 +98,178 @@ async fn copilot_live_round_trip() {
         .await
         .expect("copilot round-trip");
     assert!(resp.usage.output_tokens > 0, "copilot output_tokens == 0");
+}
+
+// ---------------------------------------------------------------------
+// Anthropic prompt-cache live checks (Plan 3, Task 5).
+//
+// Both tests are `#[ignore]`d on top of the usual env gate, so a plain
+// `cargo test` (or even the nightly run without `--ignored`) never spends
+// money. Run them only after the user has explicitly approved the spend:
+//
+//   RUPU_LIVE_TESTS=1 RUPU_LIVE_ANTHROPIC_KEY=... \
+//     cargo test -p rupu-providers --test live_smoke -- --ignored --nocapture prompt_cache
+//   RUPU_LIVE_TESTS=1 RUPU_LIVE_ANTHROPIC_KEY=... \
+//     cargo test -p rupu-providers --test live_smoke -- --ignored --nocapture cache_control_on_empty_tool_result
+//
+// `--nocapture` matters: the usage numbers are printed with `eprintln!`, and a
+// missing env var skips (returns early, reported as "ok") rather than fails —
+// the same behaviour as the round-trip tests above.
+
+/// Model for the prompt-cache checks. `claude-haiku-4-5` (used by the plain
+/// round-trip test) needs a 4096-token prefix to cache at all, which the ~3k
+/// filler below would silently miss; Sonnet 4.6's minimum cacheable prefix is
+/// 2048 tokens. Override with `RUPU_LIVE_ANTHROPIC_MODEL` (mind the minimum:
+/// 4096 for Opus 4.5/4.6 and Haiku 4.5, 1024-2048 for the Sonnet line).
+fn cache_test_model() -> String {
+    std::env::var("RUPU_LIVE_ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into())
+}
+
+/// Deterministic invented filler of roughly 3,000 tokens (~34 numbered
+/// ledger entries of ~90 tokens each). Numbering each entry keeps the text
+/// from being one trivially repeated string; the same input always yields
+/// byte-identical output so both requests share a cacheable prefix.
+fn cacheable_system_prompt() -> String {
+    let entry = "The lighthouse keeper at Marrowgate logged the tides each dusk: three \
+        barrels of salt for the herring boats, one lantern wick trimmed, and a note about \
+        the gull that had learned to open the tin biscuit box. Nothing about the harbour \
+        ledger was urgent, but every entry was copied twice, once in ink for the office \
+        and once in pencil for the wall.";
+    let mut out = String::from(
+        "You are a terse assistant. Below is a reference ledger; ignore it and answer \
+         the user in one short word.\n\n",
+    );
+    for i in 1..=34 {
+        out.push_str(&format!("Ledger entry {i}: {entry}\n"));
+    }
+    out
+}
+
+/// Builds a caching-ON (default) client from the live env pattern, or `None`
+/// (skip) when the env gate / key is absent.
+fn live_anthropic_client() -> Option<rupu_providers::AnthropicClient> {
+    if !live_enabled() {
+        eprintln!("SKIPPED: RUPU_LIVE_TESTS != 1");
+        return None;
+    }
+    let Ok(key) = std::env::var("RUPU_LIVE_ANTHROPIC_KEY") else {
+        eprintln!("SKIPPED: RUPU_LIVE_ANTHROPIC_KEY not set");
+        return None;
+    };
+    // `AnthropicClient::new` leaves prompt caching at its default: ON.
+    Some(rupu_providers::AnthropicClient::new(
+        key,
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    ))
+}
+
+fn assert_whole_prompt_usage(label: &str, usage: &Usage) {
+    assert!(
+        usage.input_tokens >= usage.cached_tokens + usage.cache_write_tokens,
+        "{label}: normalized input_tokens ({}) must cover cache reads ({}) + cache writes ({})",
+        usage.input_tokens,
+        usage.cached_tokens,
+        usage.cache_write_tokens,
+    );
+}
+
+/// Live: the SAME streaming request twice must write (or already hit) the
+/// cache the first time and read it the second.
+///
+/// Cost: two tiny requests (~3k input tokens each, `max_tokens = 16`) on
+/// Sonnet 4.6 — a few cents. Requires explicit user approval before running;
+/// see the run command in the block comment above.
+#[tokio::test]
+#[ignore = "live API: spends money; run with --ignored after approval"]
+async fn live_anthropic_prompt_cache_reads_on_second_request() {
+    let Some(mut client) = live_anthropic_client() else {
+        return;
+    };
+    let mut req = minimal_request(&cache_test_model());
+    req.system = Some(cacheable_system_prompt());
+    req.messages = vec![Message::user("Say hi.")];
+    req.max_tokens = 16;
+
+    let first = client
+        .stream(&req, |_| {})
+        .await
+        .expect("first streamed request");
+    eprintln!("prompt_cache first  usage: {:?}", first.usage);
+    let second = client
+        .stream(&req, |_| {})
+        .await
+        .expect("second streamed request");
+    eprintln!("prompt_cache second usage: {:?}", second.usage);
+
+    // A warm cache from a run within the last 5 minutes is fine: the first
+    // call then reads instead of writes.
+    assert!(
+        first.usage.cache_write_tokens > 0 || first.usage.cached_tokens > 0,
+        "first request neither wrote nor read the cache (input_tokens = {}; is the prefix \
+         below the model's minimum cacheable length?): {:?}",
+        first.usage.input_tokens,
+        first.usage,
+    );
+    assert!(
+        second.usage.cached_tokens > 0,
+        "second identical request did not read the cache: {:?}",
+        second.usage,
+    );
+    assert_whole_prompt_usage("first", &first.usage);
+    assert_whole_prompt_usage("second", &second.usage);
+}
+
+/// Live: the rolling breakpoint lands on the final `tool_result` even when its
+/// content is empty. This answers empirically whether Anthropic accepts
+/// `cache_control` on an empty `tool_result` block (a 400 here means the
+/// request builder must skip empty tool results as marker targets).
+///
+/// Cost: one tiny streaming request (`max_tokens = 32`) — well under a cent.
+/// Requires explicit user approval before running; see the run command in the
+/// block comment above.
+#[tokio::test]
+#[ignore = "live API: spends money; run with --ignored after approval"]
+async fn live_anthropic_cache_control_on_empty_tool_result_is_accepted() {
+    let Some(mut client) = live_anthropic_client() else {
+        return;
+    };
+    let tool_use_id = "toolu_01cachechecknoop000001";
+    let mut req = minimal_request(&cache_test_model());
+    req.system = Some("You are a terse test harness. Reply with one short sentence.".into());
+    req.tools = vec![ToolDefinition {
+        name: "noop".into(),
+        description: "Does nothing and returns nothing.".into(),
+        input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+    }];
+    req.messages = vec![
+        Message::user("Call the noop tool once, then tell me it finished."),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: tool_use_id.into(),
+                name: "noop".into(),
+                input: serde_json::json!({}),
+            }],
+        },
+        // Final user message ends with an EMPTY tool_result — the block the
+        // rolling cache breakpoint is placed on.
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: String::new(),
+                is_error: false,
+            }],
+        },
+    ];
+    req.max_tokens = 32;
+
+    let resp = client
+        .stream(&req, |_| {})
+        .await
+        .expect("Anthropic must accept cache_control on an empty tool_result (got an error/400)");
+    eprintln!("cache_control_on_empty_tool_result usage: {:?}", resp.usage);
+    assert_whole_prompt_usage("empty tool_result", &resp.usage);
 }
 
 // Gemini live test deferred until AI Studio API-key path is wired
