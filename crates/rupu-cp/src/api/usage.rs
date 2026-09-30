@@ -180,8 +180,8 @@ fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsa
         input_tokens: u64_at(summary_val, "total_input_tokens"),
         output_tokens: u64_at(summary_val, "total_output_tokens"),
         cached_tokens: u64_at(summary_val, "total_cached_tokens"),
-        // The CLI report carries no cache-write counts (here or per row).
-        cache_write_tokens: 0,
+        // Absent (a CLI that predates cache writes) → 0.
+        cache_write_tokens: u64_at(summary_val, "total_cache_write_tokens"),
         total_tokens: u64_at(summary_val, "total_tokens"),
         cost_usd: summary_val.get("total_cost_usd").and_then(|x| x.as_f64()),
         priced: !partial_at(summary_val),
@@ -234,7 +234,7 @@ fn usage_body_from_remote_report(report: &serde_json::Value) -> Result<RemoteUsa
             input_tokens,
             output_tokens,
             cached_tokens: u64_at(r, "cached_tokens"),
-            cache_write_tokens: 0,
+            cache_write_tokens: u64_at(r, "cache_write_tokens"),
             // The CLI report has no per-row total; cached tokens are not
             // added in, matching `crate::usage::breakdown`'s own arithmetic.
             total_tokens: input_tokens + output_tokens,
@@ -322,6 +322,7 @@ fn merge_breakdown_rows(
                 acc.input_tokens += row.input_tokens;
                 acc.output_tokens += row.output_tokens;
                 acc.cached_tokens += row.cached_tokens;
+                acc.cache_write_tokens += row.cache_write_tokens;
                 acc.total_tokens += row.total_tokens;
                 acc.runs += row.runs;
                 acc.cost_usd = match (acc.cost_usd, row.cost_usd) {
@@ -967,6 +968,8 @@ struct UsageRunRow {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    cache_write_tokens: u64,
     total_tokens: u64,
     /// `None` = unpriced. Never fabricated — mirrors `UsageBreakdownRow.cost_usd`.
     cost_usd: Option<f64>,
@@ -1023,6 +1026,7 @@ async fn get_usage_runs(
                 input_tokens: row.input_tokens,
                 output_tokens: row.output_tokens,
                 cached_tokens: row.cached_tokens,
+                cache_write_tokens: row.cache_write_tokens,
                 total_tokens: row.input_tokens + row.output_tokens,
                 priced: priced_cost.is_some(),
                 cost_usd: priced_cost,
@@ -1085,6 +1089,81 @@ mod tests {
             row.host_id.is_empty(),
             "the caller tags rows with the real host id"
         );
+        // A report from a CLI that predates cache writes carries none.
+        assert_eq!(body.summary.cache_write_tokens, 0);
+        assert_eq!(row.cache_write_tokens, 0);
+    }
+
+    /// A remote CLI report's cache writes (`summary.total_cache_write_tokens`,
+    /// `rows[].cache_write_tokens`) reach the CP body.
+    #[test]
+    fn remote_usage_report_carries_cache_write_tokens() {
+        let report = serde_json::json!({
+            "summary": {
+                "total_input_tokens": 1000, "total_output_tokens": 20,
+                "total_cached_tokens": 600, "total_cache_write_tokens": 40,
+                "total_tokens": 1020, "total_runs": 1,
+                "total_cost_usd": 0.5, "cost_partial": false
+            },
+            "rows": [{
+                "group": "opus", "model": "opus", "input_tokens": 1000,
+                "output_tokens": 20, "cached_tokens": 600,
+                "cache_write_tokens": 40, "runs": 1,
+                "cost_usd": 0.5, "cost_partial": false
+            }]
+        });
+        let body = usage_body_from_remote_report(&report).expect("mappable");
+        assert_eq!(body.summary.cache_write_tokens, 40);
+        assert_eq!(body.breakdown[0].cache_write_tokens, 40);
+        assert_eq!(
+            body.breakdown[0].total_tokens, 1020,
+            "input + output; cache writes are inside input, never added again"
+        );
+    }
+
+    fn breakdown_row(model: &str, input: u64, cache_write: u64) -> crate::usage::UsageBreakdownRow {
+        crate::usage::UsageBreakdownRow {
+            provider: String::new(),
+            model: model.into(),
+            agent: String::new(),
+            workflow: String::new(),
+            host_id: String::new(),
+            workspace_id: String::new(),
+            input_tokens: input,
+            output_tokens: 10,
+            cached_tokens: 5,
+            cache_write_tokens: cache_write,
+            total_tokens: input + 10,
+            cost_usd: Some(1.0),
+            priced: true,
+            runs: 1,
+        }
+    }
+
+    /// Two hosts' rows sharing a group key fold into one row that sums every
+    /// token field — cache writes included — so the merged breakdown agrees
+    /// with the merged summary.
+    #[test]
+    fn merge_breakdown_rows_sums_same_key_rows_including_cache_writes() {
+        let merged = merge_breakdown_rows(
+            vec![
+                breakdown_row("opus", 100, 30),
+                breakdown_row("opus", 50, 5),
+                breakdown_row("haiku", 7, 0),
+            ],
+            crate::usage::GroupBy::Model,
+        );
+        assert_eq!(merged.len(), 2);
+        let opus = merged.iter().find(|r| r.model == "opus").unwrap();
+        assert_eq!(opus.input_tokens, 150);
+        assert_eq!(opus.output_tokens, 20);
+        assert_eq!(opus.cached_tokens, 10);
+        assert_eq!(opus.cache_write_tokens, 35);
+        assert_eq!(opus.total_tokens, 170);
+        assert_eq!(opus.runs, 2);
+        assert_eq!(opus.cost_usd, Some(2.0));
+        let haiku = merged.iter().find(|r| r.model == "haiku").unwrap();
+        assert_eq!(haiku.cache_write_tokens, 0);
     }
 
     /// A remote that says its totals are a lower bound (`summary.partial`)

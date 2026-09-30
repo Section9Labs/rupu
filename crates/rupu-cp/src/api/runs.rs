@@ -3333,6 +3333,14 @@ mod tests {
             serde_json::json!(30),
             "{v}"
         );
+        // Cache writes are a subset of input: the total is input + output
+        // (1000 + 20), never input + output + cache writes.
+        assert_eq!(v["summary"]["total_tokens"], serde_json::json!(1020), "{v}");
+        assert_eq!(
+            v["steps"]["build"]["total_tokens"],
+            serde_json::json!(1020),
+            "{v}"
+        );
     }
 
     /// Same mirror rule for the usage-timeline (now built off the executor).

@@ -312,6 +312,67 @@ fn usage_supports_global_json_format() {
         .stdout(predicate::str::contains("\"top_providers\""));
 }
 
+/// The JSON report carries prompt-cache writes in the summary and in every
+/// breakdown/run row — a remote CP reads them off an SSH host's report.
+#[test]
+fn usage_json_report_carries_cache_write_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join(".rupu");
+    let project = dir.path().join("project");
+    let transcripts = home.join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let path = write_usage_transcript(
+        &transcripts,
+        "run_usage_cache_write",
+        "reviewer",
+        "anthropic",
+        "claude-sonnet-4-6",
+        Utc::now(),
+        1000,
+        20,
+    );
+    // A second call that wrote 30 of its 500 prompt tokens to the cache.
+    let mut writer = JsonlWriter::append(&path).unwrap();
+    writer
+        .write(&Event::Usage {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            served_model: None,
+            input_tokens: 500,
+            output_tokens: 5,
+            cached_tokens: 0,
+            cache_write_tokens: 30,
+            purpose: None,
+        })
+        .unwrap();
+    writer.flush().unwrap();
+
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = Command::cargo_bin("rupu")
+            .unwrap()
+            .current_dir(&project)
+            .env("RUPU_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice(&out.stdout).expect("json report")
+    };
+
+    let report = json(&["usage", "--format", "json"]);
+    assert_eq!(
+        report["summary"]["total_cache_write_tokens"], 30,
+        "{report}"
+    );
+    assert_eq!(report["summary"]["total_tokens"], 1525, "{report}");
+    assert_eq!(report["rows"][0]["cache_write_tokens"], 30, "{report}");
+
+    let runs = json(&["usage", "runs", "--format", "json"]);
+    assert_eq!(runs["summary"]["total_cache_write_tokens"], 30, "{runs}");
+    assert_eq!(runs["rows"][0]["cache_write_tokens"], 30, "{runs}");
+}
+
 #[test]
 fn usage_supports_csv_format() {
     let dir = tempfile::tempdir().unwrap();

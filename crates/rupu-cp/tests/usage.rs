@@ -733,6 +733,66 @@ async fn usage_runs_returns_flat_per_run_rows_with_run_id_and_priced_cost() {
 }
 
 #[tokio::test]
+async fn usage_runs_rows_carry_cache_write_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    seed_run_with_usage(
+        dir.path(),
+        "run_cw",
+        "nightly-review",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1000,
+        20,
+        started,
+    );
+    // A second call on the same transcript that wrote 30 prompt tokens to
+    // the provider's cache (a subset of its 500 input tokens).
+    let mut line = serde_json::to_vec(&rupu_transcript::Event::Usage {
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        served_model: None,
+        input_tokens: 500,
+        output_tokens: 5,
+        cached_tokens: 0,
+        cache_write_tokens: 30,
+        purpose: None,
+    })
+    .unwrap();
+    line.push(b'\n');
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("run_cw.jsonl"))
+        .unwrap()
+        .write_all(&line)
+        .unwrap();
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/runs?since=2026-01-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["cache_write_tokens"].as_u64(), Some(30), "{rows:?}");
+    assert_eq!(rows[0]["input_tokens"].as_u64(), Some(1500));
+    assert_eq!(
+        rows[0]["total_tokens"].as_u64(),
+        Some(1525),
+        "input + output; cache writes are not added again"
+    );
+}
+
+#[tokio::test]
 async fn usage_runs_workspace_id_scopes_to_that_project_only() {
     let dir = tempfile::tempdir().unwrap();
     let now = chrono::Utc::now();

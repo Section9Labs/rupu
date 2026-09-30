@@ -402,6 +402,9 @@ struct UsageSummary {
     total_input_tokens: u64,
     total_output_tokens: u64,
     total_cached_tokens: u64,
+    /// Prompt-cache writes — a subset of `total_input_tokens`. JSON only
+    /// (the CSV/table layouts are unchanged).
+    total_cache_write_tokens: u64,
     total_tokens: u64,
     total_runs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -648,6 +651,8 @@ struct UsageBreakdownRow {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    /// Prompt-cache writes (JSON only).
+    cache_write_tokens: u64,
     runs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
@@ -695,6 +700,8 @@ struct UsageRunRow {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    /// Prompt-cache writes (JSON only).
+    cache_write_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
     cost_partial: bool,
@@ -750,6 +757,7 @@ struct GroupAccumulator {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
     run_ids: BTreeSet<String>,
     cost: CostTally,
 }
@@ -767,6 +775,7 @@ fn build_summary(dataset: &UsageDataset, pricing: &rupu_config::PricingConfig) -
         total_input_tokens: totals.input_tokens,
         total_output_tokens: totals.output_tokens,
         total_cached_tokens: totals.cached_tokens,
+        total_cache_write_tokens: totals.cache_write_tokens,
         total_tokens: totals.input_tokens + totals.output_tokens,
         total_runs: totals.runs,
         total_cost_usd: total_cost.cost_usd(),
@@ -810,6 +819,7 @@ fn build_breakdown_rows(
         acc.input_tokens += fact.input_tokens;
         acc.output_tokens += fact.output_tokens;
         acc.cached_tokens += fact.cached_tokens;
+        acc.cache_write_tokens += fact.cache_write_tokens;
         acc.run_ids.insert(fact.run_id.clone());
         acc.cost.add(cost_for_fact(fact, pricing));
         entry.0 = row;
@@ -821,6 +831,7 @@ fn build_breakdown_rows(
             row.input_tokens = acc.input_tokens;
             row.output_tokens = acc.output_tokens;
             row.cached_tokens = acc.cached_tokens;
+            row.cache_write_tokens = acc.cache_write_tokens;
             row.runs = acc.run_ids.len() as u64;
             row.cost_usd = acc.cost.cost_usd();
             row.cost_partial = acc.cost.partial();
@@ -846,6 +857,7 @@ fn row_template(group_by: UsageGroupBy, fact: &UsageFact) -> UsageBreakdownRow {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 0,
             cost_usd: None,
             cost_partial: false,
@@ -861,6 +873,7 @@ fn row_template(group_by: UsageGroupBy, fact: &UsageFact) -> UsageBreakdownRow {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 0,
             cost_usd: None,
             cost_partial: false,
@@ -876,6 +889,7 @@ fn row_template(group_by: UsageGroupBy, fact: &UsageFact) -> UsageBreakdownRow {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 0,
             cost_usd: None,
             cost_partial: false,
@@ -891,6 +905,7 @@ fn row_template(group_by: UsageGroupBy, fact: &UsageFact) -> UsageBreakdownRow {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 0,
             cost_usd: None,
             cost_partial: false,
@@ -909,6 +924,7 @@ fn row_template(group_by: UsageGroupBy, fact: &UsageFact) -> UsageBreakdownRow {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 0,
             cost_usd: None,
             cost_partial: false,
@@ -924,6 +940,7 @@ fn row_template(group_by: UsageGroupBy, fact: &UsageFact) -> UsageBreakdownRow {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 0,
             cost_usd: None,
             cost_partial: false,
@@ -939,6 +956,7 @@ fn row_template(group_by: UsageGroupBy, fact: &UsageFact) -> UsageBreakdownRow {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 0,
             cost_usd: None,
             cost_partial: false,
@@ -1000,6 +1018,7 @@ fn build_run_rows(
                 input_tokens: run.input_tokens,
                 output_tokens: run.output_tokens,
                 cached_tokens: run.cached_tokens,
+                cache_write_tokens: run.cache_write_tokens,
                 cost_usd: cost.cost_usd(),
                 cost_partial: cost.partial(),
             }
@@ -1551,6 +1570,7 @@ mod tests {
             total_input_tokens: 1_234_567,
             total_output_tokens: 42,
             total_cached_tokens: 0,
+            total_cache_write_tokens: 0,
             total_tokens: 1_234_609,
             total_runs: 2,
             total_cost_usd: Some(12_345.678_9),
@@ -1573,6 +1593,7 @@ mod tests {
             input_tokens,
             output_tokens: 5,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             runs: 1,
             cost_usd: Some(cost_usd),
             cost_partial: false,
@@ -1661,6 +1682,7 @@ mod tests {
             input_tokens,
             output_tokens: 5,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             cost_usd: Some(3.4),
             cost_partial: false,
         }

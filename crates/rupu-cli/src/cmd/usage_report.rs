@@ -32,6 +32,8 @@ pub struct UsageFact {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    /// Prompt-cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +51,7 @@ pub struct UsageRun {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
     pub providers: Vec<String>,
     pub models: Vec<String>,
     pub agents: Vec<String>,
@@ -59,6 +62,7 @@ pub struct UsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
     pub runs: u64,
 }
 
@@ -228,6 +232,7 @@ impl UsageDataset {
             input_tokens: self.facts.iter().map(|fact| fact.input_tokens).sum(),
             output_tokens: self.facts.iter().map(|fact| fact.output_tokens).sum(),
             cached_tokens: self.facts.iter().map(|fact| fact.cached_tokens).sum(),
+            cache_write_tokens: self.facts.iter().map(|fact| fact.cache_write_tokens).sum(),
             runs: self
                 .facts
                 .iter()
@@ -306,6 +311,7 @@ fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
         input_tokens: u64,
         output_tokens: u64,
         cached_tokens: u64,
+        cache_write_tokens: u64,
         providers: BTreeSet<String>,
         models: BTreeSet<String>,
         agents: BTreeSet<String>,
@@ -331,6 +337,7 @@ fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
         entry.input_tokens += fact.input_tokens;
         entry.output_tokens += fact.output_tokens;
         entry.cached_tokens += fact.cached_tokens;
+        entry.cache_write_tokens += fact.cache_write_tokens;
         entry.providers.insert(fact.provider.clone());
         entry.models.insert(fact.model.clone());
         entry.agents.insert(fact.agent.clone());
@@ -353,6 +360,7 @@ fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
                 input_tokens: entry.input_tokens,
                 output_tokens: entry.output_tokens,
                 cached_tokens: entry.cached_tokens,
+                cache_write_tokens: entry.cache_write_tokens,
                 providers: entry.providers.into_iter().collect(),
                 models: entry.models.into_iter().collect(),
                 agents: entry.agents.into_iter().collect(),
@@ -484,6 +492,7 @@ impl WorkflowUsageMetadata {
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
             cached_tokens: row.cached_tokens,
+            cache_write_tokens: row.cache_write_tokens,
         }
     }
 }
@@ -538,6 +547,7 @@ impl StandaloneUsageMetadata {
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
             cached_tokens: row.cached_tokens,
+            cache_write_tokens: row.cache_write_tokens,
         }
     }
 }
