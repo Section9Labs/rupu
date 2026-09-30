@@ -50,6 +50,13 @@ impl Format {
         }
     }
 
+    /// Whether this build can render the format: everything but PDF always,
+    /// PDF only with the `pdf` cargo feature. Lets a caller refuse a request
+    /// up front instead of after collecting its findings.
+    pub fn is_available(self) -> bool {
+        self != Format::Pdf || cfg!(feature = "pdf")
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "md" | "markdown" => Some(Format::Markdown),
@@ -63,7 +70,7 @@ impl Format {
 /// Fail fast, before any work (and even for an empty selection), when the
 /// requested format is not compiled into this build.
 fn ensure_supported(fmt: Format) -> Result<(), ExportError> {
-    if fmt == Format::Pdf && !cfg!(feature = "pdf") {
+    if !fmt.is_available() {
         return Err(ExportError::PdfUnavailable);
     }
     Ok(())

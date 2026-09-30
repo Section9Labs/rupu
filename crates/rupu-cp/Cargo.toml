@@ -9,6 +9,13 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# PDF finding-report export (embeds Typst and its fonts, roughly +50 MB in a
+# release binary). Without it the other export formats still work and a PDF
+# request answers 501.
+default = ["pdf"]
+pdf = ["rupu-findings-report/pdf"]
+
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
 chrono.workspace = true
@@ -48,6 +55,7 @@ rupu-transcript = { path = "../rupu-transcript" }
 rupu-ast = { path = "../rupu-ast" }
 rupu-scm = { path = "../rupu-scm" }
 rupu-mcp = { path = "../rupu-mcp" }
+rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 
 [dev-dependencies]
 chrono.workspace = true

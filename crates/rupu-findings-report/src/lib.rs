@@ -17,6 +17,7 @@ pub mod number;
 pub mod pdf;
 pub mod prose;
 pub mod render;
+pub mod select;
 mod text;
 pub mod typst_doc;
 

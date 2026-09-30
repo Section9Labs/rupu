@@ -2,7 +2,9 @@ use crate::model::{ExportFinding, ExportInput};
 use rupu_coverage::Severity;
 use std::collections::{BTreeMap, HashMap};
 
-fn rank(s: Severity) -> u8 {
+/// Sort rank of a severity: 0 is the worst (critical). Numbering sorts by
+/// it; selection compares against it.
+pub(crate) fn rank(s: Severity) -> u8 {
     match s {
         Severity::Critical => 0,
         Severity::High => 1,
@@ -87,6 +89,33 @@ fn clean_component(s: &str) -> String {
 /// Longest finding number (in chars) a file name will carry.
 const MAX_NUMBER_CHARS: usize = 40;
 
+/// Longest title (in chars) a file name will carry.
+const MAX_TITLE_CHARS: usize = 80;
+
+/// A title as safe file-name text: the cleaning [`filename`] applies to a
+/// finding title (no separators, control or bidi characters; whitespace
+/// collapsed; at most 80 characters). It may come back empty, and it does not
+/// touch a leading dot: a caller that uses it as a whole name handles both.
+pub fn sanitize_title(s: &str) -> String {
+    let collapsed = clean_component(s);
+    let short: String = collapsed.chars().take(MAX_TITLE_CHARS).collect();
+    short.trim_end().to_string()
+}
+
+/// The display-number prefix used when none is configured.
+pub const DEFAULT_PREFIX: &str = "SEC";
+
+/// Whether `p` is acceptable as a display-number prefix: an ASCII letter then
+/// up to 15 letters, digits, `_` or `-`. The configured value ends up in file
+/// names and document text, and a project-level config is repo-controlled, so
+/// anything else is refused rather than escaped.
+pub fn is_valid_prefix(p: &str) -> bool {
+    let mut chars = p.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && p.len() <= 16
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// The suggested file name: `<number> - <title>.<ext>`. Both the title and
 /// the number are cleaned: the number is caller-supplied, so it must not be
 /// able to smuggle a path (`../../x`) into a download or zip entry name.
@@ -100,9 +129,7 @@ pub fn filename(f: &ExportFinding, ext: &str) -> String {
         "" => "finding",
         n => n,
     };
-    let collapsed = clean_component(title(f));
-    let short: String = collapsed.chars().take(80).collect();
-    format!("{number} - {}.{ext}", short.trim_end())
+    format!("{number} - {}.{ext}", sanitize_title(title(f)))
 }
 
 #[cfg(test)]
@@ -200,6 +227,40 @@ mod tests {
         r.summary = "a\u{200e}b\u{200f}c\u{202a}d\u{202b}e\u{202c}f\u{202d}g\u{202e}h\u{2066}i\u{2067}j\u{2068}k\u{2069}l".into();
         let f = assign_numbers(vec![input("a", r)], "SEC").remove(0);
         assert_eq!(filename(&f, "md"), "SEC-001 - abcdefghijkl.md");
+    }
+
+    #[test]
+    fn sanitize_title_cleans_and_truncates_like_a_finding_title() {
+        assert_eq!(
+            sanitize_title("Q3 / \"audit\":\n  <report>\u{202e}  "),
+            "Q3 audit report"
+        );
+        assert_eq!(sanitize_title("x".repeat(200).as_str()).chars().count(), 80);
+        assert_eq!(sanitize_title("  \n "), "");
+        // Leading dots are the caller's call: a title is not a whole name here.
+        assert_eq!(sanitize_title("..hidden"), "..hidden");
+    }
+
+    #[test]
+    fn prefix_validation_accepts_only_short_identifier_like_prefixes() {
+        for ok in ["SEC", "VULN", "a", "Sec_1", "ACME-SEC", "A234567890123456"] {
+            assert!(is_valid_prefix(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "1SEC",
+            "-SEC",
+            "_SEC",
+            "SE C",
+            "SEC/1",
+            "../x",
+            "SEC\n",
+            "SEC\"",
+            "SÉC",
+            "A2345678901234567",
+        ] {
+            assert!(!is_valid_prefix(bad), "{bad:?}");
+        }
     }
 
     #[test]

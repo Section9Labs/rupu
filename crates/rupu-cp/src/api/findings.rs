@@ -7,23 +7,32 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderValue},
     response::Response,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use rupu_coverage::report::{
     summarize, ArtifactKind, ArtifactStorage, ArtifactStore, ReportSummary,
 };
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
+use rupu_findings_report::model::{ExportFinding, ExportInput, ReportMeta};
+use rupu_findings_report::number::{
+    assign_numbers, filename, is_valid_prefix, number_map, sanitize_title, DEFAULT_PREFIX,
+};
+use rupu_findings_report::select::{describe, select, Selection};
+use rupu_findings_report::{render_finding, render_project, render_split_zip, ExportError, Format};
 use rupu_orchestrator::{executor::Event, runs::RunStore};
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
+use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/findings", get(list_findings))
+        .route("/api/findings/export", post(export_findings))
         .route("/api/findings/:id", get(get_finding))
+        .route("/api/findings/:id/export", get(export_finding))
         .route("/api/findings/:id/artifacts/:sha256", get(get_artifact))
 }
 
@@ -407,6 +416,26 @@ fn sub_run_ids_from_events(store: &RunStore, parent: &str) -> Vec<String> {
     out
 }
 
+/// `run_id → workflow_name` for each distinct, non-empty id in `run_ids` whose
+/// run the `RunStore` can load. Each id is loaded once; an id that can't be
+/// resolved (an agent/session-local id with no `run.json`) is simply absent.
+fn workflow_names_by_run<'a>(
+    store: &RunStore,
+    run_ids: impl IntoIterator<Item = &'a str>,
+) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for run_id in run_ids {
+        if run_id.is_empty() || !seen.insert(run_id) {
+            continue;
+        }
+        if let Ok(rec) = store.load(run_id) {
+            names.insert(run_id.to_string(), rec.workflow_name);
+        }
+    }
+    names
+}
+
 /// `GET /api/findings` — every finding across every registered workspace's
 /// coverage targets, tagged with provenance, plus a per-severity summary.
 ///
@@ -422,16 +451,10 @@ async fn list_findings(
     // Join `declared_by.run_id → workflow_name` via the RunStore. Load each
     // distinct run id once; a load error / NotFound leaves that id out of the
     // map (finding keeps `workflow_name: None`).
-    let mut wf_by_run: HashMap<String, String> = HashMap::new();
-    for f in &out {
-        let run_id = &f.record.declared_by.run_id;
-        if run_id.is_empty() || wf_by_run.contains_key(run_id) {
-            continue;
-        }
-        if let Ok(rec) = s.run_store.load(run_id) {
-            wf_by_run.insert(run_id.clone(), rec.workflow_name);
-        }
-    }
+    let wf_by_run = workflow_names_by_run(
+        &s.run_store,
+        out.iter().map(|f| f.record.declared_by.run_id.as_str()),
+    );
     for f in &mut out {
         f.workflow_name = wf_by_run.get(&f.record.declared_by.run_id).cloned();
     }
@@ -676,6 +699,341 @@ async fn get_artifact(
             .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
     Ok(resp)
+}
+
+// ── report exports ──────────────────────────────────────────────────────────
+
+/// Title of a project report when the request gives none.
+const DEFAULT_EXPORT_TITLE: &str = "Findings report";
+
+/// Longest report title accepted, in characters. The title lands in the
+/// document, its page header and the download's file name.
+const MAX_EXPORT_TITLE_CHARS: usize = 200;
+
+/// Query of `GET /api/findings/:id/export`.
+#[derive(Debug, Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
+/// Body of `POST /api/findings/export`. Unknown fields are refused: a
+/// misspelt filter (`severity` for `min_severity`) must not quietly widen the
+/// report to every finding.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportBody {
+    format: Option<String>,
+    title: Option<String>,
+    /// Only these finding ids (which also opts summary findings in).
+    #[serde(default)]
+    ids: Vec<String>,
+    ws_id: Option<String>,
+    /// A run and its sub-runs, resolved as the list endpoint does.
+    run_id: Option<String>,
+    /// `critical` | `high` | `medium` | `low` | `info`: this severity and worse.
+    min_severity: Option<String>,
+    owner: Option<String>,
+    cwe: Option<String>,
+    /// Keep summary-profile findings (off by default).
+    #[serde(default)]
+    include_summaries: bool,
+    /// One file per finding plus an index, as a zip.
+    #[serde(default)]
+    split: bool,
+}
+
+/// A rendered file on its way to the client.
+struct Download {
+    bytes: Vec<u8>,
+    content_type: &'static str,
+    name: String,
+    /// Rendered HTML: additionally served with a sandboxing CSP.
+    html: bool,
+}
+
+/// The requested format, refused up front when it is unknown or this build
+/// cannot produce it (PDF without the `pdf` feature is 501).
+fn export_format(raw: Option<&str>) -> Result<Format, ApiError> {
+    let fmt = raw
+        .and_then(Format::parse)
+        .ok_or_else(|| ApiError::bad_request("format must be one of md, html, pdf"))?;
+    if !fmt.is_available() {
+        return Err(export_error(ExportError::PdfUnavailable));
+    }
+    Ok(fmt)
+}
+
+fn export_error(e: ExportError) -> ApiError {
+    match e {
+        ExportError::PdfUnavailable => ApiError::not_available(e.to_string()),
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
+fn parse_min_severity(raw: &str) -> Result<Severity, ApiError> {
+    serde_json::from_value(serde_json::Value::String(raw.to_lowercase())).map_err(|_| {
+        ApiError::bad_request("min_severity must be one of critical, high, medium, low, info")
+    })
+}
+
+/// The display-number prefix: `[findings].export_id_prefix` when it is a
+/// sane identifier, else `SEC`. The value ends up in file names and document
+/// text and the project layer of the config is repo-controlled, so an invalid
+/// one is refused (with a warning) rather than escaped.
+fn export_prefix(s: &AppState) -> String {
+    let configured = s
+        .config
+        .read()
+        .ok()
+        .and_then(|c| c.findings.export_id_prefix.clone());
+    match configured {
+        None => DEFAULT_PREFIX.to_string(),
+        Some(p) if is_valid_prefix(&p) => p,
+        Some(p) => {
+            tracing::warn!(
+                prefix = ?p.chars().take(32).collect::<String>(),
+                "ignoring invalid [findings].export_id_prefix (a letter, then up to 15 of \
+                 A-Z a-z 0-9 _ -); using {DEFAULT_PREFIX}"
+            );
+            DEFAULT_PREFIX.to_string()
+        }
+    }
+}
+
+fn export_input(f: FindingOut) -> ExportInput {
+    ExportInput {
+        ws_id: f.ws_id,
+        project: f.project,
+        workflow_name: f.workflow_name,
+        record: f.record,
+    }
+}
+
+/// Fill in `workflow_name` (joined via `declared_by.run_id`, as the list
+/// endpoint does) on findings that are about to be rendered.
+fn attach_workflow_names(runs: &RunStore, findings: &mut [ExportFinding]) {
+    let names = workflow_names_by_run(
+        runs,
+        findings
+            .iter()
+            .map(|f| f.input.record.declared_by.run_id.as_str()),
+    );
+    for f in findings {
+        f.input.workflow_name = names.get(&f.input.record.declared_by.run_id).cloned();
+    }
+}
+
+/// A `Content-Disposition` value that always downloads `name`. The quoted
+/// `filename` is ASCII with `"`, `\` and anything unprintable replaced by
+/// `_`; a name that has more than that also gets the RFC 6266 `filename*`
+/// form so a UTF-8 title survives.
+fn attachment_disposition(name: &str) -> String {
+    let fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut out = format!("attachment; filename=\"{fallback}\"");
+    if fallback != name {
+        let mut encoded = String::new();
+        for b in name.bytes() {
+            if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+                encoded.push(b as char);
+            } else {
+                encoded.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out.push_str(&format!("; filename*=UTF-8''{encoded}"));
+    }
+    out
+}
+
+/// The download response: always an attachment (rendered HTML is never shown
+/// inline from this origin), `nosniff`, and for HTML a `sandbox` CSP as well.
+fn download_response(d: Download) -> Response {
+    let mut resp = Response::new(Body::from(d.bytes));
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(d.content_type),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if d.html {
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("sandbox"),
+        );
+    }
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&attachment_disposition(&d.name))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    resp
+}
+
+/// The file name (no extension) a project report is offered under: the
+/// title, cleaned as a finding title is for [`filename`]. A title that
+/// cleans to nothing, or would start a hidden file, falls back to the default.
+fn report_file_stem(title: &str) -> String {
+    match sanitize_title(title).trim_start_matches('.') {
+        "" => DEFAULT_EXPORT_TITLE.to_string(),
+        stem => stem.to_string(),
+    }
+}
+
+fn render_one_finding(
+    global: &std::path::Path,
+    runs: &RunStore,
+    id: &str,
+    prefix: &str,
+    fmt: Format,
+) -> Result<Download, ApiError> {
+    let all = collect_all_findings(global);
+    let ws_id = all
+        .iter()
+        .find(|f| f.record.id == id)
+        .map(|f| f.ws_id.clone())
+        .ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    // Numbers are per project: number only the finding's own.
+    let project: Vec<ExportInput> = all
+        .into_iter()
+        .filter(|f| f.ws_id == ws_id)
+        .map(export_input)
+        .collect();
+    let mut numbered = assign_numbers(project, prefix);
+    let numbers = number_map(&numbered);
+    let pos = numbered
+        .iter()
+        .position(|f| f.input.record.id == id)
+        .ok_or_else(|| ApiError::internal(format!("finding {id} was not numbered")))?;
+    let mut finding = numbered.swap_remove(pos);
+    attach_workflow_names(runs, std::slice::from_mut(&mut finding));
+    let bytes = render_finding(&finding, &numbers, fmt).map_err(export_error)?;
+    Ok(Download {
+        bytes,
+        content_type: fmt.content_type(),
+        name: filename(&finding, fmt.ext()),
+        html: fmt == Format::Html,
+    })
+}
+
+/// `GET /api/findings/:id/export?format=md|html|pdf` — one finding as a
+/// downloadable report, numbered within its own project.
+async fn export_finding(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ExportQuery>,
+) -> Result<Response, ApiError> {
+    let fmt = export_format(q.format.as_deref())?;
+    let prefix = export_prefix(&s);
+    let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
+    let download =
+        tokio::task::spawn_blocking(move || render_one_finding(&global, &runs, &id, &prefix, fmt))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(download_response(download))
+}
+
+fn render_selection(
+    global: &std::path::Path,
+    runs: &RunStore,
+    prefix: &str,
+    body: ExportBody,
+    fmt: Format,
+    min_severity: Option<Severity>,
+    title: String,
+) -> Result<Download, ApiError> {
+    let run_ids = body
+        .run_id
+        .as_deref()
+        .map(|parent| resolve_run_scope(runs, parent));
+    // Number everything first, then select: a finding keeps the number it has
+    // in the whole project whatever else is left out.
+    let numbered = assign_numbers(
+        collect_all_findings(global)
+            .into_iter()
+            .map(export_input)
+            .collect(),
+        prefix,
+    );
+    let sel = Selection {
+        ids: body.ids,
+        ws_id: body.ws_id,
+        run_ids,
+        min_severity,
+        owner: body.owner,
+        cwe: body.cwe,
+        include_summaries: body.include_summaries,
+    };
+    let mut chosen = select(numbered, &sel);
+    if chosen.is_empty() {
+        return Err(ApiError::not_found("no findings match this selection"));
+    }
+    attach_workflow_names(runs, &mut chosen);
+    let meta = ReportMeta {
+        scope: describe(&sel, body.run_id.as_deref(), &chosen),
+        title,
+        generated_at: chrono::Utc::now(),
+    };
+    let stem = report_file_stem(&meta.title);
+    if body.split {
+        let bytes = render_split_zip(&meta, &chosen, fmt).map_err(export_error)?;
+        Ok(Download {
+            bytes,
+            content_type: "application/zip",
+            name: format!("{stem}.zip"),
+            html: false,
+        })
+    } else {
+        let bytes = render_project(&meta, &chosen, fmt).map_err(export_error)?;
+        Ok(Download {
+            bytes,
+            content_type: fmt.content_type(),
+            name: format!("{stem}.{}", fmt.ext()),
+            html: fmt == Format::Html,
+        })
+    }
+}
+
+/// `POST /api/findings/export` — a report over the findings the body selects:
+/// one file, or with `split` a zip of one file per finding plus an index.
+/// 404 when nothing matches.
+async fn export_findings(
+    State(s): State<AppState>,
+    Json(body): Json<ExportBody>,
+) -> Result<Response, ApiError> {
+    let fmt = export_format(body.format.as_deref())?;
+    let min_severity = body
+        .min_severity
+        .as_deref()
+        .map(parse_min_severity)
+        .transpose()?;
+    let title = match body.title.as_deref().map(str::trim) {
+        Some(t) if t.chars().count() > MAX_EXPORT_TITLE_CHARS => {
+            return Err(ApiError::bad_request(format!(
+                "title is longer than {MAX_EXPORT_TITLE_CHARS} characters"
+            )));
+        }
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => DEFAULT_EXPORT_TITLE.to_string(),
+    };
+    let prefix = export_prefix(&s);
+    let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
+    let download = tokio::task::spawn_blocking(move || {
+        render_selection(&global, &runs, &prefix, body, fmt, min_severity, title)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(download_response(download))
 }
 
 #[cfg(test)]
@@ -2108,5 +2466,673 @@ mod tests {
         let mut got = String::new();
         f.read_to_string(&mut got).unwrap();
         assert_eq!(got, "the hashed bytes\n");
+    }
+
+    // ── report exports ────────────────────────────────────────────────────────
+
+    /// Like `seed_workspace_findings`, for any workspace id and directory.
+    fn seed_named_workspace(
+        global: &std::path::Path,
+        ws_id: &str,
+        dir: &str,
+        records: &[FindingRecord],
+    ) {
+        let repo = global.join(dir);
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws = rupu_workspace::Workspace {
+            id: ws_id.to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: None,
+            initial_branch: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        let workspaces_dir = global.join("workspaces");
+        std::fs::create_dir_all(&workspaces_dir).unwrap();
+        std::fs::write(
+            workspaces_dir.join(format!("{ws_id}.toml")),
+            toml::to_string(&ws).unwrap(),
+        )
+        .unwrap();
+        let paths = CoveragePaths::new(&repo, "tgt1");
+        paths.ensure_dir().unwrap();
+        let jsonl: String = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.findings, jsonl).unwrap();
+    }
+
+    /// A full-profile finding with a chosen severity and declaring run.
+    fn full_in_run(id: &str, sev: Severity, run: &str) -> FindingRecord {
+        let mut r = full_record(id);
+        r.severity = sev;
+        r.declared_by = attribution_run(run);
+        r
+    }
+
+    async fn post_raw(
+        app: Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt as _;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    async fn export_post(
+        app: Router,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+        let (status, headers, bytes) = post_raw(app, "/api/findings/export", body).await;
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// Three full findings in `ws1`: `crit` (SEC-001), `high` (SEC-002) and
+    /// `med` (SEC-003), declared by run_crit / run_high / run_med.
+    fn app_with_three_full(tmp: &tempfile::TempDir) -> Router {
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                full_in_run("fnd_med", Severity::Medium, "run_med"),
+                full_in_run("fnd_crit", Severity::Critical, "run_crit"),
+                full_in_run("fnd_high", Severity::High, "run_high"),
+            ],
+        );
+        app_for(tmp.path())
+    }
+
+    fn disposition(h: &axum::http::HeaderMap) -> &str {
+        header_str(h, "content-disposition")
+    }
+
+    #[tokio::test]
+    async fn export_md_is_a_named_attachment_starting_with_its_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, h, body) =
+            get_raw(app_for(tmp.path()), "/api/findings/fnd_a/export?format=md").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            header_str(&h, "content-type"),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        let d = disposition(&h);
+        assert!(d.starts_with("attachment; filename=\"SEC-001 - "), "{d}");
+        assert!(d.ends_with(".md\""), "{d}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.starts_with("Filename:"),
+            "{}",
+            &body[..40.min(body.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_html_is_an_attachment_never_inline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, h, body) = get_raw(
+            app_for(tmp.path()),
+            "/api/findings/fnd_a/export?format=html",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "text/html; charset=utf-8");
+        let d = disposition(&h);
+        assert!(d.starts_with("attachment;"), "{d}");
+        assert!(!d.contains("inline"), "{d}");
+        assert!(d.contains(".html"), "{d}");
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&h, "content-security-policy"), "sandbox");
+        assert!(String::from_utf8_lossy(&body).contains("<html"));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    async fn export_pdf_is_a_pdf_attachment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, h, body) =
+            get_raw(app_for(tmp.path()), "/api/findings/fnd_a/export?format=pdf").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "application/pdf");
+        assert!(disposition(&h).starts_with("attachment; filename=\"SEC-001 - "));
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert!(body.starts_with(b"%PDF"));
+    }
+
+    #[cfg(not(feature = "pdf"))]
+    #[tokio::test]
+    async fn export_pdf_without_pdf_support_is_501() {
+        // Another crate in the build graph can switch the renderer's `pdf`
+        // feature on even when this crate's is off (feature unification).
+        if Format::Pdf.is_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let app = app_for(tmp.path());
+        let (status, _, body) = get_raw(app.clone(), "/api/findings/fnd_a/export?format=pdf").await;
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(error_of(&body).contains("PDF"), "{}", error_of(&body));
+        // Fails before any lookup, even for an empty selection.
+        let (status, _, _) =
+            export_post(app, serde_json::json!({"format": "pdf", "ids": ["x"]})).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn export_rejects_an_unknown_or_missing_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let app = app_for(tmp.path());
+        for uri in [
+            "/api/findings/fnd_a/export?format=exe",
+            "/api/findings/fnd_a/export",
+            "/api/findings/fnd_a/export?format=",
+        ] {
+            let (status, _, body) = get_raw(app.clone(), uri).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri}");
+            assert!(error_of(&body).contains("format"), "{uri}");
+        }
+        for body in [
+            serde_json::json!({"format": "exe"}),
+            serde_json::json!({"ids": ["fnd_a"]}),
+        ] {
+            let (status, _, _) = export_post(app.clone(), body).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn export_of_an_unknown_finding_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let (status, _, body) = get_raw(
+            app_for(tmp.path()),
+            "/api/findings/fnd_nope/export?format=md",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&body), "finding fnd_nope not found");
+    }
+
+    #[tokio::test]
+    async fn a_finding_is_numbered_within_its_own_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_named_workspace(
+            tmp.path(),
+            "ws_a",
+            "repo_a",
+            &[
+                full_in_run("fnd_crit", Severity::Critical, "r"),
+                full_in_run("fnd_high", Severity::High, "r"),
+            ],
+        );
+        seed_named_workspace(
+            tmp.path(),
+            "ws_b",
+            "repo_b",
+            &[full_in_run("fnd_other", Severity::Low, "r")],
+        );
+        let app = app_for(tmp.path());
+        for (id, number) in [
+            ("fnd_crit", "SEC-001"),
+            ("fnd_high", "SEC-002"),
+            ("fnd_other", "SEC-001"),
+        ] {
+            let (status, h, body) =
+                get_raw(app.clone(), &format!("/api/findings/{id}/export?format=md")).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            let want = format!("attachment; filename=\"{number} - ");
+            assert!(
+                disposition(&h).starts_with(&want),
+                "{id}: {}",
+                disposition(&h)
+            );
+            let body = String::from_utf8(body).unwrap();
+            assert!(body.starts_with(&format!("Filename: {number} - ")), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_configured_prefix_replaces_sec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        state.config.write().unwrap().findings.export_id_prefix = Some("VULN".into());
+        let app = routes().with_state(state);
+        let (status, h, _) = get_raw(app.clone(), "/api/findings/fnd_a/export?format=md").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            disposition(&h).starts_with("attachment; filename=\"VULN-001 - "),
+            "{}",
+            disposition(&h)
+        );
+        let (_, _, body) = export_post(app, serde_json::json!({"format": "md"})).await;
+        assert!(body.contains("VULN-001") && !body.contains("SEC-001"));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_configured_prefix_falls_back_to_sec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        for bad in [
+            "../x",
+            "SEC 1",
+            "",
+            "1ABC",
+            "A23456789012345678",
+            "SEC\"",
+            "É",
+        ] {
+            let state = AppState::new(
+                tmp.path().to_path_buf(),
+                rupu_config::PricingConfig::default(),
+            );
+            state.config.write().unwrap().findings.export_id_prefix = Some(bad.into());
+            let (status, h, _) = get_raw(
+                routes().with_state(state),
+                "/api/findings/fnd_a/export?format=md",
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{bad:?}");
+            assert!(
+                disposition(&h).starts_with("attachment; filename=\"SEC-001 - "),
+                "{bad:?}: {}",
+                disposition(&h)
+            );
+        }
+    }
+
+    fn run_record(id: &str, workflow: &str) -> rupu_orchestrator::runs::RunRecord {
+        use rupu_orchestrator::runs::{RunRecord, RunStatus};
+        RunRecord {
+            id: id.into(),
+            workflow_name: workflow.into(),
+            status: RunStatus::Completed,
+            inputs: Default::default(),
+            event: None,
+            workspace_id: "ws1".into(),
+            workspace_path: "/tmp/x".into(),
+            transcript_dir: "/tmp/x/.rupu/transcripts".into(),
+            started_at: at("2026-09-29T00:00:00Z"),
+            finished_at: None,
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            resume_approver: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            final_output: None,
+            loop_progress: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn exports_carry_the_workflow_name_joined_from_the_run_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                full_in_run("fnd_wf", Severity::Critical, "run_wf"),
+                full_in_run("fnd_lost", Severity::High, "run_lost"),
+            ],
+        );
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        state
+            .run_store
+            .create(run_record("run_wf", "audit-flow"), "name: t\nsteps: []\n")
+            .unwrap();
+        let app = routes().with_state(state);
+        let (_, _, body) = get_raw(app.clone(), "/api/findings/fnd_wf/export?format=md").await;
+        assert!(String::from_utf8(body).unwrap().contains("audit-flow"));
+        let (_, _, body) = export_post(app, serde_json::json!({"format": "md"})).await;
+        assert!(body.contains("audit-flow"));
+    }
+
+    #[tokio::test]
+    async fn project_report_is_an_attachment_named_by_its_title() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, body) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "title": "Q3 / \"audit\"\n review"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            header_str(&h, "content-type"),
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Q3 audit review.md\""
+        );
+        for n in ["SEC-001", "SEC-002", "SEC-003"] {
+            assert!(body.contains(n), "{n}");
+        }
+        // No title: the default.
+        let (_, h, _) = export_post(app.clone(), serde_json::json!({"format": "html"})).await;
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Findings report.html\""
+        );
+        let (_, h, _) =
+            export_post(app, serde_json::json!({"format": "md", "title": "  ... "})).await;
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Findings report.md\""
+        );
+    }
+
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    async fn project_report_as_pdf() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, bytes) = post_raw(
+            app,
+            "/api/findings/export",
+            serde_json::json!({"format": "pdf"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "application/pdf");
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"Findings report.pdf\""
+        );
+        assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    #[tokio::test]
+    async fn split_export_of_two_ids_is_a_zip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, bytes) = post_raw(
+            app,
+            "/api/findings/export",
+            serde_json::json!({
+                "format": "md", "title": "Split set", "split": true,
+                "ids": ["fnd_crit", "fnd_med"],
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(header_str(&h, "content-type"), "application/zip");
+        assert_eq!(disposition(&h), "attachment; filename=\"Split set.zip\"");
+        assert_eq!(header_str(&h, "x-content-type-options"), "nosniff");
+        assert!(bytes.starts_with(b"PK"));
+        // Zip entry names are stored uncompressed: the index, and the two
+        // chosen findings under their stable numbers (the high one is absent).
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(hay.contains("index.md"));
+        assert!(hay.contains("SEC-001 - "));
+        assert!(hay.contains("SEC-003 - "));
+        assert!(!hay.contains("SEC-002 - "));
+    }
+
+    #[tokio::test]
+    async fn a_selection_that_matches_nothing_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        for body in [
+            serde_json::json!({"format": "md", "ids": ["fnd_nope"]}),
+            serde_json::json!({"format": "md", "owner": "Nobody At All"}),
+            serde_json::json!({"format": "md", "cwe": "CWE-1"}),
+            serde_json::json!({"format": "md", "ws_id": "ws_missing"}),
+            serde_json::json!({"format": "md", "run_id": "run_missing"}),
+            serde_json::json!({"format": "md", "split": true, "ids": ["fnd_nope"]}),
+        ] {
+            let (status, h, text) = export_post(app.clone(), body.clone()).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(
+                error_of(text.as_bytes()),
+                "no findings match this selection",
+                "{body}"
+            );
+            assert!(!disposition(&h).contains("attachment"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_findings_at_all_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (status, _, text) =
+            export_post(app_for(tmp.path()), serde_json::json!({"format": "md"})).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_of(text.as_bytes()),
+            "no findings match this selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_filters_narrow_the_report_and_keep_numbers_stable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let sel = |v: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let (status, _, text) = export_post(app, v).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{text}");
+                text
+            }
+        };
+        // Severity floor: critical + high, not medium.
+        let text = sel(serde_json::json!({"format": "md", "min_severity": "high"})).await;
+        assert!(text.contains("SEC-001") && text.contains("SEC-002"));
+        assert!(!text.contains("SEC-003"));
+        // One id keeps its project-wide number (medium is SEC-003, not 001).
+        let text = sel(serde_json::json!({"format": "md", "ids": ["fnd_med"]})).await;
+        assert!(text.contains("SEC-003") && !text.contains("SEC-001"));
+        // One run.
+        let text = sel(serde_json::json!({"format": "md", "run_id": "run_high"})).await;
+        assert!(text.contains("SEC-002") && !text.contains("SEC-001") && !text.contains("SEC-003"));
+        // One workspace / a CWE from the report / its exact owner.
+        let text =
+            sel(serde_json::json!({"format": "md", "ws_id": "ws1", "min_severity": "critical"}))
+                .await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+        let text =
+            sel(serde_json::json!({"format": "md", "cwe": "cwe-639", "min_severity": "critical"}))
+                .await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+        let text = sel(
+            serde_json::json!({"format": "md", "owner": "Unknown", "min_severity": "critical"}),
+        )
+        .await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+    }
+
+    #[tokio::test]
+    async fn a_run_selection_includes_its_sub_runs_like_the_list_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                full_in_run("fnd_top", Severity::Critical, "run_parent"),
+                full_in_run("fnd_unit", Severity::High, "run_unit1"),
+                full_in_run("fnd_else", Severity::Medium, "run_other"),
+            ],
+        );
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        // A fan-out unit is its own sub-run; its id is only in the parent's
+        // live event stream (the transcript stem).
+        let ev_path = state.run_store.events_path("run_parent");
+        std::fs::create_dir_all(ev_path.parent().unwrap()).unwrap();
+        let ev = Event::UnitStarted {
+            run_id: "run_parent".into(),
+            step_id: "assess".into(),
+            index: 0,
+            unit_key: "u".into(),
+            agent: None,
+            transcript_path: tmp.path().join("transcripts/run_unit1.jsonl"),
+            host: None,
+        };
+        std::fs::write(&ev_path, serde_json::to_string(&ev).unwrap() + "\n").unwrap();
+        let (status, _, text) = export_post(
+            routes().with_state(state),
+            serde_json::json!({"format": "md", "run_id": "run_parent"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(text.contains("SEC-001") && text.contains("SEC-002"));
+        assert!(!text.contains("SEC-003"));
+    }
+
+    #[tokio::test]
+    async fn summary_findings_are_opt_in_except_when_listed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let summary = finding("fnd_sum", Severity::High, "2026-01-01T00:00:00Z").record;
+        seed_workspace_findings(
+            tmp.path(),
+            &[full_in_run("fnd_full", Severity::Critical, "r"), summary],
+        );
+        let app = app_for(tmp.path());
+        let (_, _, text) = export_post(app.clone(), serde_json::json!({"format": "md"})).await;
+        assert!(text.contains("SEC-001") && !text.contains("SEC-002"));
+        let (_, _, text) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "include_summaries": true}),
+        )
+        .await;
+        assert!(text.contains("SEC-001") && text.contains("SEC-002"));
+        let (status, _, text) =
+            export_post(app, serde_json::json!({"format": "md", "ids": ["fnd_sum"]})).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(text.contains("SEC-002") && !text.contains("SEC-001"));
+    }
+
+    #[tokio::test]
+    async fn export_request_errors_are_client_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        // A severity outside the five words.
+        let (status, _, text) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "min_severity": "urgent"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error_of(text.as_bytes()).contains("min_severity"));
+        // A misspelt filter must not silently select everything.
+        let (status, _, _) = export_post(
+            app,
+            serde_json::json!({"format": "md", "severity": "critical"}),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}");
+    }
+
+    #[test]
+    fn attachment_disposition_is_ascii_safe_and_carries_utf8_separately() {
+        assert_eq!(
+            attachment_disposition("SEC-001 - a.md"),
+            "attachment; filename=\"SEC-001 - a.md\""
+        );
+        // A header breaker can't leave the quotes, and non-ASCII moves to the
+        // RFC 6266 `filename*` form.
+        assert_eq!(
+            attachment_disposition("é \"日本\\\n.md"),
+            "attachment; filename=\"_ _____.md\"; \
+             filename*=UTF-8''%C3%A9%20%22%E6%97%A5%E6%9C%AC%5C%0A.md"
+        );
+    }
+
+    #[test]
+    fn report_file_stem_is_a_safe_non_hidden_name() {
+        assert_eq!(report_file_stem("Q3 review"), "Q3 review");
+        assert_eq!(report_file_stem("../../etc/passwd"), "etcpasswd");
+        for empty in ["", "   ", "...", "///", "\u{202e}"] {
+            assert_eq!(report_file_stem(empty), "Findings report", "{empty:?}");
+        }
+        assert_eq!(report_file_stem(&"x".repeat(500)).chars().count(), 80);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_title_cannot_break_out_of_the_content_disposition() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = app_with_three_full(&tmp);
+        let (status, h, _) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "title": "a\r\nX-Evil: 1\"; filename=\"x.exe"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // The quotes were dropped from the title, so the `;` stays inside the
+        // one quoted string and starts no second parameter.
+        assert_eq!(
+            disposition(&h),
+            "attachment; filename=\"a X-Evil 1; filename=x.exe.md\""
+        );
+        assert!(h.get("x-evil").is_none());
+        // A title that is UTF-8 keeps it, in `filename*`.
+        let (_, h, _) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "title": "Bericht Übersicht"}),
+        )
+        .await;
+        assert!(
+            disposition(&h).ends_with("filename*=UTF-8''Bericht%20%C3%9Cbersicht.md"),
+            "{}",
+            disposition(&h)
+        );
+        // Too long is refused rather than truncated.
+        let (status, _, _) = export_post(
+            app,
+            serde_json::json!({"format": "md", "title": "t".repeat(201)}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
     }
 }
