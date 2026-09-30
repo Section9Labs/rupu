@@ -95,6 +95,8 @@ pub struct CliAgentDispatcher {
     /// overrides). Every dispatched child resolves its OWN provider/model's
     /// limits through it (spec 2026-09-30 §6.1), not the parent's.
     limits_ctx: rupu_runtime::model_limits::LimitsContext,
+    /// The parent `rupu run`'s coverage stream; children append to it.
+    coverage_stream: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -132,6 +134,7 @@ impl CliAgentDispatcher {
         findings_base: rupu_coverage::FindingWriteOptions,
         usage_ledger: Option<rupu_orchestrator::usage_ledger::UsageLedger>,
         limits_ctx: rupu_runtime::model_limits::LimitsContext,
+        coverage_stream: Option<PathBuf>,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -153,6 +156,7 @@ impl CliAgentDispatcher {
             namer: std::sync::Mutex::new(None),
             usage_ledger,
             limits_ctx,
+            coverage_stream,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -404,6 +408,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             codename: codename.clone(),
             agent: None,
             provider: None,
+            coverage_stream: self.coverage_stream.clone(),
         };
 
         let opts = AgentRunOpts {
@@ -770,6 +775,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -889,6 +895,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -970,6 +977,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
         let namer =
             rupu_codename::SharedNamer::in_memory(rupu_codename::CrewNamer::new("jade-reef"));
@@ -1077,6 +1085,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
         std::env::set_var(
             "RUPU_MOCK_PROVIDER_SCRIPT",
@@ -1143,6 +1152,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1215,6 +1225,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1297,6 +1308,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1386,6 +1398,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1480,6 +1493,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(
@@ -1559,6 +1573,7 @@ mod tests {
             rupu_runtime::model_limits::LimitsContext::for_cache_dir(
                 dir.path().join("cache/models"),
             ),
+            None,
         );
 
         std::env::set_var(

@@ -485,6 +485,7 @@ impl StepFactory for DefaultStepFactory {
                 codename: None,
                 agent: None,
                 provider: None,
+                coverage_stream: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),

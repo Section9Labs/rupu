@@ -37,6 +37,17 @@ struct CoverageBundle {
     prompt_section: String,
 }
 
+/// The run stream for records written under `scope`, when `rupu run` asked
+/// for one (see `ToolContext::coverage_stream`).
+fn run_stream_for(ctx: &ToolContext, scope: &str) -> Option<rupu_coverage::RunStream> {
+    ctx.coverage_stream
+        .clone()
+        .map(|path| rupu_coverage::RunStream {
+            path,
+            scope_name: scope.to_string(),
+        })
+}
+
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 
 /// Maximum times a single provider call is retried on a transient error
@@ -1227,12 +1238,15 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
             let resolved_scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
             let target = target_id(&opts.workspace_path, resolved_scope);
-            let paths = CoveragePaths::new(&opts.workspace_path, &target);
+            let paths = CoveragePaths::new(&opts.workspace_path, &target)
+                .with_run_stream(run_stream_for(&opts.tool_context, resolved_scope));
             paths
                 .ensure_dir()
                 .map_err(|e| RunError::Coverage(format!("ensure coverage dir: {e}")))?;
             write_snapshot(&catalog, &paths.catalog)
                 .map_err(|e| RunError::Coverage(format!("write catalog snapshot: {e}")))?;
+            rupu_coverage::stream_catalog(&paths, &catalog)
+                .map_err(|e| RunError::Coverage(format!("stream catalog snapshot: {e}")))?;
             // Capture a run manifest describing this run's defining inputs.
             // This is the single all-surfaces seam (workflow / agent /
             // autoflow / session all reach run_agent), so every run becomes
@@ -1379,7 +1393,8 @@ async fn run_agent_inner(opts: &mut AgentRunOpts) -> Result<RunResult, RunError>
     {
         let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
         let target = target_id(&opts.workspace_path, scope);
-        let paths = CoveragePaths::new(&opts.workspace_path, &target);
+        let paths = CoveragePaths::new(&opts.workspace_path, &target)
+            .with_run_stream(run_stream_for(&opts.tool_context, scope));
         paths
             .ensure_dir()
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;

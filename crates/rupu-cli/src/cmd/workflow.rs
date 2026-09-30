@@ -3621,6 +3621,7 @@ pub(crate) async fn resume_run(
             &store, run_id,
         )),
         limits_ctx.clone(),
+        None,
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -5318,6 +5319,7 @@ async fn execute_workflow_invocation(
             &run_store, &run_id,
         )),
         limits_ctx.clone(),
+        None,
     );
     // One codename namer for the whole run — shared by the orchestrator
     // (static slots), the sub-agent dispatcher (`>role#n`), and the inline

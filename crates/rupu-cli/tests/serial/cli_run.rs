@@ -100,6 +100,25 @@ async fn rupu_run_writes_transcript_under_mock_provider() {
     assert_eq!(entries.len(), 1, "expected exactly one transcript file");
     let summary = rupu_transcript::JsonlReader::summary(entries[0].path()).unwrap();
     assert_eq!(summary.status, rupu_transcript::RunStatus::Ok);
+
+    // Every `rupu run` opens its coverage stream with a begin line, even when
+    // the run records nothing: a coordinator reads its absence as "this host
+    // can't stream".
+    let run_id = entries[0]
+        .path()
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let stream = rupu_coverage::stream_path(&global.path().join("runs"), &run_id);
+    let text = std::fs::read_to_string(&stream)
+        .unwrap_or_else(|e| panic!("coverage stream {stream:?} should exist: {e}"));
+    let first: rupu_coverage::StreamLine =
+        serde_json::from_str(text.lines().next().unwrap()).expect("first stream line parses");
+    assert!(
+        matches!(first, rupu_coverage::StreamLine::Begin { run_id: ref r, .. } if *r == run_id),
+        "first stream line must be this run's begin line: {first:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
