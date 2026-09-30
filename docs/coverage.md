@@ -508,7 +508,8 @@ byte to `findings.jsonl.pre-import-<UTC time>` beside it (for example
 `findings.jsonl.pre-import-20260930T101500Z`), and it is then replaced
 atomically under the ledger lock: every other line is written back unchanged.
 The size limits (`report_max_bytes` and the `artifact_max_*` keys) come from
-`[findings]` in the global config, as when a report is recorded.
+`[findings]` in the global config only; unlike when an agent records a report,
+a project's `.rupu/config.toml` is not layered in.
 
 **Dry run.** `--dry-run` parses and validates every report and prints `would
 attach` for those that would go in. It writes nothing: no ledger change, no

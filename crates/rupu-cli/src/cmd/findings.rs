@@ -100,8 +100,8 @@ pub struct ImportArgs {
     #[arg(long = "id", value_name = "FINDING_ID", value_parser = non_blank)]
     id: Option<String>,
     /// Parse and validate every report and check that the artifacts it lists
-    /// exist; write nothing (no ledger change, backup or lock file). Nothing
-    /// is read or copied, so trouble found only while copying an artifact
+    /// exist; write nothing (no ledger change, backup or lock file). No
+    /// artifact is read or copied, so trouble found only while copying one
     /// shows up only on a real import.
     #[arg(long)]
     dry_run: bool,
