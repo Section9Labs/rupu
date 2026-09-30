@@ -11,7 +11,10 @@ describe('codename components', () => {
       <AgentName codename="jade-reef/heron#4" agent="security-reviewer" provider="anthropic" model="claude-opus-5-5" />,
     );
     expect(container.textContent).toContain('heron#4 · security-reviewer · anthropic/claude-opus-5-5');
-    expect(container.querySelector('[title="jade-reef/heron#4"]')).not.toBeNull();
+    // Tooltip is the FULL identity: whole codename · agent · provider/model.
+    expect(
+      container.querySelector('[title="jade-reef/heron#4 · security-reviewer · anthropic/claude-opus-5-5"]'),
+    ).not.toBeNull();
     expect(container.querySelector('svg')).not.toBeNull();
   });
   it('AgentName showCrew with a crew-only codename renders the crew once', () => {
@@ -30,9 +33,20 @@ describe('codename components', () => {
   });
   it('CrewChip derived is muted with title', () => {
     const { container } = render(<CrewChip crew="cobalt-harbor" derived />);
-    const el = container.querySelector('[title="derived for a run recorded before codenames"]');
+    const el = container.querySelector('[title="cobalt-harbor (derived for a run recorded before codenames)"]');
     expect(el).not.toBeNull();
     expect(el!.className).toContain('opacity-60');
+  });
+  it('AgentName derived title uses the same derived wording as CrewChip', () => {
+    const { container } = render(<AgentName codename="jade-reef/heron" agent="a" derived />);
+    expect(
+      container.querySelector('[title="jade-reef/heron · a (derived for a run recorded before codenames)"]'),
+    ).not.toBeNull();
+  });
+  it('AgentName and CrewChip render nothing for a falsy codename/crew', () => {
+    expect(render(<AgentName codename="" agent="a" showCrew />).container.textContent).toBe('');
+    expect(render(<AgentName codename={undefined} />).container.textContent).toBe('');
+    expect(render(<CrewChip crew="" />).container.textContent).toBe('');
   });
   it('uses the dark tint under a dark ThemeContext', () => {
     const { container } = render(

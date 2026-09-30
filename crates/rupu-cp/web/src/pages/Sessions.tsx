@@ -36,6 +36,7 @@ import { Spinner } from '../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../components/HostSelect';
 import { SessionStatusPill } from '../components/StatusPill';
 import { AgentName } from '../components/codename/AgentName';
+import { memberLabel } from '../lib/codename';
 import { usePagedList } from '../lib/usePagedList';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
@@ -255,12 +256,20 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     titleValue: (s) => s.agent_name,
     render: (s) => (
       <span className="text-sm font-medium text-ink">
-        <AgentName
-          codename={s.codename}
-          agent={s.agent_name}
-          showCrew
-          derived={s.codename_derived}
-        />
+        {s.codename ? (
+          <AgentName
+            codename={s.codename}
+            agent={s.agent_name}
+            provider={s.provider_name}
+            model={s.model}
+            showCrew
+            derived={s.codename_derived}
+          />
+        ) : (
+          <span className="font-mono">
+            {memberLabel(undefined, s.agent_name, s.provider_name, s.model)}
+          </span>
+        )}
       </span>
     ),
   },

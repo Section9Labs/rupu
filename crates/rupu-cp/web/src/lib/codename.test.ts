@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseCodename, crewTint, roleBadge, memberLabel } from './codename';
+import { parseCodename, crewTint, roleBadge, memberLabel, identityTitle } from './codename';
 describe('codename', () => {
   it('parses crew, leaf and role', () => {
     expect(parseCodename('cobalt-harbor')).toEqual({ crew: 'cobalt-harbor', leaf: 'cobalt-harbor', role: undefined });
@@ -20,5 +20,15 @@ describe('codename', () => {
     expect(memberLabel('jade-reef/heron#4', 'security-reviewer', 'anthropic', 'claude-opus-5-5'))
       .toBe('heron#4 · security-reviewer · anthropic/claude-opus-5-5');
     expect(memberLabel(undefined, 'triage')).toBe('triage');
+  });
+  it('palette lookups ignore Object.prototype members', () => {
+    expect(crewTint('constructor-harbor', 'light')).toBeUndefined();
+    expect(crewTint('toString', 'dark')).toBeUndefined();
+    expect(roleBadge('constructor', 'light')).toBeUndefined();
+    expect(roleBadge('__proto__', 'light')).toBeUndefined();
+  });
+  it('builds the full identity title', () => {
+    expect(identityTitle('jade-reef/heron#4', 'rev', 'anthropic', 'opus')).toBe('jade-reef/heron#4 · rev · anthropic/opus');
+    expect(identityTitle('jade-reef/heron#4', undefined, undefined, 'opus')).toBe('jade-reef/heron#4 · opus');
   });
 });

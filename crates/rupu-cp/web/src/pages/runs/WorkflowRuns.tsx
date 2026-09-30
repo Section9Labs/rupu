@@ -368,7 +368,7 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     titleValue: (r) => r.workflow_name,
     render: (r) => (
       <span className="inline-flex items-center gap-2">
-        <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />
+        {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
         <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
       </span>
     ),
