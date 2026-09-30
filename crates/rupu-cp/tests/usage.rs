@@ -1536,12 +1536,45 @@ async fn agent_and_project_rollups_include_standalone_spend_once() {
         .clone();
     assert_eq!(p["usage"]["total_tokens"].as_u64(), Some(550), "{p}");
     assert_eq!(p["run_count"].as_u64(), Some(1), "{p}");
+    // Every contributing model is priced, so the rollup is priced and costed
+    // (an empty `EntityRollup` must start priced, like `rollup(empty)`).
+    assert_eq!(p["usage"]["priced"], true, "{p}");
+    assert!(p["usage"]["cost_usd"].as_f64().is_some(), "{p}");
     let detail = get_json(format!("{}/api/projects/ws_wf", srv.base_url)).await;
     assert_eq!(
         detail["usage"]["total_tokens"].as_u64(),
         Some(550),
         "{detail}"
     );
+}
+
+#[tokio::test]
+async fn workflow_list_rollup_is_priced_for_priced_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    write_agent_md(global, "reviewer");
+    let wf_dir = global.join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("wf-fold.yaml"),
+        "name: wf-fold\nsteps:\n  - id: review\n    agent: reviewer\n    prompt: hi\n",
+    )
+    .unwrap();
+    write_workflow_run_in_global_transcripts(global, "run_WF", "reviewer", &[(400, 40)]);
+
+    let srv = spawn_server(global).await;
+    let rows = get_json(format!("{}/api/workflows", srv.base_url)).await;
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "wf-fold")
+        .unwrap_or_else(|| panic!("workflow row missing: {rows}"))
+        .clone();
+    assert_eq!(row["usage"]["total_tokens"].as_u64(), Some(440), "{row}");
+    assert_eq!(row["run_count"].as_u64(), Some(1), "{row}");
+    assert_eq!(row["usage"]["priced"], true, "{row}");
+    assert!(row["usage"]["cost_usd"].as_f64().is_some(), "{row}");
 }
 
 #[tokio::test]

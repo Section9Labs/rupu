@@ -172,12 +172,28 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
 }
 
 /// Per-entity rollup: summed usage + run count + most-recent activity.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EntityRollup {
     pub usage: UsageSummary,
     pub run_count: u64,
     /// Most-recent contributing run timestamp (ISO-8601), if any.
     pub last_active: Option<String>,
+}
+
+/// An empty rollup is PRICED, matching `rollup(empty)`: `add_spend` ANDs
+/// `priced`, so a derived `Default` (`priced: false`) would latch every
+/// `rollup_by` entity to unpriced no matter what its runs cost.
+impl Default for EntityRollup {
+    fn default() -> Self {
+        Self {
+            usage: UsageSummary {
+                priced: true,
+                ..UsageSummary::default()
+            },
+            run_count: 0,
+            last_active: None,
+        }
+    }
 }
 
 impl EntityRollup {
@@ -612,6 +628,7 @@ pub(crate) mod tests {
         assert_eq!(r.usage.input_tokens, 30);
         assert_eq!(r.usage.total_tokens, 35);
         assert!((r.usage.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+        assert!(r.usage.priced, "all-priced inputs keep the rollup priced");
         assert_eq!(r.last_active.as_deref(), Some("2026-01-02T00:00:00Z"));
     }
 
