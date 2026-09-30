@@ -1280,6 +1280,12 @@ impl RunStore {
         self.run_dir(run_id).join("events.jsonl")
     }
 
+    /// Path to the run's usage ledger (one JSON row per LLM call; see
+    /// `usage_ledger`).
+    pub fn usage_ledger_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("usage.jsonl")
+    }
+
     /// Read run records from an arbitrary runs root (active or archive),
     /// newest first. Shared by `list` / `list_archived`.
     fn list_in(root: &std::path::Path) -> Result<Vec<RunRecord>, RunStoreError> {
