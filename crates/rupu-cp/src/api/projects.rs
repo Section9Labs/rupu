@@ -322,12 +322,17 @@ async fn project_runs(
     load_workspace(&s, &ws_id)?;
     let runs = scoped_runs(&s, &ws_id)?; // already sorted newest-first
     let page_runs = crate::pagination::paginate(runs, &page);
-    Ok(Json(
-        page_runs
+    // The usage fold runs on the blocking pool.
+    let store = std::sync::Arc::clone(&s.run_store);
+    let pricing = s.pricing.clone();
+    let rows = crate::api::runs::blocking(move || {
+        Ok(page_runs
             .iter()
-            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
-            .collect(),
-    ))
+            .map(|r| RunListRow::with_usage(r, &store, &pricing))
+            .collect())
+    })
+    .await?;
+    Ok(Json(rows))
 }
 
 /// `GET /api/projects/:ws_id/sessions` — session DTOs scoped to the project.

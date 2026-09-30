@@ -575,14 +575,26 @@ fn stat(path: &Path) -> Stat {
 }
 
 /// What a terminal run's cached result was computed against.
+///
+/// Known edge: a LOCAL run with no ledger (legacy) stats only its run files,
+/// not the transcripts it folded, so a transcript that gets one more `Usage`
+/// line after `run.json` turned terminal stays frozen at the sealed total
+/// until a run file changes. Ledger runs are safe — the late turn's ledger row
+/// changes `usage.jsonl` — and mirrored runs stat their folded files below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Seal {
     /// `run.json`, `usage.jsonl`, `events.jsonl`, `step_results.jsonl`.
     files: [Stat; 4],
-    /// Mirrored runs only: the worker-cache / agent-mirror files the result
-    /// folded, which a host pull may still fill after the run turned terminal.
+    /// Extra files the result depends on: for mirrored runs the worker-cache /
+    /// agent-mirror files it folded (a host pull may still fill them after the
+    /// run turned terminal), and for every run each resolution candidate of a
+    /// transcript that resolved nowhere, at its absent stat — so a late pull
+    /// that creates any of them breaks the seal.
     mirrors: Vec<(PathBuf, Stat)>,
 }
+
+/// The stat of a path [`resolve`] found absent (`is_file()` false).
+const ABSENT: Stat = (0, None);
 
 /// The fallback transcript versions a build used, per key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,26 +681,25 @@ fn safe_key(key: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Spec §4.2 rule 3's resolution: the recorded path, then (mirrored runs) the
-/// worker mirror cache, then the agent mirror path. `None` = nowhere.
-fn resolve(path: &Path, key: &str, worker: Option<&str>, global: &Path) -> Option<PathBuf> {
-    if path.is_file() {
-        return Some(path.to_path_buf());
-    }
-    if let Some(w) = worker {
-        if let Some(c) = cache_path(global, w, path) {
-            if c.is_file() {
-                return Some(c);
-            }
-        }
+/// Spec §4.2 rule 3's candidates, in resolution order: the recorded path,
+/// then (mirrored runs) the worker mirror cache, then the agent mirror path.
+fn candidates(path: &Path, key: &str, worker: Option<&str>, global: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    if let Some(c) = worker.and_then(|w| cache_path(global, w, path)) {
+        out.push(c);
     }
     if safe_key(key) {
-        let m = agent_mirror_path(global, key);
-        if m.is_file() {
-            return Some(m);
-        }
+        out.push(agent_mirror_path(global, key));
     }
-    None
+    out
+}
+
+/// Spec §4.2 rule 3's resolution: the first [`candidates`] entry that is a
+/// file. `None` = nowhere.
+fn resolve(path: &Path, key: &str, worker: Option<&str>, global: &Path) -> Option<PathBuf> {
+    candidates(path, key, worker, global)
+        .into_iter()
+        .find(|c| c.is_file())
 }
 
 /// A finished run's wall-clock duration.
@@ -829,6 +840,9 @@ impl UsageIndex {
         let mut changed = st.last.is_none();
         let mut ledger_reset = false;
         let mut partial = false;
+        // A file that exists but could not be read: partial AND never sealed
+        // (becoming readable again need not change any stat we compare).
+        let mut unreadable = false;
 
         // Rule 1: the ledger.
         match drain_lines(&mut st.ledger.cursor, &ledger_path) {
@@ -846,6 +860,7 @@ impl UsageIndex {
             Err(e) => {
                 tracing::debug!(run_id, error = %e, "usage index: ledger unreadable");
                 partial = true;
+                unreadable = true;
             }
         }
 
@@ -862,6 +877,7 @@ impl UsageIndex {
             Err(e) => {
                 tracing::debug!(run_id, error = %e, "usage index: step_results unreadable");
                 partial = true;
+                unreadable = true;
             }
         }
         match drain_lines(&mut st.events, &events_path) {
@@ -875,6 +891,7 @@ impl UsageIndex {
             Err(e) => {
                 tracing::debug!(run_id, error = %e, "usage index: events unreadable");
                 partial = true;
+                unreadable = true;
             }
         }
         // The sub-run walk: only for a run with no ledger (legacy / mirrored:
@@ -911,8 +928,14 @@ impl UsageIndex {
                 if k.from_step_results || worker.is_some() {
                     partial = true;
                 }
+                // Seal against every place it could still appear.
+                for c in candidates(&k.kt.path, &k.kt.key, worker.as_deref(), &global) {
+                    mirrors.push((c, ABSENT));
+                }
                 continue;
             };
+            // A local run's folded transcripts are not sealed over (see the
+            // legacy-run edge on `Seal`); a mirrored run's are.
             if worker.is_some() {
                 mirrors.push((path.clone(), stat(&path)));
             }
@@ -921,6 +944,7 @@ impl UsageIndex {
                 let mut f = lock_fold(&fold);
                 f.drain(&path);
                 partial |= f.unreadable;
+                unreadable |= f.unreadable;
                 FallbackView {
                     key: k.kt.key.clone(),
                     path: path.clone(),
@@ -984,9 +1008,12 @@ impl UsageIndex {
         };
 
         // Rule 5: seal a terminal run after this full computation (walk
-        // included). A partial result is never sealed — a host pull may still
-        // deliver the missing transcript.
-        if terminal && !partial {
+        // included). A result that is partial only because transcripts are
+        // missing is sealed too — the seal stats each missing transcript's
+        // candidates at ABSENT, so a host pull that delivers one re-validates
+        // — rather than re-walking a finished run on every request. An
+        // unreadable file is never sealed over.
+        if terminal && !unreadable {
             st.seal = Some(Seal { files, mirrors });
         }
         usage
@@ -1593,6 +1620,84 @@ mod tests {
             &unit_started("run_REMOTEGONE", "fan", 0, Path::new("/nope/run_Y.jsonl")),
         );
         assert!(idx.run_usage(&store, "run_REMOTEGONE").partial);
+    }
+
+    fn is_sealed(idx: &UsageIndex, store: &RunStore, run_id: &str) -> bool {
+        let state = idx.run_state(store, run_id);
+        let st = idx.lock_run(&state);
+        st.seal.is_some()
+    }
+
+    #[test]
+    fn terminal_partial_run_is_sealed_until_the_missing_transcript_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        let idx = UsageIndex::default();
+        create_run(&store, "run_HALF", RunStatus::Completed);
+        let present = tmp.path().join("transcripts/run_P.jsonl");
+        let missing = tmp.path().join("transcripts/run_M.jsonl");
+        append(
+            &present,
+            &transcript_lines("builder", PROVIDER, MODEL, &[(10, 1)]),
+        );
+        store
+            .append_step_result("run_HALF", &step_result("a", &present))
+            .unwrap();
+        store
+            .append_step_result("run_HALF", &step_result("b", &missing))
+            .unwrap();
+
+        let first = idx.run_usage(&store, "run_HALF");
+        assert!(first.partial);
+        assert_eq!(total(&first), tok(10, 1));
+        assert!(
+            is_sealed(&idx, &store, "run_HALF"),
+            "a finished run with a permanently missing transcript must not re-walk every call"
+        );
+        let second = idx.run_usage(&store, "run_HALF");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(is_sealed(&idx, &store, "run_HALF"));
+
+        // The missing transcript appears (a late host pull): the seal breaks,
+        // it is counted, and the run is no longer partial.
+        append(
+            &missing,
+            &transcript_lines("builder", PROVIDER, MODEL, &[(20, 2)]),
+        );
+        let third = idx.run_usage(&store, "run_HALF");
+        assert!(!third.partial);
+        assert_eq!(total(&third), tok(30, 3));
+        assert_eq!(step_total(&third, "b"), tok(20, 2));
+        assert!(is_sealed(&idx, &store, "run_HALF"));
+    }
+
+    #[test]
+    fn terminal_partial_mirrored_run_unseals_when_the_cache_fills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _recorded) = crate::usage::tests::seed_remote_run(tmp.path());
+        let mut rec = store.load("run_01USAGE").unwrap();
+        rec.status = RunStatus::Completed;
+        store.update(&rec).unwrap();
+
+        let idx = UsageIndex::default();
+        let first = idx.run_usage(&store, "run_01USAGE");
+        assert!(first.partial, "nothing mirrored yet");
+        assert!(is_sealed(&idx, &store, "run_01USAGE"));
+
+        // The terminal pull lands the worker-cache copy.
+        let cache = tmp
+            .path()
+            .join("mirror")
+            .join("host_abc")
+            .join("transcripts")
+            .join("run_01A.jsonl");
+        append(
+            &cache,
+            &transcript_lines("remote", PROVIDER, MODEL, &[(40, 4)]),
+        );
+        let second = idx.run_usage(&store, "run_01USAGE");
+        assert!(!second.partial);
+        assert_eq!(total(&second), tok(40, 4));
     }
 
     #[test]

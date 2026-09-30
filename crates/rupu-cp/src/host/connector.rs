@@ -758,6 +758,17 @@ pub(crate) async fn open_run_events_tail(
 
 // ── Mirror-backed observation helpers ────────────────────────────────────────
 
+/// Run a synchronous connector body — run-store reads plus the usage fold,
+/// which does file IO under a per-run `std::sync::Mutex` — on tokio's
+/// blocking pool instead of an executor thread. Only a panicked body errors.
+pub(crate) async fn blocking_host<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, HostConnectorError> + Send + 'static,
+) -> Result<T, HostConnectorError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| HostConnectorError::Invalid(format!("connector task failed: {e}")))?
+}
+
 /// List runs from the central [`RunStore`] filtered to `worker_id`.
 ///
 /// Shared by [`TunnelHostConnector`] and the upcoming `SshHostConnector` — both

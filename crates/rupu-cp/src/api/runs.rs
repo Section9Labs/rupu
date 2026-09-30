@@ -62,17 +62,31 @@ fn map_approval_err(id: &str, e: ApprovalError) -> ApiError {
 }
 
 /// Reload a run and serialize it in the same shape as `GET /api/runs/:id`
-/// so the UI can refresh from an approve/reject response.
-fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
+/// so the UI can refresh from an approve/reject response. The usage fold runs
+/// off the executor and never fails the (already-recorded) mutation.
+async fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
     let record = s.run_store.load(id).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
     })?;
     let steps = s.run_store.read_step_results(id).unwrap_or_default();
-    let usage = crate::usage::summarize_run(&s.run_store, id, &s.pricing);
+    let u = crate::usage::run_usage_blocking(Arc::clone(&s.run_store), id.to_string()).await;
+    let usage = crate::usage::summarize_run_usage(&u, &s.pricing);
     Ok(Json(
         serde_json::json!({ "run": record, "steps": steps, "usage": usage }),
     ))
+}
+
+/// Run a synchronous request body — run-store reads plus the usage fold,
+/// which does file IO under a per-run `std::sync::Mutex` — on tokio's
+/// blocking pool instead of an executor thread. Only a panicked body errors
+/// (a 500, as it would have been inline).
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> ApiResult<T> + Send + 'static,
+) -> ApiResult<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::internal(format!("request task failed: {e}")))?
 }
 
 /// Optional `?host=<id>` / `?gate=<step_id>` query params for control
@@ -154,7 +168,7 @@ async fn approve_run(
     s.run_store
         .request_resume_approval(&id, "web", mode.as_deref(), now, q.gate.as_deref())
         .map_err(|e| map_approval_err(&id, e))?;
-    let mut resp = run_response(&s, &id)?;
+    let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
 }
@@ -207,7 +221,7 @@ async fn reject_run(
     s.run_store
         .reject_gate(&id, "web", &reason, now, q.gate.as_deref())
         .map_err(|e| map_approval_err(&id, e))?;
-    let mut resp = run_response(&s, &id)?;
+    let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
 }
@@ -264,7 +278,7 @@ async fn cancel_run(
         .run_store
         .cancel(&id, "web", &reason, now)
         .map_err(|e| map_cancel_err(&id, e))?;
-    let mut resp = run_response(&s, &id)?;
+    let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
 }
@@ -324,7 +338,7 @@ async fn pause_run(
     s.run_store
         .set_pause_marker(&id)
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut resp = run_response(&s, &id)?;
+    let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
 }
@@ -380,7 +394,7 @@ async fn resume_run(
     s.run_store
         .request_resume_approval(&id, "web", None, now, None)
         .map_err(|e| map_approval_err(&id, e))?;
-    let mut resp = run_response(&s, &id)?;
+    let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
 }
@@ -758,17 +772,24 @@ async fn list_workflow_runs(
     let page = q.page();
     if let Some(host_id) = &q.host {
         if host_id == "local" {
-            let rows = query_run_rows(
-                &s.run_store,
-                page.offset(),
-                page.limit(),
-                q.lifecycle.as_deref(),
-                true, // workflow_only
-                None,
-                &s.pricing,
-                &q.range(),
-            )
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            let store = Arc::clone(&s.run_store);
+            let pricing = s.pricing.clone();
+            let lifecycle = q.lifecycle.clone();
+            let range = q.range();
+            let rows = blocking(move || {
+                query_run_rows(
+                    &store,
+                    page.offset(),
+                    page.limit(),
+                    lifecycle.as_deref(),
+                    true, // workflow_only
+                    None,
+                    &pricing,
+                    &range,
+                )
+                .map_err(|e| ApiError::internal(e.to_string()))
+            })
+            .await?;
             let tagged: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|r| {
@@ -851,12 +872,25 @@ async fn get_run_from_host(s: &AppState, host_id: &str, id: &str) -> ApiResult<s
         Ok(v) => Ok(v),
         Err(e) => {
             if conn.serves_runs_from_local_mirror() && s.run_store.load(id).is_ok() {
-                return query_run_detail(&s.run_store, id, &s.pricing)
-                    .map_err(|e| run_not_found_or_internal(id, e));
+                return local_run_detail(Arc::clone(&s.run_store), s, id).await;
             }
             Err(host_connector_err(id, host_id, e))
         }
     }
+}
+
+/// [`query_run_detail`] against `store`, off the async executor.
+async fn local_run_detail(
+    store: Arc<RunStore>,
+    s: &AppState,
+    id: &str,
+) -> ApiResult<serde_json::Value> {
+    let pricing = s.pricing.clone();
+    let id = id.to_string();
+    blocking(move || {
+        query_run_detail(&store, &id, &pricing).map_err(|e| run_not_found_or_internal(&id, e))
+    })
+    .await
 }
 
 /// Build a `RunRecord`-shaped JSON value (plus a sibling `cycle_id`) for a
@@ -952,16 +986,12 @@ async fn get_run(
     }
 
     match resolve_run_location(&s, &id).await {
-        RunLocation::Global => {
-            let detail = query_run_detail(&s.run_store, &id, &s.pricing)
-                .map_err(|e| run_not_found_or_internal(&id, e))?;
-            Ok(Json(detail))
-        }
+        RunLocation::Global => local_run_detail(Arc::clone(&s.run_store), &s, &id)
+            .await
+            .map(Json),
         RunLocation::ProjectLocal { path } => {
-            let store = RunStore::new(path.join(".rupu").join("runs"));
-            let detail = query_run_detail(&store, &id, &s.pricing)
-                .map_err(|e| run_not_found_or_internal(&id, e))?;
-            Ok(Json(detail))
+            let store = Arc::new(RunStore::new(path.join(".rupu").join("runs")));
+            local_run_detail(store, &s, &id).await.map(Json)
         }
         RunLocation::Host { host_id } => get_run_from_host(&s, &host_id, &id).await.map(Json),
         RunLocation::Unpersisted {
@@ -1115,10 +1145,17 @@ async fn get_run_usage_timeline(
     }
 
     match resolve_run_location(&s, &id).await {
-        RunLocation::Global => build_usage_timeline_json(&s.run_store, &id).map(Json),
+        RunLocation::Global => {
+            let store = Arc::clone(&s.run_store);
+            blocking(move || build_usage_timeline_json(&store, &id))
+                .await
+                .map(Json)
+        }
         RunLocation::ProjectLocal { path } => {
             let store = RunStore::new(path.join(".rupu").join("runs"));
-            build_usage_timeline_json(&store, &id).map(Json)
+            blocking(move || build_usage_timeline_json(&store, &id))
+                .await
+                .map(Json)
         }
         RunLocation::Host { host_id } => {
             usage_timeline_from_host(&s, &host_id, &id).await.map(Json)
@@ -1367,13 +1404,19 @@ async fn list_archived_runs(
     if q.kind.as_deref() == Some("workflow") {
         records.retain(|r| r.event.is_none() && r.source_wake_id.is_none());
     }
-    let mut rows = Vec::with_capacity(records.len());
-    for r in &records {
-        let row = RunListRow::with_usage(r, &s.run_store, &s.pricing);
-        let mut v = serde_json::to_value(row).map_err(|e| ApiError::internal(e.to_string()))?;
-        v["host_id"] = serde_json::json!("local");
-        rows.push(v);
-    }
+    let store = Arc::clone(&s.run_store);
+    let pricing = s.pricing.clone();
+    let rows = blocking(move || {
+        let mut rows = Vec::with_capacity(records.len());
+        for r in &records {
+            let row = RunListRow::with_usage(r, &store, &pricing);
+            let mut v = serde_json::to_value(row).map_err(|e| ApiError::internal(e.to_string()))?;
+            v["host_id"] = serde_json::json!("local");
+            rows.push(v);
+        }
+        Ok(rows)
+    })
+    .await?;
     Ok(Json(rows))
 }
 

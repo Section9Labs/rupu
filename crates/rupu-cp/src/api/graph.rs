@@ -141,10 +141,20 @@ async fn run_graph(
     }
 
     match resolve_run_location(&s, &id).await {
-        RunLocation::Global => build_run_graph_json(&s.run_store, &s.pricing, &id).map(Json),
+        // Store reads + the usage fold run on the blocking pool.
+        RunLocation::Global => {
+            let store = std::sync::Arc::clone(&s.run_store);
+            let pricing = s.pricing.clone();
+            crate::api::runs::blocking(move || build_run_graph_json(&store, &pricing, &id))
+                .await
+                .map(Json)
+        }
         RunLocation::ProjectLocal { path } => {
             let store = RunStore::new(path.join(".rupu").join("runs"));
-            build_run_graph_json(&store, &s.pricing, &id).map(Json)
+            let pricing = s.pricing.clone();
+            crate::api::runs::blocking(move || build_run_graph_json(&store, &pricing, &id))
+                .await
+                .map(Json)
         }
         RunLocation::Host { host_id } => run_graph_from_host(&s, &host_id, &id).await.map(Json),
         RunLocation::Unpersisted {

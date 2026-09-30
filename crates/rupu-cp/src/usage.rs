@@ -92,6 +92,110 @@ pub fn transcripts_usage(labeled: &[(String, PathBuf)]) -> Arc<RunUsage> {
     UsageIndex::global().transcripts_usage(labeled)
 }
 
+/// Run a synchronous usage computation on tokio's blocking pool. The fold
+/// reads files while holding a per-run (or per-file) `std::sync::Mutex`, so
+/// async handlers must not run it on an executor thread. Usage accounting
+/// never fails a request: if `f` panics the failure is logged and
+/// `fallback()` is returned instead.
+pub async fn usage_blocking<T: Send + 'static>(
+    what: &'static str,
+    f: impl FnOnce() -> T + Send + 'static,
+    fallback: impl FnOnce() -> T,
+) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(what, error = %e, "usage computation failed; reporting it as partial");
+            fallback()
+        }
+    }
+}
+
+/// An empty result that says it is incomplete — what a failed fold reports.
+pub fn unknown_usage() -> Arc<RunUsage> {
+    Arc::new(RunUsage {
+        partial: true,
+        ..RunUsage::default()
+    })
+}
+
+/// [`run_usage`] off the async executor (see [`usage_blocking`]). Never
+/// fails: a panicked fold reads as an empty, `partial` result.
+pub async fn run_usage_blocking(store: Arc<RunStore>, run_id: String) -> Arc<RunUsage> {
+    usage_blocking(
+        "run_usage",
+        move || run_usage(&store, &run_id),
+        unknown_usage,
+    )
+    .await
+}
+
+/// [`transcripts_usage`] off the async executor (see [`usage_blocking`]).
+/// Never fails: a panicked fold reads as an empty, `partial` result.
+pub async fn transcripts_usage_blocking(labeled: Vec<(String, PathBuf)>) -> Arc<RunUsage> {
+    usage_blocking(
+        "transcripts_usage",
+        move || transcripts_usage(&labeled),
+        unknown_usage,
+    )
+    .await
+}
+
+/// [`summarize_run`] for each of `run_ids`, in order, off the async executor
+/// (see [`usage_blocking`]). Never fails: a panicked fold prices every run as
+/// an empty, `partial` result.
+pub async fn summarize_runs_blocking(
+    store: Arc<RunStore>,
+    run_ids: Vec<String>,
+    pricing: PricingConfig,
+) -> Vec<UsageSummary> {
+    let n = run_ids.len();
+    let fallback_pricing = pricing.clone();
+    usage_blocking(
+        "summarize_runs",
+        move || {
+            run_ids
+                .iter()
+                .map(|id| summarize_run(&store, id, &pricing))
+                .collect()
+        },
+        move || vec![summarize_run_usage(&unknown_usage(), &fallback_pricing); n],
+    )
+    .await
+}
+
+/// [`run_metrics`] for each of `run_ids`, in order, off the async executor
+/// (see [`usage_blocking`]). Never fails: a panicked fold reports every run
+/// as an empty, `partial` result.
+pub async fn run_metrics_blocking(
+    store: Arc<RunStore>,
+    run_ids: Vec<String>,
+    pricing: PricingConfig,
+) -> Vec<RunMetrics> {
+    let n = run_ids.len();
+    let fallback_pricing = pricing.clone();
+    usage_blocking(
+        "run_metrics",
+        move || {
+            run_ids
+                .iter()
+                .map(|id| run_metrics(&store, id, &pricing))
+                .collect()
+        },
+        move || {
+            let usage = summarize_run_usage(&unknown_usage(), &fallback_pricing);
+            vec![
+                RunMetrics {
+                    usage,
+                    ..RunMetrics::default()
+                };
+                n
+            ]
+        },
+    )
+    .await
+}
+
 /// Price a [`RunUsage`]; carries its `partial` flag through.
 pub fn summarize_run_usage(u: &RunUsage, pricing: &PricingConfig) -> UsageSummary {
     let mut s = summarize(&u.rows, pricing);
@@ -675,6 +779,42 @@ pub(crate) mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].provider, "anthropic");
         assert_eq!(b[0].input_tokens, 2000);
+    }
+
+    // ── Off-executor wrappers ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_usage_blocking_matches_the_sync_fold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _) = seed_remote_run(tmp.path());
+        let cache = tmp.path().join("mirror/host_abc/transcripts/run_01A.jsonl");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cache,
+            concat!(
+                r#"{"type":"usage","data":{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":70,"output_tokens":7,"cached_tokens":0}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let sync = run_usage(&store, "run_01USAGE");
+        let off = run_usage_blocking(std::sync::Arc::clone(&store), "run_01USAGE".into()).await;
+        assert_eq!(off.rows, sync.rows);
+        assert_eq!(off.turns, sync.turns);
+        assert!(!off.partial);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_usage_computation_degrades_to_partial_never_an_error() {
+        let u = usage_blocking(
+            "test",
+            || -> Arc<RunUsage> { panic!("fold blew up") },
+            unknown_usage,
+        )
+        .await;
+        assert!(u.partial, "a failed fold is reported incomplete");
+        assert!(u.rows.is_empty());
+        assert_eq!(u.turns, 0);
     }
 
     // ── `run_transcript_paths`' host-mirror fallback (spec §6.3) ──────────

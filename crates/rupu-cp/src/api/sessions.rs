@@ -614,7 +614,7 @@ async fn get_session_usage_timeline(
     let env: SessionRunsEnvelope =
         serde_json::from_str(&text).unwrap_or(SessionRunsEnvelope { runs: vec![] });
     let (labeled, _) = session_turn_transcripts(&env.runs, &s.run_store);
-    let u = crate::usage::transcripts_usage(&labeled);
+    let u = crate::usage::transcripts_usage_blocking(labeled).await;
     let v = serde_json::to_value(&u.points).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(v))
 }
