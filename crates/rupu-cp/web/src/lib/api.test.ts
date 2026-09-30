@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { api, ApiError, presetWindow, windowFromDayRange } from './api';
+import { api, ApiError, apiErrorMessage, presetWindow, windowFromDayRange } from './api';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -344,6 +344,30 @@ describe('api.getUsageRuns', () => {
     await api.getUsageRuns();
     const calledUrl = fetchSpy.mock.calls[0][0] as string;
     expect(calledUrl).toContain('until=');
+  });
+});
+
+describe('apiErrorMessage', () => {
+  it('extracts the message from a JSON {"error"} body', () => {
+    const body = JSON.stringify({ error: 'finding x not found' });
+    expect(apiErrorMessage(new ApiError(404, body, body))).toBe('finding x not found');
+  });
+
+  it('falls back to the raw body text when it is not the {"error"} shape', () => {
+    expect(apiErrorMessage(new ApiError(502, 'upstream exploded', 'upstream exploded'))).toBe('upstream exploded');
+    const other = JSON.stringify({ detail: 'nope' });
+    expect(apiErrorMessage(new ApiError(400, other, other))).toBe(other);
+  });
+
+  it('falls back to the message, then the HTTP status, for an empty body', () => {
+    expect(apiErrorMessage(new ApiError(500, 'Internal Server Error', ''))).toBe('Internal Server Error');
+    expect(apiErrorMessage(new ApiError(503, '', ''))).toBe('Request failed (HTTP 503)');
+  });
+
+  it('handles a plain Error and non-Error values', () => {
+    expect(apiErrorMessage(new Error('boom'))).toBe('boom');
+    expect(apiErrorMessage('bare string')).toBe('bare string');
+    expect(apiErrorMessage(undefined)).toBe('undefined');
   });
 });
 

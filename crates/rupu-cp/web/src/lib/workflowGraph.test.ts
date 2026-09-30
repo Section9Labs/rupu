@@ -1842,3 +1842,169 @@ describe('loops: inline validation', () => {
     expect('error' in res).toBe(true);
   });
 });
+
+// ── findings_profile (Plan 2 Task 9) ─────────────────────────────────────────
+// Mirrors the server's parse-time rules in workflow.rs `validate_step_shape` /
+// `validate_findings_profile_default`.
+
+describe('findings_profile: parse + round-trip', () => {
+  it('parses findings_profile on a linear agent step into data, out of raw_passthrough, and re-emits it identically', () => {
+    const input = {
+      name: 'wf',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p', findings_profile: 'summary' }],
+    };
+    const g = yamlToGraph(input);
+    expect(g.nodes[0].data.findings_profile).toBe('summary');
+    expect(g.nodes[0].data.raw_passthrough).toBeUndefined();
+    const res = graphToWorkflowObject(g);
+    expect('obj' in res).toBe(true);
+    if (!('obj' in res)) return;
+    // Key ORDER is part of the contract, not just deep-equality.
+    expect(JSON.stringify(res.obj)).toBe(JSON.stringify(input));
+  });
+
+  it('a step without findings_profile emits no such key', () => {
+    const g = yamlToGraph({ name: 'wf', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] });
+    expect(g.nodes[0].data.findings_profile).toBeUndefined();
+    const res = graphToWorkflowObject(g);
+    if (!('obj' in res)) throw new Error('expected obj');
+    expect(JSON.stringify(res.obj)).not.toContain('findings_profile');
+  });
+
+  it('an unknown findings_profile value is preserved verbatim (raw_passthrough) rather than dropped', () => {
+    const input = { name: 'wf', steps: [{ id: 'a', agent: 'x', prompt: 'p', findings_profile: 'bogus' }] };
+    const g = yamlToGraph(input);
+    expect(g.nodes[0].data.findings_profile).toBeUndefined();
+    expectRoundTrip(input);
+  });
+
+  it('round-trips findings_profile on for_each, parallel, panel and a findings.record action step', () => {
+    expectRoundTrip({
+      name: 'wf',
+      steps: [
+        { id: 'fe', agent: 'x', prompt: 'p', for_each: '{{ inputs.items }}', findings_profile: 'full' },
+        { id: 'par', parallel: [{ id: 's', agent: 'x', prompt: 'p' }], findings_profile: 'summary' },
+        { id: 'pan', panel: { panelists: ['x'], subject: 's' }, findings_profile: 'summary' },
+        {
+          id: 'rec',
+          action: 'findings.record',
+          with: { scope: 'repo', summary: 's', severity: 'low', rationale: 'r' },
+          findings_profile: 'summary',
+        },
+      ],
+    });
+  });
+});
+
+describe('findings_profile: validateGraph (mirrors workflow.rs parse rules)', () => {
+  const wf = (steps: Record<string, unknown>[], extra: Record<string, unknown> = {}) =>
+    yamlToGraph({ name: 'wf', ...extra, steps });
+
+  it('returns no problems for a local agent step with a profile', () => {
+    const g = wf([{ id: 'a', agent: 'x', prompt: 'p', findings_profile: 'summary' }]);
+    expect(validateGraph(g)).toEqual({});
+  });
+
+  it('accepts it on for_each, parallel and panel steps', () => {
+    const g = wf([
+      { id: 'fe', agent: 'x', prompt: 'p', for_each: '{{ inputs.items }}', findings_profile: 'full' },
+      { id: 'par', parallel: [{ id: 's', agent: 'x', prompt: 'p' }], findings_profile: 'summary' },
+      { id: 'pan', panel: { panelists: ['x'], subject: 's' }, findings_profile: 'summary' },
+    ]);
+    expect(validateGraph(g)).toEqual({});
+  });
+
+  it('accepts it on an action step calling exactly findings.record', () => {
+    const g = wf([{ id: 'rec', action: 'findings.record', with: { scope: 'repo' }, findings_profile: 'summary' }]);
+    expect(validateGraph(g)).toEqual({});
+  });
+
+  it('flags it on an action step calling any other tool', () => {
+    const g = wf([{ id: 'c', action: 'issues.comment', with: {}, findings_profile: 'summary' }]);
+    const msg = (validateGraph(g).c ?? []).join(' ');
+    expect(msg).toContain('findings_profile only applies to');
+    expect(msg).toContain('findings.record');
+    expect(msg).toContain('issues.comment');
+  });
+
+  it('flags it on a host: step', () => {
+    const g = wf([{ id: 'r', agent: 'x', prompt: 'p', host: 'box', findings_profile: 'summary' }]);
+    expect((validateGraph(g).r ?? []).join(' ')).toContain('findings_profile is not supported on a remote step');
+    expect((validateGraph(g).r ?? []).join(' ')).toContain("agent's frontmatter");
+  });
+
+  it('flags it on a distribute: step', () => {
+    const g = wf([
+      {
+        id: 'r',
+        agent: 'x',
+        prompt: 'p',
+        for_each: '{{ inputs.items }}',
+        distribute: { hosts: ['a', 'b'] },
+        findings_profile: 'full',
+      },
+    ]);
+    expect((validateGraph(g).r ?? []).join(' ')).toContain('findings_profile is not supported on a remote step');
+  });
+
+  it('flags it on a branch step (runs no agent)', () => {
+    const g = wf([
+      { id: 'a', agent: 'x', prompt: 'p' },
+      {
+        id: 'g',
+        findings_profile: 'summary',
+        branch: { condition: '{{ steps.a.output }}', then: ['x'], else: ['y'] },
+      },
+      { id: 'x', agent: 'x', prompt: 'p' },
+      { id: 'y', agent: 'x', prompt: 'p' },
+    ]);
+    expect((validateGraph(g).g ?? []).join(' ')).toContain(
+      'findings_profile has no effect on a step that runs no agent',
+    );
+  });
+
+  it('flags it on a standalone approval gate, a bare split, a bare join and a run: step', () => {
+    const g = wf([
+      { id: 'gate', approval: { required: true }, findings_profile: 'summary' },
+      { id: 'sp', split: ['j1', 'j2'], findings_profile: 'summary' },
+      { id: 'j1', agent: 'x', prompt: 'p' },
+      { id: 'j2', agent: 'x', prompt: 'p' },
+      { id: 'jn', join: {}, findings_profile: 'summary' },
+      { id: 'cmd', run: { command: 'echo hi' }, findings_profile: 'summary' },
+    ]);
+    const p = validateGraph(g);
+    for (const id of ['gate', 'sp', 'jn', 'cmd']) {
+      expect((p[id] ?? []).join(' ')).toContain('findings_profile has no effect on a step that runs no agent');
+    }
+  });
+
+  it('does not flag a step that has no findings_profile', () => {
+    const g = wf([
+      { id: 'a', agent: 'x', prompt: 'p', host: 'box' },
+      { id: 'gate', approval: { required: true } },
+    ]);
+    expect(validateGraph(g)).toEqual({});
+  });
+
+  it('flags defaults.findings_profile when any step is remote, naming each remote step', () => {
+    const g = wf(
+      [
+        { id: 'local', agent: 'x', prompt: 'p' },
+        { id: 'remote', agent: 'x', prompt: 'p', host: 'box' },
+      ],
+      { defaults: { findings_profile: 'summary' } },
+    );
+    const p = validateGraph(g);
+    expect(p.local).toBeUndefined();
+    expect((p.remote ?? []).join(' ')).toContain('defaults.findings_profile does not reach remote step remote');
+  });
+
+  it('does not flag defaults.findings_profile with only local steps, or a remote step with no default', () => {
+    expect(
+      validateGraph(wf([{ id: 'a', agent: 'x', prompt: 'p' }], { defaults: { findings_profile: 'summary' } })),
+    ).toEqual({});
+    expect(
+      validateGraph(wf([{ id: 'r', agent: 'x', prompt: 'p', host: 'box' }], { defaults: { continue_on_error: true } })),
+    ).toEqual({});
+  });
+});

@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, normFindingSeverity, type FindingsResponse } from '../../lib/api';
 import { type Severity } from '../../lib/severity';
+import { ExportReportButton } from '../findings/ExportReportButton';
 import { FindingMetrics } from '../findings/FindingMetrics';
 import { FindingsTable } from '../findings/FindingsTable';
 
@@ -67,6 +68,15 @@ export default function ProjectFindingsTab({ wsId }: { wsId: string }) {
   return (
     <div className="space-y-4">
       <FindingMetrics summary={resp.summary} active={activeSev} onSelect={setActiveSev} />
+
+      {/* The report covers exactly the rows the severity filter leaves. */}
+      <div className="flex justify-end">
+        <ExportReportButton
+          findings={rows}
+          defaultTitle={`${all[0]?.project ?? 'Project'} findings report`}
+          wsId={wsId}
+        />
+      </div>
 
       {rows.length === 0 ? (
         <div className="rounded-xl border border-dashed border-border bg-panel/50 py-10 text-center text-sm text-ink-dim">

@@ -178,7 +178,7 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::coverage::Action,
     },
-    /// Finding reports: the embedded report schema.
+    /// Finding reports: the embedded report schema, and report exports.
     Findings {
         #[command(subcommand)]
         action: cmd::findings::Action,
@@ -441,11 +441,7 @@ fn ensure_output_format_supported(
             &[output::formats::OutputFormat::Table],
         ),
         Cmd::Coverage { action } => cmd::coverage::ensure_output_format(action, format),
-        Cmd::Findings { .. } => output::formats::ensure_supported(
-            "findings",
-            format,
-            &[output::formats::OutputFormat::Table],
-        ),
+        Cmd::Findings { action } => cmd::findings::ensure_output_format(action, format),
         Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
         Cmd::Webhook { .. } => output::formats::ensure_supported(
             "webhook",

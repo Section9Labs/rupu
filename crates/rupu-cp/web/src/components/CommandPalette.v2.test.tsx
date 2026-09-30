@@ -77,7 +77,7 @@ describe('CommandPalette v2', () => {
     );
   });
 
-  it('shell="v2" navigates a finding entity result to /security', async () => {
+  it('shell="v2" navigates a finding entity result to its report page', async () => {
     mockEmptyApi();
     const finding: FindingOut = {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
@@ -115,6 +115,6 @@ describe('CommandPalette v2', () => {
     expect(result).toBeTruthy();
     fireEvent.click(result as HTMLElement);
 
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/security'));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/findings/f-1'));
   });
 });

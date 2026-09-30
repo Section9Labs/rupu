@@ -1,8 +1,9 @@
 // Shared findings list rendered as a SortableTable. Used by the global Findings
 // page, the per-project Findings tab, and the coverage-detail Overview. Columns:
-// Severity | Summary | File:Line | CWE | Concern | Agent, plus Project | Target when
-// `showProvenance` is set (the cross-project / project-scoped variants). Each
-// row expands (via `renderDetail`) to its evidence panel.
+// Severity | Summary | Report | File:Line | CWE | Concern | Agent, plus Project |
+// Target when `showProvenance` is set (the cross-project / project-scoped
+// variants). Each row expands (via `renderDetail`) to its evidence panel — or,
+// for a full-profile finding, to the triage card summarising its structured report.
 //
 // Severity sorts by rank with critical highest; Summary / File / Concern sort
 // lexically. The rows arrive backend-sorted (critical → info, newest first), so
@@ -15,11 +16,13 @@ import {
   type FindingOut,
   type FindingRecord,
 } from '../../lib/api';
-import { cweFromFinding } from '../../lib/cwe';
+import { cweFromFinding, cweRef } from '../../lib/cwe';
+import { codeHref } from '../../lib/findingReport';
 import SeverityChip from '../coverage/SeverityChip';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { AgentName } from '../codename/AgentName';
 import { FindingEvidence } from './FindingEvidence';
+import TriageCard from './TriageCard';
 import { findingCodename } from './findingCodename';
 
 function location(f: FindingRecord): string {
@@ -68,6 +71,31 @@ export function FindingsTable({
       render: (f) => <span className="text-ink leading-snug">{f.summary}</span>,
     },
     {
+      key: 'report',
+      header: 'Report',
+      fit: true,
+      sortable: true,
+      // Completeness ratio; rows without a report_summary sort below every
+      // full report (-1) so "summary" rows cluster together.
+      sortValue: (f) =>
+        f.report_summary && f.report_summary.completeness.total > 0
+          ? f.report_summary.completeness.filled / f.report_summary.completeness.total
+          : -1,
+      render: (f) =>
+        f.report_summary ? (
+          <span className="font-mono text-note text-ink-dim">
+            {f.report_summary.completeness.filled}/{f.report_summary.completeness.total}
+            {f.report_summary.has_poc && <span className="ml-1 text-ok">PoC</span>}
+          </span>
+        ) : f.profile === 'full' ? (
+          // A full-profile row without a report_summary carries a report this
+          // build couldn't parse (e.g. written by a newer rupu).
+          <span className="text-note text-ink-mute">unreadable</span>
+        ) : (
+          <span className="text-note text-ink-mute">summary</span>
+        ),
+    },
+    {
       key: 'location',
       header: 'File:Line',
       fit: true,
@@ -81,11 +109,7 @@ export function FindingsTable({
           return (
             <button
               type="button"
-              onClick={() =>
-                navigate(
-                  `/projects/${encodeURIComponent(rowWsId)}/code?path=${encodeURIComponent(f.file_path!)}&line=${f.line_range![0]}`,
-                )
-              }
+              onClick={() => navigate(codeHref(rowWsId, f.file_path!, f.line_range![0]))}
               className="font-mono text-note break-all text-brand-700 hover:underline"
             >
               {loc}
@@ -100,7 +124,8 @@ export function FindingsTable({
       header: 'CWE',
       fit: true,
       render: (f) => {
-        const cwe = cweFromFinding(f);
+        const reportCwe = f.report_summary?.cwe[0];
+        const cwe = (reportCwe ? cweRef(reportCwe) : null) ?? cweFromFinding(f);
         return cwe ? (
           <a
             href={cwe.url}
@@ -184,7 +209,13 @@ export function FindingsTable({
           ? `${(f as FindingOut).ws_id}/${(f as FindingOut).target_id}/${f.id}`
           : f.id
       }
-      renderDetail={(f) => <FindingEvidence finding={f} />}
+      renderDetail={(f) =>
+        f.profile === 'full' && f.report_summary ? (
+          <TriageCard finding={f} />
+        ) : (
+          <FindingEvidence finding={f} />
+        )
+      }
     />
   );
 }
