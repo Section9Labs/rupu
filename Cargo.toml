@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rupu-ast",
+    "crates/rupu-codename",
     "crates/rupu-app-canvas",
     "crates/rupu-coverage",
     "crates/rupu-transcript",
@@ -160,6 +161,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 # Network egress observability (netflow)
+rupu-codename = { path = "crates/rupu-codename" }
 rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
 
 [workspace.lints.rust]
