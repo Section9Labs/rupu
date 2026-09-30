@@ -125,6 +125,7 @@ pub fn host_features() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
+        CAP_RUN_COVERAGE_STREAM.to_string(),
     ]
 }
 

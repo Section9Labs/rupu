@@ -15,6 +15,7 @@
     ]
   },
   "features": [
-    "agent.findings_profile"
+    "agent.findings_profile",
+    "run.coverage_stream"
   ]
 }

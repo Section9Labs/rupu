@@ -751,3 +751,119 @@ async fn launch_agent_without_a_profile_skips_the_feature_check() {
     info.assert_hits(0);
     post.assert();
 }
+
+// ── Remote findings Plan A, Task 6: coverage stream over HTTP ────────────────
+
+/// A real remote CP serves a run's stream; the connector fetches it.
+#[tokio::test]
+async fn unit_coverage_fetches_the_remote_runs_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    );
+    let p = rupu_coverage::stream_path(&state.run_store.root, "run_H1");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        b"{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_H1\"}\n",
+    )
+    .unwrap();
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let bytes = c.unit_coverage("run_H1").await.unwrap();
+    assert!(bytes.starts_with(b"{\"ledger\":\"begin\""));
+    assert!(c.unit_coverage("run_NONE").await.unwrap().is_empty());
+}
+
+/// An older remote answers unknown /api paths with the SPA (200 HTML), so the
+/// connector must check the feature first rather than trust the status.
+#[tokio::test]
+async fn unit_coverage_refuses_a_remote_without_the_feature() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(serde_json::json!({"version": "0.70.0", "features": []}));
+    });
+    let spa = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/coverage");
+        then.status(200).body("<!doctype html>");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.unit_coverage("run_H1").await.unwrap_err();
+    assert!(matches!(err, HostConnectorError::Unsupported(_)), "{err:?}");
+    spa.assert_hits(0);
+}
+
+#[tokio::test]
+async fn unmatched_api_paths_are_a_json_404_not_the_spa() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    );
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    #[allow(clippy::disallowed_methods)]
+    let resp = reqwest::get(format!("http://{addr}/api/definitely/not/a/route"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("/api/definitely"));
+}
+
+#[tokio::test]
+async fn coverage_endpoint_serves_ndjson_and_rejects_a_malformed_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    );
+    let p = rupu_coverage::stream_path(&state.run_store.root, "run_H2");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(
+        &p,
+        b"{\"ledger\":\"begin\",\"v\":1,\"run_id\":\"run_H2\"}\n",
+    )
+    .unwrap();
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    #[allow(clippy::disallowed_methods)]
+    let ok = reqwest::get(format!("http://{addr}/api/runs/run_H2/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(
+        ok.headers().get("content-type").unwrap(),
+        "application/x-ndjson"
+    );
+    // A run that wrote none: 200, empty body.
+    #[allow(clippy::disallowed_methods)]
+    let none = reqwest::get(format!("http://{addr}/api/runs/run_NONE/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(none.status(), 200);
+    assert!(none.bytes().await.unwrap().is_empty());
+    #[allow(clippy::disallowed_methods)]
+    let bad = reqwest::get(format!("http://{addr}/api/runs/not-a-run/coverage"))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+}

@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
         .route("/api/runs/:id/usage", get(get_run_usage))
         .route("/api/runs/:id/autoflow", get(get_run_autoflow))
+        .route("/api/runs/:id/coverage", get(get_run_coverage))
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
@@ -35,6 +36,26 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/resume", post(resume_run))
         .route("/api/runs/:id/archive", post(archive_run))
         .route("/api/runs/:id/restore", post(restore_run))
+}
+
+/// `GET /api/runs/:id/coverage` — the run's coverage stream as this host
+/// wrote it, for a coordinator merging a placed unit (spec
+/// 2026-09-30-rupu-remote-findings-transport-design.md §A2). 200 with an
+/// empty body when the run wrote none.
+async fn get_run_coverage(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let bytes =
+        crate::host::connector::mirror_unit_coverage(&s.run_store, &id).map_err(|e| match e {
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Map an [`ApprovalError`] from the store's approve/reject flow to an

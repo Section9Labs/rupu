@@ -475,12 +475,34 @@ impl HostConnector for HttpHostConnector {
             .await
     }
 
-    /// Temporary until the HTTP transport lands: refuse loudly rather than
-    /// report "no stream arrived".
-    async fn unit_coverage(&self, _run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
-        Err(HostConnectorError::Unsupported(
-            "coverage collection over HTTP is not implemented yet".into(),
-        ))
+    async fn unit_coverage(&self, run_id: &str) -> Result<Vec<u8>, HostConnectorError> {
+        let valid = run_id.starts_with("run_")
+            && run_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(HostConnectorError::Invalid(format!(
+                "{run_id:?} is not a valid run id"
+            )));
+        }
+        // An older remote answers an unknown /api path with the SPA and 200,
+        // so the feature — not the status — says whether this is a stream.
+        self.require_feature(
+            crate::node::protocol::CAP_RUN_COVERAGE_STREAM,
+            "this unit's coverage cannot be collected",
+        )
+        .await?;
+        let resp = self
+            .send(
+                self.client
+                    .get(self.url(&format!("/api/runs/{run_id}/coverage"))),
+            )
+            .await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        Ok(bytes.to_vec())
     }
 
     async fn proxy_get_json(
