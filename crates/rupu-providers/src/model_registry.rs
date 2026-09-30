@@ -246,9 +246,10 @@ fn make_model_info(id: String, provider_name: &str) -> ModelInfo {
     }
 }
 
-/// Strip a trailing `[1m]` opt-in suffix (case-insensitive).
+/// Strip a trailing `[1m]` opt-in suffix (case-insensitive). Never panics on multi-byte UTF-8.
 pub fn strip_1m(model: &str) -> &str {
-    if model.len() >= 4 && model[model.len() - 4..].eq_ignore_ascii_case("[1m]") {
+    let b = model.as_bytes();
+    if b.len() >= 4 && b[b.len() - 4..].eq_ignore_ascii_case(b"[1m]") {
         &model[..model.len() - 4]
     } else {
         model
@@ -350,5 +351,13 @@ mod tests {
             match_model_id(["claude-s"], "claude-s[1m]"),
             Some("claude-s")
         );
+    }
+
+    #[test]
+    fn strip_1m_never_panics_on_multibyte() {
+        assert_eq!(strip_1m("a€bc"), "a€bc");
+        assert_eq!(strip_1m("gpt-é"), "gpt-é");
+        assert_eq!(strip_1m("modèle[1m]"), "modèle");
+        assert_eq!(match_model_id(["x"], "é"), None);
     }
 }
