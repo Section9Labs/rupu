@@ -99,7 +99,10 @@ pub struct ImportArgs {
     /// one finding id itself. Only with one file.
     #[arg(long = "id", value_name = "FINDING_ID", value_parser = non_blank)]
     id: Option<String>,
-    /// Parse and validate every report; change nothing.
+    /// Parse and validate every report and check that the artifacts it lists
+    /// exist; write nothing (no ledger change, backup or lock file). Nothing
+    /// is read or copied, so trouble found only while copying an artifact
+    /// shows up only on a real import.
     #[arg(long)]
     dry_run: bool,
 }
@@ -321,6 +324,7 @@ fn export_cmd(args: &ExportArgs) -> anyhow::Result<()> {
 const IMPORT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// What became of one file named for import.
+#[derive(Debug, PartialEq)]
 enum Line {
     Attached(String),
     Skipped(String),
@@ -360,15 +364,40 @@ fn read_report_file(file: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
-fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
+/// What an [`AttachOutcome`] means for the file whose report was for `id`.
+fn outcome_line(id: String, outcome: rupu_coverage::tools::AttachOutcome) -> Line {
     use rupu_coverage::tools::report_finding::ReportFindingError;
-    use rupu_coverage::tools::{attach_reports, AttachItem, AttachOutcome};
+    use rupu_coverage::tools::AttachOutcome;
+    match outcome {
+        AttachOutcome::Attached => Line::Attached(id),
+        AttachOutcome::AlreadyHasReport => Line::Skipped(format!("{id} already has a report")),
+        AttachOutcome::NotFound => Line::failed(format!("no parseable finding {id} in its ledger")),
+        AttachOutcome::Duplicate => {
+            Line::failed(format!("{id} appears more than once in its ledger"))
+        }
+        AttachOutcome::Rejected(ReportFindingError::Report(v)) => Line::Failed(
+            format!("{} problem(s) in the report", v.0.len()),
+            v.0.iter()
+                .map(|e| format!("{}: {}", e.path, e.message))
+                .collect(),
+        ),
+        AttachOutcome::Rejected(e) => Line::failed(e.to_string()),
+    }
+}
+
+fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
+    use rupu_coverage::tools::{attach_reports, AttachItem};
     use rupu_findings_report::import::{parse_report, retain_known_cross_references, Parsed};
     use std::collections::{BTreeMap, HashSet};
 
-    let files = report_files(&args.paths)?;
+    let found = find_reports(&args.paths)?;
+    let files = &found.files;
     if args.id.is_some() && (files.len() != 1 || args.paths.iter().any(|p| !p.is_file())) {
         anyhow::bail!("--id needs exactly one report file");
+    }
+    if files.is_empty() && found.unreadable.is_empty() {
+        let under: Vec<String> = args.paths.iter().map(|p| p.display().to_string()).collect();
+        anyhow::bail!("no Markdown reports found under {}", under.join(", "));
     }
     let global = crate::paths::global_dir()?;
     // Limits come from the global config, as for the export prefix; an
@@ -402,10 +431,14 @@ fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
     }
 
     let mut lines: BTreeMap<PathBuf, Line> = BTreeMap::new();
+    // Found while searching but not readable: one failed line each.
+    for (path, why) in &found.unreadable {
+        lines.insert(path.clone(), Line::failed(why.clone()));
+    }
     // finding id → the files whose report is for it
     let mut wanted: BTreeMap<String, Vec<(PathBuf, rupu_coverage::FindingReport)>> =
         BTreeMap::new();
-    for file in &files {
+    for file in files {
         let parsed = read_report_file(file).and_then(|md| Ok(parse_report(&md)?));
         match parsed {
             Err(e) => {
@@ -516,26 +549,7 @@ fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
         };
         backups.extend(batch.backup);
         for ((file, id), outcome) in files.into_iter().zip(ids).zip(batch.outcomes) {
-            let line = match outcome {
-                AttachOutcome::Attached => Line::Attached(id),
-                AttachOutcome::AlreadyHasReport => {
-                    Line::Skipped(format!("{id} already has a report"))
-                }
-                AttachOutcome::NotFound => {
-                    Line::failed(format!("no parseable finding {id} in its ledger"))
-                }
-                AttachOutcome::Duplicate => {
-                    Line::failed(format!("{id} appears more than once in its ledger"))
-                }
-                AttachOutcome::Rejected(ReportFindingError::Report(v)) => Line::Failed(
-                    format!("{} problem(s) in the report", v.0.len()),
-                    v.0.iter()
-                        .map(|e| format!("{}: {}", e.path, e.message))
-                        .collect(),
-                ),
-                AttachOutcome::Rejected(e) => Line::failed(e.to_string()),
-            };
-            lines.insert(file, line);
+            lines.insert(file, outcome_line(id, outcome));
         }
     }
 
@@ -574,41 +588,85 @@ fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a search for report files found.
+#[derive(Debug, Default)]
+struct Found {
+    /// The report files, in path order, each file once however it was named.
+    files: Vec<PathBuf>,
+    /// Paths found while searching a directory that could not be read, with
+    /// the OS error. One failed line each; the search went on without them.
+    unreadable: Vec<(PathBuf, String)>,
+}
+
 /// The files named, plus every `*.md` under the directories named, in path
-/// order. Hidden directories and files found while searching are skipped.
-fn report_files(paths: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+/// order. While searching, hidden files and directories are skipped and
+/// symlinks are not followed (a symlinked file or directory is not found).
+///
+/// A named path that cannot be read fails the search, naming the path and
+/// the OS error. A path found *while searching* that cannot be read is
+/// recorded in [`Found::unreadable`] and the search goes on.
+fn find_reports(paths: &[PathBuf]) -> anyhow::Result<Found> {
+    fn walk(dir: &Path, found: &mut Found) {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => walk_entries(dir, entries, found),
+            Err(e) => found.unreadable.push((dir.to_path_buf(), e.to_string())),
+        }
+    }
+    fn walk_entries(dir: &Path, entries: std::fs::ReadDir, found: &mut Found) {
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                // The entry itself is unknown: it is the directory that
+                // could not be listed in full.
+                Err(e) => {
+                    found.unreadable.push((dir.to_path_buf(), e.to_string()));
+                    continue;
+                }
+            };
             if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
             let path = entry.path();
-            let kind = entry.file_type()?;
+            let kind = match entry.file_type() {
+                Ok(k) => k,
+                Err(e) => {
+                    found.unreadable.push((path, e.to_string()));
+                    continue;
+                }
+            };
             if kind.is_dir() {
-                walk(&path, out)?;
+                walk(&path, found);
             } else if kind.is_file()
                 && path
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("md"))
             {
-                out.push(path);
+                found.files.push(path);
             }
         }
-        Ok(())
     }
-    let mut out = Vec::new();
+    let mut found = Found::default();
     for p in paths {
-        let meta = std::fs::metadata(p).with_context(|| format!("cannot read {}", p.display()))?;
+        let meta = std::fs::metadata(p)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", p.display()))?;
         if meta.is_dir() {
-            walk(p, &mut out).with_context(|| format!("cannot read {}", p.display()))?;
+            let entries = std::fs::read_dir(p)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", p.display()))?;
+            walk_entries(p, entries, &mut found);
         } else {
-            out.push(p.clone());
+            found.files.push(p.clone());
         }
     }
-    out.sort();
-    out.dedup();
-    Ok(out)
+    // One file however it was spelled (`a.md` and `./a.md`, a directory and
+    // a file inside it): the first spelling found is the one kept.
+    let mut seen = std::collections::HashSet::new();
+    found
+        .files
+        .retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
+    found.files.sort();
+    found.unreadable.sort();
+    found.unreadable.dedup();
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -766,8 +824,43 @@ mod tests {
         );
     }
 
+    /// A path whose mode is changed for a test and put back when dropped, so
+    /// the temp dir can be cleaned up even when an assertion fails first.
+    #[cfg(unix)]
+    struct Mode {
+        path: PathBuf,
+        original: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl Mode {
+        fn set(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let original = std::fs::metadata(path).unwrap().permissions();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            Self {
+                path: path.to_path_buf(),
+                original,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.original.clone());
+        }
+    }
+
+    fn names(root: &Path, files: &[PathBuf]) -> Vec<String> {
+        files
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_str().unwrap().to_string())
+            .collect()
+    }
+
     #[test]
-    fn report_files_walks_directories_for_markdown_in_path_order() {
+    fn find_reports_walks_directories_for_markdown_in_path_order() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
@@ -783,22 +876,106 @@ mod tests {
         ] {
             std::fs::write(root.join(f), "x").unwrap();
         }
-        let got = report_files(&[root.to_path_buf()]).unwrap();
-        let rel: Vec<_> = got
-            .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(rel, ["a.MD", "b.md", "sub/c.md", "sub/deeper/d.md"]);
+        let found = find_reports(&[root.to_path_buf()]).unwrap();
+        assert_eq!(
+            names(root, &found.files),
+            ["a.MD", "b.md", "sub/c.md", "sub/deeper/d.md"]
+        );
+        assert!(found.unreadable.is_empty());
         // A file named outright is taken as is (whatever its extension, and
         // even a hidden one); naming it twice, or its directory as well,
         // lists it once.
         let txt = root.join("notes.txt");
         let hidden = root.join(".dot.md");
-        let got =
-            report_files(&[txt.clone(), root.join("sub"), txt.clone(), hidden.clone()]).unwrap();
-        assert_eq!(got.len(), 4, "{got:?}");
-        assert!(got.contains(&txt) && got.contains(&hidden));
-        assert!(report_files(&[root.join("missing")]).is_err());
+        let found =
+            find_reports(&[txt.clone(), root.join("sub"), txt.clone(), hidden.clone()]).unwrap();
+        assert_eq!(found.files.len(), 4, "{:?}", found.files);
+        assert!(found.files.contains(&txt) && found.files.contains(&hidden));
+    }
+
+    #[test]
+    fn a_file_is_listed_once_however_it_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.md"), "x").unwrap();
+        let found = find_reports(&[
+            root.join("a.md"),
+            root.join("sub").join("..").join("a.md"),
+            root.join(".").join("a.md"),
+            root.to_path_buf(),
+            root.join("sub").join("..").to_path_buf(),
+        ])
+        .unwrap();
+        assert_eq!(found.files.len(), 1, "{:?}", found.files);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_found_while_searching_are_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("reports");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(root.join("real.md"), "x").unwrap();
+        std::fs::write(elsewhere.join("outside.md"), "x").unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("outside.md"), root.join("linked.md")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("linked_dir")).unwrap();
+        // A link back to the directory being searched must not loop.
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+
+        let found = find_reports(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(names(&root, &found.files), ["real.md"]);
+        assert!(found.unreadable.is_empty());
+        // Named outright, a link is just the file it points to.
+        let found = find_reports(&[root.join("linked.md")]).unwrap();
+        assert_eq!(found.files, [root.join("linked.md")]);
+    }
+
+    #[test]
+    fn a_named_path_that_cannot_be_read_names_the_path_and_the_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        let err = find_reports(&[tmp.path().to_path_buf(), missing.clone()]).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&missing.display().to_string()), "{text}");
+        assert!(text.contains("No such file or directory"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_path_found_while_searching_is_recorded_and_the_search_goes_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("locked")).unwrap();
+        std::fs::write(root.join("a.md"), "x").unwrap();
+        std::fs::write(root.join("locked/b.md"), "x").unwrap();
+        let _mode = Mode::set(&root.join("locked"), 0o000);
+        if std::fs::read_dir(root.join("locked")).is_ok() {
+            eprintln!("skipped: directory permissions are not enforced for this user");
+            return;
+        }
+
+        let found = find_reports(&[root.to_path_buf()]).unwrap();
+        assert_eq!(names(root, &found.files), ["a.md"]);
+        assert_eq!(found.unreadable.len(), 1, "{:?}", found.unreadable);
+        assert_eq!(found.unreadable[0].0, root.join("locked"));
+        assert!(
+            found.unreadable[0].1.contains("Permission denied"),
+            "{:?}",
+            found.unreadable
+        );
+        // The same directory named outright fails the search, with its path
+        // and the cause.
+        let err = find_reports(&[root.join("locked")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&root.join("locked").display().to_string()),
+            "{err}"
+        );
+        assert!(err.contains("Permission denied"), "{err}");
     }
 
     #[test]
@@ -814,6 +991,77 @@ mod tests {
         let bin = tmp.path().join("bin.md");
         std::fs::write(&bin, [0xff, 0xfe]).unwrap();
         assert!(read_report_file(&bin).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_report_file_reports_the_os_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("locked.md");
+        std::fs::write(&file, "x").unwrap();
+        let _mode = Mode::set(&file, 0o000);
+        if std::fs::File::open(&file).is_ok() {
+            eprintln!("skipped: file permissions are not enforced for this user");
+            return;
+        }
+        let err = read_report_file(&file).unwrap_err().to_string();
+        assert!(err.contains("Permission denied"), "{err}");
+    }
+
+    #[test]
+    fn each_attach_outcome_has_its_wording() {
+        use rupu_coverage::report::{ArtifactError, FieldError, ReportValidationError};
+        use rupu_coverage::tools::report_finding::ReportFindingError;
+        use rupu_coverage::tools::AttachOutcome;
+        let id = || "fnd_1".to_string();
+        assert_eq!(
+            outcome_line(id(), AttachOutcome::Attached),
+            Line::Attached(id())
+        );
+        assert_eq!(
+            outcome_line(id(), AttachOutcome::AlreadyHasReport),
+            Line::Skipped("fnd_1 already has a report".into())
+        );
+        assert_eq!(
+            outcome_line(id(), AttachOutcome::NotFound),
+            Line::failed("no parseable finding fnd_1 in its ledger")
+        );
+        assert_eq!(
+            outcome_line(id(), AttachOutcome::Duplicate),
+            Line::failed("fnd_1 appears more than once in its ledger")
+        );
+        let problems = ReportValidationError(vec![
+            FieldError {
+                path: "report.artifacts[0].path".into(),
+                message: "must not contain `..`".into(),
+            },
+            FieldError {
+                path: "report.impact".into(),
+                message: "must not be empty".into(),
+            },
+        ]);
+        assert_eq!(
+            outcome_line(
+                id(),
+                AttachOutcome::Rejected(ReportFindingError::Report(problems))
+            ),
+            Line::Failed(
+                "2 problem(s) in the report".into(),
+                vec![
+                    "report.artifacts[0].path: must not contain `..`".into(),
+                    "report.impact: must not be empty".into(),
+                ]
+            )
+        );
+        assert_eq!(
+            outcome_line(
+                id(),
+                AttachOutcome::Rejected(ReportFindingError::Artifact(ArtifactError::Missing {
+                    path: "out/x.txt".into()
+                }))
+            ),
+            Line::failed("artifact `out/x.txt` does not exist in the workspace")
+        );
     }
 
     #[test]

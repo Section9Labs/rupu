@@ -11,10 +11,15 @@
 //! missing final newline, lines that are not UTF-8 or not JSON, and keys this
 //! version does not know all survive). The line that is replaced keeps its
 //! own line terminator.
+//!
+//! A dry run reads the ledger and touches nothing else: it takes no lock and
+//! creates no file or directory, so it works on a read-only ledger directory.
 
 use crate::ledger::events::FindingRecord;
 use crate::ledger::paths::CoveragePaths;
-use crate::report::{ArtifactError, FindingProfile, FindingReport, FindingWriteOptions};
+use crate::report::{
+    ArtifactError, ArtifactStore, FindingProfile, FindingReport, FindingWriteOptions,
+};
 use crate::tools::report_finding::{
     check_full_report, derived_fields, lock_findings, prepare_full_report, ReportFindingError,
 };
@@ -31,7 +36,8 @@ pub struct AttachItem {
 
 #[derive(Debug)]
 pub enum AttachOutcome {
-    /// Written (on a dry run: would be; the report passed validation).
+    /// Written (on a dry run: would be; the report passed validation and
+    /// its artifacts resolve).
     Attached,
     /// No finding with this id in this ledger.
     NotFound,
@@ -54,6 +60,11 @@ pub struct AttachBatch {
     pub backup: Option<PathBuf>,
 }
 
+/// Attach each item's report to its finding. With `dry_run`, only report what
+/// would happen: the ledger is read, but no lock is taken and nothing is
+/// created or written. A dry run's `Attached` means the report passed
+/// validation and every artifact it lists exists inside the workspace, within
+/// the count and size limits.
 pub fn attach_reports(
     paths: &CoveragePaths,
     items: Vec<AttachItem>,
@@ -76,7 +87,13 @@ fn attach_reports_with(
     dry_run: bool,
     before_rename: &mut dyn FnMut(),
 ) -> std::io::Result<AttachBatch> {
-    let _lock = lock_findings(paths)?;
+    // A dry run writes nothing, so it needs no exclusion (and taking the lock
+    // would create the sidecar, and fail on a read-only directory).
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(lock_findings(paths)?)
+    };
     let raw = match std::fs::read(&paths.findings) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -119,15 +136,7 @@ fn attach_reports_with(
                 {
                     AttachOutcome::AlreadyHasReport
                 } else if dry_run {
-                    // The same rejections a real run gives, minus the ones
-                    // that need the artifact store to be touched.
-                    match check_full_report(&item.report, &known, opts).and_then(|()| {
-                        if !item.report.artifacts.is_empty() && opts.artifact_root.is_none() {
-                            Err(ReportFindingError::Artifact(ArtifactError::NoStore))
-                        } else {
-                            Ok(())
-                        }
-                    }) {
+                    match dry_run_check(paths, &item.report, &known, opts) {
                         Ok(()) => {
                             claimed.insert(*i);
                             AttachOutcome::Attached
@@ -162,6 +171,27 @@ fn attach_reports_with(
         None
     };
     Ok(AttachBatch { outcomes, backup })
+}
+
+/// The rejections a real run gives, minus the ones that need the artifact
+/// store to be written to or a file to be read: the report validates, an
+/// artifact store is configured when the report lists artifacts, and every
+/// listed artifact path exists inside the workspace and is within the count
+/// and size limits (`ArtifactError::Missing` / `Escapes` / `TooManyFiles` /
+/// `TooLarge`, as a real ingest gives). Nothing is created, hashed or copied.
+fn dry_run_check(
+    paths: &CoveragePaths,
+    report: &FindingReport,
+    known: &[String],
+    opts: &FindingWriteOptions,
+) -> Result<(), ReportFindingError> {
+    check_full_report(report, known, opts)?;
+    if report.artifacts.is_empty() {
+        return Ok(());
+    }
+    let root = opts.artifact_root.as_ref().ok_or(ArtifactError::NoStore)?;
+    ArtifactStore::new(root).check(&paths.workspace, &report.artifacts, opts.ingest_limits())?;
+    Ok(())
 }
 
 /// A ledger line as JSON text: `None` when it is not UTF-8, otherwise the

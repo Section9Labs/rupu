@@ -422,13 +422,53 @@ fn a_self_cross_reference_is_dropped() {
     assert_eq!(refs, "None", "{refs}");
 }
 
+/// A path whose mode is changed for a test and put back when dropped, so the
+/// temp dir can be cleaned up even when an assertion fails first.
+#[cfg(unix)]
+struct Restrict {
+    path: PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Restrict {
+    fn new(path: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self {
+            path: path.to_path_buf(),
+            original,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Restrict {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.path, self.original.clone());
+    }
+}
+
+/// Whether a read-only directory refuses new files to this user (root is
+/// not bound by it). Probes by trying, rather than reading the uid.
+#[cfg(unix)]
+fn creation_is_denied(dir: &Path) -> bool {
+    let probe = dir.join("probe");
+    match std::fs::write(&probe, "x") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// One ledger that cannot be updated fails its own files; the other ledgers
 /// are still imported.
 #[cfg(unix)]
 #[test]
 fn a_ledger_that_cannot_be_updated_fails_its_files_and_the_rest_go_on() {
-    use std::os::unix::fs::PermissionsExt;
-
     let home = tempfile::tempdir().unwrap();
     let repo = seed(home.path(), &[summary_record(ID1)]);
     let locked = write_ledger(&repo, "tgt2", &[summary_record(ID9)]);
@@ -439,11 +479,9 @@ fn a_ledger_that_cannot_be_updated_fails_its_files_and_the_rest_go_on() {
     std::fs::write(dir.join("b.md"), PLAIN.replace(ID1, ID9)).unwrap();
 
     // A read-only target directory: the ledger lock cannot be created.
-    std::fs::set_permissions(&locked.root, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let probe = std::fs::write(locked.root.join("probe"), "x");
-    if probe.is_ok() {
-        // Running as a user the mode does not bind (root): nothing to test.
-        std::fs::set_permissions(&locked.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _restore = Restrict::new(&locked.root, 0o555);
+    if !creation_is_denied(&locked.root) {
+        eprintln!("skipped: directory permissions are not enforced for this user");
         return;
     }
     let assert = rupu(home.path())
@@ -451,7 +489,6 @@ fn a_ledger_that_cannot_be_updated_fails_its_files_and_the_rest_go_on() {
         .arg(&dir)
         .assert()
         .failure();
-    std::fs::set_permissions(&locked.root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let out = stdout_of(assert);
     assert!(out.contains("1 attached, 0 skipped, 1 failed"), "{out}");
@@ -462,4 +499,299 @@ fn a_ledger_that_cannot_be_updated_fails_its_files_and_the_rest_go_on() {
         std::fs::read_to_string(&locked.findings).unwrap(),
         locked_before
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_works_on_a_read_only_ledger_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let paths = CoveragePaths::new(&repo, "tgt1");
+    let file = home.path().join("NB-001.md");
+    std::fs::write(&file, PLAIN).unwrap();
+    let before = ledger(&repo);
+
+    let _restore = Restrict::new(&paths.root, 0o555);
+    if !creation_is_denied(&paths.root) {
+        eprintln!("skipped: directory permissions are not enforced for this user");
+        return;
+    }
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import", "--dry-run"])
+            .arg(&file)
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("1 would attach, 0 skipped, 0 failed"), "{out}");
+    assert_eq!(ledger(&repo), before);
+    assert!(!paths.root.join("findings.jsonl.lock").exists());
+}
+
+#[test]
+fn a_report_that_fails_validation_prints_each_problem() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let file = home.path().join("NB-001.md");
+    // Parses as a report, but two of its artifact paths are not acceptable.
+    std::fs::write(
+        &file,
+        format!("{PLAIN}\nArtifacts\n- ../secrets.txt\n- /etc/hosts\n"),
+    )
+    .unwrap();
+    let before = ledger(&repo);
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&file)
+            .assert()
+            .failure(),
+    );
+    assert!(
+        out.contains("NB-001.md: 2 problem(s) in the report"),
+        "{out}"
+    );
+    let detail: Vec<&str> = out.lines().filter(|l| l.starts_with(' ')).collect();
+    assert_eq!(detail.len(), 2, "{out}");
+    assert!(
+        detail[0].trim() == "report.artifacts[0].path: must not contain `..`",
+        "{out}"
+    );
+    assert!(
+        detail[1].trim() == "report.artifacts[1].path: must be workspace-relative, not absolute",
+        "{out}"
+    );
+    assert!(out.contains("0 attached, 0 skipped, 1 failed"), "{out}");
+    assert_eq!(ledger(&repo), before);
+}
+
+#[test]
+fn a_missing_artifact_fails_a_real_import_and_a_dry_run_alike() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let file = home.path().join("NB-001.md");
+    std::fs::write(
+        &file,
+        format!("{PLAIN}\nArtifacts\n- evidence/absent.txt\n"),
+    )
+    .unwrap();
+    let before = ledger(&repo);
+    for dry in [true, false] {
+        let mut cmd = rupu(home.path());
+        cmd.args(["findings", "import"]);
+        if dry {
+            cmd.arg("--dry-run");
+        }
+        let out = stdout_of(cmd.arg(&file).assert().failure());
+        assert!(
+            out.contains("artifact `evidence/absent.txt` does not exist in the workspace"),
+            "dry={dry}: {out}"
+        );
+        assert!(out.contains("0 skipped, 1 failed"), "dry={dry}: {out}");
+        assert_eq!(ledger(&repo), before, "dry={dry}");
+    }
+    // Present, the same artifact goes in.
+    std::fs::create_dir_all(repo.join("evidence")).unwrap();
+    std::fs::write(repo.join("evidence/absent.txt"), "GET /api/notes/1").unwrap();
+    rupu(home.path())
+        .args(["findings", "import", "--dry-run"])
+        .arg(&file)
+        .assert()
+        .success();
+    assert_eq!(ledger(&repo), before);
+    rupu(home.path())
+        .args(["findings", "import"])
+        .arg(&file)
+        .assert()
+        .success();
+    let report = &line_of(&ledger(&repo), ID1)["report"];
+    assert_eq!(report["artifacts"][0]["path"], "evidence/absent.txt");
+}
+
+#[test]
+fn an_id_present_in_two_ledgers_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let second = write_ledger(&repo, "tgt2", &[summary_record(ID1)]);
+    let file = home.path().join("NB-001.md");
+    std::fs::write(&file, PLAIN).unwrap();
+    let (before1, before2) = (
+        ledger(&repo),
+        std::fs::read_to_string(&second.findings).unwrap(),
+    );
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&file)
+            .assert()
+            .failure(),
+    );
+    assert!(
+        out.contains(&format!("{ID1} is in more than one ledger")),
+        "{out}"
+    );
+    assert_eq!(ledger(&repo), before1);
+    assert_eq!(std::fs::read_to_string(&second.findings).unwrap(), before2);
+}
+
+#[test]
+fn an_id_on_two_lines_of_one_ledger_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1), summary_record(ID1)]);
+    let file = home.path().join("NB-001.md");
+    std::fs::write(&file, PLAIN).unwrap();
+    let before = ledger(&repo);
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&file)
+            .assert()
+            .failure(),
+    );
+    assert!(
+        out.contains(&format!("{ID1} appears more than once in its ledger")),
+        "{out}"
+    );
+    assert_eq!(ledger(&repo), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_report_file_is_a_failed_line_and_the_rest_go_on() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let dir = home.path().join("reports");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("NB-001.md"), PLAIN).unwrap();
+    let locked = dir.join("locked.md");
+    std::fs::write(&locked, PLAIN).unwrap();
+    let _restore = Restrict::new(&locked, 0o000);
+    if std::fs::File::open(&locked).is_ok() {
+        eprintln!("skipped: file permissions are not enforced for this user");
+        return;
+    }
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&dir)
+            .assert()
+            .failure(),
+    );
+    assert!(out.contains("locked.md: Permission denied"), "{out}");
+    assert!(out.contains("1 attached, 0 skipped, 1 failed"), "{out}");
+    assert_eq!(line_of(&ledger(&repo), ID1)["profile"], "full");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_subdirectory_is_a_failed_line_and_the_rest_go_on() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let dir = home.path().join("reports");
+    let sub = dir.join("locked");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(dir.join("NB-001.md"), PLAIN).unwrap();
+    let _restore = Restrict::new(&sub, 0o000);
+    if std::fs::read_dir(&sub).is_ok() {
+        eprintln!("skipped: directory permissions are not enforced for this user");
+        return;
+    }
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import"])
+            .arg(&dir)
+            .assert()
+            .failure(),
+    );
+    assert!(
+        out.contains(&format!("{}: Permission denied", sub.display())),
+        "{out}"
+    );
+    assert!(out.contains("1 attached, 0 skipped, 1 failed"), "{out}");
+    assert_eq!(line_of(&ledger(&repo), ID1)["profile"], "full");
+}
+
+#[test]
+fn a_named_path_that_does_not_exist_fails_the_command_naming_it() {
+    let home = tempfile::tempdir().unwrap();
+    seed(home.path(), &[summary_record(ID1)]);
+    let missing = home.path().join("no-such-dir");
+    let assert = rupu(home.path())
+        .args(["findings", "import"])
+        .arg(&missing)
+        .assert()
+        .failure();
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(err.contains(&missing.display().to_string()), "{err}");
+    assert!(err.contains("No such file or directory"), "{err}");
+}
+
+#[test]
+fn the_same_file_named_two_ways_is_one_file() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    std::fs::write(home.path().join("NB-001.md"), PLAIN).unwrap();
+    // Run from the directory holding the file, so both spellings are relative.
+    let out = stdout_of(
+        rupu(home.path())
+            .args(["findings", "import", "NB-001.md", "./NB-001.md"])
+            .assert()
+            .success(),
+    );
+    assert!(out.contains("1 attached, 0 skipped, 0 failed"), "{out}");
+    assert!(!out.contains("reports cite"), "{out}");
+    assert_eq!(line_of(&ledger(&repo), ID1)["profile"], "full");
+}
+
+#[test]
+fn a_search_that_finds_no_markdown_is_an_error() {
+    let home = tempfile::tempdir().unwrap();
+    seed(home.path(), &[summary_record(ID1)]);
+    let dir = home.path().join("reports");
+    std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+    std::fs::write(dir.join("notes.txt"), "not markdown").unwrap();
+    std::fs::write(dir.join(".hidden/NB-001.md"), PLAIN).unwrap();
+    let assert = rupu(home.path())
+        .args(["findings", "import"])
+        .arg(&dir)
+        .assert()
+        .failure();
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        err.contains(&format!(
+            "no Markdown reports found under {}",
+            dir.display()
+        )),
+        "{err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_reports_are_not_found_while_searching_a_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = seed(home.path(), &[summary_record(ID1)]);
+    let real = home.path().join("real");
+    let dir = home.path().join("reports");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(real.join("NB-001.md"), PLAIN).unwrap();
+    std::os::unix::fs::symlink(real.join("NB-001.md"), dir.join("linked.md")).unwrap();
+    std::os::unix::fs::symlink(&real, dir.join("linked_dir")).unwrap();
+    let before = ledger(&repo);
+    let assert = rupu(home.path())
+        .args(["findings", "import"])
+        .arg(&dir)
+        .assert()
+        .failure();
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(err.contains("no Markdown reports found under"), "{err}");
+    assert_eq!(ledger(&repo), before);
+    // Named outright, the link is followed.
+    rupu(home.path())
+        .args(["findings", "import"])
+        .arg(dir.join("linked.md"))
+        .assert()
+        .success();
+    assert_eq!(line_of(&ledger(&repo), ID1)["profile"], "full");
 }

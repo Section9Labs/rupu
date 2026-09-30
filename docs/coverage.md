@@ -27,7 +27,8 @@ variance: diff two runs, and replay a run to compare it against the original.
 ## How it works
 
 Coverage data for a *target* lives under `<workspace>/.rupu/coverage/<target_id>/`
-as append-only JSONL plus a catalog snapshot:
+as append-only JSONL (apart from the one-time `rupu findings import`, which
+replaces `findings.jsonl` once, after a backup) plus a catalog snapshot:
 
 | File | Contents |
 |------|----------|
@@ -468,9 +469,17 @@ best-effort.
 rupu findings import <PATH>... [--id <fnd_…>] [--dry-run]
 ```
 
-`PATH` is a report file, or a directory searched (recursively, skipping hidden
-files and directories) for `*.md` files. A file named outright is always read,
-whatever its extension. A file over 4 MiB fails.
+**Which files.** `PATH` is a report file, or a directory searched recursively
+for `*.md` files. While searching, hidden files and directories are skipped and
+symlinks are not followed (a symlinked file or directory is not found; name a
+symlinked file outright and it is read). A file named outright is always read,
+whatever its extension. A file named twice, or by two spellings (`a.md` and
+`./a.md`), counts once. A file over 4 MiB fails. A named path that cannot be
+read fails the command before anything is imported, naming the path and the OS
+error; a file or directory found while searching that cannot be read becomes a
+`failed` line for that path (with the error), and the search goes on. A search
+that finds no Markdown file at all fails with `no Markdown reports found under
+<paths>`.
 
 **Layouts read.** Two spellings of the report layout: the one `rupu findings
 export --to md` writes, and a plain-text one with bare heading lines
@@ -482,27 +491,33 @@ findings is refused; split it into one file per finding first.
 **Which finding.** The one `fnd_` id the report cites outside its
 Cross-References section, usually on its `Finding ID:` line. A report that cites
 none, or several, fails; import it alone with `--id <fnd_…>`, which names the
-finding for a single report file (`--id` with a directory or several files is a
-usage error). The finding is looked up across the registered projects, as
-`rupu findings export` does, and must be in exactly one project's ledger. Two
-files for the same finding fail both.
+finding for a single report file (`--id` with a directory, or with several
+files, is refused). The finding is looked up across the registered projects, as
+`rupu findings export` does, and must be in exactly one ledger (a project keeps
+one per coverage target). Two files for the same finding fail both.
 
 **What happens to the finding.** It becomes a full-profile finding. The report
 goes through the same validation as `report_finding` and attaches whole or not
 at all: a report that fails validation is listed with every problem and changes
-nothing. `summary`, `severity` and `evidence` are re-derived from the report, as
-for any full finding; the id, provenance (run, model, surface, declared-at),
-location and every other field of the record are kept. A finding that already
-has a report is skipped, never changed. Before a ledger is rewritten it is
-copied byte for byte to `findings.jsonl.pre-import-<UTC time>` beside it (for
-example `findings.jsonl.pre-import-20260930T101500Z`), and it is then replaced
+nothing, and the other reports in the run are still imported. `summary`,
+`severity` and `evidence` are re-derived from the report, as for any full
+finding; the id, provenance (run, model, surface, declared-at), location and
+every other field of the record are kept. A finding that already has a report
+is skipped, never changed. Before a ledger is rewritten it is copied byte for
+byte to `findings.jsonl.pre-import-<UTC time>` beside it (for example
+`findings.jsonl.pre-import-20260930T101500Z`), and it is then replaced
 atomically under the ledger lock: every other line is written back unchanged.
-The size limits and ticket patterns come from `[findings]` in the global config,
-as when a report is recorded.
+The size limits (`report_max_bytes` and the `artifact_max_*` keys) come from
+`[findings]` in the global config, as when a report is recorded.
 
-`--dry-run` parses and validates every report and prints `would attach` for
-those that would go in; it writes nothing, not even a backup. It does not open
-a report's artifact files, so a missing artifact is only found by a real run.
+**Dry run.** `--dry-run` parses and validates every report and prints `would
+attach` for those that would go in. It writes nothing: no ledger change, no
+backup, and it takes no lock, so it also works on a read-only ledger directory.
+It checks that each artifact the report lists exists inside the workspace and
+is within the artifact count and size limits, without reading or copying the
+files. Trouble that only appears while copying an artifact, and a report that
+goes over `report_max_bytes` only once a directory artifact has been expanded,
+are found only by a real import.
 
 **Missing content.** Nothing is invented. A field or section the schema has no
 sentinel for must be in the file, or the file fails: the title; Category,

@@ -331,6 +331,251 @@ fn an_id_on_two_ledger_lines_is_left_alone() {
     assert_eq!(std::fs::read_to_string(&paths.findings).unwrap(), doubled);
 }
 
+/// Names of the entries in `dir`, sorted.
+fn listing(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A directory with write permission removed, restored when dropped (so
+/// the temp dir can be cleaned up even if an assertion fails first).
+#[cfg(unix)]
+struct ReadOnlyDir {
+    dir: std::path::PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl ReadOnlyDir {
+    /// `None` when this process is not bound by directory permissions (root
+    /// is not), in which case there is nothing to test.
+    fn new(dir: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(dir).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o555);
+        std::fs::set_permissions(dir, locked).unwrap();
+        let guard = Self {
+            dir: dir.to_path_buf(),
+            original,
+        };
+        // Probe by trying to create a file, rather than reading the uid.
+        let probe = dir.join("probe");
+        if std::fs::write(&probe, "x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            return None; // dropping `guard` restores the mode
+        }
+        Some(guard)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.dir, self.original.clone());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_takes_no_lock_and_works_on_a_read_only_directory() {
+    let (_d, paths) = setup();
+    let id = seed_summary(&paths);
+    // Seeding leaves the lock sidecar behind; without it, taking the lock
+    // would have to create it, which a read-only directory refuses.
+    std::fs::remove_file(paths.root.join("findings.jsonl.lock")).unwrap();
+    let before_bytes = std::fs::read(&paths.findings).unwrap();
+    let before_listing = listing(&paths.root);
+    let Some(_guard) = ReadOnlyDir::new(&paths.root) else {
+        eprintln!("skipped: directory permissions are not enforced for this user");
+        return;
+    };
+
+    let dry = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: id.clone(),
+            report: report(),
+        }],
+        &full_opts(),
+        true,
+    )
+    .expect("a dry run only reads");
+    assert!(matches!(dry.outcomes.as_slice(), [AttachOutcome::Attached]));
+    assert!(dry.backup.is_none());
+    assert_eq!(std::fs::read(&paths.findings).unwrap(), before_bytes);
+    assert_eq!(listing(&paths.root), before_listing);
+
+    // A real run needs the lock and the directory, so it cannot go ahead.
+    assert!(attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: id,
+            report: report(),
+        }],
+        &full_opts(),
+        false,
+    )
+    .is_err());
+}
+
+#[test]
+fn a_dry_run_on_a_missing_ledger_creates_nothing() {
+    let (d, paths) = setup();
+    let batch = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: "fnd_01J00000000000000000000001".into(),
+            report: report(),
+        }],
+        &full_opts(),
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        batch.outcomes.as_slice(),
+        [AttachOutcome::NotFound]
+    ));
+    // Not even the coverage directory.
+    assert!(listing(d.path()).is_empty());
+}
+
+fn artifact(path: &str) -> rupu_coverage::report::ArtifactRef {
+    rupu_coverage::report::ArtifactRef {
+        path: path.into(),
+        sha256: String::new(),
+        size: 0,
+        kind: None,
+        stored: None,
+        host: None,
+    }
+}
+
+#[test]
+fn a_dry_run_rejects_a_missing_artifact_as_a_real_run_does() {
+    let (d, paths) = setup();
+    let id = seed_summary(&paths);
+    let store = d.path().join("store");
+    let opts = FindingWriteOptions {
+        artifact_root: Some(store.clone()),
+        ..full_opts()
+    };
+    let mut r = report();
+    r.artifacts = vec![artifact("evidence/absent.txt")];
+    let item = || {
+        vec![AttachItem {
+            finding_id: id.clone(),
+            report: r.clone(),
+        }]
+    };
+    let before = std::fs::read(&paths.findings).unwrap();
+
+    let dry = attach_reports(&paths, item(), &opts, true).unwrap();
+    let real = attach_reports(&paths, item(), &opts, false).unwrap();
+    for batch in [dry, real] {
+        match batch.outcomes.as_slice() {
+            [AttachOutcome::Rejected(rupu_coverage::ReportFindingError::Artifact(
+                rupu_coverage::report::ArtifactError::Missing { path },
+            ))] => assert_eq!(path, "evidence/absent.txt"),
+            o => panic!("expected Rejected(Missing), got {o:?}"),
+        }
+        assert!(batch.backup.is_none());
+    }
+    assert_eq!(std::fs::read(&paths.findings).unwrap(), before);
+    assert!(!store.exists(), "no artifact store was created");
+}
+
+#[test]
+fn a_dry_run_applies_the_artifact_count_and_size_limits_a_real_run_does() {
+    use rupu_coverage::report::ArtifactError;
+    let (d, paths) = setup();
+    let id = seed_summary(&paths);
+    std::fs::write(paths.workspace.join("a.txt"), "xx").unwrap();
+    std::fs::write(paths.workspace.join("b.txt"), "xx").unwrap();
+    let mut r = report();
+    r.artifacts = vec![artifact("a.txt"), artifact("b.txt")];
+    let store = d.path().join("store");
+    let too_many = FindingWriteOptions {
+        artifact_root: Some(store.clone()),
+        artifact_max_files: 1,
+        ..full_opts()
+    };
+    let too_large = FindingWriteOptions {
+        artifact_root: Some(store.clone()),
+        artifact_total_max_bytes: 3,
+        ..full_opts()
+    };
+    for dry in [true, false] {
+        let item = || {
+            vec![AttachItem {
+                finding_id: id.clone(),
+                report: r.clone(),
+            }]
+        };
+        let batch = attach_reports(&paths, item(), &too_many, dry).unwrap();
+        assert!(
+            matches!(
+                batch.outcomes.as_slice(),
+                [AttachOutcome::Rejected(
+                    rupu_coverage::ReportFindingError::Artifact(ArtifactError::TooManyFiles {
+                        max: 1
+                    })
+                )]
+            ),
+            "dry={dry}: {:?}",
+            batch.outcomes
+        );
+        let batch = attach_reports(&paths, item(), &too_large, dry).unwrap();
+        assert!(
+            matches!(
+                batch.outcomes.as_slice(),
+                [AttachOutcome::Rejected(
+                    rupu_coverage::ReportFindingError::Artifact(ArtifactError::TooLarge {
+                        total: 4,
+                        ..
+                    })
+                )]
+            ),
+            "dry={dry}: {:?}",
+            batch.outcomes
+        );
+    }
+}
+
+#[test]
+fn a_dry_run_accepts_a_present_artifact_without_copying_it() {
+    let (d, paths) = setup();
+    let id = seed_summary(&paths);
+    std::fs::create_dir_all(paths.workspace.join("evidence")).unwrap();
+    std::fs::write(paths.workspace.join("evidence/request.txt"), "GET /x").unwrap();
+    let store = d.path().join("store");
+    let opts = FindingWriteOptions {
+        artifact_root: Some(store.clone()),
+        ..full_opts()
+    };
+    let mut r = report();
+    r.artifacts = vec![artifact("evidence/request.txt")];
+    let batch = attach_reports(
+        &paths,
+        vec![AttachItem {
+            finding_id: id,
+            report: r,
+        }],
+        &opts,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        batch.outcomes.as_slice(),
+        [AttachOutcome::Attached]
+    ));
+    assert!(!store.exists(), "a dry run copies nothing");
+}
+
 #[test]
 fn a_dry_run_refuses_artifacts_when_there_is_no_store() {
     let (_d, paths) = setup();
