@@ -12,6 +12,12 @@ export interface UsageSummary {
   /** false when at least one contributing model lacked a price. */
   priced: boolean;
   runs: number;
+  /**
+   * True when some of this run's transcripts were not readable on this CP (a
+   * remote host that is not yet mirrored) — the totals are a lower bound.
+   * Only `GET /api/runs/:id/usage` sets it; absent elsewhere.
+   */
+  partial?: boolean;
 }
 
 /**

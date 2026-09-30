@@ -44,6 +44,7 @@ import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/r
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
+import { useRunUsage } from '../lib/runUsage';
 
 const MAX_EVENTS = 2000;
 
@@ -437,9 +438,6 @@ export default function RunDetail() {
 
   // The effective run record from the graph.
   const run = graph?.run ?? null;
-  // Usage for the header row from the graph.
-  const displayUsage = graph?.usage;
-
   // Live awaiting info: prefer a live awaiting node from the model, else the
   // persisted record.
   const awaiting = useMemo(() => {
@@ -514,6 +512,15 @@ export default function RunDetail() {
 
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
+
+  // Live usage (spec 2026-09-29 §7): polls GET /api/runs/:id/usage every 2s
+  // while the run is live (and once more when it turns terminal). `run` gates
+  // liveness so a not-yet-loaded graph doesn't read as a running run. When the
+  // endpoint is unavailable (older remote CP) `liveUsage` stays null and the
+  // header/chart fall back to the graph's one-shot usage + the timeline fetch.
+  const { usage: liveUsage } = useRunUsage(id, host, run !== null && isRunning);
+  // Usage for the header row: live summary, else the graph's one-shot numbers.
+  const displayUsage = liveUsage?.summary ?? graph?.usage;
   // Pause is only offered while the run is actively `running` (not merely
   // `pending`, and not `awaiting_approval` — those have their own gate).
   const isPausable = effectiveStatus === 'running';
@@ -754,7 +761,16 @@ export default function RunDetail() {
                 {displayUsage.cached_tokens > 0 && (
                   <span><span className="text-ink-mute">cached</span> {formatTokens(displayUsage.cached_tokens)}</span>
                 )}
-                <span><span className="text-ink-mute">total</span> {formatTokens(displayUsage.total_tokens)}</span>
+                <span
+                  title={
+                    displayUsage.partial
+                      ? 'Some transcripts were not readable on this CP (remote host not yet mirrored)'
+                      : undefined
+                  }
+                >
+                  <span className="text-ink-mute">total</span> {displayUsage.partial ? '≥' : ''}
+                  {formatTokens(displayUsage.total_tokens)}
+                </span>
                 <span className="font-medium text-ink">
                   {formatCost(displayUsage.cost_usd)}{displayUsage.cost_usd !== null && !displayUsage.priced ? '*' : ''}
                 </span>
@@ -1161,7 +1177,7 @@ export default function RunDetail() {
           <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
             Token usage by turn
           </h2>
-          <RunUsageTimeline series={series} separators />
+          <RunUsageTimeline series={liveUsage?.points ?? series} separators />
         </section>
 
         {/* Autoflow panel — only when this run has an autoflow-history trail. */}

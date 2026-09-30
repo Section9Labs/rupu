@@ -1102,6 +1102,25 @@ export interface UsageTimelinePoint {
   tokens_cached: number;
 }
 
+/**
+ * `GET /api/runs/:id/usage` — a run's live usage (spec 2026-09-29 §5.3).
+ * `points` is an append-only tail of the per-turn series: `points_from` is the
+ * index of `points[0]` in the full series (0 unless the request's
+ * `since`+`epoch` matched the run's current epoch).
+ */
+export interface RunUsageResponse {
+  summary: UsageSummary;
+  /** Per step id (`""` = unattributed). */
+  steps: Record<string, UsageSummary>;
+  turns: number;
+  /** Some transcripts were not readable on this CP (remote host not yet mirrored). */
+  partial: boolean;
+  /** Decimal string — the server's u64 epoch exceeds JS's 2^53 safe-integer range. */
+  epoch: string;
+  points_from: number;
+  points: UsageTimelinePoint[];
+}
+
 export interface SessionSummary {
   session_id: string;
   agent_name: string;
@@ -2014,6 +2033,23 @@ export const api = {
   getRunUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<UsageTimelinePoint[]>(`/api/runs/${encodeURIComponent(id)}/usage-timeline${qs}`);
+  },
+  /**
+   * Live usage of one run. Pass `since` + `epoch` (from the previous response)
+   * to receive only the new tail of `points`; either alone is ignored.
+   */
+  getRunUsage(
+    id: string,
+    opts?: { host?: string; since?: number; epoch?: string },
+  ): Promise<RunUsageResponse> {
+    const q = new URLSearchParams();
+    if (opts?.host) q.set('host', opts.host);
+    if (opts?.since != null && opts?.epoch != null) {
+      q.set('since', String(opts.since));
+      q.set('epoch', opts.epoch);
+    }
+    const qs = q.toString() ? `?${q}` : '';
+    return request<RunUsageResponse>(`/api/runs/${encodeURIComponent(id)}/usage${qs}`);
   },
   getSessionUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
