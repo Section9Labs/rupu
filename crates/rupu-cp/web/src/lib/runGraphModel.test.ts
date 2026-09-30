@@ -870,3 +870,41 @@ describe('codenames and provider/model', () => {
     expect(u.model).toBeUndefined();
   });
 });
+
+describe('parallel sub-step identities + unit agents', () => {
+  const PAR: StepNodeDto = {
+    id: 'p', kind: 'parallel',
+    parallel: [{ id: 'lint', agent: 'linter' }, { id: 'test', agent: 'tester' }],
+  };
+
+  it('sub-steps carry the DAG agent, step_result item codename, and agent_started provider/model by declared position', () => {
+    const g = makeGraph({
+      steps: [PAR],
+      step_results: [{
+        run_id: runId(), step_id: 'p', success: true,
+        items: [{ index: 0, sub_id: 'lint', codename: 'jade-reef/heron.a' }],
+      }],
+    });
+    const events: RunEvent[] = [
+      {
+        type: 'agent_started', run_id: runId(), step_id: 'p', unit_index: 1,
+        codename: 'jade-reef/lynx.b', agent: 'tester', provider: 'openai', model: 'gpt-5',
+        agent_run_id: 'ar', transcript_path: '/t/b.jsonl',
+      },
+    ];
+    const subs = buildRunGraphModel(g, events).nodeById('p')!.parallel!;
+    expect(subs[0]).toMatchObject({ id: 'lint', agent: 'linter', codename: 'jade-reef/heron.a' });
+    expect(subs[0].provider).toBeUndefined();
+    expect(subs[1]).toMatchObject({
+      id: 'test', agent: 'tester', codename: 'jade-reef/lynx.b', provider: 'openai', model: 'gpt-5',
+    });
+  });
+
+  it('unit_started agent lands on UnitView.agent (panel units run their own agents)', () => {
+    const g = makeGraph({});
+    const events: RunEvent[] = [
+      { type: 'unit_started', run_id: runId(), step_id: 'b', index: 0, unit_key: 'alice', agent: 'sec-reviewer', transcript_path: '/t/0.jsonl' },
+    ];
+    expect(buildRunGraphModel(g, events).nodeById('b')!.fanout!.units[0].agent).toBe('sec-reviewer');
+  });
+});

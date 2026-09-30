@@ -10,6 +10,7 @@ import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
+import { AgentName } from '../codename/AgentName';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -73,7 +74,17 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
               >
                 {ss.glyph}
               </span>
-              <span className="truncate text-note text-ink">{sub.id}</span>
+              <span className="shrink-0 truncate text-note text-ink">{sub.id}</span>
+              {sub.codename && (
+                <span className="min-w-0 truncate text-meta text-ink-dim">
+                  <AgentName
+                    codename={sub.codename}
+                    agent={sub.agent}
+                    provider={sub.provider}
+                    model={sub.model}
+                  />
+                </span>
+              )}
             </div>
           );
         })}

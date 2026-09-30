@@ -245,6 +245,38 @@ describe('codenames on container nodes', () => {
     expect(screen.queryByTestId('rg-fanout-role')).toBeNull();
   });
 
+  it('ParallelNode rows show the sub-step codename · agent · provider/model', () => {
+    const node = {
+      ...PARALLEL,
+      parallel: [
+        { id: 'lint', state: 'done', agent: 'linter', codename: 'jade-reef/heron.a', provider: 'anthropic', model: 'claude-opus-5-5' },
+        { id: 'test', state: 'running', agent: 'tester' },
+      ],
+    } as GraphNode;
+    renderParallel(node);
+    expect(screen.getByText('lint')).toBeInTheDocument();
+    expect(screen.getByText('heron.a · linter · anthropic/claude-opus-5-5')).toBeInTheDocument();
+    // no codename → sub id row still renders, no identity
+    expect(screen.getByText('test')).toBeInTheDocument();
+  });
+
+  it('PanelLoopNode unit title uses the unit agent, never the unit key', () => {
+    const node = {
+      ...PANEL,
+      fanout: {
+        ...PANEL.fanout!,
+        units: [
+          { index: 0, key: 'alice', state: 'done', codename: 'jade-reef/lynx1', agent: 'sec-reviewer', provider: 'openai', model: 'gpt-5' },
+          { index: 1, key: 'bob', state: 'running', codename: 'jade-reef/lynx2' },
+        ],
+      },
+    } as GraphNode;
+    const { container } = renderPanel(node);
+    expect(container.querySelector('button[title^="lynx1 · sec-reviewer · openai/gpt-5"]')).not.toBeNull();
+    expect(container.querySelector('button[title^="lynx2 · running"]')).not.toBeNull();
+    expect(container.querySelector('button[title*="bob"]')).toBeNull();
+  });
+
   it('PanelLoopNode unit chips use the codename leaf when present', () => {
     const node = {
       ...PANEL,

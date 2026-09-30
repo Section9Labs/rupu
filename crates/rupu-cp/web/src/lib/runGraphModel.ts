@@ -33,9 +33,24 @@ export interface UnitView {
   key: string;
   state: StepState;
   transcriptPath?: string;
+  /** The agent this unit runs, from its unit_started / agent_started event
+   *  (panel units each run their own panelist / fixer agent). */
+  agent?: string;
   /** Server-minted agent codename for this unit (checkpoint / unit_started / agent_started). */
   codename?: string;
   /** Provider + model from the unit's `agent_started` (absent for placed units). */
+  provider?: string;
+  model?: string;
+}
+
+/** One `parallel:` sub-step. `agent` comes from the DAG; codename from the
+ *  step_result's per-sub item; codename/provider/model from `agent_started`
+ *  whose `unit_index` is the sub-step's declared position. */
+export interface ParallelSubView {
+  id: string;
+  state: StepState;
+  agent?: string;
+  codename?: string;
   provider?: string;
   model?: string;
 }
@@ -60,7 +75,7 @@ export interface GraphNode {
   /** Path to this step's agent transcript JSONL, when one was recorded. */
   transcriptPath?: string;
   fanout?: FanoutState;
-  parallel?: { id: string; state: StepState }[];
+  parallel?: ParallelSubView[];
   /** For panel/gate steps — current iteration / max. Task 9 populates `current`. */
   round?: { current: number; max: number };
   gate?: StepNodeDto['gate'];
@@ -96,13 +111,17 @@ function coerceItem(item: unknown): string {
 }
 
 interface AgentIdentity {
+  agent?: string;
   codename?: string;
   provider?: string;
   model?: string;
 }
 
 /** Overlay an agent_started identity; absent fields leave existing values. */
-function applyIdentity(target: { codename?: string; provider?: string; model?: string }, id: AgentIdentity): void {
+function applyIdentity(
+  target: { codename?: string; provider?: string; model?: string },
+  id: AgentIdentity,
+): void {
   if (id.codename) target.codename = id.codename;
   if (id.provider) target.provider = id.provider;
   if (id.model) target.model = id.model;
@@ -148,7 +167,11 @@ export function buildRunGraphModel(
 
     // Parallel sub-steps: initialise each to pending.
     if (dto.kind === 'parallel' && dto.parallel != null) {
-      node.parallel = dto.parallel.map((sub) => ({ id: sub.id, state: 'pending' as StepState }));
+      node.parallel = dto.parallel.map((sub) => {
+        const view: ParallelSubView = { id: sub.id, state: 'pending' };
+        if (sub.agent) view.agent = sub.agent;
+        return view;
+      });
     }
 
     nodeMap.set(dto.id, node);
@@ -163,6 +186,17 @@ export function buildRunGraphModel(
 
     if (result.transcript_path != null) node.transcriptPath = result.transcript_path;
     if (result.codename) node.codename = result.codename;
+    // Parallel steps persist one item per sub-step (`sub_id`) carrying the
+    // instance's codename.
+    if (node.parallel && Array.isArray(result.items)) {
+      for (const item of result.items) {
+        if (item == null || typeof item !== 'object') continue;
+        const rec = item as Record<string, unknown>;
+        if (typeof rec.sub_id !== 'string' || typeof rec.codename !== 'string' || !rec.codename) continue;
+        const sub = node.parallel.find((s) => s.id === rec.sub_id);
+        if (sub) sub.codename = rec.codename;
+      }
+    }
 
     if (result.skipped === true) {
       node.state = 'skipped';
@@ -261,6 +295,7 @@ export function buildRunGraphModel(
         if (existing) {
           existing.state = 'running';
           if (ev.codename) existing.codename = ev.codename;
+          if (ev.agent) existing.agent = ev.agent;
         } else {
           const unit: UnitView = {
             index: ev.index,
@@ -269,12 +304,18 @@ export function buildRunGraphModel(
             transcriptPath: ev.transcript_path,
           };
           if (ev.codename) unit.codename = ev.codename;
+          if (ev.agent) unit.agent = ev.agent;
           units.set(ev.index, unit);
         }
         break;
       }
       case 'agent_started': {
-        const id: AgentIdentity = { codename: ev.codename, provider: ev.provider, model: ev.model };
+        const id: AgentIdentity = {
+          agent: ev.agent,
+          codename: ev.codename,
+          provider: ev.provider,
+          model: ev.model,
+        };
         if (ev.unit_index == null) {
           stepIdentities.set(ev.step_id, id);
         } else {
@@ -333,10 +374,16 @@ export function buildRunGraphModel(
   }
   for (const [stepId, byIndex] of unitIdentities) {
     const units = unitsByStep.get(stepId);
-    if (!units) continue;
+    const subs = nodeMap.get(stepId)?.parallel;
     for (const [idx, id] of byIndex) {
-      const unit = units.get(idx);
-      if (unit) applyIdentity(unit, id);
+      const unit = units?.get(idx);
+      if (unit) {
+        applyIdentity(unit, id);
+        if (id.agent) unit.agent = id.agent;
+      }
+      // Parallel sub-steps: unit_index is the sub-step's declared position.
+      const sub = subs?.[idx];
+      if (sub) applyIdentity(sub, id);
     }
   }
 

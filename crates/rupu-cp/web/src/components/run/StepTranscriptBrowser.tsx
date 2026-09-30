@@ -149,7 +149,7 @@ export default function StepTranscriptBrowser({
                         <span className="min-w-0 truncate text-ink-dim">
                           <AgentName
                             codename={u.codename}
-                            agent={agent}
+                            agent={u.agent ?? agent}
                             provider={u.provider}
                             model={u.model}
                           />

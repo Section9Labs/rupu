@@ -46,6 +46,7 @@ import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { CrewChip } from '../components/codename/CrewChip';
 import { AgentName } from '../components/codename/AgentName';
+import { SubrunIdentityContext, buildSubrunIdentities } from '../components/transcript/subrunIdentity';
 import { parseCodename } from '../lib/codename';
 
 const MAX_EVENTS = 2000;
@@ -398,6 +399,9 @@ export default function RunDetail() {
 
   // Plain RunEvent[] for the model builder (drop the seq wrapper).
   const rawEvents = useMemo<RunEvent[]>(() => events.map((e) => e.event), [events]);
+  // sub_run_id → codename/agent/provider/model from dispatch_started, so the
+  // transcript's dispatch tool cards can name their sub-agents fully.
+  const subrunIdentities = useMemo(() => buildSubrunIdentities(rawEvents), [rawEvents]);
 
   // Merge skeleton + checkpoints + live events into the render model. Cheap;
   // recompute on every event so the graph reflects live state.
@@ -737,9 +741,7 @@ export default function RunDetail() {
   // A for_each unit runs the step's one agent; panel/parallel units each run
   // their own, which the node-level `agent` doesn't name.
   const selectedAgent = selectedUnit
-    ? selectedNode?.kind === 'for_each'
-      ? selectedNode.agent
-      : undefined
+    ? (selectedUnit.agent ?? (selectedNode?.kind === 'for_each' ? selectedNode.agent : undefined))
     : selectedNode?.agent;
 
   return (
@@ -1228,32 +1230,34 @@ export default function RunDetail() {
           parent <main>. */}
       <div className="flex h-[65vh] min-h-[420px] flex-col px-8 pb-6 pt-3">
         {tab === 'transcript' && (
-          <div className="flex h-full min-h-0 flex-col overflow-auto">
-            {selection && selectedFanout ? (
-              <StepTranscriptBrowser
-                stepId={selection.stepId}
-                units={selectedFanout.units}
-                agent={selectedNode?.kind === 'for_each' ? selectedNode.agent : undefined}
-                initialUnitIndex={selection.unitIndex}
-                runId={id}
-                host={host}
-              />
-            ) : selection && selectedTranscriptPath ? (
-              <TranscriptPanel
-                key={selectedTranscriptPath}
-                path={selectedTranscriptPath}
-                live={isRunning}
-                runId={id}
-                host={host}
-              />
-            ) : (
-              <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
-                {selection
-                  ? `No transcript yet for ${selection.stepId}.`
-                  : 'Select a step in the graph to view its transcript.'}
-              </div>
-            )}
-          </div>
+          <SubrunIdentityContext.Provider value={subrunIdentities}>
+            <div className="flex h-full min-h-0 flex-col overflow-auto">
+              {selection && selectedFanout ? (
+                <StepTranscriptBrowser
+                  stepId={selection.stepId}
+                  units={selectedFanout.units}
+                  agent={selectedNode?.kind === 'for_each' ? selectedNode.agent : undefined}
+                  initialUnitIndex={selection.unitIndex}
+                  runId={id}
+                  host={host}
+                />
+              ) : selection && selectedTranscriptPath ? (
+                <TranscriptPanel
+                  key={selectedTranscriptPath}
+                  path={selectedTranscriptPath}
+                  live={isRunning}
+                  runId={id}
+                  host={host}
+                />
+              ) : (
+                <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
+                  {selection
+                    ? `No transcript yet for ${selection.stepId}.`
+                    : 'Select a step in the graph to view its transcript.'}
+                </div>
+              )}
+            </div>
+          </SubrunIdentityContext.Provider>
         )}
         {tab === 'events' && (
           <div className="h-full min-h-0">

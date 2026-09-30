@@ -8,6 +8,7 @@
 import { it, expect, describe, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { summarizeInput, parseAstGrepText, parseSubrunOutput } from './ToolCard';
+import { SubrunIdentityContext } from './subrunIdentity';
 import ToolCard from './ToolCard';
 import type { ToolView, FindingView } from './transcriptView';
 import { api } from '../../lib/api';
@@ -757,4 +758,26 @@ it('subrun ToolView with a codename renders the sub-agent name next to its agent
   };
   render(<ToolCard tool={tv} />);
   expect(screen.getByText('lead>lynx#1 · scanner')).not.toBeNull();
+});
+
+it('subrun card prefers the SubrunIdentityContext entry (provider/model) for its sub_run_id', () => {
+  const tv: ToolView = {
+    tool: 'dispatch_agent',
+    kind: 'subrun',
+    input: { agent: 'scanner' },
+    output: JSON.stringify({
+      ok: true, agent: 'scanner', tokens_used: 5,
+      transcript_path: '/runs/abc/transcript.jsonl', sub_run_id: 'sub_X',
+      codename: 'otter-3/lead>lynx#1',
+    }),
+  };
+  const ids = new Map([
+    ['sub_X', { codename: 'otter-3/lead>lynx#1', agent: 'scanner', provider: 'anthropic', model: 'claude-opus-5-5' }],
+  ]);
+  render(
+    <SubrunIdentityContext.Provider value={ids}>
+      <ToolCard tool={tv} />
+    </SubrunIdentityContext.Provider>,
+  );
+  expect(screen.getByText('lead>lynx#1 · scanner · anthropic/claude-opus-5-5')).not.toBeNull();
 });

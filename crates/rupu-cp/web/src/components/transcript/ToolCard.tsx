@@ -25,7 +25,7 @@
  * No `any`. Static Tailwind class strings only.
  */
 
-import { useState } from 'react';
+import { useContext, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ToolView, FindingView, ToolAuditView } from './transcriptView';
@@ -38,6 +38,7 @@ import StructuredView from './StructuredView';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { AgentName } from '../codename/AgentName';
+import { SubrunIdentityContext } from './subrunIdentity';
 import { formatDuration } from '../../lib/duration';
 
 // ---------------------------------------------------------------------------
@@ -513,13 +514,23 @@ function SubrunPayloadRow({
   payload: SubrunPayload;
   onOpenTranscript?: (path: string) => void;
 }) {
-  const { ok, tokensUsed, transcriptPath, error, codename, agent } = payload;
+  const { ok, tokensUsed, transcriptPath, error } = payload;
+  // Prefer the run's dispatch_started identity (it alone carries
+  // provider/model); fall back to the tool output's codename/agent.
+  const known = useContext(SubrunIdentityContext).get(payload.subRunID ?? '');
+  const codename = known?.codename ?? payload.codename;
+  const agent = known?.agent ?? payload.agent;
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap gap-1.5 items-center">
         {codename && (
           <span className="text-[11px] text-ink">
-            <AgentName codename={codename} agent={agent ?? undefined} />
+            <AgentName
+              codename={codename}
+              agent={agent ?? undefined}
+              provider={known?.provider}
+              model={known?.model}
+            />
           </span>
         )}
         {ok !== null && (
