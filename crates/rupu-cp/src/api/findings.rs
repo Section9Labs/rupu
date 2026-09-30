@@ -16,9 +16,10 @@ use rupu_coverage::report::{
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
 use rupu_findings_report::model::{ExportFinding, ExportInput, ReportMeta};
 use rupu_findings_report::number::{
-    assign_numbers, filename, is_valid_prefix, number_map, sanitize_title, DEFAULT_PREFIX,
+    assign_numbers, filename, fit_file_name, is_valid_prefix, number_map, sanitize_title,
+    DEFAULT_PREFIX,
 };
-use rupu_findings_report::select::{describe, select, Selection};
+use rupu_findings_report::select::{describe, parse_cwe, select, Selection};
 use rupu_findings_report::{render_finding, render_project, render_split_zip, ExportError, Format};
 use rupu_orchestrator::{executor::Event, runs::RunStore};
 use rupu_workspace::WorkspaceStore;
@@ -1000,6 +1001,33 @@ pub fn export_finding_report(
     })
 }
 
+/// How many PDF renders `cp serve` runs at once. A Typst compile is CPU- and
+/// memory-heavy (fonts, layout, a whole project in one document), and `cp
+/// serve` is a long-running process: without a bound, a burst of export
+/// clicks would pin every blocking thread and grow the heap together.
+/// Markdown and HTML are cheap and are not gated.
+const MAX_CONCURRENT_PDF_RENDERS: usize = 2;
+
+static PDF_RENDERS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_PDF_RENDERS);
+
+/// A slot to render `fmt` in: for PDF, one of `gate`'s permits (waiting for
+/// one to free up), for everything else nothing. The permit is moved into the
+/// blocking render and released when the render ends, not when the request
+/// does: a client that disconnects does not cancel the compile.
+async fn render_slot(
+    gate: &'static tokio::sync::Semaphore,
+    fmt: Format,
+) -> Result<Option<tokio::sync::SemaphorePermit<'static>>, ApiError> {
+    if fmt != Format::Pdf {
+        return Ok(None);
+    }
+    gate.acquire()
+        .await
+        .map(Some)
+        .map_err(|e| ApiError::internal(e.to_string()))
+}
+
 /// `GET /api/findings/:id/export?format=md|html|pdf` — one finding as a
 /// downloadable report, numbered within its own project.
 async fn export_finding(
@@ -1010,7 +1038,9 @@ async fn export_finding(
     let fmt = export_format(q.format.as_deref())?;
     let prefix = export_prefix(&s);
     let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
+    let slot = render_slot(&PDF_RENDERS, fmt).await?;
     let download = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         export_finding_report(&global, &runs, &id, &prefix, fmt)
     })
     .await
@@ -1063,6 +1093,19 @@ pub fn export_project_report(
             .collect(),
         prefix,
     );
+    // Every finding's number, with its project, taken before selecting: a
+    // cross-reference to a finding the selection leaves out still prints the
+    // number its own export carries.
+    let all_numbers: Vec<(String, String, String)> = numbered
+        .iter()
+        .map(|f| {
+            (
+                f.input.ws_id.clone(),
+                f.input.record.id.clone(),
+                f.number.clone(),
+            )
+        })
+        .collect();
     let sel = Selection {
         ids: req.ids,
         ws_id: req.ws_id,
@@ -1079,6 +1122,14 @@ pub fn export_project_report(
         ));
     }
     attach_workflow_names(runs, &mut chosen);
+    // Numbers are per project, so only the projects in the report lend theirs:
+    // another project's `SEC-004` would name a finding the reader cannot see.
+    let in_report: HashSet<&str> = chosen.iter().map(|f| f.input.ws_id.as_str()).collect();
+    let numbers: HashMap<String, String> = all_numbers
+        .into_iter()
+        .filter(|(ws_id, _, _)| in_report.contains(ws_id.as_str()))
+        .map(|(_, id, number)| (id, number))
+        .collect();
     let meta = ReportMeta {
         scope: describe(&sel, req.run_id.as_deref(), &chosen),
         title: req.title,
@@ -1086,19 +1137,19 @@ pub fn export_project_report(
     };
     let stem = report_file_stem(&meta.title);
     if req.split {
-        let bytes = render_split_zip(&meta, &chosen, fmt)?;
+        let bytes = render_split_zip(&meta, &chosen, &numbers, fmt)?;
         Ok(ExportedReport {
             bytes,
             content_type: "application/zip",
-            name: format!("{stem}.zip"),
+            name: fit_file_name(&stem, "zip"),
             html: false,
         })
     } else {
-        let bytes = render_project(&meta, &chosen, fmt)?;
+        let bytes = render_project(&meta, &chosen, &numbers, fmt)?;
         Ok(ExportedReport {
             bytes,
             content_type: fmt.content_type(),
-            name: format!("{stem}.{}", fmt.ext()),
+            name: fit_file_name(&stem, fmt.ext()),
             html: fmt == Format::Html,
         })
     }
@@ -1118,6 +1169,17 @@ async fn export_findings(
         .map(|raw| parse_min_severity(raw).ok_or_else(min_severity_error))
         .transpose()?;
     let title = normalize_export_title(body.title.as_deref()).map_err(ApiError::bad_request)?;
+    // Compared by number (CWE-79 never selects CWE-798); an unreadable value
+    // is refused rather than matching nothing.
+    let cwe = body
+        .cwe
+        .as_deref()
+        .map(|raw| {
+            parse_cwe(raw)
+                .map(|n| format!("CWE-{n}"))
+                .ok_or_else(|| ApiError::bad_request("cwe must be a CWE id such as CWE-79"))
+        })
+        .transpose()?;
     let prefix = export_prefix(&s);
     let req = ReportRequest {
         title,
@@ -1126,12 +1188,14 @@ async fn export_findings(
         run_id: body.run_id,
         min_severity,
         owner: body.owner,
-        cwe: body.cwe,
+        cwe,
         include_summaries: body.include_summaries,
         split: body.split,
     };
     let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
+    let slot = render_slot(&PDF_RENDERS, fmt).await?;
     let download = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         export_project_report(&global, &runs, &prefix, req, fmt)
     })
     .await
@@ -3157,6 +3221,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cross_reference_to_a_finding_left_out_prints_its_project_number() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut citing = full_in_run("fnd_crit", Severity::Critical, "run_crit");
+        citing.report.as_mut().unwrap().cross_references =
+            rupu_coverage::report::OrSentinel::Value(vec![rupu_coverage::report::CrossRef {
+                finding_id: "fnd_med".to_string(),
+                relation: rupu_coverage::report::Relation::Sibling,
+                note: None,
+            }]);
+        seed_workspace_findings(
+            tmp.path(),
+            &[
+                citing,
+                full_in_run("fnd_high", Severity::High, "run_high"),
+                full_in_run("fnd_med", Severity::Medium, "run_med"),
+            ],
+        );
+        let app = app_for(tmp.path());
+        // fnd_med (SEC-003) is left out by both selections.
+        for body in [
+            serde_json::json!({"format": "md", "min_severity": "high"}),
+            serde_json::json!({"format": "md", "ids": ["fnd_crit"]}),
+        ] {
+            let (status, _, text) = export_post(app.clone(), body.clone()).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert!(text.contains("- SEC-003 (sibling)"), "{body}\n{text}");
+            assert!(!text.contains("fnd_med"), "{body}\n{text}");
+        }
+        // The single-finding export of the same finding prints the same
+        // number. (The split archive is handed the same map; that path is
+        // covered by rupu-findings-report's
+        // `a_cross_reference_to_a_finding_left_out_keeps_its_project_number`.)
+        let (_, _, single) = get_raw(app, "/api/findings/fnd_crit/export?format=md").await;
+        assert!(String::from_utf8_lossy(&single).contains("- SEC-003 (sibling)"));
+    }
+
+    #[tokio::test]
+    async fn a_cwe_selection_compares_numbers_not_substrings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut xss = full_in_run("fnd_xss", Severity::Critical, "r");
+        xss.report.as_mut().unwrap().cwe = vec!["CWE-79".to_string()];
+        let mut creds = full_in_run("fnd_creds", Severity::High, "r");
+        creds.report.as_mut().unwrap().cwe = vec![];
+        creds.concern_id = Some("cwe-top25-2023:cwe-798-hardcoded-credentials".to_string());
+        seed_workspace_findings(tmp.path(), &[xss, creds]);
+        let app = app_for(tmp.path());
+        for cwe in ["CWE-79", "cwe-79", "79"] {
+            let (status, _, text) =
+                export_post(app.clone(), serde_json::json!({"format": "md", "cwe": cwe})).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{cwe}");
+            assert!(
+                text.contains("SEC-001") && !text.contains("SEC-002"),
+                "{cwe}"
+            );
+            // The scope line names the CWE in its canonical form.
+            assert!(text.contains("CWE CWE-79"), "{cwe}");
+        }
+        let (status, _, text) =
+            export_post(app, serde_json::json!({"format": "md", "cwe": "CWE-798"})).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(text.contains("SEC-002") && !text.contains("SEC-001"));
+    }
+
+    #[tokio::test]
+    async fn only_pdf_renders_wait_for_a_render_slot() {
+        static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let a = render_slot(&GATE, Format::Pdf).await.unwrap();
+        let b = render_slot(&GATE, Format::Pdf).await.unwrap();
+        assert!(a.is_some() && b.is_some());
+        // Both permits are out: a third PDF waits...
+        let third = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            render_slot(&GATE, Format::Pdf),
+        )
+        .await;
+        assert!(
+            third.is_err(),
+            "a third concurrent PDF render was let through"
+        );
+        // ...while Markdown and HTML never do.
+        assert!(render_slot(&GATE, Format::Markdown)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(render_slot(&GATE, Format::Html).await.unwrap().is_none());
+        // A finished render frees its slot.
+        drop(a);
+        assert!(render_slot(&GATE, Format::Pdf).await.unwrap().is_some());
+        drop(b);
+        assert_eq!(MAX_CONCURRENT_PDF_RENDERS, 2);
+    }
+
+    #[tokio::test]
     async fn export_request_errors_are_client_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
         let app = app_with_three_full(&tmp);
@@ -3168,6 +3325,14 @@ mod tests {
         .await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
         assert!(error_of(text.as_bytes()).contains("min_severity"));
+        // A CWE that is not a CWE id.
+        let (status, _, text) = export_post(
+            app.clone(),
+            serde_json::json!({"format": "md", "cwe": "xss"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error_of(text.as_bytes()).contains("cwe"));
         // A misspelt filter must not silently select everything.
         let (status, _, _) = export_post(
             app,

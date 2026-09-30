@@ -19,11 +19,50 @@ pub struct Selection {
     pub min_severity: Option<Severity>,
     /// Exact match on `report.ownership.owner`.
     pub owner: Option<String>,
-    /// A CWE id: matches an entry of `report.cwe`, or appears in `concern_id`.
+    /// A CWE (`CWE-79`, `cwe-79`, `cwe_79` or `79`), compared by number with
+    /// each entry of `report.cwe` and with the CWE a `concern_id` names (see
+    /// [`concern_cwe`]). A value [`parse_cwe`] cannot read matches nothing,
+    /// so callers refuse one up front.
     pub cwe: Option<String>,
     /// Keep summary-profile findings. Off by default: a report is about the
     /// findings that carry a full write-up.
     pub include_summaries: bool,
+}
+
+/// The number of a requested CWE: `CWE-79`, `cwe-79`, `cwe_79`, `cwe79` or a
+/// bare `79` (surrounding whitespace ignored). `None` for anything else.
+pub fn parse_cwe(raw: &str) -> Option<u32> {
+    let s = raw.trim();
+    let digits = match s.get(..3) {
+        Some(p) if p.eq_ignore_ascii_case("cwe") => {
+            let rest = &s[3..];
+            rest.strip_prefix(['-', '_']).unwrap_or(rest)
+        }
+        _ => s,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The CWE number a `concern_id` names, by the web's rule (`lib/cwe.ts`
+/// `cweFromFinding`: the first `cwe[-_]?<digits>`, case-insensitive). The
+/// whole digit run is read, so `cwe-top25-2023:cwe-798-hardcoded-credentials`
+/// is 798 and never 79, and `cwe-79` / `cwe-79-xss` are 79.
+pub fn concern_cwe(concern_id: &str) -> Option<u32> {
+    let lower = concern_id.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find("cwe") {
+        let rest = &lower[from + at + 3..];
+        let rest = rest.strip_prefix(['-', '_']).unwrap_or(rest);
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            return rest[..digits].parse().ok();
+        }
+        from += at + 3;
+    }
+    None
 }
 
 /// Filter `numbered` (already numbered, so numbers stay stable whatever is
@@ -31,7 +70,8 @@ pub struct Selection {
 /// set, `ids` included.
 pub fn select(numbered: Vec<ExportFinding>, sel: &Selection) -> Vec<ExportFinding> {
     let wanted: HashSet<&str> = sel.ids.iter().map(String::as_str).collect();
-    let cwe = sel.cwe.as_deref().map(str::to_lowercase);
+    // `Some(None)`: a CWE was asked for but is unreadable, so nothing matches.
+    let cwe = sel.cwe.as_deref().map(parse_cwe);
     numbered
         .into_iter()
         .filter(|f| {
@@ -66,15 +106,18 @@ pub fn select(numbered: Vec<ExportFinding>, sel: &Selection) -> Vec<ExportFindin
                     return false;
                 }
             }
-            if let Some(cwe) = &cwe {
+            if let Some(cwe) = cwe {
+                let Some(n) = cwe else {
+                    return false;
+                };
                 let in_report = r
                     .report
                     .as_ref()
-                    .is_some_and(|rep| rep.cwe.iter().any(|c| c.to_lowercase() == *cwe));
+                    .is_some_and(|rep| rep.cwe.iter().any(|c| parse_cwe(c) == Some(n)));
                 let in_concern = r
                     .concern_id
                     .as_deref()
-                    .is_some_and(|c| c.to_lowercase().contains(cwe.as_str()));
+                    .is_some_and(|c| concern_cwe(c) == Some(n));
                 if !in_report && !in_concern {
                     return false;
                 }
@@ -294,6 +337,89 @@ mod tests {
             ..with_summaries()
         };
         assert!(!ids(&select(all, &sel)).contains(&"full"));
+    }
+
+    #[test]
+    fn a_requested_cwe_is_read_as_its_number() {
+        for (raw, want) in [
+            ("CWE-79", Some(79)),
+            ("cwe-79", Some(79)),
+            ("Cwe_79", Some(79)),
+            ("cwe79", Some(79)),
+            (" 79 ", Some(79)),
+            ("CWE-0798", Some(798)),
+            ("CWE-", None),
+            ("CWE-79x", None),
+            ("xss", None),
+            ("", None),
+            ("CWE-99999999999", None),
+        ] {
+            assert_eq!(parse_cwe(raw), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_concern_id_names_the_cwe_of_its_whole_digit_run() {
+        for (id, want) in [
+            ("cwe-79", Some(79)),
+            ("cwe-79-xss", Some(79)),
+            ("CWE-79", Some(79)),
+            ("cwe-798-hardcoded-credentials", Some(798)),
+            ("cwe-top25-2023:cwe-79-xss", Some(79)),
+            ("cwe-top25-2023:cwe-787-out-of-bounds-write", Some(787)),
+            ("cwe-research:cwe-1004-sensitive-cookie", Some(1004)),
+            ("cwe_20-input", Some(20)),
+            ("authz-idor", None),
+            ("owasp-top10-2021:a03-injection", None),
+        ] {
+            assert_eq!(concern_cwe(id), want, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn a_cwe_never_matches_a_longer_cwe_that_starts_with_its_digits() {
+        let with_concern = |id: &str, concern: &str| {
+            let mut f = make(id, Severity::High, "run_a", None);
+            f.input.record.concern_id = Some(concern.into());
+            f
+        };
+        let with_report_cwe = |id: &str, cwe: &str| {
+            let mut r = report();
+            r.cwe = vec![cwe.into()];
+            make(id, Severity::High, "run_a", Some(r))
+        };
+        let all = vec![
+            with_concern("xss", "cwe-79"),
+            with_concern("xss_slug", "cwe-top25-2023:cwe-79-xss"),
+            with_concern("creds", "cwe-top25-2023:cwe-798-hardcoded-credentials"),
+            with_concern("ssrf_like", "cwe-792-incomplete-filtering"),
+            with_concern("cmd", "cwe-top25-2023:cwe-78-os-command-injection"),
+            with_concern("oob", "cwe-top25-2023:cwe-787-out-of-bounds-write"),
+            with_concern("prefixed", "cwe-179-early-validation"),
+            with_report_cwe("reported_xss", "CWE-79"),
+            with_report_cwe("reported_creds", "CWE-798"),
+        ];
+        let by = |c: &str| Selection {
+            cwe: Some(c.into()),
+            ..with_summaries()
+        };
+        let want_79 = ["xss", "xss_slug", "reported_xss"];
+        assert_eq!(ids(&select(all.clone(), &by("CWE-79"))), want_79);
+        // Any spelling of the same number selects the same findings.
+        for spelling in ["cwe-79", "cwe_79", "79"] {
+            assert_eq!(
+                ids(&select(all.clone(), &by(spelling))),
+                want_79,
+                "{spelling}"
+            );
+        }
+        assert_eq!(ids(&select(all.clone(), &by("CWE-78"))), ["cmd"]);
+        assert_eq!(
+            ids(&select(all.clone(), &by("CWE-798"))),
+            ["creds", "reported_creds"]
+        );
+        // An unreadable CWE matches nothing rather than everything.
+        assert!(select(all, &by("xss")).is_empty());
     }
 
     #[test]

@@ -350,6 +350,18 @@ shipped the export generation above, with these differences from the text:
   no-referrer policy, so an exported document loads nothing.
 - **PDF fonts are bundled but limited** to Libertinus Serif, New Computer Modern
   and DejaVu Sans Mono: no CJK or emoji glyphs.
+- **Tests are assertions, not snapshots.** There are no insta snapshots for
+  Markdown or HTML: `rupu-findings-report`'s tests assert section order, field
+  text, escaping and (for Markdown) what a CommonMark parser makes of the
+  output. PDF has no page-count check: its tests assert a valid `%PDF` document
+  (and that a project PDF is larger than one finding's) and that an adversarial
+  corpus compiles through the real emitters.
+- **The `POST /api/findings/export` body is flat**:
+  `{format, title?, ids?, ws_id?, run_id?, min_severity?, owner?, cwe?,
+  include_summaries?, split?}`, not `ids? | filter?: {…}`. `ids` and the
+  filters combine (a finding must pass all of them), there is no `profile`
+  filter (`include_summaries` covers it), and unknown fields are refused so a
+  misspelt filter cannot widen a report.
 
 ## Backfill (last, optional)
 

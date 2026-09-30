@@ -7,6 +7,7 @@ use rupu_findings_report::html;
 use rupu_findings_report::model::ReportMeta;
 use rupu_findings_report::number::number_map;
 use rupu_findings_report::typst_doc;
+use std::collections::HashMap;
 
 const XSS: &str = "<img src=x onerror=alert(1)>";
 const TYPST_INJECT: &str = "#set page(width: 1cm)";
@@ -30,7 +31,7 @@ fn two_finding_blocks() -> Vec<Block> {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "Project notebin".into(),
     };
-    project_blocks(&meta, &all)
+    project_blocks(&meta, &all, &HashMap::new())
 }
 
 // ---------------------------------------------------------------- HTML

@@ -8,8 +8,8 @@ use crate::number;
 use crate::text::{longest_backtick_run, one_line};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_coverage::report::{
-    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, FindingReport, Likelihood, OrSentinel,
-    Relation, RiskLevel, Ticket, VerificationStatus, NOT_PROVIDED_PREFIX,
+    ArtifactKind, ArtifactRef, ArtifactStorage, ChainHop, FindingReport, HopRole, Likelihood,
+    OrSentinel, Relation, RiskLevel, Ticket, VerificationStatus, NOT_PROVIDED_PREFIX,
 };
 use rupu_coverage::FindingRecord;
 use rupu_coverage::{FindingProfile, FindingScope, Severity, Surface};
@@ -298,7 +298,17 @@ pub fn finding_blocks(f: &ExportFinding, numbers: &HashMap<String, String>) -> V
     }
 }
 
-/// One call-chain hop as a step. Every agent-supplied part is collapsed to
+fn hop_role(r: HopRole) -> &'static str {
+    match r {
+        HopRole::Source => "source",
+        HopRole::Hop => "hop",
+        HopRole::Sink => "sink",
+    }
+}
+
+/// One call-chain hop as a step, ending in its role (`source` / `hop` /
+/// `sink`: the schema does not require hops in that order, so the order alone
+/// does not say which is which). Every agent-supplied part is collapsed to
 /// one line: a label with a newline in it must not start a Markdown block.
 fn hop_step(h: &ChainHop) -> String {
     let mut s = format!("**{}**", one_line(&h.label));
@@ -315,6 +325,7 @@ fn hop_step(h: &ChainHop) -> String {
         (None, Some(p)) => s.push_str(&format!(" — passes because {}", one_line(p))),
         (None, None) => {}
     }
+    s.push_str(&format!(" — role: {}", hop_role(h.role)));
     s
 }
 
@@ -593,10 +604,30 @@ pub fn index_blocks(meta: &ReportMeta, findings: &[ExportFinding]) -> Vec<Block>
     ]
 }
 
+/// `numbers` plus the display number of every finding in `findings`, so a
+/// cross-reference between two findings of the report always resolves even
+/// when the caller's map is partial (or empty).
+pub(crate) fn with_own_numbers(
+    numbers: &HashMap<String, String>,
+    findings: &[ExportFinding],
+) -> HashMap<String, String> {
+    let mut all = numbers.clone();
+    all.extend(number::number_map(findings));
+    all
+}
+
 /// A whole-project report: title, a summary of what it covers, an index, then
-/// every finding on its own page.
-pub fn project_blocks(meta: &ReportMeta, findings: &[ExportFinding]) -> Vec<Block> {
-    let numbers = number::number_map(findings);
+/// every finding on its own page. `numbers` resolves cross-references: the
+/// caller passes the numbers of every finding the selection was made from (a
+/// finding the selection left out is still cited by its `SEC-00N`, as its own
+/// single-finding export would cite it), and the findings' own numbers are
+/// added to it.
+pub fn project_blocks(
+    meta: &ReportMeta,
+    findings: &[ExportFinding],
+    numbers: &HashMap<String, String>,
+) -> Vec<Block> {
+    let numbers = with_own_numbers(numbers, findings);
     let mut b = index_blocks(meta, findings);
     for f in findings {
         b.push(Block::PageBreak);

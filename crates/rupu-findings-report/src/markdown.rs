@@ -4,6 +4,7 @@
 use crate::blocks::Block;
 use crate::text::{longest_backtick_run, one_line};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use std::ops::Range;
 
 /// A fence longer than any backtick run in the text, and at least three.
 fn fence_for(text: &str) -> String {
@@ -74,6 +75,131 @@ fn close_open_fence(md: &str) -> String {
     }
 }
 
+/// The byte ranges of every code block (fenced or indented, at any depth) in
+/// `md`, in document order. Code blocks never nest, so they do not overlap.
+fn code_block_ranges(md: &str) -> Vec<Range<usize>> {
+    Parser::new_ext(md, Options::empty())
+        .into_offset_iter()
+        .filter_map(|(e, r)| matches!(e, Event::Start(Tag::CodeBlock(_))).then_some(r))
+        .collect()
+}
+
+/// Whether `rest`, the text after a line's leading `<`, begins an autolink
+/// (`<https://…>`, `<user@host>`). Such a line never opens an HTML block:
+/// every HTML block start has a tag name (letters, digits, `-`) followed by
+/// whitespace, `/`, `>` or the end of the line, and here it is followed by
+/// `+ . _ % : @` instead. So it is left alone and stays a link.
+fn starts_autolink(rest: &str) -> bool {
+    let run = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-' | b'_' | b'%'))
+        .count();
+    rest.bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric())
+        && matches!(rest.as_bytes().get(run), Some(b':' | b'@'))
+}
+
+/// Agent Markdown with a backslash before the `<` that starts any line
+/// (after at most three spaces) outside a code block. Every CommonMark HTML
+/// block (types 1-7) starts that way, and one of types 1-5 (`<script`,
+/// `<pre`, `<style`, `<textarea`, `<!--`, `<?`, `<!X`, `<![CDATA[`) left
+/// unterminated runs to the end of the document, turning every later
+/// section and finding into raw HTML that a sanitising viewer then drops.
+/// Escaped, the line is text, as the HTML and PDF exports already show it.
+/// Code blocks (found by parsing, so a fence inside a list item counts) are
+/// copied byte for byte, and so is a line opening an autolink.
+fn escape_html_block_starts(md: &str) -> String {
+    let code = code_block_ranges(md);
+    let mut next_code = 0;
+    let mut out = String::with_capacity(md.len() + 16);
+    let mut start = 0;
+    for line in md.split_inclusive('\n') {
+        let end = start + line.len();
+        while code.get(next_code).is_some_and(|r| r.end <= start) {
+            next_code += 1;
+        }
+        let in_code = code.get(next_code).is_some_and(|r| r.start < end);
+        let indent = line.bytes().take_while(|b| *b == b' ').count();
+        let rest = &line[indent..];
+        if !in_code && indent <= 3 && rest.starts_with('<') && !starts_autolink(&rest[1..]) {
+            out.push_str(&line[..indent]);
+            out.push('\\');
+            out.push_str(rest);
+        } else {
+            out.push_str(line);
+        }
+        start = end;
+    }
+    out
+}
+
+/// Agent Markdown with its headings moved below the document's own (`#` is
+/// the title, `##` a section): an ATX heading goes two levels down, capped at
+/// six (`#` → `###`, `##` → `####`, `####` → `######`). A setext heading
+/// (`===` / `---` underline) at the top level becomes an ATX heading at the
+/// shifted level, its lines joined; one inside a list item or quote keeps its
+/// text but loses its heading-ness (the underline's first character is
+/// escaped). The HTML and Typst emitters shift headings the same way.
+/// Headings are found by parsing, so nothing inside a code block is touched.
+fn shift_headings(md: &str) -> String {
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    let mut depth = 0usize;
+    for (event, range) in Parser::new_ext(md, Options::empty()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                let from = level as usize;
+                let to = (from + 2).min(6);
+                let src = &md[range.clone()];
+                let hashes = src.bytes().take_while(|b| *b == b'#').count();
+                let atx = hashes == from
+                    && matches!(
+                        src.as_bytes().get(hashes),
+                        None | Some(b' ' | b'\t' | b'\n' | b'\r')
+                    );
+                let body = src.trim_end_matches(['\n', '\r']);
+                let underline_line = body.rfind('\n').map_or(0, |i| i + 1);
+                if atx {
+                    edits.push((range.start..range.start, "#".repeat(to - from)));
+                } else if depth == 0 {
+                    let text: Vec<&str> = body[..underline_line]
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    let tail = &src[body.len()..];
+                    let atx_line = format!("{} {}{tail}", "#".repeat(to), text.join(" "));
+                    edits.push((range, atx_line));
+                } else if let Some(i) = body[underline_line..].find(['=', '-']) {
+                    let at = range.start + underline_line + i;
+                    edits.push((at..at, "\\".to_string()));
+                }
+                depth += 1;
+            }
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let mut out = String::with_capacity(md.len() + 2 * edits.len());
+    let mut done = 0;
+    for (range, text) in edits {
+        out.push_str(&md[done..range.start]);
+        out.push_str(&text);
+        done = range.end;
+    }
+    out.push_str(&md[done..]);
+    out
+}
+
+/// Agent Markdown made safe to splice into the report at a line start: HTML
+/// block starts escaped, headings shifted below the document's own, and an
+/// unclosed top-level fence closed (last, since escaping can expose a fence
+/// that an HTML block used to hide).
+fn agent_markdown(md: &str) -> String {
+    close_open_fence(&shift_headings(&escape_html_block_starts(md)))
+}
+
 /// Render blocks as CommonMark (with GFM tables), the reference layout the
 /// other emitters follow.
 ///
@@ -99,7 +225,7 @@ pub fn render(blocks: &[Block]) -> String {
             Block::Heading(h) => out.push_str(&format!("## {}\n\n", one_line(h))),
             Block::Prose(p) => {
                 if !p.trim().is_empty() {
-                    out.push_str(&format!("{}\n\n", close_open_fence(p.trim_end())));
+                    out.push_str(&format!("{}\n\n", agent_markdown(p.trim_end())));
                 }
             }
             Block::Code { lang, text } => {
@@ -115,13 +241,12 @@ pub fn render(blocks: &[Block]) -> String {
                     continue;
                 }
                 for (i, s) in steps.iter().enumerate() {
-                    // Two trailing spaces: a hard break, so consecutive steps
-                    // stay on their own lines instead of merging into one
-                    // paragraph.
-                    let step = close_open_fence(&format!("Step {}: {}", i + 1, s.trim()));
-                    out.push_str(&format!("{step}  \n"));
+                    // A blank line after each step: a step ending in a list
+                    // (or a quote) would otherwise absorb the next step as a
+                    // lazy continuation line.
+                    let step = agent_markdown(&format!("Step {}: {}", i + 1, s.trim()));
+                    out.push_str(&format!("{step}\n\n"));
                 }
-                out.push('\n');
             }
             Block::Note(n) => out.push_str(&format!("_{}_\n\n", one_line(n))),
             Block::Table { headers, rows } => {

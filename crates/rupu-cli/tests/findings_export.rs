@@ -365,6 +365,7 @@ fn bad_arguments_are_usage_errors_and_write_nothing() {
         ["--to", "docx"],
         ["--severity", "urgent"],
         ["--cwe", ""],
+        ["--cwe", "xss"],
         ["--id", " "],
     ] {
         let out = rupu(tmp.path())

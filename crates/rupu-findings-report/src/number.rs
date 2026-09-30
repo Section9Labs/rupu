@@ -58,19 +58,29 @@ pub fn title(f: &ExportFinding) -> &str {
         .unwrap_or(&f.input.record.summary)
 }
 
-/// Bidirectional and other invisible formatting characters that can make a
-/// filename display as something it is not (e.g. right-to-left override).
-fn is_bidi_control(c: char) -> bool {
+/// Invisible formatting characters that can make a file name display as
+/// something it is not: bidi controls (e.g. right-to-left override) and
+/// zero-width characters (which also make two names that look the same
+/// differ).
+pub(crate) fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
-        '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2060}'
+            | '\u{FEFF}'
     )
 }
 
 /// `s` as one safe file-name component: whitespace runs (including newlines)
 /// become a single space, and path separators, Windows-reserved characters,
-/// control characters and bidi controls are dropped. A dropped `/` or `\`
-/// means no `..` segment can survive as a path component.
+/// control characters, bidi controls and zero-width characters are dropped.
+/// A dropped `/` or `\` means no `..` segment can survive as a path
+/// component.
 fn clean_component(s: &str) -> String {
     let cleaned: String = s
         .chars()
@@ -80,7 +90,7 @@ fn clean_component(s: &str) -> String {
         .filter(|c| {
             !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
                 && !c.is_control()
-                && !is_bidi_control(*c)
+                && !is_invisible_format(*c)
         })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -92,9 +102,41 @@ const MAX_NUMBER_CHARS: usize = 40;
 /// Longest title (in chars) a file name will carry.
 const MAX_TITLE_CHARS: usize = 80;
 
+/// Longest generated file name, in bytes, extension included. File systems
+/// cap a name at 255 bytes, and a title in a multibyte script reaches that
+/// well before its character cap; the margin leaves room for what a browser
+/// or an extracting tool appends (` (1)`, `.part`).
+pub const MAX_NAME_BYTES: usize = 200;
+
+/// `s` cut to at most `max` bytes, at a char boundary.
+pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// `<stem>.<ext>` (or just `stem` when `ext` is empty) in at most
+/// [`MAX_NAME_BYTES`] bytes: the stem is cut at a char boundary, trailing
+/// whitespace dropped, to leave room for the whole extension.
+pub fn fit_file_name(stem: &str, ext: &str) -> String {
+    let suffix = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    let stem = truncate_bytes(stem, MAX_NAME_BYTES.saturating_sub(suffix.len())).trim_end();
+    format!("{stem}{suffix}")
+}
+
 /// A title as safe file-name text: the cleaning [`filename`] applies to a
-/// finding title (no separators, control or bidi characters; whitespace
-/// collapsed; at most 80 characters). It may come back empty, and it does not
+/// finding title (no separators, control, bidi or zero-width characters;
+/// whitespace collapsed; at most 80 characters, which can still be 320
+/// bytes: a caller building a whole name goes through [`fit_file_name`]). It may come back empty, and it does not
 /// touch a leading dot: a caller that uses it as a whole name handles both.
 pub fn sanitize_title(s: &str) -> String {
     let collapsed = clean_component(s);
@@ -118,7 +160,9 @@ pub fn is_valid_prefix(p: &str) -> bool {
 
 /// The suggested file name: `<number> - <title>.<ext>`. Both the title and
 /// the number are cleaned: the number is caller-supplied, so it must not be
-/// able to smuggle a path (`../../x`) into a download or zip entry name.
+/// able to smuggle a path (`../../x`) into a download or zip entry name. The
+/// whole name is at most [`MAX_NAME_BYTES`] bytes: the title is cut to fit
+/// (the number, at most 40 characters, always does).
 pub fn filename(f: &ExportFinding, ext: &str) -> String {
     let number: String = clean_component(&f.number)
         .trim_start_matches('.')
@@ -129,7 +173,7 @@ pub fn filename(f: &ExportFinding, ext: &str) -> String {
         "" => "finding",
         n => n,
     };
-    format!("{number} - {}.{ext}", sanitize_title(title(f)))
+    fit_file_name(&format!("{number} - {}", sanitize_title(title(f))), ext)
 }
 
 #[cfg(test)]
@@ -261,6 +305,47 @@ mod tests {
         ] {
             assert!(!is_valid_prefix(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn filename_strips_zero_width_characters() {
+        let mut r = rec("fnd_x", Severity::High, "2026-01-01T00:00:00Z");
+        r.summary = "\u{feff}a\u{200b}b\u{200c}c\u{200d}d\u{2060}e".into();
+        let f = assign_numbers(vec![input("a", r)], "SEC").remove(0);
+        assert_eq!(filename(&f, "md"), "SEC-001 - abcde.md");
+        assert_eq!(sanitize_title("Q3\u{200b} review\u{feff}"), "Q3 review");
+    }
+
+    #[test]
+    fn a_long_multibyte_title_is_cut_to_the_name_byte_cap_at_a_char_boundary() {
+        for (unit, ext) in [("漢字", "md"), ("🔒", "html"), ("é", "pdf")] {
+            let mut r = rec("fnd_x", Severity::High, "2026-01-01T00:00:00Z");
+            r.summary = unit.repeat(200);
+            let f = assign_numbers(vec![input("a", r)], "SEC").remove(0);
+            let name = filename(&f, ext);
+            assert!(name.len() <= MAX_NAME_BYTES, "{} bytes: {name}", name.len());
+            assert!(name.starts_with(&format!("SEC-001 - {unit}")), "{name}");
+            assert!(name.ends_with(&format!(".{ext}")), "{name}");
+            // Only whole characters of the title survive.
+            let title = &name["SEC-001 - ".len()..name.len() - ext.len() - 1];
+            assert!(title.chars().all(|c| unit.contains(c)), "{title}");
+        }
+    }
+
+    #[test]
+    fn fit_file_name_keeps_the_extension_and_a_short_name_whole() {
+        assert_eq!(fit_file_name("report", "zip"), "report.zip");
+        assert_eq!(fit_file_name("report", ""), "report");
+        let long = "ü".repeat(150); // 300 bytes
+        let fitted = fit_file_name(&long, "html");
+        assert_eq!(fitted.len(), MAX_NAME_BYTES - 1); // 97 ü + ".html" = 199
+        assert!(fitted.ends_with(".html"));
+        // Trailing whitespace at the cut is dropped.
+        let spaced = format!("{} tail", "a".repeat(196));
+        assert_eq!(
+            fit_file_name(&spaced, "md"),
+            format!("{}.md", "a".repeat(196))
+        );
     }
 
     #[test]

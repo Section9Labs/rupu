@@ -88,9 +88,9 @@ fn tickets_render_verbatim_sentinels_or_type_identifier_and_url() {
     let listed = with_report(|r| {
         r.tickets = OrSentinel::Value(vec![
             Ticket {
-                kind: "Jira".into(),
+                kind: "Tracker".into(),
                 identifier: "SEC-12".into(),
-                url: Some("https://jira.example/SEC-12".into()),
+                url: Some("https://tracker.example/SEC-12".into()),
                 notes: None,
             },
             Ticket {
@@ -103,7 +103,7 @@ fn tickets_render_verbatim_sentinels_or_type_identifier_and_url() {
     });
     assert_eq!(
         fields(&listed, "Existing Ticket References"),
-        Some("Jira SEC-12 (https://jira.example/SEC-12); GitHub #40 — filed by the scanner")
+        Some("Tracker SEC-12 (https://tracker.example/SEC-12); GitHub #40 — filed by the scanner")
     );
 }
 
@@ -116,9 +116,13 @@ fn call_chain_steps_omit_absent_parts() {
     assert_eq!(steps.len(), 3);
     assert_eq!(
         steps[0],
-        "**router: GET /api/notes/{id}** — `src/app.rs:12-30` — gate: session cookie (passes because any signed-in user has one)"
+        "**router: GET /api/notes/{id}** — `src/app.rs:12-30` — gate: session cookie (passes because any signed-in user has one) — role: source"
     );
-    assert_eq!(steps[1], "**get_note()** — `src/routes/notes.rs:40-58`");
+    assert_eq!(
+        steps[1],
+        "**get_note()** — `src/routes/notes.rs:40-58` — role: hop"
+    );
+    assert!(steps[2].ends_with(" — role: sink"), "{}", steps[2]);
 
     let blocks = with_report(|r| {
         r.call_chain = OrSentinel::Value(vec![
@@ -145,8 +149,14 @@ fn call_chain_steps_omit_absent_parts() {
     let Block::Steps(steps) = &after_heading(&blocks, "Call Chain / Attack Flow")[0] else {
         panic!("expected Steps");
     };
-    assert_eq!(steps[0], "**entry** — `0x401000` — gate: auth");
-    assert_eq!(steps[1], "**sink** — `a.rs` — passes because no check");
+    assert_eq!(
+        steps[0],
+        "**entry** — `0x401000` — gate: auth — role: source"
+    );
+    assert_eq!(
+        steps[1],
+        "**sink** — `a.rs` — passes because no check — role: sink"
+    );
 }
 
 #[test]
@@ -165,7 +175,7 @@ fn a_backtick_in_a_path_cannot_close_its_code_span() {
     let Block::Steps(steps) = &after_heading(&blocks, "Call Chain / Attack Flow")[0] else {
         panic!("expected Steps");
     };
-    assert_eq!(steps[0], "**x** — ``we`ird.rs:1-2``");
+    assert_eq!(steps[0], "**x** — ``we`ird.rs:1-2`` — role: hop");
 }
 
 #[test]
@@ -317,7 +327,7 @@ fn cwe_ids_are_a_comma_joined_row_after_category_and_omitted_when_empty() {
 fn ticket_parts_are_omitted_when_absent() {
     let blocks = with_report(|r| {
         r.tickets = OrSentinel::Value(vec![Ticket {
-            kind: "Jira".into(),
+            kind: "Tracker".into(),
             identifier: "SEC-1".into(),
             url: None,
             notes: Some("reopened".into()),
@@ -325,7 +335,7 @@ fn ticket_parts_are_omitted_when_absent() {
     });
     assert_eq!(
         fields(&blocks, "Existing Ticket References"),
-        Some("Jira SEC-1 — reopened")
+        Some("Tracker SEC-1 — reopened")
     );
 }
 
@@ -527,7 +537,7 @@ fn a_hop_cannot_start_a_block_from_its_label_gate_or_reason() {
     };
     assert_eq!(
         steps[0],
-        "**entry ## Root Cause ---** — gate: auth # owned (passes because any user - item)"
+        "**entry ## Root Cause ---** — gate: auth # owned (passes because any user - item) — role: hop"
     );
     assert!(!steps[0].contains('\n'));
 }

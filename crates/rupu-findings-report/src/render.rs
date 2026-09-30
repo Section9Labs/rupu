@@ -3,8 +3,11 @@
 
 use crate::blocks::{finding_blocks, index_blocks, project_blocks, Block};
 use crate::model::{ExportFinding, ReportMeta};
-use crate::number::{filename, number_map, title};
+use crate::number::{
+    filename, fit_file_name, is_invisible_format, title, truncate_bytes, MAX_NAME_BYTES,
+};
 use crate::{html, markdown};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
@@ -135,14 +138,15 @@ pub fn render_finding(
 fn project_pdf(
     meta: &ReportMeta,
     findings: &[ExportFinding],
+    numbers: &HashMap<String, String>,
     compile: impl Fn(String) -> Result<Vec<u8>, ExportError>,
 ) -> Result<Vec<u8>, ExportError> {
-    let blocks = project_blocks(meta, findings);
+    let numbers = crate::blocks::with_own_numbers(numbers, findings);
+    let blocks = project_blocks(meta, findings, &numbers);
     let err = match compile(typst_doc::render(&blocks)) {
         Ok(bytes) => return Ok(bytes),
         Err(e) => e,
     };
-    let numbers = number_map(findings);
     let failing: Vec<(&str, String)> = findings
         .iter()
         .filter_map(|f| {
@@ -166,29 +170,39 @@ fn project_pdf(
     }
 }
 
+/// A whole-project report over `findings`. `numbers` maps finding ids to
+/// display numbers for cross-references: pass the map of every finding the
+/// selection was made from (see [`crate::blocks::project_blocks`]), so a
+/// reference to a finding the selection left out still prints its number.
+/// The findings' own numbers are always included.
 pub fn render_project(
     meta: &ReportMeta,
     findings: &[ExportFinding],
+    numbers: &HashMap<String, String>,
     fmt: Format,
 ) -> Result<Vec<u8>, ExportError> {
     ensure_supported(fmt)?;
     #[cfg(feature = "pdf")]
     {
         if fmt == Format::Pdf {
-            return project_pdf(meta, findings, pdf::render_pdf);
+            return project_pdf(meta, findings, numbers, pdf::render_pdf);
         }
     }
-    emit(&meta.title, &project_blocks(meta, findings), fmt)
+    emit(&meta.title, &project_blocks(meta, findings, numbers), fmt)
 }
 
 /// A zip entry name that is one flat file name whatever the caller put in the
 /// finding number. `number::filename` already cleans it; this is the last line
 /// of defence at the point a path is actually written: separators, drive
-/// colons and control characters become `_`, and leading dots go, so the entry
-/// can never be a parent-directory or absolute path, or a hidden file.
+/// colons and control characters become `_`, bidi and zero-width characters
+/// go, and leading dots go, so the entry can never be a parent-directory or
+/// absolute path, or a hidden file. It is also cut to
+/// [`MAX_NAME_BYTES`] bytes, keeping its extension, so it extracts on a file
+/// system with a 255-byte name limit.
 fn safe_entry_name(name: &str) -> String {
     let flat: String = name
         .chars()
+        .filter(|c| !is_invisible_format(*c))
         .map(|c| {
             if matches!(c, '/' | '\\' | ':') || c.is_control() {
                 '_'
@@ -197,9 +211,23 @@ fn safe_entry_name(name: &str) -> String {
             }
         })
         .collect();
-    match flat.trim_start_matches('.') {
+    let (stem, ext) = split_ext(flat.trim_start_matches('.'));
+    match fit_file_name(stem, ext).trim_start_matches('.') {
         "" => "finding".to_string(),
         n => n.to_string(),
+    }
+}
+
+/// Longest text after a name's last `.` that counts as its extension.
+const MAX_EXT_BYTES: usize = 16;
+
+/// `name` split into its stem and extension (without the dot). A dot that
+/// starts the name, or one followed by more than [`MAX_EXT_BYTES`] bytes, is
+/// part of the stem: only a real extension is kept whole when a name is cut.
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 && name.len() - i - 1 <= MAX_EXT_BYTES => (&name[..i], &name[i + 1..]),
+        _ => (name, ""),
     }
 }
 
@@ -212,13 +240,18 @@ fn unique_entry_name(name: String, used: &mut HashSet<String>) -> String {
     if used.insert(name.to_lowercase()) {
         return name;
     }
-    let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => name.split_at(i),
-        _ => (name.as_str(), ""),
-    };
+    let (stem, ext) = split_ext(&name);
     let mut n = 2;
     loop {
-        let candidate = format!("{stem} ({n}){ext}");
+        // The suffix must not push the name past the byte cap: the stem gives
+        // way (at a char boundary) instead.
+        let suffix = if ext.is_empty() {
+            format!(" ({n})")
+        } else {
+            format!(" ({n}).{ext}")
+        };
+        let stem = truncate_bytes(stem, MAX_NAME_BYTES.saturating_sub(suffix.len())).trim_end();
+        let candidate = format!("{stem}{suffix}");
         if used.insert(candidate.to_lowercase()) {
             return candidate;
         }
@@ -228,13 +261,41 @@ fn unique_entry_name(name: String, used: &mut HashSet<String>) -> String {
 
 /// One file per finding (named by [`filename`]) plus `index.md`, the Markdown
 /// project index. The index stays Markdown whatever the finding format is.
+/// `numbers` is as for [`render_project`]. Every entry is dated
+/// `meta.generated_at` (see [`zip_time`]).
 pub fn render_split_zip(
     meta: &ReportMeta,
     findings: &[ExportFinding],
+    numbers: &HashMap<String, String>,
     fmt: Format,
 ) -> Result<Vec<u8>, ExportError> {
     ensure_supported(fmt)?;
-    build_zip(meta, findings, fmt, render_finding)
+    build_zip(meta, findings, numbers, fmt, render_finding)
+}
+
+/// A zip entry timestamp for `t`. Zip stores a local-time date with no zone
+/// from 1980 to 2107 (and seconds rounded down to even); `t`'s UTC fields are
+/// used as they are, and a time outside the range is clamped to its nearest
+/// end.
+fn zip_time(t: DateTime<Utc>) -> zip::DateTime {
+    let fields = match u16::try_from(t.year()) {
+        Ok(y) if (1980..=2107).contains(&y) => {
+            // chrono's month/day/hour/minute/second always fit a u8.
+            let small = |v: u32| u8::try_from(v).unwrap_or(0);
+            (
+                y,
+                small(t.month()),
+                small(t.day()),
+                small(t.hour()),
+                small(t.minute()),
+                small(t.second()),
+            )
+        }
+        _ if t.year() < 1980 => (1980, 1, 1, 0, 0, 0),
+        _ => (2107, 12, 31, 23, 59, 58),
+    };
+    let (y, mo, d, h, mi, s) = fields;
+    zip::DateTime::from_date_and_time(y, mo, d, h, mi, s).unwrap_or_default()
 }
 
 /// [`render_split_zip`] with the per-finding renderer injected, so the
@@ -242,6 +303,7 @@ pub fn render_split_zip(
 fn build_zip(
     meta: &ReportMeta,
     findings: &[ExportFinding],
+    numbers: &HashMap<String, String>,
     fmt: Format,
     render_one: impl Fn(
         &ExportFinding,
@@ -249,11 +311,12 @@ fn build_zip(
         Format,
     ) -> Result<Vec<u8>, ExportError>,
 ) -> Result<Vec<u8>, ExportError> {
-    let numbers = number_map(findings);
+    let numbers = crate::blocks::with_own_numbers(numbers, findings);
     let zip_err = |e: zip::result::ZipError| ExportError::Zip(e.to_string());
     let io_err = |e: std::io::Error| ExportError::Zip(e.to_string());
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default();
+    let opts =
+        zip::write::SimpleFileOptions::default().last_modified_time(zip_time(meta.generated_at));
     let mut used = HashSet::new();
 
     let index = unique_entry_name("index.md".to_string(), &mut used);
@@ -347,6 +410,55 @@ mod tests {
     }
 
     #[test]
+    fn entry_names_lose_zero_width_characters_and_fit_the_byte_cap() {
+        assert_eq!(
+            safe_entry_name("SEC-001 - a\u{200b}b\u{feff}c\u{2060}.md"),
+            "SEC-001 - abc.md"
+        );
+        assert_eq!(safe_entry_name("\u{200d}.hidden"), "hidden");
+        let long = format!("{}.pdf", "ß".repeat(300)); // 600 bytes of stem
+        let got = safe_entry_name(&long);
+        assert!(got.len() <= MAX_NAME_BYTES, "{}", got.len());
+        assert!(got.ends_with(".pdf"), "{got}");
+        assert!(got.trim_end_matches(".pdf").chars().all(|c| c == 'ß'));
+        let no_ext = "x".repeat(400);
+        assert_eq!(safe_entry_name(&no_ext).len(), MAX_NAME_BYTES);
+        // An "extension" longer than any real one is cut like the rest.
+        let dotted = format!("SEC.{}", "y".repeat(400));
+        assert_eq!(safe_entry_name(&dotted).len(), MAX_NAME_BYTES);
+    }
+
+    #[test]
+    fn a_suffixed_entry_name_stays_within_the_byte_cap() {
+        let mut used = HashSet::new();
+        let name = format!("{}.md", "ø".repeat(98)); // 196 + 3 = 199 bytes
+        assert_eq!(unique_entry_name(name.clone(), &mut used), name);
+        let second = unique_entry_name(name, &mut used);
+        assert!(second.len() <= MAX_NAME_BYTES, "{}", second.len());
+        assert!(second.ends_with(" (2).md"), "{second}");
+    }
+
+    #[test]
+    fn zip_times_are_the_generated_time_clamped_to_the_zip_range() {
+        let at = |s: &str| {
+            let t = zip_time(s.parse().unwrap());
+            (
+                t.year(),
+                t.month(),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+            )
+        };
+        assert_eq!(at("2026-09-29T12:34:57Z"), (2026, 9, 29, 12, 34, 56));
+        assert_eq!(at("1970-01-01T00:00:00Z"), (1980, 1, 1, 0, 0, 0));
+        assert_eq!(at("2200-06-01T00:00:00Z"), (2107, 12, 31, 23, 59, 58));
+        assert_eq!(at("1980-01-01T00:00:00Z"), (1980, 1, 1, 0, 0, 0));
+        assert_eq!(at("2107-12-31T23:59:59Z"), (2107, 12, 31, 23, 59, 58));
+    }
+
+    #[test]
     fn repeated_entry_names_get_a_numbered_suffix_before_the_extension() {
         let mut used = HashSet::new();
         let mut take = |n: &str| unique_entry_name(n.to_string(), &mut used);
@@ -377,7 +489,7 @@ mod tests {
     #[test]
     fn a_split_zip_failure_names_the_finding_whose_render_failed() {
         let all = vec![finding(1, "fine"), finding(2, "bad"), finding(3, "fine")];
-        let err = build_zip(&meta(), &all, Format::Pdf, |f, _, _| {
+        let err = build_zip(&meta(), &all, &HashMap::new(), Format::Pdf, |f, _, _| {
             if f.number == "SEC-002" {
                 Err(ExportError::Typst("expected function".into()))
             } else {
@@ -417,7 +529,9 @@ mod tests {
                 finding(3, "fine"),
                 finding(4, "POISON-B"),
             ];
-            let err = project_pdf(&meta(), &all, fake).unwrap_err().to_string();
+            let err = project_pdf(&meta(), &all, &HashMap::new(), fake)
+                .unwrap_err()
+                .to_string();
             // Each finding carries the diagnostic from ITS OWN compile; the
             // combined document would have reported "bad A" for both.
             assert!(err.contains("SEC-002 (bad A)"), "{err}");
@@ -433,7 +547,9 @@ mod tests {
         fn a_single_bad_finding_is_named_in_the_singular() {
             // Only SEC-002 is broken; the fault is reported once.
             let all = vec![finding(1, "fine"), finding(2, "POISON-B")];
-            let err = project_pdf(&meta(), &all, fake).unwrap_err().to_string();
+            let err = project_pdf(&meta(), &all, &HashMap::new(), fake)
+                .unwrap_err()
+                .to_string();
             assert_eq!(
                 err,
                 "PDF rendering failed: finding SEC-002 could not be rendered: bad B"
@@ -444,7 +560,7 @@ mod tests {
         fn a_failure_no_single_finding_reproduces_keeps_the_original_error() {
             // Fails only on the combined document (it has the index heading).
             let all = vec![finding(1, "fine"), finding(2, "fine")];
-            let err = project_pdf(&meta(), &all, |m| {
+            let err = project_pdf(&meta(), &all, &HashMap::new(), |m| {
                 if m.contains("Index") {
                     Err(ExportError::Typst("combined only".into()))
                 } else {
@@ -462,7 +578,7 @@ mod tests {
         fn a_successful_project_compiles_once_and_skips_the_per_finding_pass() {
             let calls = Cell::new(0);
             let all = vec![finding(1, "fine"), finding(2, "fine")];
-            let out = project_pdf(&meta(), &all, |m| {
+            let out = project_pdf(&meta(), &all, &HashMap::new(), |m| {
                 calls.set(calls.get() + 1);
                 fake(m)
             })

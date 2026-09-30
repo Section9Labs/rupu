@@ -5,9 +5,10 @@
 mod common;
 
 use common::*;
+use rupu_coverage::report::{CrossRef, OrSentinel, Relation};
 use rupu_coverage::Severity;
 use rupu_findings_report::model::{ExportFinding, ReportMeta};
-use rupu_findings_report::number::{filename, number_map};
+use rupu_findings_report::number::{filename, number_map, MAX_NAME_BYTES};
 use rupu_findings_report::{render_finding, render_project, render_split_zip, Format};
 use std::collections::HashMap;
 use std::io::Read;
@@ -78,7 +79,7 @@ fn markdown_finding_and_project_are_markdown() {
     assert!(!md.contains("<html"), "{md}");
 
     let all = two();
-    let md = text(render_project(&meta(), &all, Format::Markdown).unwrap());
+    let md = text(render_project(&meta(), &all, &HashMap::new(), Format::Markdown).unwrap());
     assert!(md.starts_with("# Notebin findings\n"), "{md}");
     assert!(md.contains("## Index"), "{md}");
     assert!(md.contains("Lookup ignores the owner"), "{md}");
@@ -91,7 +92,7 @@ fn html_finding_and_project_are_html_documents() {
     assert!(html.starts_with("<!doctype html>"), "{html}");
     assert!(html.contains("<title>SEC-001 - Notes API"), "{html}");
 
-    let html = text(render_project(&meta(), &two(), Format::Html).unwrap());
+    let html = text(render_project(&meta(), &two(), &HashMap::new(), Format::Html).unwrap());
     assert!(html.starts_with("<!doctype html>"), "{html}");
     assert!(html.contains("<title>Notebin findings</title>"), "{html}");
     assert!(html.contains("Lookup ignores the owner"), "{html}");
@@ -100,7 +101,7 @@ fn html_finding_and_project_are_html_documents() {
 #[test]
 fn markdown_split_zip_has_an_index_and_one_file_per_finding() {
     let all = two();
-    let zip = render_split_zip(&meta(), &all, Format::Markdown).unwrap();
+    let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Markdown).unwrap();
     let entries = unzip(&zip);
     let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
     let want: Vec<String> = ["index.md".to_string()]
@@ -129,7 +130,7 @@ fn markdown_split_zip_has_an_index_and_one_file_per_finding() {
 
 #[test]
 fn html_split_zip_holds_html_documents_and_a_markdown_index() {
-    let zip = render_split_zip(&meta(), &two(), Format::Html).unwrap();
+    let zip = render_split_zip(&meta(), &two(), &HashMap::new(), Format::Html).unwrap();
     let entries = unzip(&zip);
     assert_eq!(entries[0].0, "index.md");
     for (name, body) in &entries[1..] {
@@ -154,7 +155,7 @@ fn hostile_numbers_cannot_escape_the_archive() {
     ] {
         let mut all = two();
         all[0].number = number.to_string();
-        let zip = render_split_zip(&meta(), &all, Format::Markdown).unwrap();
+        let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Markdown).unwrap();
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
         assert_eq!(z.len(), 3, "number {number:?}");
         for i in 0..z.len() {
@@ -182,7 +183,7 @@ fn hostile_numbers_cannot_escape_the_archive() {
 fn a_hostile_number_reads_as_a_clean_prefix_in_the_entry_name() {
     let mut all = two();
     all[0].number = "../../evil".to_string();
-    let zip = render_split_zip(&meta(), &all, Format::Markdown).unwrap();
+    let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Markdown).unwrap();
     let names: Vec<String> = unzip(&zip).into_iter().map(|(n, _)| n).collect();
     assert!(names[1].starts_with("evil - "), "{names:?}");
     assert_eq!(names[1], filename(&all[0], "md"));
@@ -198,7 +199,7 @@ fn identical_numbers_and_titles_across_projects_get_distinct_entries() {
     let all = numbered(vec![input("alpha", None, a), input("beta", None, b)]);
     assert_eq!(all[0].number, all[1].number);
     assert_eq!(filename(&all[0], "md"), filename(&all[1], "md"));
-    let zip = render_split_zip(&meta(), &all, Format::Markdown).unwrap();
+    let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Markdown).unwrap();
     let names: Vec<String> = unzip(&zip).into_iter().map(|(n, _)| n).collect();
     assert_eq!(names.len(), 3);
     assert_eq!(names[1], filename(&all[0], "md"));
@@ -207,8 +208,89 @@ fn identical_numbers_and_titles_across_projects_get_distinct_entries() {
 }
 
 #[test]
+fn split_zip_entries_are_dated_when_the_report_was_generated() {
+    let zip = render_split_zip(&meta(), &two(), &HashMap::new(), Format::Markdown).unwrap();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
+    assert_eq!(z.len(), 3);
+    for i in 0..z.len() {
+        let f = z.by_index(i).unwrap();
+        let t = f.last_modified().expect("a modification time");
+        // meta().generated_at is 2026-09-29T12:00:00Z.
+        assert_eq!(
+            (t.year(), t.month(), t.day(), t.hour(), t.minute()),
+            (2026, 9, 29, 12, 0),
+            "{}",
+            f.name()
+        );
+    }
+}
+
+#[test]
+fn long_multibyte_titles_give_entry_names_within_the_byte_cap() {
+    let mut a = summary_record("fnd_a", Severity::High);
+    a.summary = "記録".repeat(120);
+    let mut b = summary_record("fnd_b", Severity::High);
+    b.summary = "記録".repeat(120);
+    // Two projects: same number, same (cut) title, so the second entry also
+    // needs a de-duplication suffix within the cap.
+    let all = numbered(vec![input("alpha", None, a), input("beta", None, b)]);
+    let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Html).unwrap();
+    let names: Vec<String> = unzip(&zip).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names.len(), 3);
+    for name in &names[1..] {
+        assert!(name.len() <= MAX_NAME_BYTES, "{} bytes: {name}", name.len());
+        assert!(name.ends_with(".html"), "{name}");
+        assert!(name.starts_with("SEC-001 - 記録"), "{name}");
+    }
+    assert!(names[2].ends_with(" (2).html"), "{names:?}");
+}
+
+#[test]
+fn a_cross_reference_to_a_finding_left_out_keeps_its_project_number() {
+    let mut citing = full_report();
+    citing.cross_references = OrSentinel::Value(vec![CrossRef {
+        finding_id: "fnd_left_out".into(),
+        relation: Relation::Sibling,
+        note: None,
+    }]);
+    let all = numbered(vec![
+        input(
+            "notebin",
+            None,
+            full_record("fnd_cite", Severity::Critical, citing),
+        ),
+        input(
+            "notebin",
+            None,
+            full_record("fnd_left_out", Severity::High, full_report()),
+        ),
+    ]);
+    // The whole project's numbers, as the caller has them before selecting.
+    let project_numbers = number_map(&all);
+    let chosen = &all[..1];
+
+    let md = text(render_project(&meta(), chosen, &project_numbers, Format::Markdown).unwrap());
+    assert!(md.contains("- SEC-002 (sibling)"), "{md}");
+    assert!(!md.contains("fnd_left_out"), "{md}");
+    let html = text(render_project(&meta(), chosen, &project_numbers, Format::Html).unwrap());
+    assert!(html.contains("SEC-002 (sibling)"), "{html}");
+
+    let zip = render_split_zip(&meta(), chosen, &project_numbers, Format::Markdown).unwrap();
+    let entries = unzip(&zip);
+    assert!(
+        entries[1].1.contains("- SEC-002 (sibling)"),
+        "{}",
+        entries[1].1
+    );
+
+    // Given only the selection's own numbers, the id is all there is to show.
+    let md = text(render_project(&meta(), chosen, &HashMap::new(), Format::Markdown).unwrap());
+    assert!(md.contains("- fnd_left_out (sibling)"), "{md}");
+}
+
+#[test]
 fn an_empty_split_zip_is_just_the_index() {
-    let zip = render_split_zip(&meta(), &[], Format::Markdown).unwrap();
+    let zip = render_split_zip(&meta(), &[], &HashMap::new(), Format::Markdown).unwrap();
     let names: Vec<String> = unzip(&zip).into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["index.md"]);
 }
@@ -235,12 +317,22 @@ mod without_pdf {
     fn every_pdf_entry_point_reports_pdf_unavailable() {
         let f = full_finding();
         assert_unavailable(render_finding(&f, &one_numbers(&f), Format::Pdf));
-        assert_unavailable(render_project(&meta(), &two(), Format::Pdf));
-        assert_unavailable(render_split_zip(&meta(), &two(), Format::Pdf));
+        assert_unavailable(render_project(
+            &meta(),
+            &two(),
+            &HashMap::new(),
+            Format::Pdf,
+        ));
+        assert_unavailable(render_split_zip(
+            &meta(),
+            &two(),
+            &HashMap::new(),
+            Format::Pdf,
+        ));
         // Even an empty selection is refused, rather than silently producing
         // an archive with only an index.
-        assert_unavailable(render_project(&meta(), &[], Format::Pdf));
-        assert_unavailable(render_split_zip(&meta(), &[], Format::Pdf));
+        assert_unavailable(render_project(&meta(), &[], &HashMap::new(), Format::Pdf));
+        assert_unavailable(render_split_zip(&meta(), &[], &HashMap::new(), Format::Pdf));
     }
 
     #[test]
@@ -248,6 +340,6 @@ mod without_pdf {
         let f = full_finding();
         assert!(render_finding(&f, &one_numbers(&f), Format::Markdown).is_ok());
         assert!(render_finding(&f, &one_numbers(&f), Format::Html).is_ok());
-        assert!(render_split_zip(&meta(), &two(), Format::Markdown).is_ok());
+        assert!(render_split_zip(&meta(), &two(), &HashMap::new(), Format::Markdown).is_ok());
     }
 }

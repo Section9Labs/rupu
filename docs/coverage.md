@@ -306,8 +306,9 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
 A stored finding can be exported as Markdown, self-contained HTML, or PDF, for
 one finding or for a whole project. The Markdown, HTML and PDF documents all
 carry the same sections in the same order, and every field of the report is in
-them: CWE, verification, ticket notes, claim-to-artifact links, artifact kind and
-host, and provenance (surface, concern, scope, location). Free-text fields that
+them: CWE, verification, ticket notes, claim-to-artifact links, each call-chain
+hop's role (`source`, `hop`, `sink`), artifact kind and host, and provenance
+(surface, concern, scope, location). Free-text fields that
 the report stores as Markdown (the location input and output among them) render
 as Markdown. A `summary`-profile finding exports as a short document built from
 its summary, severity, location, rationale and provenance, marked as a summary
@@ -321,7 +322,8 @@ whatever else a report leaves out, and the CLI and the control plane agree on
 it. A number is a display label for a point in time, not a stored identifier:
 recording a new critical finding renumbers the ones after it. The `fnd_` id is
 the stable handle, and a project report's index lists number and id side by
-side.
+side. A cross-reference to another finding of the same project prints that
+finding's number, even when a filter leaves it out of the report.
 
 The prefix comes from `[findings].export_id_prefix`, default `SEC`. It is read
 from the **global** config (`~/.rupu/config.toml`) only: a project's
@@ -333,16 +335,25 @@ default is used.
 **File names.** A finding is named `<NUMBER> - <Short Title>.<ext>`, for example
 `SEC-003 - SQL injection in the search endpoint.pdf`. The title is shortened
 (80 characters), whitespace is collapsed, and path separators, Windows-reserved
-characters, control characters and bidirectional-override characters are
-removed. Entries in a split zip are cleaned the same way and de-duplicated. A
-project report is named after its title (default "Findings report").
+characters, control characters, bidirectional-override characters and
+zero-width characters are removed. A whole name is at most 200 bytes, extension
+included (a title in a multibyte script is cut, at a character boundary, to
+fit), so it can be written or extracted where names are limited to 255 bytes.
+Entries in a split zip are cleaned the same way, de-duplicated, and dated with
+the time the report was generated. A project report is named after its title
+(default "Findings report").
 
 **Formats.**
 
 - **Markdown** (`md`): plain text, with the sections in the same order as the
   other formats. Every finding's document opens with a `Filename:` line giving
   the suggested PDF file name (`<NUMBER> - <Short Title>.pdf`), in every export
-  format, not only PDF.
+  format, not only PDF. Report text is kept as Markdown, with three changes so
+  it cannot restructure the document around it: a `<` that starts a line
+  outside a code block is escaped (an unclosed `<script>` or `<!--` would
+  otherwise turn every later section into raw HTML), headings are moved two
+  levels down (`#` becomes `###`, as in HTML and PDF), and an unclosed code
+  fence is closed. Code blocks are copied unchanged.
 - **HTML** (`html`): one self-contained file with inline CSS. It loads nothing
   from the network and runs no script; a strict Content-Security-Policy
   (`default-src 'none'`, no `<base>`, no form posts) and a no-referrer policy are
@@ -381,9 +392,12 @@ The document format is `--to` (default `md`), not `--format`: `--format` is
 rupu's global output flag (`table`, `json`, `csv`) and has nothing to shape here.
 Filters combine: a finding must pass all of them. `--severity` keeps that
 severity and worse. `--run` keeps findings declared by that run and its
-sub-runs. `--project` must be a registered project: a workspace id, or the path
-of a registered project's checkout. Anything else is an error ("no project
-matches ...").
+sub-runs. `--cwe` compares CWE numbers: `CWE-79` (or `cwe-79`, or `79`) keeps
+findings whose report lists CWE-79 or whose concern is CWE-79
+(`cwe-top25-2023:cwe-79-xss`), never CWE-798 or CWE-179; a value that is not a
+CWE id is a usage error. `--project` must be a registered project: a workspace
+id, or the path of a registered project's checkout. Anything else is an error
+("no project matches ...").
 
 Exactly one `--id` on its own writes that finding as a stand-alone document.
 Adding any of `--project`, `--run`, `--severity`, `--owner`, `--cwe`, `--split`
@@ -422,14 +436,17 @@ title. The download is named by the server.
   min_severity?, owner?, cwe?, include_summaries?, split?}`. Unknown fields are
   rejected with `422` (a misspelt filter must not widen the report), and the
   body of that rejection is plain text rather than the API's usual JSON error.
-  A missing or unknown `format`, an unknown `min_severity`, or a `title` over
-  200 characters is `400`; a selection that matches nothing is `404`; PDF from
-  a build without the `pdf` feature is `501`.
+  `cwe` is compared by number, as `--cwe` is. A missing or unknown `format`, an
+  unknown `min_severity`, a `cwe` that is not a CWE id, or a `title` over 200
+  characters is `400`; a selection that matches nothing is `404`; PDF from a
+  build without the `pdf` feature is `501`.
 
 Both are attachments with `Content-Disposition: attachment` and
 `X-Content-Type-Options: nosniff`; an HTML response also carries
 `Content-Security-Policy: sandbox`. The control plane uses the same numbering
-and the same global-config prefix as the CLI.
+and the same global-config prefix as the CLI. At most two PDF exports render at
+once in `cp serve` (a Typst compile is CPU- and memory-heavy); further PDF
+requests wait their turn, while Markdown and HTML are never held up.
 
 ## CLI
 

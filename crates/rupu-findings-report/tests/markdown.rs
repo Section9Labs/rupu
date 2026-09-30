@@ -225,7 +225,7 @@ fn a_project_renders_an_index_and_a_rule_between_findings() {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "Project notebin · severity ≥ high".into(),
     };
-    let md = render(&project_blocks(&meta, &all));
+    let md = render(&project_blocks(&meta, &all, &HashMap::new()));
     assert!(md.starts_with("# Notebin findings\n"), "{md}");
     for want in [
         "**Generated:** 2026-09-29T12:00:00Z",
@@ -256,7 +256,7 @@ fn an_empty_project_reports_zero_findings() {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "all".into(),
     };
-    let md = render(&project_blocks(&meta, &[]));
+    let md = render(&project_blocks(&meta, &[], &HashMap::new()));
     assert!(md.contains("**Findings:** 0"));
     assert!(!md.contains("---\n"));
 }
@@ -298,9 +298,32 @@ fn values_cannot_break_out_of_their_line_or_table_cell() {
 }
 
 #[test]
-fn consecutive_steps_end_in_hard_breaks_so_they_stay_on_separate_lines() {
+fn consecutive_steps_are_separated_by_a_blank_line() {
     let md = render(&[Block::Steps(vec!["first".into(), "second".into()])]);
-    assert_eq!(md, "Step 1: first  \nStep 2: second\n");
+    assert_eq!(md, "Step 1: first\n\nStep 2: second\n");
+}
+
+#[test]
+fn a_step_ending_in_a_list_does_not_absorb_the_next_step() {
+    let md = render(&[Block::Steps(vec![
+        "Run:\n- open the notes page\n- copy the note id".into(),
+        "Request the note as user B".into(),
+    ])]);
+    // Where a CommonMark parser puts the second step: never inside an item.
+    let mut items = 0usize;
+    let mut found = false;
+    for e in Parser::new_ext(&md, Options::empty()) {
+        match e {
+            Event::Start(Tag::Item) => items += 1,
+            Event::End(TagEnd::Item) => items -= 1,
+            Event::Text(t) if t.contains("Step 2") => {
+                assert_eq!(items, 0, "Step 2 is inside a list item:\n{md}");
+                found = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(found, "{md}");
 }
 
 /// Text of every heading of `level` in `md`, as a CommonMark parser sees them.
@@ -409,7 +432,7 @@ fn an_unclosed_fence_in_a_step_does_not_swallow_the_next_step() {
     ])]);
     assert_eq!(
         md,
-        "Step 1: run this\n```sh\nrm -rf /tmp/x\n```  \nStep 2: then this\n"
+        "Step 1: run this\n```sh\nrm -rf /tmp/x\n```\n\nStep 2: then this\n"
     );
 }
 
@@ -436,7 +459,7 @@ fn an_unclosed_fence_in_one_finding_does_not_swallow_the_next_finding() {
         generated_at: ts("2026-09-29T12:00:00Z"),
         scope: "all".into(),
     };
-    let md = render(&project_blocks(&meta, &all));
+    let md = render(&project_blocks(&meta, &all, &HashMap::new()));
 
     // The fence is closed right after the description, before the next section.
     let fence = md
@@ -497,4 +520,179 @@ fn a_full_record_without_its_report_renders_the_could_not_load_note() {
     assert!(md.contains("_Full report could not be loaded by this build — summary record shown._"));
     assert!(!md.contains("no full report was recorded"));
     assert!(!md.contains("## Root Cause"));
+}
+
+/// A full finding with `description` as its Description, rendered alone.
+fn with_description(description: &str) -> String {
+    let mut report = full_report();
+    report.description = description.into();
+    let f = numbered(vec![input(
+        "notebin",
+        None,
+        full_record("fnd_d", Severity::High, report),
+    )])
+    .remove(0);
+    render(&finding_blocks(&f, &HashMap::new()))
+}
+
+const SECTIONS: [&str; 14] = [
+    "Description",
+    "Impact",
+    "Location",
+    "Root Cause",
+    "Call Chain / Attack Flow",
+    "Evidence",
+    "Remediation",
+    "Recommended Patch",
+    "CI/CD Detection",
+    "Regression Test",
+    "Cross-References",
+    "References",
+    "Replication Steps",
+    "Provenance",
+];
+
+#[test]
+fn an_unclosed_html_block_in_prose_does_not_swallow_the_later_sections() {
+    for description in [
+        "The payload is\n\n<script src=https://notebin.example/x.js>\n\nand it runs.",
+        "<script>",
+        "<!-- todo: verify",
+        "Summary.\n   <!-- indented, still an HTML block start",
+        "<?php echo $note;",
+        "<![CDATA[ note body",
+        "<style>\nbody { display: none }",
+        "<div>\n\n<pre>",
+    ] {
+        let md = with_description(description);
+        // A real parser still sees every later section as a heading.
+        assert_eq!(
+            headings(&md, HeadingLevel::H2),
+            SECTIONS,
+            "{description:?}\n{md}"
+        );
+        // And no line of the document opens an HTML block.
+        for e in Parser::new_ext(&md, Options::empty()) {
+            assert!(
+                !matches!(e, Event::Start(Tag::HtmlBlock)),
+                "{description:?}\n{md}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unclosed_html_block_in_one_finding_does_not_swallow_the_next_finding() {
+    let mut open = full_report();
+    open.description = "Proof:\n\n<script>alert(document.cookie)".into();
+    let mut comment = full_report();
+    comment.title = "Second finding".into();
+    comment.impact = "<!-- the rest is unverified".into();
+    let mut third = full_report();
+    third.title = "Third finding".into();
+    let all = numbered(vec![
+        input(
+            "notebin",
+            None,
+            full_record("fnd_1", Severity::Critical, open),
+        ),
+        input(
+            "notebin",
+            None,
+            full_record("fnd_2", Severity::High, comment),
+        ),
+        input(
+            "notebin",
+            None,
+            full_record("fnd_3", Severity::Medium, third),
+        ),
+    ]);
+    let meta = ReportMeta {
+        title: "Notebin".into(),
+        generated_at: ts("2026-09-29T12:00:00Z"),
+        scope: "all".into(),
+    };
+    let md = render(&project_blocks(&meta, &all, &HashMap::new()));
+    let h1 = headings(&md, HeadingLevel::H1);
+    assert!(h1.contains(&"Second finding".to_string()), "{h1:?}\n{md}");
+    assert!(h1.contains(&"Third finding".to_string()), "{h1:?}");
+    let h2 = headings(&md, HeadingLevel::H2);
+    assert_eq!(
+        h2.iter().filter(|h| *h == "Provenance").count(),
+        3,
+        "{h2:?}"
+    );
+    // The agent text survives, as text.
+    assert!(md.contains("\\<script>alert(document.cookie)"), "{md}");
+    assert!(md.contains("\\<!-- the rest is unverified"), "{md}");
+}
+
+#[test]
+fn fenced_code_in_prose_is_copied_byte_for_byte() {
+    let fenced =
+        "```html\n<script>alert(1)</script>\n# not a heading\nnot a setext\n===\n  <!-- x\n```";
+    let md = with_description(&format!("Intro.\n\n{fenced}\n\nAfter."));
+    assert!(md.contains(fenced), "{md}");
+    // Inside a list item too: the parser, not a line scan, decides what is code.
+    let listed = "- step\n\n  ```\n  <!-- kept\n  # kept\n  ```";
+    assert_eq!(
+        render(&[Block::Prose(listed.into())]),
+        format!("{listed}\n")
+    );
+    // Indented code is code as well.
+    let indented = "Text.\n\n    <script>\n    # kept";
+    assert_eq!(
+        render(&[Block::Prose(indented.into())]),
+        format!("{indented}\n")
+    );
+}
+
+#[test]
+fn a_line_opening_an_autolink_is_left_a_link() {
+    for line in [
+        "<https://notebin.example/docs>",
+        "<security@notebin.example>",
+    ] {
+        assert_eq!(render(&[Block::Prose(line.into())]), format!("{line}\n"));
+    }
+}
+
+#[test]
+fn agent_headings_are_shifted_below_the_document_headings() {
+    let md = with_description(
+        "# Big\n\n## Remediation\n\n### Three\n\n#### Four\n\n###### Six\n\n\
+         Setext one\n===\n\nSetext\ntwo\n---\n\n> Quoted\n> ---\n\n```\n# in code\n## in code\n```",
+    );
+    // The document's own h1/h2 are untouched and nothing is added to them.
+    assert_eq!(
+        headings(&md, HeadingLevel::H1),
+        ["Notes API returns another user's note by id"]
+    );
+    assert_eq!(headings(&md, HeadingLevel::H2), SECTIONS, "{md}");
+    assert_eq!(
+        headings(&md, HeadingLevel::H3),
+        ["Big", "Setext one"],
+        "{md}"
+    );
+    assert_eq!(
+        headings(&md, HeadingLevel::H4),
+        ["Remediation", "Setext two"],
+        "{md}"
+    );
+    assert_eq!(headings(&md, HeadingLevel::H5), ["Three"], "{md}");
+    assert_eq!(headings(&md, HeadingLevel::H6), ["Four", "Six"], "{md}");
+    assert!(md.contains("### Big\n"), "{md}");
+    assert!(md.contains("#### Remediation\n"), "{md}");
+    assert!(md.contains("###### Six\n"), "{md}");
+    assert!(md.contains("### Setext one\n"), "{md}");
+    // A setext heading inside a quote keeps its words but is no heading.
+    assert!(md.contains("> Quoted\n> \\---"), "{md}");
+    // Code is untouched.
+    assert!(md.contains("```\n# in code\n## in code\n```"), "{md}");
+}
+
+#[test]
+fn headings_in_a_step_are_shifted_too() {
+    let md = render(&[Block::Steps(vec!["Setup\n\n## Expected".into()])]);
+    assert_eq!(md, "Step 1: Setup\n\n#### Expected\n");
 }

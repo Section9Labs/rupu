@@ -55,8 +55,9 @@ pub struct ExportArgs {
     /// Only findings whose report names this owner.
     #[arg(long, value_name = "OWNER", value_parser = non_blank)]
     owner: Option<String>,
-    /// Only findings for this CWE (e.g. CWE-79).
-    #[arg(long, value_name = "CWE-N", value_parser = non_blank)]
+    /// Only findings for this CWE (e.g. CWE-79), compared by number: CWE-79
+    /// never selects CWE-798.
+    #[arg(long, value_name = "CWE-N", value_parser = cwe_id)]
     cwe: Option<String>,
     /// Keep findings recorded without a full report (left out by default).
     #[arg(long)]
@@ -111,6 +112,15 @@ fn non_blank(raw: &str) -> Result<String, String> {
     } else {
         Ok(trimmed.to_string())
     }
+}
+
+/// A `--cwe` value (`CWE-79`, `cwe-79` or `79`), normalised to `CWE-79`.
+/// Anything else is a usage error rather than a filter that matches nothing.
+fn cwe_id(raw: &str) -> Result<String, String> {
+    let raw = non_blank(raw)?;
+    rupu_findings_report::select::parse_cwe(&raw)
+        .map(|n| format!("CWE-{n}"))
+        .ok_or_else(|| format!("`{raw}` is not a CWE id (expected e.g. CWE-79)"))
 }
 
 pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
@@ -325,6 +335,17 @@ mod tests {
             assert_eq!(export(&args).single_id(), None, "{extra:?}");
         }
         assert_eq!(export(&["--id", "fnd_1", "--split"]).single_id(), None);
+    }
+
+    #[test]
+    fn a_cwe_is_normalised_and_an_unreadable_one_is_a_usage_error() {
+        for raw in ["CWE-79", "cwe-79", "79"] {
+            assert_eq!(export(&["--cwe", raw]).cwe.as_deref(), Some("CWE-79"));
+        }
+        for bad in ["xss", "CWE-", "CWE-79a"] {
+            let argv = ["harness", "export", "-o", "out", "--cwe", bad];
+            assert!(Harness::try_parse_from(argv).is_err(), "{bad}");
+        }
     }
 
     #[test]

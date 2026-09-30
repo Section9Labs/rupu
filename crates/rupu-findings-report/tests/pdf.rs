@@ -64,7 +64,7 @@ fn a_project_pdf_is_bigger_than_one_finding() {
     let all = two();
     let numbers = number_map(&all);
     let single = render_finding(&all[0], &numbers, Format::Pdf).unwrap();
-    let project = render_project(&meta(), &all, Format::Pdf).unwrap();
+    let project = render_project(&meta(), &all, &HashMap::new(), Format::Pdf).unwrap();
     assert!(is_pdf(&project));
     assert!(
         project.len() > single.len(),
@@ -76,7 +76,7 @@ fn a_project_pdf_is_bigger_than_one_finding() {
 
 #[test]
 fn an_empty_project_still_renders_a_pdf() {
-    let pdf = render_project(&meta(), &[], Format::Pdf).unwrap();
+    let pdf = render_project(&meta(), &[], &HashMap::new(), Format::Pdf).unwrap();
     assert!(is_pdf(&pdf));
 }
 
@@ -98,7 +98,7 @@ fn typst_looking_text_is_data_not_code() {
 #[test]
 fn pdf_split_zip_holds_real_pdfs() {
     let all = two();
-    let zip = render_split_zip(&meta(), &all, Format::Pdf).unwrap();
+    let zip = render_split_zip(&meta(), &all, &HashMap::new(), Format::Pdf).unwrap();
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
     assert_eq!(z.len(), 3);
     for i in 0..z.len() {
@@ -358,7 +358,8 @@ fn hostile_report_fields_compile_end_to_end() {
         let blocks = finding_blocks(f, &numbers);
         compiles(&f.number, &blocks);
     }
-    let pdf = render_project(&meta(), &all, Format::Pdf).expect("project compiles");
+    let pdf =
+        render_project(&meta(), &all, &HashMap::new(), Format::Pdf).expect("project compiles");
     assert!(is_pdf(&pdf));
 }
 
