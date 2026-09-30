@@ -1891,7 +1891,7 @@ fn usage_runs_fixture_is_current() {
     // is private to that module — hand-built. 6 flat `(run × model)` workflow
     // rows spanning 2 days and 3 models (2 priced + 1 unpriced/nil-cost row,
     // per the brief), plus 1 standalone agent run (`kind: "agent"`,
-    // `workflow_name: null`). `host_id` is always `"local"` — this endpoint
+    // `workflow_name: ""`). `host_id` is always `"local"` — this endpoint
     // is local-only, no host fan-out (see the doc comment on `get_usage_runs`).
     let day1 = Utc.with_ymd_and_hms(2026, 8, 19, 9, 0, 0).unwrap();
     let day2 = Utc.with_ymd_and_hms(2026, 8, 20, 9, 0, 0).unwrap();
@@ -2003,7 +2003,7 @@ fn usage_runs_fixture_is_current() {
             "run_id": "run-07",
             "kind": "agent",
             "started_at": day2,
-            "workflow_name": null,
+            "workflow_name": "",
             "agent": "rupuso",
             "provider": "anthropic",
             "model": "claude-sonnet-4-6",
@@ -2023,13 +2023,17 @@ fn usage_runs_fixture_is_current() {
 #[test]
 fn usage_outliers_fixture_is_current() {
     // `GET /api/usage/outliers` (api/usage_outliers.rs): `OutlierRun` is
-    // `pub` — mirrored for real. 2 outliers across 2 workflows.
+    // `pub` — mirrored for real. 2 outliers across 2 workflows, plus 1
+    // standalone agent run (`kind: "agent"`, `workflow_name: ""`, baselined
+    // against its agent's other standalone runs).
     let t = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
 
     let outliers = vec![
         OutlierRun {
             run_id: "run-06".into(),
+            kind: "workflow",
             workflow_name: "nightly-health".into(),
+            agent: None,
             cost_usd: 12.50,
             baseline_usd: 1.20,
             ratio: 12.50 / 1.20,
@@ -2037,10 +2041,22 @@ fn usage_outliers_fixture_is_current() {
         },
         OutlierRun {
             run_id: "run-09".into(),
+            kind: "workflow",
             workflow_name: "hotfix".into(),
+            agent: None,
             cost_usd: 8.0,
             baseline_usd: 2.0,
             ratio: 4.0,
+            started_at: t + chrono::Duration::days(1),
+        },
+        OutlierRun {
+            run_id: "run-10".into(),
+            kind: "agent",
+            workflow_name: String::new(),
+            agent: Some("rupuso".into()),
+            cost_usd: 3.5,
+            baseline_usd: 1.0,
+            ratio: 3.5,
             started_at: t + chrono::Duration::days(1),
         },
     ];

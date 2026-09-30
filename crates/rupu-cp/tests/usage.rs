@@ -1293,9 +1293,9 @@ async fn usage_endpoint_includes_standalone_and_session_transcripts_once() {
     assert_eq!(kind_of("run_S"), "agent");
     assert_eq!(kind_of("run_T"), "session");
     let s_row = rows.iter().find(|r| r["run_id"] == "run_S").unwrap();
-    assert!(
-        s_row["workflow_name"].is_null(),
-        "a standalone row has no workflow: {s_row}"
+    assert_eq!(
+        s_row["workflow_name"], "",
+        "a standalone row has no workflow (\"\", an additive-only wire change): {s_row}"
     );
     assert_eq!(s_row["total_tokens"].as_u64(), Some(110));
     assert_eq!(s_row["host_id"], "local");
@@ -1405,4 +1405,164 @@ async fn agent_run_usage_includes_dispatch_children() {
         Some(1155),
         "{body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Part E: the entity rollups and outliers count standalone agent runs and
+// session turns too — each transcript once (Task 9 fix round 1).
+// ---------------------------------------------------------------------------
+
+fn write_agent_md(global: &std::path::Path, name: &str) {
+    let dir = global.join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{name}.md")),
+        format!(
+            "---\nname: {name}\ndescription: agent {name}\nprovider: {FOLD_PROVIDER}\nmodel: {FOLD_MODEL}\n---\n\nYou are {name}.\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_workspace(global: &std::path::Path, id: &str) {
+    let dir = global.join("workspaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = global.join("proj");
+    std::fs::write(
+        dir.join(format!("{id}.toml")),
+        format!(
+            "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+            path.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// A standalone `rupu run` transcript + its meta in `<global>/transcripts`.
+fn write_standalone_run(
+    global: &std::path::Path,
+    run_id: &str,
+    agent: &str,
+    workspace_id: &str,
+    usages: &[(u32, u32)],
+) {
+    let tdir = global.join("transcripts");
+    write_fold_transcript(
+        &tdir.join(format!("{run_id}.jsonl")),
+        agent,
+        workspace_id,
+        usages,
+    );
+    write_standalone_meta(&tdir, run_id, None, "run_cli");
+}
+
+/// A completed workflow run (workspace `ws_wf`) whose one step transcript sits
+/// in `<global>/transcripts` — claimed by the run, never standalone spend.
+fn write_workflow_run_in_global_transcripts(
+    global: &std::path::Path,
+    run_id: &str,
+    agent: &str,
+    usages: &[(u32, u32)],
+) {
+    let t_path = global
+        .join("transcripts")
+        .join(format!("{run_id}_step.jsonl"));
+    write_fold_transcript(&t_path, agent, "ws_wf", usages);
+    let store = create_workflow_run(global, run_id, rupu_orchestrator::RunStatus::Completed);
+    store
+        .append_step_result(run_id, &step_result(run_id, "review", t_path))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn agent_and_project_rollups_include_standalone_spend_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    write_agent_md(global, "solo");
+    write_agent_md(global, "reviewer");
+    write_workspace(global, "ws_wf");
+    write_standalone_run(global, "run_S1", "solo", "ws_wf", &[(100, 10)]);
+    write_workflow_run_in_global_transcripts(global, "run_WF", "reviewer", &[(400, 40)]);
+
+    let srv = spawn_server(global).await;
+
+    // Per-agent: the standalone run counts for its agent, the workflow step
+    // transcript counts once — and both match `/api/usage?group_by=agent`.
+    let agents = get_json(format!("{}/api/agents", srv.base_url)).await;
+    let agent_total = |name: &str| {
+        agents
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name)
+            .unwrap_or_else(|| panic!("agent {name} missing: {agents}"))["usage"]["total_tokens"]
+            .as_u64()
+    };
+    let by_agent = get_json(format!(
+        "{}/api/usage?host=local&group_by=agent",
+        srv.base_url
+    ))
+    .await;
+    let usage_total = |name: &str| {
+        by_agent["breakdown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["agent"] == name)
+            .and_then(|r| r["total_tokens"].as_u64())
+    };
+    assert_eq!(agent_total("solo"), Some(110), "{agents}");
+    assert_eq!(agent_total("solo"), usage_total("solo"), "{by_agent}");
+    assert_eq!(
+        agent_total("reviewer"),
+        Some(440),
+        "not double counted: {agents}"
+    );
+    assert_eq!(
+        agent_total("reviewer"),
+        usage_total("reviewer"),
+        "{by_agent}"
+    );
+
+    // Per-project: list and detail both include the standalone run's spend,
+    // the workflow step once; the run count stays the workflow-run count.
+    let projects = get_json(format!("{}/api/projects", srv.base_url)).await;
+    let p = projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["ws_id"] == "ws_wf")
+        .unwrap_or_else(|| panic!("project missing: {projects}"))
+        .clone();
+    assert_eq!(p["usage"]["total_tokens"].as_u64(), Some(550), "{p}");
+    assert_eq!(p["run_count"].as_u64(), Some(1), "{p}");
+    let detail = get_json(format!("{}/api/projects/ws_wf", srv.base_url)).await;
+    assert_eq!(
+        detail["usage"]["total_tokens"].as_u64(),
+        Some(550),
+        "{detail}"
+    );
+}
+
+#[tokio::test]
+async fn outliers_include_standalone_runs_and_never_double_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    for id in ["run_C1", "run_C2", "run_C3"] {
+        write_standalone_run(global, id, "solo", "ws_a", &[(1000, 0)]);
+    }
+    write_standalone_run(global, "run_SPIKE", "solo", "ws_a", &[(10_000, 0)]);
+    // An expensive workflow step by the same agent, in the global transcripts
+    // dir: if it leaked into the standalone population it would be a second
+    // "solo" outlier.
+    write_workflow_run_in_global_transcripts(global, "run_WF", "solo", &[(50_000, 0)]);
+
+    let srv = spawn_server(global).await;
+    let out = get_json(format!("{}/api/usage/outliers", srv.base_url)).await;
+    let out = out.as_array().expect("array");
+    assert_eq!(out.len(), 1, "only the standalone spike: {out:?}");
+    assert_eq!(out[0]["run_id"], "run_SPIKE");
+    assert_eq!(out[0]["kind"], "agent");
+    assert_eq!(out[0]["agent"], "solo");
+    assert_eq!(out[0]["workflow_name"], "");
 }

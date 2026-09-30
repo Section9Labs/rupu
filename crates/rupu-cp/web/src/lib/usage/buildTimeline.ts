@@ -56,9 +56,7 @@ function pivotKeyOf(row: UsageRunRow, pivot: Pivot): string {
     case 'agent':
       return row.agent;
     case 'workflow':
-      // A standalone/session row has no workflow (`null`); `/api/usage`'s
-      // breakdown keys the same spend as `''`, so a toggle matches both.
-      return row.workflow_name ?? '';
+      return row.workflow_name;
     case 'host':
       return row.host_id;
     case 'project':

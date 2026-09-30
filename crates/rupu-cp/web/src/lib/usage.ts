@@ -72,8 +72,8 @@ export interface UsageRunRow {
    *  (`agent`) or a session turn (`session`). Absent from CPs predating it. */
   kind?: 'workflow' | 'agent' | 'session';
   started_at: string;
-  /** `null` for a standalone agent run or session turn. */
-  workflow_name: string | null;
+  /** `""` for a standalone agent run or session turn. */
+  workflow_name: string;
   agent: string;
   provider: string;
   model: string;

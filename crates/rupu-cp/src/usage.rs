@@ -184,8 +184,15 @@ pub struct EntityRollup {
 impl EntityRollup {
     /// Fold one run's usage + timestamp into the rollup.
     pub fn add(&mut self, usage: &UsageSummary, at: Option<String>) {
-        self.usage = rollup([self.usage.clone(), usage.clone()].into_iter());
+        self.add_spend(usage, at);
         self.run_count += 1;
+    }
+
+    /// Fold spend + activity that is not a run-store run (a standalone agent
+    /// run or session turn): usage and `last_active` move, `run_count` —
+    /// the entity's workflow-run count — does not.
+    pub fn add_spend(&mut self, usage: &UsageSummary, at: Option<String>) {
+        self.usage = rollup([self.usage.clone(), usage.clone()].into_iter());
         if let Some(at) = at {
             match &self.last_active {
                 Some(cur) if *cur >= at => {}

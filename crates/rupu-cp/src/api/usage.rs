@@ -410,16 +410,18 @@ pub(crate) fn resolve_window(
 /// One local spend source's usage, attributed: a workflow run from the run
 /// store, or a standalone agent run / session turn
 /// ([`crate::usage_sources::extra_sources`]).
-struct LocalSource {
-    kind: crate::usage_sources::SourceKind,
-    id: String,
-    started_at: DateTime<Utc>,
-    /// `None` for a standalone agent run or session turn.
-    workflow_name: Option<String>,
-    /// Stamped with `workflow` (empty when none), `workspace_id` and
-    /// `host_id = "local"`.
-    rows: Vec<rupu_transcript::UsageRow>,
-    partial: bool,
+pub(crate) struct LocalSource {
+    pub(crate) kind: crate::usage_sources::SourceKind,
+    pub(crate) id: String,
+    pub(crate) started_at: DateTime<Utc>,
+    /// The workflow's name; `""` for a standalone agent run or session turn.
+    pub(crate) workflow: String,
+    /// The agent named by a standalone run's / session turn's transcript;
+    /// `""` for a workflow run (its steps name their own agents in `rows`).
+    pub(crate) agent: String,
+    /// Stamped with `workflow`, `workspace_id` and `host_id = "local"`.
+    pub(crate) rows: Vec<rupu_transcript::UsageRow>,
+    pub(crate) partial: bool,
 }
 
 /// Every local spend source started in `[start, end]` (and in `workspace`,
@@ -465,7 +467,8 @@ fn collect_local_sources(
             kind: SourceKind::Workflow,
             id: r.id.clone(),
             started_at: r.started_at,
-            workflow_name: Some(r.workflow_name.clone()),
+            workflow: r.workflow_name.clone(),
+            agent: String::new(),
             rows,
             partial: u.partial,
         });
@@ -491,7 +494,8 @@ fn collect_local_sources(
             kind: src.kind,
             id: src.id,
             started_at: at,
-            workflow_name: None,
+            workflow: String::new(),
+            agent: src.agent,
             rows,
             partial: u.partial,
         });
@@ -499,8 +503,10 @@ fn collect_local_sources(
     Ok((out, earliest))
 }
 
-/// [`collect_local_sources`] on the blocking pool.
-async fn local_sources(
+/// [`collect_local_sources`] on the blocking pool. Shared by every local
+/// usage aggregate (`/api/usage`, its timeline and `/runs`, and
+/// `/api/usage/outliers`) so they all count the same sources.
+pub(crate) async fn local_sources(
     s: &AppState,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -928,8 +934,9 @@ struct UsageRunRow {
     /// session turn).
     kind: &'static str,
     started_at: DateTime<Utc>,
-    /// `None` (`null`) for a standalone agent run or session turn.
-    workflow_name: Option<String>,
+    /// `""` for a standalone agent run or session turn (additive wire change
+    /// only: `kind` says which).
+    workflow_name: String,
     agent: String,
     provider: String,
     model: String,
@@ -985,7 +992,7 @@ async fn get_usage_runs(
                 run_id: src.id.clone(),
                 kind: src.kind.as_str(),
                 started_at: src.started_at,
-                workflow_name: src.workflow_name.clone(),
+                workflow_name: row.workflow,
                 agent: row.agent,
                 provider: row.provider,
                 model: row.model,

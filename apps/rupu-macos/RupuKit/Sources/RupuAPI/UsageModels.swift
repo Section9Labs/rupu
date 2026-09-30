@@ -177,28 +177,6 @@ public struct APIUsageRunRow: Decodable, Equatable, Sendable {
         case costUSD = "cost_usd"
         case priced
     }
-
-    /// Synthesized decoding except `workflow_name`, which is `null` for a
-    /// standalone agent run or session turn: it decodes as `""`, the key
-    /// `/api/usage`'s breakdown gives the same spend, so the workflow pivot
-    /// groups (and toggles) them identically.
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        runID = try c.decode(String.self, forKey: .runID)
-        startedAt = try c.decode(String.self, forKey: .startedAt)
-        workflowName = try c.decodeIfPresent(String.self, forKey: .workflowName) ?? ""
-        agent = try c.decode(String.self, forKey: .agent)
-        provider = try c.decode(String.self, forKey: .provider)
-        model = try c.decode(String.self, forKey: .model)
-        workspaceID = try c.decode(String.self, forKey: .workspaceID)
-        hostID = try c.decode(String.self, forKey: .hostID)
-        inputTokens = try c.decode(UInt64.self, forKey: .inputTokens)
-        outputTokens = try c.decode(UInt64.self, forKey: .outputTokens)
-        cachedTokens = try c.decode(UInt64.self, forKey: .cachedTokens)
-        totalTokens = try c.decode(UInt64.self, forKey: .totalTokens)
-        costUSD = try c.decodeIfPresent(Double.self, forKey: .costUSD)
-        priced = try c.decode(Bool.self, forKey: .priced)
-    }
 }
 
 /// A run costing far more than its OWN workflow's median baseline

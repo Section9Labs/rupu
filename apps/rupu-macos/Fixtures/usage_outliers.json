@@ -1,6 +1,7 @@
 [
   {
     "run_id": "run-06",
+    "kind": "workflow",
     "workflow_name": "nightly-health",
     "cost_usd": 12.5,
     "baseline_usd": 1.2,
@@ -9,10 +10,21 @@
   },
   {
     "run_id": "run-09",
+    "kind": "workflow",
     "workflow_name": "hotfix",
     "cost_usd": 8.0,
     "baseline_usd": 2.0,
     "ratio": 4.0,
+    "started_at": "2026-08-21T12:00:00Z"
+  },
+  {
+    "run_id": "run-10",
+    "kind": "agent",
+    "workflow_name": "",
+    "agent": "rupuso",
+    "cost_usd": 3.5,
+    "baseline_usd": 1.0,
+    "ratio": 3.5,
     "started_at": "2026-08-21T12:00:00Z"
   }
 ]

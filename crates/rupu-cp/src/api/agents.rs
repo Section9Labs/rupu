@@ -491,6 +491,53 @@ struct AgentDetailDto {
     raw: String,
 }
 
+/// Every local spend source's usage rows, for the per-agent rollup, plus
+/// each agent's most recent contributing start (RFC-3339). Blocking IO.
+///
+/// Workflow runs come from the one fold (`crate::usage::run_usage` —
+/// ledger-first, cached process-wide); standalone agent runs and session
+/// turns from [`crate::usage_sources::unclaimed_extra_sources`] (each
+/// transcript once: a transcript a workflow run claims is never also a
+/// standalone source). Each `UsageRow` (one per `(provider, model, agent)`)
+/// names the agent its transcript ran — for a standalone run, its own
+/// agent, and each dispatched child's agent for the child's share. `last_run`
+/// is folded from the SAME rows, the run's start as the candidate time.
+fn agent_usage_rows(
+    store: &rupu_orchestrator::runs::RunStore,
+    global: &std::path::Path,
+) -> (
+    Vec<rupu_transcript::UsageRow>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
+    let mut last_runs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut add = |rows: Vec<rupu_transcript::UsageRow>, at: Option<String>| {
+        if let Some(at) = at {
+            for row in rows.iter().filter(|r| !r.agent.is_empty()) {
+                last_runs
+                    .entry(row.agent.clone())
+                    .and_modify(|cur| {
+                        if *cur < at {
+                            *cur = at.clone();
+                        }
+                    })
+                    .or_insert_with(|| at.clone());
+            }
+        }
+        all_rows.extend(rows);
+    };
+    for r in store.list().unwrap_or_default() {
+        let rows = crate::usage::run_usage(store, &r.id).rows.clone();
+        add(rows, Some(r.started_at.to_rfc3339()));
+    }
+    for src in crate::usage_sources::unclaimed_extra_sources(global, store) {
+        let rows = crate::usage::transcripts_usage(&src.paths).rows.clone();
+        add(rows, src.started_at.map(|t| t.to_rfc3339()));
+    }
+    (all_rows, last_runs)
+}
+
 /// `GET /api/agents` — global agent definitions plus one representative
 /// workspace per distinct repo among the registered projects'
 /// `<path>/.rupu/agents/*.md` (see [`distinct_repo_workspaces`]), sorted by
@@ -564,36 +611,16 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     // already-sorted order) rather than duplicating it onto every same-named
     // row. See the doc comment on `AgentDto::usage`.
     //
-    // Single pass over the run store: each run's usage comes from the one
-    // fold (`crate::usage::run_usage` — ledger-first, cached process-wide).
-    // Its `UsageRow`s (one per `(provider, model, agent)`) feed straight into
-    // `all_rows` for `breakdown`, which re-groups by agent name and sums —
-    // token/run counts are strictly additive and every transcript lands in
-    // exactly one run's rows. `last_run` is folded from the SAME per-run rows
-    // (their `agent` field names who the run's usage attributes to;
-    // `run.started_at` is the candidate timestamp).
-    let runs = s.run_store.list().unwrap_or_default();
-    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
-    let mut last_runs: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for r in &runs {
-        let rows = crate::usage::run_usage(&s.run_store, &r.id).rows.clone();
-        let at = r.started_at.to_rfc3339();
-        for row in &rows {
-            if row.agent.is_empty() {
-                continue;
-            }
-            last_runs
-                .entry(row.agent.clone())
-                .and_modify(|cur| {
-                    if *cur < at {
-                        *cur = at.clone();
-                    }
-                })
-                .or_insert_with(|| at.clone());
-        }
-        all_rows.extend(rows);
-    }
+    // Every local spend source feeds `breakdown` (see `agent_usage_rows`),
+    // which re-groups by agent name — the same rows `/api/usage` groups, so
+    // an agent's usage here matches `/api/usage?group_by=agent`.
+    let (all_rows, last_runs) = {
+        let store = Arc::clone(&s.run_store);
+        let global = s.global_dir.clone();
+        tokio::task::spawn_blocking(move || agent_usage_rows(&store, &global))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     let breakdown = crate::usage::breakdown(&all_rows, &s.pricing, crate::usage::GroupBy::Agent);
 
     let mut canonical_dto_for_name: std::collections::HashMap<String, usize> =

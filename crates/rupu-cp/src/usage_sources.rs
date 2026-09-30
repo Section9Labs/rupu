@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// Which kind of run a spend source is (`UsageRunRow.kind` on the wire).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     Workflow,
     Agent,
@@ -153,6 +153,16 @@ pub fn claimed_transcripts(run_store: &RunStore, runs: &[RunRecord]) -> HashSet<
         claim(&archive, &r.id);
     }
     claimed
+}
+
+/// Every standalone agent run and session turn under `global` that no
+/// workflow run (active or archived) claims: [`extra_sources`] with the
+/// claimed set built from the whole run store. For the entity rollups and
+/// any other aggregate that does not already hold the run list. Blocking IO.
+pub fn unclaimed_extra_sources(global: &Path, run_store: &RunStore) -> Vec<ExtraSource> {
+    let runs = run_store.list().unwrap_or_default();
+    let claimed = claimed_transcripts(run_store, &runs);
+    extra_sources(global, run_store, &claimed)
 }
 
 /// Standalone + session transcripts under `global`, EXCLUDING any path in

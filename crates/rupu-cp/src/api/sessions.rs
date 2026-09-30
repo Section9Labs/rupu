@@ -252,13 +252,25 @@ fn session_usage_from_totals(
     }
 }
 
+/// Which sessions a scan keeps, and whether it prices them.
+#[derive(Clone, Copy)]
+pub(crate) struct SessionScan<'a> {
+    /// `Some` → each session gets a `usage` block ([`session_usage`], which
+    /// folds its turns' transcripts); `None` → no usage is computed at all,
+    /// for callers that only count or list sessions.
+    pub(crate) pricing: Option<&'a rupu_config::PricingConfig>,
+    /// `Some(w)` → only sessions whose `workspace_id == w`, filtered BEFORE
+    /// any usage is folded.
+    pub(crate) workspace: Option<&'a str>,
+}
+
 /// Scan `<root>` for `<id>/session.json` entries. Assigns `scope` to
 /// each successfully parsed session and pushes it onto `out`.
 fn scan_session_dir(
     root: &std::path::Path,
     scope: &str,
     run_store: &rupu_orchestrator::runs::RunStore,
-    pricing: &rupu_config::PricingConfig,
+    scan: SessionScan<'_>,
     out: &mut Vec<serde_json::Value>,
 ) {
     if !root.is_dir() {
@@ -276,40 +288,61 @@ fn scan_session_dir(
         if !dir.is_dir() {
             continue;
         }
-        if let Some(dto) = try_load_session(&dir) {
-            let usage = session_usage(&dto, run_store, pricing);
-            match serde_json::to_value(&dto) {
-                Ok(mut val) => {
-                    if let serde_json::Value::Object(ref mut map) = val {
-                        map.insert(
-                            "scope".to_string(),
-                            serde_json::Value::String(scope.to_string()),
-                        );
-                        if let Ok(u) = serde_json::to_value(&usage) {
-                            map.insert("usage".to_string(), u);
-                        }
-                    }
-                    out.push(val);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session_dir = %dir.display(),
-                        error = %e,
-                        "failed to serialize session dto; skipping"
+        let Some(dto) = try_load_session(&dir) else {
+            continue;
+        };
+        if scan.workspace.is_some_and(|w| dto.workspace_id != w) {
+            continue;
+        }
+        let usage = scan
+            .pricing
+            .map(|pricing| session_usage(&dto, run_store, pricing));
+        match serde_json::to_value(&dto) {
+            Ok(mut val) => {
+                if let serde_json::Value::Object(ref mut map) = val {
+                    map.insert(
+                        "scope".to_string(),
+                        serde_json::Value::String(scope.to_string()),
                     );
+                    if let Some(Ok(u)) = usage.map(|u| serde_json::to_value(&u)) {
+                        map.insert("usage".to_string(), u);
+                    }
                 }
+                out.push(val);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_dir = %dir.display(),
+                    error = %e,
+                    "failed to serialize session dto; skipping"
+                );
             }
         }
     }
 }
 
-/// Collect all sessions from both active and archive dirs. Each entry has an
-/// injected `"scope"` key (`"active"` or `"archived"`). Exposed as
-/// `pub(crate)` so that the dashboard aggregate can reuse the scan without
-/// duplicating logic.
+/// Collect all sessions from both active and archive dirs, each priced.
+/// Each entry has an injected `"scope"` key (`"active"` or `"archived"`).
+/// Blocking IO (every session's turn transcripts are folded) — call from
+/// `spawn_blocking`.
 pub(crate) fn collect_sessions(
     global_dir: &std::path::Path,
     pricing: &rupu_config::PricingConfig,
+) -> Vec<serde_json::Value> {
+    collect_sessions_with(
+        global_dir,
+        SessionScan {
+            pricing: Some(pricing),
+            workspace: None,
+        },
+    )
+}
+
+/// [`collect_sessions`] with an explicit [`SessionScan`]: a workspace
+/// filter and/or no pricing. Blocking IO — call from `spawn_blocking`.
+pub(crate) fn collect_sessions_with(
+    global_dir: &std::path::Path,
+    scan: SessionScan<'_>,
 ) -> Vec<serde_json::Value> {
     // Session turns' dispatch sub-runs live in the global run store.
     let run_store = rupu_orchestrator::runs::RunStore::new(global_dir.join("runs"));
@@ -318,14 +351,14 @@ pub(crate) fn collect_sessions(
         &global_dir.join("sessions"),
         "active",
         &run_store,
-        pricing,
+        scan,
         &mut sessions,
     );
     scan_session_dir(
         &global_dir.join("sessions-archive"),
         "archived",
         &run_store,
-        pricing,
+        scan,
         &mut sessions,
     );
     sessions
@@ -496,7 +529,15 @@ async fn get_session(
         None => return Err(ApiError::not_found(format!("session {id} not found"))),
     };
 
-    let usage = session_usage(&dto, &s.run_store, &s.pricing);
+    // Folding the turns' transcripts is blocking IO.
+    let usage = {
+        let dto = dto.clone();
+        let store = std::sync::Arc::clone(&s.run_store);
+        let pricing = s.pricing.clone();
+        tokio::task::spawn_blocking(move || session_usage(&dto, &store, &pricing))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     let mut val = serde_json::to_value(&dto).map_err(|e| ApiError::internal(e.to_string()))?;
     if let serde_json::Value::Object(ref mut map) = val {
         map.insert(
