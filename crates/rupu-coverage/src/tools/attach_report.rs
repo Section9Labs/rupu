@@ -64,9 +64,11 @@ pub fn attach_reports(
 }
 
 /// [`attach_reports`] with a hook that runs after the replacement ledger is
-/// staged and before it is renamed into place: the only window in which a
-/// writer that does not take the lock can change the ledger, so tests use it
-/// to stand in for one.
+/// staged and before it is renamed into place. It is a test seam: the hook is
+/// where a test can stand in for a writer that does not take the lock (an
+/// older worker, say) or check that the lock is held. The length check that
+/// catches such a writer is not limited to this window; an unlocked append at
+/// any point after the ledger was read is detected.
 fn attach_reports_with(
     paths: &CoveragePaths,
     items: Vec<AttachItem>,
@@ -228,7 +230,8 @@ fn backup_path(root: &Path, stamp: &str) -> PathBuf {
 /// Back the ledger up byte for byte, then replace it with `segments` via a
 /// temp file and a rename, so a reader sees the old ledger or the new one,
 /// never a mix. Returns the backup's path. On any failure before the rename
-/// nothing is left behind: not the temp file, not the backup.
+/// nothing is left behind: not the temp file, not the backup (including a
+/// partial one).
 ///
 /// The lock only excludes writers that take it. `read_len` is the ledger's
 /// length when it was read; if it has changed by the time the replacement is
@@ -242,7 +245,12 @@ fn replace_ledger(
 ) -> std::io::Result<PathBuf> {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let backup = backup_path(&paths.root, &stamp);
-    std::fs::copy(&paths.findings, &backup)?;
+    if let Err(e) = std::fs::copy(&paths.findings, &backup) {
+        // `backup` did not exist before the copy, so anything there is a
+        // partial copy of ours.
+        let _ = std::fs::remove_file(&backup);
+        return Err(e);
+    }
     let tmp = paths.root.join("findings.jsonl.import-tmp");
     let swapped = stage_and_swap(paths, segments, read_len, &tmp, before_rename);
     if swapped.is_err() {
@@ -250,14 +258,17 @@ fn replace_ledger(
         let _ = std::fs::remove_file(&backup);
     }
     swapped?;
-    // Make the rename itself durable, not only the file's contents.
-    match std::fs::File::open(&paths.root).and_then(|d| d.sync_all()) {
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
-            ) => {}
-        other => other?,
+    // Make the rename itself durable, not only the file's contents. Best
+    // effort: the ledger has been swapped by now, so a filesystem that cannot
+    // sync a directory must not turn a completed import into an error (the
+    // caller would lose the outcomes, and a retry would find every item
+    // already attached).
+    if let Err(e) = std::fs::File::open(&paths.root).and_then(|d| d.sync_all()) {
+        tracing::warn!(
+            ?e,
+            dir = ?paths.root,
+            "findings ledger replaced, but syncing its directory failed"
+        );
     }
     Ok(backup)
 }
@@ -376,6 +387,48 @@ mod tests {
             .filter(|n| n.contains("pre-import") || n.contains("import-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn the_ledger_lock_is_held_from_read_to_rename_and_released_after() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let id = seed_summary(&paths);
+        let sidecar = paths.root.join("findings.jsonl.lock");
+        let try_lock = || {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&sidecar)
+                .unwrap();
+            // Dropping `f` releases a lock this probe happened to win.
+            f.try_lock()
+        };
+
+        let mut probed = false;
+        attach_reports_with(
+            &paths,
+            vec![AttachItem {
+                finding_id: id,
+                report: report(),
+            }],
+            &FindingWriteOptions::default().with_profile(FindingProfile::Full),
+            false,
+            &mut || {
+                probed = true;
+                assert!(
+                    matches!(try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                    "the ledger lock must still be held right before the rename"
+                );
+            },
+        )
+        .unwrap();
+        assert!(probed, "the hook ran, so the ledger was rewritten");
+        assert!(
+            try_lock().is_ok(),
+            "the lock is released when the import returns"
+        );
     }
 
     #[test]
