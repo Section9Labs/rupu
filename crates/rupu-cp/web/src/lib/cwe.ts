@@ -20,6 +20,30 @@ export function cweFromFinding(finding: {
   return null;
 }
 
+/** Build a CWE `{id, url}` from a bare number or an id string (`"639"`,
+ *  `"CWE-639"`, `"cwe_639"`). `null` when no number can be found. */
+export function cweRef(raw: string): { id: string; url: string } | null {
+  const m = raw.match(/(\d+)/);
+  return m ? mk(m[1]) : null;
+}
+
+/** Every distinct CWE id (`CWE-639`) a list row carries: the report summary's
+ *  declared CWEs first, then the concern/evidence-derived one. */
+export function findingCweIds(finding: {
+  report_summary?: { cwe: string[] } | null;
+  concern_id?: string | null;
+  evidence?: { references?: string[] } | null;
+}): string[] {
+  const ids = new Set<string>();
+  for (const raw of finding.report_summary?.cwe ?? []) {
+    const ref = cweRef(raw);
+    if (ref) ids.add(ref.id);
+  }
+  const derived = cweFromFinding(finding);
+  if (derived) ids.add(derived.id);
+  return [...ids];
+}
+
 function mk(n: string): { id: string; url: string } {
   return {
     id: `CWE-${n}`,

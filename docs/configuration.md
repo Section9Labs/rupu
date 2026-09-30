@@ -231,6 +231,7 @@ for what a finding report contains and how artifacts are stored.
 | `artifact_total_max_bytes` | integer   | `2147483648` (2 GiB)        | Most bytes one report's artifacts may add up to in the store: only files that are copied count, and a file over `artifact_max_bytes` (recorded by reference) does not. Checked before anything is copied; a larger set rejects the finding with the total named |
 | `report_max_bytes`   | integer         | `262144` (256 KiB)          | Serialized-size budget for one `full` finding report; a larger report is rejected with the size named |
 | `ticket_patterns`    | array\<string\> | `[]`                        | Patterns (regexes or URL prefixes) that identify existing tickets in your organisation; appended to the finding-writing guidance agents get under the `full` profile. Nothing organisation-specific ships in rupu |
+| `export_id_prefix`   | string          | `SEC`                       | Prefix of the per-project display number on exported finding reports (`SEC-001`, `SEC-002`, …), used by `rupu findings export` and the control plane's downloads. Read from the **global** `config.toml` only: a project `.rupu/config.toml` never changes it, because it ends up in file names and document text. Must match `^[A-Za-z][A-Za-z0-9_-]{0,15}$`; anything else is ignored with a warning and `SEC` is used. See [Exporting reports](coverage.md#exporting-reports) |
 
 ---
 

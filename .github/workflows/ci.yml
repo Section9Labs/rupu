@@ -266,6 +266,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Every test binary that links rupu-findings-report carries Typst and
+      # its bundled fonts, and with full debug info the target dir outgrows
+      # the runner's free disk. Reclaim the preinstalled SDKs this job never
+      # uses (the build runs in the musl container).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
       - name: Build the pinned musl image
         run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
 
@@ -277,6 +287,8 @@ jobs:
           cache-directories: ".cargo-musl"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Line tables only: panics and backtraces still name file:line, but
+      # the dozens of test binaries stop carrying full debug info.
       - name: Test
         run: |
           mkdir -p .cargo-musl
@@ -352,6 +364,16 @@ jobs:
             -e CARGO_INCREMENTAL \
             rupu-linux-build \
             cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # PDF export is a default-on `pdf` feature; everything above builds with
+      # it. This keeps the build without it (no Typst, no bundled fonts)
+      # compiling too.
+      - name: Check the CLI without PDF support
+        run: |
+          docker run --rm -v "$PWD":/work -w /work \
+            -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            rupu-linux-build \
+            cargo check -p rupu-cli --no-default-features --locked
 
       # Informational only: `main` carries a large number of rustfmt diff
       # sites predating this workflow. Promote to blocking once a dedicated

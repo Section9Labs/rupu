@@ -388,6 +388,8 @@ Rules:
   - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`);
   - `findings_profile` on an `action:` step that calls any tool other than `findings.record` (e.g. `action: issues.comment`) — only `findings.record` has a findings contract for the profile to configure.
 
+The control-plane workflow editor (`rupu cp serve`) authors both levels. Where the server accepts the field (steps that run a local agent, and a local `action: findings.record` step), the step form has a **Findings** select: *Inherit* (omits the key, so the step falls back through the precedence above), *Full report*, or *Summary*. The Settings inspector has a **Defaults** card for `defaults.findings_profile` (unset omits the key, and `defaults:` itself when it ends up empty; other `defaults:` keys are preserved and listed read-only). The editor validates the same placement rules as the parser before saving: a `findings_profile` on a step that runs no agent, on a non-`findings.record` action, or on a remote step, and a `defaults.findings_profile` alongside a remote step, are flagged in the editor and would be rejected by the server. A profile set on a step that cannot take one stays visible in the form so it can be cleared.
+
 > **Upgrading:** the built-in profile is `full`, so an existing `action: findings.record` step that sends `summary` / `severity` / `rationale` now fails to parse. Add `findings_profile: summary` to that step (or `defaults.findings_profile: summary` to the workflow), or change its `with:` to send a `report`.
 
 ### `when`

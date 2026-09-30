@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "urn:rupu:schema:finding-report:v1",
   "title": "rupu finding report",
-  "description": "A complete security finding report, recorded once by the agent. The report is the source of truth for the finding. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
+  "description": "A complete security finding report, recorded once by the agent. Presentations and exports (Markdown, HTML, PDF) are generated from this report, so no separate report file is written. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
   "type": "object",
   "additionalProperties": false,
   "required": ["title", "ownership", "tickets", "rating", "category", "attack_vector", "cwe", "description", "impact", "location", "root_cause", "call_chain", "evidence", "remediation", "recommended_patch", "ci_cd_detection", "regression_test", "replication_steps", "cross_references", "references"],

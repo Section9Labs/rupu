@@ -247,8 +247,11 @@ struct SituationStoreTests {
             box.latest.yield(.event(.stepFailed(runID: "r", stepID: "s\(i)", error: "e\(i)")))
         }
 
-        await expectEventually("the cap trims the backlog to maxEventRows") {
+        // Wait for the LAST push to land, not just for three rows: three
+        // rows already exist after the third event, before s3/s4 are folded.
+        await expectEventually("all five pushes are folded and the cap holds") {
             store.eventRows.count == 3
+                && store.eventRows.first?.event == .stepFailed(runID: "r", stepID: "s4", error: "e4")
         }
         #expect(store.eventRows.count == 3, "cap (3) must hold even though 5 distinct events were pushed")
         #expect(

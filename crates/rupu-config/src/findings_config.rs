@@ -20,6 +20,8 @@ pub struct FindingsConfig {
     /// Patterns (regexes or URL prefixes) that identify existing tickets in
     /// this organisation; added to the agent guidance. Empty by default.
     pub ticket_patterns: Vec<String>,
+    /// Display-number prefix for exported reports (default `SEC`).
+    pub export_id_prefix: Option<String>,
 }
 
 #[cfg(test)]
@@ -43,6 +45,13 @@ mod tests {
         assert_eq!(cfg.findings.artifact_total_max_bytes, Some(10_485_760));
         assert_eq!(cfg.findings.report_max_bytes, None);
         assert_eq!(cfg.findings.ticket_patterns, vec!["ABC-[0-9]+".to_string()]);
+    }
+
+    #[test]
+    fn parses_export_id_prefix() {
+        let cfg: Config = toml::from_str("[findings]\nexport_id_prefix = \"VULN\"\n").unwrap();
+        assert_eq!(cfg.findings.export_id_prefix.as_deref(), Some("VULN"));
+        assert_eq!(Config::default().findings.export_id_prefix, None);
     }
 
     #[test]

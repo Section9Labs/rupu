@@ -87,18 +87,25 @@ impl Drop for TempFile {
 }
 
 /// SHA-256 of a file's contents, streamed.
-pub(crate) fn sha256_file(p: &Path) -> std::io::Result<String> {
+pub fn sha256_file(p: &Path) -> std::io::Result<String> {
     sha256_file_counted(p).map(|(sha, _)| sha)
 }
 
-/// SHA-256 of a file's contents plus the number of bytes actually hashed.
-fn sha256_file_counted(p: &Path) -> std::io::Result<(String, u64)> {
-    let mut f = File::open(p)?;
+/// SHA-256 of everything `r` yields from its current position to EOF, streamed.
+/// Lets a caller hash the exact handle it will later serve, so the bytes served
+/// are the bytes hashed (a path can be re-pointed between two opens; an open
+/// handle cannot).
+pub fn sha256_reader<R: Read>(r: &mut R) -> std::io::Result<String> {
+    sha256_reader_counted(r).map(|(sha, _)| sha)
+}
+
+/// [`sha256_reader`] plus the number of bytes actually hashed.
+fn sha256_reader_counted<R: Read>(r: &mut R) -> std::io::Result<(String, u64)> {
     let mut h = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
     let mut total = 0u64;
     loop {
-        let n = f.read(&mut buf)?;
+        let n = r.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -106,6 +113,11 @@ fn sha256_file_counted(p: &Path) -> std::io::Result<(String, u64)> {
         total += n as u64;
     }
     Ok((hex(&h.finalize()), total))
+}
+
+/// SHA-256 of a file's contents plus the number of bytes actually hashed.
+fn sha256_file_counted(p: &Path) -> std::io::Result<(String, u64)> {
+    sha256_reader_counted(&mut File::open(p)?)
 }
 
 fn sniff_kind(p: &Path) -> std::io::Result<ArtifactKind> {
@@ -128,6 +140,16 @@ impl ArtifactStore {
 
     pub fn blob_path(&self, sha256: &str) -> PathBuf {
         self.root.join(&sha256[..2.min(sha256.len())]).join(sha256)
+    }
+
+    /// Like `blob_path`, but only for a well-formed sha256 (64 lowercase hex).
+    /// Use this for any caller-supplied digest (e.g. an HTTP path segment).
+    pub fn blob_path_checked(&self, sha256: &str) -> Option<PathBuf> {
+        let ok = sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        ok.then(|| self.blob_path(sha256))
     }
 
     /// Resolve every requested path (expanding directories), check the whole
@@ -404,6 +426,35 @@ mod tests {
     use super::*;
     use crate::report::types::{ArtifactKind, ArtifactRef, ArtifactStorage};
     use std::fs;
+
+    #[test]
+    fn sha256_reader_hashes_from_the_current_position_and_matches_the_file_hash() {
+        use std::io::{Seek, SeekFrom};
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("a.bin");
+        fs::write(&p, b"hello world").unwrap();
+        // Known SHA-256 of "hello world".
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert_eq!(sha256_file(&p).unwrap(), expected);
+
+        let mut f = File::open(&p).unwrap();
+        assert_eq!(sha256_reader(&mut f).unwrap(), expected);
+        // The handle is now at EOF: a second pass hashes nothing (SHA-256 of
+        // the empty input) until the caller rewinds.
+        assert_eq!(
+            sha256_reader(&mut f).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        f.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(sha256_reader(&mut f).unwrap(), expected);
+        // Works on any reader, and across multiple CHUNK-sized reads.
+        let big = vec![7u8; CHUNK * 2 + 5];
+        fs::write(&p, &big).unwrap();
+        assert_eq!(
+            sha256_reader(&mut std::io::Cursor::new(&big)).unwrap(),
+            sha256_file(&p).unwrap()
+        );
+    }
 
     fn req(p: &str) -> ArtifactRef {
         ArtifactRef {
@@ -778,6 +829,20 @@ mod tests {
         assert!(
             matches!(&err, ArtifactError::Path { reason, .. } if reason.contains("workspace root")),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn blob_path_checked_rejects_non_hex_and_wrong_length() {
+        let s = ArtifactStore::new("/tmp/store");
+        assert!(s.blob_path_checked("").is_none());
+        assert!(s.blob_path_checked("../etc/passwd").is_none());
+        assert!(s.blob_path_checked(&"A".repeat(64)).is_none()); // uppercase
+        assert!(s.blob_path_checked(&"a".repeat(63)).is_none());
+        let ok = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            s.blob_path_checked(&ok).unwrap(),
+            std::path::PathBuf::from("/tmp/store").join("01").join(&ok)
         );
     }
 
