@@ -2431,30 +2431,18 @@ async fn runs(
     report::emit_collection(global_format, &output)
 }
 
-/// Per-step transcripts for one run, sourced from the run's
-/// `step_results.jsonl`. Includes panel sub-run transcripts
-/// (`items[].transcript_path`) so a panel-of-3 review counts all
-/// three reviewers' tokens.
-///
-/// This is the version used by `rupu workflow runs`: scoping to one
-/// run via the run-store avoids the double-count you'd get from
-/// scanning the project-wide `transcript_dir` (which collects every
-/// run's transcripts together).
+/// One run's usage rows (by provider, model, agent) from the shared usage
+/// fold ([`rupu_cp::usage::run_usage`]): every usage-ledger row — fan-out
+/// units, panelists and dispatched sub-agents included, running steps
+/// too — plus a fold of any known transcript without ledger rows (legacy
+/// runs, remote mirrors). The same definition the control plane serves,
+/// so `rupu workflow runs` / `show-run` can't disagree with it; scoped to
+/// one run, so nothing is double-counted across runs.
 fn aggregate_run_usage_from_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
 ) -> Vec<rupu_transcript::UsageRow> {
-    let Ok(records) = store.read_step_results(run_id) else {
-        return Vec::new();
-    };
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    for rec in &records {
-        paths.push(rec.transcript_path.clone());
-        for item in &rec.items {
-            paths.push(item.transcript_path.clone());
-        }
-    }
-    rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default())
+    rupu_cp::usage::run_usage(store, run_id).rows.clone()
 }
 
 fn total_tokens(rows: &[rupu_transcript::UsageRow]) -> u64 {
@@ -4904,6 +4892,7 @@ async fn execute_workflow_invocation(
             skip_count: 0,
             live_event_hook: ctx.live_event_hook.clone(),
             view_mode: ctx.live_view,
+            pricing: cfg.pricing.clone(),
         };
         let mut current_runner = runner_task;
         let mut current_run_id = rid.clone();
@@ -5066,6 +5055,7 @@ async fn execute_workflow_invocation(
                         skip_count: prior_count,
                         live_event_hook: ctx.live_event_hook.clone(),
                         view_mode: ctx.live_view,
+                        pricing: cfg.pricing.clone(),
                     };
                     let _ = result;
                 }

@@ -1318,26 +1318,34 @@ async fn show(
     report::emit_detail(global_format, &output)
 }
 
-/// Build the per-turn token series for one session: every `usage` event
-/// across the session's run transcripts, in recorded order, labeled by the
-/// run that produced it.
+/// Build the per-call token series for one session: every `usage` event
+/// across the session's turn transcripts — each turn's dispatched sub-agents
+/// and compaction calls included — labeled by the turn's run.
 ///
-/// Delegates to [`rupu_cp::usage::turn_series`] — the SAME function
-/// `rupu-cp`'s local `/api/sessions/:id/usage-timeline` branch calls — so a
-/// remote session's chart cannot silently disagree with a local one. A run
-/// whose transcript is missing or partial contributes no points rather than
-/// failing the whole series.
+/// The same labelled set and the same fold
+/// ([`rupu_cp::usage::transcripts_usage`]'s `points`) as `rupu-cp`'s local
+/// `/api/sessions/:id/usage-timeline` branch, so a remote session's chart
+/// cannot silently disagree with a local one. A turn whose transcript is
+/// missing contributes no points rather than failing the whole series.
 fn build_session_usage_timeline(
     global: &Path,
     session_id: &str,
 ) -> anyhow::Result<Vec<rupu_cp::usage::TurnPoint>> {
     let (session, _scope) = read_session(global, session_id)?;
+    let run_store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let labeled: Vec<(String, PathBuf)> = session
         .runs
         .iter()
-        .map(|r| (r.run_id.clone(), r.transcript_path.clone()))
+        .filter(|r| r.transcript_path.is_file())
+        .flat_map(|r| {
+            rupu_cp::usage_sources::with_dispatch_children(
+                &run_store,
+                &r.run_id,
+                &r.transcript_path,
+            )
+        })
         .collect();
-    Ok(rupu_cp::usage::turn_series(&labeled))
+    Ok(rupu_cp::usage::transcripts_usage(&labeled).points.clone())
 }
 
 #[derive(Serialize)]
@@ -7587,12 +7595,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         };
 
         let outcome = rupu_agent::run_agent(opts).await;
-        // Snapshot live cached_tokens before clearing — UsageSnapshot events
-        // populated it during streaming, but RunResult (from rupu-agent) only
-        // carries in/out. Keep cached as an additive grand-total dimension.
-        let cached_tokens = read_session_live_usage(&global, scope, &args.session_id)?
-            .map(|record| record.usage.cached_tokens)
-            .unwrap_or(0);
+        // The turn's cached tokens: the provider-reported total summed over
+        // every call (`RunResult.total_tokens_cached`), not the worker's
+        // streaming snapshot, which only ever held the last call's figure
+        // and stays empty for a provider that sends no usage snapshot.
+        let cached_tokens = outcome
+            .as_ref()
+            .map_or(0, |result| result.total_tokens_cached);
         clear_session_live_usage(&global, scope, &args.session_id)?;
 
         session = read_session(&global, &args.session_id)?.0;
@@ -8233,7 +8242,20 @@ mod tests {
         let mut run_entries = Vec::new();
         for (run_id, turns) in runs {
             let path = transcripts.join(format!("{run_id}.jsonl"));
-            let mut lines = Vec::new();
+            // Every real transcript opens with `RunStart`; the usage fold
+            // anchors on it (a `Usage` before any `RunStart` is an orphan).
+            let mut lines = vec![serde_json::to_string(&TranscriptEvent::RunStart {
+                run_id: run_id.to_string(),
+                workspace_id: "ws_1".into(),
+                agent: "scout".into(),
+                provider: "anthropic".into(),
+                model: "opus".into(),
+                started_at: Utc::now(),
+                mode: RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
+            })
+            .unwrap()];
             for _ in 0..*turns {
                 lines.push(
                     serde_json::to_string(&TranscriptEvent::Usage {
@@ -8288,7 +8310,8 @@ mod tests {
     /// The series is per TURN, labeled by the owning run, and its `turn`
     /// counter runs globally across the session's runs in recorded order —
     /// the same contract `rupu-cp`'s local `/api/sessions/:id/usage-timeline`
-    /// branch produces, since both call `rupu_cp::usage::turn_series`.
+    /// branch produces, since both fold through
+    /// `rupu_cp::usage::transcripts_usage`.
     #[test]
     fn session_usage_timeline_emits_one_point_per_turn_labeled_by_run() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10139,6 +10162,105 @@ mod tests {
             .unwrap(),
             "replay must skip turn 2 entirely — it never joined message_history"
         );
+    }
+
+    /// An idle session under `<tmp>/global` with a dense history that
+    /// reliably exceeds a tiny compaction window (the recipe of
+    /// `compact_clears_history_source_transcript_and_next_turn_seeds_inline`).
+    fn idle_dense_session(tmp: &tempfile::TempDir, session_id: &str) -> (PathBuf, SessionRecord) {
+        let global = tmp.path().join("global");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        let mut record = test_session_record();
+        record.session_id = session_id.into();
+        record.status = SessionStatus::Idle;
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global.join("sessions").join(session_id).join("transcripts");
+        std::fs::create_dir_all(&record.transcripts_dir).expect("create transcripts dir");
+        let dense_chunk = "x".repeat(1000);
+        let mut history = vec![Message::user(&format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            history.push(Message::assistant(&format!("assistant {i}: {dense_chunk}")));
+            history.push(Message::user(&format!("user {i}: {dense_chunk}")));
+        }
+        record.message_history = history;
+        record.compact_at_percent = Some(80);
+        record.context_window_tokens = None;
+        record.active_run_id = None;
+        record.active_transcript_path = None;
+        record.active_pid = None;
+        record.worker_pid = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_tokens_cached = 0;
+        (global, record)
+    }
+
+    /// Run `f` with `RUPU_HOME` = `global` and the mock provider scripted
+    /// to `script`, restoring both afterwards.
+    async fn with_mock_home<T>(
+        global: &Path,
+        script: &str,
+        f: impl std::future::Future<Output = T>,
+    ) -> T {
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", script);
+        let out = f.await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        out
+    }
+
+    /// A turn's cached tokens come from its `RunResult` — the summed
+    /// provider-reported figure — not the worker's streaming snapshot
+    /// (which a non-streaming or snapshot-less provider never fills).
+    #[tokio::test]
+    async fn turn_records_cached_tokens_from_the_run_result() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_cached01");
+        record.message_history = Vec::new();
+        record.runs = vec![SessionRunRecord {
+            run_id: "run_cached".into(),
+            prompt: "go".into(),
+            transcript_path: record.transcripts_dir.join("run_cached.jsonl"),
+            started_at: Utc::now(),
+            completed_at: None,
+            status: None,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+            total_tokens_cached: 0,
+            duration_ms: 0,
+            pid: None,
+            error: None,
+        }];
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        with_mock_home(
+            &global,
+            r#"[{ "AssistantTextWithUsage": { "text": "ok", "stop": "end_turn", "usage": { "input_tokens": 50, "output_tokens": 5, "cached_tokens": 30 } } }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_cached".into(),
+                prompt: "go".into(),
+            }),
+        )
+        .await
+        .expect("turn completes");
+
+        let (after, _) = read_session(&global, &record.session_id).expect("read session");
+        assert_eq!(after.total_tokens_cached, 30);
+        assert_eq!(after.runs[0].total_tokens_cached, 30);
     }
 
     /// I-1 (transcript fidelity plan 1, whole-branch review): compaction

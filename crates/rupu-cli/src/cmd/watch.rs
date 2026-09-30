@@ -92,6 +92,7 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
         // attached to a tty; pipes/non-tty keep the line-stream path.
         let attach_opts = AttachOpts {
             view_mode,
+            pricing: resolve_watch_pricing(),
             ..AttachOpts::default()
         };
         let outcome = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -294,6 +295,22 @@ fn load_run_started_at(run_json: &std::path::Path) -> Option<chrono::DateTime<ch
 fn load_run_json_value(run_json: &std::path::Path) -> Option<serde_json::Value> {
     let bytes = std::fs::read(run_json).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Prices for the step and run footers, layered the way `rupu usage`
+/// resolves them (global + project, policy locks applied). A missing or
+/// unreadable config falls back to the built-in price table.
+fn resolve_watch_pricing() -> rupu_config::PricingConfig {
+    let Ok(global) = paths::global_dir() else {
+        return rupu_config::PricingConfig::default();
+    };
+    let project_cfg = std::env::current_dir()
+        .ok()
+        .and_then(|pwd| paths::project_root_for(&pwd).ok().flatten())
+        .map(|root| root.join(".rupu/config.toml"));
+    rupu_config::layer_files_locked(Some(&global.join("config.toml")), project_cfg.as_deref())
+        .map(|cfg| cfg.pricing)
+        .unwrap_or_default()
 }
 
 fn resolve_watch_prefs(view: Option<LiveViewMode>) -> UiPrefs {

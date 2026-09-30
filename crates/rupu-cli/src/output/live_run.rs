@@ -489,17 +489,19 @@ impl LiveRunState {
                     } else {
                         NodeStatus::Failed
                     };
-                    unit.tokens += tokens_in + tokens_out;
-                    step.tokens_in += tokens_in;
-                    step.tokens_out += tokens_out;
+                    // The unit's honest total (spec §3.4). Step and run
+                    // totals come from the usage fold alone
+                    // (`apply_run_usage`), which already counts this unit's
+                    // ledger rows; `max` keeps this from stacking on the
+                    // fold's own value for the unit. A remote unit has no
+                    // ledger rows, so this is its only per-unit figure.
+                    unit.tokens = unit.tokens.max(tokens_in + tokens_out);
                     // Keep the collapsed `done/total` summary coherent: at
                     // minimum the step has as many units as the highest
                     // index seen so far.
                     let seen = step.units.len();
                     step.fanout_total = Some(step.fanout_total.unwrap_or(0).max(seen));
                 }
-                self.tokens_in += tokens_in;
-                self.tokens_out += tokens_out;
             }
             WfEvent::RunCompleted {
                 status,
@@ -613,15 +615,15 @@ impl LiveRunState {
                         } else {
                             NodeStatus::Failed
                         };
-                        unit.tokens += tokens_in + tokens_out;
-                        step.tokens_in += tokens_in;
-                        step.tokens_out += tokens_out;
+                        // Display only: the child's own row. Its spend is
+                        // already in the fold's step and run totals (its
+                        // ledger rows attribute to its ancestor's step), so
+                        // it is never added to those here.
+                        unit.tokens = unit.tokens.max(tokens_in + tokens_out);
                     }
                     // No matching unit (e.g. `DispatchStarted` was missed)
                     // — nothing to complete; graceful no-op.
                 }
-                self.tokens_in += tokens_in;
-                self.tokens_out += tokens_out;
             }
         }
     }
@@ -646,70 +648,44 @@ impl LiveRunState {
         }
     }
 
-    /// Record per-step token deltas (from transcript `Usage` events).
-    pub fn add_step_tokens(&mut self, step_id: &str, tokens_in: u64, tokens_out: u64) {
-        if let Some(step) = self.step_mut(step_id) {
-            step.tokens_in += tokens_in;
-            step.tokens_out += tokens_out;
-        }
-        self.tokens_in += tokens_in;
-        self.tokens_out += tokens_out;
-    }
-
-    /// Add a per-turn token delta (from the active transcript's `Usage`
-    /// event) to the currently-active fan-out / panel unit, and keep the
-    /// owning step + run totals consistent.
+    /// Set the run, step and unit token totals and the run cost from the
+    /// run's usage fold (`rupu_cp::usage::run_usage`: ledger rows plus a
+    /// fold of every known transcript without them). Replaces rather than
+    /// accumulates, so applying the same fold twice is a no-op — tokens
+    /// cover every unit and dispatched child, never double-count a
+    /// dispatch, and never re-count when the focus moves.
     ///
-    /// The live loop tails the active unit's transcript and drains each
-    /// `Usage` event exactly once, so these deltas accumulate without
-    /// double-counting. When the active unit changes, the previous unit's
-    /// accumulated total stays put (this only touches the active slot).
-    /// Falls back to crediting the active step when no unit is in focus
-    /// (a linear step's transcript).
-    pub fn add_active_tokens(&mut self, tokens_in: u64, tokens_out: u64) {
-        let step_id = match self.active.step_id.clone() {
-            Some(id) => id,
-            None => return,
-        };
-        let unit_key = self.active.unit_key.clone();
-        if let Some(step) = self.step_mut(&step_id) {
-            if let Some(key) = unit_key {
-                if let Some(unit) = step.units.iter_mut().find(|u| u.key == key) {
-                    unit.tokens += tokens_in + tokens_out;
-                }
-            }
-            step.tokens_in += tokens_in;
-            step.tokens_out += tokens_out;
-        }
-        self.tokens_in += tokens_in;
-        self.tokens_out += tokens_out;
-    }
-
-    /// Price a single per-turn `Usage` delta and accumulate it into the
-    /// run-total `cost`. Called as each `Usage` transcript event is
-    /// drained (once per event, alongside [`add_active_tokens`]), so cost
-    /// accrues monotonically without double-counting. `provider`/`model`
-    /// come from the `Usage` event itself; `agent` is the active step's
-    /// agent (the agent-level pricing fallback).
-    ///
-    /// When no pricing tier matches the `(provider, model, agent)` triple
-    /// the delta is skipped — `cost` only becomes `Some` once at least one
-    /// priced delta has landed, mirroring `run_cost_usd`'s "None unless a
-    /// price was found" contract.
-    #[allow(clippy::too_many_arguments)]
-    pub fn accumulate_cost(
+    /// A step with no fold rows reads zero. Units are set only where the
+    /// fold has a figure for `(step_id, unit_index)` (the ledger's own
+    /// units); a unit it can't see — a remote unit, a dispatch child's
+    /// slot — keeps the figure its completion event reported. `cost` is
+    /// the priced rows' sum, `None` when no row is priced (never a made-up
+    /// `$0`).
+    pub fn apply_run_usage(
         &mut self,
+        u: &rupu_cp::usage_index::RunUsage,
         pricing: &rupu_config::PricingConfig,
-        provider: &str,
-        model: &str,
-        agent: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cached_tokens: u64,
     ) {
-        if let Some(p) = rupu_config::pricing::lookup(pricing, provider, model, agent) {
-            let delta = p.cost_usd(input_tokens, output_tokens, cached_tokens);
-            self.cost = Some(self.cost.unwrap_or(0.0) + delta);
+        let summary = rupu_cp::usage::summarize(&u.rows, pricing);
+        self.tokens_in = summary.input_tokens;
+        self.tokens_out = summary.output_tokens;
+        self.cost = summary.cost_usd;
+        for step in &mut self.steps {
+            let (tokens_in, tokens_out) = u.by_step.get(&step.id).map_or((0, 0), |rows| {
+                rows.iter().fold((0, 0), |(i, o), r| {
+                    (i + r.input_tokens, o + r.output_tokens)
+                })
+            });
+            step.tokens_in = tokens_in;
+            step.tokens_out = tokens_out;
+        }
+        for ((step_id, index), t) in &u.by_unit {
+            if let Some(unit) = self
+                .step_mut(step_id)
+                .and_then(|step| step.units.get_mut(*index))
+            {
+                unit.tokens = t.input + t.output;
+            }
         }
     }
 
@@ -1521,11 +1497,27 @@ fn handle_live_run_keypress(
     }
 }
 
+/// How often the live view re-reads the run's usage fold.
+const USAGE_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Pull `run_id`'s usage from the shared fold ([`rupu_cp::usage::run_usage`])
+/// into `state` ([`LiveRunState::apply_run_usage`]).
+fn refresh_run_usage(
+    state: &mut LiveRunState,
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    pricing: &rupu_config::PricingConfig,
+) {
+    let usage = rupu_cp::usage::run_usage(store, run_id);
+    state.apply_run_usage(&usage, pricing);
+}
+
 /// Drive the live three-zone view on the alternate screen until the run
 /// reaches a terminal state. Tails `events.jsonl` for step status, reads
 /// `run.json` for the active step's transcript path, and tails that
-/// transcript for the focus feed. Repaints on a ~100ms tick and
-/// immediately after each event batch.
+/// transcript for the focus feed. Tokens and cost come from the run's usage
+/// fold, re-read once a second ([`refresh_run_usage`]). Repaints on a
+/// ~100ms tick and immediately after each event batch.
 ///
 /// The view fully owns the terminal via [`AltScreenGuard`]: every tick
 /// re-queries the terminal size (resize-aware), rebuilds a frame bounded
@@ -1556,6 +1548,7 @@ pub async fn run_live_view(
     let mut state = LiveRunState::from_workflow(&workflow, &run_id);
 
     let mut transcript_tailer: Option<(std::path::PathBuf, crate::output::TranscriptTailer)> = None;
+    let mut last_usage_refresh: Option<std::time::Instant> = None;
     let mut tick: u64 = 0;
     let mut stdout = std::io::stdout();
     // Take the alternate screen. The guard restores the normal screen
@@ -1619,41 +1612,25 @@ pub async fn run_live_view(
                 state.active.feed.clear();
             }
         }
+        // The focused transcript feeds the activity feed only. Tokens and
+        // cost come from the run's usage fold below — tailing one focused
+        // transcript saw neither the other units nor dispatch children,
+        // and re-read (re-counted) a transcript whenever focus returned.
         if let Some((_, tailer)) = transcript_tailer.as_mut() {
             for ev in tailer.drain() {
                 let now = Utc::now();
-                // Per-turn token usage from the active unit's transcript
-                // feeds the unit's `⇡tokens` (the orchestrator's
-                // `UnitCompleted` carries 0). Drained once per event, so
-                // accumulation does not double-count across ticks.
-                if let rupu_transcript::Event::Usage {
-                    provider,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
-                    ..
-                } = &ev
-                {
-                    state.add_active_tokens(*input_tokens as u64, *output_tokens as u64);
-                    // Price this delta from the event's own provider/model
-                    // (covers mid-run model swaps) and the active step's
-                    // agent for the agent-level pricing fallback.
-                    let agent = state.active.agent.clone().unwrap_or_default();
-                    state.accumulate_cost(
-                        &pricing,
-                        provider,
-                        model,
-                        &agent,
-                        *input_tokens as u64,
-                        *output_tokens as u64,
-                        *cached_tokens as u64,
-                    );
-                }
                 if let Some((kind, text)) = map_transcript_event(&ev, now) {
                     state.push_activity(now, kind, text);
                 }
             }
+        }
+
+        // Tokens + cost from the shared fold, once a second. `run_usage`
+        // is incremental (reads only bytes appended since the last call),
+        // so this stays cheap on a long run.
+        if last_usage_refresh.is_none_or(|at| at.elapsed() >= USAGE_REFRESH_EVERY) {
+            refresh_run_usage(&mut state, &store, &run_id, &pricing);
+            last_usage_refresh = Some(std::time::Instant::now());
         }
 
         // Repaint. Re-query the size every tick so a mid-run terminal
@@ -1684,6 +1661,9 @@ pub async fn run_live_view(
 
     // Render one final frame reflecting the terminal state, then drop the
     // guard to restore the normal screen and print a short summary there.
+    // Refresh the fold first so the last frame carries the final spend,
+    // not up-to-a-second-stale figures.
+    refresh_run_usage(&mut state, &store, &run_id, &pricing);
     let now = Utc::now();
     let (cols, rows) = terminal::size().unwrap_or((100, 30));
     let frame = render_view(&state, &workflow, now, cols as usize, rows as usize);
@@ -2210,16 +2190,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_unit_completed_marks_done_and_adds_tokens() {
+    fn apply_unit_completed_marks_done_without_touching_fold_totals() {
         let mut state = fanout_state(true);
-        let step_tokens_before = state
-            .steps
-            .iter()
-            .find(|s| s.id == "assess")
-            .unwrap()
-            .tokens_in;
-        let run_in_before = state.tokens_in;
-        let run_out_before = state.tokens_out;
+        let step_before = (state.steps[1].tokens_in, state.steps[1].tokens_out);
+        let run_before = (state.tokens_in, state.tokens_out);
         // Unit 3 starts Waiting in the fixture; complete it.
         state.apply(&WfEvent::UnitCompleted {
             run_id: "run_01ABC".into(),
@@ -2233,13 +2207,33 @@ mod tests {
         });
         let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
         assert_eq!(step.units[3].status, NodeStatus::Complete);
+        // The unit shows its own honest total (the only source for a remote
+        // unit, which has no ledger rows) ...
         assert_eq!(step.units[3].tokens, 1250);
-        assert_eq!(step.tokens_in, step_tokens_before + 1000);
-        assert_eq!(step.tokens_out, 250);
-        assert_eq!(state.tokens_in, run_in_before + 1000);
-        assert_eq!(state.tokens_out, run_out_before + 250);
+        // ... but step and run totals are the fold's alone: adding here
+        // would stack on top of the ledger rows the fold already counted.
+        assert_eq!((step.tokens_in, step.tokens_out), step_before);
+        assert_eq!((state.tokens_in, state.tokens_out), run_before);
         // done_units now counts conf-manager + tlb-agent + rtc = 3.
         assert_eq!(step.done_units(), 3);
+    }
+
+    #[test]
+    fn apply_unit_completed_never_stacks_on_a_fold_value() {
+        // app-gw (index 2) already carries 120K from the fold; its
+        // UnitCompleted reports the same honest total. It must not double.
+        let mut state = fanout_state(true);
+        state.apply(&WfEvent::UnitCompleted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 2,
+            unit_key: "app-gw".into(),
+            success: true,
+            tokens_in: 100_000,
+            tokens_out: 20_000,
+            host: None,
+        });
+        assert_eq!(state.steps[1].units[2].tokens, 120_000);
     }
 
     #[test]
@@ -2340,8 +2334,6 @@ mod tests {
             agent: Some("security-reviewer".into()),
             transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
         });
-        let run_in_before = state.tokens_in;
-        let run_out_before = state.tokens_out;
         state.apply(&WfEvent::DispatchCompleted {
             run_id: "run_01ABC".into(),
             sub_run_id: "sub_child".into(),
@@ -2352,11 +2344,8 @@ mod tests {
         let step = state.steps.iter().find(|s| s.id == "report").unwrap();
         let unit = &step.units[0];
         assert_eq!(unit.status, NodeStatus::Complete);
+        // The child's own row shows its own spend (display only).
         assert_eq!(unit.tokens, 620);
-        assert_eq!(step.tokens_in, 500);
-        assert_eq!(step.tokens_out, 120);
-        assert_eq!(state.tokens_in, run_in_before + 500);
-        assert_eq!(state.tokens_out, run_out_before + 120);
 
         // Failure path marks Failed rather than Complete.
         state.apply(&WfEvent::DispatchStarted {
@@ -2471,40 +2460,6 @@ mod tests {
     }
 
     #[test]
-    fn add_active_tokens_sums_into_active_unit_and_totals() {
-        let mut state = fanout_state(true);
-        // Focus the app-gw unit (index 2) like an UnitStarted would.
-        state.active.step_id = Some("assess".into());
-        state.active.unit_key = Some("app-gw".into());
-        let unit_before = state.steps[1].units[2].tokens;
-        let step_in_before = state.steps[1].tokens_in;
-        let run_in_before = state.tokens_in;
-
-        // Two per-turn Usage deltas accumulate (no double-count).
-        state.add_active_tokens(1000, 250);
-        state.add_active_tokens(500, 100);
-
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        let unit = step.units.iter().find(|u| u.key == "app-gw").unwrap();
-        assert_eq!(unit.tokens, unit_before + 1500 + 350);
-        assert_eq!(step.tokens_in, step_in_before + 1500);
-        assert_eq!(state.tokens_in, run_in_before + 1500);
-
-        // A later unit switch leaves the prior unit's total in place.
-        state.active.unit_key = Some("rtc".into());
-        state.add_active_tokens(42, 0);
-        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
-        let app_gw = step.units.iter().find(|u| u.key == "app-gw").unwrap();
-        assert_eq!(
-            app_gw.tokens,
-            unit_before + 1850,
-            "completed unit unchanged"
-        );
-        let rtc = step.units.iter().find(|u| u.key == "rtc").unwrap();
-        assert_eq!(rtc.tokens, 42);
-    }
-
-    #[test]
     fn overall_progress_fraction_blends_active_fanout() {
         // 4 steps, step 2 (`assess`) active with 2 of 5 units done.
         // (1 completed + 2/5) / 4 = 1.4 / 4 = 0.35.
@@ -2547,79 +2502,208 @@ mod tests {
         assert!((frac - 1.0).abs() < 1e-9, "got {frac}");
     }
 
+    fn row(provider: &str, model: &str, input: u64, output: u64) -> rupu_transcript::UsageRow {
+        rupu_transcript::UsageRow {
+            provider: provider.into(),
+            model: model.into(),
+            agent: "oracle-assessor".into(),
+            input_tokens: input,
+            output_tokens: output,
+            runs: 1,
+            ..Default::default()
+        }
+    }
+
+    fn tok(input: u64, output: u64) -> rupu_cp::usage_index::Tokens {
+        rupu_cp::usage_index::Tokens {
+            input,
+            output,
+            cached: 0,
+        }
+    }
+
     #[test]
-    fn accumulate_cost_prices_usage_deltas() {
-        // Built-in anthropic pricing exists for claude-sonnet-4-6:
-        // input 3.0 / output 15.0 per Mtok. cost starts None.
+    fn apply_run_usage_sets_all_units_not_just_focused() {
+        // The fixture focuses app-gw (index 2); the fold covers every unit.
         let mut state = fanout_state(true);
-        state.cost = None;
+        let mut u = rupu_cp::usage_index::RunUsage::default();
+        u.by_unit.insert(("assess".into(), 0), tok(100, 10));
+        u.by_unit.insert(("assess".into(), 2), tok(300, 30));
+        u.by_step
+            .insert("assess".into(), vec![row("anthropic", "claude-x", 400, 40)]);
+        u.rows = vec![row("anthropic", "claude-x", 400, 40)];
+        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
+        assert_eq!(state.steps[1].id, "assess");
+        assert_eq!(state.steps[1].units[0].tokens, 110);
+        assert_eq!(state.steps[1].units[2].tokens, 330);
+        assert_eq!(state.tokens_in, 400);
+        assert_eq!(state.tokens_out, 40);
+    }
+
+    #[test]
+    fn apply_run_usage_replaces_idempotently_and_prices_the_rows() {
+        let mut state = fanout_state(true);
+        let model = "claude-sonnet-4-6"; // built-in: $3 in / $15 out per Mtok
+        let mut u = rupu_cp::usage_index::RunUsage::default();
+        u.by_step.insert(
+            "understand".into(),
+            vec![row("anthropic", model, 1_000_000, 0)],
+        );
+        u.by_step
+            .insert("assess".into(), vec![row("anthropic", model, 0, 1_000_000)]);
+        u.rows = vec![row("anthropic", model, 1_000_000, 1_000_000)];
         let pricing = rupu_config::PricingConfig::default();
 
-        // 1M input + 1M output → 3.0 + 15.0 = 18.0.
-        state.accumulate_cost(
-            &pricing,
-            "anthropic",
-            "claude-sonnet-4-6",
-            "oracle-assessor",
-            1_000_000,
-            1_000_000,
-            0,
+        // Applying the same fold twice (a refresh with nothing new) must
+        // not stack: the values are replaced, not accumulated.
+        state.apply_run_usage(&u, &pricing);
+        state.apply_run_usage(&u, &pricing);
+
+        assert_eq!((state.tokens_in, state.tokens_out), (1_000_000, 1_000_000));
+        assert_eq!(state.steps[0].tokens_in, 1_000_000);
+        // `assess` had a stale 890K input in the fixture — replaced.
+        assert_eq!(
+            (state.steps[1].tokens_in, state.steps[1].tokens_out),
+            (0, 1_000_000)
+        );
+        // A step the fold has no rows for reads zero.
+        assert_eq!(
+            (state.steps[2].tokens_in, state.steps[2].tokens_out),
+            (0, 0)
         );
         assert_eq!(state.cost, Some(18.0));
-
-        // A second delta accumulates rather than overwrites.
-        state.accumulate_cost(
-            &pricing,
-            "anthropic",
-            "claude-sonnet-4-6",
-            "oracle-assessor",
-            0,
-            1_000_000,
-            0,
-        );
-        assert_eq!(state.cost, Some(33.0));
     }
 
     #[test]
-    fn accumulate_cost_unknown_model_leaves_cost_untouched() {
+    fn apply_run_usage_unpriced_rows_leave_cost_none() {
         let mut state = fanout_state(true);
-        state.cost = None;
+        let u = rupu_cp::usage_index::RunUsage {
+            rows: vec![row("nonesuch-provider", "nonesuch-model", 1_000, 1_000)],
+            ..Default::default()
+        };
+        state.apply_run_usage(&u, &rupu_config::PricingConfig::default());
+        assert_eq!(state.cost, None, "no price → the `—` placeholder, never $0");
+        assert_eq!(state.tokens_in, 1_000);
+    }
+
+    #[test]
+    fn dispatch_completed_no_longer_adds_tokens() {
+        let mut state = dispatch_state();
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
+        });
+        let before = (state.tokens_in, state.tokens_out);
+        let report = |s: &LiveRunState| {
+            let step = s.steps.iter().find(|st| st.id == "report").unwrap();
+            (step.tokens_in, step.tokens_out)
+        };
+        let step_before = report(&state);
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            success: true,
+            tokens_in: 999,
+            tokens_out: 999,
+        });
+        // The child's ledger rows are already in the fold (under its
+        // ancestor's step); adding them here was the double count.
+        assert_eq!((state.tokens_in, state.tokens_out), before);
+        assert_eq!(report(&state), step_before);
+    }
+
+    /// One ledger row for the run-store round trip below.
+    fn ledger_row(
+        id: &str,
+        step: Option<&str>,
+        unit: Option<usize>,
+        agent_run: &str,
+        parent: Option<&str>,
+        input: u64,
+        output: u64,
+    ) -> rupu_orchestrator::usage_ledger::LedgerRow {
+        rupu_orchestrator::usage_ledger::LedgerRow {
+            v: rupu_orchestrator::usage_ledger::LEDGER_VERSION,
+            id: id.into(),
+            at: Utc::now(),
+            kind: rupu_orchestrator::usage_ledger::LedgerKind::Turn,
+            step_id: step.map(str::to_string),
+            unit_index: unit,
+            unit_key: None,
+            agent_run_id: agent_run.into(),
+            parent_agent_run_id: parent.map(str::to_string),
+            transcript: std::path::PathBuf::from(format!("/nowhere/{agent_run}.jsonl")),
+            agent: "oracle-assessor".into(),
+            provider: "nonesuch-provider".into(),
+            model: "nonesuch-model".into(),
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn refresh_run_usage_reads_every_unit_and_dispatch_child_from_the_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_LEDGER", RunStatus::Running),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+        let ledger = rupu_orchestrator::usage_ledger::UsageLedger::for_run(&store, "run_LEDGER");
+        ledger.append(&ledger_row(
+            "r1",
+            Some("assess"),
+            Some(0),
+            "ag_u0",
+            None,
+            100,
+            10,
+        ));
+        ledger.append(&ledger_row(
+            "r2",
+            Some("assess"),
+            Some(2),
+            "ag_u2",
+            None,
+            300,
+            30,
+        ));
+        // A sub-agent unit 2 dispatched: untagged, attributed via its parent.
+        ledger.append(&ledger_row(
+            "r3",
+            None,
+            None,
+            "ag_child",
+            Some("ag_u2"),
+            50,
+            5,
+        ));
+
+        let mut state = fanout_state(true);
         let pricing = rupu_config::PricingConfig::default();
-        // No pricing tier matches → cost stays None (the `—` placeholder).
-        state.accumulate_cost(
-            &pricing,
-            "nonesuch-provider",
-            "nonesuch-model",
-            "nonesuch-agent",
-            1_000_000,
-            1_000_000,
-            0,
-        );
-        assert_eq!(state.cost, None);
-    }
+        refresh_run_usage(&mut state, &store, "run_LEDGER", &pricing);
+        assert_eq!(state.steps[1].units[0].tokens, 110);
+        assert_eq!(state.steps[1].units[2].tokens, 385, "own 330 + child 55");
+        assert_eq!((state.tokens_in, state.tokens_out), (450, 45));
 
-    #[test]
-    fn add_active_tokens_credits_linear_step_when_no_unit() {
-        // A linear step is active (unit_key = None, as set by
-        // `apply(StepStarted)`); a drained `Usage` delta must update the
-        // step + run totals via the `unit_key = None` branch.
-        let mut state = fanout_state(true);
-        state.active.step_id = Some("understand".into());
-        state.active.unit_key = None;
-        let step_in_before = state.steps[0].tokens_in;
-        let step_out_before = state.steps[0].tokens_out;
-        let run_in_before = state.tokens_in;
-        let run_out_before = state.tokens_out;
-
-        state.add_active_tokens(1500, 400);
-
-        let step = state.steps.iter().find(|s| s.id == "understand").unwrap();
-        assert_eq!(step.tokens_in, step_in_before + 1500);
-        assert_eq!(step.tokens_out, step_out_before + 400);
-        assert_eq!(state.tokens_in, run_in_before + 1500);
-        assert_eq!(state.tokens_out, run_out_before + 400);
-        // No units on a linear step → none mutated.
-        assert!(step.units.is_empty());
+        // The child finishing, a refocus, and a second refresh with no new
+        // rows all leave the totals exactly where the ledger puts them.
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_LEDGER".into(),
+            sub_run_id: "sub_child".into(),
+            success: true,
+            tokens_in: 50,
+            tokens_out: 5,
+        });
+        state.active.unit_key = Some("conf-manager".into());
+        refresh_run_usage(&mut state, &store, "run_LEDGER", &pricing);
+        assert_eq!((state.tokens_in, state.tokens_out), (450, 45));
+        assert_eq!(state.steps[1].units[2].tokens, 385);
     }
 
     #[test]
