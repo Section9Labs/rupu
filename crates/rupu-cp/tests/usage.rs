@@ -84,6 +84,7 @@ fn write_run_transcript(path: &std::path::Path, model: &str) {
         input_tokens: 1000,
         output_tokens: 200,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         purpose: None,
     };
     let mut buf = Vec::new();
@@ -264,6 +265,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 input_tokens: 1000,
                 output_tokens: 200,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 purpose: None,
             })
             .unwrap(),
@@ -543,6 +545,7 @@ fn write_run_transcript_for(
         input_tokens,
         output_tokens,
         cached_tokens: 0,
+        cache_write_tokens: 0,
         purpose: None,
     };
     let mut buf = Vec::new();
@@ -727,6 +730,66 @@ async fn usage_runs_returns_flat_per_run_rows_with_run_id_and_priced_cost() {
     );
     assert_eq!(r2["input_tokens"].as_u64().unwrap(), 1000);
     assert_eq!(r2["output_tokens"].as_u64().unwrap(), 200);
+}
+
+#[tokio::test]
+async fn usage_runs_rows_carry_cache_write_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    seed_run_with_usage(
+        dir.path(),
+        "run_cw",
+        "nightly-review",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1000,
+        20,
+        started,
+    );
+    // A second call on the same transcript that wrote 30 prompt tokens to
+    // the provider's cache (a subset of its 500 input tokens).
+    let mut line = serde_json::to_vec(&rupu_transcript::Event::Usage {
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        served_model: None,
+        input_tokens: 500,
+        output_tokens: 5,
+        cached_tokens: 0,
+        cache_write_tokens: 30,
+        purpose: None,
+    })
+    .unwrap();
+    line.push(b'\n');
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("run_cw.jsonl"))
+        .unwrap()
+        .write_all(&line)
+        .unwrap();
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/runs?since=2026-01-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["cache_write_tokens"].as_u64(), Some(30), "{rows:?}");
+    assert_eq!(rows[0]["input_tokens"].as_u64(), Some(1500));
+    assert_eq!(
+        rows[0]["total_tokens"].as_u64(),
+        Some(1525),
+        "input + output; cache writes are not added again"
+    );
 }
 
 #[tokio::test]
@@ -1048,6 +1111,7 @@ fn write_fold_transcript(
             input_tokens: *input,
             output_tokens: *output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: None,
         });
     }
@@ -1229,6 +1293,7 @@ async fn usage_endpoint_counts_inflight_step_from_ledger() {
         input_tokens: input,
         output_tokens: output,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     let mut ledger = Vec::new();
     for r in [row("u1", 1000, 100), row("u2", 2000, 200)] {
@@ -1707,6 +1772,7 @@ fn ledger_line(id: &str, step: &str, input: u64, output: u64) -> Vec<u8> {
         input_tokens: input,
         output_tokens: output,
         cached_tokens: 0,
+        cache_write_tokens: 0,
     };
     let mut line = serde_json::to_vec(&row).unwrap();
     line.push(b'\n');

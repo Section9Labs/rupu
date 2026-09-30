@@ -45,6 +45,7 @@
     }
   ],
   "usage": {
+    "cache_write_tokens": 0,
     "cached_tokens": 100,
     "cost_usd": 0.42,
     "input_tokens": 3000,

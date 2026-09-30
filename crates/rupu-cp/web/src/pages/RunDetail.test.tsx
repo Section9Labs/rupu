@@ -1081,6 +1081,29 @@ describe('RunDetail — live usage', () => {
     expect(screen.queryByText(/≥/)).not.toBeInTheDocument();
   });
 
+  it('shows cache writes next to cached only when there are any', async () => {
+    stubBase({ ...RUNNING_GRAPH, usage: EMPTY_USAGE });
+    vi.spyOn(api, 'getRunUsage').mockResolvedValue(
+      liveResp({ summary: { ...LIVE_SUMMARY, cache_write_tokens: 45_678 } }),
+    );
+
+    renderPage();
+
+    const label = await screen.findByText('cache write');
+    expect(label.parentElement).toHaveTextContent(`cache write ${formatTokens(45_678)}`);
+    expect(screen.getByText('cached')).toBeInTheDocument();
+  });
+
+  it('hides cache writes when zero or absent', async () => {
+    stubBase({ ...RUNNING_GRAPH, usage: EMPTY_USAGE });
+    vi.spyOn(api, 'getRunUsage').mockResolvedValue(liveResp());
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText(formatTokens(1_234_567))).toBeInTheDocument());
+    expect(screen.queryByText('cache write')).not.toBeInTheDocument();
+  });
+
   it('marks a partial total with a lower-bound sign and an explanatory title', async () => {
     stubBase({ ...GRAPH, usage: EMPTY_USAGE });
     vi.spyOn(api, 'getRunUsage').mockResolvedValue(

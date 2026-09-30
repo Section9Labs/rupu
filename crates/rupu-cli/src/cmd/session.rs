@@ -362,6 +362,8 @@ struct SessionRecord {
     #[serde(default)]
     anthropic_oauth_prefix: Option<bool>,
     #[serde(default)]
+    anthropic_prompt_cache: Option<bool>,
+    #[serde(default)]
     effort: Option<ThinkingLevel>,
     #[serde(default)]
     context_window: Option<ContextWindow>,
@@ -1574,6 +1576,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         permission_mode: mode_str,
         no_stream: args.no_stream,
         anthropic_oauth_prefix: spec.anthropic_oauth_prefix,
+        anthropic_prompt_cache: spec.anthropic_prompt_cache,
         effort: spec.effort,
         context_window: spec.context_window,
         output_format: spec.output_format,
@@ -6431,7 +6434,16 @@ fn session_total_cost_detail(
     )?;
     Some(format!(
         "${:.2}",
-        pricing.cost_usd(session.total_tokens_in, session.total_tokens_out, 0)
+        // Cache reads are on the record and priced at the read rate. Cache
+        // writes are not (a session record's running totals carry no
+        // cache-write count), so they bill at the plain input rate — a small
+        // underestimate where the vendor charges a write premium.
+        pricing.cost_usd(
+            session.total_tokens_in,
+            session.total_tokens_out,
+            session.total_tokens_cached,
+            0,
+        )
     ))
 }
 
@@ -6699,6 +6711,7 @@ fn compaction_usage_event(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens.saturating_add(usage.reasoning_tokens),
         cached_tokens: usage.cached_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
         purpose: Some(COMPACTION_PURPOSE.to_string()),
     }
 }
@@ -6787,6 +6800,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        anthropic_prompt_cache: session.anthropic_prompt_cache,
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7182,6 +7196,7 @@ async fn run_compact_request(
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        anthropic_prompt_cache: session.anthropic_prompt_cache,
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7525,6 +7540,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+            anthropic_prompt_cache: session.anthropic_prompt_cache,
             // `openai_compatible` stays `None` here — a separate,
             // pre-existing limitation (the session worker doesn't support
             // custom openai-compatible endpoints), unrelated to kind
@@ -8361,6 +8377,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 20,
                         cached_tokens: 0,
+                        cache_write_tokens: 0,
                         purpose: None,
                     })
                     .unwrap(),
@@ -9212,6 +9229,40 @@ mod tests {
     }
 
     #[test]
+    fn session_cost_prices_cached_input_at_the_cache_read_rate() {
+        // 1M input, half of it cache reads: 0.5M × $10 + 0.5M × $1 = $5.50.
+        // Billing the cached half at the full input rate would show $10.00.
+        let session = SessionRecord {
+            provider_name: "anthropic".into(),
+            model: "claude-test-model".into(),
+            total_tokens_in: 1_000_000,
+            total_tokens_out: 0,
+            total_tokens_cached: 500_000,
+            ..test_session_record()
+        };
+        let mut state = fresh_completion_state();
+        state.pricing = PricingConfig::default();
+        state
+            .pricing
+            .models
+            .entry("anthropic".into())
+            .or_default()
+            .insert(
+                "claude-test-model".into(),
+                rupu_config::ModelPricing {
+                    input_per_mtok: 10.0,
+                    output_per_mtok: 20.0,
+                    cached_input_per_mtok: Some(1.0),
+                    cache_write_per_mtok: None,
+                },
+            );
+        assert_eq!(
+            session_total_cost_detail(&session, &state).as_deref(),
+            Some("$5.50")
+        );
+    }
+
+    #[test]
     fn retained_session_header_shows_coverage_indicator_when_cached() {
         let session = test_session_record();
         let mut state = SessionInteractiveState::new(
@@ -9308,6 +9359,7 @@ mod tests {
                 input_tokens: 123,
                 output_tokens: 7,
                 cached_tokens: 9,
+                cache_write_tokens: 0,
                 reasoning_tokens: 0,
             },))
         );
@@ -9342,6 +9394,7 @@ mod tests {
             input_tokens: 12,
             output_tokens: 5,
             cached_tokens: 2,
+            cache_write_tokens: 0,
             purpose: None,
         });
 
@@ -9760,6 +9813,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 4,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: None,
         });
         state.push_transcript_event(&TranscriptEvent::AssistantMessage {
@@ -9878,6 +9932,7 @@ mod tests {
             permission_mode: "bypass".into(),
             no_stream: false,
             anthropic_oauth_prefix: None,
+            anthropic_prompt_cache: None,
             effort: None,
             context_window: None,
             output_format: None,
@@ -10268,6 +10323,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: purpose.map(str::to_string),
         }
     }
@@ -10379,6 +10435,32 @@ mod tests {
             ],
         );
         assert_eq!(last_turn_input_tokens(&path), Some(1_200));
+    }
+
+    /// A session-compaction summariser call records the prompt-cache writes
+    /// it was billed for, like the agent runner's in-run compaction.
+    #[test]
+    fn compaction_usage_event_carries_cache_write_tokens() {
+        let usage = rupu_providers::types::Usage {
+            input_tokens: 900,
+            output_tokens: 10,
+            cached_tokens: 200,
+            cache_write_tokens: 40,
+            reasoning_tokens: 2,
+        };
+        match compaction_usage_event("anthropic", "claude-x", &usage) {
+            TranscriptEvent::Usage {
+                cached_tokens,
+                cache_write_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(cached_tokens, 200);
+                assert_eq!(cache_write_tokens, 40);
+                assert_eq!(output_tokens, 12);
+            }
+            other => panic!("expected a usage event, got {other:?}"),
+        }
     }
 
     /// Ruling (Task 3 review): the TUI context gauge tracks the last TURN's

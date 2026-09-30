@@ -120,7 +120,10 @@ pub struct UsageTurn {
     pub input_tokens: u64,
     /// Billable output (output + reasoning) — identical to the transcript.
     pub output_tokens: u64,
+    /// Cache reads — a subset of `input_tokens`.
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    pub cache_write_tokens: u64,
 }
 
 pub type OnUsageCallback = std::sync::Arc<dyn Fn(&UsageTurn) + Send + Sync>;
@@ -398,6 +401,11 @@ self-contained.";
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        // One-off request: its system prompt differs from the agent's and it
+        // carries no tools, so its prefix matches no cached turn and no later
+        // request will ever read what it would write. Caching it would only
+        // pay the 1.25× cache-write premium (spec 2026-09-29 §9).
+        disable_prompt_cache: true,
     };
 
     let summary_resp = provider.send(&summary_req).await?;
@@ -512,6 +520,7 @@ async fn compact_context(
                 input_tokens: cu.input_tokens,
                 output_tokens: billable as u32,
                 cached_tokens: cu.cached_tokens,
+                cache_write_tokens: cu.cache_write_tokens,
                 purpose: Some("compaction".to_string()),
             }) {
                 tracing::warn!(error = %e, "failed to write compaction usage event to transcript");
@@ -524,6 +533,7 @@ async fn compact_context(
                     input_tokens: cu.input_tokens as u64,
                     output_tokens: billable,
                     cached_tokens: cu.cached_tokens as u64,
+                    cache_write_tokens: cu.cache_write_tokens as u64,
                 });
             }
             *messages = outcome.messages;
@@ -1180,6 +1190,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 anthropic_task_budget: opts.anthropic_task_budget,
                 anthropic_context_management: opts.anthropic_context_management,
                 anthropic_speed: opts.anthropic_speed,
+                disable_prompt_cache: false,
             };
             let mut trim_attempts = 0u32;
             let mut http_retries = 0u32;
@@ -1379,6 +1390,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                     input_tokens: resp.usage.input_tokens as u64,
                     output_tokens: billable_output_tokens,
                     cached_tokens: resp.usage.cached_tokens as u64,
+                    cache_write_tokens: resp.usage.cache_write_tokens as u64,
                 });
             }
             writer.write(&Event::Usage {
@@ -1395,6 +1407,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 input_tokens: resp.usage.input_tokens,
                 output_tokens: billable_output_tokens as u32,
                 cached_tokens: resp.usage.cached_tokens,
+                cache_write_tokens: resp.usage.cache_write_tokens,
                 purpose: None,
             })?;
             total_cached += resp.usage.cached_tokens as u64;
@@ -2305,6 +2318,7 @@ mod on_tool_call_tests {
                     input_tokens: 15,
                     output_tokens: 8,
                     cached_tokens: 0,
+                    cache_write_tokens: 0,
                     reasoning_tokens,
                 },
             }]);
@@ -2377,8 +2391,11 @@ mod on_tool_call_tests {
                 input_per_mtok: 1.25,
                 output_per_mtok: 10.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             };
-            let cost = pricing.cost_usd(result.total_tokens_in, result.total_tokens_out, 0);
+            // This Gemini fixture reports no cache reads or writes (the
+            // scripted `Usage` above zeroes both), so 0 is the real count.
+            let cost = pricing.cost_usd(result.total_tokens_in, result.total_tokens_out, 0, 0);
             (result.total_tokens_out, cost)
         }
 
@@ -3291,6 +3308,42 @@ mod compaction_tests {
             Some(rupu_providers::model_tier::ThinkingLevel::Auto),
             "compaction summary request must set thinking so echoed reasoning \
              blocks in its history don't 400 on the api-key auth path"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_messages_opts_the_summary_request_out_of_prompt_caching() {
+        // The summary request has its own system prompt and no tools, so no
+        // later request ever reads the prefix it would cache — a cache write
+        // there is a pure 1.25× surcharge. It must carry the per-request
+        // opt-out, which the Anthropic client honours over its own flag.
+        let dense_chunk = "y".repeat(1000);
+        let mut msgs = vec![text_msg(Role::User, &format!("goal: {dense_chunk}"))];
+        for i in 0..5 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("step {i}: {dense_chunk}"),
+            ));
+            msgs.push(text_msg(Role::User, &format!("note {i}: {dense_chunk}")));
+        }
+
+        let mut provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Condensed notes.".to_string(),
+            stop: StopReason::EndTurn,
+            input_tokens: 400,
+            output_tokens: 8,
+        }]);
+
+        compact_messages(&msgs, &mut provider, "mock-1", 1000, Some(80), 900)
+            .await
+            .expect("no provider error")
+            .expect("should compact");
+
+        let captured = provider.captured_requests();
+        assert_eq!(captured.len(), 1, "expected exactly one summary request");
+        assert!(
+            captured[0].disable_prompt_cache,
+            "compaction summary request must opt out of prompt caching"
         );
     }
 

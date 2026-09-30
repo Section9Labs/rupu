@@ -25,6 +25,13 @@ pub struct ProviderConfig {
     pub max_retries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
+    /// Anthropic explicit prompt caching (`cache_control` breakpoints).
+    /// `None`/`Some(true)` → on; `Some(false)` → off, e.g. for an
+    /// Anthropic-compatible gateway that rejects `cache_control`. Agent
+    /// frontmatter `anthropicPromptCache` overrides it. Ignored by every
+    /// other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -64,5 +71,19 @@ max_output = 8192
         assert_eq!(cfg.stream, Some(true));
         assert_eq!(cfg.base_url.as_deref(), Some("http://192.29.35.246:8080"));
         assert_eq!(cfg.models.len(), 1);
+    }
+
+    #[test]
+    fn prompt_cache_parses_and_is_omitted_when_unset() {
+        let cfg: ProviderConfig = toml::from_str("prompt_cache = false\n").unwrap();
+        assert_eq!(cfg.prompt_cache, Some(false));
+        assert_eq!(
+            toml::to_string(&cfg).unwrap().trim(),
+            "prompt_cache = false"
+        );
+
+        let cfg: ProviderConfig = toml::from_str("timeout_ms = 1000\n").unwrap();
+        assert_eq!(cfg.prompt_cache, None);
+        assert!(!toml::to_string(&cfg).unwrap().contains("prompt_cache"));
     }
 }

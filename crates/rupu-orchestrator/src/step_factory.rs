@@ -202,6 +202,7 @@ fn resolve_step_agent_spec(
                 max_turns: Some(50),
                 permission_mode: None,
                 anthropic_oauth_prefix: None,
+                anthropic_prompt_cache: None,
                 effort: None,
                 context_window: None,
                 output_format: None,
@@ -321,6 +322,7 @@ impl StepFactory for DefaultStepFactory {
                 );
                 let provider_config = provider_factory::ProviderConfig {
                     anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+                    anthropic_prompt_cache: spec.anthropic_prompt_cache,
                     openai_compatible: oai_params,
                     tuning: self.provider_tuning.get(&provider_name).cloned(),
                     kind: self.kinds.get(&provider_name).cloned(),
@@ -859,6 +861,7 @@ mod provider_build_error_stub_tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         }
     }
 

@@ -401,6 +401,34 @@ timeline) folds the session's run transcripts instead of `session.json` totals.
    That is two breakpoints, under the limit of 4. It is placed after the tool-name
    sanitiser and after `restore_reasoning_blocks`. Explicit markers work on API key,
    OAuth, and Anthropic-compatible gateways alike.
+
+   **Walk-back rule (fix wave).** A cache read is anchored at explicit breakpoints:
+   a request with no message-level marker does not read the messages cache at all
+   (marker (a) covers only tools + system). So when the final message has no
+   cacheable block, (b) walks back — at most 3 messages before the final one —
+   and marks the last cacheable block of the nearest message that has one. Past
+   that bound, no message-level marker is placed. The motivating case is every
+   silent `bash` call: the final message's only block is
+   `{"type":"tool_result","content":""}`, so the marker lands on the preceding
+   assistant's `tool_use` instead. Moving a marker onto a history block is not a
+   history edit, and this mirrors the API's own automatic caching, which walks
+   backward to the nearest eligible block.
+
+   Uncacheable, never marked: `thinking` / `redacted_thinking` (the allowlist is
+   `text`, `image`, `document`, `tool_use`, `tool_result`), empty or whitespace
+   text blocks, and a `tool_result` with no real content — absent, an empty or
+   whitespace string, an empty array, or an array of only empty text blocks.
+   Whether the API accepts `cache_control` on an empty `tool_result` is
+   unverified, so we don't rely on it. Still ≤ 2 markers in total.
+
+   **Per-request opt-out.** `LlmRequest::disable_prompt_cache: bool` (default
+   `false`) makes `build_request_body` skip the breakpoints for that one request,
+   whatever the client-level setting. `rupu_agent::compact_messages` sets it on the
+   compaction-summary request. That request has its own system prompt and no
+   tools, so its prefix matches no cached turn and nothing ever re-reads it —
+   caching it would only pay the 1.25× write premium. One site covers the runner's
+   auto-compaction and `rupu session compact` / `run_turn`, which all go through
+   `compact_messages`.
 4. **Config.** `ProviderConfig.prompt_cache: Option<bool>` (`None` ⇒ on) and agent
    frontmatter `anthropicPromptCache: false`. Both are threaded through
    `rupu-runtime/src/provider_factory.rs` next to `with_oauth_system_prefix`, into

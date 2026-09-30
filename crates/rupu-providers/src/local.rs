@@ -293,6 +293,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = provider.build_openai_request(&request);
         assert_eq!(body["model"], "phi-local");
@@ -335,6 +336,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = provider.build_openai_request(&request);
         let messages = body["messages"]

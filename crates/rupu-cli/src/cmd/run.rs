@@ -640,6 +640,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let auth_hint = spec.auth;
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+            anthropic_prompt_cache: spec.anthropic_prompt_cache,
             openai_compatible: oai_params,
             tuning: Some(provider_factory::provider_tuning(
                 &provider_name,
@@ -1296,8 +1297,8 @@ impl PermissionDecider for ReadonlyDecider {
 /// A `rupu run` agent's running spend, accumulated from the transcript
 /// `Usage` events the tail loop already reads — compaction summariser calls
 /// included, since they are billed. Each event is priced on its own
-/// provider/model (a mid-run model swap prices correctly) and cached-input
-/// count, with the agent as the pricing fallback key.
+/// provider/model (a mid-run model swap prices correctly) and cache read /
+/// write counts, with the agent as the pricing fallback key.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct LiveUsageTally {
     input: u64,
@@ -1320,20 +1321,23 @@ impl LiveUsageTally {
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_write_tokens,
             ..
         } = ev
         else {
             return false;
         };
-        let (input, output, cached) = (
+        let (input, output, cached, cache_write) = (
             u64::from(*input_tokens),
             u64::from(*output_tokens),
             u64::from(*cached_tokens),
+            u64::from(*cache_write_tokens),
         );
         self.input += input;
         self.output += output;
         if let Some(price) = rupu_config::pricing::lookup(pricing, provider, model, agent) {
-            self.cost = Some(self.cost.unwrap_or(0.0) + price.cost_usd(input, output, cached));
+            self.cost =
+                Some(self.cost.unwrap_or(0.0) + price.cost_usd(input, output, cached, cache_write));
         }
         true
     }
@@ -1410,6 +1414,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: purpose.map(str::to_string),
         }
     }
@@ -1438,6 +1443,31 @@ mod tests {
                 tokens: 2_000_000,
                 cost: Some(18.0)
             }
+        );
+    }
+
+    #[test]
+    fn live_usage_tally_prices_cache_writes_at_the_write_rate() {
+        // Sonnet 4.6 built-in: $3 in / $15 out, $0.30 read, $3.75 write.
+        // 1M prompt = 500k read + 300k write + 200k uncached; 100k output.
+        let pricing = rupu_config::PricingConfig::default();
+        let mut tally = LiveUsageTally::default();
+        let ev = rupu_transcript::Event::Usage {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            served_model: None,
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cached_tokens: 500_000,
+            cache_write_tokens: 300_000,
+            purpose: None,
+        };
+        assert!(tally.add(&pricing, "coder", &ev));
+        let want = 0.2 * 3.0 + 0.5 * 0.30 + 0.3 * 3.75 + 0.1 * 15.0;
+        assert!(
+            (tally.cost.unwrap() - want).abs() < 1e-9,
+            "{:?}",
+            tally.cost
         );
     }
 

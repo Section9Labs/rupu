@@ -108,6 +108,21 @@ fn anthropic_feature_flags_default_to_none_when_omitted() {
     assert!(spec.anthropic_task_budget.is_none());
     assert!(spec.anthropic_context_management.is_none());
     assert!(spec.anthropic_speed.is_none());
+    assert!(spec.anthropic_prompt_cache.is_none());
+}
+
+#[test]
+fn parses_anthropic_prompt_cache_opt_out() {
+    let s = "---\nname: gw\nanthropicPromptCache: false\n---\nbody\n";
+    assert_eq!(
+        AgentSpec::parse(s).unwrap().anthropic_prompt_cache,
+        Some(false)
+    );
+    let s = "---\nname: gw\nanthropicPromptCache: true\n---\nbody\n";
+    assert_eq!(
+        AgentSpec::parse(s).unwrap().anthropic_prompt_cache,
+        Some(true)
+    );
 }
 
 #[test]

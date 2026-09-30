@@ -37,7 +37,12 @@ use std::sync::Arc;
 pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache reads — a subset of `input_tokens`.
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    /// Defaulted so a remote CP that predates it still parses.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub total_tokens: u64,
     /// `None` when no contributing row was priced. Otherwise the sum of the
     /// priced rows' cost (a partial total when `priced == false`).
@@ -65,11 +70,17 @@ pub fn summarize(rows: &[UsageRow], pricing: &PricingConfig) -> UsageSummary {
         out.input_tokens += row.input_tokens;
         out.output_tokens += row.output_tokens;
         out.cached_tokens += row.cached_tokens;
+        out.cache_write_tokens += row.cache_write_tokens;
         out.runs += row.runs;
         match rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent) {
             Some(price) => {
                 any_priced = true;
-                cost_acc += price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens);
+                cost_acc += price.cost_usd(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                );
             }
             None => out.priced = false,
         }
@@ -260,6 +271,7 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
         out.input_tokens += s.input_tokens;
         out.output_tokens += s.output_tokens;
         out.cached_tokens += s.cached_tokens;
+        out.cache_write_tokens += s.cache_write_tokens;
         out.runs += s.runs;
         if let Some(c) = s.cost_usd {
             any_cost = true;
@@ -411,6 +423,10 @@ pub struct UsageBreakdownRow {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`. Defaulted so a remote CP
+    /// that predates it still parses.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: Option<f64>,
     pub priced: bool,
@@ -470,6 +486,7 @@ pub fn breakdown(
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 0,
             cost_usd: None,
             priced: true,
@@ -478,10 +495,16 @@ pub fn breakdown(
         entry.input_tokens += row.input_tokens;
         entry.output_tokens += row.output_tokens;
         entry.cached_tokens += row.cached_tokens;
+        entry.cache_write_tokens += row.cache_write_tokens;
         entry.runs += row.runs;
         match rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent) {
             Some(price) => {
-                let c = price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens);
+                let c = price.cost_usd(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cached_tokens,
+                    row.cache_write_tokens,
+                );
                 entry.cost_usd = Some(entry.cost_usd.unwrap_or(0.0) + c);
             }
             None => entry.priced = false,
@@ -512,6 +535,8 @@ pub struct TurnPoint {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub tokens_cached: u64,
+    #[serde(default)]
+    pub tokens_cache_write: u64,
 }
 
 #[cfg(test)]
@@ -550,6 +575,34 @@ pub(crate) mod tests {
         assert!(s.priced);
         // 1M*3.0 + 1M*15.0 = $18.00
         assert!((s.cost_usd.unwrap() - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summarize_and_breakdown_bill_cache_writes_at_the_write_rate() {
+        // Sonnet 4.6 built-in: $3 in / $15 out, $0.30 read, $3.75 write.
+        // 1M prompt = 500k read + 300k write + 200k uncached; 100k output.
+        let pricing = PricingConfig::default();
+        let rows = [UsageRow {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cached_tokens: 500_000,
+            cache_write_tokens: 300_000,
+            ..row("anthropic", "claude-sonnet-4-6", 0, 0, 0)
+        }];
+        let want = 0.2 * 3.0 + 0.5 * 0.30 + 0.3 * 3.75 + 0.1 * 15.0;
+
+        let s = summarize(&rows, &pricing);
+        assert!(
+            (s.cost_usd.unwrap() - want).abs() < 1e-9,
+            "{:?}",
+            s.cost_usd
+        );
+        assert_eq!(s.cache_write_tokens, 300_000);
+
+        let b = breakdown(&rows, &pricing, GroupBy::Model);
+        assert_eq!(b.len(), 1);
+        assert!((b[0].cost_usd.unwrap() - want).abs() < 1e-9);
+        assert_eq!(b[0].cache_write_tokens, 300_000);
     }
 
     #[test]
@@ -611,6 +664,7 @@ pub(crate) mod tests {
             input_tokens: 10,
             output_tokens: 5,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 15,
             cost_usd: Some(2.0),
             priced: true,
@@ -621,6 +675,7 @@ pub(crate) mod tests {
             input_tokens: 20,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 20,
             cost_usd: None,
             priced: false,
@@ -658,6 +713,34 @@ pub(crate) mod tests {
         let s = summarize_run_usage(&u, &PricingConfig::default());
         assert!(s.partial);
         assert_eq!(s.total_tokens, 15);
+    }
+
+    #[test]
+    fn summarize_and_rollup_carry_cache_write_tokens() {
+        let pricing = PricingConfig::default();
+        let mut a = row("anthropic", "claude-sonnet-4-6", 1000, 10, 600);
+        a.cache_write_tokens = 30;
+        let mut b = row("anthropic", "claude-sonnet-4-6", 500, 5, 0);
+        b.cache_write_tokens = 5;
+        let s = summarize(&[a, b], &pricing);
+        assert_eq!(s.cache_write_tokens, 35);
+        assert_eq!(s.cached_tokens, 600);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["cache_write_tokens"], serde_json::json!(35), "{v}");
+
+        let r = rollup([s.clone(), s].into_iter());
+        assert_eq!(r.cache_write_tokens, 70);
+        let mut e = EntityRollup::default();
+        e.add(&r, None);
+        assert_eq!(e.usage.cache_write_tokens, 70);
+
+        // A remote CP that predates the field (host fan-out) parses as 0.
+        let old: UsageSummary = serde_json::from_value(serde_json::json!({
+            "input_tokens": 1, "output_tokens": 1, "cached_tokens": 0,
+            "total_tokens": 2, "cost_usd": null, "priced": false, "runs": 1
+        }))
+        .unwrap();
+        assert_eq!(old.cache_write_tokens, 0);
     }
 
     #[test]
@@ -707,6 +790,7 @@ pub(crate) mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 total_tokens: 15,
                 cost_usd: Some(1.0),
                 priced: true,
@@ -720,6 +804,7 @@ pub(crate) mod tests {
                 input_tokens: 20,
                 output_tokens: 0,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 total_tokens: 20,
                 cost_usd: Some(2.0),
                 priced: true,

@@ -237,6 +237,8 @@ fn session_usage_from_totals(
                     dto.total_tokens_in,
                     dto.total_tokens_out,
                     dto.total_tokens_cached,
+                    // A session's own totals carry no cache-write count.
+                    0,
                 )
             },
         );
@@ -244,6 +246,8 @@ fn session_usage_from_totals(
         input_tokens: dto.total_tokens_in,
         output_tokens: dto.total_tokens_out,
         cached_tokens: dto.total_tokens_cached,
+        // A session's own totals carry no cache-write count.
+        cache_write_tokens: 0,
         total_tokens,
         priced: cost_usd.is_some(),
         cost_usd,
@@ -1136,6 +1140,7 @@ mod tests {
                 input_tokens: 70,
                 output_tokens: 7,
                 cached_tokens: 0,
+                cache_write_tokens: 0,
                 purpose: None,
             },
         ] {

@@ -20,7 +20,7 @@
 use crate::{ModelPricing, PricingConfig};
 
 /// Built-in USD-per-million-tokens defaults for the major models.
-/// Last reviewed: 2026-09-04, all three sections, against
+/// Last reviewed: 2026-09-29, all three sections, against
 /// <https://developers.openai.com/api/docs/pricing>,
 /// <https://platform.claude.com/docs/en/about-claude/pricing>, and
 /// <https://ai.google.dev/gemini-api/docs/pricing>. Pricing drifts over
@@ -35,15 +35,35 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
     // ── Anthropic ─────────────────────────────────────────────────
     // First-party API rates from
     // https://platform.claude.com/docs/en/about-claude/pricing.
-    // `cached_input_per_mtok` is the cache-READ (hit) rate. Cache
-    // writes bill at 1.25x (5m) / 2x (1h) the input rate; transcripts
-    // fold cache-creation tokens into `input_tokens`, so writes are
-    // billed here at 1x and slightly under-counted. Long context is
+    // `cached_input_per_mtok` is the cache-READ (hit) rate.
+    // Cache writes bill at 1.25x input (5-minute TTL — rupu's only TTL);
+    // `input_tokens` is normalized to include reads and writes (see
+    // `rupu_providers::anthropic::AnthropicWireUsage`). Long context is
     // included at standard rates on 4.6+ models, so no surcharge to
     // model. Batch discounts and the 1.1x `inference_geo: "us"` uplift
     // are not modeled.
-    // Fable 5.1 / Mythos 5.1 cache hits bill at 0.025x input (all other
-    // models: 0.1x).
+    // Fable 5.1 / Mythos 5.1 cache hits bill at 0.025x input, Opus 5.5 at
+    // 0.05x (all other models: 0.1x).
+    (
+        "anthropic",
+        "claude-opus-5-5",
+        ModelPricing {
+            input_per_mtok: 4.0,
+            output_per_mtok: 20.0,
+            cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: Some(5.0),
+        },
+    ),
+    (
+        "anthropic",
+        "claude-sonnet-5-5",
+        ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 10.0,
+            cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: Some(2.5),
+        },
+    ),
     (
         "anthropic",
         "claude-fable-5-1",
@@ -51,6 +71,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 10.0,
             output_per_mtok: 50.0,
             cached_input_per_mtok: Some(0.25),
+            cache_write_per_mtok: Some(12.5),
         },
     ),
     (
@@ -60,6 +81,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 10.0,
             output_per_mtok: 50.0,
             cached_input_per_mtok: Some(0.25),
+            cache_write_per_mtok: Some(12.5),
         },
     ),
     (
@@ -69,6 +91,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 10.0,
             output_per_mtok: 50.0,
             cached_input_per_mtok: Some(1.0),
+            cache_write_per_mtok: Some(12.5),
         },
     ),
     (
@@ -78,6 +101,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 10.0,
             output_per_mtok: 50.0,
             cached_input_per_mtok: Some(1.0),
+            cache_write_per_mtok: Some(12.5),
         },
     ),
     (
@@ -87,6 +111,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 25.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: Some(6.25),
         },
     ),
     (
@@ -96,6 +121,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 25.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: Some(6.25),
         },
     ),
     (
@@ -105,6 +131,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 25.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: Some(6.25),
         },
     ),
     (
@@ -114,6 +141,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 25.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: Some(6.25),
         },
     ),
     (
@@ -123,6 +151,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 25.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: Some(6.25),
         },
     ),
     // Retired on the first-party API; still priced for historical runs.
@@ -133,6 +162,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 15.0,
             output_per_mtok: 75.0,
             cached_input_per_mtok: Some(1.50),
+            cache_write_per_mtok: Some(18.75),
         },
     ),
     (
@@ -142,6 +172,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 15.0,
             output_per_mtok: 75.0,
             cached_input_per_mtok: Some(1.50),
+            cache_write_per_mtok: Some(18.75),
         },
     ),
     (
@@ -151,6 +182,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.0,
             output_per_mtok: 10.0,
             cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: Some(2.5),
         },
     ),
     (
@@ -160,6 +192,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.30),
+            cache_write_per_mtok: Some(3.75),
         },
     ),
     (
@@ -169,6 +202,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.30),
+            cache_write_per_mtok: Some(3.75),
         },
     ),
     (
@@ -178,6 +212,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 3.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.30),
+            cache_write_per_mtok: Some(3.75),
         },
     ),
     (
@@ -187,6 +222,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.0,
             output_per_mtok: 5.0,
             cached_input_per_mtok: Some(0.10),
+            cache_write_per_mtok: Some(1.25),
         },
     ),
     // Haiku 3.5 keeps the older `claude-3-5-haiku-<YYYYMMDD>` id shape;
@@ -198,6 +234,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.80,
             output_per_mtok: 4.0,
             cached_input_per_mtok: Some(0.08),
+            cache_write_per_mtok: Some(1.0),
         },
     ),
     // Retro-alias: legacy transcripts recorded Anthropic's served-model id
@@ -215,6 +252,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 15.0,
             output_per_mtok: 75.0,
             cached_input_per_mtok: Some(1.50),
+            cache_write_per_mtok: Some(18.75),
         },
     ),
     // ── OpenAI ────────────────────────────────────────────────────
@@ -232,6 +270,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 10.0,
             output_per_mtok: 50.0,
             cached_input_per_mtok: Some(1.0),
+            cache_write_per_mtok: None,
         },
     ),
     // Promotional rate, published as available at least through 2026-11-21.
@@ -242,6 +281,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 4.0,
             output_per_mtok: 20.0,
             cached_input_per_mtok: Some(0.40),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -251,6 +291,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.0,
             output_per_mtok: 12.0,
             cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -260,6 +301,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.20,
             output_per_mtok: 1.20,
             cached_input_per_mtok: Some(0.02),
+            cache_write_per_mtok: None,
         },
     ),
     // Daybreak cyber model; short-context tier only is published.
@@ -270,6 +312,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 12.50,
             output_per_mtok: 75.0,
             cached_input_per_mtok: Some(1.25),
+            cache_write_per_mtok: None,
         },
     ),
     // Daybreak aliases: `blue` currently points at gpt-5.6-sol and `red` at
@@ -282,6 +325,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 4.0,
             output_per_mtok: 20.0,
             cached_input_per_mtok: Some(0.40),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -291,6 +335,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 12.50,
             output_per_mtok: 75.0,
             cached_input_per_mtok: Some(1.25),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -300,6 +345,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 30.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: None,
         },
     ),
     // Pro-tier models publish no cached-input rate; `None` bills cache hits
@@ -311,6 +357,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 30.0,
             output_per_mtok: 180.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -320,6 +367,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.50,
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.25),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -329,6 +377,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.75,
             output_per_mtok: 4.50,
             cached_input_per_mtok: Some(0.075),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -338,6 +387,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.20,
             output_per_mtok: 1.25,
             cached_input_per_mtok: Some(0.02),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -347,6 +397,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 30.0,
             output_per_mtok: 180.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -356,6 +407,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.75,
             output_per_mtok: 14.0,
             cached_input_per_mtok: Some(0.175),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -365,6 +417,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.75,
             output_per_mtok: 14.0,
             cached_input_per_mtok: Some(0.175),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -374,6 +427,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 21.0,
             output_per_mtok: 168.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -383,6 +437,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.25,
             output_per_mtok: 10.0,
             cached_input_per_mtok: Some(0.125),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -392,6 +447,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.25,
             output_per_mtok: 10.0,
             cached_input_per_mtok: Some(0.125),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -401,6 +457,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.25,
             output_per_mtok: 2.0,
             cached_input_per_mtok: Some(0.025),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -410,6 +467,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.05,
             output_per_mtok: 0.40,
             cached_input_per_mtok: Some(0.005),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -419,6 +477,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 15.0,
             output_per_mtok: 120.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         },
     ),
     // The ChatGPT-tuned alias listed under "Specialized models".
@@ -429,6 +488,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 30.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -438,6 +498,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.0,
             output_per_mtok: 8.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -447,6 +508,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.40,
             output_per_mtok: 1.60,
             cached_input_per_mtok: Some(0.10),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -456,6 +518,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.10,
             output_per_mtok: 0.40,
             cached_input_per_mtok: Some(0.025),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -465,6 +528,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.50,
             output_per_mtok: 10.0,
             cached_input_per_mtok: Some(1.25),
+            cache_write_per_mtok: None,
         },
     ),
     // The original gpt-4o snapshot is priced differently from the bare id.
@@ -478,6 +542,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 5.0,
             output_per_mtok: 15.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -487,6 +552,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.15,
             output_per_mtok: 0.60,
             cached_input_per_mtok: Some(0.075),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -496,6 +562,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 15.0,
             output_per_mtok: 60.0,
             cached_input_per_mtok: Some(7.50),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -505,6 +572,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 150.0,
             output_per_mtok: 600.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -514,6 +582,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.0,
             output_per_mtok: 8.0,
             cached_input_per_mtok: Some(0.50),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -523,6 +592,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 20.0,
             output_per_mtok: 80.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -532,6 +602,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.10,
             output_per_mtok: 4.40,
             cached_input_per_mtok: Some(0.55),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -541,6 +612,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.10,
             output_per_mtok: 4.40,
             cached_input_per_mtok: Some(0.275),
+            cache_write_per_mtok: None,
         },
     ),
     // ── Google Gemini ─────────────────────────────────────────────
@@ -563,6 +635,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.75,
             output_per_mtok: 3.75,
             cached_input_per_mtok: Some(0.075),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -572,6 +645,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.75,
             output_per_mtok: 3.75,
             cached_input_per_mtok: Some(0.075),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -581,6 +655,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.75,
             output_per_mtok: 3.75,
             cached_input_per_mtok: Some(0.075),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -590,6 +665,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.50,
             output_per_mtok: 9.0,
             cached_input_per_mtok: Some(0.15),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -599,6 +675,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.30,
             output_per_mtok: 2.50,
             cached_input_per_mtok: Some(0.03),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -608,6 +685,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.0,
             output_per_mtok: 12.0,
             cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -617,6 +695,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 2.0,
             output_per_mtok: 12.0,
             cached_input_per_mtok: Some(0.20),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -626,6 +705,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.25,
             output_per_mtok: 1.50,
             cached_input_per_mtok: Some(0.025),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -635,6 +715,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.50,
             output_per_mtok: 3.0,
             cached_input_per_mtok: Some(0.05),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -644,6 +725,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 1.25,
             output_per_mtok: 10.0,
             cached_input_per_mtok: Some(0.125),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -653,6 +735,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.30,
             output_per_mtok: 2.50,
             cached_input_per_mtok: Some(0.03),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -662,6 +745,7 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             input_per_mtok: 0.10,
             output_per_mtok: 0.40,
             cached_input_per_mtok: Some(0.01),
+            cache_write_per_mtok: None,
         },
     ),
 ];
@@ -849,6 +933,7 @@ mod tests {
                 input_per_mtok: 99.0, // intentionally wrong vs. builtin
                 output_per_mtok: 99.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         cfg.models.insert("anthropic".into(), anthro);
@@ -875,6 +960,7 @@ mod tests {
                 input_per_mtok: 5.0,
                 output_per_mtok: 25.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         // Provider+model that nobody knows about → should hit agent rung.
@@ -908,6 +994,7 @@ mod tests {
                 input_per_mtok: 3.0,
                 output_per_mtok: 15.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         anthro.insert(
@@ -916,6 +1003,7 @@ mod tests {
                 input_per_mtok: 6.0,
                 output_per_mtok: 22.5,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         cfg.models.insert("anthropic".into(), anthro);
@@ -975,6 +1063,7 @@ mod tests {
                 input_per_mtok: 99.0,
                 output_per_mtok: 99.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         cfg.models.insert("openai".into(), openai_user);
@@ -1081,6 +1170,7 @@ mod tests {
                 ("input", Some(price.input_per_mtok)),
                 ("output", Some(price.output_per_mtok)),
                 ("cached", price.cached_input_per_mtok),
+                ("cache write", price.cache_write_per_mtok),
             ] {
                 if let Some(rate) = rate {
                     assert!(
@@ -1128,9 +1218,63 @@ mod tests {
         assert_eq!(sonnet5.input_per_mtok, 2.0);
         assert_eq!(sonnet5.output_per_mtok, 10.0);
 
+        let opus55 = lookup(&cfg, "anthropic", "claude-opus-5-5", "any").unwrap();
+        assert_eq!(opus55.input_per_mtok, 4.0);
+        assert_eq!(opus55.output_per_mtok, 20.0);
+        assert_eq!(opus55.cached_input_per_mtok, Some(0.20));
+        assert_eq!(opus55.cache_write_per_mtok, Some(5.0));
+
+        let sonnet55 = lookup(&cfg, "anthropic", "claude-sonnet-5-5", "any").unwrap();
+        assert_eq!(sonnet55.input_per_mtok, 2.0);
+        assert_eq!(sonnet55.output_per_mtok, 10.0);
+        assert_eq!(sonnet55.cached_input_per_mtok, Some(0.20));
+        assert_eq!(sonnet55.cache_write_per_mtok, Some(2.5));
+
         let opus41 = lookup(&cfg, "anthropic", "claude-opus-4-1", "any").unwrap();
         assert_eq!(opus41.input_per_mtok, 15.0);
         assert_eq!(opus41.output_per_mtok, 75.0);
+    }
+
+    #[test]
+    fn every_builtin_anthropic_entry_bills_cache_writes_at_1_25x_input() {
+        // 5-minute-TTL cache writes bill at 1.25x the input rate — rupu's
+        // only TTL. A new Anthropic entry that forgets the write rate would
+        // silently bill writes at 1x.
+        let mut checked = 0;
+        for (provider, model, price) in BUILTIN_PRICES {
+            if *provider != "anthropic" {
+                continue;
+            }
+            let write = price
+                .cache_write_per_mtok
+                .unwrap_or_else(|| panic!("anthropic/{model} has no cache-write rate"));
+            assert!(
+                (write - 1.25 * price.input_per_mtok).abs() < 1e-9,
+                "anthropic/{model}: write {write} != 1.25 x input {}",
+                price.input_per_mtok
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 20,
+            "expected the full Anthropic section, saw {checked}"
+        );
+    }
+
+    #[test]
+    fn non_anthropic_builtins_carry_no_separate_write_rate() {
+        // OpenAI and Gemini bill no separate cache-write charge, so the
+        // write rate stays unset and writes (which they never report) would
+        // fall back to the input rate.
+        for (provider, model, price) in BUILTIN_PRICES {
+            if *provider == "anthropic" {
+                continue;
+            }
+            assert_eq!(
+                price.cache_write_per_mtok, None,
+                "{provider}/{model} should not set a write rate"
+            );
+        }
     }
 
     #[test]
@@ -1222,6 +1366,7 @@ mod tests {
                 input_per_mtok: 0.0,
                 output_per_mtok: 0.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         cfg.models.insert("google-antigravity".into(), ag);
@@ -1262,6 +1407,7 @@ mod tests {
                 input_per_mtok: 1.0,
                 output_per_mtok: 2.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         cfg.models.insert("openai-oracle".into(), acct);
@@ -1283,6 +1429,7 @@ mod tests {
                 input_per_mtok: 7.0,
                 output_per_mtok: 8.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         cfg.models.insert("openai".into(), kind);
@@ -1299,6 +1446,7 @@ mod tests {
                 input_per_mtok: 5.0,
                 output_per_mtok: 25.0,
                 cached_input_per_mtok: None,
+                cache_write_per_mtok: None,
             },
         );
         let p = lookup(&cfg, "some-account", "gpt-5.6-cyber", "reviewer").unwrap();

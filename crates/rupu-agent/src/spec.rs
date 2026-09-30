@@ -48,6 +48,14 @@ struct Frontmatter {
     /// resolved provider/auth is not Anthropic OAuth.
     #[serde(default, rename = "anthropicOauthPrefix")]
     anthropic_oauth_prefix: Option<bool>,
+    /// Anthropic prompt caching opt-out (default on). `false` disables the
+    /// explicit `cache_control` breakpoints for this agent — e.g. when its
+    /// provider is an Anthropic-compatible gateway that rejects them. `None`
+    /// (default) defers to `[providers.<name>] prompt_cache`; any explicit
+    /// value here wins over the provider config. No effect on non-Anthropic
+    /// providers.
+    #[serde(default, rename = "anthropicPromptCache")]
+    anthropic_prompt_cache: Option<bool>,
     /// Reasoning / thinking effort level. Accepts the canonical
     /// `auto|minimal|low|medium|high|max` plus aliases `adaptive`
     /// (= auto) and `xhigh` (= max). Each provider maps to its native
@@ -149,6 +157,9 @@ pub struct AgentSpec {
     pub max_turns: Option<u32>,
     pub permission_mode: Option<String>,
     pub anthropic_oauth_prefix: Option<bool>,
+    /// Anthropic prompt caching opt-out — see the `anthropicPromptCache`
+    /// frontmatter doc comment on `Frontmatter`.
+    pub anthropic_prompt_cache: Option<bool>,
     pub effort: Option<ThinkingLevel>,
     pub context_window: Option<ContextWindow>,
     pub output_format: Option<OutputFormat>,
@@ -208,6 +219,7 @@ impl AgentSpec {
             max_turns: fm.max_turns,
             permission_mode: fm.permission_mode,
             anthropic_oauth_prefix: fm.anthropic_oauth_prefix,
+            anthropic_prompt_cache: fm.anthropic_prompt_cache,
             effort: fm.effort,
             context_window: fm.context_window,
             output_format: fm.output_format,

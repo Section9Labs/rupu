@@ -769,6 +769,11 @@ export default function RunDetail() {
                 {displayUsage.cached_tokens > 0 && (
                   <span><span className="text-ink-mute">cached</span> {formatTokens(displayUsage.cached_tokens)}</span>
                 )}
+                {(displayUsage.cache_write_tokens ?? 0) > 0 && (
+                  <span>
+                    <span className="text-ink-mute">cache write</span> {formatTokens(displayUsage.cache_write_tokens ?? 0)}
+                  </span>
+                )}
                 <span
                   title={
                     displayUsage.partial

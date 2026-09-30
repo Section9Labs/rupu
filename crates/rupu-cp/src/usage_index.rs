@@ -52,7 +52,10 @@ const MAX_PARENT_HOPS: usize = 64;
 pub struct Tokens {
     pub input: u64,
     pub output: u64,
+    /// Cache reads — a subset of `input`.
     pub cached: u64,
+    /// Cache writes — a subset of `input`, like `cached`.
+    pub cache_write: u64,
 }
 
 impl Tokens {
@@ -60,6 +63,7 @@ impl Tokens {
         self.input = self.input.saturating_add(o.input);
         self.output = self.output.saturating_add(o.output);
         self.cached = self.cached.saturating_add(o.cached);
+        self.cache_write = self.cache_write.saturating_add(o.cache_write);
     }
 }
 
@@ -142,6 +146,7 @@ impl LedgerFold {
             input: row.input_tokens,
             output: row.output_tokens,
             cached: row.cached_tokens,
+            cache_write: row.cache_write_tokens,
         };
         if let Some(key) = transcript_key(&row.transcript) {
             if self.keys.insert(key.clone()) {
@@ -235,6 +240,7 @@ impl TranscriptFold {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                cache_write_tokens,
                 purpose,
                 ..
             } => {
@@ -248,6 +254,7 @@ impl TranscriptFold {
                     input: u64::from(input_tokens),
                     output: u64::from(output_tokens),
                     cached: u64::from(cached_tokens),
+                    cache_write: u64::from(cache_write_tokens),
                 };
                 self.by_model
                     .entry((provider, model, agent.clone()))
@@ -312,6 +319,7 @@ fn add_row(map: &mut BTreeMap<ModelKey, UsageRow>, key: &ModelKey, t: Tokens) {
     row.input_tokens = row.input_tokens.saturating_add(t.input);
     row.output_tokens = row.output_tokens.saturating_add(t.output);
     row.cached_tokens = row.cached_tokens.saturating_add(t.cached);
+    row.cache_write_tokens = row.cache_write_tokens.saturating_add(t.cache_write);
     row.runs += 1;
 }
 
@@ -329,6 +337,7 @@ impl Acc {
             tokens_in: t.input,
             tokens_out: t.output,
             tokens_cached: t.cached,
+            tokens_cache_write: t.cache_write,
         });
     }
 
@@ -1037,7 +1046,14 @@ impl UsageIndex {
                     if let Some(last) = &st.last {
                         // Tokens only: a ledger point's label may legitimately
                         // resolve later (a child row before its ancestor's).
-                        let tok = |p: &TurnPoint| (p.tokens_in, p.tokens_out, p.tokens_cached);
+                        let tok = |p: &TurnPoint| {
+                            (
+                                p.tokens_in,
+                                p.tokens_out,
+                                p.tokens_cached,
+                                p.tokens_cache_write,
+                            )
+                        };
                         debug_assert!(
                             last.points.len() <= built.points.len()
                                 && last
@@ -1239,6 +1255,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
         };
         serde_json::to_string(&row).unwrap() + "\n"
     }
@@ -1261,6 +1278,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             purpose: purpose.map(str::to_string),
         })
     }
@@ -1337,6 +1355,7 @@ mod tests {
             t.input += r.input_tokens;
             t.output += r.output_tokens;
             t.cached += r.cached_tokens;
+            t.cache_write += r.cache_write_tokens;
         }
         t
     }
@@ -1354,6 +1373,7 @@ mod tests {
             input,
             output,
             cached: 0,
+            cache_write: 0,
         }
     }
 
@@ -1371,7 +1391,15 @@ mod tests {
         if exact_order {
             assert_eq!(a.points, b.points, "points");
         } else {
-            let key = |p: &TurnPoint| (p.label.clone(), p.tokens_in, p.tokens_out, p.tokens_cached);
+            let key = |p: &TurnPoint| {
+                (
+                    p.label.clone(),
+                    p.tokens_in,
+                    p.tokens_out,
+                    p.tokens_cached,
+                    p.tokens_cache_write,
+                )
+            };
             let mut pa: Vec<_> = a.points.iter().map(key).collect();
             let mut pb: Vec<_> = b.points.iter().map(key).collect();
             pa.sort();
@@ -1526,6 +1554,99 @@ mod tests {
         assert_eq!(u.rows.len(), 2, "two agents");
         assert!(u.rows.iter().all(|r| r.runs == 1));
         assert!(!u.partial);
+    }
+
+    /// `line` (one [`ledger_line`]) with `cache_write_tokens` set to `n`.
+    fn with_cache_write(line: String, n: u64) -> String {
+        let mut row: LedgerRow = serde_json::from_str(line.trim_end()).unwrap();
+        row.cache_write_tokens = n;
+        serde_json::to_string(&row).unwrap() + "\n"
+    }
+
+    #[test]
+    fn cache_write_tokens_fold_from_ledger_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_CWLEDGER", RunStatus::Running);
+        let t = tmp.path().join("transcripts/run_A.jsonl");
+        append(
+            &store.usage_ledger_path("run_CWLEDGER"),
+            &[
+                with_cache_write(
+                    ledger_line(
+                        "01CW1",
+                        Some("s"),
+                        Some(0),
+                        "run_A",
+                        None,
+                        &t,
+                        100,
+                        10,
+                        LedgerKind::Turn,
+                    ),
+                    30,
+                ),
+                with_cache_write(
+                    ledger_line(
+                        "01CW2",
+                        Some("s"),
+                        Some(0),
+                        "run_A",
+                        None,
+                        &t,
+                        50,
+                        5,
+                        LedgerKind::Turn,
+                    ),
+                    5,
+                ),
+            ]
+            .concat(),
+        );
+
+        let u = UsageIndex::default().run_usage(&store, "run_CWLEDGER");
+        assert_eq!(u.rows.len(), 1);
+        assert_eq!(u.rows[0].cache_write_tokens, 35);
+        assert_eq!(u.rows[0].input_tokens, 150);
+        assert_eq!(u.by_step["s"][0].cache_write_tokens, 35);
+        assert_eq!(u.by_unit[&("s".to_string(), 0)].cache_write, 35);
+        let points: Vec<u64> = u.points.iter().map(|p| p.tokens_cache_write).collect();
+        assert_eq!(points, [30, 5]);
+    }
+
+    #[test]
+    fn cache_write_tokens_fold_from_a_fallback_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_CWFALLBACK", RunStatus::Running);
+        let a = tmp.path().join("transcripts/run_A.jsonl");
+        let mut text = transcript_lines("builder", PROVIDER, MODEL, &[]);
+        text += &event_json(&Event::Usage {
+            provider: PROVIDER.into(),
+            model: MODEL.into(),
+            served_model: None,
+            input_tokens: 90,
+            output_tokens: 9,
+            cached_tokens: 20,
+            cache_write_tokens: 7,
+            purpose: None,
+        });
+        append(&a, &text);
+        store
+            .append_step_result("run_CWFALLBACK", &step_result("build", &a))
+            .unwrap();
+
+        let u = UsageIndex::default().run_usage(&store, "run_CWFALLBACK");
+        assert_eq!(u.rows.len(), 1);
+        assert_eq!(u.rows[0].cache_write_tokens, 7);
+        assert_eq!(u.rows[0].cached_tokens, 20);
+        assert_eq!(u.by_step["build"][0].cache_write_tokens, 7);
+        assert_eq!(u.points.len(), 1);
+        assert_eq!(u.points[0].tokens_cache_write, 7);
+
+        // The same file through the session/standalone entry point.
+        let s = UsageIndex::default().transcripts_usage(&[("turn".into(), a.clone())]);
+        assert_eq!(s.rows[0].cache_write_tokens, 7);
     }
 
     #[test]

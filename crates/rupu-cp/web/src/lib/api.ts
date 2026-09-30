@@ -1115,6 +1115,8 @@ export interface UsageTimelinePoint {
   tokens_in: number;
   tokens_out: number;
   tokens_cached: number;
+  /** Cache writes; absent from CPs that predate the field. */
+  tokens_cache_write?: number;
 }
 
 /**
