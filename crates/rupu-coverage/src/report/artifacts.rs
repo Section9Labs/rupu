@@ -40,6 +40,28 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// RAII guard for temporary files: removes the file on drop unless disarmed.
+struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Consume the guard without dropping the file (e.g., after successful rename).
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// SHA-256 of a file's contents, streamed.
 pub(crate) fn sha256_file(p: &Path) -> std::io::Result<String> {
     let mut f = File::open(p)?;
@@ -128,8 +150,19 @@ impl ArtifactStore {
                         .replace('\\', "/");
                     out.push(self.ingest_file(&rel, &f, max_bytes)?);
                 }
-            } else {
+            } else if fs::metadata(&canon)
+                .map_err(|source| ArtifactError::Io {
+                    path: r.path.clone(),
+                    source,
+                })?
+                .is_file()
+            {
                 out.push(self.ingest_file(&r.path, &canon, max_bytes)?);
+            } else {
+                return Err(ArtifactError::Path {
+                    path: r.path.clone(),
+                    reason: "not a regular file or directory",
+                });
             }
         }
         Ok(out)
@@ -164,11 +197,14 @@ impl ArtifactStore {
 
     /// Stream `src` into a temp file in the store while hashing, then move it
     /// to its content address (or drop it when that blob already exists).
+    /// Cleans up the temp file on any error via RAII guard.
     fn copy_hashing(&self, src: &Path) -> std::io::Result<String> {
         fs::create_dir_all(&self.root)?;
-        let tmp = self.root.join(format!("{}.tmp", ulid::Ulid::new()));
+        let tmp_path = self.root.join(format!("{}.tmp", ulid::Ulid::new()));
+        let tmp = TempFile::new(tmp_path.clone());
+
         let mut input = File::open(src)?;
-        let mut output = File::create(&tmp)?;
+        let mut output = File::create(&tmp_path)?;
         let mut h = Sha256::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
@@ -184,10 +220,12 @@ impl ArtifactStore {
         let sha = hex(&h.finalize());
         let dest = self.blob_path(&sha);
         if dest.exists() {
-            fs::remove_file(&tmp)?;
+            fs::remove_file(&tmp_path)?;
+            tmp.disarm();
         } else {
             fs::create_dir_all(dest.parent().expect("blob path has a parent"))?;
-            fs::rename(&tmp, &dest)?;
+            fs::rename(&tmp_path, &dest)?;
+            tmp.disarm();
         }
         Ok(sha)
     }
@@ -265,11 +303,15 @@ mod tests {
             .unwrap();
         assert_eq!(out[0].sha256, out[1].sha256);
         assert_eq!(out[0].kind, Some(ArtifactKind::Binary));
-        let blobs: Vec<_> = walk(store.path())
-            .into_iter()
-            .filter(|p| !p.ends_with(".tmp"))
-            .collect();
-        assert_eq!(blobs.len(), 1, "{blobs:?}");
+        let blobs: Vec<_> = walk(store.path());
+        let tmp_files: Vec<_> = blobs.iter().filter(|p| p.ends_with(".tmp")).collect();
+        assert!(
+            tmp_files.is_empty(),
+            "no temp files should remain; found: {:?}",
+            tmp_files
+        );
+        let real_blobs: Vec<_> = blobs.into_iter().filter(|p| !p.ends_with(".tmp")).collect();
+        assert_eq!(real_blobs.len(), 1);
     }
 
     #[test]
@@ -325,6 +367,68 @@ mod tests {
             .ingest(ws.path(), &[req("/etc/hosts")], 1024)
             .unwrap_err();
         assert!(matches!(err, ArtifactError::Path { .. }), "{err}");
+    }
+
+    #[test]
+    fn temp_file_cleaned_up_on_error() {
+        let (ws, store) = setup();
+        fs::write(ws.path().join("src.txt"), "data").unwrap();
+
+        // Compute the expected sha256 of "data"
+        let expected_sha = {
+            let mut h = sha2::Sha256::new();
+            h.update(b"data");
+            hex(&h.finalize())
+        };
+
+        // Pre-create a regular FILE at <root>/<first two hex chars>,
+        // so create_dir_all in the blob path will fail.
+        fs::create_dir_all(store.path()).unwrap();
+        let shard = store.path().join(&expected_sha[..2]);
+        fs::write(&shard, "obstacle").unwrap();
+
+        let s = ArtifactStore::new(store.path());
+        let err = s.ingest(ws.path(), &[req("src.txt")], 1024).unwrap_err();
+
+        // Error should be Io (from create_dir_all failure)
+        assert!(matches!(err, ArtifactError::Io { .. }), "{err}");
+
+        // Assert no .tmp files remain in the store
+        let blobs: Vec<_> = walk(store.path());
+        let tmp_files: Vec<_> = blobs.iter().filter(|p| p.ends_with(".tmp")).collect();
+        assert!(
+            tmp_files.is_empty(),
+            "temp file should have been cleaned up; found: {:?}",
+            tmp_files
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_refused_without_blocking() {
+        let (ws, store) = setup();
+
+        // Try to create a FIFO. If mkfifo is not available, skip gracefully.
+        let fifo_path = ws.path().join("blocked.fifo");
+        let mkfifo_result = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status();
+
+        if mkfifo_result.is_err() || !mkfifo_result.unwrap().success() {
+            // mkfifo not available or failed; skip test
+            return;
+        }
+
+        let s = ArtifactStore::new(store.path());
+        let err = s
+            .ingest(ws.path(), &[req("blocked.fifo")], 1024)
+            .unwrap_err();
+
+        // Should be a Path error for "not a regular file or directory"
+        assert!(
+            matches!(err, ArtifactError::Path { reason, .. } if reason.contains("not a regular file")),
+            "expected Path error, got: {err}"
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<String> {
