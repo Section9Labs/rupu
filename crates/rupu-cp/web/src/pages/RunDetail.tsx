@@ -515,10 +515,15 @@ export default function RunDetail() {
 
   // Live usage (spec 2026-09-29 §7): polls GET /api/runs/:id/usage every 2s
   // while the run is live (and once more when it turns terminal). `run` gates
-  // liveness so a not-yet-loaded graph doesn't read as a running run. When the
-  // endpoint is unavailable (older remote CP) `liveUsage` stays null and the
-  // header/chart fall back to the graph's one-shot usage + the timeline fetch.
-  const { usage: liveUsage } = useRunUsage(id, host, run !== null && isRunning);
+  // liveness so a not-yet-loaded graph doesn't read as a running run, and is
+  // `runKnown`: a freshly launched run 404s here until its run.json lands (the
+  // same race fetchRunGraphWithRetry rides out), so a 404 only means "older
+  // remote CP" once the graph has confirmed the run exists. When the endpoint
+  // is unavailable `liveUsage` stays null and the header/chart fall back to
+  // the graph's one-shot usage + the timeline fetch.
+  const { usage: liveUsage } = useRunUsage(id, host, run !== null && isRunning, {
+    runKnown: run !== null,
+  });
   // Usage for the header row: live summary, else the graph's one-shot numbers.
   const displayUsage = liveUsage?.summary ?? graph?.usage;
   // Pause is only offered while the run is actively `running` (not merely

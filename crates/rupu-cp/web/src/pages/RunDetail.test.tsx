@@ -1096,6 +1096,21 @@ describe('RunDetail — live usage', () => {
     );
   });
 
+  it('goes live after a new run\'s transient 404 (run.json not landed when the page mounted)', async () => {
+    stubBase({ ...RUNNING_GRAPH, usage: EMPTY_USAGE });
+    // The mount-time request races the launch: 404, then the run exists.
+    const usageSpy = vi
+      .spyOn(api, 'getRunUsage')
+      .mockRejectedValueOnce(new ApiError(404, 'not found'))
+      .mockResolvedValue(liveResp());
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText(formatTokens(1_234_567))).toBeInTheDocument());
+    expect(screen.getByTestId('usage-timeline-mock')).toHaveAttribute('data-points', '2');
+    expect(usageSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
   it('falls back to the graph usage + one-shot timeline when the endpoint 404s', async () => {
     stubBase({
       ...GRAPH,

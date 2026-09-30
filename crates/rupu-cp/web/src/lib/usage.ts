@@ -15,7 +15,9 @@ export interface UsageSummary {
   /**
    * True when some of this run's transcripts were not readable on this CP (a
    * remote host that is not yet mirrored) — the totals are a lower bound.
-   * Only `GET /api/runs/:id/usage` sets it; absent elsewhere.
+   * The Rust `UsageSummary` serializes it on every summary (default false);
+   * it stays optional here only so a payload from an older remote CP, which
+   * predates the field, still type-checks.
    */
   partial?: boolean;
 }

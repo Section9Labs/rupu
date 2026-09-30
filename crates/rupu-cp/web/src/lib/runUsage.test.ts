@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderHook, waitFor, act } from '@testing-library/react';
+import { renderHook, waitFor, act, cleanup } from '@testing-library/react';
 import { mergeRunUsage, useRunUsage } from './runUsage';
 import { api, ApiError } from './api';
 
@@ -52,8 +52,30 @@ describe('mergeRunUsage', () => {
   });
   it('keeps the series (no new points) on an empty same-epoch tail', () => {
     const a = mergeRunUsage(null, resp({ points: [pt(1), pt(2)] }));
-    const b = mergeRunUsage(a, resp({ points_from: 2, points: [] }));
+    const b = mergeRunUsage(a, resp({ points_from: 2, points: [], summary: summary(3) }));
     expect(b.points.map((p) => p.turn)).toEqual([1, 2]);
+    expect(b.summary.total_tokens).toBe(3);
+  });
+  it('returns the SAME object for an unchanged response (no re-render, no chart redraw)', () => {
+    const a = mergeRunUsage(null, resp({ points: [pt(1), pt(2)], summary: summary(3), steps: { s: summary(3) }, turns: 2 }));
+    // A quiet poll: same epoch, tail resumes at the end, nothing new, equal (but
+    // freshly deserialized) summary/steps.
+    const quiet = () =>
+      resp({ points_from: 2, points: [], summary: summary(3), steps: { s: summary(3) }, turns: 2 });
+    expect(mergeRunUsage(a, quiet())).toBe(a);
+    // An empty run polling itself is equally unchanged.
+    const empty = mergeRunUsage(null, resp({}));
+    expect(mergeRunUsage(empty, resp({}))).toBe(empty);
+  });
+  it('returns a new object as soon as anything changes', () => {
+    const a = mergeRunUsage(null, resp({ points: [pt(1)], summary: summary(3), turns: 1 }));
+    const base = { points_from: 1, points: [], summary: summary(3), turns: 1 };
+    expect(mergeRunUsage(a, resp({ ...base, summary: summary(4) }))).not.toBe(a);
+    expect(mergeRunUsage(a, resp({ ...base, turns: 2 }))).not.toBe(a);
+    expect(mergeRunUsage(a, resp({ ...base, partial: true }))).not.toBe(a);
+    expect(mergeRunUsage(a, resp({ ...base, steps: { s: summary(3) } }))).not.toBe(a);
+    expect(mergeRunUsage(a, resp({ ...base, points: [pt(2)] }))).not.toBe(a);
+    expect(mergeRunUsage(a, resp({ ...base, epoch: '8' }))).not.toBe(a);
   });
 });
 
@@ -62,6 +84,9 @@ describe('useRunUsage', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
   });
   afterEach(() => {
+    // Unmount first: a still-mounted hook keeps its interval + visibility
+    // listener alive and would poll the NEXT test's spy.
+    cleanup();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -146,11 +171,11 @@ describe('useRunUsage', () => {
     expect(spy).toHaveBeenLastCalledWith('run_2', { host: undefined });
   });
 
-  it('reports unavailable (no throw) when the endpoint 404s, and stops polling', async () => {
-    const spy = vi
-      .spyOn(api, 'getRunUsage')
-      .mockRejectedValue(new ApiError(404, 'not found'));
-    const { result } = renderHook(() => useRunUsage('run_1', 'old-host', true, { intervalMs: 50 }));
+  it('reports unavailable (no throw) on a 404 once the run is known, and stops polling', async () => {
+    const spy = vi.spyOn(api, 'getRunUsage').mockRejectedValue(new ApiError(404, 'not found'));
+    const { result } = renderHook(() =>
+      useRunUsage('run_1', 'old-host', true, { intervalMs: 50, runKnown: true }),
+    );
     await waitFor(() => expect(result.current.unavailable).toBe(true));
     expect(result.current.usage).toBeNull();
     const calls = spy.mock.calls.length;
@@ -158,6 +183,67 @@ describe('useRunUsage', () => {
       vi.advanceTimersByTime(500);
     });
     expect(spy.mock.calls.length).toBe(calls);
+  });
+
+  it('treats a 404 as transient while the run is not known yet: keeps polling, then populates', async () => {
+    const spy = vi
+      .spyOn(api, 'getRunUsage')
+      .mockRejectedValueOnce(new ApiError(404, 'not found'))
+      .mockRejectedValueOnce(new ApiError(404, 'not found'))
+      .mockResolvedValueOnce(resp({ points: [pt(1)], summary: summary(5) }))
+      .mockResolvedValue(resp({ points_from: 1, points: [pt(2)], summary: summary(9) }));
+    const { result } = renderHook(() =>
+      useRunUsage('run_1', undefined, true, { intervalMs: 50, runKnown: false }),
+    );
+    // Two 404s: no `unavailable`, no gone-state.
+    await waitFor(() => expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(result.current.unavailable).toBe(false);
+    // The third poll lands and the fourth resumes from its tail: polling went on.
+    await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(5));
+    expect(result.current.unavailable).toBe(false);
+    await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(9));
+    // ...and it resumed from the tail (since/epoch), not from scratch.
+    expect(spy).toHaveBeenCalledWith('run_1', { host: undefined, since: 1, epoch: '7' });
+  });
+
+  it('a 404 that was already in flight when the run became known is still transient, and retries at once', async () => {
+    let reject404: (() => void) | undefined;
+    const first = new Promise<never>((_, rej) => {
+      reject404 = () => rej(new ApiError(404, 'not found'));
+    });
+    const spy = vi
+      .spyOn(api, 'getRunUsage')
+      .mockImplementationOnce(() => first)
+      .mockResolvedValue(resp({ points: [pt(1)], summary: summary(7) }));
+    // intervalMs is huge: only the immediate retry can produce the second call.
+    const { result, rerender } = renderHook(
+      ({ known }) => useRunUsage('run_1', undefined, true, { intervalMs: 600_000, runKnown: known }),
+      { initialProps: { known: false } },
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    rerender({ known: true }); // e.g. the graph just loaded
+    await act(async () => {
+      reject404?.();
+    });
+    await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(7));
+    expect(result.current.unavailable).toBe(false);
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('a 404 after the run is known clears when the id changes (new run polls afresh)', async () => {
+    const spy = vi.spyOn(api, 'getRunUsage').mockImplementation(async (id) => {
+      if (id === 'run_1') throw new ApiError(404, 'not found');
+      return resp({ points: [pt(1)], summary: summary(11) });
+    });
+    const { result, rerender } = renderHook(
+      ({ id }) => useRunUsage(id, undefined, true, { intervalMs: 50 }),
+      { initialProps: { id: 'run_1' } },
+    );
+    await waitFor(() => expect(result.current.unavailable).toBe(true));
+    rerender({ id: 'run_2' });
+    await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(11));
+    expect(result.current.unavailable).toBe(false);
+    expect(spy).toHaveBeenCalledWith('run_2', { host: undefined });
   });
 
   it('keeps the last good usage across a transient poll error', async () => {
@@ -171,5 +257,133 @@ describe('useRunUsage', () => {
     });
     expect(result.current.usage?.summary.total_tokens).toBe(5);
     expect(result.current.unavailable).toBe(false);
+  });
+
+  it('does not refetch when a run that just loaded goes live (page-load dedupe)', async () => {
+    const spy = vi.spyOn(api, 'getRunUsage').mockResolvedValue(resp({ points: [pt(1)] }));
+    const { result, rerender } = renderHook(
+      ({ live, known }) => useRunUsage('run_1', undefined, live, { intervalMs: 10_000, runKnown: known }),
+      { initialProps: { live: false, known: false } },
+    );
+    await waitFor(() => expect(result.current.usage?.points).toHaveLength(1));
+    // The graph resolves as `running`: live and runKnown flip together.
+    rerender({ live: true, known: true });
+    await act(async () => {
+      vi.advanceTimersByTime(100);
+    });
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('still fetches on going terminal even right after a poll (final numbers are newer)', async () => {
+    const spy = vi
+      .spyOn(api, 'getRunUsage')
+      .mockResolvedValueOnce(resp({ points: [pt(1)], summary: summary(1) }))
+      .mockResolvedValue(resp({ points_from: 1, points: [pt(2)], summary: summary(2) }));
+    const { result, rerender } = renderHook(
+      ({ live }) => useRunUsage('run_1', undefined, live, { intervalMs: 10_000 }),
+      { initialProps: { live: true } },
+    );
+    await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(1));
+    rerender({ live: false });
+    await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(2));
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('a queued final fetch belongs to its run: switching runs mid-flight does not leak it', async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const spy = vi
+      .spyOn(api, 'getRunUsage')
+      .mockImplementationOnce(async () => {
+        await gate;
+        return resp({ points: [pt(1)] });
+      })
+      .mockResolvedValue(resp({ points: [pt(9)], epoch: 'b' }));
+    const { result, rerender } = renderHook(
+      ({ id, live }) => useRunUsage(id, undefined, live, { intervalMs: 600_000 }),
+      { initialProps: { id: 'run_a', live: true } },
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    rerender({ id: 'run_a', live: false }); // queues run_a's final fetch
+    rerender({ id: 'run_b', live: false }); // ...but the user moved on
+    await waitFor(() => expect(result.current.usage?.epoch).toBe('b'));
+    await act(async () => {
+      release?.();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(100);
+    });
+    // run_a once (discarded), run_b once — no phantom re-run of run_a's queue.
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(result.current.usage?.epoch).toBe('b');
+  });
+
+  it('does not re-render (same usage object) when a poll changes nothing', async () => {
+    vi.spyOn(api, 'getRunUsage')
+      .mockResolvedValueOnce(resp({ points: [pt(1)], summary: summary(3) }))
+      .mockResolvedValue(resp({ points_from: 1, points: [], summary: summary(3) }));
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useRunUsage('run_1', undefined, true, { intervalMs: 20 });
+    });
+    await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(3));
+    const first = result.current.usage;
+    const afterFirst = renders;
+    await act(async () => {
+      vi.advanceTimersByTime(200);
+    });
+    expect(result.current.usage).toBe(first);
+    expect(renders).toBe(afterFirst);
+  });
+
+  describe('hidden tab', () => {
+    const setVisibility = (v: 'hidden' | 'visible') => {
+      Object.defineProperty(document, 'visibilityState', { value: v, configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+    afterEach(() => {
+      // Drop the own-property override so jsdom's prototype getter is back.
+      delete (document as unknown as { visibilityState?: string }).visibilityState;
+    });
+
+    it('sends no request while hidden, then exactly one when visible again', async () => {
+      const spy = vi
+        .spyOn(api, 'getRunUsage')
+        .mockResolvedValueOnce(resp({ points: [pt(1)] }))
+        .mockResolvedValue(resp({ points_from: 1, points: [pt(2)] }));
+      const { result } = renderHook(() => useRunUsage('run_1', undefined, true, { intervalMs: 50 }));
+      await waitFor(() => expect(result.current.usage?.points).toHaveLength(1));
+      setVisibility('hidden');
+      const before = spy.mock.calls.length;
+      await act(async () => {
+        vi.advanceTimersByTime(500); // ten interval ticks' worth
+      });
+      expect(spy.mock.calls.length).toBe(before);
+      setVisibility('visible');
+      // The fetch goes out synchronously on the visibilitychange.
+      expect(spy.mock.calls.length).toBe(before + 1);
+      await waitFor(() => expect(result.current.usage?.points).toHaveLength(2));
+    });
+
+    it('refetches on becoming visible even when the run went terminal while hidden', async () => {
+      const spy = vi
+        .spyOn(api, 'getRunUsage')
+        .mockResolvedValueOnce(resp({ points: [pt(1)], summary: summary(1) }))
+        .mockResolvedValue(resp({ points_from: 1, points: [pt(2)], summary: summary(2) }));
+      const { result, rerender } = renderHook(
+        ({ live }) => useRunUsage('run_1', undefined, live, { intervalMs: 600_000 }),
+        { initialProps: { live: true } },
+      );
+      await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(1));
+      setVisibility('hidden');
+      rerender({ live: false }); // terminal, but the final fetch is skipped: hidden
+      expect(spy).toHaveBeenCalledTimes(1);
+      setVisibility('visible');
+      await waitFor(() => expect(result.current.usage?.summary.total_tokens).toBe(2));
+      expect(spy).toHaveBeenCalledTimes(2);
+    });
   });
 });
