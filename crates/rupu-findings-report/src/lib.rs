@@ -4,6 +4,8 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+pub mod blocks;
+pub mod markdown;
 pub mod model;
 pub mod number;
 pub mod prose;
