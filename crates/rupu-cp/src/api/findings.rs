@@ -1458,6 +1458,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_finding_with_an_unloadable_workspace_reports_every_claim_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Every claim points at a real file with its real hash, so a loadable
+        // workspace would report `current` for all of them: `unknown` below can
+        // only come from the workspace failing to load.
+        let mut rec = full_record("fnd_orphan");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("src/a.rs")).unwrap();
+        {
+            let report = rec.report.as_mut().unwrap();
+            for c in &mut report.evidence {
+                c.file = Some("src/a.rs".into());
+                c.sha256 = Some(sha.clone());
+            }
+        }
+        let claims = rec.report.as_ref().unwrap().evidence.len();
+        assert!(claims > 0);
+        seed_workspace_findings(tmp.path(), &[rec]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+
+        let (status, ok) = get_json(
+            routes().with_state(state.clone()),
+            "/api/findings/fnd_orphan",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            ok["evidence_status"],
+            serde_json::json!(vec!["current"; claims])
+        );
+
+        // Rename the record so the store still LISTS the workspace (the
+        // finding stays discoverable through its ledger) but `load(ws_id)`,
+        // which reads `<id>.toml`, no longer finds it.
+        let dir = tmp.path().join("workspaces");
+        std::fs::rename(dir.join("ws1.toml"), dir.join("moved.toml")).unwrap();
+        let (status, json) = get_json(routes().with_state(state), "/api/findings/fnd_orphan").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["id"], "fnd_orphan");
+        assert_eq!(
+            json["evidence_status"],
+            serde_json::json!(vec!["unknown"; claims])
+        );
+    }
+
+    #[tokio::test]
     async fn get_finding_for_a_summary_finding_has_empty_evidence_status() {
         let tmp = tempfile::TempDir::new().unwrap();
         let summary = finding("fnd_summary", Severity::High, "2026-09-29T00:00:00Z").record;
