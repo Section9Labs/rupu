@@ -255,7 +255,7 @@ gaps; `None Provided`, `Not Applicable`, and `None` count as answers.
 Call-chain steps link into the project's Code tab. Each evidence claim carries a
 badge comparing the file hash recorded at write time with the file now
 (`current`, `changed`, `missing`, or `unknown` when the file could not be
-checked, for example above 500 MiB). The proof-of-concept browser lists the
+checked, for example above 64 MiB). The proof-of-concept browser lists the
 artifacts, the patch renders as a diff, and the CI/CD and regression commands
 have copy buttons. A `summary`-profile finding opens a compact page instead.
 
@@ -281,7 +281,8 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
 - `GET /api/findings/:id` returns the whole record with its `report` and an
   `evidence_status` per evidence claim (`current`, `changed`, `missing`,
   `unknown`). Claim files are hashed off the async runtime; a file over
-  500 MiB reports `unknown`.
+  64 MiB reports `unknown` (a much lower limit than the artifact copy cap,
+  because every detail request re-hashes every claim's file).
 - `GET /api/findings/:id/artifacts/:sha256` serves an artifact only if that
   finding lists it; `:sha256` must be 64 lowercase hex characters. Text is
   served inline as `text/plain`; anything else is an attachment. Every response

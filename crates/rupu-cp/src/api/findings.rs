@@ -90,19 +90,22 @@ pub enum ClaimState {
     Unknown,
 }
 
+/// Largest file a detail request will hash to judge an evidence claim's
+/// staleness; a larger file reports [`ClaimState::Unknown`]. Evidence claims
+/// cite source files, so this is far below the 500 MiB artifact cap: every
+/// `GET /api/findings/:id` re-hashes every claim's file, and a request must not
+/// be able to make the server read hundreds of megabytes per claim.
+pub(crate) const CLAIM_HASH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// One [`ClaimState`] per `report.evidence[i]`, comparing each claim's recorded
 /// `sha256` against the file's current contents under `workspace`. Files larger
-/// than the artifact cap are not hashed (`Unknown`). Synchronous and
+/// than [`CLAIM_HASH_MAX_BYTES`] are not hashed (`Unknown`). Synchronous and
 /// potentially slow: async callers must run it under `spawn_blocking`.
 pub(crate) fn claim_states(
     workspace: &std::path::Path,
     r: &rupu_coverage::FindingReport,
 ) -> Vec<ClaimState> {
-    claim_states_capped(
-        workspace,
-        r,
-        rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES,
-    )
+    claim_states_capped(workspace, r, CLAIM_HASH_MAX_BYTES)
 }
 
 fn claim_states_capped(
@@ -1435,6 +1438,23 @@ mod tests {
             claim_states_capped(ws.path(), &report, 64),
             vec![ClaimState::Current]
         );
+    }
+
+    #[test]
+    fn claim_states_use_the_dedicated_claim_hash_cap_not_the_artifact_cap() {
+        // Claims cite source files: 64 MiB, far below the 500 MiB artifact cap.
+        assert_eq!(CLAIM_HASH_MAX_BYTES, 64 * 1024 * 1024);
+        assert!(CLAIM_HASH_MAX_BYTES < rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES);
+        let ws = tempfile::TempDir::new().unwrap();
+        // A sparse file one byte over the cap: never read, so this stays cheap.
+        let big = std::fs::File::create(ws.path().join("big.log")).unwrap();
+        big.set_len(CLAIM_HASH_MAX_BYTES + 1).unwrap();
+        drop(big);
+        let mut report = full_record("f6").report.unwrap();
+        report.evidence[0].file = Some("big.log".into());
+        report.evidence[0].sha256 = Some("0".repeat(64));
+        report.evidence.truncate(1);
+        assert_eq!(claim_states(ws.path(), &report), vec![ClaimState::Unknown]);
     }
 
     #[tokio::test]
