@@ -101,15 +101,20 @@ impl SharedNamer {
     /// Load `path` if it holds a namer; otherwise build one with `init` and
     /// persist it. A corrupt file is logged and replaced by `init()`.
     pub fn open_or_init(path: PathBuf, init: impl FnOnce() -> CrewNamer) -> Self {
-        let loaded = std::fs::read(&path)
-			.ok()
-			.and_then(|b| match serde_json::from_slice::<CrewNamer>(&b) {
-				Ok(n) => Some(n),
-				Err(e) => {
-					tracing::warn!(path = %path.display(), error = %e, "codenames.json unreadable; reinitialising");
-					None
-				}
-			});
+        let loaded =
+            std::fs::read(&path)
+                .ok()
+                .and_then(|b| match serde_json::from_slice::<CrewNamer>(&b) {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "codenames.json unreadable; reinitialising"
+                        );
+                        None
+                    }
+                });
         let fresh = loaded.is_none();
         let s = Self {
             inner: Arc::new(Mutex::new(loaded.unwrap_or_else(init))),
@@ -146,7 +151,7 @@ impl SharedNamer {
         }
     }
 
-    /// Run `f` against the namer; persist if it changed state.
+    /// Run `f` against the namer; persist if it changed state (while holding the lock).
     pub fn with<R>(&self, f: impl FnOnce(&mut CrewNamer) -> R) -> R {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
@@ -155,11 +160,29 @@ impl SharedNamer {
         let before = guard.clone();
         let out = f(&mut guard);
         if *guard != before {
-            let state = guard.clone();
-            drop(guard);
-            self.persist(&state);
+            self.persist_locked(&guard);
         }
         out
+    }
+
+    /// Persist while holding the MutexGuard to serialize writes.
+    fn persist_locked(&self, state: &CrewNamer) {
+        let Some(path) = &self.path else { return };
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
+            std::fs::rename(&tmp, path)
+        };
+        if let Err(e) = write() {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to persist codenames.json"
+            );
+        }
     }
 
     pub fn crew(&self) -> String {
@@ -182,8 +205,10 @@ mod tests {
     #[test]
     fn different_defs_colliding_on_a_word_are_probed() {
         let mut n = CrewNamer::new("jade-reef");
+        // Verify that security-reviewer's base word is ferret (no collision yet).
+        assert_eq!(crate::role_word("security-reviewer"), "ferret");
         n.seed_role("other", "ferret");
-        // security-reviewer's base word is ferret; it's taken, so it probes.
+        // Now ferret is taken, so canonical_role must probe to a different word.
         assert_ne!(n.canonical_role("security-reviewer"), "ferret");
     }
 
@@ -218,5 +243,41 @@ mod tests {
         let again = SharedNamer::open_or_init(path, || panic!("must load, not init"));
         assert_eq!(again.with(|n| n.next_instance(&parent, "lynx")), 2);
         assert_eq!(again.crew(), "jade-reef");
+    }
+
+    #[test]
+    fn concurrent_with_serializes_persists() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run").join("codenames.json");
+        let s = Arc::new(SharedNamer::open_or_init(path.clone(), || {
+            CrewNamer::new("jade-reef")
+        }));
+        let parent: Codename = "jade-reef/heron".parse().unwrap();
+
+        // Spawn 8 threads, each calling next_instance 25 times (200 total calls).
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let s_clone = Arc::clone(&s);
+            let parent_clone = parent.clone();
+            let handle = thread::spawn(move || {
+                for _ in 0..25 {
+                    s_clone.with(|n| n.next_instance(&parent_clone, "lynx"));
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Reload the file: next instance should be 201 (proof that all 200
+        // increments were persisted without loss).
+        let reloaded = SharedNamer::open_or_init(path, || panic!("must load, not init"));
+        let next = reloaded.with(|n| n.next_instance(&parent, "lynx"));
+        assert_eq!(next, 201);
     }
 }
