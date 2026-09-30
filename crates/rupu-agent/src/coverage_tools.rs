@@ -300,9 +300,22 @@ impl Tool for ReportFindingTool {
         let parsed: ReportFindingInput = serde_path_to_error::deserialize(input)
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let attribution = attribution_from_ctx(ctx);
-        match report_finding(&self.paths, attribution, parsed, &self.options) {
-            Ok(out) => Ok(ok_output(format!("finding_id: {}", out.id), started)),
-            Err(e) => Ok(err_output(e.to_string(), started)),
+        // The write is synchronous and can be long (hashing and copying
+        // artifacts up to the configured caps), so it runs on the blocking
+        // pool rather than stalling this runtime worker.
+        let paths = self.paths.clone();
+        let options = self.options.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            report_finding(&paths, attribution, parsed, &options)
+        })
+        .await;
+        match result {
+            Ok(Ok(out)) => Ok(ok_output(format!("finding_id: {}", out.id), started)),
+            Ok(Err(e)) => Ok(err_output(e.to_string(), started)),
+            Err(join) => Ok(err_output(
+                format!("report_finding did not complete: {join}"),
+                started,
+            )),
         }
     }
 }

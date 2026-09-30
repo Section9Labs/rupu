@@ -13,9 +13,12 @@ pub mod schema;
 pub mod types;
 pub mod validate;
 
-pub use artifacts::{ArtifactError, ArtifactStore};
+pub use artifacts::{ArtifactError, ArtifactStore, IngestLimits};
 pub use guidance::guidance;
-pub use options::{FindingWriteOptions, DEFAULT_ARTIFACT_MAX_BYTES, DEFAULT_REPORT_MAX_BYTES};
+pub use options::{
+    FindingWriteOptions, DEFAULT_ARTIFACT_MAX_BYTES, DEFAULT_ARTIFACT_MAX_FILES,
+    DEFAULT_ARTIFACT_TOTAL_MAX_BYTES, DEFAULT_REPORT_MAX_BYTES,
+};
 pub use profile::FindingProfile;
 pub use types::*;
 pub use validate::{validate_report, FieldError, ReportValidationError, ValidateCtx};

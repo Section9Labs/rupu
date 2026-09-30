@@ -125,7 +125,12 @@ impl ToolDispatcher {
                 if let Some(profile) = findings_profile {
                     ctx.options.profile = profile;
                 }
-                tools::findings::dispatch_record(&ctx, parsed)
+                // The write is synchronous and can be long (hashing and
+                // copying artifacts up to the configured caps): run it on the
+                // blocking pool, not on this runtime worker.
+                tokio::task::spawn_blocking(move || tools::findings::dispatch_record(&ctx, parsed))
+                    .await
+                    .map_err(|e| McpError::Tool(format!("findings.record did not complete: {e}")))?
                     .map(|id| format!("finding_id: {id}"))
                     .map_err(McpError::Tool)
             }
