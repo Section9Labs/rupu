@@ -1117,9 +1117,22 @@ impl RunStore {
     }
 
     /// Find the agent instance named `codename` (`crew/role#n>…`) inside a
-    /// run. Returns `(agent_run_id, transcript_path)`. Looks at step
-    /// records, then fan-out item records, then the first line of each
-    /// sub-run transcript (dispatched sub-agents).
+    /// run. Returns `(agent_run_id, transcript_path)`.
+    ///
+    /// Search order:
+    /// 1. step records, then fan-out item records (`step_results.jsonl`) —
+    ///    the static-slot instances;
+    /// 2. the run's `events.jsonl`: `AgentStarted` (`agent_run_id`) and
+    ///    `DispatchStarted` (`sub_run_id`) carry the minted codename and the
+    ///    transcript path, which covers dispatched sub-agents at any depth
+    ///    in a workflow run;
+    /// 3. a walk of the sub-run tree for runs with no event log (standalone
+    ///    `rupu run`, or a torn `events.jsonl`): sub-runs live under the
+    ///    DISPATCHING agent's run id — `<root>/<parent>/sub/<sub_id>/` where
+    ///    `<parent>` is the run itself, a step/unit agent run id, or another
+    ///    sub-run id (grandchildren: `<root>/sub_X/sub/sub_Y/`) — so the walk
+    ///    starts from the run id plus every step/item run id and recurses,
+    ///    matching each transcript's first-line `RunStart.codename`.
     pub fn find_instance(
         &self,
         run_id: &str,
@@ -1138,24 +1151,71 @@ impl RunStore {
                 }
             }
         }
-        for sub_id in self.sub_run_ids(run_id) {
-            let path = self.sub_run_transcript(run_id, &sub_id);
-            if !path.is_file() {
+        if let Some(hit) = self.find_instance_in_events(run_id, codename) {
+            return Ok(Some(hit));
+        }
+        let mut roots = vec![run_id.to_string()];
+        for rec in &steps {
+            roots.push(rec.run_id.clone());
+            roots.extend(rec.items.iter().map(|i| i.run_id.clone()));
+        }
+        roots.retain(|id| !id.is_empty());
+        Ok(self.find_instance_in_sub_tree(&roots, codename))
+    }
+
+    /// `events.jsonl` scan for [`Self::find_instance`]. Unparseable lines
+    /// (a torn tail, a future event variant) are skipped.
+    fn find_instance_in_events(&self, run_id: &str, codename: &str) -> Option<(String, PathBuf)> {
+        let file = File::open(self.events_path(run_id)).ok()?;
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else { break };
+            let Ok(ev) = serde_json::from_str::<crate::executor::Event>(&line) else {
                 continue;
-            }
-            let matched = match rupu_transcript::JsonlReader::iter(&path) {
-                Ok(mut events) => matches!(
-                    events.next(),
-                    Some(Ok(rupu_transcript::Event::RunStart { codename: Some(ref c), .. }))
-                        if c == codename
-                ),
-                Err(_) => false,
             };
-            if matched {
-                return Ok(Some((sub_id, path)));
+            match ev {
+                crate::executor::Event::AgentStarted {
+                    codename: Some(c),
+                    agent_run_id,
+                    transcript_path,
+                    ..
+                } if c == codename => return Some((agent_run_id, transcript_path)),
+                crate::executor::Event::DispatchStarted {
+                    codename: Some(c),
+                    sub_run_id,
+                    transcript_path,
+                    ..
+                } if c == codename => return Some((sub_run_id, transcript_path)),
+                _ => {}
             }
         }
-        Ok(None)
+        None
+    }
+
+    /// Sub-run tree walk for [`Self::find_instance`], rooted at every id in
+    /// `roots`. Cycle- and depth-guarded like [`Self::sub_run_ids_recursive`].
+    fn find_instance_in_sub_tree(
+        &self,
+        roots: &[String],
+        codename: &str,
+    ) -> Option<(String, PathBuf)> {
+        let mut visited: std::collections::HashSet<String> = roots.iter().cloned().collect();
+        let mut frontier: Vec<(String, u32)> = roots.iter().map(|r| (r.clone(), 0)).collect();
+        while let Some((parent, depth)) = frontier.pop() {
+            if depth >= MAX_SUB_RUN_RECURSION_DEPTH {
+                continue;
+            }
+            for child in self.sub_run_ids(&parent) {
+                if !visited.insert(child.clone()) {
+                    continue;
+                }
+                let path = self.sub_run_transcript(&parent, &child);
+                if transcript_codename(&path).as_deref() == Some(codename) {
+                    return Some((child, path));
+                }
+                frontier.push((child, depth + 1));
+            }
+        }
+        None
     }
 
     /// Load a run by id.
@@ -2848,6 +2908,15 @@ fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The codename stamped on a transcript's first-line `RunStart`, if any.
+fn transcript_codename(path: &Path) -> Option<String> {
+    let mut events = rupu_transcript::JsonlReader::iter(path).ok()?;
+    match events.next() {
+        Some(Ok(rupu_transcript::Event::RunStart { codename, .. })) => codename,
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3132,6 +3201,7 @@ mod tests {
             )
             .unwrap();
         let mut step = sample_step_result("a");
+        step.codename = Some("jade-reef/heron".into());
         step.items.push(ItemResultRecord {
             index: 0,
             item: serde_json::Value::Null,
@@ -3146,6 +3216,10 @@ mod tests {
         });
         store.append_step_result(&rec.id, &step).unwrap();
         assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/heron").unwrap(),
+            Some(("run_step_a".to_string(), PathBuf::from("/tmp/a.jsonl")))
+        );
+        assert_eq!(
             store.find_instance(&rec.id, "jade-reef/numbat#2").unwrap(),
             Some(("run_U".to_string(), PathBuf::from("/u.jsonl")))
         );
@@ -3154,28 +3228,139 @@ mod tests {
             None
         );
 
-        let sub = tmp.path().join(&rec.id).join("sub").join("sub_A");
-        std::fs::create_dir_all(&sub).unwrap();
-        let tp = sub.join("transcript.jsonl");
+        // Real layout, no events.jsonl: a sub-agent dispatched by the STEP
+        // agent lives under the step's agent run id, a grandchild under
+        // its dispatching sub-run's id, and one dispatched by a fan-out
+        // unit under that unit's run id.
+        let child = write_sub_transcript(
+            tmp.path(),
+            "run_step_a",
+            "sub_A",
+            "jade-reef/heron>ferret#1",
+        );
+        let grandchild = write_sub_transcript(
+            tmp.path(),
+            "sub_A",
+            "sub_B",
+            "jade-reef/heron>ferret#1>lynx#1",
+        );
+        let unit_child =
+            write_sub_transcript(tmp.path(), "run_U", "sub_C", "jade-reef/numbat#2>lynx#1");
+        assert!(!store.events_path(&rec.id).exists());
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>ferret#1")
+                .unwrap(),
+            Some(("sub_A".to_string(), child))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>ferret#1>lynx#1")
+                .unwrap(),
+            Some(("sub_B".to_string(), grandchild))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/numbat#2>lynx#1")
+                .unwrap(),
+            Some(("sub_C".to_string(), unit_child))
+        );
+    }
+
+    /// With an `events.jsonl`, a `DispatchStarted` / `AgentStarted` codename
+    /// resolves straight to the event's own id + transcript path — no
+    /// directory walk needed (the path here exists nowhere on disk).
+    #[test]
+    fn find_instance_reads_dispatch_and_agent_started_events() {
+        use crate::executor::{Event as OrchEvent, EventSink, JsonlSink};
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_ev");
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
+        let sink = JsonlSink::create(&store.events_path(&rec.id)).unwrap();
+        sink.emit(
+            &rec.id,
+            &OrchEvent::AgentStarted {
+                run_id: rec.id.clone(),
+                step_id: "a".into(),
+                unit_index: None,
+                codename: Some("jade-reef/heron".into()),
+                agent: "a".into(),
+                provider: None,
+                model: None,
+                agent_run_id: "run_step_a".into(),
+                transcript_path: PathBuf::from("/x/a.jsonl"),
+            },
+        );
+        sink.emit(
+            &rec.id,
+            &OrchEvent::DispatchStarted {
+                run_id: rec.id.clone(),
+                sub_run_id: "sub_Z".into(),
+                agent: Some("lynx".into()),
+                transcript_path: PathBuf::from("/x/sub_Z.jsonl"),
+                codename: Some("jade-reef/heron>lynx#1>ferret#2".into()),
+                provider: None,
+                model: None,
+            },
+        );
+        assert_eq!(
+            store.find_instance(&rec.id, "jade-reef/heron").unwrap(),
+            Some(("run_step_a".to_string(), PathBuf::from("/x/a.jsonl")))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>lynx#1>ferret#2")
+                .unwrap(),
+            Some(("sub_Z".to_string(), PathBuf::from("/x/sub_Z.jsonl")))
+        );
+        assert_eq!(
+            store
+                .find_instance(&rec.id, "jade-reef/heron>lynx#2")
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A standalone run (no step records, no events.jsonl): its
+    /// grandchild nests under the child's own id.
+    #[test]
+    fn find_instance_walks_standalone_grandchildren() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        write_sub_transcript(tmp.path(), "run_solo", "sub_A", "moss-fen/otter>lynx#1");
+        let gc = write_sub_transcript(tmp.path(), "sub_A", "sub_B", "moss-fen/otter>lynx#1>wren#1");
+        assert_eq!(
+            store
+                .find_instance("run_solo", "moss-fen/otter>lynx#1>wren#1")
+                .unwrap(),
+            Some(("sub_B".to_string(), gc))
+        );
+    }
+
+    fn write_sub_transcript(root: &Path, parent: &str, sub: &str, codename: &str) -> PathBuf {
+        let dir = root.join(parent).join("sub").join(sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tp = dir.join("transcript.jsonl");
         let start = rupu_transcript::Event::RunStart {
-            run_id: "sub_A".into(),
+            run_id: sub.into(),
             workspace_id: "w".into(),
-            agent: "ferret".into(),
+            agent: "x".into(),
             provider: "p".into(),
             model: "m".into(),
             started_at: Utc::now(),
             mode: rupu_transcript::RunMode::Bypass,
             schema: None,
             system_prompt: None,
-            codename: Some("jade-reef/numbat#2>ferret#1".into()),
+            codename: Some(codename.into()),
         };
         std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
-        assert_eq!(
-            store
-                .find_instance(&rec.id, "jade-reef/numbat#2>ferret#1")
-                .unwrap(),
-            Some(("sub_A".to_string(), tp))
-        );
+        tp
     }
 
     #[test]
@@ -5615,6 +5800,9 @@ mod tests {
         };
         let rec = ItemResultRecord::from(&item);
         assert_eq!(rec.codename.as_deref(), Some("jade-reef/heron#1"));
-        assert_eq!(crate::runner::ItemResult::from(&rec).codename, item.codename);
+        assert_eq!(
+            crate::runner::ItemResult::from(&rec).codename,
+            item.codename
+        );
     }
 }

@@ -217,13 +217,13 @@ struct TranscriptListRow {
 #[derive(Serialize)]
 struct TranscriptListCsvRow {
     run_id: String,
-    codename: String,
     scope: String,
     title: String,
     agent: String,
     status: String,
     total_tokens: u64,
     started_at: String,
+    codename: String,
 }
 
 #[derive(Serialize)]
@@ -319,13 +319,13 @@ impl CollectionOutput for TranscriptListOutput {
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "run_id",
-            "name",
             "scope",
             "title",
             "agent",
             "status",
             "total_tokens",
             "started_at",
+            "codename",
         ])
     }
 
@@ -2546,32 +2546,65 @@ mod tests {
                 id == "run_old",
             )
         };
-        // Instance transcript exists only under the OLDER run.
-        let sub = tmp.path().join("run_old/sub/sub_A");
-        std::fs::create_dir_all(&sub).unwrap();
-        let tp = sub.join("transcript.jsonl");
-        let start = TranscriptEvent::RunStart {
-            run_id: "sub_A".into(),
-            workspace_id: "w".into(),
-            agent: "numbat".into(),
-            provider: "p".into(),
-            model: "m".into(),
-            started_at: now,
-            mode: rupu_transcript::RunMode::Bypass,
-            schema: None,
-            system_prompt: None,
-            codename: Some("jade-reef/numbat#2".into()),
+        // Instances exist only under the OLDER run, in the real layout: the
+        // step agent (`run_step_old`) is recorded in step_results.jsonl, its
+        // dispatched sub-agent lives under the STEP's agent run id, and the
+        // grandchild under its dispatching sub-run's id.
+        std::fs::create_dir_all(tmp.path().join("run_old")).unwrap();
+        let step: rupu_orchestrator::StepResultRecord = serde_json::from_value(serde_json::json!({
+            "step_id": "review",
+            "run_id": "run_step_old",
+            "transcript_path": "/t/run_step_old.jsonl",
+            "output": "",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "",
+            "finished_at": now,
+            "codename": "jade-reef/heron",
+        }))
+        .unwrap();
+        store.append_step_result("run_old", &step).unwrap();
+        let write_sub = |parent: &str, sub: &str, codename: &str| {
+            let dir = tmp.path().join(parent).join("sub").join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            let tp = dir.join("transcript.jsonl");
+            let start = TranscriptEvent::RunStart {
+                run_id: sub.into(),
+                workspace_id: "w".into(),
+                agent: "numbat".into(),
+                provider: "p".into(),
+                model: "m".into(),
+                started_at: now,
+                mode: rupu_transcript::RunMode::Bypass,
+                schema: None,
+                system_prompt: None,
+                codename: Some(codename.into()),
+            };
+            std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
+            tp
         };
-        std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
+        let tp = write_sub("run_step_old", "sub_A", "jade-reef/heron>numbat#2");
+        let gc = write_sub("sub_A", "sub_B", "jade-reef/heron>numbat#2>lynx#1");
         std::fs::create_dir_all(tmp.path().join("run_new")).unwrap();
 
         let cands = vec![cand("run_new", 1), cand("run_old", 5)];
-        let loc = locate_instance(&store, &cands, "jade-reef", "jade-reef/numbat#2", now)
+        let loc = locate_instance(&store, &cands, "jade-reef", "jade-reef/heron>numbat#2", now)
             .unwrap()
             .expect("found in older run");
         assert_eq!(loc.run_id, "sub_A");
         assert_eq!(loc.transcript_path, tp);
         assert!(loc.archived, "carries the matched run's archived state");
+        let loc = locate_instance(
+            &store,
+            &cands,
+            "jade-reef",
+            "jade-reef/heron>numbat#2>lynx#1",
+            now,
+        )
+        .unwrap()
+        .expect("grandchild found");
+        assert_eq!(loc.run_id, "sub_B");
+        assert_eq!(loc.transcript_path, gc);
         assert!(
             locate_instance(&store, &cands, "jade-reef", "jade-reef/ferret#9", now)
                 .unwrap()
