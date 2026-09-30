@@ -121,6 +121,7 @@ mod tests {
             run_id: "run_t".to_string(),
             model: "m".to_string(),
             surface: Surface::Workflow,
+            codename: None,
         }
     }
 
@@ -153,6 +154,7 @@ mod tests {
                 run_id: "r".to_string(),
                 model: "m".to_string(),
                 surface: Surface::Workflow,
+                codename: None,
             },
             declared_at: chrono::Utc::now(),
         };

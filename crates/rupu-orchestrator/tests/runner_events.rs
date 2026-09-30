@@ -85,6 +85,7 @@ impl StepFactory for FakeFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -416,6 +417,7 @@ async fn panel_gate_emits_panel_round_events() {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }

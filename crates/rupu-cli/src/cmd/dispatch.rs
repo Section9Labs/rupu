@@ -315,6 +315,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             run_id: None,
             model: None,
             tool_mappings: None,
+            codename: None,
         };
 
         let opts = AgentRunOpts {
@@ -364,6 +365,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
             pause: None,
+            codename: None,
         };
 
         let started = std::time::Instant::now();
@@ -539,6 +541,7 @@ mod tests {
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
         w.write(&Event::AssistantMessage {

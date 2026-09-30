@@ -474,6 +474,7 @@ mod tests {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }

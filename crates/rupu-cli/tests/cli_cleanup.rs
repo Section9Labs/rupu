@@ -153,6 +153,7 @@ fn write_archived_standalone_transcript(
         mode: RunMode::Readonly,
         schema: None,
         system_prompt: None,
+        codename: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {

@@ -104,6 +104,7 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         run_id: ctx.run_id.clone(),
         model: ctx.model.clone(),
         surface: ctx.surface,
+        codename: None,
     };
     let input = rupu_coverage::ReportFindingInput {
         file_path: args.file_path,

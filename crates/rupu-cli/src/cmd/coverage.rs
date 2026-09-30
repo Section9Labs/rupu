@@ -1344,6 +1344,7 @@ mod tests {
             run_id: "r".into(),
             model: "m".into(),
             surface: Surface::Workflow,
+            codename: None,
         };
         let touch = FileTouchEvent::Read {
             path: "src/auth/login.rs".into(),
@@ -1388,6 +1389,7 @@ mod tests {
             run_id: run.to_string(),
             model: "m".to_string(),
             surface: Surface::Session,
+            codename: None,
         };
         let read = |run: &str, path: &str, secs: i64| FileTouchEvent::Read {
             path: path.to_string(),
@@ -1517,6 +1519,7 @@ mod tests {
                 run_id: "run_one".to_string(),
                 model: "m".to_string(),
                 surface: Surface::Session,
+                codename: None,
             },
             declared_at: DateTime::<Utc>::from_timestamp(100, 0).unwrap(),
         };
@@ -1601,6 +1604,7 @@ mod tests {
                 run_id: run.to_string(),
                 model: "m".to_string(),
                 surface: Surface::Session,
+                codename: None,
             },
             declared_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
         };
@@ -1659,6 +1663,7 @@ mod tests {
                 run_id: run.to_string(),
                 model: "m".to_string(),
                 surface: Surface::Session,
+                codename: None,
             },
             declared_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
         };
@@ -1969,6 +1974,7 @@ mod tests {
                 run_id: "run_1".to_string(),
                 model: "m".to_string(),
                 surface: rupu_coverage::Surface::Agent,
+                codename: None,
             },
             declared_at: Utc::now(),
         }

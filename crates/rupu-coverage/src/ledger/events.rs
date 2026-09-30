@@ -7,6 +7,10 @@ pub struct Attribution {
     pub run_id: String,
     pub model: String,
     pub surface: Surface,
+    /// Codename of the declaring agent instance. `None` for legacy records
+    /// and for the per-workflow MCP `findings.record` path (crew only there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +251,7 @@ mod tests {
             run_id: "run_01KS19A4MQXP".to_string(),
             model: "claude-sonnet-4-6".to_string(),
             surface: Surface::Workflow,
+            codename: None,
         }
     }
 

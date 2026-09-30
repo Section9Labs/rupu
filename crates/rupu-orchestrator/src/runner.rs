@@ -9727,6 +9727,7 @@ steps:
             scope_name: None,
             surface_tag: None,
             pause: None,
+            codename: None,
         }
     }
 
@@ -10962,6 +10963,7 @@ mod dag_scheduler_golden {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -11506,6 +11508,7 @@ steps:
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -12025,6 +12028,7 @@ loops:
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -12218,6 +12222,7 @@ loops:
                     context_window_tokens: None,
                     compact_at_percent: None,
                     pause: None,
+                    codename: None,
                 }
             }
         }
@@ -12506,6 +12511,7 @@ loops:
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -12700,6 +12706,7 @@ loops:
                     context_window_tokens: None,
                     compact_at_percent: None,
                     pause: None,
+                    codename: None,
                 }
             }
         }
@@ -12926,6 +12933,7 @@ loops:
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -13227,6 +13235,7 @@ loops:
                     context_window_tokens: None,
                     compact_at_percent: None,
                     pause: None,
+                    codename: None,
                 }
             }
         }
@@ -13376,6 +13385,7 @@ loops:
                     context_window_tokens: None,
                     compact_at_percent: None,
                     pause: None,
+                    codename: None,
                 }
             }
         }
@@ -13802,6 +13812,7 @@ mod join_and_prune {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -15425,6 +15436,7 @@ mod resume_and_cancel {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }
@@ -16185,6 +16197,7 @@ mod agent_terminal_status {
                 scope_name: None,
                 surface_tag: None,
                 pause: None,
+                codename: None,
             }
         }
     }

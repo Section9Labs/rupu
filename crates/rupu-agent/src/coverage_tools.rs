@@ -31,6 +31,7 @@ fn attribution_from_ctx(ctx: &ToolContext) -> Attribution {
         run_id: ctx.run_id.clone().unwrap_or_default(),
         model: ctx.model.clone().unwrap_or_default(),
         surface,
+        codename: ctx.codename.clone(),
     }
 }
 

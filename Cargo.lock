@@ -3425,6 +3425,7 @@ dependencies = [
  "predicates",
  "pty-process",
  "rupu-auth",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-mcp",

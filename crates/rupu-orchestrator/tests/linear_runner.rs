@@ -90,6 +90,7 @@ impl StepFactory for FakeFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -540,6 +541,7 @@ impl StepFactory for FailingFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -1334,6 +1336,7 @@ impl StepFactory for PanelFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -1595,6 +1598,7 @@ impl StepFactory for LoopingPanelFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -2130,6 +2134,7 @@ impl StepFactory for RecordingFailingFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }

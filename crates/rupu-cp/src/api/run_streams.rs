@@ -1601,6 +1601,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            codename: None,
         };
         let line = serde_json::to_string(&ev).unwrap();
         fs::write(dir.join(format!("{run_id}.jsonl")), format!("{line}\n")).unwrap();
@@ -2106,6 +2107,7 @@ mod tests {
                 mode: rupu_transcript::RunMode::Ask,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),

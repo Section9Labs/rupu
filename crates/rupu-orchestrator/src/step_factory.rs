@@ -435,6 +435,7 @@ impl StepFactory for DefaultStepFactory {
                 run_id: None,
                 model: None,
                 tool_mappings: None,
+                codename: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -481,6 +482,7 @@ impl StepFactory for DefaultStepFactory {
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
             pause: None,
+            codename: None,
         }
     }
 

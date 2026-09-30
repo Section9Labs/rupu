@@ -34,6 +34,7 @@ async fn end_to_end_workflow_with_stride_catalog() {
         run_id: "run_e2e_test".to_string(),
         model: "mock".to_string(),
         surface: Surface::Workflow,
+        codename: None,
     };
     handle
         .writer

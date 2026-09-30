@@ -118,6 +118,7 @@ impl StepFactory for EchoFactory {
             scope_name: None,
             surface_tag: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -184,6 +185,7 @@ impl StepFactory for FailFactory {
             scope_name: None,
             surface_tag: None,
             pause: None,
+            codename: None,
         }
     }
 }

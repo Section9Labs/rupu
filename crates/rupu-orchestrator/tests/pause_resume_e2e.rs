@@ -193,6 +193,7 @@ fn linear_agent_opts(
         scope_name: None,
         surface_tag: None,
         pause: None,
+        codename: None,
     }
 }
 

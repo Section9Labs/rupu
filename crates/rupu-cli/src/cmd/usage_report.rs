@@ -687,6 +687,7 @@ mod tests {
                 mode: rupu_transcript::RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             })
             .unwrap();
         writer
@@ -1015,6 +1016,7 @@ mod tests {
             mode: rupu_transcript::RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         };
         events[0] = Ok(run_start);
         let mut writer = JsonlWriter::create(&transcript_path).unwrap();

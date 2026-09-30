@@ -80,6 +80,7 @@ impl AgentDispatcher for FakeDispatcher {
                 mode: rupu_transcript::RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             })
             .unwrap();
         writer
@@ -178,6 +179,7 @@ impl StepFactory for DispatchFactory {
                 run_id: None,
                 model: None,
                 tool_mappings: None,
+                codename: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -206,6 +208,7 @@ impl StepFactory for DispatchFactory {
             context_window_tokens: None,
             compact_at_percent: None,
             pause: None,
+            codename: None,
         }
     }
 }
@@ -348,6 +351,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                     run_id: None,
                     model: None,
                     tool_mappings: None,
+                    codename: None,
                 },
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
@@ -376,6 +380,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 context_window_tokens: None,
                 compact_at_percent: None,
                 pause: None,
+                codename: None,
             }
         }
     }

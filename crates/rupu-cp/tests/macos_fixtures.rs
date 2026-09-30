@@ -348,6 +348,7 @@ fn transcript_events_fixture_is_current() {
             mode: rupu_transcript::RunMode::Ask,
             schema: None,
             system_prompt: None,
+            codename: None,
         },
         rupu_transcript::Event::TurnStart { turn_idx: 0 },
         rupu_transcript::Event::AssistantDelta {
@@ -1478,6 +1479,7 @@ fn coverage_attribution(run_id: &str) -> CoverageAttribution {
         run_id: run_id.into(),
         model: "claude-sonnet-4-6".into(),
         surface: CoverageSurface::Workflow,
+        codename: None,
     }
 }
 

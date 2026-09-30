@@ -181,6 +181,7 @@ fn write_transcript_file(path: &std::path::Path, run_id: &str, assistant_content
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
     writer.write(&Event::TurnStart { turn_idx: 0 }).unwrap();

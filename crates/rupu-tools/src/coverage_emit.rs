@@ -15,6 +15,7 @@ pub fn attribution_from(ctx: &ToolContext) -> Attribution {
         run_id: ctx.run_id.clone().unwrap_or_default(),
         model: ctx.model.clone().unwrap_or_default(),
         surface: surface_for(ctx),
+        codename: ctx.codename.clone(),
     }
 }
 

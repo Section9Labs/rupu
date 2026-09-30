@@ -53,6 +53,7 @@ fn write_usage_transcript(
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
     writer
@@ -617,6 +618,7 @@ fn usage_backfill_creates_sidecars_for_old_standalone_transcripts() {
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
     for event in events.into_iter().skip(1) {

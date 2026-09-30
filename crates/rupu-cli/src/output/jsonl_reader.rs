@@ -311,6 +311,7 @@ mod tests {
             mode: RunMode::Bypass,
             schema: None,
             system_prompt: None,
+            codename: None,
         };
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "{}", serde_json::to_string(&ev).unwrap()).unwrap();

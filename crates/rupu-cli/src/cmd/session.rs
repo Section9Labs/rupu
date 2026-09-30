@@ -7125,6 +7125,7 @@ async fn run_compact_request(
         // TODO(Task 2, transcript fidelity plan 1): schema/system_prompt.
         schema: None,
         system_prompt: None,
+        codename: None,
     })?;
     writer.flush()?;
 
@@ -7487,6 +7488,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             run_id: None,
             model: None,
             tool_mappings: None,
+            codename: None,
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
@@ -7583,6 +7585,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             surface_tag: Some("session".to_string()),
             pause: None,
             seed_source,
+            codename: None,
         };
 
         let outcome = rupu_agent::run_agent(opts).await;
@@ -8328,6 +8331,7 @@ mod tests {
                 mode: RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             })
             .unwrap(),
         );
@@ -8433,6 +8437,7 @@ mod tests {
                 run_id: "r".into(),
                 model: "m".into(),
                 surface: Surface::Workflow,
+                codename: None,
             },
             at: Utc::now(),
         };

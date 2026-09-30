@@ -36,6 +36,7 @@ fn write_transcript_started_at(
         mode: RunMode::Bypass,
         schema: None,
         system_prompt: None,
+        codename: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -70,6 +71,7 @@ fn write_transcript(
         mode: RunMode::Bypass,
         schema: None,
         system_prompt: None,
+        codename: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -102,6 +104,7 @@ fn write_transcript_with_assistant(
         mode: RunMode::Bypass,
         schema: None,
         system_prompt: None,
+        codename: None,
     })
     .unwrap();
     w.write(&Event::AssistantMessage {

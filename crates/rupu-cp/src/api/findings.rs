@@ -362,6 +362,7 @@ mod tests {
             run_id: run_id.to_string(),
             model: "claude-sonnet-4-6".to_string(),
             surface: Surface::Workflow,
+            codename: None,
         }
     }
 

@@ -28,6 +28,7 @@ fn reads_complete_run_summary() {
                 mode: RunMode::Ask,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             },
             Event::TurnStart { turn_idx: 0 },
             Event::TurnEnd {
@@ -68,6 +69,7 @@ fn missing_run_complete_reports_aborted() {
                 mode: RunMode::Ask,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             },
             Event::TurnStart { turn_idx: 0 },
             // no TurnEnd, no RunComplete
@@ -93,6 +95,7 @@ fn truncated_last_line_does_not_crash() {
             mode: RunMode::Ask,
             schema: None,
             system_prompt: None,
+            codename: None,
         })
         .unwrap();
     }
@@ -190,6 +193,7 @@ fn head_reads_run_start_without_needing_the_rest_of_the_file() {
                 mode: RunMode::Bypass,
                 schema: None,
                 system_prompt: None,
+                codename: None,
             },
             Event::TurnStart { turn_idx: 0 },
         ],

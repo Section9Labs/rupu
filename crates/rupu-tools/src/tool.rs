@@ -97,6 +97,9 @@ pub struct ToolContext {
     /// means no mappings are loaded; built-in tools self-instrument regardless.
     #[serde(skip)]
     pub tool_mappings: Option<std::sync::Arc<rupu_coverage::ToolMappings>>,
+    /// Codename of the running agent instance, for coverage attribution.
+    #[serde(skip)]
+    pub codename: Option<String>,
 }
 
 impl Default for ToolContext {
@@ -114,6 +117,7 @@ impl Default for ToolContext {
             run_id: None,
             model: None,
             tool_mappings: None,
+            codename: None,
         }
     }
 }

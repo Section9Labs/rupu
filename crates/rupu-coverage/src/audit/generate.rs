@@ -221,6 +221,7 @@ mod tests {
             run_id: "r".to_string(),
             model: model.to_string(),
             surface: Surface::Workflow,
+            codename: None,
         }
     }
 

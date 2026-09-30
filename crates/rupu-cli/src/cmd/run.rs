@@ -815,6 +815,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             run_id: None,
             model: None,
             tool_mappings: None,
+            codename: None,
         };
 
         let backend_id = "local_checkout".to_string();
@@ -908,6 +909,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
             pause: None,
+            codename: None,
         };
 
         // Spawn the agent in a background task and tail the transcript with

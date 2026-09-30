@@ -106,6 +106,7 @@ mod tests {
     fn attribution() -> Attribution {
         Attribution {
             run_id: "run_t".to_string(),
+            codename: None,
             model: "m".to_string(),
             surface: Surface::Workflow,
         }

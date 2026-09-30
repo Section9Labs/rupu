@@ -94,6 +94,7 @@ mod tests {
             run_id: "run_test".to_string(),
             model: "mock".to_string(),
             surface: Surface::Workflow,
+            codename: None,
         }
     }
 
