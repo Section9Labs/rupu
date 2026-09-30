@@ -15,6 +15,9 @@ const DEFAULT_API_URL: &str = "https://api.openai.com/v1/responses";
 const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// The Codex model catalog. The only OpenAI endpoint that carries
+/// per-model limits; the public `/v1/models` has ids only (spec 2026-09-30 §3).
+const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0";
 
 /// Netflow-instrumented client bound to `sink`. No run context is
 /// available at construction — stamped
@@ -169,6 +172,7 @@ pub struct OpenAiCodexClient {
     /// `[providers.openai].org_id` — sent as `OpenAI-Organization` on the
     /// platform API (ISSUES.md I-12).
     org_id: Option<String>,
+    chatgpt_models_url: String,
 }
 
 /// The `OpenAI-Organization` header value for a request to `api_url`, if any.
@@ -243,6 +247,7 @@ impl OpenAiCodexClient {
                     auth_json_path,
                     credential_store: None,
                     org_id: None,
+                    chatgpt_models_url: CODEX_MODELS_URL.to_string(),
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
@@ -256,6 +261,7 @@ impl OpenAiCodexClient {
                 auth_json_path,
                 credential_store: None,
                 org_id: None,
+                chatgpt_models_url: CODEX_MODELS_URL.to_string(),
             }),
         }
     }
@@ -818,6 +824,37 @@ impl OpenAiCodexClient {
 
         Ok(())
     }
+
+    async fn get_models_json(&self, url: &str) -> Result<serde_json::Value, ProviderError> {
+        let mut req = self.client.get(url).header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", self.access_token),
+        );
+        if !self.account_id.is_empty() {
+            req = req.header("chatgpt-account-id", &self.account_id);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        resp.json()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -955,6 +992,42 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
             .map(|id| make_model_info(id, crate::provider_id::ProviderId::OpenaiCodex))
             .collect()
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        self.ensure_valid_token().await?;
+        let pid = crate::provider_id::ProviderId::OpenaiCodex;
+        if self.api_url.contains("/backend-api/codex/responses") {
+            let url = format!(
+                "{}?client_version=0.50.0",
+                self.api_url.replace("/responses", "/models")
+            );
+            return Ok(models_from_listing(
+                &self.get_models_json(&url).await?,
+                false,
+                pid,
+            ));
+        }
+        // API key: Codex metadata is only on the ChatGPT backend. Try it
+        // first, then fall back to ids-only `/v1/models`.
+        let backend = self.chatgpt_models_url.clone();
+        match self.get_models_json(&backend).await {
+            Ok(v) => {
+                let models = models_from_listing(&v, true, pid);
+                if !models.is_empty() {
+                    return Ok(models);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "codex model catalog unavailable with an API key; falling back to /v1/models")
+            }
+        }
+        let base = self
+            .api_url
+            .trim_end_matches("/v1/responses")
+            .trim_end_matches('/');
+        let v = self.get_models_json(&format!("{base}/v1/models")).await?;
+        Ok(models_from_listing(&v, false, pid))
+    }
 }
 
 /// Lenient model-id extractor for the assorted shapes OpenAI's
@@ -1013,6 +1086,56 @@ pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
         return entries_from_array(arr);
     }
     Vec::new()
+}
+
+/// A Codex `/codex/models` entry's usable input limit (spec §3):
+/// `context_window × effective_context_window_percent / 100` (percent
+/// defaults to 95, as in Codex), falling back to `max_context_window`
+/// when `context_window` is absent. 0 means unknown.
+pub(crate) fn codex_input_limit(entry: &serde_json::Value) -> u32 {
+    let window = entry
+        .get("context_window")
+        .and_then(|v| v.as_u64())
+        .or_else(|| entry.get("max_context_window").and_then(|v| v.as_u64()));
+    let Some(window) = window else { return 0 };
+    let pct = entry
+        .get("effective_context_window_percent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(95)
+        .clamp(1, 100);
+    u32::try_from(window * pct / 100).unwrap_or(u32::MAX)
+}
+
+/// Model listing → `ModelInfo`s. The Codex `models` array carries limits;
+/// the public `/v1/models` `data` array carries ids only (limits 0). In
+/// API-key mode, entries with `supported_in_api: false` are dropped.
+pub(crate) fn models_from_listing(
+    parsed: &serde_json::Value,
+    api_key_mode: bool,
+    provider: crate::provider_id::ProviderId,
+) -> Vec<crate::model_pool::ModelInfo> {
+    if let Some(arr) = parsed.get("models").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter(|e| {
+                !(api_key_mode
+                    && e.get("supported_in_api").and_then(|v| v.as_bool()) == Some(false))
+            })
+            .filter_map(|e| {
+                let id = ["slug", "id", "display_name", "name"]
+                    .iter()
+                    .find_map(|k| e.get(*k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))?
+                    .to_string();
+                let mut mi = make_model_info(id, provider);
+                mi.context_window = codex_input_limit(e);
+                Some(mi)
+            })
+            .collect();
+    }
+    extract_model_ids(parsed)
+        .into_iter()
+        .map(|id| make_model_info(id, provider))
+        .collect()
 }
 
 // ── model_pool helper ────────────────────────────────────────────────
@@ -3127,5 +3250,162 @@ mod tuning_tests {
             .unwrap()
             .get("OpenAI-Organization")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod fetch_models_tests {
+    use super::*;
+    use crate::provider_id::ProviderId;
+
+    #[test]
+    fn codex_input_limit_applies_effective_percent() {
+        let e = serde_json::json!({ "slug": "a", "context_window": 272000, "effective_context_window_percent": 95 });
+        assert_eq!(codex_input_limit(&e), 258_400);
+    }
+
+    #[test]
+    fn codex_input_limit_defaults_percent_to_95_and_falls_back_to_max_window() {
+        assert_eq!(
+            codex_input_limit(&serde_json::json!({ "context_window": 100000 })),
+            95_000
+        );
+        assert_eq!(
+            codex_input_limit(&serde_json::json!({ "max_context_window": 200000 })),
+            190_000
+        );
+        assert_eq!(codex_input_limit(&serde_json::json!({ "slug": "x" })), 0);
+    }
+
+    #[test]
+    fn listing_filters_supported_in_api_only_in_api_key_mode() {
+        let v = serde_json::json!({ "models": [
+            { "slug": "m-api", "context_window": 1000, "supported_in_api": true },
+            { "slug": "m-app", "context_window": 1000, "supported_in_api": false }
+        ]});
+        let ids = |ms: Vec<crate::model_pool::ModelInfo>| {
+            ms.into_iter().map(|m| m.id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(models_from_listing(&v, true, ProviderId::OpenaiCodex)),
+            ["m-api"]
+        );
+        assert_eq!(
+            ids(models_from_listing(&v, false, ProviderId::OpenaiCodex)),
+            ["m-api", "m-app"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_oauth_backend_reads_limits() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models").header("chatgpt-account-id", "acct-1");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "slug": "gpt-test-1", "context_window": 272000, "max_context_window": 872000, "effective_context_window_percent": 95 }
+            ]}));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "t".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
+        client.account_id = "acct-1".into();
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        m.assert();
+        assert_eq!(models[0].id, "gpt-test-1");
+        assert_eq!(
+            (models[0].context_window, models[0].max_output_tokens),
+            (258_400, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_api_key_tries_codex_backend_first() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let backend = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .header("authorization", "Bearer sk-k");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "slug": "gpt-api", "context_window": 200000, "supported_in_api": true },
+                { "slug": "gpt-app-only", "context_window": 200000, "supported_in_api": false }
+            ]}));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        backend.assert();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-api"]
+        );
+        assert_eq!(models[0].context_window, 190_000);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_api_key_falls_back_to_v1_models_ids() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(401);
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .json_body(serde_json::json!({ "data": [{ "id": "gpt-plain" }] }));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        public.assert();
+        assert_eq!(models[0].id, "gpt-plain");
+        assert_eq!(models[0].context_window, 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_errors_when_both_listings_fail() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET);
+            then.status(500);
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "sk-k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        client.chatgpt_models_url = server.url("/backend-api/codex/models");
+        assert!(
+            <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+                .await
+                .is_err()
+        );
     }
 }
