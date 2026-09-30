@@ -336,12 +336,16 @@ fn filter_label(filter: UnitFilter) -> Option<&'static str> {
 fn density_row(step: &StepView) -> Line {
     let c = step.unit_counts();
     let filled = density_fill(c.done, c.total);
-    let mut line = Line::new()
-        .dim(CHILD_INDENT)
-        .good("▓".repeat(filled))
-        .dim("░".repeat(DENSITY_WIDTH - filled))
-        .plain(" ")
-        .strong(format!("{}/{}", c.done, c.total));
+    let mut line = Line::new().dim(CHILD_INDENT);
+    // Only non-empty runs: a zero-width styled segment would still wrap
+    // nothing in colour codes once Plan 3 renders it.
+    if filled > 0 {
+        line = line.good("▓".repeat(filled));
+    }
+    if filled < DENSITY_WIDTH {
+        line = line.dim("░".repeat(DENSITY_WIDTH - filled));
+    }
+    line = line.plain(" ").strong(format!("{}/{}", c.done, c.total));
     for (st, n) in [
         (Status::Complete, c.done),
         (Status::Working, c.running),
@@ -549,7 +553,7 @@ fn dispatch_rows(view: &RunView, step: &StepView) -> Vec<Line> {
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let branch = if i == last { "┗━ " } else { "┣━ " };
+            let branch = if i == last { BRANCH_LAST } else { BRANCH_MID };
             let st = unit_status(d.status);
             let line = Line::new()
                 .dim(CHILD_INDENT)
@@ -1423,5 +1427,76 @@ mod tests {
             .collect();
         assert_eq!(keys, vec!["2", "3", "4", "5"], "{s}");
         assert!(s.contains("+2 more · [enter] expand"), "{s}");
+    }
+
+    #[test]
+    fn parallel_fanout_selected_shows_no_dispatch_children_and_parallel_label() {
+        let mut v = fanout_with(
+            "fan",
+            StepKind::Parallel,
+            &[UnitStatus::Done, UnitStatus::Running, UnitStatus::Queued],
+        );
+        // A sub-agent dispatched while `fan` was active (parent_step_id = fan).
+        dispatch(
+            &mut v,
+            "sub_1",
+            "triage",
+            "wren#1",
+            "claude-haiku-4-5",
+            false,
+        );
+        assert_eq!(
+            v.dispatches
+                .values()
+                .next()
+                .unwrap()
+                .parent_step_id
+                .as_deref(),
+            Some("fan"),
+            "fixture: the dispatch belongs to the parallel step"
+        );
+
+        // Operator-selected at Run depth, then drilled to Step and Unit depth:
+        // the `parallel` label shows and no dispatch child is ever listed —
+        // only a singleton `step_row` renders sub-agents.
+        let mut run_depth = NavState::default();
+        run_depth.apply(NavKey::Down, &v);
+        let drilled_step = drilled(&v, 0);
+        let mut drilled_unit = drilled(&v, 0);
+        drilled_unit.apply(NavKey::In, &v);
+        assert_eq!(
+            drilled_step.depth(),
+            crate::output::live_view::nav::Depth::Step
+        );
+        assert_eq!(
+            drilled_unit.depth(),
+            crate::output::live_view::nav::Depth::Unit
+        );
+        for nav in [run_depth, drilled_step, drilled_unit] {
+            let rows = graph(&v, &nav);
+            let s = render_plain(&rows);
+            assert!(s.contains("fan · parallel · 3 units"), "{s}");
+            assert!(!s.contains("for_each"), "{s}");
+            assert!(!s.contains("wren#1") && !s.contains("triage"), "{s}");
+        }
+    }
+
+    #[test]
+    fn density_bar_never_emits_an_empty_segment() {
+        // A zero-width segment would still wrap a styled run (stray ANSI
+        // resets) in the Plan 3 renderer.
+        let no_empty = |statuses: &[UnitStatus]| {
+            let v = fanout_with("h", StepKind::ForEach, statuses);
+            let density = &fanout_block(&v.steps[0], &NavState::default(), false)[1];
+            assert!(
+                density.segments.iter().all(|seg| !seg.text.is_empty()),
+                "{:?}",
+                density.segments
+            );
+        };
+        no_empty(&[UnitStatus::Queued; 3]); // 0/3: no filled run
+        no_empty(&[UnitStatus::Done; 86]); // 86/86: no empty run
+        no_empty(&[]); // 0/0
+        no_empty(&[UnitStatus::Done, UnitStatus::Queued]); // both runs present
     }
 }
