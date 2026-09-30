@@ -265,19 +265,8 @@ pub fn report_finding(
         report,
     };
     paths.ensure_dir()?;
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.findings)?;
-    // One `write_all` of the line and its newline together: with two
-    // writes, a concurrent writer appending to the same ledger could land
-    // its line between ours and our newline, fusing two records into one
-    // unparseable line.
-    let mut line = serde_json::to_string(&record)?;
-    line.push('\n');
-    f.write_all(line.as_bytes())?;
-    f.flush()?;
+    // One write per line, then the run stream — see `ledger::stream::append_line`.
+    crate::ledger::stream::append_record(paths, crate::ledger::stream::Ledger::Findings, &record)?;
     Ok(ReportFindingOutput { id })
 }
 

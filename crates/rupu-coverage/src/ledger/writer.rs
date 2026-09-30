@@ -71,9 +71,15 @@ async fn run_writer(paths: CoveragePaths, mut rx: mpsc::Receiver<WriteRequest>) 
     while let Some(req) = rx.recv().await {
         match req {
             WriteRequest::File(ev) => {
-                if let Ok(line) = serde_json::to_string(&ev) {
+                if let Ok(mut line) = serde_json::to_string(&ev) {
+                    line.push('\n');
                     let _ = files_f.write_all(line.as_bytes()).await;
-                    let _ = files_f.write_all(b"\n").await;
+                    line.pop();
+                    crate::ledger::stream::stream_json(
+                        &paths,
+                        crate::ledger::stream::Ledger::Files,
+                        &line,
+                    );
                 }
             }
             WriteRequest::Flush(ack) => {
@@ -127,6 +133,44 @@ mod tests {
         assert_eq!(lines.len(), 50);
         for line in lines {
             let _: FileTouchEvent = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_mirrors_file_events_into_the_run_stream() {
+        use crate::ledger::stream::{RunStream, StreamLine};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stream = tmp.path().join("runs/run_test/coverage.jsonl");
+        let paths =
+            CoveragePaths::new(tmp.path(), "test-target").with_run_stream(Some(RunStream {
+                path: stream.clone(),
+                scope_name: "sec".to_string(),
+            }));
+        let handle = CoverageWriterHandle::spawn(paths.clone()).unwrap();
+        handle
+            .writer
+            .record_file_touch(FileTouchEvent::Read {
+                path: "a.rs".to_string(),
+                line_range: [1, 10],
+                tool: "read_file".to_string(),
+                attribution: attribution(),
+                at: Utc::now(),
+            })
+            .await;
+        handle.shutdown().await;
+
+        let ledger = tokio::fs::read_to_string(&paths.files).await.unwrap();
+        assert_eq!(ledger.lines().count(), 1);
+        let streamed = tokio::fs::read_to_string(&stream).await.unwrap();
+        let lines: Vec<&str> = streamed.lines().collect();
+        assert_eq!(lines.len(), 1);
+        match serde_json::from_str::<StreamLine>(lines[0]).unwrap() {
+            StreamLine::Files { scope_name, record } => {
+                assert_eq!(scope_name, "sec");
+                assert_eq!(serde_json::to_string(&record).unwrap(), ledger.trim_end());
+            }
+            other => panic!("expected a files line, got {other:?}"),
         }
     }
 }

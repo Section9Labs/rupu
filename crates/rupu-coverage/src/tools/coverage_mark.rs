@@ -80,15 +80,11 @@ pub async fn coverage_mark(
         declared_at: Utc::now(),
     };
     paths.ensure_dir()?;
-    let line = serde_json::to_string(&assertion)?;
-    let body = format!("{line}\n");
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.concerns)?;
-    use std::io::Write;
-    f.write_all(body.as_bytes())?;
-    f.flush()?;
+    crate::ledger::stream::append_record(
+        paths,
+        crate::ledger::stream::Ledger::Concerns,
+        &assertion,
+    )?;
 
     Ok(CoverageMarkOutput { ok: true, warnings })
 }
