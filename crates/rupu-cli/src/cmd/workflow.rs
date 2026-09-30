@@ -586,8 +586,6 @@ struct WorkflowListRow {
 #[derive(Serialize)]
 struct WorkflowRunsRow {
     run_id: String,
-    /// Crew codename (stored, else derived for legacy runs).
-    codename: String,
     status: String,
     started_at: String,
     duration_seconds: Option<i64>,
@@ -595,6 +593,8 @@ struct WorkflowRunsRow {
     total_tokens: u64,
     cost_usd: Option<f64>,
     workflow: String,
+    /// Crew codename (stored, else derived for legacy runs).
+    codename: String,
 }
 
 #[derive(Serialize)]
@@ -902,7 +902,6 @@ impl CollectionOutput for WorkflowRunsOutput {
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "run_id",
-            "name",
             "status",
             "started_at",
             "duration_seconds",
@@ -910,6 +909,7 @@ impl CollectionOutput for WorkflowRunsOutput {
             "total_tokens",
             "cost_usd",
             "workflow",
+            "codename",
         ])
     }
 

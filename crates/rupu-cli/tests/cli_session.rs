@@ -289,6 +289,11 @@ async fn session_list_survives_a_malformed_config_across_all_formats() {
         .args(["--format", "csv", "session", "list"])
         .assert()
         .success()
+        // The codename column is additive: appended last, never shifting
+        // the positional columns existing consumers read.
+        .stdout(predicate::str::starts_with(
+            "session_id,agent,scope,status,target,active_run_id,updated_at,codename\n",
+        ))
         .stdout(predicate::str::contains("ses_cfgfail01"));
 }
 

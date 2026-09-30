@@ -401,7 +401,7 @@ async fn list_csv_with_no_rows_emits_headers() {
         .assert()
         .success()
         .stdout(predicate::str::starts_with(
-            "run_id,name,scope,title,agent,status,total_tokens,started_at\n",
+            "run_id,scope,title,agent,status,total_tokens,started_at,codename\n",
         ));
 }
 

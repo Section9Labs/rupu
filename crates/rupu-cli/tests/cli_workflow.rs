@@ -83,6 +83,27 @@ fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
     assert!(status.success());
 }
 
+/// The codename column is additive: appended LAST (named `codename`,
+/// matching the JSON key), so positional CSV consumers keep reading the
+/// same columns they always did.
+#[tokio::test]
+async fn workflow_runs_csv_appends_codename_column_last() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("runs").create_dir_all().unwrap();
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "csv", "workflow", "runs"])
+        .assert()
+        .success()
+        .stdout(predicates::str::starts_with(
+            "run_id,status,started_at,duration_seconds,expires_in_seconds,total_tokens,cost_usd,workflow,codename\n",
+        ));
+}
+
 #[tokio::test]
 async fn workflow_list_shows_global_and_project() {
     let _guard = ENV_LOCK.lock().await;

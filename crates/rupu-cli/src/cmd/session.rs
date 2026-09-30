@@ -480,13 +480,13 @@ struct SessionListRow {
 #[derive(Serialize)]
 struct SessionListCsvRow {
     session_id: String,
-    codename: String,
     agent: String,
     scope: String,
     status: String,
     target: String,
     active_run_id: String,
     updated_at: String,
+    codename: String,
 }
 
 #[derive(Serialize)]
@@ -614,13 +614,13 @@ impl CollectionOutput for SessionListOutput {
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "session_id",
-            "name",
             "agent",
             "scope",
             "status",
             "target",
             "active_run_id",
             "updated_at",
+            "codename",
         ])
     }
 
