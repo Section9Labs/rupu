@@ -528,9 +528,11 @@ const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Open `path`, confirm the handle is a regular file whose contents hash to
 /// `expected_sha`, and return that SAME handle rewound to the start, so the
-/// bytes streamed are exactly the bytes that were hashed. Synchronous and
-/// potentially slow (it reads the whole file): async callers must run it under
-/// `spawn_blocking`.
+/// path cannot be re-pointed between the hash and the stream. That is not a
+/// content guarantee: the file is streamed after it was hashed, and an
+/// in-place rewrite of the same inode while it streams is not prevented (the
+/// workspace is agent-writable). Synchronous and potentially slow (it reads the
+/// whole file): async callers must run it under `spawn_blocking`.
 ///
 /// `recorded_size` (0 = not recorded) short-circuits an obviously changed file
 /// with a 409 before paying for the hash.
@@ -572,10 +574,12 @@ fn open_verified(
 /// finding's report references.
 ///
 /// Only artifacts listed in the finding's own `report.artifacts` are served, so
-/// this can never be used to read an arbitrary blob out of the shared store.
-/// Artifacts are never rendered as HTML: text is `text/plain` inline, anything
-/// else an `application/octet-stream` attachment, always `nosniff` and
-/// `Content-Security-Policy: sandbox`.
+/// a request can reach only a blob some finding in the ledger references. That
+/// limits exposure, but it is not a hard boundary: the ledger lives in the
+/// agent-writable workspace, so a forged ledger line can list any blob in the
+/// store whose sha256 is already known. Artifacts are never rendered as HTML:
+/// text is `text/plain` inline, anything else an `application/octet-stream`
+/// attachment, always `nosniff` and `Content-Security-Policy: sandbox`.
 async fn get_artifact(
     State(s): State<AppState>,
     Path((id, sha)): Path<(String, String)>,
