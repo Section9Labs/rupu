@@ -1304,7 +1304,8 @@ async fn run_usage_from_host(
         // An older remote CP has no such route: it answers 404, or — through
         // its SPA fallback — a 200 that is not JSON. Both mean "this host
         // cannot serve live usage", which the web degrades on; never a 500.
-        HostConnectorError::NotFound(_) | HostConnectorError::Remote(0, _) => {
+        // A reply that failed mid-body is a transport failure and stays 5xx.
+        HostConnectorError::NotFound(_) | HostConnectorError::NotJson(_) => {
             ApiError::not_found(format!("host {host_id} does not serve usage for run {id}"))
         }
         HostConnectorError::Unreachable(m) => {

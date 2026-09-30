@@ -989,6 +989,47 @@ async fn get_run_usage_older_remote_spa_fallback_maps_to_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// A reply cut off mid-body is a transport failure, not an older CP: it stays
+/// a 5xx rather than being mistaken for "this host has no such endpoint".
+#[tokio::test]
+async fn get_run_usage_truncated_remote_reply_stays_5xx() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      content-length: 100\r\n\r\n{\"summary\":",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &format!("http://{remote}")).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/remote_usage_r5/usage?host={host_id}"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        resp.status().is_server_error(),
+        "a truncated reply must stay 5xx, got {}",
+        resp.status()
+    );
+}
+
 /// `GET /api/runs/:id/usage?host=<unknown>` → 404.
 #[tokio::test]
 async fn get_run_usage_unknown_host_returns_404() {

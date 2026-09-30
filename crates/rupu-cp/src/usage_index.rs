@@ -24,8 +24,8 @@
 use crate::host::transcript_paths::{agent_mirror_path, cache_path, global_dir_of};
 use crate::usage::TurnPoint;
 use rupu_orchestrator::runs::{
-    known_transcript_from_event_line, known_transcripts_from_step_result_line, KnownTranscript,
-    RunRecord, RunStore,
+    known_transcript_from_event_line, known_transcripts_from_step_result_line,
+    placed_step_from_event_line, KnownTranscript, RunRecord, RunStore,
 };
 use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow};
 use rupu_transcript::{transcript_key, Event, JsonlCursor, UsageRow};
@@ -576,26 +576,29 @@ fn stat(path: &Path) -> Stat {
 
 /// What a terminal run's cached result was computed against.
 ///
-/// Known edge: on a LOCAL run, a fallback transcript folded at its recorded
-/// path is not statted (only the run files are), so one more `Usage` line
-/// after `run.json` turned terminal stays frozen at the sealed total until a
-/// run file changes. That covers a legacy (no-ledger) run's own transcripts,
+/// Known edge: on a LOCAL run, a fallback transcript of a LOCAL unit or step
+/// is not statted (only the run files are), so one more `Usage` line after
+/// `run.json` turned terminal stays frozen at the sealed total until a run
+/// file changes. That covers a legacy (no-ledger) run's own transcripts,
 /// which are written before the run finishes; turns the coordinator ledgers
-/// change `usage.jsonl`. Placed units write no coordinator ledger rows and are
-/// served from the agent mirror, which a host pull may still grow after the
-/// run turned terminal — so every fallback that resolved away from its
-/// recorded path is statted in `mirrors`, as is every folded file of a
-/// mirrored run.
+/// change `usage.jsonl`. A PLACED unit or step (its `unit_started` /
+/// `step_started` / step result names a host) writes no coordinator ledger
+/// rows, and its transcript — recorded, since #646, AS the coordinator's
+/// agent-mirror path — is filled by a host pull that may still grow it after
+/// the run turned terminal. So placement decides: every placed fallback is
+/// statted in `mirrors`, as is any fallback that resolved away from its
+/// recorded path and every folded file of a mirrored run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Seal {
     /// `run.json`, `usage.jsonl`, `events.jsonl`, `step_results.jsonl`.
     files: [Stat; 4],
     /// Extra files the result depends on: every folded fallback file of a
-    /// mirrored run, and on any run each folded fallback that resolved to a
-    /// worker-cache / agent-mirror file instead of its recorded path (a host
-    /// pull may still fill them after the run turned terminal); plus each
-    /// resolution candidate of a transcript that resolved nowhere, at its
-    /// absent stat — so a late pull that creates any of them breaks the seal.
+    /// mirrored run; on any run, each folded fallback of a placed unit/step
+    /// and each that resolved to a worker-cache / agent-mirror file instead
+    /// of its recorded path (a host pull may still fill them after the run
+    /// turned terminal); plus each resolution candidate of a transcript that
+    /// resolved nowhere, at its absent stat — so a late pull that creates any
+    /// of them breaks the seal.
     mirrors: Vec<(PathBuf, Stat)>,
 }
 
@@ -619,6 +622,9 @@ struct RunState {
     /// Insertion-ordered known set.
     known: Vec<Known>,
     known_idx: HashMap<String, usize>,
+    /// Steps a `step_started` placed on a fleet host (additive, like the
+    /// known set): every transcript of theirs ran there.
+    placed_steps: HashSet<String>,
     /// Fallback transcripts the last build folded.
     fallback: Vec<FallbackView>,
     /// The per-turn series, append-only in observation order.
@@ -641,7 +647,9 @@ impl RunState {
 
     /// Add to the known set; `true` when it changed. A `step_results` sighting
     /// of a key first seen in events replaces it (durable label wins, as in
-    /// `RunStore::known_transcripts`) and marks it should-exist.
+    /// `RunStore::known_transcripts`) and marks it should-exist. Placement
+    /// (`host`) is kept from whichever sighting stated it; it only affects
+    /// what a seal stats, never the usage, so it is not a change.
     fn add_known(&mut self, kt: KnownTranscript, from_step_results: bool) -> bool {
         match self.known_idx.get(&kt.key) {
             None => {
@@ -654,15 +662,28 @@ impl RunState {
             }
             Some(&i) => {
                 let k = &mut self.known[i];
-                if from_step_results && !k.from_step_results {
+                let host = k.kt.host.take().or_else(|| kt.host.clone());
+                let changed = if from_step_results && !k.from_step_results {
                     k.kt = kt;
                     k.from_step_results = true;
                     true
                 } else {
                     false
-                }
+                };
+                k.kt.host = host;
+                changed
             }
         }
+    }
+
+    /// The transcript ran on a fleet host: its own sighting said so, or its
+    /// step was placed by a `step_started`.
+    fn placed(&self, k: &Known) -> bool {
+        k.kt.host.is_some()
+            || k.kt
+                .step_id
+                .as_ref()
+                .is_some_and(|s| self.placed_steps.contains(s))
     }
 
     fn known_step(&self, key: &str) -> Option<String> {
@@ -891,6 +912,8 @@ impl UsageIndex {
                 for l in &lines {
                     if let Some(kt) = known_transcript_from_event_line(l) {
                         changed |= st.add_known(kt, false);
+                    } else if let Some((step, _host)) = placed_step_from_event_line(l) {
+                        st.placed_steps.insert(step);
                     }
                 }
             }
@@ -941,11 +964,12 @@ impl UsageIndex {
                 continue;
             };
             // Seal over every folded file a host pull may still grow: all of a
-            // mirrored run's, and — on a local run — any that resolved
-            // somewhere other than its recorded path (a placed unit's agent
-            // mirror; placed units write no coordinator ledger rows). A local
-            // run's own on-disk transcripts are not (the legacy edge on `Seal`).
-            if worker.is_some() || path != k.kt.path {
+            // mirrored run's; on a local run, every transcript of a unit or
+            // step that ran on a host (since #646 its recorded path IS the
+            // agent mirror, so placement — not the path — says so), and any
+            // that resolved away from its recorded path. A local run's own
+            // on-disk transcripts are not (the legacy edge on `Seal`).
+            if worker.is_some() || st.placed(k) || path != k.kt.path {
                 mirrors.push((path.clone(), stat(&path)));
             }
             let fold = self.file_fold(&path);
@@ -1680,40 +1704,93 @@ mod tests {
         assert!(is_sealed(&idx, &store, "run_HALF"));
     }
 
+    /// The layouts a placed unit/step leaves on a LOCAL run (no `worker_id`)
+    /// since #646: its transcript is recorded AS the coordinator's agent-mirror
+    /// path, so `resolve` returns the recorded path itself — only placement
+    /// says a host pull may still grow it.
+    fn placed_layouts(tmp: &Path, store: &RunStore) -> Vec<(&'static str, PathBuf)> {
+        let mut out = Vec::new();
+
+        // A `distribute:` unit: `unit_started` carries the host.
+        let unit = agent_mirror_path(tmp, "run_UNIT7");
+        create_run(store, "run_PLACEDUNIT", RunStatus::Completed);
+        let ev = RunEvent::UnitStarted {
+            run_id: "run_PLACEDUNIT".into(),
+            step_id: "fan".into(),
+            index: 0,
+            unit_key: "unit0".into(),
+            agent: Some("fanner".into()),
+            transcript_path: unit.clone(),
+            host: Some("mini".into()),
+        };
+        append(
+            &store.events_path("run_PLACEDUNIT"),
+            &(serde_json::to_string(&ev).unwrap() + "\n"),
+        );
+        out.push(("run_PLACEDUNIT", unit));
+
+        // A `host:` linear step: the host is on `step_started`; the transcript
+        // arrives via `step_working`, which names none.
+        let step = agent_mirror_path(tmp, "run_STEP8");
+        create_run(store, "run_PLACEDSTEP", RunStatus::Completed);
+        for ev in [
+            RunEvent::StepStarted {
+                run_id: "run_PLACEDSTEP".into(),
+                step_id: "fan".into(),
+                kind: rupu_orchestrator::runs::StepKind::Linear,
+                agent: Some("fanner".into()),
+                host: Some("mini".into()),
+            },
+            RunEvent::StepWorking {
+                run_id: "run_PLACEDSTEP".into(),
+                step_id: "fan".into(),
+                note: None,
+                transcript_path: Some(step.clone()),
+            },
+        ] {
+            append(
+                &store.events_path("run_PLACEDSTEP"),
+                &(serde_json::to_string(&ev).unwrap() + "\n"),
+            );
+        }
+        out.push(("run_PLACEDSTEP", step));
+
+        // Only the durable step result survives (events rotated/absent): its
+        // `host` says where the step ran.
+        let durable = agent_mirror_path(tmp, "run_STEP9");
+        create_run(store, "run_PLACEDRESULT", RunStatus::Completed);
+        let mut sr = step_result("fan", &durable);
+        sr.host = Some("mini".into());
+        store.append_step_result("run_PLACEDRESULT", &sr).unwrap();
+        out.push(("run_PLACEDRESULT", durable));
+
+        out
+    }
+
     #[test]
-    fn sealed_local_run_revalidates_a_growing_placed_unit_mirror() {
-        // A LOCAL run (no worker) whose fan-out unit was placed on a host: the
-        // unit writes no coordinator ledger rows, its recorded path is the
-        // host's, and its transcript is served from the agent mirror — which
-        // a host pull may still grow after `run.json` turned terminal.
+    fn sealed_local_run_revalidates_a_growing_placed_transcript() {
         let tmp = tempfile::tempdir().unwrap();
         let store = run_store(tmp.path());
         let idx = UsageIndex::default();
-        create_run(&store, "run_PLACED", RunStatus::Completed);
-        let recorded = Path::new("/remote-host/.rupu/transcripts/run_UNIT7.jsonl");
-        assert!(!recorded.exists());
-        append(
-            &store.events_path("run_PLACED"),
-            &unit_started("run_PLACED", "fan", 0, recorded),
-        );
-        let mirror = agent_mirror_path(tmp.path(), "run_UNIT7");
-        append(
-            &mirror,
-            &transcript_lines("fanner", PROVIDER, MODEL, &[(10, 1)]),
-        );
+        for (run_id, transcript) in placed_layouts(tmp.path(), &store) {
+            append(
+                &transcript,
+                &transcript_lines("fanner", PROVIDER, MODEL, &[(10, 1)]),
+            );
+            let first = idx.run_usage(&store, run_id);
+            assert_eq!(total(&first), tok(10, 1), "{run_id}");
+            assert!(!first.partial, "{run_id}");
+            assert!(is_sealed(&idx, &store, run_id), "{run_id}");
 
-        let first = idx.run_usage(&store, "run_PLACED");
-        assert_eq!(total(&first), tok(10, 1));
-        assert!(is_sealed(&idx, &store, "run_PLACED"));
-
-        // The mirror grows (a late tail/pull): the seal re-validates and the
-        // new turn counts — no run file changed.
-        append(&mirror, &usage_line(PROVIDER, MODEL, 20, 2, None));
-        let second = idx.run_usage(&store, "run_PLACED");
-        assert_eq!(total(&second), tok(30, 3));
-        assert_eq!(step_total(&second, "fan"), tok(30, 3));
-        assert_extends(&first, &second);
-        assert!(is_sealed(&idx, &store, "run_PLACED"));
+            // A late host pull/tail grows the mirror — no run file changes. The
+            // seal re-validates and the new turn counts.
+            append(&transcript, &usage_line(PROVIDER, MODEL, 20, 2, None));
+            let second = idx.run_usage(&store, run_id);
+            assert_eq!(total(&second), tok(30, 3), "{run_id}");
+            assert_eq!(step_total(&second, "fan"), tok(30, 3), "{run_id}");
+            assert_extends(&first, &second);
+            assert!(is_sealed(&idx, &store, run_id), "{run_id}");
+        }
     }
 
     #[test]

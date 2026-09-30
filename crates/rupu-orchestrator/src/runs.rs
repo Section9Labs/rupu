@@ -827,11 +827,31 @@ pub struct KnownTranscript {
     /// Step id the transcript belongs to; `None` for a dispatched child.
     pub step_id: Option<String>,
     pub path: PathBuf,
+    /// The fleet host that ran the transcript's agent, when the line that
+    /// named it says so (`unit_started.host`, a step result's `host`, an
+    /// item's `host`); `None` = local or not stated. A placed LINEAR step's
+    /// transcript arrives via `step_working`, which carries no host — its
+    /// placement is on the step's `step_started` line, see
+    /// [`placed_step_from_event_line`].
+    pub host: Option<String>,
 }
 
-fn known(path: PathBuf, step_id: Option<String>) -> Option<KnownTranscript> {
+fn known(path: PathBuf, step_id: Option<String>, host: Option<String>) -> Option<KnownTranscript> {
     let key = rupu_transcript::transcript_key(&path)?;
-    Some(KnownTranscript { key, step_id, path })
+    Some(KnownTranscript {
+        key,
+        step_id,
+        path,
+        host,
+    })
+}
+
+/// A JSON object's non-empty string `host`, if any.
+fn host_of(o: &serde_json::Value) -> Option<String> {
+    o.get("host")
+        .and_then(|h| h.as_str())
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
 }
 
 /// The transcript a single `events.jsonl` line names, if any
@@ -853,16 +873,30 @@ pub fn known_transcript_from_event_line(line: &str) -> Option<KnownTranscript> {
             .and_then(|s| s.as_str())
             .map(str::to_string)
     };
-    known(path, step)
+    known(path, step, host_of(&v))
+}
+
+/// `(step_id, host)` when a single `events.jsonl` line is a `step_started`
+/// that placed the step on a fleet host. Every transcript of that step ran
+/// there — including a linear step's, which `step_working` names without a
+/// host. Parsed leniently, like [`known_transcript_from_event_line`].
+pub fn placed_step_from_event_line(line: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type")?.as_str()? != "step_started" {
+        return None;
+    }
+    let step_id = v.get("step_id")?.as_str()?.to_string();
+    Some((step_id, host_of(&v)?))
 }
 
 /// Transcripts a single `step_results.jsonl` line names: the step's own
 /// plus every fan-out item's, all labelled with the step id. Parsed
 /// leniently as JSON (like [`known_transcript_from_event_line`]) — only
-/// `step_id`, `transcript_path` and `items[].transcript_path` are read — so
-/// a newer writer's record shape never drops a step or its items from
-/// discovery. A line that isn't a JSON object with a string `step_id`
-/// yields nothing.
+/// `step_id`, `transcript_path`, `host` and `items[].{transcript_path,host}`
+/// are read — so a newer writer's record shape never drops a step or its
+/// items from discovery. An item without its own `host` inherits the step's
+/// (a step that ran on a host ran its items there). A line that isn't a JSON
+/// object with a string `step_id` yields nothing.
 pub fn known_transcripts_from_step_result_line(line: &str) -> Vec<KnownTranscript> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
@@ -875,9 +909,10 @@ pub fn known_transcripts_from_step_result_line(line: &str) -> Vec<KnownTranscrip
             .and_then(|p| p.as_str())
             .map(PathBuf::from)
     };
+    let step_host = host_of(&v);
     let mut out = Vec::new();
     if let Some(p) = path_of(&v) {
-        out.extend(known(p, Some(step_id.to_string())));
+        out.extend(known(p, Some(step_id.to_string()), step_host.clone()));
     }
     for item in v
         .get("items")
@@ -886,7 +921,8 @@ pub fn known_transcripts_from_step_result_line(line: &str) -> Vec<KnownTranscrip
         .flatten()
     {
         if let Some(p) = path_of(item) {
-            out.extend(known(p, Some(step_id.to_string())));
+            let host = host_of(item).or_else(|| step_host.clone());
+            out.extend(known(p, Some(step_id.to_string()), host));
         }
     }
     out
@@ -1202,6 +1238,10 @@ impl RunStore {
     /// occurrence wins. `step_results` is read first, so a durable step
     /// label beats an event-derived one for the same transcript.
     ///
+    /// `host` is the placement any sighting stated (first one wins), else
+    /// the host a `step_started` placed the transcript's step on
+    /// ([`placed_step_from_event_line`]).
+    ///
     /// Sub-runs live under the *dispatching agent's* run id, which for a
     /// workflow step is the step agent's run id rather than `run_id`, so
     /// the sub-run walk starts from `run_id` AND from every key found by
@@ -1209,12 +1249,21 @@ impl RunStore {
     /// garbled file contributes nothing rather than failing the read.
     pub fn known_transcripts(&self, run_id: &str) -> Vec<KnownTranscript> {
         let mut out: Vec<KnownTranscript> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut push = |k: KnownTranscript, out: &mut Vec<KnownTranscript>| {
-            if seen.insert(k.key.clone()) {
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut push = |k: KnownTranscript, out: &mut Vec<KnownTranscript>| match index.get(&k.key)
+        {
+            None => {
+                index.insert(k.key.clone(), out.len());
                 out.push(k);
             }
+            Some(&i) => {
+                if out[i].host.is_none() {
+                    out[i].host = k.host;
+                }
+            }
         };
+        let mut placed_steps: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         if let Ok(body) = std::fs::read_to_string(self.step_results_log(run_id)) {
             for line in body.lines().filter(|l| !l.trim().is_empty()) {
                 for k in known_transcripts_from_step_result_line(line) {
@@ -1226,6 +1275,8 @@ impl RunStore {
             for line in body.lines().filter(|l| !l.trim().is_empty()) {
                 if let Some(k) = known_transcript_from_event_line(line) {
                     push(k, &mut out);
+                } else if let Some((step, host)) = placed_step_from_event_line(line) {
+                    placed_steps.entry(step).or_insert(host);
                 }
             }
         }
@@ -1233,6 +1284,15 @@ impl RunStore {
         roots.extend(out.iter().map(|k| k.key.clone()));
         for k in self.dispatched_transcripts(roots.iter().map(String::as_str)) {
             push(k, &mut out);
+        }
+        for k in &mut out {
+            if k.host.is_none() {
+                k.host = k
+                    .step_id
+                    .as_ref()
+                    .and_then(|s| placed_steps.get(s))
+                    .cloned();
+            }
         }
         out
     }
@@ -1259,6 +1319,7 @@ impl RunStore {
                         key: sub,
                         step_id: None,
                         path,
+                        host: None,
                     });
                 }
             }
@@ -5841,5 +5902,149 @@ mod tests {
         // No step id: nothing to label the transcripts with.
         let anon = serde_json::json!({"transcript_path": "/x/run_F.jsonl"}).to_string();
         assert!(known_transcripts_from_step_result_line(&anon).is_empty());
+    }
+
+    #[test]
+    fn known_transcripts_parsers_read_placement() {
+        use crate::executor::Event;
+        let line = |ev: &Event| serde_json::to_string(ev).unwrap();
+        let unit = |host: Option<&str>| {
+            line(&Event::UnitStarted {
+                run_id: "run_wf".into(),
+                step_id: "fan".into(),
+                index: 0,
+                unit_key: "u0".into(),
+                agent: Some("a".into()),
+                transcript_path: PathBuf::from("/g/transcripts/run_U.jsonl"),
+                host: host.map(str::to_string),
+            })
+        };
+        let placed = known_transcript_from_event_line(&unit(Some("mini"))).unwrap();
+        assert_eq!(placed.host.as_deref(), Some("mini"));
+        assert_eq!(
+            known_transcript_from_event_line(&unit(None)).unwrap().host,
+            None
+        );
+
+        let started = |host: Option<&str>| {
+            line(&Event::StepStarted {
+                run_id: "run_wf".into(),
+                step_id: "build".into(),
+                kind: StepKind::Linear,
+                agent: Some("a".into()),
+                host: host.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            placed_step_from_event_line(&started(Some("mini"))),
+            Some(("build".to_string(), "mini".to_string()))
+        );
+        assert_eq!(placed_step_from_event_line(&started(None)), None);
+        assert_eq!(placed_step_from_event_line(&unit(Some("mini"))), None);
+        assert_eq!(placed_step_from_event_line("{not json"), None);
+
+        // A step result's host covers the step's transcript and every item
+        // without a host of its own; an item's own host wins.
+        let v = serde_json::json!({
+            "step_id": "fan",
+            "transcript_path": "/x/run_S.jsonl",
+            "host": "mini",
+            "items": [
+                {"transcript_path": "/x/run_I0.jsonl"},
+                {"transcript_path": "/x/run_I1.jsonl", "host": "kuki"}
+            ]
+        })
+        .to_string();
+        let got: Vec<(String, Option<String>)> = known_transcripts_from_step_result_line(&v)
+            .into_iter()
+            .map(|k| (k.key, k.host))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("run_S".to_string(), Some("mini".to_string())),
+                ("run_I0".to_string(), Some("mini".to_string())),
+                ("run_I1".to_string(), Some("kuki".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn known_transcripts_carry_placement_across_sightings_and_step_started() {
+        use crate::executor::Event;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let rec = sample_record("run_placed");
+        store.create(rec.clone(), "name: wf\nsteps: []\n").unwrap();
+        let t = tmp.path().join("transcripts");
+        // A fan-out step's result names a unit without a host...
+        let mut sr = sample_step_result("fan");
+        sr.transcript_path = t.join("run_FANSTEP.jsonl");
+        sr.items = vec![ItemResultRecord {
+            index: 0,
+            item: serde_json::json!("a"),
+            sub_id: "fan.0".into(),
+            rendered_prompt: String::new(),
+            run_id: "run_UNIT".into(),
+            transcript_path: t.join("run_UNIT.jsonl"),
+            output: String::new(),
+            success: true,
+            is_fixer: false,
+        }];
+        store.append_step_result(&rec.id, &sr).unwrap();
+        let events = [
+            // ...whose `unit_started` says where it ran.
+            Event::UnitStarted {
+                run_id: rec.id.clone(),
+                step_id: "fan".into(),
+                index: 0,
+                unit_key: "a".into(),
+                agent: Some("a".into()),
+                transcript_path: t.join("run_UNIT.jsonl"),
+                host: Some("mini".into()),
+            },
+            // A placed linear step: host on `step_started` only.
+            Event::StepStarted {
+                run_id: rec.id.clone(),
+                step_id: "build".into(),
+                kind: StepKind::Linear,
+                agent: Some("a".into()),
+                host: Some("kuki".into()),
+            },
+            Event::StepWorking {
+                run_id: rec.id.clone(),
+                step_id: "build".into(),
+                note: None,
+                transcript_path: Some(t.join("run_BUILD.jsonl")),
+            },
+            // A local linear step.
+            Event::StepWorking {
+                run_id: rec.id.clone(),
+                step_id: "local".into(),
+                note: None,
+                transcript_path: Some(t.join("run_LOCAL.jsonl")),
+            },
+        ];
+        let body: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(store.events_path(&rec.id), body).unwrap();
+
+        let got = store.known_transcripts(&rec.id);
+        let host_of = |k: &str| {
+            got.iter()
+                .find(|x| x.key == k)
+                .unwrap_or_else(|| panic!("{k} missing: {got:?}"))
+                .host
+                .clone()
+        };
+        assert_eq!(host_of("run_UNIT").as_deref(), Some("mini"));
+        assert_eq!(host_of("run_BUILD").as_deref(), Some("kuki"));
+        assert_eq!(host_of("run_FANSTEP"), None);
+        assert_eq!(host_of("run_LOCAL"), None);
+        // The durable step-results label still wins.
+        let unit = got.iter().find(|x| x.key == "run_UNIT").unwrap();
+        assert_eq!(unit.step_id.as_deref(), Some("fan"));
     }
 }

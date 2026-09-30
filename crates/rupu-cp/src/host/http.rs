@@ -442,9 +442,15 @@ impl HostConnector for HttpHostConnector {
                     .get(format!("{}{}", self.base_url, path_and_query)),
             )
             .await?;
-        resp.json()
+        // Read, then parse: reqwest's `json()` reports a body that failed to
+        // arrive and a body that arrived but isn't JSON alike (`is_decode`),
+        // and callers must tell a transport failure (5xx) from a remote that
+        // does not serve this path as JSON at all (an older CP's SPA fallback).
+        let body = resp
+            .bytes()
             .await
-            .map_err(|e| HostConnectorError::Remote(0, e.to_string()))
+            .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+        serde_json::from_slice(&body).map_err(|e| HostConnectorError::NotJson(e.to_string()))
     }
 
     async fn list_sessions(
@@ -722,5 +728,60 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "bounded probe took {elapsed:?}; expected well under the OS default connect timeout"
         );
+    }
+
+    /// A one-connection HTTP server that reads the request head, writes
+    /// `response` verbatim, and closes the socket.
+    async fn one_shot_server(response: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    /// A 2xx whose complete body is not JSON (an older CP's SPA fallback) is
+    /// `NotJson` — what `/api/runs/:id/usage` degrades to a 404 on.
+    #[tokio::test]
+    async fn proxy_get_json_non_json_reply_is_not_json() {
+        let body = "<!doctype html><html></html>";
+        let addr = one_shot_server(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )
+        .await;
+        let conn = HttpHostConnector::new(format!("http://{addr}"), None);
+        let err = conn.proxy_get_json("/api/runs/r/usage").await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::NotJson(_)), "{err:?}");
+    }
+
+    /// A body cut off mid-response is a transport failure, NOT `NotJson`:
+    /// callers keep reporting it as a 5xx.
+    #[tokio::test]
+    async fn proxy_get_json_truncated_body_is_a_transport_failure() {
+        let addr = one_shot_server(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"summ"
+                .to_vec(),
+        )
+        .await;
+        let conn = HttpHostConnector::new(format!("http://{addr}"), None);
+        let err = conn.proxy_get_json("/api/runs/r/usage").await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Remote(0, _)), "{err:?}");
     }
 }

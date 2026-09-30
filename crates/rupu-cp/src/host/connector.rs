@@ -104,6 +104,12 @@ pub enum HostConnectorError {
     /// A non-2xx HTTP response from a remote host (status code, body).
     #[error("remote error {0}: {1}")]
     Remote(u16, String),
+    /// A 2xx reply whose complete body is not JSON — e.g. an older rupu-cp
+    /// whose SPA fallback answers an `/api/*` path it has no route for with
+    /// its HTML index. Distinct from a body that could not be READ (a
+    /// transport failure mid-response), which stays `Remote(0, _)`.
+    #[error("remote reply is not JSON: {0}")]
+    NotJson(String),
     /// A bad request or a local precondition failure (no launcher, wrong mode).
     #[error("invalid: {0}")]
     Invalid(String),
@@ -965,6 +971,7 @@ pub(crate) mod testing {
                     HostConnectorError::NotFound(m) => HostConnectorError::NotFound(m.clone()),
                     HostConnectorError::Unauthorized => HostConnectorError::Unauthorized,
                     HostConnectorError::Remote(c, m) => HostConnectorError::Remote(*c, m.clone()),
+                    HostConnectorError::NotJson(m) => HostConnectorError::NotJson(m.clone()),
                 }),
                 None => Err(HostConnectorError::Unsupported("run netflow".into())),
             }
