@@ -130,7 +130,9 @@ pub struct RunView {
     pub gates: Vec<GateView>,
     pub error: Option<String>,
     pub usage: Option<rupu_cp::usage::UsageSummary>,
-    /// Panel findings by severity string (lowercased). Empty when none.
+    /// Panel findings by severity (lowercased), counting findings EMITTED per
+    /// step-result record (a finding that persists across bounded-loop
+    /// iterations is counted once per iteration). Empty when none.
     pub findings_by_severity: BTreeMap<String, usize>,
     /// Step that was active most recently — the attribution target for a
     /// dispatch (which carries no `step_id`).
@@ -388,11 +390,14 @@ impl RunView {
     /// folds token/cost totals through the shared `rupu_cp::usage` path
     /// (which already resolves fan-out + remote-mirror transcripts).
     pub fn from_run_dir(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> RunView {
-        let mut v = RunView::default();
+        // Carry the id even if run.json is missing/unreadable (degraded view).
+        let mut v = RunView {
+            run_id: run_id.to_string(),
+            ..RunView::default()
+        };
 
         // 1. Replay the event log.
-        let events_path = store.run_dir(run_id).join("events.jsonl");
-        let mut tailer = crate::output::jsonl_reader::WfEventTailer::new(events_path);
+        let mut tailer = crate::output::jsonl_reader::WfEventTailer::new(store.events_path(run_id));
         for ev in tailer.drain_events() {
             v.apply(&ev);
         }
@@ -807,6 +812,109 @@ mod tests {
         assert_eq!(v.gates.len(), 1);
         assert_eq!(v.gates[0].step_id, "triage");
         // No transcripts on disk -> usage folds to a zero summary, not a panic.
-        assert!(v.usage.is_some());
+        assert_eq!(v.usage.unwrap().total_tokens, 0);
+    }
+
+    #[test]
+    fn from_run_dir_overlays_step_results_findings_host_and_loop_iteration() {
+        use rupu_orchestrator::runs::{FindingRecord, StepResultRecord};
+        use rupu_orchestrator::RunStore;
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path().join("runs");
+        let run_dir = runs.join("run_OVL");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        std::fs::write(
+            run_dir.join("run.json"),
+            serde_json::json!({
+                "id": "run_OVL",
+                "workflow_name": "overlay-wf",
+                "status": "awaiting_approval",
+                "inputs": {},
+                "workspace_id": "ws",
+                "workspace_path": tmp.path(),
+                "transcript_dir": tmp.path(),
+                "started_at": "2026-09-30T10:00:00Z",
+                "awaiting": [{
+                    "step_id": "triage",
+                    "prompt": "approve?",
+                    "since": "2026-09-30T11:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Replay creates the "triage" and "impl" steps.
+        let mut f = std::fs::File::create(run_dir.join("events.jsonl")).unwrap();
+        writeln!(f, r#"{{"type":"run_started","event_version":1,"run_id":"run_OVL","workflow_path":"wf","started_at":"2026-09-30T10:00:00Z"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"step_started","run_id":"run_OVL","step_id":"triage","kind":"panel","agent":null}}"#).unwrap();
+        writeln!(f, r#"{{"type":"step_started","run_id":"run_OVL","step_id":"impl","kind":"linear","agent":null}}"#).unwrap();
+        drop(f);
+
+        let store = RunStore::new(runs);
+        let finding = |severity: &str| FindingRecord {
+            source: "panel".into(),
+            severity: severity.into(),
+            title: "t".into(),
+            body: "b".into(),
+            codename: None,
+        };
+        let record = |step_id: &str, kind: StepKind| StepResultRecord {
+            run_outcome: None,
+            step_id: step_id.into(),
+            run_id: "run_OVL".into(),
+            transcript_path: tmp.path().join("t.jsonl"),
+            output: String::new(),
+            success: true,
+            skipped: false,
+            rendered_prompt: String::new(),
+            kind,
+            items: vec![],
+            findings: vec![],
+            iterations: 1,
+            resolved: true,
+            finished_at: Utc::now(),
+            loop_iteration: None,
+            host: None,
+            codename: None,
+        };
+        let mut triage = record("triage", StepKind::Panel);
+        triage.findings = vec![finding("High"), finding("high"), finding("low")];
+        let mut imp = record("impl", StepKind::Linear);
+        imp.host = Some("kuki".into());
+        imp.loop_iteration = Some(2);
+        store.append_step_result("run_OVL", &triage).unwrap();
+        store.append_step_result("run_OVL", &imp).unwrap();
+
+        let pricing = rupu_config::PricingConfig::default();
+        let v = RunView::from_run_dir(&store, "run_OVL", &pricing);
+
+        let mut want = BTreeMap::new();
+        want.insert("high".to_string(), 2usize);
+        want.insert("low".to_string(), 1usize);
+        assert_eq!(v.findings_by_severity, want);
+        let imp_view = v.steps.iter().find(|s| s.step_id == "impl").unwrap();
+        assert_eq!(imp_view.host, Some("kuki".to_string()));
+        assert_eq!(imp_view.loop_iteration, Some(2));
+        assert_eq!(v.status, RunStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn from_run_dir_degrades_when_run_json_missing() {
+        use rupu_orchestrator::RunStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path().join("runs");
+        // Only the run dir exists: no run.json, no events.jsonl.
+        std::fs::create_dir_all(runs.join("run_GONE")).unwrap();
+
+        let store = RunStore::new(runs);
+        let pricing = rupu_config::PricingConfig::default();
+        let v = RunView::from_run_dir(&store, "run_GONE", &pricing);
+
+        assert_eq!(v.run_id, "run_GONE");
+        assert!(v.steps.is_empty());
+        assert_eq!(v.usage.unwrap().total_tokens, 0);
     }
 }
