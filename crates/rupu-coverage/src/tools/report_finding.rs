@@ -116,6 +116,22 @@ pub fn report_finding(
                     store.ingest(&paths.workspace, &report.artifacts, opts.artifact_max_bytes)?;
             }
             hash_claim_files(&paths.workspace, &mut report);
+            // Directory artifacts expand to one entry per file, so the report
+            // can grow far past the budget `validate_report` checked. Re-check
+            // before anything reaches the ledger.
+            let size = serde_json::to_vec(&report)?.len();
+            if size > opts.report_max_bytes {
+                return Err(ReportFindingError::Report(
+                    crate::report::ReportValidationError(vec![crate::report::FieldError {
+                        path: "report.artifacts".into(),
+                        message: format!(
+                            "after expanding directories the report is {size} bytes, over the {} byte budget ({} artifact files); list specific files instead of large directories",
+                            opts.report_max_bytes,
+                            report.artifacts.len()
+                        ),
+                    }]),
+                ));
+            }
             let evidence = FindingEvidence {
                 code_excerpt: report.evidence.iter().find_map(|c| c.excerpt.clone()),
                 rationale: report.root_cause.clone(),
@@ -617,5 +633,38 @@ mod tests {
             matches!(err, ReportFindingError::MissingField("severity")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn directory_artifact_expansion_is_held_to_the_report_budget() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("pocs/big")).unwrap();
+        for n in 0..40 {
+            std::fs::write(ws.path().join(format!("pocs/big/f{n}.txt")), format!("{n}")).unwrap();
+        }
+        let mut r = fixture_report();
+        r.artifacts = vec![crate::report::ArtifactRef {
+            path: "pocs/big".into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }];
+        // Just above the pre-ingest size: validation passes, the expanded
+        // report (40 entries, each with a 64-char hash) cannot.
+        let pre = serde_json::to_vec(&r).unwrap().len();
+        let opts = crate::report::FindingWriteOptions {
+            report_max_bytes: pre + 64,
+            ..full_opts(store.path())
+        };
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let err = report_finding(&paths, attribution(), full_input(r), &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.artifacts"), "{err}");
+        assert!(err.contains("40 artifact files"), "{err}");
+        assert!(!paths.findings.exists(), "nothing written on rejection");
     }
 }
