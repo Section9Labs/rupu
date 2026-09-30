@@ -821,6 +821,13 @@ async fn reject_runs_on_reject_cleanup_chain() {
         "on_reject step should see steps.gate.decision == rejected; got {:?}",
         cleanup_record.output
     );
+    // The cleanup agent is its own static slot of the run's crew: a
+    // singleton `crew/<role of worker>` (spec §4), not an unnamed run.
+    let crew = record_after_reject.codename.clone().expect("crew");
+    assert_eq!(
+        cleanup_record.codename.as_deref(),
+        Some(format!("{crew}/{}", rupu_codename::role_word("worker")).as_str()),
+    );
 
     // The terminal status set by `RunStore::reject` is untouched by cleanup.
     let record_final = store.load(&run_id).unwrap();

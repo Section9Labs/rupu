@@ -59,7 +59,7 @@ New leaf crate, no rupu deps (workspace deps only: `serde`).
 - `RoleBadge`: `{ shape: Shape, hue: HueIdx }` — 12 shapes (circle, triangle, square, diamond, pentagon, hexagon, star, cross, ring, chevron, drop, bolt) × 12 hues ≈ 144, derived from the role word.
 - `Codename` struct (`crew`, `segments: Vec<Segment { role, n: Option<u32>, attempt: Option<u32> }>`), `Display`, `FromStr`, serde as its string form.
 - `fn crew_for(id: &str) -> Crew` — FNV-1a 64 over the **whole** id string (the ULID's first 48 bits are a timestamp; hashing only a prefix would make same-millisecond runs collide). Never `DefaultHasher` (not stable across Rust versions).
-- `RoleAllocator` — per-crew: `fn role_for(&mut self, agent_def: &str) -> &str`. Hash agent name → index; if the word is already taken by a *different* agent def in this crew, linear-probe to the next free word. Same def ⇒ same word within the crew. Serializable so it can be persisted (§5).
+- `RoleAllocator` — per-crew: `fn role_for(&mut self, agent_def: &str) -> &str`. Hash agent name → index; if the word is already taken by a *different* agent def in this crew, linear-probe to the next free word. Same def ⇒ same word within the crew. Serializable so it can be persisted (§5). Implemented as `CrewNamer` (role words + instance counters) behind `SharedNamer`.
 - `InstanceCounter` — per (parent codename, role) monotone counter, serializable.
 
 ### 4.2 Stability contract
@@ -79,17 +79,17 @@ Every id-mint site also mints the codename, and the codename travels with the id
 
 | Site | Mints |
 |---|---|
-| `runner.rs` / `in_process.rs` / `cp_launcher.rs` / `cmd/workflow.rs` workflow run start | crew; `RoleAllocator` persisted on `RunRecord` |
+| `runner.rs` / `in_process.rs` / `cp_launcher.rs` / `cmd/workflow.rs` workflow run start | crew (on `RunRecord.codename`); the allocator (`CrewNamer`: role words + instance counters) persisted to `<run_dir>/codenames.json` |
 | per-step agent run (`runner.rs` step dispatch) | `crew/role` |
 | fan-out unit (`unit_index`, incl. placed units — minted by the coordinator into `UnitDispatch` next to `run_id`, same pattern as PR #646) | `crew/role#n` |
 | unit retry (`retry_run_id`) | `…#n.attempt` |
 | `dispatch_agent` / `dispatch_agents_parallel` (`rupu-tools`) | parent codename + `>role#n`; parent codename + counters reach the tool via `ToolContext` |
 | `cp_agent_launcher.rs`, `rupu run <agent>` | crew + `crew/role` |
-| `cmd/session.rs` session create | crew + `crew/role`; `RoleAllocator` + `InstanceCounter`s persisted in the session record |
+| `cmd/session.rs` session create | crew + `crew/role`, stored on the session record; no allocator — sessions do not dispatch sub-agents yet, so there is nothing to count |
 
 New fields (all `#[serde(default, skip_serializing_if = "Option::is_none")]`, so every legacy file round-trips byte-for-byte):
-- `RunRecord.codename: Option<String>` (crew) + `RunRecord.codename_state: Option<AllocatorState>`
-- session record: same pair
+- `RunRecord.codename: Option<String>` — the crew only. Allocator state is not on the record: it lives in `<run_dir>/codenames.json`, written under the namer's lock after every change (temp file + atomic rename), and reloaded on resume.
+- session record: `codename: Option<String>` (`crew/role`) — no allocator state (see the table above)
 - `rupu_transcript::Event::RunStart.codename: Option<String>` (full instance codename)
 - `StepResultRecord.codename`, `ItemResultRecord.codename`, `UnitCheckpoint.codename`
 - `DispatchOutcome.codename`
