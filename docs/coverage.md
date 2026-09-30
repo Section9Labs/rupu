@@ -289,8 +289,11 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
   sandbox`. A copied artifact is read from the content-addressed store. An
   external artifact on this machine is opened once and hashed from that same
   handle: `409` if it no longer matches the recorded hash, `404` if it is gone.
-  An external artifact recorded on another host returns `404`; fetching it
-  remotely is not supported yet.
+  Artifacts recorded by remote or placed units are not viewable in the control
+  plane yet: such a unit ingests into that host's own store, and nothing records
+  the host on the artifact today. Should an artifact ever carry a `host`, the
+  endpoint answers `404` for it, because fetching from another host is not
+  built (see `TODO.md`).
 
 ### Not built yet
 

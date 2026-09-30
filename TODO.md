@@ -302,6 +302,7 @@ and are not repeated here.
 - [ ] **SSH `ControlMaster` reuse** — every dashboard tile and status poll pays a fresh TCP+SSH handshake.
 - [ ] **mTLS / cert rotation for node tunnels** — `node/protocol.rs:50` declares an `Mtls {}` variant that is never constructed; node auth is enrollment-token-only.
 - [ ] Capability/label host selector and load-aware placement; bucket retention/GC.
+- [ ] **Finding-report artifacts from remote/placed units** (finding reports spec, "Artifacts": `docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md`) — a remote or placed unit ingests its PoC artifacts into *that host's* store, and nothing sets `ArtifactRef.host` today, so the CP answers "artifact blob missing" for them (`GET /api/findings/:id/artifacts/:sha256`, `crates/rupu-cp/src/api/findings.rs`). Two halves: (a) record `stored: external` + `host` on artifacts ingested by remote/placed units; (b) pull on first view through a new `HostConnector::pull_finding_artifact` hook (same pattern as the SSH lazy transcript mirror), verifying the pulled bytes against the recorded sha256 before caching them in the coordinator's store. Until (a) lands there is nothing for (b) to key on.
 
 ### rupu-cp — web
 - [ ] **Re-run a finished run from the web** — no `rerun` route; re-running means retyping every input.
