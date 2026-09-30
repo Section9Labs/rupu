@@ -245,9 +245,9 @@ export step is needed to read one.
 **Report page (`/findings/:id`).** A full-profile finding opens a report page
 with a section rail (description, impact, location, root cause, call chain,
 evidence, PoC artifacts, replication steps, remediation, patch, CI/CD and
-regression commands, references, provenance), a header ledger (ownership,
-tickets, category, attack vector, rating, CVSS v3, CWE, verification status),
-and a completeness meter, `n/11`, that lists the gaps. The meter counts eleven
+regression commands, references, provenance), a header of CWE and verification-status chips above a ledger (ownership,
+tickets, category, attack vector, impact, likelihood, risk rating, risk factor,
+CVSS v3), and a completeness meter, `n/11`, that lists the gaps. The meter counts eleven
 fields that can be left unanswered: owner, product, affected component, source
 repository, tickets, CVSS v3, attack vector, call chain, recommended patch,
 CI/CD detection, and regression test. `Unknown` and `Not Provided — …` count as
@@ -266,8 +266,8 @@ rest. Expanding a
 full-profile row shows a triage card (root cause, attack path, owner and
 product with unknowns flagged, completeness, verification status) with an
 "Open full report" link. The global Findings page also filters by profile,
-owner, and CWE. Each finding row on a run's Findings tab has an "Open report"
-link, and the command palette opens findings at `/findings/:id`. In the Code
+owner, and CWE. Each full-profile finding row on a run's Findings tab has an
+"Open report" link, and the command palette opens findings at `/findings/:id`. In the Code
 tab, a full-profile finding's inline card has tabs (Root cause, Call chain,
 Evidence, Patch, Repro) that load the report when the card is expanded.
 
@@ -294,10 +294,9 @@ Evidence, Patch, Repro) that load the report when the card is expanded.
 
 ### Not built yet
 
-Markdown, HTML, and PDF export of a report, and the macOS app's finding-report
-views, arrive in later plans. Today a `full` report is stored on the finding
-record, its artifacts are stored as described above, and the control-plane web
-UI renders it.
+Markdown, HTML, and PDF export of a report arrives in a later plan. Today a
+`full` report is stored on the finding record, its artifacts are stored as
+described above, and the control-plane web UI is the rendered view.
 
 ## CLI
 
