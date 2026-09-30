@@ -2340,7 +2340,7 @@ impl AnthropicClient {
         let mut out = Vec::new();
         let mut after: Option<String> = None;
         // Bounded: a server that repeats `last_id` must not loop forever.
-        for _ in 0..50 {
+        for page_num in 0..50 {
             let resp = self.models_request(after.as_deref()).await?;
             let status = resp.status();
             if !status.is_success() {
@@ -2370,8 +2370,38 @@ impl AnthropicClient {
                 status: crate::model_pool::ModelStatus::default(),
             }));
             match (page.has_more, page.last_id) {
-                (true, Some(last)) => after = Some(last),
-                _ => break,
+                (false, _) => break, // Normal end: has_more is false
+                (true, None) => {
+                    // Edge case (b): has_more but no last_id
+                    warn!(
+                        "anthropic models pagination stopped: has_more=true but no last_id; \
+                         returning {} models collected so far",
+                        out.len()
+                    );
+                    break;
+                }
+                (true, Some(ref new_last)) => {
+                    // Check for repeated cursor (edge case a)
+                    if after.as_ref() == Some(new_last) {
+                        warn!(
+                            "anthropic models pagination stopped: cursor repeated (last_id={:?}); \
+                             returning {} models collected so far",
+                            new_last,
+                            out.len()
+                        );
+                        break;
+                    }
+                    // Check if we're about to hit the cap (edge case c)
+                    if page_num == 49 {
+                        warn!(
+                            "anthropic models pagination stopped: reached 50-page limit with has_more=true; \
+                             returning {} models collected so far",
+                            out.len()
+                        );
+                        break;
+                    }
+                    after = Some(new_last.clone());
+                }
             }
         }
         Ok(out)
@@ -5601,6 +5631,44 @@ mod tests {
             matches!(err, ProviderError::Api { status: 401, .. }),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_stops_on_repeated_cursor_edge_case_a() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let page1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("limit", "1000")
+                .matches(no_after_id);
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-1", "type": "model", "max_input_tokens": 100, "max_tokens": 10 }],
+                "has_more": true, "first_id": "model-1", "last_id": "model-1"
+            }));
+        });
+        let page2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .query_param("after_id", "model-1");
+            then.status(200).json_body(serde_json::json!({
+                "data": [{ "id": "model-2", "type": "model", "max_input_tokens": 200, "max_tokens": 20 }],
+                "has_more": true, "first_id": "model-2", "last_id": "model-1"
+            }));
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages?beta=true", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let models = <AnthropicClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        page1.assert();
+        page2.assert_hits(1); // Cursor repeated: after_id=model-1 page fetched exactly once
+        assert_eq!(models.len(), 2); // Two models: one from page1, one from page2
+        assert_eq!(models[0].id, "model-1");
+        assert_eq!(models[1].id, "model-2");
     }
 
     // ── Reasoning capture (Task 2) ───────────────────────────────────
