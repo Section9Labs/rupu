@@ -1,5 +1,6 @@
 pub mod discover;
 pub mod events;
+pub mod ingest;
 pub mod manifest;
 pub mod paths;
 pub mod stream;
@@ -11,6 +12,7 @@ pub use events::{
     AssertionStatus, Attribution, ConcernAssertion, Evidence, FileTouchEvent, FindingEvidence,
     FindingRecord, FindingScope, Surface,
 };
+pub use ingest::{ingest_unit_stream, IngestError, IngestReport, IngestSource};
 pub use manifest::{append_manifest, find_manifest, read_manifests, RunManifest};
 pub use paths::CoveragePaths;
 pub use stream::{
