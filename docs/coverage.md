@@ -107,7 +107,8 @@ list them in the agent's `tools:`):
 
 A finding is recorded once, as structured data. That structured record is the
 source of truth for the finding: rendered views and exports are built on it (see
-the "Not built yet" note at the end of this section for what exists today).
+"Viewing reports in the control plane" and "Not built yet" at the end of this
+section for what exists today).
 
 ### Profiles
 
@@ -236,9 +237,67 @@ The schema is embedded in the binary and kept in lockstep with the validator by
 a test, so external prompts and tools can be generated from rupu rather than
 maintained by hand.
 
-> Not built yet: Markdown / HTML / PDF export, the web report page, and the
-> macOS views arrive in later plans. Today a `full` report is stored on the
-> finding record and its artifacts are stored as described above.
+### Viewing reports in the control plane
+
+The control-plane web UI (`rupu cp serve`) renders a stored `full` report; no
+export step is needed to read one.
+
+**Report page (`/findings/:id`).** A full-profile finding opens a report page
+with a section rail (description, impact, location, root cause, call chain,
+evidence, PoC artifacts, replication steps, remediation, patch, CI/CD and
+regression commands, references, provenance), a header ledger (ownership,
+tickets, category, attack vector, rating, CVSS v3, CWE, verification status),
+and a completeness meter, `n/11`, that lists the gaps. The meter counts eleven
+fields that can be left unanswered: owner, product, affected component, source
+repository, tickets, CVSS v3, attack vector, call chain, recommended patch,
+CI/CD detection, and regression test. `Unknown` and `Not Provided — …` count as
+gaps; `None Provided`, `Not Applicable`, and `None` count as answers.
+Call-chain steps link into the project's Code tab. Each evidence claim carries a
+badge comparing the file hash recorded at write time with the file now
+(`current`, `changed`, `missing`, or `unknown` when the file could not be
+checked, for example above 500 MiB). The proof-of-concept browser lists the
+artifacts, the patch renders as a diff, and the CI/CD and regression commands
+have copy buttons. A `summary`-profile finding opens a compact page instead.
+
+**Lists and triage.** The findings tables (the global Findings page, a
+project's findings tab, and coverage detail) show a Report column with the
+`n/11` count and a PoC marker for full-profile rows, and "summary" for the
+rest. Expanding a
+full-profile row shows a triage card (root cause, attack path, owner and
+product with unknowns flagged, completeness, verification status) with an
+"Open full report" link. The global Findings page also filters by profile,
+owner, and CWE. Each finding row on a run's Findings tab has an "Open report"
+link, and the command palette opens findings at `/findings/:id`. In the Code
+tab, a full-profile finding's inline card has tabs (Root cause, Call chain,
+Evidence, Patch, Repro) that load the report when the card is expanded.
+
+**API.**
+
+- `GET /api/findings` and the `findings` array in `GET /api/coverage/:target`
+  return slim rows without the report body. A full-profile row carries
+  `report_summary`: `owner`, `product`, `cwe`, `root_cause`, `chain`,
+  `completeness` (`filled`, `total`, `gaps`), `has_poc`, and
+  `verification_status`.
+- `GET /api/findings/:id` returns the whole record with its `report` and an
+  `evidence_status` per evidence claim (`current`, `changed`, `missing`,
+  `unknown`). Claim files are hashed off the async runtime; a file over
+  500 MiB reports `unknown`.
+- `GET /api/findings/:id/artifacts/:sha256` serves an artifact only if that
+  finding lists it; `:sha256` must be 64 lowercase hex characters. Text is
+  served inline as `text/plain`; anything else is an attachment. Every response
+  carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy:
+  sandbox`. A copied artifact is read from the content-addressed store. An
+  external artifact on this machine is opened once and hashed from that same
+  handle: `409` if it no longer matches the recorded hash, `404` if it is gone.
+  An external artifact recorded on another host returns `404`; fetching it
+  remotely is not supported yet.
+
+### Not built yet
+
+Markdown, HTML, and PDF export of a report, and the macOS app's finding-report
+views, arrive in later plans. Today a `full` report is stored on the finding
+record, its artifacts are stored as described above, and the control-plane web
+UI renders it.
 
 ## CLI
 
