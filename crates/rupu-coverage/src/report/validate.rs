@@ -56,9 +56,14 @@ pub(crate) fn rel_path_problem(p: &str) -> Option<&'static str> {
     None
 }
 
+/// `Not Provided — <justification>`, where the justification starts right
+/// after the prefix's single space. Mirrors the schema's
+/// `^Not Provided — \S`: a second space (or any whitespace) before the
+/// justification is rejected by both.
 fn not_provided_ok(s: &str) -> bool {
     s.strip_prefix(NOT_PROVIDED_PREFIX)
-        .is_some_and(|rest| !rest.trim().is_empty())
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| !c.is_whitespace())
 }
 
 const NOT_PROVIDED_HINT: &str =
@@ -342,6 +347,8 @@ mod tests {
     fn not_provided_needs_a_justification() {
         let mut r = valid();
         r.regression_test = OrSentinel::Sentinel("Not Provided — ".into());
+        assert_eq!(problems(&r), vec!["report.regression_test".to_string()]);
+        r.regression_test = OrSentinel::Sentinel("Not Provided —  double space".into());
         assert_eq!(problems(&r), vec!["report.regression_test".to_string()]);
         r.regression_test =
             OrSentinel::Sentinel("Not Provided — requires hardware we do not have".into());
