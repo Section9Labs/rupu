@@ -861,7 +861,7 @@ impl RunStore {
         Self { root }
     }
 
-    fn run_dir(&self, run_id: &str) -> PathBuf {
+    pub fn run_dir(&self, run_id: &str) -> PathBuf {
         self.root.join(run_id)
     }
 

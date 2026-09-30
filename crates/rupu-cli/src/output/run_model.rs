@@ -8,8 +8,10 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use rupu_config::PricingConfig;
 use rupu_orchestrator::executor::Event;
 use rupu_orchestrator::runs::{RunStatus, StepKind};
+use rupu_orchestrator::RunStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitStatus {
@@ -379,6 +381,65 @@ impl RunView {
     }
 }
 
+impl RunView {
+    /// Build the full projection of a run from its on-disk artifacts.
+    /// Replays `events.jsonl`, overlays `run.json` (crew + gates + status)
+    /// and `step_results.jsonl` (loop iteration, host, panel findings), and
+    /// folds token/cost totals through the shared `rupu_cp::usage` path
+    /// (which already resolves fan-out + remote-mirror transcripts).
+    pub fn from_run_dir(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> RunView {
+        let mut v = RunView::default();
+
+        // 1. Replay the event log.
+        let events_path = store.run_dir(run_id).join("events.jsonl");
+        let mut tailer = crate::output::jsonl_reader::WfEventTailer::new(events_path);
+        for ev in tailer.drain_events() {
+            v.apply(&ev);
+        }
+
+        // 2. Overlay run.json.
+        if let Ok(rec) = store.load(run_id) {
+            v.run_id = rec.id.clone();
+            v.workflow_name = rec.workflow_name.clone();
+            v.crew = rec.codename.clone();
+            v.status = rec.status;
+            v.gates = rec
+                .awaiting_gates()
+                .into_iter()
+                .map(|g| GateView {
+                    step_id: g.step_id.clone(),
+                    prompt: g.prompt.clone(),
+                    since: g.since,
+                    expires_at: g.expires_at,
+                })
+                .collect();
+        }
+
+        // 3. step_results: loop iteration, host, panel findings by severity.
+        if let Ok(records) = store.read_step_results(run_id) {
+            for r in &records {
+                let s = v.step_mut(&r.step_id);
+                if r.loop_iteration.is_some() {
+                    s.loop_iteration = r.loop_iteration;
+                }
+                if r.host.is_some() {
+                    s.host = r.host.clone();
+                }
+                for fnd in &r.findings {
+                    *v.findings_by_severity
+                        .entry(fnd.severity.to_lowercase())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        // 4. Token/cost totals via the proven fold (one pass, no double-count).
+        v.usage = Some(rupu_cp::usage::summarize_run(store, run_id, pricing));
+
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,5 +756,57 @@ mod tests {
         });
         assert_eq!(v.steps[0].panel_round, Some(2));
         assert_eq!(v.steps[0].panel_max, Some(5));
+    }
+
+    #[test]
+    fn from_run_dir_builds_totals_gates_and_crew() {
+        use rupu_orchestrator::RunStore;
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = tmp.path().join("runs");
+        let run_dir = runs.join("run_TEST");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        // Minimal run.json: workflow_name, codename crew, awaiting gate.
+        std::fs::write(
+            run_dir.join("run.json"),
+            serde_json::json!({
+                "id": "run_TEST",
+                "workflow_name": "assess-services",
+                "status": "awaiting_approval",
+                "inputs": {},
+                "workspace_id": "ws",
+                "workspace_path": tmp.path(),
+                "transcript_dir": tmp.path(),
+                "started_at": "2026-09-30T10:00:00Z",
+                "codename": "mint-tundra",
+                "awaiting": [{
+                    "step_id": "triage",
+                    "prompt": "approve report publish?",
+                    "since": "2026-09-30T11:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // events.jsonl: one completed linear step.
+        let mut f = std::fs::File::create(run_dir.join("events.jsonl")).unwrap();
+        writeln!(f, r#"{{"type":"run_started","event_version":1,"run_id":"run_TEST","workflow_path":"wf","started_at":"2026-09-30T10:00:00Z"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"step_started","run_id":"run_TEST","step_id":"preflight","kind":"run","agent":null}}"#).unwrap();
+        writeln!(f, r#"{{"type":"step_completed","run_id":"run_TEST","step_id":"preflight","success":true,"duration_ms":18000}}"#).unwrap();
+
+        let store = RunStore::new(runs);
+        let pricing = rupu_config::PricingConfig::default();
+        let v = RunView::from_run_dir(&store, "run_TEST", &pricing);
+
+        assert_eq!(v.workflow_name, "assess-services");
+        assert_eq!(v.crew.as_deref(), Some("mint-tundra"));
+        assert_eq!(v.steps.len(), 1);
+        assert_eq!(v.steps[0].state, StepState::Complete);
+        assert_eq!(v.gates.len(), 1);
+        assert_eq!(v.gates[0].step_id, "triage");
+        // No transcripts on disk -> usage folds to a zero summary, not a panic.
+        assert!(v.usage.is_some());
     }
 }
