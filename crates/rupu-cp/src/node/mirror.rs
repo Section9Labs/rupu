@@ -317,7 +317,9 @@ impl NodeMirror {
     /// # Errors
     /// [`MirrorError::InvalidRunId`], [`MirrorError::Store`],
     /// [`MirrorError::WrongNode`] as for `append`; [`MirrorError::Io`] when
-    /// the temp file cannot be written or renamed (the temp file is removed).
+    /// the temp file cannot be written or renamed. Either way the (possibly
+    /// partly written) temp file is removed and the existing ledger is left
+    /// untouched.
     pub fn replace_usage_ledger(
         &self,
         run_id: &str,
@@ -331,8 +333,7 @@ impl NodeMirror {
         }
         let path = self.run_store.usage_ledger_path(run_id);
         let tmp = path.with_file_name(format!("usage.jsonl.{}.tmp", ulid::Ulid::new()));
-        std::fs::write(&tmp, content)?;
-        if let Err(e) = std::fs::rename(&tmp, &path) {
+        if let Err(e) = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, &path)) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }

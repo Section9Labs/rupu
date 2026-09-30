@@ -434,6 +434,57 @@ fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     );
 }
 
+/// A failed replace leaves no temp file behind and the existing ledger path
+/// untouched. The rename is made to fail by occupying the ledger path with a
+/// non-empty directory; the write-failure path shares the same cleanup branch.
+#[cfg(unix)]
+#[test]
+fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
+    use rupu_cp::node::mirror::{MirrorError, NodeMirror};
+    use rupu_cp::node::protocol::{RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "smoke-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    let run_id = "run_NODEMIRRUSAGE03";
+    let node_id = "node-43";
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+    let path = store.usage_ledger_path(run_id);
+    std::fs::create_dir_all(path.join("occupied")).unwrap();
+
+    let err = mirror
+        .replace_usage_ledger(run_id, node_id, "{\"id\":\"01J0000000000000000000USGD\"}\n")
+        .expect_err("a file cannot be renamed over a non-empty directory");
+    assert!(
+        matches!(err, MirrorError::Io(_)),
+        "expected Io, got {err:?}"
+    );
+    assert!(
+        path.join("occupied").is_dir(),
+        "the ledger path is untouched"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
+
 /// After `create_run` + `append(RunJson, <node record with bogus paths>)`,
 /// the loaded record must carry the CP-side `transcript_dir` and
 /// `workspace_path` (not the node's paths), while run-state fields

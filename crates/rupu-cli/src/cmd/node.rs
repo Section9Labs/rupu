@@ -901,6 +901,52 @@ pub(crate) fn next_control_seq(existing: &[(u64, Vec<u8>)]) -> u64 {
     existing.iter().map(|(s, _)| *s + 1).max().unwrap_or(0)
 }
 
+/// Drain the run's usage ledger and upload its new rows as the next
+/// `usage.<seq>` result object, bumping `usage_seq` once the put lands.
+/// Nothing new → no object. No capability gate: an older CP's poller skips the
+/// unknown `usage.*` key.
+async fn upload_usage_ledger(
+    bucket: &dyn Bucket,
+    rid: &str,
+    run_dir: &Path,
+    offsets: &mut FileOffsets,
+    usage_seq: &mut u64,
+) {
+    let lines = drain_usage_ledger(run_dir, offsets, true);
+    if lines.is_empty() {
+        return;
+    }
+    let body = lines.join("\n") + "\n";
+    let key = result_key("usage", *usage_seq);
+    if let Err(e) = bucket.put_result(rid, &key, body.as_bytes()).await {
+        warn!(run_id = %rid, key = %key, error = %e, "node pull: put usage result failed");
+    } else {
+        *usage_seq += 1;
+    }
+}
+
+/// The bucket loop's terminal pass for a run whose `run.json` reads terminal:
+/// drain the usage ledger ONE more time, then write the `finished` marker.
+///
+/// The routine drain earlier in the same pass awaits a network `put_result`
+/// before `run.json` is read, so a row the runner appended in that window
+/// would otherwise never be uploaded — the run leaves `active` this pass — and
+/// the CP's total would stay short for good. Uploading it BEFORE `finished`
+/// also means a CP that sees the marker already has every row.
+async fn finish_bucket_run(
+    bucket: &dyn Bucket,
+    rid: &str,
+    run_dir: &Path,
+    offsets: &mut FileOffsets,
+    usage_seq: &mut u64,
+    status: &str,
+) {
+    upload_usage_ledger(bucket, rid, run_dir, offsets, usage_seq).await;
+    if let Err(e) = bucket.put_finished(rid, status).await {
+        warn!(run_id = %rid, status = %status, error = %e, "node pull: put_finished failed");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bucket pull agent loop
 // ---------------------------------------------------------------------------
@@ -1025,16 +1071,14 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
 
             // Drain usage.jsonl (the run's usage ledger). No capability gate:
             // an older CP's poller skips the unknown `usage.*` key.
-            let lines = drain_usage_ledger(&run_dir, &mut state.offsets, true);
-            if !lines.is_empty() {
-                let body = lines.join("\n") + "\n";
-                let key = result_key("usage", state.usage_seq);
-                if let Err(e) = bucket.put_result(rid, &key, body.as_bytes()).await {
-                    warn!(run_id = %rid, key = %key, error = %e, "node pull: put usage result failed");
-                } else {
-                    state.usage_seq += 1;
-                }
-            }
+            upload_usage_ledger(
+                &bucket,
+                rid,
+                &run_dir,
+                &mut state.offsets,
+                &mut state.usage_seq,
+            )
+            .await;
 
             // Upload run.json (always — reflects current in-progress status).
             let run_json_path = run_dir.join("run.json");
@@ -1130,12 +1174,19 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                 }
             }
 
-            // Check for terminal status → put_finished + remove from active.
+            // Check for terminal status → final ledger drain + put_finished +
+            // remove from active.
             if let Some((status, _body)) = read_terminal_status(&run_json_path) {
                 info!(run_id = %rid, status = %status, "node pull: run finished");
-                if let Err(e) = bucket.put_finished(rid, &status).await {
-                    warn!(run_id = %rid, status = %status, error = %e, "node pull: put_finished failed");
-                }
+                finish_bucket_run(
+                    &bucket,
+                    rid,
+                    &run_dir,
+                    &mut state.offsets,
+                    &mut state.usage_seq,
+                    &status,
+                )
+                .await;
                 finished.push(rid.clone());
             }
         }
@@ -1380,6 +1431,136 @@ mod tests {
         assert!(drain_usage_ledger(dir.path(), &mut gated, false).is_empty());
         assert!(drain_usage_ledger(dir.path(), &mut gated, false).is_empty());
         assert_eq!(gated.usage, 0);
+    }
+
+    use rupu_cp::host::bucket::BucketError;
+
+    /// A [`Bucket`] that records the order of the writes the terminal pass
+    /// makes (`put_result` key / `put_finished` status + the body), so a test
+    /// can assert the late ledger row lands BEFORE the finished marker.
+    #[derive(Default)]
+    struct RecordingBucket {
+        ops: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Bucket for RecordingBucket {
+        async fn put_job(&self, _: &str, _: &[u8]) -> Result<(), BucketError> {
+            unreachable!("the terminal pass never writes jobs")
+        }
+        async fn list_jobs(&self) -> Result<Vec<String>, BucketError> {
+            unreachable!()
+        }
+        async fn claim_job(&self, _: &str, _: &str) -> Result<bool, BucketError> {
+            unreachable!()
+        }
+        async fn get_job(&self, _: &str) -> Result<Vec<u8>, BucketError> {
+            unreachable!()
+        }
+        async fn put_control(&self, _: &str, _: u64, _: &[u8]) -> Result<(), BucketError> {
+            unreachable!()
+        }
+        async fn list_control(&self, _: &str) -> Result<Vec<(u64, Vec<u8>)>, BucketError> {
+            unreachable!()
+        }
+        async fn put_result(
+            &self,
+            _run_id: &str,
+            key: &str,
+            body: &[u8],
+        ) -> Result<(), BucketError> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push((key.to_string(), String::from_utf8_lossy(body).into_owned()));
+            Ok(())
+        }
+        async fn list_results(&self, _: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+            unreachable!()
+        }
+        async fn put_finished(&self, _run_id: &str, status: &str) -> Result<(), BucketError> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(("finished".to_string(), status.to_string()));
+            Ok(())
+        }
+        async fn get_finished(&self, _: &str) -> Result<Option<String>, BucketError> {
+            unreachable!()
+        }
+        async fn probe(&self) -> Result<(), BucketError> {
+            unreachable!()
+        }
+    }
+
+    /// The bucket loop's terminal pass (same race as the tunnel's, above): a
+    /// row appended after the routine drain is uploaded as the next `usage.*`
+    /// object, exactly once and BEFORE the `finished` marker; with no late row
+    /// the pass writes no empty usage object.
+    #[tokio::test]
+    async fn bucket_terminal_pass_uploads_the_late_row_before_finished() {
+        let dir = tempdir().unwrap();
+        let ledger = dir.path().join("usage.jsonl");
+        std::fs::write(&ledger, "{\"id\":\"USGA\"}\n{\"id\":\"USGB\"}\n").unwrap();
+        let bucket = RecordingBucket::default();
+        let mut off = offsets();
+        let mut seq = 0u64;
+
+        // Routine drain earlier in the pass.
+        upload_usage_ledger(&bucket, "run_BKT", dir.path(), &mut off, &mut seq).await;
+        // The runner appends a final row, then writes the terminal run.json.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        writeln!(f, r#"{{"id":"USGC"}}"#).unwrap();
+        drop(f);
+        finish_bucket_run(
+            &bucket,
+            "run_BKT",
+            dir.path(),
+            &mut off,
+            &mut seq,
+            "completed",
+        )
+        .await;
+
+        let ops = bucket.ops.lock().unwrap().clone();
+        let keys: Vec<&str> = ops.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["usage.0000.jsonl", "usage.0001.jsonl", "finished"],
+            "{ops:?}"
+        );
+        assert!(ops[0].1.contains("USGA") && ops[0].1.contains("USGB"));
+        assert!(!ops[0].1.contains("USGC"));
+        assert_eq!(ops[1].1, "{\"id\":\"USGC\"}\n", "only the late row");
+        assert_eq!(ops[2].1, "completed");
+        assert_eq!(seq, 2);
+
+        // Nothing late: the terminal pass is just the marker.
+        let quiet = RecordingBucket::default();
+        let mut off = offsets();
+        let mut seq = 0u64;
+        upload_usage_ledger(&quiet, "run_QUIET", dir.path(), &mut off, &mut seq).await;
+        finish_bucket_run(
+            &quiet,
+            "run_QUIET",
+            dir.path(),
+            &mut off,
+            &mut seq,
+            "failed",
+        )
+        .await;
+        let keys: Vec<String> = quiet
+            .ops
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(keys, ["usage.0000.jsonl", "finished"]);
+        assert_eq!(seq, 1);
     }
 
     /// A run with no usage ledger yet (or never) drains to nothing.

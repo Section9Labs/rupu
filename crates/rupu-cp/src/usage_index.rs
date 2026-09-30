@@ -564,14 +564,29 @@ struct Known {
     from_step_results: bool,
 }
 
-/// `(len, mtime)`; a missing file is `(0, None)`.
-type Stat = (u64, Option<SystemTime>);
+/// `(len, mtime, inode)`; a missing file is [`ABSENT`]. The inode (unix; `0`
+/// elsewhere) is what catches an authoritative replace by rename — a mirror's
+/// terminal ledger pull — that happens to leave the length unchanged and lands
+/// within the filesystem's mtime granularity (or carries the old mtime):
+/// without it a sealed terminal run would never see the new content.
+type Stat = (u64, Option<SystemTime>, u64);
 
 fn stat(path: &Path) -> Stat {
     match std::fs::metadata(path) {
-        Ok(m) => (m.len(), m.modified().ok()),
-        Err(_) => (0, None),
+        Ok(m) => (m.len(), m.modified().ok(), inode(&m)),
+        Err(_) => ABSENT,
     }
+}
+
+#[cfg(unix)]
+fn inode(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    m.ino()
+}
+
+#[cfg(not(unix))]
+fn inode(_: &std::fs::Metadata) -> u64 {
+    0
 }
 
 /// What a terminal run's cached result was computed against.
@@ -602,8 +617,9 @@ struct Seal {
     mirrors: Vec<(PathBuf, Stat)>,
 }
 
-/// The stat of a path [`resolve`] found absent (`is_file()` false).
-const ABSENT: Stat = (0, None);
+/// The stat of a path [`resolve`] found absent (`is_file()` false), and of any
+/// missing file.
+const ABSENT: Stat = (0, None, 0);
 
 /// The fallback transcript versions a build used, per key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2043,6 +2059,66 @@ mod tests {
         assert_eq!(total(&replaced), tok(6, 3));
         let fresh = UsageIndex::default().run_usage(&store, "run_EPOCH");
         assert_same_usage(&replaced, &fresh, true);
+    }
+
+    /// A sealed terminal run whose ledger is REPLACED by rename with content of
+    /// the same length and the same mtime (a mirror's authoritative terminal
+    /// pull landing inside the filesystem's mtime granularity) still
+    /// re-validates: the seal compares the inode too.
+    #[cfg(unix)]
+    #[test]
+    fn sealed_terminal_run_revalidates_an_equal_length_ledger_replace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_SWAP", RunStatus::Completed);
+        let ledger = store.usage_ledger_path("run_SWAP");
+        let t = tmp.path().join("transcripts/run_A.jsonl");
+        let original = ledger_line(
+            "01W1",
+            Some("s"),
+            None,
+            "run_A",
+            None,
+            &t,
+            100,
+            1,
+            LedgerKind::Turn,
+        );
+        append(&ledger, &original);
+
+        let idx = UsageIndex::default();
+        let first = idx.run_usage(&store, "run_SWAP");
+        assert_eq!(total(&first), tok(100, 1));
+        assert!(is_sealed(&idx, &store, "run_SWAP"));
+
+        // Same length, different tokens, same mtime — only the inode moves.
+        let replaced = original.replace("\"input_tokens\":100", "\"input_tokens\":200");
+        assert_ne!(replaced, original);
+        assert_eq!(replaced.len(), original.len());
+        let mtime = std::fs::metadata(&ledger).unwrap().modified().unwrap();
+        let staged = ledger.with_extension("jsonl.swap");
+        std::fs::write(&staged, &replaced).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&staged, &ledger).unwrap();
+        let m = std::fs::metadata(&ledger).unwrap();
+        assert_eq!(
+            (m.len(), m.modified().unwrap()),
+            (original.len() as u64, mtime),
+            "precondition: length and mtime are unchanged"
+        );
+
+        let second = idx.run_usage(&store, "run_SWAP");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a replaced ledger must break the seal"
+        );
+        assert_eq!(total(&second), tok(200, 1));
+        assert!(is_sealed(&idx, &store, "run_SWAP"));
     }
 
     #[test]

@@ -968,10 +968,10 @@ enum PumpProbe {
 }
 
 /// One terminal-status probe for the tail pump: `cat run.json`; if the status
-/// is terminal, mirror the record, catch up the transcript, and `finish` the
-/// run. Returns [`PumpProbe::Finalized`] when the run was finalized (the pump
-/// should stop). Shared by the pump's interval tick and its dispatcher nudge
-/// so both paths finalize identically.
+/// is terminal, replace the usage ledger, mirror the record, catch up the
+/// transcripts, and `finish` the run. Returns [`PumpProbe::Finalized`] when
+/// the run was finalized (the pump should stop). Shared by the pump's interval
+/// tick and its dispatcher nudge so both paths finalize identically.
 async fn pump_finalize_if_terminal(
     exec: &dyn RemoteExec,
     mirror: &NodeMirror,
@@ -1002,11 +1002,15 @@ async fn pump_finalize_if_terminal(
         return PumpProbe::Alive;
     }
     let status = status.to_string();
+    // The authoritative ledger replace goes BEFORE the terminal `run.json` is
+    // mirrored: the usage fold seals a terminal run on what it reads, so a
+    // reader must never see "terminal" next to the tailed (possibly short)
+    // ledger. The replace only needs the run to exist with this worker id,
+    // which `create_run` already guaranteed.
+    pump_catch_up_usage_ledger(exec, mirror, run_id, host_id).await;
     let _ = mirror.append(run_id, host_id, ArtifactFile::RunJson, &trimmed);
     // Before `finish`, so the synthesized step-result row sees the complete
-    // transcript on disk — and so a reader that sees the run terminal also
-    // sees its complete usage ledger.
-    pump_catch_up_usage_ledger(exec, mirror, run_id, host_id).await;
+    // transcript on disk.
     pump_catch_up_transcript(exec, mirror, run_id, host_id, cat_transcript_cmd).await;
     pump_pull_step_transcripts(exec, mirror, lazy, run_id, host_id).await;
     let _ = mirror.finish(run_id, host_id, &status);
@@ -1480,12 +1484,18 @@ impl SshHostConnector {
                                             } else if path.ends_with("unit_checkpoints.jsonl") {
                                                 Some(ArtifactFile::UnitCheckpoints)
                                             } else if path.ends_with("usage.jsonl") {
-                                                // The pump never truncates the mirrored
-                                                // ledger. `tail -n +1` replays it from
-                                                // byte zero after a reconnect, re-appending
-                                                // lines already mirrored; that is
-                                                // harmless because the CP's usage fold
-                                                // dedups rows by their ULID `id`.
+                                                // Tailed ledger lines are only ever
+                                                // APPENDED here — no truncate on the
+                                                // first header, unlike the transcript.
+                                                // `tail -n +1` replays the file from
+                                                // byte zero after a reconnect,
+                                                // re-appending lines already mirrored;
+                                                // that is harmless because the CP's
+                                                // usage fold dedups rows by their ULID
+                                                // `id`. The one rewrite is the terminal
+                                                // pull, which REPLACES the whole file
+                                                // with the remote's (see
+                                                // `pump_catch_up_usage_ledger`).
                                                 Some(ArtifactFile::Usage)
                                             } else if path.ends_with(&transcript_suffix) {
                                                 if !transcript_replayed {
@@ -1627,9 +1637,12 @@ impl SshHostConnector {
                 // so the run is never stuck in Running.
                 if !terminal_seen {
                     // Ordering matches the happy path (`pump_finalize_if_terminal`):
-                    // mirror the final `run.json` FIRST, then catch the transcript
-                    // up, then pull the step transcripts, then finish. Running the
-                    // transcript work first left the mirrored record stale for the
+                    // replace the usage ledger with the remote's FIRST, then
+                    // mirror the final `run.json`, then catch the transcript up,
+                    // then pull the step transcripts, then finish. The ledger
+                    // leads so a reader never sees a terminal record beside the
+                    // tailed ledger (the usage fold seals on that); the record
+                    // leads the transcript work, which left it stale for the
                     // whole (possibly slow) pull.
                     //
                     // Use the observed status only if it is terminal; a
@@ -1637,7 +1650,12 @@ impl SshHostConnector {
                     // persist as final since the executor may still be alive.
                     // Finish as "failed" in that case — and when the cat fails
                     // outright — so the run is never stuck in Running.
-                    let finish_status = match exec.run(&cat_cmd).await {
+                    let run_json = exec.run(&cat_cmd).await;
+                    // Same authoritative ledger pull as the terminal arm: rows
+                    // still buffered in the dead stream are gone, so replace the
+                    // mirrored ledger with the remote's while we can reach it.
+                    pump_catch_up_usage_ledger(exec.as_ref(), &mirror, &run_id, &host_id).await;
+                    let finish_status = match run_json {
                         Ok(out) if out.success && !out.stdout.trim().is_empty() => {
                             let trimmed = out.stdout.trim().to_string();
                             let _ =
@@ -1654,10 +1672,6 @@ impl SshHostConnector {
                         }
                         _ => "failed".to_string(),
                     };
-                    // Same authoritative ledger pull as the terminal arm: rows
-                    // still buffered in the dead stream are gone, so replace the
-                    // mirrored ledger with the remote's while we can reach it.
-                    pump_catch_up_usage_ledger(exec.as_ref(), &mirror, &run_id, &host_id).await;
                     // Same terminal transcript catch-up as the interval arm above:
                     // the stream ended without a clean terminal detection, so any
                     // buffered-but-undelivered transcript lines are gone. Replace
@@ -6066,6 +6080,148 @@ mod tests {
             ledger.lines().collect::<Vec<_>>(),
             vec![USAGE_ROW_1, USAGE_ROW_LATE]
         );
+    }
+
+    /// Wraps a [`FakeExec`] and records the MIRRORED run's status each time
+    /// the pump `cat`s the remote ledger — the pull runs right before its
+    /// replace, so a terminal status here means a reader could already see
+    /// "terminal" beside the tailed (short) ledger, and the usage fold would
+    /// seal on it.
+    ///
+    /// `cat run.json` answers `run_json`, set once the mirror record exists
+    /// (the body is derived from it — see [`remote_run_json`]). In `fallback`
+    /// mode the tail stream ENDS after its lines, and `cat run.json` answers
+    /// `run_json_after_end` once it has — so only the stream-end fallback can
+    /// ever see the run terminal, whatever order the pump's unbiased
+    /// `select!` takes.
+    struct LedgerOrderExec {
+        inner: FakeExec,
+        store: std::sync::OnceLock<std::sync::Arc<rupu_orchestrator::RunStore>>,
+        run_id: &'static str,
+        seen: std::sync::Mutex<Vec<rupu_orchestrator::RunStatus>>,
+        run_json: std::sync::OnceLock<String>,
+        fallback: bool,
+        run_json_after_end: std::sync::OnceLock<String>,
+        ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LedgerOrderExec {
+        fn new(inner: FakeExec, run_id: &'static str, fallback: bool) -> Self {
+            Self {
+                inner,
+                store: std::sync::OnceLock::new(),
+                run_id,
+                seen: Default::default(),
+                run_json: std::sync::OnceLock::new(),
+                fallback,
+                run_json_after_end: std::sync::OnceLock::new(),
+                ended: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for LedgerOrderExec {
+        async fn run(&self, c: &str) -> Result<RemoteOutput, RemoteExecError> {
+            if c.starts_with("cat ") && c.contains("/usage.jsonl") {
+                if let Some(store) = self.store.get() {
+                    let status = store.load(self.run_id).unwrap().status;
+                    self.seen.lock().unwrap().push(status);
+                }
+            }
+            if c.starts_with("cat ") && c.ends_with("/run.json") {
+                self.inner.commands.lock().unwrap().push(c.to_string());
+                let ended = self.ended.load(std::sync::atomic::Ordering::SeqCst);
+                let after_end = ended.then(|| self.run_json_after_end.get()).flatten();
+                return Ok(RemoteOutput {
+                    stdout: after_end
+                        .or(self.run_json.get())
+                        .cloned()
+                        .unwrap_or_default(),
+                    stderr: String::new(),
+                    success: true,
+                });
+            }
+            self.inner.run(c).await
+        }
+        fn spawn_lines(&self, c: &str) -> Result<LineStream, RemoteExecError> {
+            if !self.fallback {
+                return self.inner.spawn_lines(c);
+            }
+            self.inner.commands.lock().unwrap().push(c.to_string());
+            let lines: Vec<std::io::Result<String>> =
+                self.inner.tail_lines.iter().cloned().map(Ok).collect();
+            let ended = std::sync::Arc::clone(&self.ended);
+            let end = futures_util::stream::poll_fn(move |_| {
+                ended.store(true, std::sync::atomic::Ordering::SeqCst);
+                Poll::Ready(None::<std::io::Result<String>>)
+            });
+            Ok(Box::pin(futures_util::stream::iter(lines).chain(end)))
+        }
+        async fn run_bytes(
+            &self,
+            c: &str,
+            stdin: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            self.inner.run_bytes(c, stdin).await
+        }
+    }
+
+    /// The terminal ledger replace lands BEFORE the terminal `run.json` is
+    /// mirrored — on the interval arm (tail never ends, so only the terminal
+    /// probe can finalize) and on the stream-end fallback — so no reader can
+    /// see the run terminal next to the short tailed ledger.
+    #[tokio::test]
+    async fn tail_pump_replaces_the_ledger_before_mirroring_the_terminal_record() {
+        use rupu_orchestrator::RunStatus;
+        for (run_id, fallback) in [("run_01USAGEORD1", false), ("run_01USAGEORD2", true)] {
+            let tail_lines = vec![
+                format!("==> /home/ci/.rupu/runs/{run_id}/usage.jsonl <=="),
+                USAGE_ROW_1.to_string(),
+            ];
+            let mut fake = FakeExec::ok(tail_lines);
+            fake.cat_usage_stdout = Some(format!("{USAGE_ROW_1}\n{USAGE_ROW_LATE}\n"));
+            let exec = std::sync::Arc::new(LedgerOrderExec::new(fake, run_id, fallback));
+            let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+            conn.mirror
+                .create_run(run_id, &conn.host_id, &workflow_spec())
+                .unwrap();
+            let _ = exec.store.set(std::sync::Arc::clone(&run_store));
+            let terminal = remote_run_json(&run_store, run_id, RunStatus::Completed, None);
+            if fallback {
+                let running = remote_run_json(&run_store, run_id, RunStatus::Running, None);
+                let _ = exec.run_json.set(running);
+                let _ = exec.run_json_after_end.set(terminal);
+            } else {
+                let _ = exec.run_json.set(terminal);
+            }
+            conn.spawn_tail_pump(run_id.to_string());
+            wait_until_finished(&run_store, run_id).await;
+
+            assert_eq!(
+                run_store.load(run_id).unwrap().status,
+                RunStatus::Completed,
+                "fallback={fallback}: finalized from the terminal record"
+            );
+            let seen = exec.seen.lock().unwrap().clone();
+            assert_eq!(
+                seen.len(),
+                1,
+                "fallback={fallback}: one ledger pull: {seen:?}"
+            );
+            assert!(
+                !seen[0].is_terminal(),
+                "fallback={fallback}: the mirrored run was already {:?} when the \
+                 ledger was pulled — a reader could seal on the short ledger",
+                seen[0]
+            );
+            let ledger = std::fs::read_to_string(run_store.usage_ledger_path(run_id)).unwrap();
+            assert_eq!(
+                ledger.lines().collect::<Vec<_>>(),
+                vec![USAGE_ROW_1, USAGE_ROW_LATE],
+                "fallback={fallback}"
+            );
+        }
     }
 
     /// Reproduces the live-host truncation: the dispatching process is the
