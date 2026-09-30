@@ -168,3 +168,19 @@ describe('buildVitals', () => {
     expect(v.eventsPerMin).toBe(12);
   });
 });
+
+describe('deriveActivity — codenames', () => {
+  it('step_started with a codename reads `leaf · agent`', () => {
+    const ev = { type: 'step_started', run_id: 'r1', step_id: 'scan', kind: 'linear', agent: 'oracle', codename: 'jade-reef/scout' } as RunEvent;
+    expect(deriveActivity([{ ts: 1, event: ev }]).get('r1')!.action).toBe('scout · oracle');
+  });
+  it('agent_started with a codename reads `leaf · agent`', () => {
+    const ev = { type: 'agent_started', run_id: 'r2', step_id: 'review', codename: 'jade-reef/heron#4', agent: 'sec-reviewer', agent_run_id: 'a', transcript_path: 't' } as RunEvent;
+    expect(deriveActivity([{ ts: 1, event: ev }]).get('r2')!.action).toBe('heron#4 · sec-reviewer');
+  });
+  it('step_started without a codename is unchanged', () => {
+    const ev = { type: 'step_started', run_id: 'r3', step_id: 'scan', kind: 'linear', agent: 'oracle' } as RunEvent;
+    expect(deriveActivity([{ ts: 1, event: ev }]).get('r3')!.action).toBe('oracle · scan');
+  });
+});
+

@@ -18,6 +18,7 @@ import {
   type KnownRunEvent,
   type RunEvent,
 } from '../api';
+import { memberLabel, parseCodename } from '../codename';
 
 /** Which filter chip a card answers to. `activity` is the catch-all for agent
  *  work / step + run lifecycle / panel rounds. */
@@ -62,6 +63,16 @@ export interface StreamCard {
   workflow?: string;
   stepId?: string;
   agent?: string;
+  /** Server-minted agent codename (e.g. `jade-reef/heron#4`) when the event /
+   *  finding carries one. Display-only — never computed client-side. */
+  codename?: string;
+  /** Crew word of the run (`jade-reef`) — from the event's codename, or the
+   *  caller's run_id → run codename lookup for run-level cards. Drives the
+   *  tint stripe + the run link label. */
+  crew?: string;
+  /** Provider / model the agent ran on (agent_started carries them). */
+  provider?: string;
+  model?: string;
   /** Step kind (e.g. `for_each`, `panel`) when the event carries it. */
   stepKind?: string;
   /** Fan-out / panel unit key — WHICH target this event is about. */
@@ -112,7 +123,27 @@ function stepLabel(stepId: string | undefined): string {
  * frames are stamped with arrival time (mirroring the existing Events page).
  * `key` is likewise caller-owned so history↔live dedup stays in one place.
  */
-export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard | null {
+export function cardFromEvent(
+  ev: RunEvent,
+  ts: number,
+  key: string,
+  crewByRun?: ReadonlyMap<string, string>,
+): StreamCard | null {
+  const card = cardFromEventInner(ev, ts, key);
+  if (!card || card.crew || !card.runId || !crewByRun) return card;
+  // Run-level cards (run_started / awaiting / completed …) carry no codename
+  // of their own; the page resolves run_id → run.codename and we take its
+  // crew word so every card of a run shares the tint.
+  const runName = crewByRun.get(card.runId);
+  return runName ? { ...card, crew: parseCodename(runName).crew } : card;
+}
+
+/** Codename + its crew word, spread onto a card when the event carries one. */
+function named(codename: string | undefined): { codename?: string; crew?: string } {
+  return codename ? { codename, crew: parseCodename(codename).crew } : {};
+}
+
+function cardFromEventInner(ev: RunEvent, ts: number, key: string): StreamCard | null {
   if (!isKnownRunEvent(ev)) {
     // Unknown/forward-compat event — still surface it rather than drop it, so
     // a new backend event type is visible instead of silently missing.
@@ -142,7 +173,7 @@ export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard
     case 'step_started':
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: k.agent ? 'Scanning' : 'Step', stepId: k.step_id, agent: k.agent ?? undefined,
-        stepKind: k.kind,
+        stepKind: k.kind, ...named(k.codename),
         // Agent is rendered as its own field; the title is just the step so it
         // isn't repeated ("agent agent · step").
         title: stepLabel(k.step_id),
@@ -173,11 +204,23 @@ export function cardFromEvent(ev: RunEvent, ts: number, key: string): StreamCard
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: 'Skipped', stepId: k.step_id, title: `${stepLabel(k.step_id)} skipped`, detail: k.reason };
     case 'unit_started':
+      // New-era runs always follow a named unit_started with an agent_started
+      // (which carries provider/model too) — render only that one, so a wide
+      // fan-out doesn't double its cards. Legacy (unnamed) units keep theirs.
+      if (k.codename) return null;
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: 'Fan-out', stepId: k.step_id, agent: k.agent ?? undefined,
         unitKey: k.unit_key, transcriptPath: k.transcript_path,
         // Agent + unit render as their own fields; keep the title the step.
         title: stepLabel(k.step_id) };
+    case 'agent_started':
+      return { ...base, form: 'activity', group: 'activity', accent: 'brand',
+        badge: 'Agent', stepId: k.step_id, agent: k.agent,
+        provider: k.provider, model: k.model, ...named(k.codename),
+        transcriptPath: k.transcript_path,
+        // The member label IS the headline: who launched, on what.
+        title: memberLabel(k.codename, k.agent, k.provider, k.model),
+        detail: k.unit_index != null ? `${stepLabel(k.step_id)} · unit ${k.unit_index}` : stepLabel(k.step_id) };
     case 'unit_completed':
       return { ...base, form: 'complete', group: 'activity',
         accent: k.success ? 'brand' : 'error', badge: k.success ? 'Unit done' : 'Unit failed',
@@ -231,5 +274,6 @@ export function cardFromFinding(f: FindingOut): StreamCard {
     filePath: f.file_path ?? undefined,
     fileLine: f.line_range?.[0],
     permalink: f.permalink ?? undefined,
+    ...named(f.codename || undefined),
   };
 }

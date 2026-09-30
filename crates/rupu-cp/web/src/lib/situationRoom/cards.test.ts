@@ -16,6 +16,8 @@ import type {
   PanelRoundEvent,
   UnitStartedEvent,
   UnitCompletedEvent,
+  AgentStartedEvent,
+  RunStartedEvent,
 } from '../api';
 
 describe('cardFromEvent', () => {
@@ -144,5 +146,67 @@ describe('cardFromFinding', () => {
     const c = cardFromFinding({ ...base, severity: 'bogus', file_path: null, line_range: null });
     expect(c.severity).toBe('info');
     expect(c.fileRef).toBeUndefined();
+  });
+});
+
+describe('cardFromEvent — codenames', () => {
+  const agentStarted: AgentStartedEvent = {
+    type: 'agent_started', run_id: 'r1', step_id: 'review', unit_index: 4,
+    codename: 'jade-reef/heron#4', agent: 'sec-reviewer', provider: 'anthropic',
+    model: 'claude-sonnet-4-6', agent_run_id: 'ar1', transcript_path: 't/ar1.jsonl',
+  };
+
+  it('agent_started is one agent-launch card titled with the member label', () => {
+    const c = cardFromEvent(agentStarted, 1000, 'k1')!;
+    expect(c).not.toBeNull();
+    expect(c.title).toBe('heron#4 · sec-reviewer · anthropic/claude-sonnet-4-6');
+    expect(c.codename).toBe('jade-reef/heron#4');
+    expect(c.crew).toBe('jade-reef');
+    expect(c.agent).toBe('sec-reviewer');
+    expect(c.provider).toBe('anthropic');
+    expect(c.model).toBe('claude-sonnet-4-6');
+    expect(c.transcriptPath).toBe('t/ar1.jsonl');
+    expect(c.group).toBe('activity');
+  });
+
+  it('unit_started carrying a codename yields no card (agent_started follows it)', () => {
+    const ev: UnitStartedEvent = { type: 'unit_started', run_id: 'r1', step_id: 'review', index: 4, unit_key: 'crates/db', agent: 'sec-reviewer', codename: 'jade-reef/heron#4', transcript_path: 't/u4.jsonl' };
+    expect(cardFromEvent(ev, 1000, 'k1')).toBeNull();
+  });
+
+  it('legacy unit_started (no codename) keeps its card', () => {
+    const ev: UnitStartedEvent = { type: 'unit_started', run_id: 'r1', step_id: 'review', index: 4, unit_key: 'crates/db', agent: 'sec-reviewer', transcript_path: 't/u4.jsonl' };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c).not.toBeNull();
+    expect(c.codename).toBeUndefined();
+  });
+
+  it('step_started sets codename + crew from the event', () => {
+    const ev: StepStartedEvent = { type: 'step_started', run_id: 'r1', step_id: 'scan', kind: 'linear', agent: 'oracle', codename: 'jade-reef/scout' };
+    const c = cardFromEvent(ev, 1000, 'k1')!;
+    expect(c.codename).toBe('jade-reef/scout');
+    expect(c.crew).toBe('jade-reef');
+  });
+
+  it('run-level cards take their crew from the caller-supplied run lookup', () => {
+    const ev: RunStartedEvent = { type: 'run_started', run_id: 'r1', event_version: 1, workflow_path: 'wf.yaml', started_at: '2026-09-29T00:00:00Z' };
+    expect(cardFromEvent(ev, 1000, 'k1')!.crew).toBeUndefined();
+    const c = cardFromEvent(ev, 1000, 'k1', new Map([['r1', 'jade-reef']]))!;
+    expect(c.crew).toBe('jade-reef');
+    expect(c.codename).toBeUndefined();
+  });
+});
+
+describe('cardFromFinding — codenames', () => {
+  it('carries the declaring agent codename + crew', () => {
+    const f = {
+      codename: 'cobalt-harbor/heron#3', codename_derived: false,
+      id: 'f9', ws_id: 'ws', project: 'p', target_id: 't', scope: null,
+      summary: 's', severity: 'high', evidence: { rationale: '' },
+      declared_by: null, declared_at: '2026-01-01T00:00:00Z',
+    } as FindingOut;
+    const c = cardFromFinding(f);
+    expect(c.codename).toBe('cobalt-harbor/heron#3');
+    expect(c.crew).toBe('cobalt-harbor');
   });
 });

@@ -55,3 +55,17 @@ describe('filterStreamCards', () => {
     expect(filterStreamCards(cards, 'all', 'zzz-nope')).toEqual([]);
   });
 });
+
+describe('filterStreamCards — codenames', () => {
+  const named: StreamCard[] = [
+    card({ key: 'n', title: 'review', codename: 'jade-reef/heron#4', crew: 'jade-reef', provider: 'anthropic', model: 'claude-sonnet-4-6' }),
+    card({ key: 'o', title: 'other' }),
+  ];
+  it('matches a codename leaf word, the crew, and provider/model', () => {
+    expect(filterStreamCards(named, 'all', 'heron').map((c) => c.key)).toEqual(['n']);
+    expect(filterStreamCards(named, 'all', 'jade-reef').map((c) => c.key)).toEqual(['n']);
+    expect(filterStreamCards(named, 'all', 'sonnet').map((c) => c.key)).toEqual(['n']);
+    expect(filterStreamCards(named, 'all', 'anthropic').map((c) => c.key)).toEqual(['n']);
+  });
+});
+

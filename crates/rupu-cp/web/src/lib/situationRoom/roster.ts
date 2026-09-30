@@ -17,6 +17,7 @@ import {
   type ProjectRow,
   type RunEvent,
 } from '../api';
+import { parseCodename } from '../codename';
 
 /** Per-run live state, distilled from the event stream by the page. */
 export interface RunActivity {
@@ -45,7 +46,16 @@ export function deriveActivity(items: { ts: number; event: RunEvent }[]): Map<st
         case 'step_awaiting_approval': state = 'awaiting'; action = `awaiting · ${event.step_id}`; break;
         case 'run_paused': state = 'paused'; action = 'paused'; break;
         case 'step_paused': state = 'paused'; action = `paused · ${event.step_id}`; break;
-        case 'step_started': action = event.agent ? `${event.agent} · ${event.step_id}` : event.step_id; break;
+        case 'step_started':
+          action = event.codename
+            ? `${parseCodename(event.codename).leaf} · ${event.agent ?? event.step_id}`
+            : event.agent ? `${event.agent} · ${event.step_id}` : event.step_id;
+          break;
+        case 'agent_started':
+          action = event.codename
+            ? `${parseCodename(event.codename).leaf} · ${event.agent}`
+            : `${event.agent} · ${event.step_id}`;
+          break;
         case 'step_working': action = event.note?.trim() || event.step_id; break;
         case 'step_completed': action = event.step_id; break;
         case 'step_resumed': action = event.step_id; break;

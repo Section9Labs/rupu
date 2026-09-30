@@ -94,6 +94,9 @@ export default function Events() {
   // run_id → workflow_name, learned from the same lazy getRun call as the
   // workspace. Lets each event surface which workflow it belongs to.
   const [runToWorkflow, setRunToWorkflow] = useState<Map<string, string>>(new Map());
+  // run_id → run codename (server-minted, e.g. `jade-reef`), from the same
+  // getRun — gives run-level cards (started/awaiting/completed) their crew.
+  const [runToCodename, setRunToCodename] = useState<Map<string, string>>(new Map());
   // Authoritative *terminal* run.json statuses (completed/failed/cancelled/
   // rejected), learned via the same lazy getRun calls — reconciles runs whose
   // event log ended mid-step so they don't spin forever.
@@ -208,6 +211,10 @@ export default function Events() {
         if (typeof wf === 'string' && wf && !wf.startsWith('agent:')) {
           setRunToWorkflow((prev) => new Map(prev).set(runId, wf));
         }
+        const codename = res.run.codename;
+        if (typeof codename === 'string' && codename) {
+          setRunToCodename((prev) => new Map(prev).set(runId, codename));
+        }
         const status = res.run.status;
         if (typeof status === 'string' && TERMINAL_STATUSES.has(status)) {
           setRunStatus((prev) => new Map(prev).set(runId, status));
@@ -263,11 +270,11 @@ export default function Events() {
   const eventCards = useMemo(() => {
     const out: StreamCard[] = [];
     for (const { key, ts, event } of items) {
-      const c = cardFromEvent(event, ts, key);
+      const c = cardFromEvent(event, ts, key, runToCodename);
       if (c) out.push(c);
     }
     return out;
-  }, [items]);
+  }, [items, runToCodename]);
 
   // The stream shows the most-recent findings only (getFindings can return
   // hundreds across all projects); the roster + pulse still count the full set.
