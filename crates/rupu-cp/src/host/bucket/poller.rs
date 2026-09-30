@@ -105,6 +105,7 @@ pub async fn poll_bucket_run(
 /// - `step_results*.jsonl`      → [`ArtifactFile::StepResults`]
 /// - `unit_checkpoints*.jsonl`  → [`ArtifactFile::UnitCheckpoints`]
 /// - `usage*.jsonl`             → [`ArtifactFile::Usage`]
+/// - `coverage*.jsonl`          → [`ArtifactFile::Coverage`]
 /// - `run.json`                 → [`ArtifactFile::RunJson`]
 /// - anything else              → `None` (caller skips + marks consumed)
 fn classify_key(key: &str) -> Option<ArtifactFile> {
@@ -123,6 +124,9 @@ fn classify_key(key: &str) -> Option<ArtifactFile> {
         }
         if key.starts_with("usage") {
             return Some(ArtifactFile::Usage);
+        }
+        if key.starts_with("coverage") {
+            return Some(ArtifactFile::Coverage);
         }
     }
     None
@@ -149,6 +153,10 @@ mod tests {
         assert!(matches!(
             classify_key("usage.0001.jsonl"),
             Some(ArtifactFile::Usage)
+        ));
+        assert!(matches!(
+            classify_key("coverage.0001.jsonl"),
+            Some(ArtifactFile::Coverage)
         ));
         assert!(matches!(classify_key("run.json"), Some(ArtifactFile::RunJson)));
         assert!(classify_key("finished").is_none());

@@ -1169,6 +1169,17 @@ async fn ws_valid_hello_receives_welcome_and_is_online() {
         ),
         "Welcome must advertise usage_ledger, got {response:?}"
     );
+    // The Welcome advertises what this CP can parse, so a node knows it may
+    // send `ArtifactFile::Coverage` frames.
+    match response {
+        Frame::Welcome { capabilities } => assert!(
+            capabilities
+                .iter()
+                .any(|c| c == rupu_cp::node::protocol::CAP_MIRROR_COVERAGE),
+            "Welcome must advertise mirror.coverage, got {capabilities:?}"
+        ),
+        other => panic!("expected Welcome, got {other:?}"),
+    }
 
     // Node must be online in the registry.
     // Give the server a moment to register before we check.

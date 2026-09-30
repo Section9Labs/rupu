@@ -139,6 +139,10 @@ struct FileOffsets {
     /// `usage.jsonl` — the run's usage ledger. Only ever advanced on a
     /// tunnel connection whose CP advertised [`CAP_USAGE_LEDGER`].
     usage: u64,
+    /// `coverage.jsonl` — the run's coverage stream. Only ever advanced on a
+    /// tunnel connection whose CP advertised `mirror.coverage` (the bucket
+    /// worker always drains it).
+    coverage: u64,
 }
 
 /// Per-run state for the bucket pull agent.  Extends [`FileOffsets`] with
@@ -151,6 +155,7 @@ struct BucketRunState {
     step_results_seq: u64,
     unit_checkpoints_seq: u64,
     usage_seq: u64,
+    coverage_seq: u64,
     /// Highest control seq we've already applied (`None` = none applied yet).
     last_ctrl_seq: Option<u64>,
 }
@@ -445,9 +450,10 @@ async fn connect_and_run(
     // CP can't parse the `usage` artifact kind and would log-and-drop every
     // line. (Bucket hosts need no gate — an older poller just skips the key.)
     let usage_ok = welcome_advertises(&welcome_frame, CAP_USAGE_LEDGER);
-    // Only a CP that advertised it can parse `ArtifactFile::Coverage` frames.
-    // Task 8 wires this into the artifact pump and drops the underscore.
-    let _mirror_coverage =
+    // Only a CP that advertised it can parse `ArtifactFile::Coverage` frames;
+    // an older CP would reject the unknown variant, so the pump never sends
+    // one unless this is set.
+    let mirror_coverage =
         welcome_advertises(&welcome_frame, rupu_cp::node::protocol::CAP_MIRROR_COVERAGE);
     eprintln!("connected ✓ (authenticated as {node_id})");
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
@@ -501,6 +507,12 @@ async fn connect_and_run(
             for line in drain_usage_ledger(&run_dir, &mut state.offsets, usage_ok) {
                 send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
             }
+            // coverage.jsonl — only a CP that advertised it parses these frames.
+            if mirror_coverage {
+                for line in drain_coverage(&run_dir, &mut state.offsets.coverage) {
+                    send_artifact(&mut sink, rid, ArtifactFile::Coverage, line).await;
+                }
+            }
             // run.json — check for terminal status.
             if let Some((status, body)) = read_terminal_status(&run_dir.join("run.json")) {
                 // A ledger row can land between the drain above and this
@@ -514,6 +526,13 @@ async fn connect_and_run(
                 // never re-sent.
                 for line in drain_usage_ledger(&run_dir, &mut state.offsets, usage_ok) {
                     send_artifact(&mut sink, rid, ArtifactFile::Usage, line).await;
+                }
+                // Final coverage drain: the run may have written its last lines
+                // after the drain above and before run.json turned terminal.
+                if mirror_coverage {
+                    for line in drain_coverage(&run_dir, &mut state.offsets.coverage) {
+                        send_artifact(&mut sink, rid, ArtifactFile::Coverage, line).await;
+                    }
                 }
                 send_artifact(&mut sink, rid, ArtifactFile::RunJson, body).await;
                 let frame = Frame::RunFinished {
@@ -547,6 +566,7 @@ async fn connect_and_run(
                                     step_results: 0,
                                     unit_checkpoints: 0,
                                     usage: 0,
+                                    coverage: 0,
                                 },
                             },
                         );
@@ -579,6 +599,14 @@ async fn connect_and_run(
                     // here and note this limitation.
                     if let Err(e) = state.child.start_kill() {
                         warn!(run_id = %run_id, error = %e, "node: kill child failed");
+                    }
+                    // Last chance to ship coverage the run wrote since the
+                    // previous drain — a cancelled run gets no terminal block.
+                    if mirror_coverage {
+                        let run_dir = runs_root.join(&run_id);
+                        for line in drain_coverage(&run_dir, &mut state.offsets.coverage) {
+                            send_artifact(&mut sink, &run_id, ArtifactFile::Coverage, line).await;
+                        }
                     }
                     let cancelled_frame = Frame::RunFinished {
                         run_id: run_id.clone(),
@@ -903,6 +931,11 @@ fn read_terminal_status(run_json: &Path) -> Option<(String, String)> {
 // Bucket pull agent helpers (unit-testable)
 // ---------------------------------------------------------------------------
 
+/// New lines of a run's coverage stream (`runs/<id>/coverage.jsonl`).
+fn drain_coverage(run_dir: &Path, offset: &mut u64) -> Vec<String> {
+    drain_new_lines(&run_dir.join(rupu_coverage::STREAM_FILE), offset)
+}
+
 /// Build the result object key for a drained JSONL file chunk.
 ///
 /// Format: `"<kind>.<seq:04>.jsonl"` — e.g. `"events.0001.jsonl"`.
@@ -910,6 +943,28 @@ fn read_terminal_status(run_json: &Path) -> Option<(String, String)> {
 /// 9 999 chunks per kind per run.
 pub(crate) fn result_key(kind: &str, seq: u64) -> String {
     format!("{kind}.{seq:04}.jsonl")
+}
+
+/// Upload `lines` as one `<kind>.<seq>.jsonl` result object, advancing `seq`
+/// only when the upload landed.
+async fn put_lines(
+    bucket: &ObjectStoreBucket,
+    rid: &str,
+    kind: &str,
+    lines: Vec<String>,
+    seq: &mut u64,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let body = lines.join("\n") + "\n";
+    let key = result_key(kind, *seq);
+    match bucket.put_result(rid, &key, body.as_bytes()).await {
+        Ok(()) => *seq += 1,
+        Err(e) => {
+            warn!(run_id = %rid, key = %key, error = %e, "node pull: put {kind} result failed")
+        }
+    }
 }
 
 /// Return the next control sequence number to assign given an existing list.
@@ -1038,11 +1093,13 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                                 step_results: 0,
                                 unit_checkpoints: 0,
                                 usage: 0,
+                                coverage: 0,
                             },
                             events_seq: 0,
                             step_results_seq: 0,
                             unit_checkpoints_seq: 0,
                             usage_seq: 0,
+                            coverage_seq: 0,
                             last_ctrl_seq: None,
                         },
                     );
@@ -1115,6 +1172,9 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                 &mut state.usage_seq,
             )
             .await;
+            // coverage.jsonl — an older CP's poller skips unknown keys.
+            let lines = drain_coverage(&run_dir, &mut state.offsets.coverage);
+            put_lines(&bucket, rid, "coverage", lines, &mut state.coverage_seq).await;
 
             // Upload run.json (always — reflects current in-progress status).
             let run_json_path = run_dir.join("run.json");
@@ -1214,6 +1274,10 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             // remove from active.
             if let Some((status, _body)) = read_terminal_status(&run_json_path) {
                 info!(run_id = %rid, status = %status, "node pull: run finished");
+                // Final coverage drain: the run may have written its last lines
+                // after the drain above and before run.json turned terminal.
+                let lines = drain_coverage(&run_dir, &mut state.offsets.coverage);
+                put_lines(&bucket, rid, "coverage", lines, &mut state.coverage_seq).await;
                 finish_bucket_run(
                     &bucket,
                     rid,
@@ -1369,6 +1433,7 @@ mod tests {
             step_results: 0,
             unit_checkpoints: 0,
             usage: 0,
+            coverage: 0,
         }
     }
 
@@ -1943,6 +2008,56 @@ mod tests {
         if let Some(ip) = rupu_cp::net::detect_routable_ip() {
             assert!(!ip.is_loopback(), "detected loopback: {ip}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // drain_coverage: the run's coverage stream, tailed incrementally
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn drain_coverage_reads_the_run_stream_incrementally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path();
+        std::fs::write(run_dir.join(rupu_coverage::STREAM_FILE), "a\nb\n").unwrap();
+        let mut off = 0u64;
+        assert_eq!(drain_coverage(run_dir, &mut off), vec!["a", "b"]);
+        std::fs::write(run_dir.join(rupu_coverage::STREAM_FILE), "a\nb\nc\n").unwrap();
+        assert_eq!(drain_coverage(run_dir, &mut off), vec!["c"]);
+    }
+
+    #[tokio::test]
+    async fn put_lines_uploads_one_numbered_object_and_advances_seq() {
+        let bucket = ObjectStoreBucket::from_url("memory:///", None).unwrap();
+        let mut seq = 0u64;
+
+        // Nothing to upload: no object, seq unchanged.
+        put_lines(&bucket, "run_1", "coverage", vec![], &mut seq).await;
+        assert_eq!(seq, 0);
+        assert!(bucket.list_results("run_1").await.unwrap().is_empty());
+
+        put_lines(
+            &bucket,
+            "run_1",
+            "coverage",
+            vec!["a".into(), "b".into()],
+            &mut seq,
+        )
+        .await;
+        put_lines(&bucket, "run_1", "coverage", vec!["c".into()], &mut seq).await;
+        assert_eq!(seq, 2);
+
+        let results = bucket.list_results("run_1").await.unwrap();
+        let got: Vec<(&str, &str)> = results
+            .iter()
+            .map(|(k, v)| (k.as_str(), std::str::from_utf8(v).unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("coverage.0000.jsonl", "a\nb\n"),
+                ("coverage.0001.jsonl", "c\n")
+            ]
+        );
     }
 
     // ------------------------------------------------------------------
