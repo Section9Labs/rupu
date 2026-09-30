@@ -528,11 +528,10 @@ fn summary_blocks(f: &ExportFinding, note: &str) -> Vec<Block> {
     b
 }
 
-/// A whole-project report: title, a summary of what it covers, an index, then
-/// every finding on its own page.
-pub fn project_blocks(meta: &ReportMeta, findings: &[ExportFinding]) -> Vec<Block> {
-    let numbers = number::number_map(findings);
-
+/// The head of a project report: title, a summary of what it covers, and the
+/// index table. `project_blocks` continues with the per-finding pages; the
+/// split archive's `index.md` is exactly this and nothing more.
+pub fn index_blocks(meta: &ReportMeta, findings: &[ExportFinding]) -> Vec<Block> {
     let counts: Vec<String> = [
         Severity::Critical,
         Severity::High,
@@ -555,7 +554,7 @@ pub fn project_blocks(meta: &ReportMeta, findings: &[ExportFinding]) -> Vec<Bloc
         format!("{} — {}", findings.len(), counts.join(", "))
     };
 
-    let mut b = vec![
+    vec![
         Block::Title(meta.title.clone()),
         Block::Fields(vec![
             kv("Generated", rfc3339(meta.generated_at)),
@@ -588,7 +587,14 @@ pub fn project_blocks(meta: &ReportMeta, findings: &[ExportFinding]) -> Vec<Bloc
                 })
                 .collect(),
         },
-    ];
+    ]
+}
+
+/// A whole-project report: title, a summary of what it covers, an index, then
+/// every finding on its own page.
+pub fn project_blocks(meta: &ReportMeta, findings: &[ExportFinding]) -> Vec<Block> {
+    let numbers = number::number_map(findings);
+    let mut b = index_blocks(meta, findings);
     for f in findings {
         b.push(Block::PageBreak);
         b.extend(finding_blocks(f, &numbers));

@@ -15,5 +15,10 @@ serde_json.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 pulldown-cmark.workspace = true
+typst.workspace = true
+typst-pdf.workspace = true
+typst-layout.workspace = true
+typst-assets.workspace = true
+zip.workspace = true
 
 [dev-dependencies]

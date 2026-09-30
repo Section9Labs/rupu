@@ -86,6 +86,15 @@ flate2 = "1"
 # `html` feature gives `html::push_html`; `getopts` only serves the CLI bin.
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 
+# PDF export for finding reports (rupu-findings-report): Typst compiled
+# in-process against the fonts bundled by typst-assets — no external binary,
+# no font discovery. `zip` backs the per-finding split archive.
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-layout = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
 # Crypto (lifted)
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
 base64 = "0.22"

@@ -111,6 +111,15 @@ pub fn md_to_html(md: &str) -> String {
     out
 }
 
+/// Nesting the Typst converter will actually emit. Typst refuses a document
+/// whose show rules or parse tree nest too deep ("maximum show rule depth
+/// exceeded" at roughly 4 block quotes per 16 levels of `>`, or ~100 nested
+/// emphasis runs), so a pathological `> > > …` or `*_*_…` would make the
+/// whole report fail to compile. Past these budgets the wrapper is dropped
+/// and its text is kept: the words survive, only the extra styling is lost.
+const MAX_QUOTE_DEPTH: usize = 4;
+const MAX_INLINE_DEPTH: usize = 24;
+
 /// A Typst string literal (with quotes) for arbitrary text.
 pub fn typst_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -135,6 +144,13 @@ pub fn md_to_typst(md: &str) -> String {
     let mut out = String::new();
     let mut code: Option<(String, String)> = None; // (lang, text) while inside a fenced block
     let mut lists: Vec<bool> = Vec::new(); // true = ordered
+
+    // One entry per open quote / emphasis-like span: whether its wrapper was
+    // emitted (false once the depth budget is spent), so the matching end
+    // event closes exactly what its start opened.
+    let mut quotes: Vec<bool> = Vec::new();
+    let mut inlines: Vec<bool> = Vec::new();
+    let mut open_inlines = 0usize;
     for e in parser(md) {
         if let Some((_, buf)) = code.as_mut() {
             match e {
@@ -192,12 +208,36 @@ pub fn md_to_typst(md: &str) -> String {
                 "\n- "
             }),
             Event::End(TagEnd::Item) => {}
-            Event::Start(Tag::Emphasis) => out.push_str("#emph["),
-            Event::Start(Tag::Strong) => out.push_str("#strong["),
-            Event::Start(Tag::Strikethrough) => out.push_str("#strike["),
-            Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => out.push(']'),
-            Event::Start(Tag::BlockQuote(_)) => out.push_str("#quote(block: true)["),
-            Event::End(TagEnd::BlockQuote(_)) => out.push_str("]\n"),
+            Event::Start(tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough)) => {
+                let emit = open_inlines < MAX_INLINE_DEPTH;
+                if emit {
+                    open_inlines += 1;
+                    out.push_str(match tag {
+                        Tag::Emphasis => "#emph[",
+                        Tag::Strong => "#strong[",
+                        _ => "#strike[",
+                    });
+                }
+                inlines.push(emit);
+            }
+            Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
+                if inlines.pop().unwrap_or(false) {
+                    open_inlines -= 1;
+                    out.push(']');
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                let emit = quotes.iter().filter(|e| **e).count() < MAX_QUOTE_DEPTH;
+                if emit {
+                    out.push_str("#quote(block: true)[");
+                }
+                quotes.push(emit);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                if quotes.pop().unwrap_or(false) {
+                    out.push_str("]\n");
+                }
+            }
             Event::Start(Tag::Link { dest_url, .. }) => match typst_link_dest(&dest_url) {
                 Some(dest) => out.push_str(&format!("#link({})[", typst_str(&dest))),
                 // `#[` (not a bare `[`): after an expression such as `#"see "`
@@ -436,5 +476,23 @@ mod tests {
         let t = md_to_typst("- one `x`\n- two");
         assert!(t.contains("\n- #\"one \"#raw(\"x\")"), "{t}");
         assert!(t.contains("\n- #\"two\""), "{t}");
+    }
+
+    #[test]
+    fn typst_caps_quote_and_emphasis_nesting_but_keeps_the_text() {
+        let t = md_to_typst(&format!("{} deepquote", ">".repeat(100)));
+        assert_eq!(t.matches("#quote(").count(), MAX_QUOTE_DEPTH, "{t}");
+        assert_eq!(t.matches(']').count(), MAX_QUOTE_DEPTH, "{t}");
+        assert!(t.contains("deepquote"), "{t}");
+
+        let em = format!("{}deepem{}", "*a _b ".repeat(100), " b_ a*".repeat(100));
+        let t = md_to_typst(&em);
+        assert!(
+            t.matches("#emph[").count() <= MAX_INLINE_DEPTH,
+            "{}",
+            t.matches("#emph[").count()
+        );
+        assert_eq!(t.matches('[').count(), t.matches(']').count(), "{t}");
+        assert!(t.contains("deepem"), "{t}");
     }
 }
