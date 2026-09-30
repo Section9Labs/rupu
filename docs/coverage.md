@@ -339,31 +339,34 @@ project report is named after its title (default "Findings report").
 
 **Formats.**
 
-- **Markdown** (`md`): plain text in the standard section order, opening with
-  the standard's `Filename:` line.
+- **Markdown** (`md`): plain text, with the sections in the same order as the
+  other formats. Every finding's document opens with a `Filename:` line giving
+  the suggested PDF file name (`<NUMBER> - <Short Title>.pdf`), in every export
+  format, not only PDF.
 - **HTML** (`html`): one self-contained file with inline CSS. It loads nothing
   from the network and runs no script; a strict Content-Security-Policy
   (`default-src 'none'`, no `<base>`, no form posts) and a no-referrer policy are
   embedded in the document as defence in depth. Report text is escaped or passed
   through a Markdown converter that neutralises raw HTML and script-like URLs,
   and images are rendered as their alt text rather than loaded.
-- **PDF** (`pdf`): generated in process with Typst, with no headless browser and
-  no external tools. Fonts are bundled (Libertinus Serif, New Computer Modern,
-  DejaVu Sans Mono), so output does not depend on the machine; the flip side is
-  that the bundle has no CJK or emoji glyphs, so those characters do not render
-  in a PDF (Markdown and HTML keep them). The Typst world can read no files, so a report cannot pull in a local
-  file or image. PDF export is behind the `pdf` cargo feature, on by default
-  and forwarded by `rupu-cp` and `rupu-cli`; it adds roughly 45-55 MB to a
-  release binary. A build without it (`--no-default-features`) still exports
-  Markdown and HTML, and asking for PDF fails with "compiled without PDF
-  support" (a non-zero exit from the CLI, `501` from the control plane).
+- **PDF** (`pdf`): generated in process with Typst, with no headless browser
+  and no external tools. Fonts are bundled (Libertinus Serif, New Computer
+  Modern, DejaVu Sans Mono), so output does not depend on the machine; the flip
+  side is that the bundle has no CJK or emoji glyphs, so those characters do not
+  render in a PDF (Markdown and HTML keep them). The PDF renderer cannot read
+  files from disk, so a report cannot pull in a local file or image. PDF export
+  is behind the `pdf` cargo feature, on by default and forwarded by `rupu-cp`
+  and `rupu-cli`; it adds roughly 45-55 MB to a release binary. A build without
+  it (`--no-default-features`) still exports Markdown and HTML, and asking for
+  PDF fails with "compiled without PDF support" (a non-zero exit from the CLI,
+  `501` from the control plane).
 
 **Project reports.** A project report has a title, a summary of what it covers,
-an index (number, severity, title, project, finding id, profile), then each finding as its own section
-(its own page in the PDF). With **split**, the export is a zip holding
-`index.md` (always Markdown) and one file per finding in the chosen format.
-Summary-profile findings are left out unless asked for; naming one with `--id`
-counts as asking.
+an index (number, severity, title, project, finding id, profile), then each
+finding as its own section (its own page in the PDF). With **split**, the export
+is a zip holding `index.md` (always Markdown) and one file per finding in the
+chosen format. Summary-profile findings are left out unless asked for; naming
+one with `--id` counts as asking.
 
 #### `rupu findings export`
 
@@ -377,15 +380,20 @@ rupu findings export [--id <fnd_…>]… [--project <ws_id|path>] [--run <run_id
 The document format is `--to` (default `md`), not `--format`: `--format` is
 rupu's global output flag (`table`, `json`, `csv`) and has nothing to shape here.
 Filters combine: a finding must pass all of them. `--severity` keeps that
-severity and worse. `--run` keeps findings declared by that run and its sub-runs.
-`--project` takes a workspace id or the path of a checkout.
+severity and worse. `--run` keeps findings declared by that run and its
+sub-runs. `--project` must be a registered project: a workspace id, or the path
+of a registered project's checkout. Anything else is an error ("no project
+matches ...").
 
-A single `--id` with no other selector writes that finding as a stand-alone
-document. Anything else (several `--id`s, or any filter, `--split`, or `--title`)
-writes a project report over the selection. `-o` is a file path, or an existing
-directory to receive the generated file name. A write failure reports the OS
-cause, and an `-o` extension that does not match the format (a zip written to
-`report.pdf`, say) produces a warning but is still written.
+Exactly one `--id` on its own writes that finding as a stand-alone document.
+Adding any of `--project`, `--run`, `--severity`, `--owner`, `--cwe`, `--split`
+or `--title` turns it into a project report over the selection, and so do
+several `--id`s or no `--id` at all. `--include-summaries` does not: a single
+`--id` names its finding, so it is included whatever its profile, and the flag
+changes nothing. `-o` is a file path, or an existing directory to receive the
+generated file name. A write failure reports the OS cause, and an `-o`
+extension that does not match the format (a zip written to `report.pdf`, say)
+produces a warning but is still written.
 
 ```bash
 # One finding as a PDF, named SEC-003 - <title>.pdf, into the existing ./reports
@@ -411,9 +419,12 @@ title. The download is named by the server.
 
 - `GET /api/findings/:id/export?format=md|html|pdf` returns one finding.
 - `POST /api/findings/export` takes `{format, title?, ids?, ws_id?, run_id?,
-  min_severity?, owner?, cwe?, include_summaries?, split?}`; unknown fields are
-  rejected (a misspelt filter must not widen the report), and a selection that
-  matches nothing is `404`.
+  min_severity?, owner?, cwe?, include_summaries?, split?}`. Unknown fields are
+  rejected with `422` (a misspelt filter must not widen the report), and the
+  body of that rejection is plain text rather than the API's usual JSON error.
+  A missing or unknown `format`, an unknown `min_severity`, or a `title` over
+  200 characters is `400`; a selection that matches nothing is `404`; PDF from
+  a build without the `pdf` feature is `501`.
 
 Both are attachments with `Content-Disposition: attachment` and
 `X-Content-Type-Options: nosniff`; an HTML response also carries

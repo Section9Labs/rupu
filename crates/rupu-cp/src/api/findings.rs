@@ -3174,7 +3174,7 @@ mod tests {
             serde_json::json!({"format": "md", "severity": "critical"}),
         )
         .await;
-        assert!(status.is_client_error(), "{status}");
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

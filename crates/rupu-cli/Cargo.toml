@@ -16,7 +16,7 @@ path = "src/main.rs"
 [features]
 # In-process PDF for `rupu findings export` (embeds Typst and its fonts,
 # roughly +50 MB in a release binary). Without it every other export format
-# still works and `--format pdf` exits with a clear message.
+# still works and `--to pdf` exits with a clear message.
 default = ["pdf"]
 pdf = ["rupu-findings-report/pdf", "rupu-cp/pdf"]
 
