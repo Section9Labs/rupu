@@ -175,6 +175,9 @@ pub struct DefaultStepFactory {
     /// run`/`rupu session` do for the same agent (ISSUES.md I-18 — this
     /// used to hardcode an empty allowlist here regardless of config).
     pub bash_env_allowlist: Vec<String>,
+    /// Artifact store + limits for recording findings; the per-step profile
+    /// is resolved in `build_opts_for_step` and set on a clone of this.
+    pub findings_base: rupu_coverage::FindingWriteOptions,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -282,6 +285,15 @@ impl StepFactory for DefaultStepFactory {
         .await
         .map_err(|e| e.to_string());
         let (spec, load_err) = resolve_step_agent_spec(load, agent_name, &rendered_prompt);
+
+        let findings = rupu_coverage::FindingWriteOptions {
+            profile: rupu_coverage::FindingProfile::resolve(
+                step.findings_profile,
+                self.workflow.defaults.findings_profile,
+                spec.findings_profile,
+            ),
+            ..self.findings_base.clone()
+        };
 
         // A missing or unparseable agent file is a hard error: fail loudly via
         // the error-stub provider instead of silently running on the default
@@ -418,7 +430,7 @@ impl StepFactory for DefaultStepFactory {
                 Arc::new(BypassDecider) as Arc<dyn PermissionDecider>
             },
             tool_context: ToolContext {
-                findings: None,
+                findings: Some(findings),
                 workspace_path,
                 bash_env_allowlist: self.bash_env_allowlist.clone(),
                 bash_timeout_secs: self.bash_timeout_secs,
@@ -1213,6 +1225,7 @@ steps:
             default_model: None,
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
+            findings_base: rupu_coverage::FindingWriteOptions::default(),
         }
     }
 
@@ -1276,6 +1289,111 @@ steps:
             Some(vec!["issues.list".to_string(), "issues.create".to_string()]),
             "actions: [] must leave the agent's full grant untouched"
         );
+    }
+
+    const WF_FINDINGS: &str = r#"
+name: findings-wf
+defaults:
+  findings_profile: full
+steps:
+  - id: overridden
+    agent: fp
+    prompt: p
+    findings_profile: summary
+  - id: inherits
+    agent: fp
+    prompt: p
+"#;
+
+    const WF_NO_DEFAULT: &str = r#"
+name: findings-wf-2
+steps:
+  - id: agent_decides
+    agent: fp
+    prompt: p
+"#;
+
+    fn write_summary_agent(global: &std::path::Path) {
+        let agents_dir = global.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("fp.md"),
+            "---\nname: fp\ntools: [report_finding]\nfindingsProfile: summary\n---\nAssess.\n",
+        )
+        .unwrap();
+    }
+
+    async fn profile_for(
+        wf: &str,
+        step: &str,
+        global: &std::path::Path,
+    ) -> rupu_coverage::FindingProfile {
+        let mut f = factory(global.to_path_buf());
+        f.workflow = Workflow::parse(wf).expect("workflow must parse");
+        let opts = f
+            .build_opts_for_step(
+                step,
+                "fp",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                global.to_path_buf(),
+                global.join(format!("{step}.jsonl")),
+                None,
+            )
+            .await;
+        opts.tool_context
+            .findings
+            .expect("step factory must always set findings options")
+            .profile
+    }
+
+    #[tokio::test]
+    async fn findings_profile_resolves_step_then_defaults_then_agent() {
+        use rupu_coverage::FindingProfile::{Full, Summary};
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_summary_agent(tmp.path());
+
+        // Step override beats the workflow default.
+        assert_eq!(
+            profile_for(WF_FINDINGS, "overridden", tmp.path()).await,
+            Summary
+        );
+        // Workflow default beats the agent's `findingsProfile: summary`.
+        assert_eq!(profile_for(WF_FINDINGS, "inherits", tmp.path()).await, Full);
+        // With neither, the agent's frontmatter decides.
+        assert_eq!(
+            profile_for(WF_NO_DEFAULT, "agent_decides", tmp.path()).await,
+            Summary
+        );
+    }
+
+    #[tokio::test]
+    async fn findings_base_limits_reach_the_step() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_summary_agent(tmp.path());
+        let mut f = factory(tmp.path().to_path_buf());
+        f.workflow = Workflow::parse(WF_NO_DEFAULT).unwrap();
+        f.findings_base = rupu_coverage::FindingWriteOptions {
+            artifact_root: Some(tmp.path().join("store")),
+            artifact_max_bytes: 7,
+            ..Default::default()
+        };
+        let opts = f
+            .build_opts_for_step(
+                "agent_decides",
+                "fp",
+                "p".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("t.jsonl"),
+                None,
+            )
+            .await;
+        let fo = opts.tool_context.findings.unwrap();
+        assert_eq!(fo.artifact_max_bytes, 7);
+        assert_eq!(fo.artifact_root, Some(tmp.path().join("store")));
     }
 
     #[tokio::test]
@@ -1457,6 +1575,7 @@ steps:
             default_model: None,
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
+            findings_base: rupu_coverage::FindingWriteOptions::default(),
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
 
@@ -1511,6 +1630,7 @@ steps:
             default_model: None,
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
+            findings_base: rupu_coverage::FindingWriteOptions::default(),
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
 
@@ -1589,6 +1709,7 @@ steps:
             default_model: None,
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
+            findings_base: rupu_coverage::FindingWriteOptions::default(),
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
 
@@ -1788,6 +1909,7 @@ steps:
             default_model: None,
             bash_timeout_secs: 120,
             bash_env_allowlist: Vec::new(),
+            findings_base: rupu_coverage::FindingWriteOptions::default(),
         };
         // The account `acct-x` is declared as kind `openai` — a builtin
         // vendor, but a name the factory's dispatch `match` would never

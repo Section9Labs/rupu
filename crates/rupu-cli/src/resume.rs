@@ -309,6 +309,7 @@ async fn rebuild_opts_from_disk(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
+        crate::findings_opts::base_options(&global, &cfg.findings),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(
@@ -320,7 +321,13 @@ async fn rebuild_opts_from_disk(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
-            options: rupu_coverage::FindingWriteOptions::default(),
+            options: crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
+                rupu_coverage::FindingProfile::resolve(
+                    None,
+                    workflow.defaults.findings_profile,
+                    None,
+                ),
+            ),
         }),
     );
     let factory = Arc::new(DefaultStepFactory {
@@ -339,6 +346,7 @@ async fn rebuild_opts_from_disk(
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
+        findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
     });
 
     let opts = OrchestratorRunOpts {

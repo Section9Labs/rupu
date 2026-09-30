@@ -198,6 +198,8 @@ pub enum WorkflowParseError {
     ActionsOnActionStep { step: String },
     #[error("step `{step}`: a non-empty `actions:` is not supported on a remote step (`host:`/`distribute:`) — the roster never reaches the remote dispatch payload, so it would be silently ignored; remove `actions:` or clear it to `[]`")]
     ActionsUnsupportedOnRemoteStep { step: String },
+    #[error("step `{step}`: `findings_profile` is not supported on an `action:` step; set `defaults.findings_profile` instead")]
+    FindingsProfileOnActionStep { step: String },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -855,6 +857,11 @@ pub struct WorkflowDefaults {
     /// `workspace:` overrides this. Absent ⇒ `None` (self-contained).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMode>,
+    /// Findings contract for every step unless a step overrides it:
+    /// `full` (complete report) or `summary`. Absent ⇒ the agent's
+    /// `findingsProfile`, else `full`. Action steps always use this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
 }
 
 /// Whether a step's file workspace is synced to the remote host it runs on.
@@ -1114,6 +1121,10 @@ pub struct Step {
     /// on a remote step (`host:` or `distribute:`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMode>,
+    /// Per-step findings contract override (step → workflow defaults →
+    /// agent `findingsProfile` → `full`). Not allowed on an `action:` step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
     /// Explicit successor edge(s). Empty in a legacy (edge-free) workflow,
     /// where flow follows list order. Non-empty makes this an explicit graph.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1833,6 +1844,12 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         && step.distribute.is_none()
     {
         return Err(WorkflowParseError::WorkspaceSyncOnLocalStep {
+            step: step.id.clone(),
+        });
+    }
+
+    if step.action.is_some() && step.findings_profile.is_some() {
+        return Err(WorkflowParseError::FindingsProfileOnActionStep {
             step: step.id.clone(),
         });
     }
@@ -3051,6 +3068,34 @@ steps:
     fn empty_actions_on_an_action_step_is_still_accepted() {
         let raw = "name: w\nsteps:\n  - id: s1\n    action: issues.list\n    with: { project: \"o/r\" }\n    actions: []\n";
         Workflow::parse(raw).expect("empty actions on an action step must stay legal (compat)");
+    }
+
+    #[test]
+    fn parses_findings_profile_on_defaults_and_step() {
+        let wf = Workflow::parse(
+            "name: w\ndefaults:\n  findings_profile: summary\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    findings_profile: full\n",
+        )
+        .unwrap();
+        assert_eq!(
+            wf.defaults.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+        assert_eq!(
+            wf.steps[0].findings_profile,
+            Some(rupu_coverage::FindingProfile::Full)
+        );
+    }
+
+    #[test]
+    fn findings_profile_on_an_action_step_is_rejected() {
+        let err = Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    action: findings.record\n    with: { scope: repo }\n    findings_profile: summary\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::FindingsProfileOnActionStep { .. }),
+            "{err}"
+        );
     }
 
     // ── §3b-bis: remote (host:/distribute:) steps fail closed ────────────────

@@ -784,6 +784,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // through — bare `rupu run` uses the `LineStreamPrinter`, which
         // renders dispatch children post-hoc from the parent transcript's
         // tool_call/tool_result entries rather than tailing `events.jsonl`.
+        let findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
         let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
             global.clone(),
             project_root.clone(),
@@ -799,11 +800,18 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             provider_factory::openai_compatible_map(&cfg.providers),
             provider_factory::provider_tuning_map(&cfg.providers),
             provider_factory::resolve_kind_map(&cfg.providers),
+            findings_base.clone(),
         );
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
         let tool_context = ToolContext {
-            findings: None,
+            findings: Some(
+                findings_base.with_profile(rupu_coverage::FindingProfile::resolve(
+                    None,
+                    None,
+                    spec.findings_profile,
+                )),
+            ),
             workspace_path: workspace_path.clone(),
             bash_env_allowlist: bash_allowlist,
             bash_timeout_secs: bash_timeout,

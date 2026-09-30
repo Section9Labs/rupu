@@ -72,6 +72,10 @@ pub struct CliAgentDispatcher {
     /// sub-agent's provider dispatches by name only, same as before this
     /// field existed.
     kinds: std::collections::HashMap<String, String>,
+    /// Findings artifact store + `[findings]` limits handed to every
+    /// dispatched child's `ToolContext`; the child's own resolved profile
+    /// (`spec.findings_profile`, else `full`) is set on a clone per dispatch.
+    findings_base: rupu_coverage::FindingWriteOptions,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -106,6 +110,7 @@ impl CliAgentDispatcher {
         >,
         provider_tuning: std::collections::HashMap<String, rupu_providers::ProviderTuning>,
         kinds: std::collections::HashMap<String, String>,
+        findings_base: rupu_coverage::FindingWriteOptions,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -123,6 +128,7 @@ impl CliAgentDispatcher {
             openai_compatible,
             provider_tuning,
             kinds,
+            findings_base,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -303,7 +309,9 @@ impl AgentDispatcher for CliAgentDispatcher {
         let child_depth = parent_depth + 1;
 
         let child_tool_ctx = ToolContext {
-            findings: None,
+            findings: Some(self.findings_base.clone().with_profile(
+                rupu_coverage::FindingProfile::resolve(None, None, spec.findings_profile),
+            )),
             workspace_path: self.workspace_path.clone(),
             bash_env_allowlist: Vec::new(),
             bash_timeout_secs: 120,
@@ -642,6 +650,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
         );
 
         std::env::set_var(
@@ -740,6 +749,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
         );
 
         std::env::set_var(
@@ -807,6 +817,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
         );
 
         std::env::set_var(
@@ -884,6 +895,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
         );
 
         std::env::set_var(
@@ -968,6 +980,7 @@ mod tests {
             oai,
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
         );
 
         std::env::set_var(
@@ -1057,6 +1070,7 @@ mod tests {
             oai,
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
         );
 
         std::env::set_var(
@@ -1131,6 +1145,7 @@ mod tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
         );
 
         std::env::set_var(
