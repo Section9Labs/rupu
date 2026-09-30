@@ -119,18 +119,36 @@ jobs:
           retention-days: 1
 
   linux:
-    name: build ${{ matrix.platform }}
+    name: build ${{ matrix.platform }} (${{ matrix.variant }})
     needs: [meta, web]
     strategy:
       fail-fast: false
       matrix:
+        # Two variants per architecture, as PARALLEL jobs. They differ only in
+        # RUPU_INSTALL_METHOD (an `option_env!` in rupu-cli's build_info.rs),
+        # but that one constant used to cost a second cold build run back to
+        # back in the same job — ~20 of the ~40 minutes a release took.
+        #
+        #   tarball → asset-<platform>:  uploaded verbatim to the release
+        #   pkg     → pkgbin-<platform>: .deb/.rpm input only, never a download
         include:
           - runner: ubuntu-latest
             platform: linux-x64
+            variant: tarball
+          - runner: ubuntu-latest
+            platform: linux-x64
+            variant: pkg
           - runner: ubuntu-24.04-arm
             platform: linux-arm64
+            variant: tarball
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            variant: pkg
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    # NO job- or workflow-level CARGO*/RUST*/CC*/CFLAGS*/CXX*/CMAKE* env:
+    # rust-cache hashes those into its key, which must equal the key ci.yml's
+    # `linux-musl-build` job writes.
     steps:
       - uses: actions/checkout@v5
         with:
@@ -151,58 +169,117 @@ jobs:
       - name: Build the pinned musl image
         run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
 
+      # Restores the dependency cache ci.yml's `linux-musl-build` job writes
+      # on main: same image, same command, same target dir, same rust-cache
+      # inputs. Keep the two blocks identical or this silently builds cold
+      # again (~20 min on x64 instead of ~10).
+      #
+      # Read-only on purpose. A cache written under a tag is invisible to
+      # every other tag, so saving one here would only evict useful entries
+      # from the repo's 10 GB cache budget.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: musl-release
+          shared-key: ${{ hashFiles('docker/linux-build.Dockerfile', 'rust-toolchain.toml') }}
+          workspaces: ". -> target/linux-musl"
+          cache-directories: ".cargo-musl"
+          save-if: false
+
+      # `.cargo-musl` as CARGO_HOME is what lets the restored registry be
+      # used at all — the image's own CARGO_HOME is thrown away with the
+      # container. Same mount as ci.yml.
       - name: Build (channel-stamped)
         run: |
+          set -euo pipefail
+          # RUPU_INSTALL_METHOD must be ABSENT for the tarball, not empty —
+          # `option_env!` reads an empty variable as Some("").
+          marker=()
+          if [ "${{ matrix.variant }}" = pkg ]; then
+            marker=(-e RUPU_INSTALL_METHOD=pkg)
+          fi
+          mkdir -p .cargo-musl
           docker run --rm \
             -e RUPU_RELEASE_CHANNEL="${{ needs.meta.outputs.channel }}" \
             -e RUPU_RELEASE_VERSION="${{ needs.meta.outputs.version }}" \
-            -v "$PWD":/work -w /work rupu-linux-build \
+            "${marker[@]}" \
+            -v "$PWD":/work -w /work \
+            -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            rupu-linux-build \
             cargo build --release -p rupu-cli --target-dir target/linux-musl
 
-      - name: Build again with the package install marker
-        run: |
-          docker run --rm \
-            -e RUPU_RELEASE_CHANNEL="${{ needs.meta.outputs.channel }}" \
-            -e RUPU_RELEASE_VERSION="${{ needs.meta.outputs.version }}" \
-            -e RUPU_INSTALL_METHOD=pkg \
-            -v "$PWD":/work -w /work rupu-linux-build \
-            cargo build --release -p rupu-cli --target-dir target/linux-musl-pkg
-          # Staged OUTSIDE dist/ deliberately: dist/ becomes the asset-*
-          # artifact that publish uploads verbatim to the release, and this
-          # binary is a packaging input, not something a user should ever
-          # download directly (it refuses to self-update by design).
-          mkdir -p pkgbin
-          cp target/linux-musl-pkg/release/rupu "pkgbin/rupu-${{ matrix.platform }}-pkg"
-
-      - name: Stage the asset under its canonical name
+      # Both variants, not just the published one: with the two builds in
+      # separate jobs, nothing else ties a pkg binary to its architecture,
+      # and `packages` names the .deb/.rpm by the artifact it downloads.
+      - name: Check the binary names its own platform
         run: |
           set -euo pipefail
-          bin=target/linux-musl/release/rupu
           # The binary names itself. Deriving this any other way is the
           # defect #555 fixed (`uname -m` says x86_64 where rupu says x64).
           platform=$(docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
-            "$bin" update --print-platform)
+            target/linux-musl/release/rupu update --print-platform)
           # Cross-check against the matrix label so a runner/arch mix-up
           # cannot publish a mislabelled asset.
           if [ "$platform" != "${{ matrix.platform }}" ]; then
             echo "::error::binary reports '$platform', matrix says '${{ matrix.platform }}'"
             exit 1
           fi
+
+      # The variant is chosen by a shell conditional now, so prove it took.
+      # A tarball stamped `pkg` would refuse `rupu update` for every tarball
+      # user; a pkg build missing the stamp would let apt/dnf-owned binaries
+      # overwrite themselves. `rupu update` checks the stamp before loading
+      # config or touching the network, so this runs offline: no network,
+      # read-only mount, and a timeout — a tarball binary here can neither
+      # reach GitHub nor replace itself.
+      - name: Check the install-method stamp matches the variant
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm --network none -v "$PWD":/work:ro -w /work \
+            rupu-linux-build timeout 60 target/linux-musl/release/rupu update 2>&1) || true
+          echo "$out"
+          if echo "$out" | grep -q "installed from a system package"; then
+            stamped=pkg
+          else
+            stamped=tarball
+          fi
+          if [ "$stamped" != "${{ matrix.variant }}" ]; then
+            echo "::error::${{ matrix.variant }} build behaves as '$stamped' — RUPU_INSTALL_METHOD was not applied as intended"
+            exit 1
+          fi
+          echo "install-method stamp matches: $stamped"
+
+      - name: Stage the release asset under its canonical name
+        if: matrix.variant == 'tarball'
+        run: |
+          set -euo pipefail
+          platform="${{ matrix.platform }}"
           mkdir -p dist
-          cp "$bin" "dist/rupu-$platform"
+          cp target/linux-musl/release/rupu "dist/rupu-$platform"
           ( cd dist && sha256sum "rupu-$platform" > "rupu-$platform.sha256" )
           cat "dist/rupu-$platform.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - if: matrix.variant == 'tarball'
+        uses: actions/upload-artifact@v4
         with:
           name: asset-${{ matrix.platform }}
           path: dist/
           if-no-files-found: error
 
+      # Staged OUTSIDE dist/ deliberately: dist/ becomes the asset-*
+      # artifact that publish uploads verbatim to the release, and this
+      # binary is a packaging input, not something a user should ever
+      # download directly (it refuses to self-update by design).
+      - name: Stage the packaging input
+        if: matrix.variant == 'pkg'
+        run: |
+          mkdir -p pkgbin
+          cp target/linux-musl/release/rupu "pkgbin/rupu-${{ matrix.platform }}-pkg"
+
       # A deliberately non-`asset-*`-named artifact: `publish` collects
       # everything matching `asset-*` and uploads it straight to the
       # release, and this binary must never reach a user directly.
-      - uses: actions/upload-artifact@v4
+      - if: matrix.variant == 'pkg'
+        uses: actions/upload-artifact@v4
         with:
           name: pkgbin-${{ matrix.platform }}
           path: pkgbin/
@@ -272,8 +349,8 @@ jobs:
           ver="${VERSION#v}"
           mkdir -p out
           # binname points at the -pkg build (RUPU_INSTALL_METHOD=pkg), not
-          # the tarball binary staged alongside it — see the "Build again
-          # with the package install marker" step in the linux job.
+          # the tarball binary — see the `pkg` variant of the linux job's
+          # matrix, whose stamp that job has already verified.
           for pair in "x64:amd64:rupu-linux-x64-pkg" "arm64:arm64:rupu-linux-arm64-pkg"; do
             src="${pair%%:*}"; rest="${pair#*:}"
             arch="${rest%%:*}"; binname="${rest#*:}"
@@ -400,6 +477,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
+
+      # Restores the dependency cache ci.yml's `darwin-release-build` job
+      # writes on main. rust-cache keys on every installed toolchain and any
+      # CARGO*/RUST* env var, so this step and everything before it must
+      # match that job — keep the two in lockstep, and keep job-level env
+      # off this job. Read-only for the same reason as the linux job: a
+      # tag-scoped cache is invisible to every later tag.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: darwin-release
+          save-if: false
 
       # Import the Developer ID cert into a throwaway keychain rather than
       # the runner's login keychain. Discarded with the runner.
