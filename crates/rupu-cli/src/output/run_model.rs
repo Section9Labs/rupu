@@ -318,8 +318,62 @@ impl RunView {
                     }
                 }
             }
-            // Dispatch, panel handled in Task 3. A `DispatchStarted` must not
-            // touch any unit slot — it falls through here for now.
+            // Sub-agent dispatches live in their own map, keyed by
+            // `sub_run_id`, and never touch any step's `units` — this is the
+            // fix for the dispatch-overwrites-unit-slot bug. The event carries
+            // no `step_id`, so attribute to the most recently active step.
+            Event::DispatchStarted {
+                sub_run_id,
+                agent,
+                codename,
+                provider,
+                model,
+                ..
+            } => {
+                self.dispatches.insert(
+                    sub_run_id.clone(),
+                    DispatchView {
+                        sub_run_id: sub_run_id.clone(),
+                        parent_step_id: self.last_active_step.clone(),
+                        agent: agent.clone(),
+                        codename: codename.clone(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        status: UnitStatus::Running,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                    },
+                );
+            }
+            // Unlike `UnitCompleted`, these token totals are the real child
+            // run totals. A completion for an unknown `sub_run_id` is a no-op.
+            Event::DispatchCompleted {
+                sub_run_id,
+                success,
+                tokens_in,
+                tokens_out,
+                ..
+            } => {
+                if let Some(d) = self.dispatches.get_mut(sub_run_id) {
+                    d.status = if *success {
+                        UnitStatus::Done
+                    } else {
+                        UnitStatus::Failed
+                    };
+                    d.tokens_in = *tokens_in;
+                    d.tokens_out = *tokens_out;
+                }
+            }
+            Event::PanelRound {
+                step_id,
+                round,
+                max_iterations,
+                ..
+            } => {
+                let s = self.step_mut(step_id);
+                s.panel_round = Some(*round);
+                s.panel_max = Some(*max_iterations);
+            }
             _ => {}
         }
     }
@@ -580,5 +634,66 @@ mod tests {
         assert_eq!(step.units[&5].unit_key, "svc-5");
         assert_eq!(step.units[&2].status, UnitStatus::Running);
         assert_eq!(step.units[&2].unit_key, "svc-2");
+    }
+
+    #[test]
+    fn dispatch_lives_in_its_own_map_attributed_to_active_step() {
+        use rupu_orchestrator::executor::Event;
+        use rupu_orchestrator::runs::StepKind;
+        let mut v = RunView::default();
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: "assess".into(),
+            kind: StepKind::Run,
+            agent: None,
+            host: None,
+            codename: None,
+        });
+        v.apply(&Event::DispatchStarted {
+            run_id: "r".into(),
+            sub_run_id: "sub1".into(),
+            agent: Some("scout".into()),
+            transcript_path: "ts".into(),
+            codename: Some("wren#1".into()),
+            provider: Some("anthropic".into()),
+            model: Some("opus".into()),
+        });
+        v.apply(&Event::DispatchCompleted {
+            run_id: "r".into(),
+            sub_run_id: "sub1".into(),
+            success: true,
+            tokens_in: 1000,
+            tokens_out: 200,
+        });
+
+        let d = &v.dispatches["sub1"];
+        assert_eq!(d.parent_step_id.as_deref(), Some("assess"));
+        assert_eq!(d.status, UnitStatus::Done);
+        assert_eq!((d.tokens_in, d.tokens_out), (1000, 200));
+        assert_eq!(d.codename.as_deref(), Some("wren#1"));
+    }
+
+    #[test]
+    fn panel_round_sets_counter() {
+        use rupu_orchestrator::executor::Event;
+        use rupu_orchestrator::runs::StepKind;
+        let mut v = RunView::default();
+        v.apply(&Event::StepStarted {
+            run_id: "r".into(),
+            step_id: "triage".into(),
+            kind: StepKind::Panel,
+            agent: None,
+            host: None,
+            codename: None,
+        });
+        v.apply(&Event::PanelRound {
+            run_id: "r".into(),
+            step_id: "triage".into(),
+            round: 2,
+            max_iterations: 5,
+            max_severity_remaining: Some("high".into()),
+        });
+        assert_eq!(v.steps[0].panel_round, Some(2));
+        assert_eq!(v.steps[0].panel_max, Some(5));
     }
 }
