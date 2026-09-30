@@ -134,12 +134,18 @@ pub trait AgentDispatcher: Send + Sync + std::fmt::Debug {
     /// parent_depth + 1`), and runs the agent to completion. Returns
     /// the child's outcome — final assistant text, tokens used,
     /// duration, and the path to the persisted child transcript.
+    ///
+    /// `parent_codename` is the dispatching agent's own codename
+    /// ([`ToolContext::codename`]); the dispatcher mints the child's
+    /// `<parent>><role>#n` name from it. `None` (a legacy caller with no
+    /// codename) leaves the child unnamed.
     async fn dispatch(
         &self,
         agent_name: &str,
         prompt: String,
         parent_run_id: &str,
         parent_depth: u32,
+        parent_codename: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError>;
 }
 
@@ -150,6 +156,10 @@ pub struct DispatchOutcome {
     pub agent: String,
     /// Sub-run id (`sub_<ULID>`).
     pub sub_run_id: String,
+    /// The child's minted codename (`<parent>><role>#n`). `None` when
+    /// the parent had no codename to derive one from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
     /// Path to the persisted child transcript. The line-stream
     /// printer uses this to render the child's run inline as a
     /// child callout frame.

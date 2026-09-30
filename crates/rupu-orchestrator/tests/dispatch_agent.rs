@@ -56,6 +56,7 @@ impl AgentDispatcher for FakeDispatcher {
         prompt: String,
         _parent_run_id: &str,
         _parent_depth: u32,
+        _parent_codename: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.calls
             .lock()
@@ -102,6 +103,7 @@ impl AgentDispatcher for FakeDispatcher {
 
         Ok(DispatchOutcome {
             agent: agent_name.to_string(),
+            codename: None,
             sub_run_id: sub_run_id.into(),
             transcript_path: path,
             output: "child says: code looks fine".into(),

@@ -310,6 +310,16 @@ async fn rebuild_opts_from_disk(
         provider_tuning.clone(),
         kinds.clone(),
     );
+    // One codename namer for the whole run, shared by the orchestrator
+    // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
+    // the same `<runs>/<run_id>` dir `run_workflow` would use, so both
+    // read and persist the one `codenames.json`.
+    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
+        &workflow,
+        run_id,
+        Some(&store_arc.root.join(run_id)),
+    ));
+    dispatcher.set_namer(naming.namer());
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(
         &mcp_registry,
@@ -320,6 +330,7 @@ async fn rebuild_opts_from_disk(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            codename: Some(rupu_codename::crew_for(run_id)),
         }),
     );
     let factory = Arc::new(DefaultStepFactory {
@@ -360,7 +371,7 @@ async fn rebuild_opts_from_disk(
         unit_dispatcher: None,
         action_dispatcher: Some(action_dispatcher),
         pause: None,
-        naming: None,
+        naming: Some(naming),
     };
 
     Ok((opts, prior_step_results))

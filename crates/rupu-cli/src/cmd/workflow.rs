@@ -3228,6 +3228,16 @@ pub(crate) async fn resume_run(
         provider_tuning.clone(),
         kinds.clone(),
     );
+    // One codename namer for the whole run, shared by the orchestrator
+    // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
+    // the same `<runs>/<run_id>` dir `run_workflow` would use, so both
+    // read and persist the one `codenames.json`.
+    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
+        &workflow,
+        run_id,
+        Some(&store.root.join(run_id)),
+    ));
+    dispatcher.set_namer(naming.namer());
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
@@ -3238,6 +3248,7 @@ pub(crate) async fn resume_run(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            codename: Some(rupu_codename::crew_for(run_id)),
         }),
     );
     let mode_str_for_policy = mode_str.clone();
@@ -3348,7 +3359,7 @@ pub(crate) async fn resume_run(
         unit_dispatcher,
         action_dispatcher: Some(action_dispatcher),
         pause: Some(pause_token.clone()),
-        naming: None,
+        naming: Some(naming),
     };
 
     println!("rupu: resuming run {run_id}");
@@ -4774,6 +4785,17 @@ async fn execute_workflow_invocation(
         provider_tuning.clone(),
         kinds.clone(),
     );
+    // One codename namer for the whole run — shared by the orchestrator
+    // (static slots), the sub-agent dispatcher (`>role#n`), and the inline
+    // approve-resume below. Built over the same `<runs>/<run_id>` dir
+    // `run_workflow` would use, so all read and persist one
+    // `codenames.json`.
+    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
+        &workflow,
+        &run_id,
+        Some(&runs_dir.join(&run_id)),
+    ));
+    dispatcher.set_namer(naming.namer());
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
     // approve-resume `resume_opts` built further down this function —
@@ -4789,6 +4811,7 @@ async fn execute_workflow_invocation(
             run_id: run_id.clone(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            codename: Some(rupu_codename::crew_for(&run_id)),
         }),
     );
 
@@ -4865,7 +4888,7 @@ async fn execute_workflow_invocation(
         unit_dispatcher,
         action_dispatcher: Some(Arc::clone(&action_dispatcher)),
         pause: Some(pause_token.clone()),
-        naming: None,
+        naming: Some(Arc::clone(&naming)),
     };
 
     // Opt-in live three-zone view (dashboard + git-graph spine + focus
@@ -5051,7 +5074,9 @@ async fn execute_workflow_invocation(
                         unit_dispatcher: resume_unit_dispatcher,
                         action_dispatcher: Some(Arc::clone(&action_dispatcher)),
                         pause: Some(pause_token.clone()),
-                        naming: None,
+                        // Same run, same namer: the resumed half keeps the
+                        // static-slot words and dispatch counters.
+                        naming: Some(Arc::clone(&naming)),
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));
                     current_run_id = result.run_id.clone();

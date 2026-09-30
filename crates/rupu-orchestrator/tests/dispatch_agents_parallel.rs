@@ -75,6 +75,7 @@ impl AgentDispatcher for FakeDispatcher {
         prompt: String,
         _parent_run_id: &str,
         _parent_depth: u32,
+        _parent_codename: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.calls
             .lock()
@@ -120,6 +121,7 @@ impl AgentDispatcher for FakeDispatcher {
 
         Ok(DispatchOutcome {
             agent: agent_name.to_string(),
+            codename: None,
             sub_run_id,
             transcript_path: path,
             output: format!("{agent_name}: review complete"),

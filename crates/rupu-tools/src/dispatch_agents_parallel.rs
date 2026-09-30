@@ -194,11 +194,13 @@ impl Tool for DispatchAgentsParallelTool {
         let semaphore = Arc::new(Semaphore::new(max_parallel));
 
         let parent_depth = ctx.depth;
+        let parent_codename = ctx.codename.clone();
         let mut handles = Vec::with_capacity(i.agents.len());
         for (idx, req) in i.agents.iter().cloned().enumerate() {
             let permit_sem = Arc::clone(&semaphore);
             let dispatcher = dispatcher.clone();
             let parent_run_id = parent_run_id.clone();
+            let parent_codename = parent_codename.clone();
             let child_prompt = render_child_prompt(&req.prompt, req.inputs.as_ref());
             handles.push(tokio::spawn(async move {
                 let _permit = permit_sem
@@ -206,7 +208,13 @@ impl Tool for DispatchAgentsParallelTool {
                     .await
                     .expect("semaphore not closed");
                 let outcome = dispatcher
-                    .dispatch(&req.agent, child_prompt, &parent_run_id, parent_depth)
+                    .dispatch(
+                        &req.agent,
+                        child_prompt,
+                        &parent_run_id,
+                        parent_depth,
+                        parent_codename.as_deref(),
+                    )
                     .await;
                 (idx, req, outcome)
             }));
@@ -243,6 +251,7 @@ impl Tool for DispatchAgentsParallelTool {
                             "duration_ms": o.duration_ms,
                             "transcript_path": o.transcript_path.display().to_string(),
                             "sub_run_id": o.sub_run_id,
+                            "codename": o.codename,
                         }),
                     );
                 }
@@ -307,6 +316,8 @@ mod tests {
         /// Per-agent canned outcome. `Ok` returns a synthetic outcome,
         /// `Err` simulates a dispatch-level failure (e.g. agent not found).
         scripted: Mutex<std::collections::BTreeMap<String, Result<DispatchOutcome, DispatchError>>>,
+        /// Every `parent_codename` the tool handed the dispatcher.
+        seen_parent_codenames: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl StubDispatcher {
@@ -320,6 +331,7 @@ mod tests {
                         .map(|(k, v)| (k.to_string(), v))
                         .collect(),
                 ),
+                seen_parent_codenames: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -327,6 +339,7 @@ mod tests {
             DispatchOutcome {
                 agent: agent.to_string(),
                 sub_run_id: format!("sub_{agent}"),
+                codename: Some(format!("p>{agent}#1")),
                 transcript_path: PathBuf::from(format!("/tmp/{agent}.jsonl")),
                 output: output.to_string(),
                 success: true,
@@ -344,7 +357,12 @@ mod tests {
             _prompt: String,
             _parent_run_id: &str,
             _parent_depth: u32,
+            parent_codename: Option<&str>,
         ) -> Result<DispatchOutcome, DispatchError> {
+            self.seen_parent_codenames
+                .lock()
+                .unwrap()
+                .push(parent_codename.map(str::to_string));
             let mut scripted = self.scripted.lock().unwrap();
             // Each agent is dispatched at most once per test, so consume
             // the scripted entry. DispatchError isn't `Clone`, so we
@@ -472,16 +490,19 @@ mod tests {
     #[tokio::test]
     async fn returns_results_keyed_by_id_in_input_order() {
         let tool = DispatchAgentsParallelTool;
-        let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::new([
+        let stub = StubDispatcher::new([
             ("sec", Ok(StubDispatcher::ok("sec", "sec output", 100))),
             ("perf", Ok(StubDispatcher::ok("perf", "perf output", 200))),
-        ]));
-        let ctx = ctx_with(
+        ]);
+        let seen = Arc::clone(&stub.seen_parent_codenames);
+        let disp: Arc<dyn AgentDispatcher> = Arc::new(stub);
+        let mut ctx = ctx_with(
             Some(disp),
             Some(vec!["sec".into(), "perf".into()]),
             Some("run_X".into()),
             0,
         );
+        ctx.codename = Some("jade-reef/heron".into());
         let out = tool
             .invoke(
                 json!({ "agents": [
@@ -500,6 +521,12 @@ mod tests {
         assert_eq!(parsed["results"]["s"]["tokens_used"], 100);
         assert_eq!(parsed["results"]["p"]["output"], "perf output");
         assert_eq!(parsed["results"]["p"]["tokens_used"], 200);
+        assert_eq!(parsed["results"]["s"]["codename"], "p>sec#1");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("jade-reef/heron".to_string()); 2],
+            "every child must receive the parent's codename"
+        );
     }
 
     #[tokio::test]

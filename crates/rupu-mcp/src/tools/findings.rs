@@ -28,6 +28,12 @@ pub struct FindingsContext {
     pub run_id: String,
     pub model: String,
     pub surface: rupu_coverage::Surface,
+    /// The run's **crew** codename (e.g. `jade-reef`), stamped on
+    /// `Attribution.codename`. Crew only, never a per-agent instance: one
+    /// `FindingsContext` is built per workflow run, not per step, so it
+    /// cannot know which agent instance made the call. `None` for callers
+    /// with no codename.
+    pub codename: Option<String>,
 }
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -104,7 +110,7 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         run_id: ctx.run_id.clone(),
         model: ctx.model.clone(),
         surface: ctx.surface,
-        codename: None,
+        codename: ctx.codename.clone(),
     };
     let input = rupu_coverage::ReportFindingInput {
         file_path: args.file_path,

@@ -651,3 +651,123 @@ async fn workflow_run_auto_tracks_current_checkout() {
         project.path().canonicalize().unwrap().display().to_string()
     );
 }
+
+/// Parent step dispatches `child` via `dispatch_agent`. Both agent loops
+/// replay this same two-turn script (the child's own `dispatch_agent`
+/// call is rejected by its empty allowlist, then it finishes).
+const DISPATCH_WORKFLOW_MOCK_SCRIPT: &str = r#"
+[
+  { "AssistantToolUse": { "text": null, "tool_id": "call_1", "tool_name": "dispatch_agent", "tool_input": {"agent": "child", "prompt": "please do the subtask"}, "stop": "tool_use" } },
+  { "AssistantText": { "text": "All done.", "stop": "end_turn" } }
+]
+"#;
+
+/// Wiring: `rupu workflow run` hands ONE `RunNaming` to both the
+/// orchestrator and the `CliAgentDispatcher`. A sub-agent dispatched from
+/// a step is named `<step codename>><role>#1`, `DispatchStarted` carries
+/// that name plus the child's provider/model, the child's own transcript
+/// `RunStart` carries it, and the dispatch counter lands in the run's
+/// shared `codenames.json` (proving the dispatcher used the run's
+/// persisted namer, not a private in-memory one).
+#[tokio::test]
+async fn workflow_run_names_dispatched_sub_agent_from_the_run_namer() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/parent.md")
+        .write_str(
+            "---\nname: parent\nprovider: anthropic\nmodel: claude-sonnet-4-6\n\
+             maxTurns: 4\ntools: [dispatch_agent]\ndispatchableAgents: [child]\n---\n\
+             you dispatch a child agent to do the subtask.",
+        )
+        .unwrap();
+    global
+        .child("agents/child.md")
+        .write_str(
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\n\
+             maxTurns: 4\n---\nyou are the child agent.",
+        )
+        .unwrap();
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/dispatch-wf.yaml")
+        .write_str(
+            "name: dispatch-wf\nsteps:\n  - id: a\n    agent: parent\n    actions: []\n    prompt: go\n",
+        )
+        .unwrap();
+
+    let project = assert_fs::TempDir::new().unwrap();
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", DISPATCH_WORKFLOW_MOCK_SCRIPT);
+    std::env::set_current_dir(project.path()).unwrap();
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "run".into(),
+        "dispatch-wf".into(),
+        "--mode".into(),
+        "bypass".into(),
+    ])
+    .await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::remove_var("RUPU_HOME");
+
+    assert_eq!(
+        format!("{exit:?}"),
+        format!("{:?}", std::process::ExitCode::from(0)),
+        "workflow run should exit 0"
+    );
+
+    let run_store = rupu_orchestrator::RunStore::new(global.path().join("runs"));
+    let runs = run_store.list().unwrap();
+    assert_eq!(runs.len(), 1);
+    let run_id = runs[0].id.clone();
+    let crew = rupu_codename::crew_for(&run_id);
+    let child_role = rupu_codename::role_word("child");
+    let run_dir = global.path().join("runs").join(&run_id);
+
+    let events = std::fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
+    let started: Vec<serde_json::Value> = events
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["type"] == "dispatch_started")
+        .collect();
+    assert_eq!(started.len(), 1, "one dispatch, got {started:?}");
+    let child = started[0]["codename"]
+        .as_str()
+        .expect("DispatchStarted must carry the child's codename")
+        .to_string();
+    assert!(
+        child.starts_with(&format!("{crew}/")) && child.ends_with(&format!(">{child_role}#1")),
+        "child codename {child:?} should be <{crew}/step>{child_role}#1"
+    );
+    assert_eq!(started[0]["provider"], "anthropic");
+    assert_eq!(started[0]["model"], "claude-sonnet-4-6");
+
+    // The child's own transcript opens with the same name.
+    let child_transcript = started[0]["transcript_path"].as_str().unwrap();
+    let run_start_codename = rupu_transcript::JsonlReader::iter(child_transcript)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find_map(|ev| match ev {
+            rupu_transcript::Event::RunStart { codename, .. } => Some(codename),
+            _ => None,
+        })
+        .expect("child transcript has a RunStart");
+    assert_eq!(run_start_codename.as_deref(), Some(child.as_str()));
+
+    // The dispatch counter was persisted by the run's shared namer.
+    let parent_codename = child.rsplit_once('>').unwrap().0;
+    let persisted = std::fs::read_to_string(run_dir.join("codenames.json"))
+        .expect("the run's codenames.json exists");
+    assert!(
+        persisted.contains(&format!("{parent_codename}>{child_role}")),
+        "codenames.json should record the dispatch counter: {persisted}"
+    );
+}

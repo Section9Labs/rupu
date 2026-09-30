@@ -3530,6 +3530,7 @@ dependencies = [
  "rupu-agent",
  "rupu-app-canvas",
  "rupu-auth",
+ "rupu-codename",
  "rupu-config",
  "rupu-coverage",
  "rupu-cp",
