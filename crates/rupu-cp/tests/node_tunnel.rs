@@ -955,6 +955,7 @@ mod tunnel_connector {
 
     fn make_agent_req(agent: &str) -> rupu_cp::agent_launcher::AgentLaunchRequest {
         rupu_cp::agent_launcher::AgentLaunchRequest {
+            codename: None,
             agent: agent.to_string(),
             prompt: Some("do the thing".to_string()),
             mode: None,

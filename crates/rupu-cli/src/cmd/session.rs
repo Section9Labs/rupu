@@ -347,6 +347,10 @@ struct SessionRecord {
     version: u32,
     session_id: String,
     agent_name: String,
+    /// `crew/role` — one identity across every turn (spec §3). `None` for
+    /// sessions created before codenames; readers use `derive_legacy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codename: Option<String>,
     #[serde(default)]
     description: Option<String>,
     provider_name: String,
@@ -1556,6 +1560,11 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         version: SessionRecord::VERSION,
         session_id: session_id.clone(),
         agent_name: spec.name.clone(),
+        codename: Some(
+            rupu_codename::Codename::crew_only(rupu_codename::crew_for(&session_id))
+                .child(rupu_codename::role_word(&spec.name), None)
+                .to_string(),
+        ),
         description: spec.description.clone(),
         provider_name,
         auth_mode: spec.auth,
@@ -7475,6 +7484,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             &metadata,
         )?;
 
+        let codename = session.codename.clone().unwrap_or_else(|| {
+            rupu_codename::derive_legacy(&session.session_id, Some(&session.agent_name))
+        });
         let tool_context = ToolContext {
             workspace_path: session.workspace_path.clone(),
             bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
@@ -7488,7 +7500,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             run_id: None,
             model: None,
             tool_mappings: None,
-            codename: None,
+            codename: Some(codename.clone()),
         };
 
         let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
@@ -7585,7 +7597,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             surface_tag: Some("session".to_string()),
             pause: None,
             seed_source,
-            codename: None,
+            codename: Some(codename.clone()),
         };
 
         let outcome = rupu_agent::run_agent(opts).await;
@@ -9745,11 +9757,20 @@ mod tests {
         assert!(plain.iter().any(|row| row.starts_with("│ streaming chunk")));
     }
 
+    #[test]
+    fn legacy_session_record_loads_without_codename() {
+        let mut v = serde_json::to_value(test_session_record()).unwrap();
+        v.as_object_mut().unwrap().remove("codename");
+        let rec: SessionRecord = serde_json::from_value(v).unwrap();
+        assert!(rec.codename.is_none());
+    }
+
     fn test_session_record() -> SessionRecord {
         SessionRecord {
             version: SessionRecord::VERSION,
             session_id: "ses_test01".into(),
             agent_name: "issue-reader".into(),
+            codename: None,
             description: Some("Persistent issue reader".into()),
             provider_name: "anthropic".into(),
             auth_mode: None,

@@ -815,6 +815,7 @@ async fn run_agent_with(
     launcher: Arc<dyn AgentLauncher>,
 ) -> Result<String, ApiError> {
     let req = AgentLaunchRequest {
+        codename: None,
         agent: name.to_string(),
         prompt: body.prompt,
         mode: body.mode,
@@ -953,6 +954,7 @@ async fn run_agent(
         // with no scope fields at all.
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
+            codename: None,
             agent: name.clone(),
             prompt: b.prompt,
             mode: b.mode,

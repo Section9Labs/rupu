@@ -545,6 +545,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         .run_id
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+    let codename = standalone_codename(&run_id, &spec.name, std::env::var("RUPU_CODENAME").ok());
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
@@ -800,6 +801,16 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             provider_factory::provider_tuning_map(&cfg.providers),
             provider_factory::resolve_kind_map(&cfg.providers),
         );
+        dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
+            runs_root.join(&run_id).join("codenames.json"),
+            || {
+                let mut n = rupu_codename::CrewNamer::new(codename.crew.clone());
+                if let Some(seg) = codename.segments.last() {
+                    n.seed_role(&spec.name, &seg.role);
+                }
+                n
+            },
+        ));
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
         let tool_context = ToolContext {
@@ -815,7 +826,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             run_id: None,
             model: None,
             tool_mappings: None,
-            codename: None,
+            codename: Some(codename.to_string()),
         };
 
         let backend_id = "local_checkout".to_string();
@@ -909,7 +920,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
             pause: None,
-            codename: None,
+            codename: Some(codename.to_string()),
         };
 
         // Spawn the agent in a background task and tail the transcript with
@@ -1072,7 +1083,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 // record consistent with the workflow-run creation site.
                 permission_mode: Some(mode_str.to_string()),
                 loop_progress: Default::default(),
-                codename: None,
+                codename: Some(codename.crew.clone()),
             };
             match store.create(rec, "") {
                 Ok(_) => {}
@@ -1321,9 +1332,36 @@ impl PermissionDecider for AskDecider {
     }
 }
 
+/// Codename for a standalone `rupu run`: a placed unit's coordinator passes
+/// its minted name via `RUPU_CODENAME`; otherwise the run is its own crew.
+pub(crate) fn standalone_codename(
+    run_id: &str,
+    agent: &str,
+    env_override: Option<String>,
+) -> rupu_codename::Codename {
+    env_override
+        .and_then(|s| s.parse::<rupu_codename::Codename>().ok())
+        .filter(|c| !c.segments.is_empty())
+        .unwrap_or_else(|| {
+            rupu_codename::Codename::crew_only(rupu_codename::crew_for(run_id))
+                .child(rupu_codename::role_word(agent), None)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_codename_derives_or_honours_env() {
+        let id = "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W";
+        let derived = standalone_codename(id, "triage", None);
+        assert_eq!(derived.to_string(), "jade-reef/numbat");
+        let placed = standalone_codename(id, "triage", Some("cobalt-harbor/heron#412".into()));
+        assert_eq!(placed.to_string(), "cobalt-harbor/heron#412");
+        let junk = standalone_codename(id, "triage", Some("junk".into()));
+        assert_eq!(junk.to_string(), "jade-reef/numbat");
+    }
 
     #[test]
     fn classify_routes_list_to_list_action() {
