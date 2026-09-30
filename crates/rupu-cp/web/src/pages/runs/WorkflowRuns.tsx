@@ -16,6 +16,8 @@
 // keystroke, over workflow name / run id / host id — composing with (not
 // replacing) the lifecycle/trigger pills above it.
 
+import { CrewChip } from '../../components/codename/CrewChip';
+import { parseCodename } from '../../lib/codename';
 import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { api, type RunListRow } from '../../lib/api';
@@ -131,7 +133,7 @@ export default function WorkflowRuns() {
   const q = query.trim().toLowerCase();
   const visible = q
     ? filtered.filter((r) =>
-        [r.workflow_name, r.id, r.host_id]
+        [r.workflow_name, r.id, r.host_id, r.codename]
           .filter((v): v is string => Boolean(v))
           .some((v) => v.toLowerCase().includes(q)),
       )
@@ -349,6 +351,14 @@ function runDurationMs(run: RunListRow): number | null {
 }
 
 const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.codename,
+    render: (r) => <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />,
+  },
   {
     key: 'status',
     header: 'Status',

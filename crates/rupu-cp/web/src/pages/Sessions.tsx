@@ -20,6 +20,7 @@
 // keystroke, over agent name / session id / host id — composing with (not
 // replacing) the Active/Archived pill above it.
 
+import { AgentName } from '../components/codename/AgentName';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageSquare, RefreshCw } from 'lucide-react';
@@ -84,7 +85,7 @@ export default function Sessions() {
   const q = query.trim().toLowerCase();
   const visible = q
     ? rows.filter((r) =>
-        [r.agent_name, r.session_id, r.host_id]
+        [r.agent_name, r.session_id, r.host_id, r.codename]
           .filter((v): v is string => Boolean(v))
           .some((v) => v.toLowerCase().includes(q)),
       )
@@ -252,7 +253,17 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     sortable: true,
     sortValue: (s) => s.agent_name,
     titleValue: (s) => s.agent_name,
-    render: (s) => <span className="text-sm font-medium text-ink">{s.agent_name}</span>,
+    render: (s) => (
+      <span className="text-sm font-medium text-ink">
+        <AgentName
+          codename={s.codename}
+          agent={s.agent_name}
+          model={s.model}
+          showCrew
+          derived={s.codename_derived}
+        />
+      </span>
+    ),
   },
   {
     key: 'session',

@@ -1022,3 +1022,38 @@ describe('RunDetail — failed / unpersisted run', () => {
     expect(screen.queryByText('Loading run…')).not.toBeInTheDocument();
   });
 });
+
+describe('RunDetail — codename', () => {
+  function stubCodenameApi(graph: RunGraphResponse) {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  it('renders the crew chip in the header', async () => {
+    stubCodenameApi({
+      ...GRAPH,
+      run: { ...GRAPH.run, codename: 'cobalt-harbor', codename_derived: false } as RunGraphResponse['run'],
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+  });
+
+  it('names the crew in the gate banner', async () => {
+    stubCodenameApi({
+      ...GRAPH,
+      run: {
+        ...GRAPH.run,
+        status: 'awaiting_approval',
+        awaiting_step_id: 'step_a',
+        codename: 'cobalt-harbor',
+        codename_derived: false,
+      } as RunGraphResponse['run'],
+    });
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByText(/cobalt-harbor is waiting for approval/)).toBeInTheDocument(),
+    );
+  });
+});

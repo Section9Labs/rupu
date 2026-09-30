@@ -7,6 +7,7 @@
 //   • a secondary, collapsed "Session details" disclosure (usage chart + fields)
 // Route: /sessions/:id
 
+import { AgentName } from '../components/codename/AgentName';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
@@ -219,6 +220,13 @@ export default function SessionDetailPage() {
           <h1 className="font-mono text-base font-semibold text-ink break-all">
             {session.session_id}
           </h1>
+          <AgentName
+            codename={session.codename}
+            agent={session.agent_name}
+            model={session.model}
+            showCrew
+            derived={session.codename_derived}
+          />
           <span className="text-ui text-ink-dim">
             <span className="font-mono">{session.agent_name}</span>
             <span className="mx-1 text-border">·</span>

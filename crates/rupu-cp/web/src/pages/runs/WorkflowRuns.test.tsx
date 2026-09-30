@@ -483,3 +483,22 @@ describe('WorkflowRuns — Turns/Duration column order (table-standardization Ta
     expect(durationIdx).toBeGreaterThan(turnsIdx);
   });
 });
+
+describe('WorkflowRuns — codenames', () => {
+  it('renders the crew name and Find matches by codename', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([
+      makeRun({ id: 'run_a', workflow_name: 'deploy-prod', codename: 'cobalt-harbor/heron#1' }),
+      makeRun({ id: 'run_b', workflow_name: 'lint-repo', codename: 'amber-fjord/kite#1' }),
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+    expect(screen.getByText('amber-fjord')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'cobalt' } });
+
+    await waitFor(() => expect(screen.queryByText('lint-repo')).not.toBeInTheDocument());
+    expect(screen.getByText('deploy-prod')).toBeInTheDocument();
+  });
+});

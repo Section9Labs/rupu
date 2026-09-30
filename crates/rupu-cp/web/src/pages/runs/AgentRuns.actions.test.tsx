@@ -115,7 +115,7 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
 
     renderPage();
     await showAll();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive session ${SESSION_ROW.session_id}`));
 
@@ -132,7 +132,7 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
 
     renderPage();
     await showAll();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive session ${SESSION_ROW.session_id}`));
 
@@ -148,7 +148,7 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
 
     renderPage();
     await showAll();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive session ${SESSION_ROW.session_id}`));
 
@@ -162,7 +162,7 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
 
     renderPage();
     await showAll();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Restore session ${SESSION_ROW.session_id}`));
 
@@ -179,7 +179,7 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
 
     renderPage();
     await showAll();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Delete session ${SESSION_ROW.session_id}`));
 
@@ -198,7 +198,7 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
 
     renderPage();
     await showAll();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Delete session ${SESSION_ROW.session_id}`));
 
@@ -214,7 +214,7 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
 
@@ -235,7 +235,7 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
 
@@ -252,7 +252,7 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Delete run ${STANDALONE_ROW.run_id}`));
 
@@ -268,7 +268,7 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
     vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Delete run ${STANDALONE_ROW.run_id}`));
 
@@ -280,7 +280,7 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([STANDALONE_ROW]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     expect(screen.queryByLabelText(`Restore run ${STANDALONE_ROW.run_id}`)).not.toBeInTheDocument();
     expect(screen.queryByText('Restore')).not.toBeInTheDocument();
@@ -313,7 +313,7 @@ describe('AgentRuns — standalone liveness-refusal override retry', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
 
@@ -344,7 +344,7 @@ describe('AgentRuns — standalone liveness-refusal override retry', () => {
       .mockReturnValueOnce(false); // declined liveness-override confirm
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
 
@@ -366,7 +366,7 @@ describe('AgentRuns — standalone liveness-refusal override retry', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValueOnce(true);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
 
@@ -386,7 +386,7 @@ describe('AgentRuns — standalone liveness-refusal override retry', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Delete run ${STANDALONE_ROW.run_id}`));
 
@@ -411,7 +411,7 @@ describe('AgentRuns — action buttons never trigger row navigation', () => {
     vi.spyOn(api, 'archiveTranscript').mockResolvedValue(undefined);
 
     renderPage();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     const button = screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`);
     // sanity: the action column is `interactive`, so SortableTable renders
@@ -436,7 +436,7 @@ describe('AgentRuns — action buttons never trigger row navigation', () => {
 
     renderPage();
     await showAll();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     const button = screen.getByLabelText(`Delete session ${SESSION_ROW.session_id}`);
     const notCanceled = fireEvent.click(button);

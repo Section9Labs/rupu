@@ -17,6 +17,7 @@
 // single merged row's `source` field, it does not need to dedupe anything
 // itself.
 
+import { AgentName } from '../../components/codename/AgentName';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
@@ -260,7 +261,7 @@ export default function AgentRuns() {
   const q = query.trim().toLowerCase();
   const visible = q
     ? sorted.filter((r) =>
-        [r.agent, r.run_id, r.session_id, r.host_id]
+        [r.agent, r.run_id, r.session_id, r.host_id, r.codename]
           .filter((v): v is string => Boolean(v))
           .some((v) => v.toLowerCase().includes(q)),
       )
@@ -448,8 +449,8 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     titleValue: (r) => r.agent ?? r.run_id,
     render: (r) => (
       <div className="min-w-0">
-        <span className="block truncate text-sm font-medium text-ink" title={r.agent ?? undefined}>
-          {r.agent ?? '—'}
+        <span className="block truncate text-sm font-medium text-ink">
+          <AgentName codename={r.codename} agent={r.agent ?? undefined} showCrew derived={r.codename_derived} />
         </span>
         {(r.trigger_source || r.session_id) && (
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">

@@ -12,6 +12,8 @@
 // getRunUsageTimeline are called with the host parameter. All control/SSE
 // calls also include the host param.
 
+import { CrewChip } from '../components/codename/CrewChip';
+import { parseCodename } from '../lib/codename';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, ArrowLeft, FileText, GitBranch, ListOrdered, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
@@ -735,6 +737,9 @@ export default function RunDetail() {
           <div className="min-w-0">
             <div className="flex items-center gap-3">
               <h1 className="truncate text-2xl font-semibold text-ink">{run.workflow_name}</h1>
+              {run.codename && (
+                <CrewChip crew={parseCodename(run.codename).crew} derived={run.codename_derived} />
+              )}
               <StatusPill status={effectiveStatus} />
               {host && host !== 'local' && (
                 <span className="rounded bg-info-bg px-1.5 py-0.5 text-note font-medium text-info ring-1 ring-info/30 font-mono">
@@ -837,7 +842,9 @@ export default function RunDetail() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-sm font-medium text-warn">
                 <Pause size={16} className="shrink-0" />
-                Awaiting approval · {awaitingGates.length} gates parked
+                {run.codename
+                  ? `${parseCodename(run.codename).crew} is waiting for approval · ${awaitingGates.length} gates parked`
+                  : `Awaiting approval · ${awaitingGates.length} gates parked`}
               </div>
               {cancellable && (
                 <Button
@@ -970,7 +977,10 @@ export default function RunDetail() {
               <Pause size={16} className="mt-0.5 shrink-0 text-warn" />
               <div className="min-w-0">
                 <div className="text-sm font-medium text-warn">
-                  Awaiting approval · <span className="font-mono">{awaiting.stepId}</span>
+                  {run.codename
+                    ? `${parseCodename(run.codename).crew} is waiting for approval · `
+                    : 'Awaiting approval · '}
+                  <span className="font-mono">{awaiting.stepId}</span>
                 </div>
                 <p className="mt-0.5 break-words text-ui text-warn">{awaiting.reason}</p>
 

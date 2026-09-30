@@ -268,3 +268,17 @@ describe('ProjectRunsTab — kit loading/empty/error states', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('network down'));
   });
 });
+
+describe('ProjectRunsTab — codenames', () => {
+  it('renders crew names and Find matches by codename', async () => {
+    mockRuns([
+      { ...ROWS[0], id: 'r-a', workflow_name: 'wf-a', codename: 'cobalt-harbor/heron#1' },
+      { ...ROWS[1], id: 'r-b', workflow_name: 'wf-b', codename: 'amber-fjord/kite#1' },
+    ]);
+    renderTab();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'cobalt' } });
+    await waitFor(() => expect(screen.queryByText('wf-b')).not.toBeInTheDocument());
+    expect(screen.getByText('wf-a')).toBeInTheDocument();
+  });
+});

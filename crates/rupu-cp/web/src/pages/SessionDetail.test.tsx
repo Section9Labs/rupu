@@ -218,3 +218,11 @@ describe('SessionDetail host-aware', () => {
     expect(screen.queryByText(/^on /)).not.toBeInTheDocument();
   });
 });
+
+describe('SessionDetail — codename', () => {
+  it('renders the crew chip and member label in the header', async () => {
+    stubApi(ACTIVE_SESSION);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+  });
+});

@@ -58,7 +58,7 @@ describe('AgentRuns — canonical column order', () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     const headers = Array.from(container.querySelectorAll('thead th')).map(
       (th) => th.textContent?.trim() ?? '',
