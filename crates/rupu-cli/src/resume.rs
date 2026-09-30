@@ -309,6 +309,10 @@ async fn rebuild_opts_from_disk(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
+        // Dispatched children append the resumed run's own ledger.
+        Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
+            &store_arc, run_id,
+        )),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(

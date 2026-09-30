@@ -799,6 +799,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             provider_factory::openai_compatible_map(&cfg.providers),
             provider_factory::provider_tuning_map(&cfg.providers),
             provider_factory::resolve_kind_map(&cfg.providers),
+            // Standalone `rupu run` has no workflow run ledger to charge;
+            // dispatched children are counted by the CP's fallback over
+            // sub-run transcripts.
+            None,
         );
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 

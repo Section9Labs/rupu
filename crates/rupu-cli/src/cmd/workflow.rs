@@ -3226,6 +3226,10 @@ pub(crate) async fn resume_run(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
+        // Dispatched children append the resumed run's own ledger.
+        Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
+            &store, run_id,
+        )),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(
@@ -4771,6 +4775,12 @@ async fn execute_workflow_invocation(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
+        // Dispatched children append this run's ledger
+        // (`<runs>/<run_id>/usage.jsonl`) — the same file the runner writes
+        // its own agent steps to.
+        Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
+            &run_store, &run_id,
+        )),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
