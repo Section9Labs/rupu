@@ -2208,52 +2208,93 @@ fn locate_transcript(fragment: &str) -> anyhow::Result<TranscriptLocation> {
     }
 }
 
-/// Resolve a codename (`crew` or `crew/role#n>…`) to a transcript. The crew
-/// part picks the most recent matching workflow run; a full instance
-/// codename then resolves to that agent instance's transcript via
-/// [`rupu_orchestrator::RunStore::find_instance`]. `Ok(None)` when the
-/// fragment is not a codename or names no known run.
+/// Resolve a codename (`crew` or `crew/role#n>…`) to a transcript. A crew
+/// name picks the most recent matching workflow run. A full instance
+/// codename is searched across the crew's runs newest-first and resolves to
+/// the first run that contains that agent instance (via
+/// [`rupu_orchestrator::RunStore::find_instance`]). `Ok(None)` when the
+/// fragment is not a codename or names no known run/instance.
 fn locate_transcript_by_codename(fragment: &str) -> anyhow::Result<Option<TranscriptLocation>> {
     let Ok(cn) = fragment.parse::<rupu_codename::Codename>() else {
         return Ok(None);
     };
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    let mut records = store.list().unwrap_or_default();
-    records.extend(store.list_archived().unwrap_or_default());
-    let crews: Vec<crate::output::codename::CrewCandidate> = records
-        .into_iter()
-        .map(|r| crate::output::codename::CrewCandidate {
-            crew: crate::output::codename::display_codename(r.codename.as_deref(), &r.id, None),
-            id: r.id,
-            started_at: r.started_at,
-        })
-        .collect();
-    let Some(run_id) = crate::output::codename::resolve_codename_fragment(&crews, fragment) else {
-        return Ok(None);
-    };
+    let mut cands: Vec<(crate::output::codename::CrewCandidate, bool)> = Vec::new();
+    for (records, archived) in [
+        (store.list().unwrap_or_default(), false),
+        (store.list_archived().unwrap_or_default(), true),
+    ] {
+        for r in records {
+            cands.push((
+                crate::output::codename::CrewCandidate {
+                    crew: crate::output::codename::display_codename(
+                        r.codename.as_deref(),
+                        &r.id,
+                        None,
+                    ),
+                    id: r.id,
+                    started_at: r.started_at,
+                },
+                archived,
+            ));
+        }
+    }
     if cn.segments.is_empty() {
+        let crews: Vec<_> = cands.into_iter().map(|(c, _)| c).collect();
+        let Some(run_id) = crate::output::codename::resolve_codename_fragment(&crews, fragment)
+        else {
+            return Ok(None);
+        };
         return locate_transcript_exact(&run_id)?.map(Some).ok_or_else(|| {
             anyhow::anyhow!(
                 "run `{run_id}` has no single transcript; name an agent instance (`{fragment}/<role>#<n>`)"
             )
         });
     }
-    match store.find_instance(&run_id, fragment)? {
-        Some((agent_run_id, transcript_path)) => {
-            let dir = transcript_path
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_default();
-            Ok(Some(TranscriptLocation {
-                metadata_path: metadata_path_for_run(&dir, &agent_run_id),
-                run_id: agent_run_id,
-                transcript_path,
-                archived: false,
-            }))
+    locate_instance(&store, &cands, &cn.crew, fragment, chrono::Utc::now())
+}
+
+/// Search the runs of `crew` newest-first for the agent instance named
+/// `fragment`. The ambiguity note is printed only on a hit.
+fn locate_instance(
+    store: &rupu_orchestrator::RunStore,
+    cands: &[(crate::output::codename::CrewCandidate, bool)],
+    crew: &str,
+    fragment: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Option<TranscriptLocation>> {
+    let mut runs: Vec<&(crate::output::codename::CrewCandidate, bool)> =
+        cands.iter().filter(|(c, _)| c.crew == crew).collect();
+    runs.sort_by_key(|(c, _)| std::cmp::Reverse(c.started_at));
+    for (cand, archived) in runs.iter().copied() {
+        let Some((agent_run_id, transcript_path)) = store.find_instance(&cand.id, fragment)? else {
+            continue;
+        };
+        let cutoff = now - chrono::Duration::days(30);
+        let others: Vec<String> = runs
+            .iter()
+            .filter(|(c, _)| c.id != cand.id && c.started_at >= cutoff)
+            .map(|(c, _)| c.id.clone())
+            .collect();
+        if !others.is_empty() {
+            eprintln!(
+                "{}",
+                crate::output::codename::ambiguity_note(crew, &cand.id, &others)
+            );
         }
-        None => Ok(None),
+        let dir = transcript_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        return Ok(Some(TranscriptLocation {
+            metadata_path: metadata_path_for_run(&dir, &agent_run_id),
+            run_id: agent_run_id,
+            transcript_path,
+            archived: *archived,
+        }));
     }
+    Ok(None)
 }
 
 /// Every transcript id (`.jsonl` stem) present across the project-local
@@ -2488,6 +2529,55 @@ fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_codename_resolves_in_an_older_run_of_the_same_crew() {
+        use crate::output::codename::CrewCandidate;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        let now = chrono::Utc::now();
+        let cand = |id: &str, days: i64| {
+            (
+                CrewCandidate {
+                    id: id.into(),
+                    crew: "jade-reef".into(),
+                    started_at: now - chrono::Duration::days(days),
+                },
+                id == "run_old",
+            )
+        };
+        // Instance transcript exists only under the OLDER run.
+        let sub = tmp.path().join("run_old/sub/sub_A");
+        std::fs::create_dir_all(&sub).unwrap();
+        let tp = sub.join("transcript.jsonl");
+        let start = TranscriptEvent::RunStart {
+            run_id: "sub_A".into(),
+            workspace_id: "w".into(),
+            agent: "numbat".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            started_at: now,
+            mode: rupu_transcript::RunMode::Bypass,
+            schema: None,
+            system_prompt: None,
+            codename: Some("jade-reef/numbat#2".into()),
+        };
+        std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
+        std::fs::create_dir_all(tmp.path().join("run_new")).unwrap();
+
+        let cands = vec![cand("run_new", 1), cand("run_old", 5)];
+        let loc = locate_instance(&store, &cands, "jade-reef", "jade-reef/numbat#2", now)
+            .unwrap()
+            .expect("found in older run");
+        assert_eq!(loc.run_id, "sub_A");
+        assert_eq!(loc.transcript_path, tp);
+        assert!(loc.archived, "carries the matched run's archived state");
+        assert!(
+            locate_instance(&store, &cands, "jade-reef", "jade-reef/ferret#9", now)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn thinking_event_renders_full_body_in_full_view_and_redacted_marker() {
