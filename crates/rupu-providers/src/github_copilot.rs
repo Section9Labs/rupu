@@ -1028,6 +1028,35 @@ mod tests {
         assert_eq!((ms[0].context_window, ms[0].max_output_tokens), (1000, 500));
         assert!(!<GithubCopilotClient as LlmProvider>::output_shares_context(&client));
     }
+
+    #[tokio::test]
+    async fn fetch_models_surfaces_non_2xx_as_error() {
+        use crate::provider::LlmProvider;
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/models")
+                .header("authorization", "Bearer cop-tok")
+                .header("x-github-api-version", "2025-10-01");
+            then.status(401).body("Unauthorized");
+        });
+        let mut client =
+            GithubCopilotClient::new(test_creds(), None, Arc::new(rupu_netflow::NullSink)).unwrap();
+        client.copilot_token = "cop-tok".into();
+        client.copilot_expires_ms = u64::MAX;
+        client.api_url = server.url("");
+        let err = <GithubCopilotClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        match err {
+            ProviderError::Api { status, message } => {
+                assert_eq!(status, 401);
+                assert_eq!(message, "Unauthorized");
+            }
+            _ => panic!("expected ProviderError::Api with status 401, got {err:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
