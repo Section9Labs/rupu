@@ -226,13 +226,12 @@ export function coverageItems(rows: CoverageSummary[]): PaletteItem[] {
 }
 
 export function findingItems(rows: FindingOut[]): PaletteItem[] {
-  // No per-finding detail route — all findings link to the findings list.
   return rows.map((f) => ({
     kind: 'finding' as const,
     id: f.id,
     title: f.summary,
     subtitle: [f.severity, f.file_path].filter(Boolean).join(' · ') || undefined,
-    to: '/findings',
+    to: `/findings/${encodeURIComponent(f.id)}`,
   }));
 }
 

@@ -156,6 +156,16 @@ describe('AppRoutes shell branch', () => {
     expect(await screen.findByText('run-detail-stub')).toBeInTheDocument();
   });
 
+  it('v2: /findings/:id (report page) is left untouched, not redirected to the list', async () => {
+    vi.spyOn(api, 'getFinding').mockRejectedValue(new Error('no finding in test'));
+    renderApp('v2', '/findings/fnd_1');
+    await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/findings/fnd_1'));
+    expect(screen.getByTestId('loc')).not.toHaveTextContent('/security');
+    // FindingDetail is a real lazy chunk (not stubbed), so its first import can
+    // be slow under a full-suite run; allow it well past findBy's 1s default.
+    expect(await screen.findByText('no finding in test', {}, { timeout: 8000 })).toBeInTheDocument();
+  }, 10000);
+
   it('v2: /events (wall display) survives untouched', async () => {
     renderApp('v2', '/events');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/events'));

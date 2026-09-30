@@ -127,13 +127,14 @@ describe('mappers', () => {
     expect(a.subtitle).toBe('autoflow · cron');
   });
 
-  it('findingItems → /findings (no detail route)', () => {
+  it('findingItems → /findings/:id (the report page)', () => {
     const rows = [
       { id: 'f1', summary: 'sqli', severity: 'high', file_path: 'src/db.ts' } as FindingOut,
     ];
     const [f] = findingItems(rows);
-    expect(f.to).toBe('/findings');
+    expect(f.to).toBe('/findings/f1');
     expect(f.subtitle).toBe('high · src/db.ts');
+    expect(findingItems([{ ...rows[0], id: 'a/b c' } as FindingOut])[0].to).toBe('/findings/a%2Fb%20c');
   });
 
   it('issueItems → run when last_run_id present, else autoflows list', () => {

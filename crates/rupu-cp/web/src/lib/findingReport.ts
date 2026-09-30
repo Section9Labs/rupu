@@ -73,6 +73,29 @@ export function isGapSentinel(s: string): boolean {
   return s.trim() === 'Unknown' || s.startsWith(NOT_PROVIDED);
 }
 
+/** Which of the report's 11 tracked fields are still gaps. Ported exactly from
+ *  `rupu-coverage/src/report/summary.rs::completeness` — same fields, same
+ *  order, same rules — so the CP and exports agree. */
+export function completeness(r: FindingReport): Completeness {
+  const unknown = (s: string) => s.trim() === 'Unknown';
+  const notProvided = (v: OrSentinel<unknown>) => typeof v === 'string' && v.startsWith(NOT_PROVIDED);
+  const checks: [string, boolean][] = [
+    ['owner', unknown(r.ownership.owner)],
+    ['product', unknown(r.ownership.product)],
+    ['affected_component', unknown(r.ownership.affected_component)],
+    ['source_repository', unknown(r.ownership.source_repository)],
+    ['tickets', typeof r.tickets === 'string' && unknown(r.tickets)],
+    ['cvss_v3', unknown(r.rating.cvss_v3)],
+    ['attack_vector', unknown(r.attack_vector)],
+    ['call_chain', notProvided(r.call_chain)],
+    ['recommended_patch', notProvided(r.recommended_patch)],
+    ['ci_cd_detection', notProvided(r.ci_cd_detection)],
+    ['regression_test', notProvided(r.regression_test)],
+  ];
+  const gaps = checks.filter(([, g]) => g).map(([n]) => n);
+  return { filled: checks.length - gaps.length, total: checks.length, gaps };
+}
+
 export function sentinelLabel(s: string): string {
   return s.startsWith(NOT_PROVIDED) ? `Not provided: ${s.slice(NOT_PROVIDED.length)}` : s;
 }

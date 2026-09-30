@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { isSentinel, isGapSentinel, sentinelLabel, codeHref, copyText, formatBytes } from './findingReport';
+import fixture from '../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
+import { isSentinel, isGapSentinel, sentinelLabel, codeHref, copyText, formatBytes, completeness, type FindingReport } from './findingReport';
 import { api, findingArtifactUrl } from './api';
 
 afterEach(() => vi.restoreAllMocks());
@@ -39,5 +40,40 @@ describe('findingReport helpers', () => {
     await api.getFinding('fnd_1');
     expect(fetchMock.mock.calls[0][0]).toBe('/api/findings/fnd_1');
     expect(findingArtifactUrl('fnd/1', 'ab')).toBe('/api/findings/fnd%2F1/artifacts/ab');
+  });
+});
+
+describe('completeness', () => {
+  const report = fixture as unknown as FindingReport;
+
+  it('fixture gaps are owner and cvss_v3', () => {
+    expect(completeness(report)).toEqual({ filled: 9, total: 11, gaps: ['owner', 'cvss_v3'] });
+  });
+
+  it('Not Provided sections are gaps but None-style answers are not', () => {
+    const r: FindingReport = {
+      ...report,
+      regression_test: 'Not Provided — needs hardware',
+      ownership: { ...report.ownership, source_repository: 'Not Applicable' },
+      tickets: 'None Provided',
+    };
+    const { gaps } = completeness(r);
+    expect(gaps).toContain('regression_test');
+    expect(gaps).not.toContain('source_repository');
+    expect(gaps).not.toContain('tickets');
+  });
+
+  it('an Unknown tickets sentinel is a gap, a ticket list is not', () => {
+    expect(completeness({ ...report, tickets: 'Unknown' }).gaps).toContain('tickets');
+    const withTicket = { ...report, tickets: [{ type: 'Jira', identifier: 'SEC-1' }] };
+    expect(completeness(withTicket).gaps).not.toContain('tickets');
+  });
+
+  it('trims Unknown but requires the exact Not Provided prefix', () => {
+    const r: FindingReport = { ...report, ownership: { ...report.ownership, product: '  Unknown ' }, recommended_patch: 'Not Provided — ' };
+    const { gaps } = completeness(r);
+    expect(gaps).toContain('product');
+    expect(gaps).toContain('recommended_patch');
+    expect(completeness({ ...report, ci_cd_detection: 'Not Provided' }).gaps).not.toContain('ci_cd_detection');
   });
 });

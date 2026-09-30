@@ -16,6 +16,7 @@ const Netflow           = React.lazy(() => import('./pages/Netflow'));
 const CoverageDetail    = React.lazy(() => import('./pages/CoverageDetail'));
 const CoverageTemplates = React.lazy(() => import('./pages/CoverageTemplates'));
 const Findings          = React.lazy(() => import('./pages/Findings'));
+const FindingDetail     = React.lazy(() => import('./pages/FindingDetail'));
 const Workflows         = React.lazy(() => import('./pages/Workflows'));
 const WorkflowDetail    = React.lazy(() => import('./pages/WorkflowDetail'));
 const Agents            = React.lazy(() => import('./pages/Agents'));
@@ -99,6 +100,8 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/coverage/:target" element={page(<CoverageDetail />)} />
         <Route path="/netflow" element={page(<Netflow />)} />
         <Route path="/findings" element={v2 ? <Navigate to="/security?tab=findings" replace /> : page(<Findings />)} />
+        {/* Per-finding report — a detail route, so it is NOT redirected under v2. */}
+        <Route path="/findings/:id" element={page(<FindingDetail />)} />
         <Route path="/workflows" element={v2 ? <Navigate to="/library?tab=workflows" replace /> : page(<Workflows />)} />
         <Route path="/workflows/:name" element={page(<WorkflowDetail />)} />
         <Route path="/agents" element={v2 ? <Navigate to="/library?tab=agents" replace /> : page(<Agents />)} />
