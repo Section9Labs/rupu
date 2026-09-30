@@ -61,9 +61,6 @@ pub struct OpenAiCompatibleParams {
     pub models: Vec<rupu_providers::OpenAiCompatibleModel>,
 }
 
-const DEFAULT_OAI_CONTEXT_WINDOW: u32 = 32_768;
-const DEFAULT_OAI_MAX_OUTPUT: u32 = 8_192;
-
 /// Resolve `[providers.<name>]` into params iff it declares
 /// `kind = "openai-compatible"` with a `base_url`. Returns `None` otherwise.
 pub fn openai_compatible_params(
@@ -81,8 +78,10 @@ pub fn openai_compatible_params(
         .iter()
         .map(|m| rupu_providers::OpenAiCompatibleModel {
             id: m.id.clone(),
-            context_window: m.context_window.unwrap_or(DEFAULT_OAI_CONTEXT_WINDOW),
-            max_output: m.max_output.unwrap_or(DEFAULT_OAI_MAX_OUTPUT),
+            // Unset means unknown (0): the live `/v1/models` `max_model_len`
+            // fills it in (spec 2026-09-30 §3). Never invent a window.
+            context_window: m.context_window.unwrap_or(0),
+            max_output: m.max_output.unwrap_or(0),
         })
         .collect();
     Some(OpenAiCompatibleParams {
@@ -991,6 +990,26 @@ mod tests {
             resolve_kind("oracle", &p).as_deref(),
             Some("openai-compatible")
         );
+    }
+
+    #[test]
+    fn openai_compatible_unset_limits_are_unknown_not_fabricated() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "box".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://127.0.0.1:1".into()),
+                models: vec![rupu_config::CustomModel {
+                    id: "m".into(),
+                    context_window: None,
+                    max_output: None,
+                }],
+                ..Default::default()
+            },
+        );
+        let p = openai_compatible_params("box", &providers).unwrap();
+        assert_eq!((p.models[0].context_window, p.models[0].max_output), (0, 0));
     }
 }
 

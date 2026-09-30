@@ -17,6 +17,39 @@ use crate::provider_id::ProviderId;
 use crate::sse::SseParser;
 use crate::types::{ContentBlock, LlmRequest, LlmResponse, StreamEvent};
 
+/// vLLM-style `GET /v1/models` → `ModelInfo`s (spec §3). `max_model_len` is the
+/// input limit; a LoRA entry with a null value inherits its `parent`'s.
+pub(crate) fn vllm_models_from_listing(v: &serde_json::Value) -> Vec<ModelInfo> {
+    let entries: Vec<&serde_json::Value> = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let own = |e: &serde_json::Value| e.get("max_model_len").and_then(|x| x.as_u64());
+    entries
+        .iter()
+        .filter_map(|e| {
+            let id = e.get("id")?.as_str()?.to_string();
+            let len = own(e).or_else(|| {
+                let parent = e.get("parent")?.as_str()?;
+                entries
+                    .iter()
+                    .find(|p| p.get("id").and_then(|x| x.as_str()) == Some(parent))
+                    .and_then(|p| own(p))
+            });
+            Some(ModelInfo {
+                id,
+                provider: ProviderId::OpenaiCompatible,
+                context_window: len.map_or(0, |n| n.min(u32::MAX as u64) as u32),
+                max_output_tokens: 0,
+                capabilities: Vec::new(),
+                cost: crate::model_pool::ModelCost::default(),
+                status: crate::model_pool::ModelStatus::default(),
+            })
+        })
+        .collect()
+}
+
 /// A model offered by an OpenAI-compatible endpoint, declared in config.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleModel {
@@ -265,6 +298,23 @@ impl LlmProvider for OpenAiCompatibleClient {
     async fn list_models(&self) -> Vec<ModelInfo> {
         self.models.iter().map(|m| self.model_info(m)).collect()
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<ModelInfo>, ProviderError> {
+        let resp = self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .headers(self.headers(false)?)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message: String = resp.text().await.unwrap_or_default().chars().take(500).collect();
+            return Err(ProviderError::Api { status: status.as_u16(), message });
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| ProviderError::Http(e.to_string()))?;
+        Ok(vllm_models_from_listing(&v))
+    }
 }
 
 #[cfg(test)]
@@ -417,5 +467,48 @@ mod tests {
         let models = c.list_models().await;
         assert!(!models[0].capabilities.contains(&ModelCapability::Streaming));
         assert!(models[0].capabilities.contains(&ModelCapability::ToolUse));
+    }
+
+    #[test]
+    fn vllm_listing_reads_max_model_len_and_inherits_for_lora() {
+        let v = serde_json::json!({ "object": "list", "data": [
+            { "id": "base-model", "object": "model", "max_model_len": 131072, "parent": null },
+            { "id": "my-lora", "object": "model", "max_model_len": null, "parent": "base-model" },
+            { "id": "mystery", "object": "model" }
+        ]});
+        let ms = vllm_models_from_listing(&v);
+        let get = |id: &str| ms.iter().find(|m| m.id == id).unwrap().context_window;
+        assert_eq!(get("base-model"), 131_072);
+        assert_eq!(get("my-lora"), 131_072);
+        assert_eq!(get("mystery"), 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_calls_v1_models() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models").header("authorization", "Bearer k");
+            then.status(200).json_body(serde_json::json!({ "data": [{ "id": "base-model", "max_model_len": 4096 }] }));
+        });
+        let mut c = OpenAiCompatibleClient::new(&format!("{}/v1", server.url("")), "k", "base-model", vec![], true, Arc::new(rupu_netflow::NullSink));
+        let ms = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c).await.unwrap();
+        m.assert();
+        assert_eq!(ms[0].context_window, 4096);
+        assert_eq!(ms[0].provider, crate::provider_id::ProviderId::OpenaiCompatible);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_surfaces_non_2xx_as_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(401);
+        });
+        let mut c = OpenAiCompatibleClient::new(&format!("{}/v1", server.url("")), "k", "base-model", vec![], true, Arc::new(rupu_netflow::NullSink));
+        let err = <OpenAiCompatibleClient as LlmProvider>::fetch_models(&mut c).await.unwrap_err();
+        m.assert();
+        assert!(matches!(err, ProviderError::Api { status: 401, .. }));
     }
 }
