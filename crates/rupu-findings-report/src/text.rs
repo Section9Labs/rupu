@@ -24,3 +24,15 @@ pub(crate) fn longest_backtick_run(s: &str) -> usize {
     }
     longest
 }
+
+/// A code-block language tag safe to place in an HTML class or a Typst
+/// `lang:` string. `Block::Code.lang` is agent-supplied and only advisory, so
+/// each emitter re-cleans it here instead of trusting the field: characters
+/// outside `[A-Za-z0-9_+.-]` are dropped, and an empty result means no tag.
+pub(crate) fn safe_lang(lang: Option<&str>) -> Option<String> {
+    let s: String = lang?
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '-'))
+        .collect();
+    (!s.is_empty()).then_some(s)
+}
