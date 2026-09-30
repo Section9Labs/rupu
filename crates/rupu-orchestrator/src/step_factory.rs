@@ -1396,6 +1396,245 @@ steps:
         assert_eq!(fo.artifact_root, Some(tmp.path().join("store")));
     }
 
+    // ── Findings profile: the full precedence table, and the unit shapes
+    // that reach the factory under an id other than a top-level step's ──
+
+    /// Agent files for the precedence table: one per frontmatter setting.
+    fn write_profile_agents(global: &std::path::Path) {
+        let agents_dir = global.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        for (name, line) in [
+            ("fp_none", ""),
+            ("fp_full", "findingsProfile: full\n"),
+            ("fp_summary", "findingsProfile: summary\n"),
+        ] {
+            std::fs::write(
+                agents_dir.join(format!("{name}.md")),
+                format!("---\nname: {name}\ntools: [report_finding]\n{line}---\nAssess.\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn findings_profile_precedence_table() {
+        use rupu_coverage::FindingProfile::{self, Full, Summary};
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_profile_agents(tmp.path());
+        let name = |p: Option<FindingProfile>| match p {
+            None => None,
+            Some(Full) => Some("full"),
+            Some(Summary) => Some("summary"),
+        };
+        // (step, workflow defaults, agent frontmatter) → resolved.
+        type Row = (
+            Option<FindingProfile>,
+            Option<FindingProfile>,
+            Option<FindingProfile>,
+            FindingProfile,
+        );
+        let table: &[Row] = &[
+            // The step wins over everything.
+            (Some(Summary), Some(Full), Some(Full), Summary),
+            (Some(Full), Some(Summary), Some(Summary), Full),
+            (Some(Summary), None, None, Summary),
+            // Then the workflow default, over the agent.
+            (None, Some(Summary), Some(Full), Summary),
+            (None, Some(Full), Some(Summary), Full),
+            (None, Some(Summary), None, Summary),
+            // Then the agent's frontmatter.
+            (None, None, Some(Summary), Summary),
+            (None, None, Some(Full), Full),
+            // Then the built-in default.
+            (None, None, None, Full),
+        ];
+        for &(step, defaults, agent, expected) in table {
+            let agent_name = match name(agent) {
+                None => "fp_none".to_string(),
+                Some(p) => format!("fp_{p}"),
+            };
+            let mut wf = String::from("name: precedence\n");
+            if let Some(d) = name(defaults) {
+                wf.push_str(&format!("defaults:\n  findings_profile: {d}\n"));
+            }
+            wf.push_str(&format!(
+                "steps:\n  - id: s\n    agent: {agent_name}\n    prompt: p\n"
+            ));
+            if let Some(p) = name(step) {
+                wf.push_str(&format!("    findings_profile: {p}\n"));
+            }
+            let mut f = factory(tmp.path().to_path_buf());
+            f.workflow = Workflow::parse(&wf).expect("workflow must parse");
+            let got = f
+                .build_opts_for_step(
+                    "s",
+                    &agent_name,
+                    "p".to_string(),
+                    "run1".to_string(),
+                    "ws1".to_string(),
+                    tmp.path().to_path_buf(),
+                    tmp.path().join("s.jsonl"),
+                    None,
+                )
+                .await
+                .tool_context
+                .findings
+                .expect("findings options always set")
+                .profile;
+            assert_eq!(
+                got, expected,
+                "step={step:?} defaults={defaults:?} agent={agent:?}"
+            );
+        }
+    }
+
+    /// Delegates to a real [`DefaultStepFactory`] and records the findings
+    /// profile each build resolved, then swaps in a scripted provider so the
+    /// run completes without a network call.
+    struct RecordingFactory {
+        inner: DefaultStepFactory,
+        seen: std::sync::Mutex<Vec<(String, rupu_coverage::FindingProfile)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StepFactory for RecordingFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: std::path::PathBuf,
+            transcript_path: std::path::PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> rupu_agent::AgentRunOpts {
+            let mut opts = self
+                .inner
+                .build_opts_for_step(
+                    step_id,
+                    agent_name,
+                    rendered_prompt,
+                    run_id,
+                    workspace_id,
+                    workspace_path,
+                    transcript_path,
+                    on_tool_call,
+                )
+                .await;
+            let profile = opts
+                .tool_context
+                .findings
+                .as_ref()
+                .expect("findings options always set")
+                .profile;
+            self.seen
+                .lock()
+                .unwrap()
+                .push((step_id.to_string(), profile));
+            opts.provider = Box::new(rupu_agent::runner::MockProvider::new(vec![
+                rupu_agent::runner::ScriptedTurn::AssistantText {
+                    text: "done".into(),
+                    stop: rupu_providers::types::StopReason::EndTurn,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ]));
+            opts
+        }
+    }
+
+    fn run_opts(
+        wf: Workflow,
+        dir: &std::path::Path,
+        factory: Arc<RecordingFactory>,
+    ) -> crate::runner::OrchestratorRunOpts {
+        crate::runner::OrchestratorRunOpts {
+            run_step: Default::default(),
+            workflow: wf,
+            inputs: Default::default(),
+            workspace_id: "ws_profile".into(),
+            workspace_path: dir.to_path_buf(),
+            transcript_dir: dir.join("transcripts"),
+            factory,
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn for_each_units_resolve_their_steps_profile() {
+        use rupu_coverage::FindingProfile::Summary;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_profile_agents(tmp.path());
+        // The agent says full and the workflow default says full; only the
+        // fan-out step says summary. Every unit must get summary.
+        let wf = Workflow::parse(
+            "name: fanout\ndefaults:\n  findings_profile: full\nsteps:\n  - id: fan\n    for_each: '[\"a.rs\", \"b.rs\", \"c.rs\"]'\n    agent: fp_full\n    prompt: \"assess {{ item }}\"\n    findings_profile: summary\n",
+        )
+        .expect("workflow must parse");
+        let mut inner = factory(tmp.path().to_path_buf());
+        inner.workflow = wf.clone();
+        let rec = Arc::new(RecordingFactory {
+            inner,
+            seen: Default::default(),
+        });
+        crate::runner::run_workflow(run_opts(wf, tmp.path(), Arc::clone(&rec)))
+            .await
+            .expect("run completes");
+        let seen = rec.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "one build per unit: {seen:?}");
+        for (step_id, profile) in seen {
+            assert_eq!(step_id, "fan");
+            assert_eq!(profile, Summary);
+        }
+    }
+
+    #[tokio::test]
+    async fn on_reject_cleanup_sub_steps_resolve_their_own_profile() {
+        use rupu_coverage::FindingProfile::{Full, Summary};
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_profile_agents(tmp.path());
+        // The cleanup sub-step lives under the gate, not in `steps`; the
+        // factory finds it there and resolves step → defaults → agent.
+        let wf = Workflow::parse(
+            "name: gated\ndefaults:\n  findings_profile: full\nsteps:\n  - id: gate\n    approval:\n      required: true\n      on_reject:\n        - id: triage\n          agent: fp_full\n          prompt: p\n          findings_profile: summary\n        - id: note\n          agent: fp_summary\n          prompt: p\n",
+        )
+        .expect("workflow must parse");
+        let mut inner = factory(tmp.path().to_path_buf());
+        inner.workflow = wf.clone();
+        let rec = Arc::new(RecordingFactory {
+            inner,
+            seen: Default::default(),
+        });
+        let mut opts = run_opts(wf, tmp.path(), Arc::clone(&rec));
+        opts.resume_from = Some(crate::runner::ResumeState::from_rejection(
+            "run_gated".into(),
+            Vec::new(),
+            "gate".into(),
+            "not today".into(),
+        ));
+        crate::runner::run_reject_cleanup(opts, "gate", "not today", "cli", None)
+            .await
+            .expect("cleanup completes");
+        let seen = rec.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![("triage".to_string(), Summary), ("note".to_string(), Full)],
+            "the step's own profile, else the workflow default over the agent's"
+        );
+    }
+
     #[tokio::test]
     async fn bash_config_reaches_the_step_opts() {
         // Regression for ISSUES.md I-18: the workflow path hardcoded a 120s

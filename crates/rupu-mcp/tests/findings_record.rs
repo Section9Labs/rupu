@@ -292,3 +292,98 @@ async fn summary_profile_refuses_a_report() {
         .expect_err("report under summary must be refused");
     assert!(err.to_string().contains("summary profile"), "{err}");
 }
+
+#[tokio::test]
+async fn full_profile_refuses_an_agent_supplied_verification() {
+    // Verification is the verdict of a later verification run; a step cannot
+    // confirm the finding it is recording.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let mut report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    report["verification"] = serde_json::json!({ "status": "confirmed" });
+    let err = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("self-verification must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("report.verification"), "{msg}");
+    assert!(msg.contains("set by verification runs"), "{msg}");
+    let paths = rupu_coverage::CoveragePaths::new(
+        tmp.path(),
+        &rupu_coverage::target_id(tmp.path(), "chimera-campaign"),
+    );
+    assert!(!paths.findings.exists(), "nothing written on rejection");
+}
+
+#[tokio::test]
+async fn a_per_call_profile_overrides_the_run_default() {
+    // The dispatcher is built once per run with the run default (`full`);
+    // an action step's own `findings_profile: summary` arrives per call.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    dispatcher
+        .call("findings.record", host_finding())
+        .await
+        .expect_err("summary-shaped call is refused under the run default");
+    let out = dispatcher
+        .call_with_findings_profile(
+            "findings.record",
+            host_finding(),
+            rupu_coverage::FindingProfile::Summary,
+        )
+        .await
+        .expect("summary-shaped call records under a per-call summary profile");
+    assert!(out.starts_with("finding_id: fnd_"), "got {out}");
+    let paths = rupu_coverage::CoveragePaths::new(
+        tmp.path(),
+        &rupu_coverage::target_id(tmp.path(), "chimera-campaign"),
+    );
+    let recs = rupu_coverage::read_findings(&paths).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].profile, rupu_coverage::FindingProfile::Summary);
+}
+
+#[tokio::test]
+async fn structural_errors_name_the_field_path() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let mut report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    report["call_chain"][0]["role"] = serde_json::json!("entrypoint");
+    let msg = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report.clone() }),
+        )
+        .await
+        .expect_err("a bad nested variant must be refused")
+        .to_string();
+    assert!(msg.contains("report.call_chain[0].role"), "{msg}");
+    assert!(msg.contains("unknown variant `entrypoint`"), "{msg}");
+
+    report["call_chain"][0]["role"] = serde_json::json!("sink");
+    let hop = report["call_chain"][0].as_object_mut().unwrap();
+    let label = hop.remove("label").unwrap();
+    hop.insert("lable".into(), label);
+    let msg = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("a nested typo must be refused")
+        .to_string();
+    assert!(msg.contains("report.call_chain[0]"), "{msg}");
+    assert!(msg.contains("lable"), "{msg}");
+}

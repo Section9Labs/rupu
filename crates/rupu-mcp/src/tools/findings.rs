@@ -28,9 +28,11 @@ pub struct FindingsContext {
     pub run_id: String,
     pub model: String,
     pub surface: rupu_coverage::Surface,
-    /// Profile + artifact store + limits. For an `action:` step this is the
-    /// workflow `defaults.findings_profile` (the dispatcher is built once per
-    /// run); a step-level `findings_profile` on an action step is a parse error.
+    /// Profile + artifact store + limits. The profile here is the run
+    /// default (workflow `defaults.findings_profile`, else `full`); the
+    /// dispatcher is built once per run, so an `action:` step's own
+    /// `findings_profile` reaches `findings.record` per call through
+    /// `ToolDispatcher::call_with_findings_profile`.
     pub options: rupu_coverage::FindingWriteOptions,
 }
 
@@ -79,8 +81,9 @@ pub fn specs() -> Vec<ToolSpec> {
         name: "findings.record",
         description: "Record a security finding in this project's findings ledger, so it appears \
                       in the control plane rather than only in an external tracker. Use the \
-                      narrowest scope the evidence supports. Under the run's full findings \
-                      profile send `report` (a complete finding report) and omit \
+                      narrowest scope the evidence supports. Under the full findings profile \
+                      (the step's `findings_profile`, else the workflow default, else full) \
+                      send `report` (a complete finding report) and omit \
                       summary/severity/rationale; under the summary profile send summary, \
                       severity and rationale.",
         input_schema,

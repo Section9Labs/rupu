@@ -1190,3 +1190,94 @@ steps:
         "skipped action step must never reach the connector"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A step-level `findings_profile` on an `action: findings.record` step reaches
+// the tool per call, overriding the run default the dispatcher was built with.
+// ---------------------------------------------------------------------------
+
+const WF_FINDINGS_SUMMARY_STEP: &str = r#"
+name: findings-summary-step
+steps:
+  - id: record
+    action: findings.record
+    findings_profile: summary
+    with:
+      scope: host
+      target_ref: "gateway.internal.example"
+      summary: "Admin console reachable without authentication"
+      severity: high
+      rationale: "GET /admin returned 200 with no session."
+"#;
+
+#[tokio::test]
+async fn step_level_findings_profile_reaches_findings_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_FINDINGS_SUMMARY_STEP).unwrap();
+    // The run default is `full` (no `defaults.findings_profile`), exactly as
+    // the CLI builds it; only the step says `summary`.
+    let dispatcher = Arc::new(
+        ToolDispatcher::new(
+            Arc::new(Registry::empty()),
+            McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
+        )
+        .with_findings(rupu_mcp::FindingsContext {
+            workspace_path: tmp.path().to_path_buf(),
+            scope_name: "findings-summary-step".into(),
+            run_id: "run_findings_profile".into(),
+            model: "mock-1".into(),
+            surface: rupu_coverage::Surface::Workflow,
+            options: rupu_coverage::FindingWriteOptions::default(),
+        }),
+    );
+    assert_eq!(
+        rupu_coverage::FindingWriteOptions::default().profile,
+        rupu_coverage::FindingProfile::Full
+    );
+
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_findings_profile".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_FINDINGS_SUMMARY_STEP.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts)
+        .await
+        .expect("summary-shaped findings.record succeeds under the step's summary profile");
+    let step = &res.step_results[0];
+    assert!(step.success, "step must succeed: {}", step.output);
+    assert!(
+        step.output.starts_with("finding_id: fnd_"),
+        "{}",
+        step.output
+    );
+
+    let paths = rupu_coverage::CoveragePaths::new(
+        tmp.path(),
+        &rupu_coverage::target_id(tmp.path(), "findings-summary-step"),
+    );
+    let found = rupu_coverage::read_findings(&paths).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].profile, rupu_coverage::FindingProfile::Summary);
+    assert_eq!(
+        found[0].summary,
+        "Admin console reachable without authentication"
+    );
+}

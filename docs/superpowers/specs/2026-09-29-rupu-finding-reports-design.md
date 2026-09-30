@@ -157,8 +157,8 @@ collide. rupu therefore:
   against **both** the JSON Schema and the serde validator, and fails if they
   disagree.
 - `rupu findings schema [--profile full]` prints the schema, so external
-  prompts (for example `~/Security`) can be regenerated from rupu rather than
-  hand-maintained.
+  prompts (for example, an external prompt file) can be regenerated from rupu
+  rather than hand-maintained.
 - Organisation-specific guidance (for example, which ticket-system URL
   patterns count as existing tickets) is **not** shipped. It is configurable
   as `[findings].ticket_patterns` and appended to the injected guidance when
@@ -290,9 +290,7 @@ the transcript's markdown + HighlighterSwift path and the existing Code tab
 for jumps. The findings table gains the triage card. Exports call the CP
 endpoints.
 
-A local-only visual mockup of the report view, the table row, and the inline
-card was reviewed during brainstorming. It is not committed because it used
-restricted assessment data.
+A visual mockup was reviewed during brainstorming; it is not part of the repo.
 
 ## Export generation
 

@@ -10,6 +10,10 @@ pub fn base_options(global: &Path, cfg: &rupu_config::FindingsConfig) -> Finding
     FindingWriteOptions {
         artifact_root: Some(global.join("findings").join("artifacts")),
         artifact_max_bytes: cfg.artifact_max_bytes.unwrap_or(d.artifact_max_bytes),
+        artifact_max_files: cfg.artifact_max_files.unwrap_or(d.artifact_max_files),
+        artifact_total_max_bytes: cfg
+            .artifact_total_max_bytes
+            .unwrap_or(d.artifact_total_max_bytes),
         report_max_bytes: cfg
             .report_max_bytes
             .map(|b| usize::try_from(b).unwrap_or(usize::MAX))
@@ -35,10 +39,23 @@ mod tests {
             o.artifact_max_bytes,
             rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES
         );
+        assert_eq!(
+            o.artifact_max_files,
+            rupu_coverage::report::DEFAULT_ARTIFACT_MAX_FILES
+        );
+        assert_eq!(
+            o.artifact_total_max_bytes,
+            rupu_coverage::report::DEFAULT_ARTIFACT_TOTAL_MAX_BYTES
+        );
         let cfg = rupu_config::FindingsConfig {
             artifact_max_bytes: Some(10),
+            artifact_max_files: Some(3),
+            artifact_total_max_bytes: Some(99),
             ..Default::default()
         };
-        assert_eq!(base_options(g, &cfg).artifact_max_bytes, 10);
+        let o = base_options(g, &cfg);
+        assert_eq!(o.artifact_max_bytes, 10);
+        assert_eq!(o.artifact_max_files, 3);
+        assert_eq!(o.artifact_total_max_bytes, 99);
     }
 }

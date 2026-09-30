@@ -74,6 +74,10 @@ fn invalid_cases_rejected_by_both() {
             mutated(|v| v["regression_test"] = json!("Not Provided — ")),
         ),
         (
+            "justification after a double space",
+            mutated(|v| v["regression_test"] = json!("Not Provided —  needs the board")),
+        ),
+        (
             "bad ticket sentinel",
             mutated(|v| v["tickets"] = json!("TBD")),
         ),

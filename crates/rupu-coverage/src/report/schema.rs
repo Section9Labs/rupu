@@ -6,6 +6,9 @@
 //! differ in which JSON Schema keywords their tool-calling accepts, so it
 //! keeps only the widely supported subset. Dropping keywords there loses
 //! nothing — `validate_report` enforces the full contract on every write.
+//! It also omits the fields rupu fills in itself (`verification`, each
+//! claim's `sha256`, and every artifact field but `path`): stored records
+//! carry them, but an agent is never asked for them.
 
 use serde_json::Value;
 
@@ -19,7 +22,34 @@ pub fn canonical_schema() -> Value {
 pub fn advertised_schema() -> Value {
     let mut v = canonical_schema();
     simplify_schema(&mut v);
+    strip_rupu_owned_fields(&mut v);
     v
+}
+
+/// Remove the fields rupu sets at write time (or a later verification run
+/// sets) from the copy an agent sees. The canonical schema keeps them,
+/// because stored records carry them.
+fn strip_rupu_owned_fields(schema: &mut Value) {
+    let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return;
+    };
+    props.remove("verification");
+    if let Some(claim) = props
+        .get_mut("evidence")
+        .and_then(|e| e.get_mut("items"))
+        .and_then(|i| i.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+    {
+        claim.remove("sha256");
+    }
+    if let Some(artifact) = props
+        .get_mut("artifacts")
+        .and_then(|a| a.get_mut("items"))
+        .and_then(|i| i.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+    {
+        artifact.retain(|k, _| k == "path");
+    }
 }
 
 /// Keywords removed from the advertised copy.
@@ -95,6 +125,26 @@ mod tests {
             assert!(!keys.iter().any(|k| k == banned), "{banned} survived");
         }
         assert!(keys.iter().any(|k| k == "anyOf"), "oneOf must become anyOf");
+    }
+
+    #[test]
+    fn advertised_schema_omits_fields_rupu_sets() {
+        let s = advertised_schema();
+        assert!(s["properties"].get("verification").is_none());
+        assert!(s["properties"]["evidence"]["items"]["properties"]
+            .get("sha256")
+            .is_none());
+        let artifact: Vec<&String> = s["properties"]["artifacts"]["items"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(artifact, vec!["path"]);
+        // The canonical schema still describes stored records in full.
+        let c = canonical_schema();
+        assert!(c["properties"]["verification"].is_object());
+        assert!(c["properties"]["evidence"]["items"]["properties"]["sha256"].is_object());
+        assert!(c["properties"]["artifacts"]["items"]["properties"]["stored"].is_object());
     }
 
     #[test]

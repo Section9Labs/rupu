@@ -99,13 +99,39 @@ pub fn report_finding(
                 .into_iter()
                 .map(|f| f.id)
                 .collect();
-            crate::report::validate_report(
-                &report,
-                &ValidateCtx {
-                    known_finding_ids: &known,
-                    max_bytes: opts.report_max_bytes,
-                },
-            )?;
+            // `verification` is part of a stored record, but it is the
+            // verdict of a later verification run: the agent that wrote the
+            // finding cannot confirm its own work. Reported alongside every
+            // other problem so the agent still fixes them all in one retry.
+            let mut problems = Vec::new();
+            if report.verification.is_some() {
+                problems.push(crate::report::FieldError {
+                    path: "report.verification".into(),
+                    message: "set by verification runs, not by the reporting agent; omit it".into(),
+                });
+            }
+            if let Err(crate::report::ReportValidationError(errors)) =
+                crate::report::validate_report(
+                    &report,
+                    &ValidateCtx {
+                        known_finding_ids: &known,
+                        max_bytes: opts.report_max_bytes,
+                    },
+                )
+            {
+                problems.extend(errors);
+            }
+            if !problems.is_empty() {
+                return Err(ReportFindingError::Report(
+                    crate::report::ReportValidationError(problems),
+                ));
+            }
+            // A claim's hash is rupu's record of the file at write time, not
+            // something the agent can assert: drop whatever it sent, then
+            // hash what is actually there (or leave it unset).
+            for claim in &mut report.evidence {
+                claim.sha256 = None;
+            }
             if !report.artifacts.is_empty() {
                 let store = opts
                     .artifact_root
@@ -113,9 +139,9 @@ pub fn report_finding(
                     .map(crate::report::ArtifactStore::new)
                     .ok_or(crate::report::ArtifactError::NoStore)?;
                 report.artifacts =
-                    store.ingest(&paths.workspace, &report.artifacts, opts.artifact_max_bytes)?;
+                    store.ingest(&paths.workspace, &report.artifacts, opts.ingest_limits())?;
             }
-            hash_claim_files(&paths.workspace, &mut report);
+            hash_claim_files(&paths.workspace, &mut report, opts.artifact_max_bytes);
             // Directory artifacts expand to one entry per file, so the report
             // can grow far past the budget `validate_report` checked. Re-check
             // before anything reaches the ledger.
@@ -168,27 +194,55 @@ pub fn report_finding(
         .create(true)
         .append(true)
         .open(&paths.findings)?;
-    let line = serde_json::to_string(&record)?;
+    // One `write_all` of the line and its newline together: with two
+    // writes, a concurrent writer appending to the same ledger could land
+    // its line between ours and our newline, fusing two records into one
+    // unparseable line.
+    let mut line = serde_json::to_string(&record)?;
+    line.push('\n');
     f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
     f.flush()?;
     Ok(ReportFindingOutput { id })
 }
 
 /// Record the SHA-256 of each evidence claim's file as it is right now, so a
 /// viewer can later flag a claim whose code has changed. Claims whose file
-/// is not in the workspace (binary targets, other trees) keep whatever the
-/// agent supplied.
-fn hash_claim_files(workspace: &std::path::Path, report: &mut crate::report::FindingReport) {
+/// is not in the workspace (binary targets, other trees) are left unhashed;
+/// the caller has already cleared anything the agent supplied.
+///
+/// Same containment rule as the artifact store: the claim's path is
+/// canonicalized and a file that resolves outside the workspace (a symlink
+/// out, say) is never read. Files over `max_bytes` (the artifact copy cap)
+/// are left unhashed rather than streamed in full, and each distinct file is
+/// hashed once however many claims cite it.
+fn hash_claim_files(
+    workspace: &std::path::Path,
+    report: &mut crate::report::FindingReport,
+    max_bytes: u64,
+) {
+    let Ok(ws_canon) = std::fs::canonicalize(workspace) else {
+        return;
+    };
+    let mut hashed: std::collections::HashMap<std::path::PathBuf, Option<String>> =
+        std::collections::HashMap::new();
     for claim in &mut report.evidence {
-        if let Some(file) = &claim.file {
-            let abs = workspace.join(file);
-            if abs.is_file() {
-                if let Ok(h) = crate::report::artifacts::sha256_file(&abs) {
-                    claim.sha256 = Some(h);
-                }
-            }
+        let Some(file) = &claim.file else { continue };
+        let Ok(canon) = std::fs::canonicalize(workspace.join(file)) else {
+            continue;
+        };
+        if !canon.starts_with(&ws_canon) {
+            continue;
         }
+        claim.sha256 = hashed
+            .entry(canon)
+            .or_insert_with_key(|canon| {
+                let meta = std::fs::metadata(canon).ok()?;
+                if !meta.is_file() || meta.len() > max_bytes {
+                    return None;
+                }
+                crate::report::artifacts::sha256_file(canon).ok()
+            })
+            .clone();
     }
 }
 
@@ -594,6 +648,158 @@ mod tests {
             Some(crate::report::ArtifactStorage::Copied)
         );
         assert_eq!(rep.evidence[0].sha256.as_ref().map(String::len), Some(64));
+    }
+
+    #[test]
+    fn agent_supplied_verification_is_rejected_with_the_other_problems() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut r = fixture_report();
+        r.verification = Some(crate::report::Verification {
+            status: crate::report::VerificationStatus::Confirmed,
+            by_run: None,
+            notes: None,
+        });
+        r.root_cause = String::new();
+        let err = report_finding(&paths, attribution(), full_input(r), &full_opts(ws.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.verification"), "{err}");
+        assert!(err.contains("set by verification runs"), "{err}");
+        assert!(err.contains("report.root_cause"), "{err}");
+        assert!(!paths.findings.exists(), "nothing written on rejection");
+    }
+
+    #[test]
+    fn agent_supplied_claim_hashes_are_never_stored() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/routes")).unwrap();
+        std::fs::write(ws.path().join("src/routes/notes.rs"), "fn get_note() {}\n").unwrap();
+        let mut r = fixture_report();
+        let forged = "0".repeat(64);
+        // Claim 0's file exists: rupu's hash replaces the forged one.
+        r.evidence[0].file = Some("src/routes/notes.rs".into());
+        r.evidence[0].sha256 = Some(forged.clone());
+        // Claim 1's file is not in the workspace: the forged hash is dropped.
+        let mut other = r.evidence[0].clone();
+        other.file = Some("not/here.rs".into());
+        r.evidence.push(other);
+        let paths = CoveragePaths::new(ws.path(), "t");
+        report_finding(
+            &paths,
+            attribution(),
+            full_input(r),
+            &full_opts(store.path()),
+        )
+        .unwrap();
+        let rep = only_record(&paths).report.unwrap();
+        let h0 = rep.evidence[0].sha256.clone().expect("hashed by rupu");
+        assert_ne!(h0, forged);
+        assert_eq!(h0.len(), 64);
+        assert_eq!(rep.evidence[1].sha256, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claim_file_symlinked_outside_the_workspace_is_not_hashed() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "not yours\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            ws.path().join("looks_local.txt"),
+        )
+        .unwrap();
+        std::fs::write(ws.path().join("big.bin"), vec![0u8; 64]).unwrap();
+        std::fs::write(ws.path().join("small.rs"), "fn a() {}\n").unwrap();
+        let mut r = fixture_report();
+        let mut claim = r.evidence[0].clone();
+        claim.file = Some("looks_local.txt".into());
+        let mut big = claim.clone();
+        big.file = Some("big.bin".into());
+        let mut small = claim.clone();
+        small.file = Some("small.rs".into());
+        let small_again = small.clone();
+        r.evidence = vec![claim, big, small, small_again];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = crate::report::FindingWriteOptions {
+            artifact_max_bytes: 32,
+            ..full_opts(store.path())
+        };
+        report_finding(&paths, attribution(), full_input(r), &opts).unwrap();
+        let rep = only_record(&paths).report.unwrap();
+        assert_eq!(rep.evidence[0].sha256, None, "outside the workspace");
+        assert_eq!(rep.evidence[1].sha256, None, "over the size cap");
+        let h = rep.evidence[2]
+            .sha256
+            .clone()
+            .expect("small local file hashed");
+        assert_eq!(rep.evidence[3].sha256.as_deref(), Some(h.as_str()));
+    }
+
+    #[test]
+    fn artifact_caps_come_from_the_options() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("pocs")).unwrap();
+        for n in 0..3 {
+            std::fs::write(ws.path().join(format!("pocs/f{n}.txt")), "xx").unwrap();
+        }
+        let mut r = fixture_report();
+        r.artifacts = vec![crate::report::ArtifactRef {
+            path: "pocs".into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let count = crate::report::FindingWriteOptions {
+            artifact_max_files: 2,
+            ..full_opts(store.path())
+        };
+        let err = report_finding(&paths, attribution(), full_input(r.clone()), &count)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than 2 files"), "{err}");
+        let total = crate::report::FindingWriteOptions {
+            artifact_total_max_bytes: 5,
+            ..full_opts(store.path())
+        };
+        let err = report_finding(&paths, attribution(), full_input(r), &total)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("6 bytes across 3 files"), "{err}");
+        assert!(!paths.findings.exists(), "nothing written on rejection");
+    }
+
+    #[test]
+    fn an_artifact_over_the_per_file_cap_is_recorded_by_reference_not_rejected() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("huge.bin"), vec![9u8; 100]).unwrap();
+        let mut r = fixture_report();
+        r.artifacts = vec![crate::report::ArtifactRef {
+            path: "huge.bin".into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        // Bigger than both the per-file and the total cap.
+        let opts = crate::report::FindingWriteOptions {
+            artifact_max_bytes: 10,
+            artifact_total_max_bytes: 15,
+            ..full_opts(store.path())
+        };
+        report_finding(&paths, attribution(), full_input(r), &opts)
+            .expect("an over-cap file is recorded external, never a rejection");
+        assert!(paths.findings.exists(), "the finding was written");
     }
 
     #[test]

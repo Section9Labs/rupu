@@ -10,6 +10,7 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { summarizeInput, parseAstGrepText, parseSubrunOutput } from './ToolCard';
 import ToolCard from './ToolCard';
 import type { ToolView, FindingView } from './transcriptView';
+import { buildTranscriptView } from './transcriptView';
 import { api } from '../../lib/api';
 import type { SourceSlice, AstResponse } from '../../lib/api';
 
@@ -196,6 +197,43 @@ it('finding ToolView renders the finding summary (no extra outer header)', () =>
   expect(screen.getByText('Secret key in binary')).not.toBeNull();
   // Finding uses its own chrome — no ⚙ prefix in the header
   expect(screen.queryByText(/⚙ report_finding/)).toBeNull();
+});
+
+it('full-profile {scope, report} report_finding call renders title + severity', () => {
+  const [tool] = buildTranscriptView([
+    {
+      type: 'tool_call',
+      data: {
+        call_id: 'f1',
+        tool: 'report_finding',
+        input: {
+          scope: 'repo',
+          report: {
+            title: 'Session cookie lacks the Secure flag',
+            rating: { risk_rating: 'High' },
+            root_cause: 'The cookie builder never sets `secure(true)`.',
+            evidence: [{ claim: 'builder call', excerpt: 'Cookie::build("sid", v)' }],
+          },
+        },
+      },
+    },
+  ]).turns.flatMap((t) => t.blocks).flatMap((b) => (b.kind === 'tool' ? [b.view] : []));
+  render(<ToolCard tool={tool} />);
+  expect(screen.getByText('Session cookie lacks the Secure flag')).not.toBeNull();
+  expect(screen.getByText('HIGH')).not.toBeNull();
+  expect(screen.queryByText(/⚙ report_finding/)).toBeNull();
+});
+
+it('finding ToolView without a parsed finding (malformed / rejected) falls back to the generic card', () => {
+  const tv: ToolView = {
+    tool: 'report_finding',
+    kind: 'finding',
+    input: { scope: 'repo', report: { tickets: 'TBD' } },
+    error: 'finding report has 1 problem(s); fix all of them and call again',
+  };
+  expect(() => render(<ToolCard tool={tv} />)).not.toThrow();
+  expect(screen.getByText(/⚙ report_finding/)).not.toBeNull();
+  expect(screen.getByText(/finding report has 1 problem/)).not.toBeNull();
 });
 
 it('terminal ToolView renders the command inside TerminalBlock', () => {

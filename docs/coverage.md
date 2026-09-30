@@ -133,8 +133,8 @@ back as `summary`.
 
 ### What `full` requires
 
-Every field of the report is required except `cwe` (it may be an empty list),
-`artifacts`, and `verification`. The rules below are enforced at write time; a
+Every field of the report is required except `cwe` (it may be an empty list)
+and `artifacts`. The rules below are enforced at write time; a
 rejected call returns **every** problem at once, each with its field path, so
 the agent can fix them all in one retry. (A structurally malformed JSON argument
 surfaces as a single parse error instead.) When a full-profile run can record
@@ -142,10 +142,20 @@ findings (the agent has a `concerns:` block or `report_finding` in `tools:`),
 finding-writing guidance is also appended to its system prompt, so the agent
 needs no external reporting-standard file.
 
-`artifacts` is described under [Artifacts](#artifacts) below. `verification` is
-optional and is normally left to rupu or a verifier rather than the agent that
-wrote the finding: `{status: unverified|confirmed|disputed|inconclusive,
-by_run?, notes?}`.
+`artifacts` is described under [Artifacts](#artifacts) below.
+
+Some fields of a stored report are set by rupu, never by the reporting agent,
+and are left out of the schema the agent is shown:
+
+- `verification` (`{status: unverified|confirmed|disputed|inconclusive,
+  by_run?, notes?}`) is set by verification runs, not by the agent that wrote
+  the finding. A `report_finding` / `findings.record` call that supplies it is
+  rejected at `report.verification`.
+- Each evidence claim's `sha256` is the hash rupu takes of the claim's `file`
+  at write time. Anything the agent sends there is discarded; a claim whose
+  file is not in the workspace is stored without a hash.
+- An artifact's `sha256`, `size`, `kind`, `stored`, and `host` are filled in
+  when rupu stores it; the agent supplies only `path`.
 
 - Required strings must be non-empty after trimming.
 - Ratings (`impact`, `risk_rating`, `risk_factor`) are `Low`/`Medium`/`High`/`Critical`;
@@ -187,20 +197,34 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A larger file is recorded `stored: external` with its path, size, and sha256.
 - A directory expands to the files inside it, each handled by the same rule.
   Symlinks inside a directory are skipped.
-- A path that escapes the workspace, does not exist, or names something other
-  than a regular file (a device, socket, or the like) rejects the finding, so a
-  typo is not silently dropped.
+- One report's artifacts are bounded before anything is copied: at most
+  `[findings].artifact_max_files` files (default 500), and the files that
+  will be copied into the store may add up to at most
+  `[findings].artifact_total_max_bytes` bytes (default 2 GiB). A file over
+  `artifact_max_bytes` is recorded by reference and does not count toward
+  that total, so it never rejects the finding. A larger set rejects the
+  finding with the count or total named; list specific files instead of
+  large directories.
+- A path that escapes the workspace, names the workspace root itself (`.`),
+  does not exist, or names something other than a regular file (a device,
+  socket, or the like) rejects the finding, so a typo is not silently dropped.
 - A remote workflow unit (`host:` / `distribute:`) runs `report_finding` on the
   host, so its artifacts go into **that host's** store and are recorded
   `stored: copied` with no `host`. Recording them as `stored: external` with
   `host` set, and pulling them into the coordinator's store on first view, is
   specified but not built yet.
 
+Each evidence claim's `sha256` is taken only from a file that resolves inside
+the workspace and is no larger than `artifact_max_bytes`; other claims are
+stored without a hash.
+
 ### Configuration
 
 ```toml
 [findings]
 artifact_max_bytes = 524288000   # copy cap per artifact file (default 500 MiB)
+artifact_max_files = 500         # files per report's artifacts (default 500)
+artifact_total_max_bytes = 2147483648  # bytes copied into the store per report (default 2 GiB)
 report_max_bytes = 262144        # serialized report budget (default 256 KiB)
 ticket_patterns = ["ABC-[0-9]+"] # extra hints appended to the full-profile guidance
 ```

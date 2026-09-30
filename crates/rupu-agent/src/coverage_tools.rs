@@ -294,12 +294,28 @@ impl Tool for ReportFindingTool {
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
-        let parsed: ReportFindingInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        // `serde_path_to_error` so a structural error names where it is
+        // (`report.call_chain[0].role: unknown variant ...`) instead of a
+        // bare message the agent has to hunt for in a large report.
+        let parsed: ReportFindingInput = serde_path_to_error::deserialize(input)
+            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let attribution = attribution_from_ctx(ctx);
-        match report_finding(&self.paths, attribution, parsed, &self.options) {
-            Ok(out) => Ok(ok_output(format!("finding_id: {}", out.id), started)),
-            Err(e) => Ok(err_output(e.to_string(), started)),
+        // The write is synchronous and can be long (hashing and copying
+        // artifacts up to the configured caps), so it runs on the blocking
+        // pool rather than stalling this runtime worker.
+        let paths = self.paths.clone();
+        let options = self.options.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            report_finding(&paths, attribution, parsed, &options)
+        })
+        .await;
+        match result {
+            Ok(Ok(out)) => Ok(ok_output(format!("finding_id: {}", out.id), started)),
+            Ok(Err(e)) => Ok(err_output(e.to_string(), started)),
+            Err(join) => Ok(err_output(
+                format!("report_finding did not complete: {join}"),
+                started,
+            )),
         }
     }
 }
@@ -551,6 +567,43 @@ mod findings_profile_tests {
         assert!(!req.contains(&"summary"));
         assert!(s["properties"]["report"]["properties"]["root_cause"].is_object());
         assert!(s["properties"].get("summary").is_none());
+    }
+
+    #[tokio::test]
+    async fn structural_errors_name_the_field_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tool = ReportFindingTool::new(
+            CoveragePaths::new(tmp.path(), "t"),
+            FindingWriteOptions::default(),
+        );
+        let mut report: Value = serde_json::from_str(include_str!(
+            "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap();
+        report["call_chain"][0]["role"] = serde_json::json!("entrypoint");
+        let err = tool
+            .invoke(
+                serde_json::json!({ "scope": "repo", "report": report.clone() }),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.call_chain[0].role"), "{err}");
+        assert!(err.contains("unknown variant `entrypoint`"), "{err}");
+
+        report["call_chain"][0]["role"] = serde_json::json!("source");
+        report["rating"]["risk_ratng"] = serde_json::json!("High");
+        let err = tool
+            .invoke(
+                serde_json::json!({ "scope": "repo", "report": report }),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.rating"), "{err}");
+        assert!(err.contains("risk_ratng"), "{err}");
     }
 
     #[test]

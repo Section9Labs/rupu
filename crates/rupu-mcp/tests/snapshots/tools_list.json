@@ -767,7 +767,7 @@
     "name": "gitlab.pipeline_trigger"
   },
   {
-    "description": "Record a security finding in this project's findings ledger, so it appears in the control plane rather than only in an external tracker. Use the narrowest scope the evidence supports. Under the run's full findings profile send `report` (a complete finding report) and omit summary/severity/rationale; under the summary profile send summary, severity and rationale.",
+    "description": "Record a security finding in this project's findings ledger, so it appears in the control plane rather than only in an external tracker. Use the narrowest scope the evidence supports. Under the full findings profile (the step's `findings_profile`, else the workflow default, else full) send `report` (a complete finding report) and omit summary/severity/rationale; under the summary profile send summary, severity and rationale.",
     "inputSchema": {
       "properties": {
         "code_excerpt": {
@@ -803,36 +803,13 @@
           "type": "array"
         },
         "report": {
-          "description": "A complete security finding report, recorded once by the agent. Every presentation (UI, Markdown, HTML, PDF) is generated from it. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
+          "description": "A complete security finding report, recorded once by the agent. The report is the source of truth for the finding. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
           "properties": {
             "artifacts": {
               "description": "Proof-of-concept files (scripts, outputs, harnesses) as workspace-relative paths; rupu stores them with the finding. Supply only 'path'.",
               "items": {
                 "properties": {
-                  "host": {
-                    "type": "string"
-                  },
-                  "kind": {
-                    "enum": [
-                      "text",
-                      "binary"
-                    ],
-                    "type": "string"
-                  },
                   "path": {
-                    "type": "string"
-                  },
-                  "sha256": {
-                    "type": "string"
-                  },
-                  "size": {
-                    "type": "integer"
-                  },
-                  "stored": {
-                    "enum": [
-                      "copied",
-                      "external"
-                    ],
                     "type": "string"
                   }
                 },
@@ -1023,10 +1000,6 @@
                     "maxItems": 2,
                     "minItems": 2,
                     "type": "array"
-                  },
-                  "sha256": {
-                    "description": "Set by rupu; omit.",
-                    "type": "string"
                   }
                 },
                 "required": [
@@ -1252,29 +1225,6 @@
             "title": {
               "description": "Short title specific to the vulnerable feature and target.",
               "type": "string"
-            },
-            "verification": {
-              "properties": {
-                "by_run": {
-                  "type": "string"
-                },
-                "notes": {
-                  "type": "string"
-                },
-                "status": {
-                  "enum": [
-                    "unverified",
-                    "confirmed",
-                    "disputed",
-                    "inconclusive"
-                  ],
-                  "type": "string"
-                }
-              },
-              "required": [
-                "status"
-              ],
-              "type": "object"
             }
           },
           "required": [

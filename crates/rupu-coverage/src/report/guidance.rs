@@ -11,8 +11,8 @@ Findings in this run use the full report profile. Record each finding with one \
 structured data and is the source of truth for this finding.
 
 - Write in a concise, formal, factual tone. Do not speculate.
-- Every field is required. When information genuinely cannot be determined, \
-use the field's sentinel instead of omitting or guessing it: `Unknown` for owner, \
+- Every field is required except `cwe` (may be an empty list) and `artifacts`. \
+When information genuinely cannot be determined, use the field's sentinel instead of omitting or guessing it: `Unknown` for owner, \
 product, affected_component, attack_vector and cvss_v3; `Not Applicable` for \
 source_repository when no source-controlled code is involved; `None Provided` for \
 tickets when none are mentioned; `None` for cross_references when no related \

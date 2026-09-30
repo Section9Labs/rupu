@@ -56,9 +56,14 @@ pub(crate) fn rel_path_problem(p: &str) -> Option<&'static str> {
     None
 }
 
+/// `Not Provided — <justification>`, where the justification starts right
+/// after the prefix's single space. Mirrors the schema's
+/// `^Not Provided — \S`: a second space (or any whitespace) before the
+/// justification is rejected by both.
 fn not_provided_ok(s: &str) -> bool {
     s.strip_prefix(NOT_PROVIDED_PREFIX)
-        .is_some_and(|rest| !rest.trim().is_empty())
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| !c.is_whitespace())
 }
 
 const NOT_PROVIDED_HINT: &str =
@@ -250,6 +255,11 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
     for (i, a) in r.artifacts.iter().enumerate() {
         if let Some(why) = rel_path_problem(&a.path) {
             c.err(format!("report.artifacts[{i}].path"), why);
+        } else if crate::report::artifacts::names_workspace_root(&a.path) {
+            c.err(
+                format!("report.artifacts[{i}].path"),
+                "names the workspace root; list the files or directories inside it that prove the finding",
+            );
         }
     }
 
@@ -338,6 +348,8 @@ mod tests {
         let mut r = valid();
         r.regression_test = OrSentinel::Sentinel("Not Provided — ".into());
         assert_eq!(problems(&r), vec!["report.regression_test".to_string()]);
+        r.regression_test = OrSentinel::Sentinel("Not Provided —  double space".into());
+        assert_eq!(problems(&r), vec!["report.regression_test".to_string()]);
         r.regression_test =
             OrSentinel::Sentinel("Not Provided — requires hardware we do not have".into());
         assert_eq!(problems(&r), Vec::<String>::new());
@@ -418,6 +430,26 @@ mod tests {
             "report.call_chain",
         ] {
             assert!(p.contains(&f.to_string()), "{f} missing from {p:?}");
+        }
+    }
+
+    #[test]
+    fn an_artifact_naming_the_workspace_root_is_rejected() {
+        let mut r = valid();
+        for p in [".", "./", "./."] {
+            r.artifacts = vec![ArtifactRef {
+                path: p.into(),
+                sha256: String::new(),
+                size: 0,
+                kind: None,
+                stored: None,
+                host: None,
+            }];
+            assert_eq!(
+                problems(&r),
+                vec!["report.artifacts[0].path".to_string()],
+                "{p}"
+            );
         }
     }
 

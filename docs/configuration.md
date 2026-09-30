@@ -227,6 +227,8 @@ for what a finding report contains and how artifacts are stored.
 | Key                  | Type            | Default                     | Notes |
 |----------------------|-----------------|-----------------------------|-------|
 | `artifact_max_bytes` | integer         | `524288000` (500 MiB)       | Per-file cap for copying a finding's artifacts into `<RUPU_HOME>/findings/artifacts`. Larger files are recorded by hash only (`stored: external`) |
+| `artifact_max_files` | integer         | `500`                       | Most files one report's artifacts may expand to (a directory counts every file inside it). Checked before anything is copied; a larger set rejects the finding |
+| `artifact_total_max_bytes` | integer   | `2147483648` (2 GiB)        | Most bytes one report's artifacts may add up to in the store: only files that are copied count, and a file over `artifact_max_bytes` (recorded by reference) does not. Checked before anything is copied; a larger set rejects the finding with the total named |
 | `report_max_bytes`   | integer         | `262144` (256 KiB)          | Serialized-size budget for one `full` finding report; a larger report is rejected with the size named |
 | `ticket_patterns`    | array\<string\> | `[]`                        | Patterns (regexes or URL prefixes) that identify existing tickets in your organisation; appended to the finding-writing guidance agents get under the `full` profile. Nothing organisation-specific ships in rupu |
 

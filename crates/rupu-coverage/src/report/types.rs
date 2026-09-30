@@ -6,7 +6,9 @@
 //! error back to the agent, never silently dropped content.
 
 use crate::catalog::types::Severity;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
+use std::marker::PhantomData;
 
 /// Prefix of the one sentinel allowed on mandatory-but-sometimes-impossible
 /// sections. Must be followed by a non-empty justification.
@@ -15,11 +17,80 @@ pub const NOT_PROVIDED_PREFIX: &str = "Not Provided — ";
 /// A field that is either real content or a sentinel string. Which sentinel
 /// strings are acceptable is per field and enforced by
 /// [`crate::report::validate_report`], not by the type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Serializes untagged. Deserializes by hand rather than `untagged`: an
+/// untagged enum buffers the input and, when no variant fits, replaces every
+/// nested error with "data did not match any variant", so a typo three
+/// levels down (`call_chain[0].role`) would surface as a shapeless complaint
+/// about the whole field. Here a JSON string is always the sentinel, and
+/// anything else is deserialized as `T` in place, propagating `T`'s own
+/// error (and its field path, under `serde_path_to_error`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum OrSentinel<T> {
     Value(T),
     Sentinel(String),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OrSentinel<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+        use serde::de::{Error, IntoDeserializer, MapAccess, SeqAccess, Visitor};
+
+        struct OrSentinelVisitor<T>(PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for OrSentinelVisitor<T> {
+            type Value = OrSentinel<T>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("the field's value, or one of its sentinel strings")
+            }
+
+            fn visit_str<E: Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OrSentinel::Sentinel(v.to_owned()))
+            }
+
+            fn visit_string<E: Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OrSentinel::Sentinel(v))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(SeqAccessDeserializer::new(seq)).map(OrSentinel::Value)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(OrSentinel::Value)
+            }
+
+            // Scalars are never a valid `T` here, but let `T` say so in its
+            // own words ("invalid type: boolean `true`, expected a sequence").
+            fn visit_bool<E: Error>(self, v: bool) -> Result<Self::Value, E> {
+                T::deserialize(v.into_deserializer()).map(OrSentinel::Value)
+            }
+
+            fn visit_i64<E: Error>(self, v: i64) -> Result<Self::Value, E> {
+                T::deserialize(v.into_deserializer()).map(OrSentinel::Value)
+            }
+
+            fn visit_u64<E: Error>(self, v: u64) -> Result<Self::Value, E> {
+                T::deserialize(v.into_deserializer()).map(OrSentinel::Value)
+            }
+
+            fn visit_f64<E: Error>(self, v: f64) -> Result<Self::Value, E> {
+                T::deserialize(v.into_deserializer()).map(OrSentinel::Value)
+            }
+
+            fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+                T::deserialize(().into_deserializer()).map(OrSentinel::Value)
+            }
+
+            fn visit_none<E: Error>(self) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+        }
+
+        d.deserialize_any(OrSentinelVisitor(PhantomData))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,4 +336,58 @@ pub struct FindingReport {
     pub artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap()
+    }
+
+    fn parse_error(v: serde_json::Value) -> String {
+        serde_path_to_error::deserialize::<_, FindingReport>(v)
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn a_nested_bad_variant_keeps_its_path_and_message() {
+        let mut v = fixture();
+        v["call_chain"][0]["role"] = serde_json::json!("entrypoint");
+        let msg = parse_error(v);
+        assert!(msg.starts_with("call_chain[0].role: "), "{msg}");
+        assert!(msg.contains("unknown variant `entrypoint`"), "{msg}");
+        assert!(!msg.contains("did not match any variant"), "{msg}");
+    }
+
+    #[test]
+    fn a_nested_typo_keeps_its_path_and_names_the_key() {
+        let mut v = fixture();
+        let hop = v["call_chain"][0].as_object_mut().unwrap();
+        let label = hop.remove("label").unwrap();
+        hop.insert("lable".into(), label);
+        let msg = parse_error(v);
+        assert!(msg.starts_with("call_chain[0]"), "{msg}");
+        assert!(msg.contains("lable"), "{msg}");
+    }
+
+    #[test]
+    fn a_string_is_the_sentinel_and_a_value_round_trips_untagged() {
+        let s: OrSentinel<Vec<Ticket>> = serde_json::from_str("\"None Provided\"").unwrap();
+        assert_eq!(s, OrSentinel::Sentinel("None Provided".into()));
+        let v: OrSentinel<Patch> = serde_json::from_str(r#"{"diff":"-a\n+b"}"#).unwrap();
+        assert!(matches!(&v, OrSentinel::Value(p) if p.diff == "-a\n+b"));
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"diff":"-a\n+b"}"#);
+        assert_eq!(serde_json::to_string(&s).unwrap(), "\"None Provided\"");
+        let err = serde_json::from_str::<OrSentinel<Vec<Ticket>>>("true").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid type: boolean `true`"),
+            "{err}"
+        );
+    }
 }

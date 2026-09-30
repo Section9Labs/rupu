@@ -271,6 +271,8 @@ A workflow step's `findings_profile` or the workflow's `defaults.findings_profil
 
 **Upgrade note:** because the built-in default is `full`, an existing agent that records thin findings (a `concerns:` block, or `report_finding` in `tools:`) is now rejected unless it sets `findingsProfile: summary` (or its workflow sets `findings_profile: summary`), or its prompt is updated to send a complete `report`.
 
+**Remote hosts:** agent frontmatter rejects unknown keys, so a rupu release that predates `findingsProfile` refuses to load an agent file that sets it. A workflow step placed on a remote host (`host:` / `distribute:`) resolves its profile from the agent file on that host, so upgrade rupu on every remote host before adding `findingsProfile` to agents they run.
+
 ```yaml
 ---
 name: quick-scanner
@@ -280,7 +282,7 @@ findingsProfile: summary   # lightweight findings; set to full for complete repo
 ---
 ```
 
-See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty), `artifacts`, and the optional `verification`.
+See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty) and `artifacts`. `verification` is set by verification runs, not by the reporting agent, and a call that supplies it is rejected.
 
 ### `maxTokens`
 

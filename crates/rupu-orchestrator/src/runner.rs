@@ -4630,6 +4630,7 @@ async fn run_node(
                     render_mode(opts.strict_templates),
                     effective_continue_on_error,
                     &opts.transcript_dir,
+                    opts.workflow.action_findings_profile(step),
                 )
                 .await
             }
@@ -5326,6 +5327,11 @@ async fn execute_action_step(
     mode: RenderMode,
     continue_on_error: bool,
     transcript_dir: &Path,
+    // The profile a `findings.record` call records under — this step's
+    // `findings_profile`, else `defaults.findings_profile`, else `full`
+    // (`Workflow::action_findings_profile`). The dispatcher is built once
+    // per run, so the per-step value travels with the call.
+    findings_profile: rupu_coverage::FindingProfile,
 ) -> Result<StepResult, RunWorkflowError> {
     let tool = step
         .action
@@ -5347,7 +5353,10 @@ async fn execute_action_step(
     // Narrowing here makes it structural: even if a future caller reuses
     // this dispatcher, an action step can still only invoke the tool named
     // in the workflow source.
-    let call_result = dispatcher.narrowed_to(tool).call(tool, args.clone()).await;
+    let call_result = dispatcher
+        .narrowed_to(tool)
+        .call_with_findings_profile(tool, args.clone(), findings_profile)
+        .await;
 
     let (allowed, applied, reason) = match &call_result {
         Ok(_) => (true, true, None),
@@ -5490,7 +5499,18 @@ async fn fire_notify_hooks(
             with: Some(n.with.clone()),
             run: None,
         };
-        match execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await {
+        let findings_profile = opts.workflow.action_findings_profile(&synth);
+        match execute_action_step(
+            dispatcher,
+            &synth,
+            ctx,
+            mode,
+            true,
+            &opts.transcript_dir,
+            findings_profile,
+        )
+        .await
+        {
             Ok(result) => {
                 persist_step_result(opts, run_id, &result);
                 step_results.push(result);
@@ -5719,6 +5739,7 @@ pub async fn run_reject_cleanup(
                         render_mode(opts.strict_templates),
                         false,
                         &opts.transcript_dir,
+                        opts.workflow.action_findings_profile(step),
                     )
                     .await
                 }
