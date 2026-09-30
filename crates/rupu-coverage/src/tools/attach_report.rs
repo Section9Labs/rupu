@@ -437,6 +437,9 @@ mod tests {
             run_id: "r".into(),
             model: "m".into(),
             surface: Surface::Workflow,
+            codename: None,
+            agent: None,
+            provider: None,
         };
         let opts = FindingWriteOptions::default().with_profile(FindingProfile::Summary);
         report_finding(paths, attribution, input, &opts).unwrap().id

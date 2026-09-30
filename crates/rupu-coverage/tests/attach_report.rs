@@ -16,6 +16,9 @@ fn attribution() -> Attribution {
         run_id: "run_old".into(),
         model: "m".into(),
         surface: Surface::Workflow,
+        codename: None,
+        agent: None,
+        provider: None,
     }
 }
 
