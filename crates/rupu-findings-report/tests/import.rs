@@ -1453,3 +1453,33 @@ fn cwe_ids_come_from_category_and_reference_lines_that_start_with_one() {
     ));
     assert_eq!(r.cwe, ["CWE-639"]);
 }
+
+#[test]
+fn only_an_id_the_label_starts_with_names_the_finding() {
+    // "duplicate of <other id>" on the id line is not this report's id: the
+    // report has no own id, and the line is kept as other text.
+    let md = PLAIN.replace(
+        &format!("Finding ID: {ID1}"),
+        &format!("Finding ID: unassigned, duplicate of {ID2}"),
+    );
+    let (r, own) = report_of(&md);
+    assert!(own.is_empty(), "{own:?}");
+    assert!(
+        r.references
+            .contains(&format!("unassigned, duplicate of {ID2}")),
+        "{}",
+        r.references
+    );
+    // An id the value starts with still counts, with any note after it kept.
+    let md = PLAIN.replace(
+        &format!("Finding ID: {ID1}"),
+        &format!("Finding ID: `{ID1}` (merged from an earlier run)"),
+    );
+    let (r, own) = report_of(&md);
+    assert_eq!(own, vec![ID1.to_string()]);
+    assert!(
+        r.references.contains("merged from an earlier run"),
+        "{}",
+        r.references
+    );
+}

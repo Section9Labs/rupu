@@ -239,11 +239,12 @@ pub fn parse_report(md: &str) -> Result<Parsed, ImportError> {
         if !ID_LABELS.contains(&f.key.as_str()) {
             continue;
         }
-        let ids = fnd_ids(&f.value);
-        if !ids.is_empty() {
-            f.used = !says_more_than(&f.value, &ids);
-            own_ids.extend(ids);
+        if fnd_ids(&f.value).is_empty() {
+            continue;
         }
+        let ids = leading_ids(&f.value);
+        f.used = !ids.is_empty() && !says_more_than(&f.value, &ids);
+        own_ids.extend(ids);
     }
     let (section_ids, id_text) = take_id_lines(&mut doc);
     own_ids.extend(section_ids);
@@ -386,9 +387,47 @@ fn id_label(line: &str) -> Option<(Vec<String>, bool)> {
     if !ID_LABELS.contains(&key.as_str()) {
         return None;
     }
-    let ids = fnd_ids(&value);
-    let more = says_more_than(&value, &ids);
-    (!ids.is_empty()).then_some((ids, more))
+    if fnd_ids(&value).is_empty() {
+        return None;
+    }
+    let ids = leading_ids(&value);
+    let more = ids.is_empty() || says_more_than(&value, &ids);
+    Some((ids, more))
+}
+
+/// The `fnd_` ids a labelled id line's value starts with. Only those name
+/// the report's own finding: `fnd_A` or `` `fnd_A` (merged from an earlier
+/// run) `` does, `unassigned, duplicate of fnd_B` does not (that line is kept
+/// as other text instead).
+fn leading_ids(value: &str) -> Vec<String> {
+    let lead = |c: char| c.is_whitespace() || matches!(c, '`' | '*' | '_' | '(' | '[' | '"' | '\'');
+    let sep = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '*' | ',' | ';' | '/' | '&' | ')' | ']' | '"' | '\''
+            )
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = value.trim_start_matches(lead);
+    while let Some(id) = id_at_start(rest) {
+        rest = rest[id.len()..].trim_start_matches(sep);
+        if !out.iter().any(|o| o == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// The `fnd_<ULID>` id `s` starts with, if any (same shape as [`fnd_ids`]).
+fn id_at_start(s: &str) -> Option<&str> {
+    let body = s.strip_prefix("fnd_")?.as_bytes();
+    let ulid = body.get(..26)?;
+    let whole = ulid
+        .iter()
+        .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+        && !body.get(26).is_some_and(|b| b.is_ascii_alphanumeric());
+    whole.then(|| &s[..30])
 }
 
 /// Whether `value` holds text beyond `ids` (and the punctuation, emphasis

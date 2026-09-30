@@ -547,8 +547,9 @@ other line is written back unchanged. The lock is `findings.jsonl.lock`, in the
 same `.rupu/coverage/<target>/` directory; every writer of the ledger creates
 it, and it is empty. On a filesystem that cannot lock at all (some network and
 FUSE mounts), agents still record findings, without the lock and with a logged
-warning, but an import cannot run there: it needs the lock, so every report
-for that ledger fails with `cannot update`. Once you have checked the imported
+warning, but an import cannot write there: it needs the lock, so every report
+that would have attached to that ledger fails with `cannot update` (reports
+rejected for other reasons still list their own problems). Once you have checked the imported
 findings, delete the backups: each is a full copy of the ledger, and a
 workspace sync or a commit of `.rupu/` would carry it along. A ledger that is a
 symlink is never replaced (the rename would replace the link, not the file it
