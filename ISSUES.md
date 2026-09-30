@@ -2021,6 +2021,7 @@ papered over. Every `file:line` in the table was re-verified against the tip of
 | `[providers.*].timeout_ms` | `rupu-providers/src/tuning.rs` (`client_timeout` → `http_client_builder`) → each client's `with_tuning` — **I-9, wired here** |
 | `[providers.*].max_retries` | `rupu-providers/src/tuning.rs` (`retry_budget`) → `AnthropicClient::max_rate_limit_retries` + `tuned::RetryingProvider` — **I-10, wired here** |
 | `[providers.*].max_concurrency` | `rupu-providers/src/tuning.rs` (`concurrency_permits`) → `tuned::ThrottledProvider` — **I-11, wired here** |
+| `[providers.*].prompt_cache` | carried uncollapsed in `ProviderTuning::prompt_cache` (`rupu-runtime/src/provider_factory.rs`, `provider_tuning`) → `resolve_anthropic_prompt_cache` (agent `anthropicPromptCache` wins, default on) → `AnthropicClient::with_prompt_cache` → `apply_cache_breakpoints` (spec 2026-09-29 §9.3–9.4) |
 | `[[providers.*.models]].id` | `rupu-runtime/src/provider_factory.rs:72` |
 | `[[providers.*.models]].context_window` | `rupu-runtime/src/provider_factory.rs:73` |
 | `[[providers.*.models]].max_output` | `rupu-runtime/src/provider_factory.rs:74` |

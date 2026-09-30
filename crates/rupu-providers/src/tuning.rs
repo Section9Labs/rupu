@@ -48,6 +48,13 @@ pub struct ProviderTuning {
     /// Vertex region. Accepted and carried, but no shipped Gemini client
     /// targets a regional Vertex endpoint — see `docs/providers.md`.
     pub region: Option<String>,
+    /// Anthropic explicit prompt-cache breakpoints (`[providers.<name>]
+    /// prompt_cache`). Deliberately NOT collapsed to its default here, unlike
+    /// the knobs above: agent frontmatter `anthropicPromptCache` must be able
+    /// to override an explicit config value, so the factory resolves
+    /// `agent.or(this).unwrap_or(true)`. `None` ⇒ on. Ignored by every other
+    /// provider.
+    pub prompt_cache: Option<bool>,
 }
 
 impl Default for ProviderTuning {
@@ -58,6 +65,7 @@ impl Default for ProviderTuning {
             max_concurrency: crate::concurrency::default_permits(""),
             org_id: None,
             region: None,
+            prompt_cache: None,
         }
     }
 }

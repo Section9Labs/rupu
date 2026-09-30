@@ -28,6 +28,12 @@ pub struct ProviderConfig {
     /// the client-side default (currently: enabled). `Some(false)` opts
     /// the agent out — useful when the prefix corrupts persona.
     pub anthropic_oauth_system_prefix: Option<bool>,
+    /// Anthropic explicit prompt caching, from the agent's
+    /// `anthropicPromptCache` frontmatter. `None` defers to
+    /// `[providers.<name>] prompt_cache` (carried in [`Self::tuning`]), and
+    /// both absent means on. `Some(_)` wins over the provider config — see
+    /// [`resolve_anthropic_prompt_cache`].
+    pub anthropic_prompt_cache: Option<bool>,
     /// Present when the provider name resolves to a config-declared
     /// OpenAI-compatible endpoint. Populated by callers that have a
     /// loaded `rupu_config::Config` (e.g. `rupu run`).
@@ -127,6 +133,7 @@ pub fn provider_tuning(
         max_concurrency: tuning::concurrency_permits(&kind, p.and_then(|p| p.max_concurrency)),
         org_id: p.and_then(|p| p.org_id.clone()),
         region: p.and_then(|p| p.region.clone()),
+        prompt_cache: p.and_then(|p| p.prompt_cache),
     }
 }
 
@@ -353,7 +360,8 @@ pub async fn build_for_provider(
 
 /// Same as [`build_for_provider`] but accepts a [`ProviderConfig`] for
 /// per-build knobs that flow from agent frontmatter / workflow step
-/// config (currently: `anthropic_oauth_system_prefix`).
+/// config (currently: `anthropic_oauth_system_prefix`,
+/// `anthropic_prompt_cache`).
 ///
 /// `sink` is taken explicitly rather than defaulted: there is no
 /// process-global netflow sink (removed alongside the seven provider
@@ -514,6 +522,22 @@ fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryErr
     Ok(Box::new(MockProvider::new(turns)))
 }
 
+/// Whether an Anthropic client places explicit prompt-cache breakpoints:
+/// agent frontmatter (`anthropicPromptCache`) wins over `[providers.<name>]
+/// prompt_cache`, and both absent means on. `tuning` is the same resolved
+/// value `build_for_provider_with_config` hands `build_anthropic` —
+/// `config.tuning`, else `ProviderTuning::for_provider` (whose `prompt_cache`
+/// is `None`).
+fn resolve_anthropic_prompt_cache(
+    config: &ProviderConfig,
+    tuning: &rupu_providers::ProviderTuning,
+) -> bool {
+    config
+        .anthropic_prompt_cache
+        .or(tuning.prompt_cache)
+        .unwrap_or(true)
+}
+
 async fn build_anthropic(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
@@ -540,12 +564,14 @@ async fn build_anthropic(
         _ => None,
     };
     let auth = creds.into_anthropic_auth_method();
+    let prompt_cache = resolve_anthropic_prompt_cache(config, tuning);
     let mut client = match std::env::var("RUPU_ANTHROPIC_BASE_URL_OVERRIDE") {
         Ok(url) => rupu_providers::anthropic::AnthropicClient::from_auth_with_url(auth, url, sink),
         Err(_) => rupu_providers::anthropic::AnthropicClient::from_auth(auth, sink),
     }
     .with_tuning(tuning)
-    .with_oauth_account_uuid(account_uuid);
+    .with_oauth_account_uuid(account_uuid)
+    .with_prompt_cache(prompt_cache);
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);
     }
@@ -680,6 +706,82 @@ mod tests {
         assert_eq!(t.max_concurrency, 8);
         assert_eq!(provider_tuning("anthropic", &providers).max_concurrency, 4);
         assert!(t.org_id.is_none());
+        // Uncollapsed: `None` means "no provider opinion", so agent
+        // frontmatter can still decide (see `resolve_anthropic_prompt_cache`).
+        assert_eq!(t.prompt_cache, None);
+    }
+
+    #[test]
+    fn provider_tuning_reads_prompt_cache() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            rupu_config::ProviderConfig {
+                prompt_cache: Some(false),
+                ..Default::default()
+            },
+        );
+        // A named anthropic-kind account (e.g. an internal gateway) opts
+        // out on its own, independently of the bare `anthropic` entry.
+        providers.insert(
+            "anthropic-gateway".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("anthropic".into()),
+                prompt_cache: Some(false),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "anthropic-work".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("anthropic".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            provider_tuning("anthropic", &providers).prompt_cache,
+            Some(false)
+        );
+        assert_eq!(
+            provider_tuning("anthropic-gateway", &providers).prompt_cache,
+            Some(false)
+        );
+        assert_eq!(
+            provider_tuning("anthropic-work", &providers).prompt_cache,
+            None
+        );
+        assert_eq!(
+            provider_tuning_map(&providers)["anthropic-gateway"].prompt_cache,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn anthropic_prompt_cache_agent_wins_over_provider_config() {
+        let tuning = |prompt_cache| rupu_providers::ProviderTuning {
+            prompt_cache,
+            ..rupu_providers::ProviderTuning::for_provider("anthropic")
+        };
+        let agent = |anthropic_prompt_cache| ProviderConfig {
+            anthropic_prompt_cache,
+            ..Default::default()
+        };
+        // (agent frontmatter, [providers.<name>] prompt_cache) → enabled
+        for (a, p, want) in [
+            (None, None, true), // default ON
+            (None, Some(false), false),
+            (None, Some(true), true),
+            (Some(false), None, false),
+            (Some(false), Some(true), false), // agent wins
+            (Some(true), Some(false), true),  // agent wins
+        ] {
+            assert_eq!(
+                resolve_anthropic_prompt_cache(&agent(a), &tuning(p)),
+                want,
+                "agent={a:?} provider={p:?}"
+            );
+        }
     }
 
     /// A named `openai`-kind account must get the OPENAI vendor default (8

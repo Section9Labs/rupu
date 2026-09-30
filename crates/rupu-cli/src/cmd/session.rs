@@ -362,6 +362,8 @@ struct SessionRecord {
     #[serde(default)]
     anthropic_oauth_prefix: Option<bool>,
     #[serde(default)]
+    anthropic_prompt_cache: Option<bool>,
+    #[serde(default)]
     effort: Option<ThinkingLevel>,
     #[serde(default)]
     context_window: Option<ContextWindow>,
@@ -1574,6 +1576,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         permission_mode: mode_str,
         no_stream: args.no_stream,
         anthropic_oauth_prefix: spec.anthropic_oauth_prefix,
+        anthropic_prompt_cache: spec.anthropic_prompt_cache,
         effort: spec.effort,
         context_window: spec.context_window,
         output_format: spec.output_format,
@@ -6789,6 +6792,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        anthropic_prompt_cache: session.anthropic_prompt_cache,
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7184,6 +7188,7 @@ async fn run_compact_request(
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        anthropic_prompt_cache: session.anthropic_prompt_cache,
         // `openai_compatible` stays `None` here — a separate, pre-existing
         // limitation (session compaction doesn't support custom
         // openai-compatible endpoints), unrelated to kind resolution.
@@ -7527,6 +7532,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+            anthropic_prompt_cache: session.anthropic_prompt_cache,
             // `openai_compatible` stays `None` here — a separate,
             // pre-existing limitation (the session worker doesn't support
             // custom openai-compatible endpoints), unrelated to kind
@@ -9884,6 +9890,7 @@ mod tests {
             permission_mode: "bypass".into(),
             no_stream: false,
             anthropic_oauth_prefix: None,
+            anthropic_prompt_cache: None,
             effort: None,
             context_window: None,
             output_format: None,

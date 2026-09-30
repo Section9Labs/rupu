@@ -62,6 +62,7 @@ Everything after the closing `---` is the system prompt.
 | `maxTurns` | integer | no | `50` | Hard cap on model turns |
 | `permissionMode` | `ask` \| `bypass` \| `readonly` | no | `ask` | CLI `--mode` overrides the file |
 | `anthropicOauthPrefix` | bool | no | provider default | Anthropic SSO only |
+| `anthropicPromptCache` | bool | no | `[providers.<name>] prompt_cache`, else on | Anthropic only; `false` disables prompt caching for this agent |
 | `effort` | string | no | provider default | Cross-provider reasoning level |
 | `contextWindow` | string | no | model default | Cross-provider context tier |
 | `outputFormat` | `text` \| `json` | no | free-form text | Hint for structured outputs |
@@ -272,11 +273,37 @@ Per-request output-token budget (the LLM request's `max_tokens`). Defaults to `8
 | Key | Valid values | Purpose |
 | --- | --- | --- |
 | `anthropicOauthPrefix` | `true` / `false` | Enables or disables Anthropic's OAuth system prefix |
+| `anthropicPromptCache` | `true` / `false` | Enables or disables explicit prompt caching (default on) |
 | `anthropicTaskBudget` | positive integer | Soft output budget, separate from `maxTurns` |
 | `anthropicContextManagement` | `tool_clearing` | Server-side pruning of older tool blocks |
 | `anthropicSpeed` | `fast` | Account-gated fast mode |
 
 If an agent needs to stay portable across providers, avoid Anthropic-only fields.
+
+#### `anthropicPromptCache`
+
+Anthropic requests use prompt caching by default. Each request carries two
+explicit `cache_control: {"type": "ephemeral"}` breakpoints (5-minute TTL):
+
+- one on the last system block, which caches the tool definitions and the
+  system prompt together (on the last tool definition when there is no system
+  prompt);
+- one on the last content block of the final message, which moves forward
+  each turn so every turn re-reads the prior conversation from the cache.
+
+Thinking blocks and empty text blocks are never marked. A prefix below the
+model's minimum cacheable length (512–4096 tokens, depending on the model) is
+simply not cached — there is no error. Cache reads and writes show up as
+`cached_tokens` and `cache_write_tokens` in usage and cost.
+
+`anthropicPromptCache: false` turns the breakpoints off for this agent. It
+overrides `[providers.<name>] prompt_cache` in either direction, so `true`
+re-enables caching for one agent on a provider whose config turns it off. Use
+`false` when the agent's provider is an Anthropic-compatible gateway that
+rejects `cache_control`. For a whole provider, prefer
+`[providers.<name>] prompt_cache = false` (see
+[providers.md](providers.md#field-reference)). Omitted, the agent follows the
+provider config, and caching is on when neither sets it.
 
 ---
 

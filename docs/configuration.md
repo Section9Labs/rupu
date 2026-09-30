@@ -57,6 +57,7 @@ user-declared `openai-compatible` name such as `oracle`). Full narrative referen
 | `timeout_ms`      | integer                  | `120000` (2 min); `0` treated as unset                 |
 | `max_retries`     | integer                  | `1` (retries after the first attempt on a retryable error) |
 | `max_concurrency` | integer                  | anthropic `4`, openai `8`, gemini `4`, copilot `4`; `0` treated as unset |
+| `prompt_cache`    | bool                     | `true` (Anthropic only; `false` for gateways that reject `cache_control`; agent `anthropicPromptCache` overrides) |
 | `default_model`   | string                   | none — the agent must set `model:` or rely on this      |
 | `models`          | array\<table\>           | `[]` — each entry: `id` (required), `context_window` (default `32768`), `max_output` (default `8192`) |
 
