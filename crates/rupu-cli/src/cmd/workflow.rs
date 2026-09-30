@@ -144,7 +144,7 @@ async fn run_workflow_with_live_view(
     pricing: rupu_config::PricingConfig,
 ) -> Result<OrchestratorRunResult, RunWfErr> {
     let runner_task = tokio::spawn(run_workflow(opts));
-    let view_task = tokio::spawn(async move {
+    let mut view_task = tokio::spawn(async move {
         let _ =
             crate::output::live_run::run_live_view(view_workflow, runs_dir, run_id, pricing).await;
     });
@@ -153,16 +153,64 @@ async fn run_workflow_with_live_view(
         Err(e) => {
             // A panicked runner task is a hard failure; surface it as an
             // io error (the closest typed variant) so the caller's
-            // existing error mapping applies.
+            // existing error mapping applies. Await the aborted view so its
+            // `AltScreenGuard` has restored the normal screen before the caller
+            // prints the completion summary (same as the timeout branch below).
             view_task.abort();
+            let _ = view_task.await;
             return Err(RunWfErr::Io(std::io::Error::other(format!(
                 "workflow task panicked: {e}"
             ))));
         }
     };
     // Give the view a brief moment to paint the final frame, then stop it.
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), view_task).await;
+    // A view that has not exited by then (e.g. the run parked at an approval
+    // gate, which the view does not treat as terminal) is aborted AND awaited:
+    // dropping its future runs `AltScreenGuard`'s drop, so the normal screen is
+    // guaranteed restored before the caller prints the completion summary.
+    // Merely dropping the join handle would detach the task and leave the
+    // alt-screen up while the summary was written into it.
+    if tokio::time::timeout(std::time::Duration::from_millis(300), &mut view_task)
+        .await
+        .is_err()
+    {
+        view_task.abort();
+        let _ = view_task.await;
+    }
     result
+}
+
+/// Print the shared completion summary for a finished (or parked) run: one
+/// truthful block built from the run dir via [`RunView::from_run_dir`] and
+/// formatted by [`render_completion_summary`]. Callers invoke this exactly once,
+/// AFTER the run's UI (alt-screen / retained view / line stream) has finished,
+/// and only for interactive surfaces — never for cron / webhook / `run_by_*`
+/// (no-UI) runs or shared-printer (autoflow) runs.
+///
+/// Returns `false` (printing nothing) when the run dir has no readable
+/// `run.json` (e.g. a run that failed before persisting): `from_run_dir`
+/// degrades to a view that still carries `run_id` (seeded up front) but has no
+/// `workflow_name` (only the `run.json` overlay sets it), so `workflow_name`
+/// is the degraded-view signal — `run_id` is never empty. A block built from
+/// such a view would be blank, so it is never printed.
+///
+/// [`RunView::from_run_dir`]: crate::output::run_model::RunView::from_run_dir
+/// [`render_completion_summary`]: crate::output::run_summary::render_completion_summary
+fn print_completion_summary(
+    runs_dir: &Path,
+    run_id: &str,
+    pricing: &rupu_config::PricingConfig,
+) -> bool {
+    let store = rupu_orchestrator::RunStore::new(runs_dir.to_path_buf());
+    let view = crate::output::run_model::RunView::from_run_dir(&store, run_id, pricing);
+    if view.workflow_name.is_empty() {
+        return false;
+    }
+    let block = crate::output::run_summary::render_completion_summary(&view, chrono::Utc::now());
+    // Leading blank line separates the block from the last UI/step line (the
+    // retired terse `workflow_done` line used to supply one).
+    print!("\n{block}");
+    true
 }
 use std::collections::BTreeMap;
 use std::io;
@@ -3426,7 +3474,7 @@ pub(crate) async fn resume_run(
     // `UnitCompleted`, so the spine fills in as the run progresses. We do
     // NOT pre-seed prior ✓ from the run-store into LiveRunState here
     // (the events stream re-establishes status as it replays).
-    let result = if live_view_enabled(io::stdout().is_terminal(), plain) {
+    let outcome = if live_view_enabled(io::stdout().is_terminal(), plain) {
         run_workflow_with_live_view(
             opts,
             view_workflow,
@@ -3434,9 +3482,18 @@ pub(crate) async fn resume_run(
             run_id.to_string(),
             cfg.pricing.clone(),
         )
-        .await?
+        .await
     } else {
-        run_workflow(opts).await?
+        run_workflow(opts).await
+    };
+    let result = match outcome {
+        Ok(result) => result,
+        Err(e) => {
+            // A runner `Err` (agent / render / action failure) leaves a Failed
+            // run on disk; print the summary before the error propagates.
+            print_completion_summary(&global.join("runs"), run_id, &cfg.pricing);
+            return Err(e.into());
+        }
     };
     // The resumed run has finished (terminal or paused again); stop the
     // marker poller so it doesn't outlive the run.
@@ -3452,24 +3509,31 @@ pub(crate) async fn resume_run(
             sr.transcript_path.display()
         );
     }
-    match &result.awaiting {
-        Some(info) => {
-            println!();
-            println!(
-                "rupu: workflow paused at step `{}` (run {})",
-                info.step_id, result.run_id
-            );
-            println!("      prompt: {}", info.prompt);
-            println!(
-                "      approve with: rupu workflow approve {}",
-                result.run_id
-            );
-        }
-        None => {
-            println!(
-                "rupu: workflow run {} finished (inspect with: rupu workflow show-run {})",
-                result.run_id, result.run_id
-            );
+    // Shared completion summary (same block `run` prints) after the per-step
+    // lines. It supersedes the legacy closing lines below — the paused form
+    // carries the gate prompt + approve/reject commands, the finished form the
+    // `show-run` pointer — so those are only a fallback for a run dir whose
+    // `run.json` can't be read (nothing to summarize), never printed alongside.
+    if !print_completion_summary(&global.join("runs"), &result.run_id, &cfg.pricing) {
+        match &result.awaiting {
+            Some(info) => {
+                println!();
+                println!(
+                    "rupu: workflow paused at step `{}` (run {})",
+                    info.step_id, result.run_id
+                );
+                println!("      prompt: {}", info.prompt);
+                println!(
+                    "      approve with: rupu workflow approve {}",
+                    result.run_id
+                );
+            }
+            None => {
+                println!(
+                    "rupu: workflow run {} finished (inspect with: rupu workflow show-run {})",
+                    result.run_id, result.run_id
+                );
+            }
         }
     }
     Ok(())
@@ -4698,6 +4762,17 @@ fn persist_portable_run_metadata(
     Ok(Some((manifest_path, result)))
 }
 
+/// Whether `execute_workflow_invocation` prints the shared completion summary.
+///
+/// Only a direct, interactive run: `attach_ui` excludes cron / webhook /
+/// `run_by_*` (no-UI) runs, and a shared printer means an autoflow cycle is
+/// interleaving many runs' lines through one printer, where a multi-line block
+/// per run would tear the stream. Pure so the "who prints" decision is
+/// unit-testable without running a workflow.
+fn summary_enabled(attach_ui: bool, has_shared_printer: bool) -> bool {
+    attach_ui && !has_shared_printer
+}
+
 async fn execute_workflow_invocation(
     name: &str,
     workflow: Workflow,
@@ -4959,8 +5034,17 @@ async fn execute_workflow_invocation(
         && ctx.shared_printer.is_none()
         && live_view_enabled(io::stdout().is_terminal(), ctx.plain);
 
+    // The shared completion summary (printed once after the run's UI has
+    // finished — see the block after `workflow_result`) is for a direct,
+    // interactive `run` only: `attach_ui` excludes cron / webhook / `run_by_*`
+    // (no-UI) runs, and a `shared_printer` means an autoflow cycle is
+    // interleaving many runs' lines through one printer, where a multi-line
+    // block per run would tear the stream. Those surfaces keep the printer's
+    // own terse completion line.
+    let print_summary = summary_enabled(ctx.attach_ui, ctx.shared_printer.is_some());
+
     let workflow_result = if use_live_view {
-        run_workflow_with_live_view(
+        match run_workflow_with_live_view(
             opts,
             workflow_for_resume.clone(),
             runs_dir.clone(),
@@ -4968,7 +5052,20 @@ async fn execute_workflow_invocation(
             cfg.pricing.clone(),
         )
         .await
-        .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
+        {
+            Ok(result) => result,
+            Err(e) => {
+                // A runner `Err` (agent / render / action failure) still
+                // leaves a Failed run on disk, and the view is already torn
+                // down: print the summary before the error propagates so the
+                // operator keeps the run id + final state (the retired bare
+                // `failed · run_…` line used to provide it).
+                if print_summary {
+                    print_completion_summary(&runs_dir, &run_id, &cfg.pricing);
+                }
+                return Err(to_anyhow_with_input_snippet(e, &path, &body));
+            }
+        }
     } else if ctx.attach_ui {
         let runner_task = tokio::spawn(run_workflow(opts));
         let rid = run_id.clone();
@@ -4978,6 +5075,7 @@ async fn execute_workflow_invocation(
             skip_count: 0,
             live_event_hook: ctx.live_event_hook.clone(),
             view_mode: ctx.live_view,
+            suppress_done_line: print_summary,
             pricing: cfg.pricing.clone(),
         };
         let mut current_runner = runner_task;
@@ -5050,6 +5148,11 @@ async fn execute_workflow_invocation(
                     &current_run_id,
                     "cancelled by operator",
                 )?;
+                // The retained view is already torn down; this early return
+                // skips the shared summary print below, so print it here.
+                if print_summary {
+                    print_completion_summary(&runs_dir, &current_run_id, &cfg.pricing);
+                }
                 return Ok(RunOutcomeSummary {
                     run_id: current_run_id,
                     awaiting_step_id: None,
@@ -5059,10 +5162,22 @@ async fn execute_workflow_invocation(
                 });
             }
 
-            let result = current_runner
+            let result = match current_runner
                 .await
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    // Same as the live-view branch: the printer has finished,
+                    // so print the summary before the runner's error
+                    // propagates (the printer's own failure line above keeps
+                    // the `error:` text).
+                    if print_summary {
+                        print_completion_summary(&runs_dir, &current_run_id, &cfg.pricing);
+                    }
+                    return Err(to_anyhow_with_input_snippet(e, &path, &body));
+                }
+            };
 
             match outcome {
                 AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
@@ -5144,6 +5259,7 @@ async fn execute_workflow_invocation(
                         skip_count: prior_count,
                         live_event_hook: ctx.live_event_hook.clone(),
                         view_mode: ctx.live_view,
+                        suppress_done_line: print_summary,
                         pricing: cfg.pricing.clone(),
                     };
                     let _ = result;
@@ -5159,6 +5275,18 @@ async fn execute_workflow_invocation(
     // The run has finished (terminal or paused); the marker poller has no
     // further use — stop it so it never outlives the run.
     pause_poller.abort();
+
+    // Shared completion summary: ONE truthful block for every interactive
+    // path that reaches here — the alt-screen live view (its UI is torn down
+    // by now and it no longer prints its own bare `completed · run_…` line)
+    // and the retained / line-printer attach (which suppress their terse
+    // success line via `AttachOpts::suppress_done_line`). Not printed for the
+    // no-UI path or shared-printer callers (see `print_summary` above). Also
+    // covers a run that parked at a gate: the formatter branches on
+    // `AwaitingApproval` and prints the gate + approve/reject block.
+    if print_summary {
+        print_completion_summary(&runs_dir, &run_id, &cfg.pricing);
+    }
 
     let artifact_manifest_path = persist_portable_run_metadata(
         run_store_for_resume.as_ref(),
@@ -6714,5 +6842,31 @@ steps:
             out.contains(longest),
             "longest workflow name must render intact on one line: {out}"
         );
+    }
+
+    #[test]
+    fn summary_enabled_truth_table() {
+        // (attach_ui, has_shared_printer) -> prints the completion summary
+        assert!(
+            super::summary_enabled(true, false),
+            "interactive run prints"
+        );
+        assert!(
+            !super::summary_enabled(true, true),
+            "shared-printer (autoflow) run must not print a per-run block"
+        );
+        assert!(
+            !super::summary_enabled(false, false),
+            "no-UI run (cron/webhook/run_by_*) prints nothing"
+        );
+        assert!(!super::summary_enabled(false, true));
+    }
+
+    #[test]
+    fn attach_opts_default_keeps_terse_done_line() {
+        // `rupu watch` (and any caller using `..AttachOpts::default()`) must
+        // keep the terse `✓ … complete` line; only `execute_workflow_invocation`
+        // opts in to suppressing it when the shared summary follows.
+        assert!(!crate::output::workflow_printer::AttachOpts::default().suppress_done_line);
     }
 }

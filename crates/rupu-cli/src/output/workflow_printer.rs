@@ -290,6 +290,13 @@ pub struct AttachOpts {
     pub live_event_hook: Option<LiveWorkflowEventHook>,
     /// Control live output density for workflow body rendering.
     pub view_mode: LiveViewMode,
+    /// When `true`, do NOT print the terse `✓ <workflow> complete …` line on
+    /// successful completion: the caller prints the shared completion summary
+    /// (`output::run_summary`) right after the attach returns, which supersedes
+    /// it. The failure line is deliberately still printed — it carries the
+    /// run's `error:` text, which the summary does not. Default `false`
+    /// preserves the terse line for `rupu watch` and shared-printer callers.
+    pub suppress_done_line: bool,
     /// Prices the run's spend for the step and run footers (the operator's
     /// layered `[pricing]`; the default still carries the built-in table).
     pub pricing: rupu_config::PricingConfig,
@@ -572,13 +579,15 @@ pub fn attach_and_print_with(
                 );
                 flush_all_tailers(&mut steps, printer, &spend, opts.view_mode);
 
-                let duration_ms = record
-                    .finished_at
-                    .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
-                    .unwrap_or(0);
-                let dur = Duration::from_millis(duration_ms);
                 printer.stop_ticker();
-                printer.workflow_done_priced(workflow_name, run_id, dur, spend.run());
+                if !opts.suppress_done_line {
+                    let duration_ms = record
+                        .finished_at
+                        .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
+                        .unwrap_or(0);
+                    let dur = Duration::from_millis(duration_ms);
+                    printer.workflow_done_priced(workflow_name, run_id, dur, spend.run());
+                }
                 return Ok(AttachOutcome::Done);
             }
             rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
@@ -783,7 +792,9 @@ pub fn attach_and_render_interactive_with(
         let mut printer = LineStreamPrinter::new();
         match final_outcome {
             AttachOutcome::Done => match record.status {
-                rupu_orchestrator::RunStatus::Completed => {
+                // Suppressed-Completed falls through to the `_ => {}` arm
+                // (prints nothing): the caller emits the shared summary.
+                rupu_orchestrator::RunStatus::Completed if !opts.suppress_done_line => {
                     let duration_ms = record
                         .finished_at
                         .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)

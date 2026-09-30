@@ -1,0 +1,11 @@
+---
+source: crates/rupu-cli/src/output/run_summary.rs
+expression: s
+---
+✗ assess-services · mint-tundra    failed · 1h 47m
+steps   ✓ preflight  ✗ sweep (1/3)
+units   1 ok · 2 failed
+tokens  ⇡6100000 ⇣420000  $18.40
+findings 11 · 1 CRIT · 5 HIGH · 3 MED · 2 LOW
+failed  otter#7 (svc-b)  svc-c  → resume to retry
+view    rupu workflow show-run run_01M1SSABCDEFG
