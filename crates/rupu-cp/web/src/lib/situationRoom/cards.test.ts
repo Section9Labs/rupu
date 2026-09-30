@@ -116,6 +116,7 @@ describe('cardFromEvent enrichment — structured context fields', () => {
 
 describe('cardFromFinding', () => {
   const base: FindingOut = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'f-1', ws_id: 'ws1', project: 'billing-api', target_id: 't1',
     file_path: 'src/routes/billing.ts', line_range: [16, 21], scope: null,
     summary: 'Broken org-scoping on GET /invoice/:id', severity: 'HIGH', concern_id: null,

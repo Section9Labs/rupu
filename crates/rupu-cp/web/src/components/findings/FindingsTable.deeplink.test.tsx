@@ -38,6 +38,7 @@ function LocationProbe() {
 describe('FindingsTable deep-link', () => {
   it("navigates using the row's own ws_id (FindingOut) when present", () => {
     const finding: FindingOut = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
       ...baseFinding({ file_path: 'src/billing.rs', line_range: [17, 19] }),
       ws_id: 'ws-row',
       project: 'proj',

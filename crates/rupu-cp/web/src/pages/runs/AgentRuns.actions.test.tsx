@@ -47,6 +47,7 @@ const REMOTE_HOST: HostView = {
 };
 
 const STANDALONE_ROW: AgentRunRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   run_id: 'run-standalone-1',
   source: 'standalone',
   agent: 'fix-bug',
@@ -66,6 +67,7 @@ const STANDALONE_ROW: AgentRunRow = {
 };
 
 const SESSION_ROW: AgentRunRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   run_id: 'run-session-1',
   source: 'session',
   agent: 'review-pr',

@@ -28,6 +28,7 @@ const LOCAL_HOST: HostView = {
 };
 
 const ROW: AgentRunRow = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   run_id: 'run-abc123',
   source: 'standalone',
   agent: 'fix-bug',

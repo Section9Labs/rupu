@@ -32,6 +32,7 @@ function usage(): RunListRow['usage'] {
 
 const ROWS: RunListRow[] = [
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-run-manual',
     workflow_name: 'wf-running-manual',
     status: 'running',
@@ -41,6 +42,7 @@ const ROWS: RunListRow[] = [
     usage: usage(),
   },
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-done-cron',
     workflow_name: 'wf-completed-cron',
     status: 'completed',
@@ -50,6 +52,7 @@ const ROWS: RunListRow[] = [
     usage: usage(),
   },
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-fail-event',
     workflow_name: 'wf-failed-event',
     status: 'failed',
@@ -59,6 +62,7 @@ const ROWS: RunListRow[] = [
     usage: usage(),
   },
   {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: 'r-await-manual',
     workflow_name: 'wf-awaiting-manual',
     status: 'awaiting_approval',

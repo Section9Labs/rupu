@@ -26,6 +26,7 @@ function project(ws: string, name: string, extra: Partial<ProjectRow> = {}): Pro
 }
 function finding(ws: string, sev: string): FindingOut {
   return {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
     id: `${ws}-${sev}-${Math.random()}`, ws_id: ws, project: ws, target_id: 't',
     file_path: null, line_range: null, scope: null, summary: 's', severity: sev,
     concern_id: null, evidence: { rationale: 'r' }, declared_by: null, declared_at: '2026-07-21T00:00:00Z',

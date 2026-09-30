@@ -109,6 +109,8 @@ export interface RunRecord {
   resume_mode?: string | null;
   expires_at?: string | null;
   issue_ref?: string | null;
+  codename?: string;
+  codename_derived?: boolean;
   [k: string]: unknown;
 }
 
@@ -122,8 +124,10 @@ export interface StepResultRecord {
   skipped?: boolean;
   rendered_prompt?: string;
   kind?: string;
+  codename?: string;
   items?: unknown[];
   findings?: Array<{
+    codename?: string;
     source: string;
     severity: string;
     title: string;
@@ -167,7 +171,9 @@ export type KnownRunEvent =
   | RunPausedEvent
   | RunResumedEvent
   | StepPausedEvent
-  | StepResumedEvent;
+  | StepResumedEvent
+  | DispatchStartedEvent
+  | AgentStartedEvent;
 
 export type RunEvent = KnownRunEvent | UnknownRunEvent;
 
@@ -189,6 +195,7 @@ export interface StepStartedEvent extends RunEventBase {
   step_id: string;
   kind: string;
   agent?: string | null;
+  codename?: string;
 }
 
 export interface StepWorkingEvent extends RunEventBase {
@@ -232,6 +239,7 @@ export interface UnitStartedEvent extends RunEventBase {
   index: number;
   unit_key: string;
   agent?: string | null;
+  codename?: string;
   transcript_path: string;
 }
 
@@ -289,6 +297,30 @@ export interface StepResumedEvent extends RunEventBase {
   step_id: string;
 }
 
+/** A sub-run was dispatched (its transcript path is now known). */
+export interface DispatchStartedEvent extends RunEventBase {
+  type: 'dispatch_started';
+  sub_run_id: string;
+  agent?: string | null;
+  transcript_path: string;
+  codename?: string;
+  provider?: string;
+  model?: string;
+}
+
+/** An agent run began inside a step / fan-out unit. */
+export interface AgentStartedEvent extends RunEventBase {
+  type: 'agent_started';
+  step_id: string;
+  unit_index?: number;
+  codename?: string;
+  agent: string;
+  provider?: string;
+  model?: string;
+  agent_run_id: string;
+  transcript_path: string;
+}
+
 /** Catch-all for any variant not yet narrowed above. */
 export interface UnknownRunEvent extends RunEventBase {
   type: string;
@@ -325,6 +357,8 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'run_resumed',
   'step_paused',
   'step_resumed',
+  'dispatch_started',
+  'agent_started',
 ]);
 
 /**
@@ -342,6 +376,8 @@ export function isKnownRunEvent(ev: RunEvent): ev is KnownRunEvent {
 // ---------------------------------------------------------------------------
 
 export interface RunListRow {
+  codename: string;
+  codename_derived: boolean;
   id: string;
   workflow_name: string;
   status: RunStatusStr;
@@ -408,6 +444,7 @@ export interface UnitCheckpoint {
   output: string;
   success: boolean | null;
   finished_at: string;      // ISO-8601
+  codename?: string;
 }
 
 export interface RunGraphResponse {
@@ -571,6 +608,8 @@ export interface AutoflowRunContext {
 }
 
 export interface AgentRunRow {
+  codename: string;
+  codename_derived: boolean;
   run_id: string;
   source: 'standalone' | 'session';
   agent?: string | null;
@@ -1103,6 +1142,8 @@ export interface UsageTimelinePoint {
 }
 
 export interface SessionSummary {
+  codename: string;
+  codename_derived: boolean;
   session_id: string;
   agent_name: string;
   model: string;
@@ -1322,6 +1363,8 @@ export interface FindingsSummary {
 /** One finding row from `GET /api/findings` — a `FindingRecord` flattened with
  *  its provenance keys (`ws_id` / `project` / `target_id`) at the top level. */
 export interface FindingOut extends FindingRecord {
+  codename: string;
+  codename_derived: boolean;
   ws_id: string;
   project: string;
   target_id: string;

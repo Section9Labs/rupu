@@ -38,6 +38,7 @@ afterEach(() => {
 });
 
 const SESSION: SessionSummary = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   session_id: 'sess-1',
   agent_name: 'reviewer',
   model: 'opus',

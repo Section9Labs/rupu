@@ -38,6 +38,7 @@ const REMOTE_HOST: HostView = {
 };
 
 const REMOTE_SESSION: SessionSummary = {
+    codename: 'cobalt-harbor/heron#1', codename_derived: false,
   session_id: 'sess-abc123',
   agent_name: 'fix-bug',
   model: 'claude-3-5-sonnet',
