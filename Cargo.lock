@@ -4846,6 +4846,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
  "hex",
  "httpmock",
  "rupu-agent",

@@ -217,6 +217,21 @@ pub fn resolve_kind(
     None
 }
 
+/// `ProviderConfig` for `name` with no agent-level overrides: what a bare
+/// model-listing call needs (spec 2026-09-30 §5).
+pub fn provider_config_for(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> ProviderConfig {
+    ProviderConfig {
+        anthropic_oauth_system_prefix: None,
+        anthropic_prompt_cache: None,
+        openai_compatible: openai_compatible_params(name, providers),
+        tuning: Some(provider_tuning(name, providers)),
+        kind: resolve_kind(name, providers),
+    }
+}
+
 /// [`resolve_kind`] for every declared `[providers.<name>]`, keyed by name.
 /// Mirrors [`openai_compatible_map`] / [`provider_tuning_map`] — for callers
 /// (`CliAgentDispatcher`, `DefaultStepFactory`) that resolve their whole
