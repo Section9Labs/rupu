@@ -93,12 +93,8 @@ pub fn emit_collection<T: CollectionOutput>(
         OutputFormat::Table => output.render_table(),
         OutputFormat::Json => formats::print_json(output.json_report()),
         OutputFormat::Csv => formats::print_csv_rows(output.csv_rows(), output.csv_headers()),
-        OutputFormat::Pretty
-        | OutputFormat::Jsonl
-        | OutputFormat::Md
-        | OutputFormat::Html
-        | OutputFormat::Pdf => {
-            unreachable!("collection outputs never support pretty/jsonl/md/html/pdf")
+        OutputFormat::Pretty | OutputFormat::Jsonl => {
+            unreachable!("collection outputs never support pretty/jsonl")
         }
     }
 }
@@ -113,12 +109,8 @@ pub fn emit_detail<T: DetailOutput>(
         OutputFormat::Table => output.render_human(),
         OutputFormat::Json => formats::print_json(output.json_report()),
         OutputFormat::Csv => unreachable!("detail outputs never support csv"),
-        OutputFormat::Pretty
-        | OutputFormat::Jsonl
-        | OutputFormat::Md
-        | OutputFormat::Html
-        | OutputFormat::Pdf => {
-            unreachable!("detail outputs never support pretty/jsonl/md/html/pdf")
+        OutputFormat::Pretty | OutputFormat::Jsonl => {
+            unreachable!("detail outputs never support pretty/jsonl")
         }
     }
 }
@@ -141,8 +133,6 @@ pub fn emit_event<T: EventOutput>(
             };
             formats::print_jsonl_rows(rows)
         }
-        OutputFormat::Csv | OutputFormat::Md | OutputFormat::Html | OutputFormat::Pdf => {
-            unreachable!("event outputs never support csv/md/html/pdf")
-        }
+        OutputFormat::Csv => unreachable!("event outputs never support csv"),
     }
 }

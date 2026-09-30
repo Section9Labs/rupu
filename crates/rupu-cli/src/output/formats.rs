@@ -9,14 +9,6 @@ pub enum OutputFormat {
     Json,
     Jsonl,
     Csv,
-    /// Document formats, for the commands that write a report file
-    /// (`rupu findings export --format md|html|pdf`). Like `pretty` and
-    /// `jsonl`, listed globally though only some commands take them: every
-    /// gate that does not list them rejects them with the usual "does not
-    /// support" error.
-    Md,
-    Html,
-    Pdf,
 }
 
 impl OutputFormat {
@@ -27,9 +19,6 @@ impl OutputFormat {
             Self::Json => "json",
             Self::Jsonl => "jsonl",
             Self::Csv => "csv",
-            Self::Md => "md",
-            Self::Html => "html",
-            Self::Pdf => "pdf",
         }
     }
 }

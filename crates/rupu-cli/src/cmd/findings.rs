@@ -6,7 +6,7 @@
 use crate::output::formats::OutputFormat;
 use crate::output::report;
 use anyhow::Context;
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use rupu_cp::api::findings as cp_findings;
 use rupu_findings_report::{ExportError, Format};
 use rupu_orchestrator::runs::RunStore;
@@ -23,14 +23,14 @@ pub enum Action {
     },
     /// Export findings as a report: one finding, or a project report.
     ///
-    /// The document format is the global `--format`: `md` (the default),
-    /// `html` or `pdf`. A single `--id` with no other selection writes that
-    /// finding as a stand-alone document; anything else writes one report
-    /// over the selection, or with `--split` a zip holding an index and one
-    /// file per finding. Findings are numbered within their project
-    /// (`SEC-001`, …; see `[findings].export_id_prefix`) before the
-    /// selection is applied, so a finding keeps its number whatever else is
-    /// left out.
+    /// A single `--id` with no other selection writes that finding as a
+    /// stand-alone document; anything else writes one report over the
+    /// selection, or with `--split` a zip holding an index and one file per
+    /// finding. Findings are numbered within their project (`SEC-001`, …)
+    /// before the selection is applied, so a finding keeps its number
+    /// whatever else is left out. The number prefix is
+    /// `[findings].export_id_prefix` in the GLOBAL config (`~/.rupu/config.toml`);
+    /// a project's `.rupu/config.toml` never changes it.
     Export(ExportArgs),
 }
 
@@ -67,10 +67,21 @@ pub struct ExportArgs {
     /// Title of the project report (default: "Findings report").
     #[arg(long, value_name = "TITLE")]
     title: Option<String>,
+    /// Document format.
+    #[arg(long, value_enum, default_value_t = ExportFormat::Md)]
+    to: ExportFormat,
     /// Where to write the report. An existing directory receives the
     /// generated file name.
     #[arg(short = 'o', long, value_name = "PATH")]
     output: PathBuf,
+}
+
+/// The document formats `--to` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExportFormat {
+    Md,
+    Html,
+    Pdf,
 }
 
 impl ExportArgs {
@@ -103,25 +114,19 @@ fn non_blank(raw: &str) -> Result<String, String> {
 }
 
 pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
-    let (command_name, supported) = match action {
-        Action::Schema { .. } => ("findings schema", report::TABLE_ONLY),
-        Action::Export(_) => (
-            "findings export",
-            &[
-                OutputFormat::Table,
-                OutputFormat::Md,
-                OutputFormat::Html,
-                OutputFormat::Pdf,
-            ][..],
-        ),
+    // Both actions write a schema / a file: the global `--format` (table,
+    // json, csv, …) has nothing to shape. The document format is `--to`.
+    let command_name = match action {
+        Action::Schema { .. } => "findings schema",
+        Action::Export(_) => "findings export",
     };
-    crate::output::formats::ensure_supported(command_name, format, supported)
+    crate::output::formats::ensure_supported(command_name, format, report::TABLE_ONLY)
 }
 
-pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
         Action::Schema { advertised } => schema_cmd(advertised),
-        Action::Export(args) => export_cmd(&args, format),
+        Action::Export(args) => export_cmd(&args),
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -139,22 +144,43 @@ fn schema_cmd(advertised: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The document format asked for with the global `--format`: `md` unless
-/// given. Refused up front when this build cannot produce it (PDF without the
-/// `pdf` feature), before any finding is read.
-fn export_format(format: Option<OutputFormat>) -> anyhow::Result<Format> {
-    let fmt = match format {
-        None | Some(OutputFormat::Md) => Format::Markdown,
-        Some(OutputFormat::Html) => Format::Html,
-        Some(OutputFormat::Pdf) => Format::Pdf,
-        Some(other) => anyhow::bail!(
-            "findings export does not support `--format {other}` (supported: `md`, `html`, `pdf`)"
-        ),
+/// The document format asked for with `--to`. Refused up front when this
+/// build cannot produce it (PDF without the `pdf` feature), before any
+/// finding is read.
+fn document_format(to: ExportFormat) -> anyhow::Result<Format> {
+    let fmt = match to {
+        ExportFormat::Md => Format::Markdown,
+        ExportFormat::Html => Format::Html,
+        ExportFormat::Pdf => Format::Pdf,
     };
     if !fmt.is_available() {
         return Err(ExportError::PdfUnavailable.into());
     }
     Ok(fmt)
+}
+
+/// The display-number prefix, from the GLOBAL config only. A project's
+/// `.rupu/config.toml` is deliberately not layered in (unlike most commands),
+/// and this is the same resolution `rupu cp serve` uses, so a finding is
+/// numbered identically wherever it is exported. A global config that cannot
+/// be read falls back to the default prefix with a warning (as the control
+/// plane does).
+fn export_prefix(global: &Path) -> String {
+    let path = global.join("config.toml");
+    let configured = match rupu_config::layer_files_locked(Some(&path), None) {
+        Ok(cfg) => cfg.findings.export_id_prefix,
+        Err(e) => {
+            crate::output::diag::warn(
+                &crate::output::diag::prefs_for_diag(false),
+                format!(
+                    "cannot read {}: {e}; numbering findings with the default prefix",
+                    path.display()
+                ),
+            );
+            None
+        }
+    };
+    cp_findings::resolve_export_prefix(configured.as_deref())
 }
 
 /// Where the report goes: `output` itself, or inside it when it is an
@@ -167,11 +193,44 @@ fn destination(output: &Path, generated_name: &str) -> PathBuf {
     }
 }
 
-fn export_cmd(args: &ExportArgs, format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let fmt = export_format(format)?;
+/// Warn (never fail) when `dest`'s extension is not the one of what is being
+/// written, e.g. a zip going to `x.pdf`.
+fn warn_on_extension_mismatch(dest: &Path, generated_name: &str) {
+    let ext_of = |p: &str| {
+        Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    let expected = ext_of(generated_name);
+    let actual = ext_of(&dest.to_string_lossy());
+    let same = expected == actual
+        || (expected == "md" && actual == "markdown")
+        || (expected == "html" && actual == "htm");
+    if same {
+        return;
+    }
+    let what = match expected.as_str() {
+        "zip" => "a zip archive",
+        "md" => "a Markdown report",
+        "html" => "an HTML report",
+        "pdf" => "a PDF report",
+        _ => "a report",
+    };
+    crate::output::diag::warn(
+        &crate::output::diag::prefs_for_diag(false),
+        format!(
+            "writing {what} to {} (expected .{expected})",
+            dest.display()
+        ),
+    );
+}
+
+fn export_cmd(args: &ExportArgs) -> anyhow::Result<()> {
+    let fmt = document_format(args.to)?;
     let global = crate::paths::global_dir()?;
-    let cfg = crate::cmd::update::load_cli_config();
-    let prefix = cp_findings::resolve_export_prefix(cfg.findings.export_id_prefix.as_deref());
+    let prefix = export_prefix(&global);
     let runs = RunStore::new(global.join("runs"));
 
     let exported = match args.single_id() {
@@ -209,7 +268,11 @@ fn export_cmd(args: &ExportArgs, format: Option<OutputFormat>) -> anyhow::Result
     };
 
     let dest = destination(&args.output, &exported.name);
-    std::fs::write(&dest, &exported.bytes).with_context(|| format!("write {}", dest.display()))?;
+    warn_on_extension_mismatch(&dest, &exported.name);
+    // Spelt out (rather than `.context()`): the failure line shows only the
+    // outermost message, and the OS error is the part that says what to fix.
+    std::fs::write(&dest, &exported.bytes)
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", dest.display()))?;
     println!("wrote {} ({} bytes)", dest.display(), exported.bytes.len());
     Ok(())
 }
@@ -274,39 +337,38 @@ mod tests {
 
     #[test]
     fn the_document_format_defaults_to_markdown() {
-        assert_eq!(export_format(None).unwrap(), Format::Markdown);
-        assert_eq!(
-            export_format(Some(OutputFormat::Html)).unwrap(),
-            Format::Html
-        );
-        // Table / json / csv describe listings, not documents.
-        assert!(export_format(Some(OutputFormat::Json)).is_err());
-        assert!(export_format(Some(OutputFormat::Table)).is_err());
+        assert_eq!(export(&[]).to, ExportFormat::Md);
+        assert_eq!(export(&["--to", "html"]).to, ExportFormat::Html);
+        assert_eq!(export(&["--to", "pdf"]).to, ExportFormat::Pdf);
+        assert_eq!(document_format(ExportFormat::Md).unwrap(), Format::Markdown);
+        assert_eq!(document_format(ExportFormat::Html).unwrap(), Format::Html);
+        let argv = ["harness", "export", "-o", "out", "--to", "docx"];
+        assert!(Harness::try_parse_from(argv).is_err());
     }
 
     #[cfg(feature = "pdf")]
     #[test]
     fn pdf_is_available_with_the_pdf_feature() {
-        assert_eq!(export_format(Some(OutputFormat::Pdf)).unwrap(), Format::Pdf);
+        assert_eq!(document_format(ExportFormat::Pdf).unwrap(), Format::Pdf);
     }
 
     #[cfg(not(feature = "pdf"))]
     #[test]
     fn pdf_without_the_pdf_feature_names_the_problem() {
-        let err = export_format(Some(OutputFormat::Pdf)).unwrap_err();
+        let err = document_format(ExportFormat::Pdf).unwrap_err();
         assert!(err.to_string().contains("without PDF support"), "{err}");
     }
 
     #[test]
-    fn export_accepts_the_document_formats_and_schema_only_table() {
+    fn the_global_format_flag_has_nothing_to_shape() {
         let export_action = Action::Export(export(&[]));
-        for f in [OutputFormat::Md, OutputFormat::Html, OutputFormat::Pdf] {
-            assert!(ensure_output_format(&export_action, f).is_ok(), "{f}");
-        }
-        assert!(ensure_output_format(&export_action, OutputFormat::Json).is_err());
         let schema = Action::Schema { advertised: false };
-        assert!(ensure_output_format(&schema, OutputFormat::Table).is_ok());
-        assert!(ensure_output_format(&schema, OutputFormat::Md).is_err());
+        for action in [&export_action, &schema] {
+            assert!(ensure_output_format(action, OutputFormat::Table).is_ok());
+            for f in [OutputFormat::Json, OutputFormat::Csv, OutputFormat::Pretty] {
+                assert!(ensure_output_format(action, f).is_err(), "{f}");
+            }
+        }
     }
 
     #[test]
@@ -329,7 +391,7 @@ mod tests {
     #[should_panic(expected = "unwind-check")]
     fn panics_still_unwind_in_a_typst_linked_binary() {
         // Keep the export path (and so Typst) referenced from this binary.
-        let _ = export_format(Some(OutputFormat::Pdf));
+        let _ = document_format(ExportFormat::Pdf);
         panic!("unwind-check");
     }
 }

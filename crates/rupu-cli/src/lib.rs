@@ -64,7 +64,6 @@ use std::process::ExitCode;
 )]
 pub struct Cli {
     /// Structured output format for commands that support tabular/report views.
-    /// `md`, `html` and `pdf` are the document formats of `findings export`.
     #[arg(long, global = true)]
     pub format: Option<output::formats::OutputFormat>,
     /// Show absolute ISO timestamps in tables instead of relative ages.
@@ -373,7 +372,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
-        Cmd::Findings { action } => cmd::findings::handle(action, cli.format).await,
+        Cmd::Findings { action } => cmd::findings::handle(action).await,
         Cmd::Cron { action } => {
             cmd::cron::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }

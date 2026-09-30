@@ -78,12 +78,17 @@ fn seed_two(home: &Path) -> PathBuf {
 }
 
 fn rupu(home: &Path) -> Command {
+    rupu_in(home, home)
+}
+
+/// Like [`rupu`], run from `cwd`. The cwd matters: rupu layers the
+/// `.rupu/config.toml` found above it, and the test binary itself runs inside
+/// the rupu checkout.
+fn rupu_in(home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::cargo_bin("rupu").unwrap();
-    // The cwd matters: rupu layers `.rupu/config.toml` found above it, and
-    // the test binary runs inside the rupu checkout.
     cmd.env("RUPU_HOME", home)
         .env("NO_COLOR", "1")
-        .current_dir(home)
+        .current_dir(cwd)
         .write_stdin("");
     cmd
 }
@@ -98,7 +103,7 @@ fn project_report_as_markdown_carries_every_finding() {
     seed_two(tmp.path());
     let out_path = tmp.path().join("out.md");
     let out = rupu(tmp.path())
-        .args(["findings", "export", "--format", "md", "-o"])
+        .args(["findings", "export", "--to", "md", "-o"])
         .arg(&out_path)
         .output()
         .unwrap();
@@ -148,7 +153,7 @@ fn a_single_id_as_pdf_writes_a_pdf() {
     let out_path = tmp.path().join("one.pdf");
     let out = rupu(tmp.path())
         .args([
-            "findings", "export", "--id", "fnd_crit", "--format", "pdf", "-o",
+            "findings", "export", "--id", "fnd_crit", "--to", "pdf", "-o",
         ])
         .arg(&out_path)
         .output()
@@ -166,7 +171,7 @@ fn pdf_without_pdf_support_is_refused_up_front() {
     let out_path = tmp.path().join("one.pdf");
     let out = rupu(tmp.path())
         .args([
-            "findings", "export", "--id", "fnd_crit", "--format", "pdf", "-o",
+            "findings", "export", "--id", "fnd_crit", "--to", "pdf", "-o",
         ])
         .arg(&out_path)
         .output()
@@ -357,7 +362,7 @@ fn bad_arguments_are_usage_errors_and_write_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     seed_two(tmp.path());
     for args in [
-        ["--format", "docx"],
+        ["--to", "docx"],
         ["--severity", "urgent"],
         ["--cwe", ""],
         ["--id", " "],
@@ -375,41 +380,231 @@ fn bad_arguments_are_usage_errors_and_write_nothing() {
 }
 
 #[test]
-fn listing_formats_are_not_document_formats() {
+fn the_global_format_flag_is_not_the_document_format() {
     let tmp = tempfile::tempdir().unwrap();
     seed_two(tmp.path());
+    for (flag, value) in [("--format", "json"), ("--format", "md")] {
+        let out = rupu(tmp.path())
+            .args(["findings", "export", flag, value, "-o"])
+            .arg(tmp.path().join("x.out"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{value}: {}", stderr(&out));
+        assert!(!tmp.path().join("x.out").exists(), "{value}");
+    }
+    // Table is all `findings` takes of the global flag.
     let out = rupu(tmp.path())
         .args(["findings", "export", "--format", "json", "-o"])
-        .arg(tmp.path().join("x.json"))
+        .arg(tmp.path().join("x.out"))
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
     assert!(
         stderr(&out).contains("does not support"),
         "{}",
         stderr(&out)
     );
-    assert!(!tmp.path().join("x.json").exists());
 }
 
 #[test]
-fn document_formats_are_only_for_export() {
+fn html_is_selected_with_to() {
     let tmp = tempfile::tempdir().unwrap();
-    for args in [
-        ["findings", "schema"],
-        ["coverage", "list"],
-        ["agent", "list"],
+    seed_two(tmp.path());
+    let out_path = tmp.path().join("out.html");
+    let out = rupu(tmp.path())
+        .args(["findings", "export", "--to", "html", "-o"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    assert!(text.to_lowercase().contains("<html"), "{text}");
+    assert!(text.contains("SEC-001"), "{text}");
+    assert!(!stderr(&out).contains("[warn]"), "{}", stderr(&out));
+}
+
+#[test]
+fn owner_narrows_to_the_findings_that_name_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = full_record("fnd_crit", Severity::Critical, "run_crit");
+    a.report.as_mut().unwrap().ownership.owner = "team-a".to_string();
+    let mut b = full_record("fnd_high", Severity::High, "run_high");
+    b.report.as_mut().unwrap().ownership.owner = "team-b".to_string();
+    seed(tmp.path(), &[a, b]);
+    let out_path = tmp.path().join("owner.md");
+    let out = rupu(tmp.path())
+        .args(["findings", "export", "--owner", "team-b", "-o"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    assert!(text.contains("SEC-002"), "{text}");
+    assert!(!text.contains("SEC-001"), "{text}");
+}
+
+#[test]
+fn cwe_narrows_to_the_findings_that_carry_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = full_record("fnd_crit", Severity::Critical, "run_crit");
+    a.report.as_mut().unwrap().cwe = vec!["CWE-79".to_string()];
+    let mut b = full_record("fnd_high", Severity::High, "run_high");
+    b.report.as_mut().unwrap().cwe = vec!["CWE-89".to_string()];
+    seed(tmp.path(), &[a, b]);
+    let out_path = tmp.path().join("cwe.md");
+    let out = rupu(tmp.path())
+        .args(["findings", "export", "--cwe", "cwe-79", "-o"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    assert!(text.contains("SEC-001"), "{text}");
+    assert!(!text.contains("SEC-002"), "{text}");
+}
+
+#[test]
+fn summary_findings_are_left_out_unless_asked_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut summary = full_record("fnd_low", Severity::Low, "run_low");
+    summary.profile = FindingProfile::Summary;
+    summary.report = None;
+    summary.summary = "zzz-summary-only-marker".to_string();
+    seed(
+        tmp.path(),
+        &[
+            full_record("fnd_crit", Severity::Critical, "run_crit"),
+            summary,
+        ],
+    );
+    let plain = tmp.path().join("plain.md");
+    let out = rupu(tmp.path())
+        .args(["findings", "export", "-o"])
+        .arg(&plain)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&plain).unwrap();
+    assert!(text.contains("SEC-001"), "{text}");
+    assert!(!text.contains("zzz-summary-only-marker"), "{text}");
+
+    let with = tmp.path().join("with.md");
+    let out = rupu(tmp.path())
+        .args(["findings", "export", "--include-summaries", "-o"])
+        .arg(&with)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&with).unwrap();
+    assert!(text.contains("SEC-002"), "{text}");
+    assert!(text.contains("zzz-summary-only-marker"), "{text}");
+}
+
+#[test]
+fn the_prefix_comes_from_the_global_config_never_the_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_two(tmp.path());
+    // A project (cwd) whose own config sets a prefix.
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".rupu")).unwrap();
+    std::fs::write(
+        project.join(".rupu/config.toml"),
+        "[findings]\nexport_id_prefix = \"ACME\"\n",
+    )
+    .unwrap();
+
+    // Project-level only: ignored, so the number is still SEC-…
+    let out_path = tmp.path().join("project-only.md");
+    let out = rupu_in(tmp.path(), &project)
+        .args(["findings", "export", "-o"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    assert!(text.contains("SEC-001"), "{text}");
+    assert!(!text.contains("ACME"), "{text}");
+
+    // Global sets one, project another: the global one wins outright.
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[findings]\nexport_id_prefix = \"GLOB\"\n",
+    )
+    .unwrap();
+    let out_path = tmp.path().join("both.md");
+    let out = rupu_in(tmp.path(), &project)
+        .args(["findings", "export", "-o"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    assert!(text.contains("GLOB-001"), "{text}");
+    assert!(!text.contains("ACME"), "{text}");
+    assert!(!text.contains("SEC-001"), "{text}");
+}
+
+#[test]
+fn a_failed_write_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_two(tmp.path());
+    let out_path = tmp.path().join("no-such-dir").join("out.md");
+    let out = rupu(tmp.path())
+        .args(["findings", "export", "-o"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("cannot write"), "{err}");
+    assert!(err.contains("out.md"), "{err}");
+    assert!(err.contains("No such file or directory"), "{err}");
+}
+
+#[test]
+fn an_extension_that_does_not_match_the_content_warns_but_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_two(tmp.path());
+    for (args, name, warning) in [
+        (vec!["--split"], "x.pdf", "writing a zip archive to"),
+        (vec![], "x.txt", "writing a Markdown report to"),
+        (vec!["--to", "html"], "x.md", "writing an HTML report to"),
     ] {
+        let out_path = tmp.path().join(name);
         let out = rupu(tmp.path())
-            .args(args)
-            .args(["--format", "pdf"])
+            .args(["findings", "export"])
+            .args(&args)
+            .arg("-o")
+            .arg(&out_path)
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
-        assert!(
-            stderr(&out).contains("does not support"),
-            "{args:?}: {}",
-            stderr(&out)
-        );
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains("[warn]"), "{args:?}: {err}");
+        assert!(err.contains(warning), "{args:?}: {err}");
+        assert!(err.contains(name), "{args:?}: {err}");
+        assert!(out_path.is_file(), "{args:?}");
+    }
+}
+
+#[test]
+fn a_matching_extension_does_not_warn() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_two(tmp.path());
+    for (args, name) in [
+        (vec![], "a.md"),
+        (vec![], "b.MD"),
+        (vec![], "c.markdown"),
+        (vec!["--split"], "d.zip"),
+        (vec!["--to", "html"], "e.html"),
+    ] {
+        let out = rupu(tmp.path())
+            .args(["findings", "export"])
+            .args(&args)
+            .arg("-o")
+            .arg(tmp.path().join(name))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}: {}", stderr(&out));
+        assert!(!stderr(&out).contains("[warn]"), "{name}: {}", stderr(&out));
     }
 }
