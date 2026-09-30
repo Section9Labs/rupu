@@ -139,6 +139,8 @@ pub struct GoogleGeminiClient {
     expires_ms: u64,
     project_id: String,
     auth_json_path: Option<PathBuf>,
+    /// Test seam: replaces variant.endpoint() for model listing only.
+    pub(crate) api_base_override: Option<String>,
 }
 
 impl GoogleGeminiClient {
@@ -200,6 +202,7 @@ impl GoogleGeminiClient {
                     expires_ms: expires,
                     project_id,
                     auth_json_path,
+                    api_base_override: None,
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
@@ -211,6 +214,7 @@ impl GoogleGeminiClient {
                 expires_ms: 0,
                 project_id: String::new(),
                 auth_json_path: None,
+                api_base_override: None,
             }),
             (AuthCredentials::ApiKey { .. }, _) => Err(ProviderError::AuthConfig(
                 "Google Cloud Code Assist (gemini-cli / antigravity) requires OAuth, \
@@ -566,6 +570,121 @@ impl crate::provider::LlmProvider for GoogleGeminiClient {
     fn provider_id(&self) -> crate::provider_id::ProviderId {
         self.variant.provider_id()
     }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        // Code Assist (`v1internal`) has no listing method (spec §3).
+        if self.variant != GeminiVariant::AiStudio {
+            return Err(ProviderError::NotImplemented {
+                provider: self.provider_id().to_string(),
+            });
+        }
+        let base = self
+            .api_base_override
+            .clone()
+            .unwrap_or_else(|| self.variant.endpoint().to_string());
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        for _ in 0..50 {
+            let mut query: Vec<(&str, String)> = vec![("pageSize", "1000".to_string())];
+            if let Some(t) = &page_token {
+                query.push(("pageToken", t.clone()));
+            }
+            let resp = self
+                .client
+                .get(format!("{base}/v1beta/models"))
+                .query(&query)
+                .header("x-goog-api-key", &self.access_token)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .await
+                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let message: String = resp
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(500)
+                    .collect();
+                return Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    message,
+                });
+            }
+            let v: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            let (models, next) = gemini_models_from_listing(&v, self.variant.provider_id());
+            out.extend(models);
+            match next {
+                Some(t) => {
+                    if Some(&t) == page_token.as_ref() {
+                        warn!("duplicate page token, stopping early");
+                        break;
+                    }
+                    page_token = Some(t);
+                }
+                None => break,
+            }
+        }
+        if page_token.is_some() {
+            warn!("page limit (50) reached while next token present, stopping early");
+        }
+        Ok(out)
+    }
+
+    fn output_shares_context(&self) -> bool {
+        false
+    }
+}
+
+// ── Model Listing ───────────────────────────────────────────────────
+
+/// AI Studio `GET /v1beta/models` page → (`ModelInfo`s, next page token)
+/// (spec 2026-09-30 §3). Keeps models that support `generateContent`.
+pub(crate) fn gemini_models_from_listing(
+    v: &serde_json::Value,
+    provider: crate::provider_id::ProviderId,
+) -> (Vec<crate::model_pool::ModelInfo>, Option<String>) {
+    let models = v
+        .get("models")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e.get("supportedGenerationMethods")
+                .and_then(|m| m.as_array())
+                .is_none_or(|ms| {
+                    ms.iter().any(|x| x.as_str() == Some("generateContent"))
+                })
+        })
+        .filter_map(|e| {
+            let name = e.get("name")?.as_str()?;
+            let n = |k: &str| {
+                e.get(k)
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x.min(u32::MAX as u64) as u32)
+                    .unwrap_or(0)
+            };
+            Some(crate::model_pool::ModelInfo {
+                id: name.strip_prefix("models/").unwrap_or(name).to_string(),
+                provider,
+                context_window: n("inputTokenLimit"),
+                max_output_tokens: n("outputTokenLimit"),
+                capabilities: Vec::new(),
+                cost: crate::model_pool::ModelCost::default(),
+                status: crate::model_pool::ModelStatus::default(),
+            })
+        })
+        .collect();
+    let next = v
+        .get("nextPageToken")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    (models, next)
 }
 
 // ── Message Conversion ───────────────────────────────────────────────
@@ -2290,11 +2409,8 @@ mod llm_provider_impl_tests {
 
     #[tokio::test]
     async fn list_models_returns_empty_until_ai_studio_wired() {
-        // Plan 3 reality: Vertex/CLI endpoint has no equivalent of AI Studio's
-        // `/v1beta/models?key=...` listing. Gemini API-key path is deferred
-        // (see TODO.md). Until then, list_models defaults to empty and the
-        // ModelRegistry's baked-in fallback (Plan 3 Task 5) provides a
-        // curated v0 list.
+        // fetch_models still defaults to empty for legacy list_models, and
+        // live limits come from `fetch_models`.
         let client = GoogleGeminiClient::new(
             oauth_creds(),
             GeminiVariant::GeminiCli,
@@ -2308,5 +2424,158 @@ mod llm_provider_impl_tests {
             "Gemini list_models should be empty until AI Studio endpoint is wired; got {} entries",
             models.len()
         );
+    }
+
+    fn no_page_token(req: &httpmock::prelude::HttpMockRequest) -> bool {
+        !req.query_params
+            .as_ref()
+            .is_some_and(|q| q.iter().any(|(k, _)| k == "pageToken"))
+    }
+
+    #[test]
+    fn gemini_listing_strips_prefix_and_reads_limits() {
+        let v = serde_json::json!({ "models": [
+            { "name": "models/gemini-test-pro", "inputTokenLimit": 1048576, "outputTokenLimit": 65536,
+              "supportedGenerationMethods": ["generateContent", "countTokens"] },
+            { "name": "models/text-embed-1", "inputTokenLimit": 2048, "outputTokenLimit": 1,
+              "supportedGenerationMethods": ["embedContent"] }
+        ], "nextPageToken": "p2" });
+        let (ms, next) =
+            gemini_models_from_listing(&v, crate::provider_id::ProviderId::GoogleGeminiCli);
+        assert_eq!(next.as_deref(), Some("p2"));
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].id, "gemini-test-pro");
+        assert_eq!(
+            (ms[0].context_window, ms[0].max_output_tokens),
+            (1_048_576, 65_536)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_ai_studio_follows_pages() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .header("x-goog-api-key", "g-key")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "tok2" }));
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "tok2");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-two", "inputTokenLimit": 20, "outputTokenLimit": 6, "supportedGenerationMethods": ["generateContent"] }
+            ]}));
+        });
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        p1.assert();
+        p2.assert();
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one", "g-two"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_models_code_assist_has_no_listing() {
+        let mut client = GoogleGeminiClient::new(
+            oauth_creds(),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::NotImplemented { .. }));
+        assert!(!<GoogleGeminiClient as LlmProvider>::output_shares_context(
+            &client
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_models_ai_studio_surfaces_non_2xx_as_error() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path("/v1beta/models");
+            then.status(403);
+        });
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(server.url(""));
+        let err = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Api { status: 403, .. }));
+    }
+
+    #[tokio::test]
+    async fn fetch_models_duplicate_token_stops_early() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let p1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-one", "inputTokenLimit": 10, "outputTokenLimit": 5, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "t" }));
+        });
+        let p2 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "t");
+            then.status(200).json_body(serde_json::json!({ "models": [
+                { "name": "models/g-two", "inputTokenLimit": 20, "outputTokenLimit": 6, "supportedGenerationMethods": ["generateContent"] }
+            ], "nextPageToken": "t" }));
+        });
+        let mut client = GoogleGeminiClient::new(
+            AuthCredentials::ApiKey {
+                key: "g-key".into(),
+            },
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        client.api_base_override = Some(server.url(""));
+        let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        // Each id should appear exactly once (no duplicates on duplicate token loop)
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["g-one", "g-two"]
+        );
+        // First page (no pageToken) should be hit once
+        p1.assert_hits(1);
+        // Second page with pageToken=t should be hit exactly once (duplicate token stops loop)
+        p2.assert_hits(1);
     }
 }
