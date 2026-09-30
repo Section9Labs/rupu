@@ -3,9 +3,10 @@
 // summary-profile findings (no structured report) degrade to the summary plus
 // its rationale. Section bodies live in components/findings/report/.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { api, apiErrorMessage, findingExportUrl, type FindingDetail as Detail, type FindingExportFormat } from '../lib/api';
+import { api, apiErrorMessage, type FindingDetail as Detail, type FindingExportFormat } from '../lib/api';
+import { saveBlob } from '../lib/download';
 import { completeness, UNREADABLE_REPORT_NOTE } from '../lib/findingReport';
 import Markdown from '../components/transcript/Markdown';
 import { FindingEvidence } from '../components/findings/FindingEvidence';
@@ -17,6 +18,7 @@ import FixSections from '../components/findings/report/FixSections';
 import ReplicationSteps from '../components/findings/report/ReplicationSteps';
 import ArtifactBrowser from '../components/findings/report/ArtifactBrowser';
 import CrossReferences from '../components/findings/report/CrossReferences';
+import { Button } from '../components/ui/Button';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 
@@ -35,22 +37,50 @@ function BackLink() {
 
 const EXPORT_FORMATS: [FindingExportFormat, string][] = [['md', 'Markdown'], ['html', 'HTML'], ['pdf', 'PDF']];
 
-/** Download links for this finding's report in each format (served as
- *  attachments by `GET /api/findings/:id/export`). */
+/** Buttons that download this finding's report in each format. They fetch the
+ *  export (`GET /api/findings/:id/export`) rather than link to it, so a failure
+ *  (404, or 501 when this build has no PDF support) reads as a message here
+ *  instead of saving the JSON error body as the "report". */
 function ExportLinks({ id }: { id: string }) {
+  const [busy, setBusy] = useState<FindingExportFormat | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Leaving the page abandons a download still in flight.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  async function download(fmt: FindingExportFormat) {
+    if (busy) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(fmt);
+    setError(null);
+    try {
+      const blob = await api.downloadFindingExport(id, fmt, { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      saveBlob(blob, `${id}.${fmt}`);
+    } catch (e: unknown) {
+      if (!controller.signal.aborted) setError(apiErrorMessage(e));
+    } finally {
+      if (!controller.signal.aborted) setBusy(null);
+    }
+  }
+
   return (
-    <div role="group" aria-label="Export finding" className="flex items-center gap-1.5 text-ui">
-      <span className="text-ink-mute">Export</span>
-      {EXPORT_FORMATS.map(([fmt, label]) => (
-        <a
-          key={fmt}
-          href={findingExportUrl(id, fmt)}
-          download
-          className="rounded bg-surface px-1.5 py-0.5 text-note font-medium text-ink ring-1 ring-border hover:bg-surface-hover"
-        >
-          {label}
-        </a>
-      ))}
+    <div className="flex flex-col items-end gap-1">
+      <div role="group" aria-label="Export finding" className="flex items-center gap-1.5 text-ui">
+        <span className="text-ink-mute">Export</span>
+        {EXPORT_FORMATS.map(([fmt, label]) => (
+          <Button key={fmt} variant="ring" disabled={busy !== null} onClick={() => void download(fmt)}>
+            {label}
+          </Button>
+        ))}
+      </div>
+      {error && (
+        <p role="alert" className="max-w-md text-right text-note text-err">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

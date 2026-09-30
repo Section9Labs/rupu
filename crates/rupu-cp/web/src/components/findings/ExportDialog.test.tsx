@@ -74,13 +74,16 @@ describe('ExportDialog', () => {
     await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
     // Summary rows are left out while "Include summary findings" is off, so the
     // toggle means something: naming a summary id server-side would opt it in.
-    expect(spy).toHaveBeenCalledWith({
-      format: 'pdf',
-      title: 'Notebin findings',
-      ids: ['f1', 'f2'],
-      include_summaries: false,
-      split: true,
-    });
+    expect(spy).toHaveBeenCalledWith(
+      {
+        format: 'pdf',
+        title: 'Notebin findings',
+        ids: ['f1', 'f2'],
+        include_summaries: false,
+        split: true,
+      },
+      { signal: expect.any(AbortSignal) },
+    );
     await waitFor(() => expect(onClose).toHaveBeenCalled());
   });
 
@@ -92,7 +95,7 @@ describe('ExportDialog', () => {
     fireEvent.click(exportButton());
 
     await waitFor(() => expect(spy).toHaveBeenCalled());
-    expect(spy).toHaveBeenCalledWith(
+    expect(spy.mock.calls[0][0]).toEqual(
       expect.objectContaining({ format: 'md', ids: ['f1', 'f2', 'f3', 'f4'], include_summaries: true, split: false }),
     );
   });
@@ -144,7 +147,9 @@ describe('ExportDialog', () => {
     expect(a.getAttribute('href')).toBe('blob:mock-url');
     expect(a.download).toBe('findings-report.html');
     expect(a.hidden).toBe(true);
-    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith('blob:mock-url'));
+    // Revoked on a long delay (see lib/download.test.ts), not while the browser
+    // may still be starting the download.
+    expect(revokeObjectURL).not.toHaveBeenCalled();
     // The anchor is not left behind in the document.
     expect(document.body.contains(a)).toBe(false);
   });
@@ -249,13 +254,131 @@ describe('ExportDialog', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('ignores Escape and the overlay while an export is running', () => {
-    vi.spyOn(api, 'exportFindings').mockReturnValue(new Promise<Blob>(() => {}));
+  /** An `exportFindings` that stays pending until its signal aborts. */
+  function stalledExport() {
+    let signal: AbortSignal | undefined;
+    const spy = vi.spyOn(api, 'exportFindings').mockImplementation((_body, opts) => {
+      signal = opts?.signal;
+      return new Promise<Blob>((_resolve, reject) => {
+        opts?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    });
+    return { spy, aborted: () => signal?.aborted ?? false };
+  }
+
+  it('Cancel during a pending export aborts the request and closes', async () => {
+    const { aborted } = stalledExport();
+    const { onClose } = setup();
+    fireEvent.click(exportButton());
+    expect(exportButton()).toBeDisabled();
+
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+
+    expect(aborted()).toBe(true);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    // The abort is not surfaced as an error, and nothing is saved.
+    await Promise.resolve();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(clicked).toHaveLength(0);
+  });
+
+  it('Escape during a pending export aborts the request and closes', () => {
+    const { aborted } = stalledExport();
     const { onClose } = setup();
     fireEvent.click(exportButton());
     fireEvent.keyDown(document, { key: 'Escape' });
+    expect(aborted()).toBe(true);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('an overlay click during a pending export aborts the request and closes', () => {
+    const { aborted } = stalledExport();
+    const { onClose } = setup();
+    fireEvent.click(exportButton());
     fireEvent.mouseDown(screen.getByTestId('export-overlay'));
-    expect(onClose).not.toHaveBeenCalled();
+    expect(aborted()).toBe(true);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts an in-flight export when the dialog is unmounted by its owner', () => {
+    const { aborted } = stalledExport();
+    const { unmount } = setup();
+    fireEvent.click(exportButton());
+    unmount();
+    expect(aborted()).toBe(true);
+  });
+
+  it('does not save a response that arrives after the dialog was cancelled', async () => {
+    let resolve!: (b: Blob) => void;
+    vi.spyOn(api, 'exportFindings').mockReturnValue(new Promise<Blob>((r) => { resolve = r; }));
+    setup();
+    fireEvent.click(exportButton());
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    resolve(new Blob(['late']));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(clicked).toHaveLength(0);
+    expect(createObjectURL).not.toHaveBeenCalled();
+  });
+
+  describe('keyboard focus', () => {
+    const tab = (el: Element, shiftKey = false) => fireEvent.keyDown(el, { key: 'Tab', shiftKey });
+
+    it('keeps Shift+Tab inside the dialog after a non-first radio is chosen', () => {
+      setup();
+      const pdf = screen.getByRole('radio', { name: 'PDF' });
+      fireEvent.click(pdf);
+      pdf.focus();
+      // A radio group is one tab stop, on the checked radio: PDF is now the
+      // dialog's first stop, so Shift+Tab from it must wrap to the last one.
+      const notPrevented = tab(pdf, true);
+      expect(notPrevented).toBe(false);
+      expect(exportButton()).toHaveFocus();
+    });
+
+    it('wraps Tab from the last control to the CHECKED radio, not the first one', () => {
+      setup();
+      const html = screen.getByRole('radio', { name: 'HTML' });
+      fireEvent.click(html);
+      exportButton().focus();
+      expect(tab(exportButton())).toBe(false);
+      expect(html).toHaveFocus();
+    });
+
+    it('lets Tab move normally between controls in the middle of the dialog', () => {
+      setup();
+      const title = screen.getByLabelText('Title');
+      title.focus();
+      expect(tab(title)).toBe(true);
+      expect(tab(title, true)).toBe(true);
+    });
+
+    it('pulls focus back when it escapes to something outside the dialog', () => {
+      render(
+        <>
+          <button>outside</button>
+          <ExportDialog open onClose={() => {}} findings={ROWS} defaultTitle="T" />
+        </>,
+      );
+      const radio = screen.getByRole('radio', { name: 'Markdown' });
+      radio.focus();
+      screen.getByRole('button', { name: 'outside' }).focus();
+      expect(screen.getByRole('dialog').contains(document.activeElement)).toBe(true);
+    });
+
+    it('puts focus back on Export after a failed export', async () => {
+      vi.spyOn(api, 'exportFindings').mockRejectedValue(new Error('boom'));
+      setup();
+      // Focus is on the first radio, which (with the rest of the form) is
+      // disabled while the export runs; the Export button is disabled too.
+      fireEvent.click(exportButton());
+      expect(exportButton()).not.toHaveFocus();
+      await screen.findByRole('alert');
+      expect(exportButton()).toBeEnabled();
+      expect(exportButton()).toHaveFocus();
+    });
   });
 
   it('starts from a clean form each time it is opened', () => {

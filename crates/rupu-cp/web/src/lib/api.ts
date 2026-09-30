@@ -77,6 +77,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return JSON.parse(text) as T;
 }
 
+/** The bytes of a finding-report export response. A non-2xx throws an
+ *  `ApiError`; a `Content-Disposition` filename comes back as the `File`'s
+ *  name (a `File` is a `Blob`). Lives beside `request` because these
+ *  responses are binary, not JSON. */
+async function exportBlob(res: Response): Promise<Blob> {
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new ApiError(res.status, text || res.statusText, text);
+  }
+  const blob = await res.blob();
+  const name = parseContentDispositionFilename(res.headers.get('Content-Disposition'));
+  return name ? new File([blob], name, { type: blob.type }) : blob;
+}
+
 // ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------
@@ -2542,21 +2556,35 @@ export const api = {
    * (`Content-Disposition`) the Blob comes back as a `File` carrying that
    * name; `File` is a `Blob`, so callers that only want the bytes are
    * unaffected. Errors are `ApiError`s — use `apiErrorMessage` to show them.
+   * `opts.signal` aborts the request (the promise rejects with an
+   * `AbortError`).
    */
-  async exportFindings(body: FindingsExportBody): Promise<Blob> {
+  async exportFindings(body: FindingsExportBody, opts?: { signal?: AbortSignal }): Promise<Blob> {
     const res = await fetch('/api/findings/export', {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: opts?.signal,
     });
-    if (!res.ok) {
-      const text = await res.text().catch(() => res.statusText);
-      throw new ApiError(res.status, text || res.statusText, text);
-    }
-    const blob = await res.blob();
-    const name = parseContentDispositionFilename(res.headers.get('Content-Disposition'));
-    return name ? new File([blob], name, { type: blob.type }) : blob;
+    return exportBlob(res);
+  },
+  /**
+   * One finding's report in `format` (`GET /api/findings/:id/export`), as the
+   * same server-named `File`-or-`Blob` that `exportFindings` returns. A non-2xx
+   * (404 unknown finding, 501 no PDF support) throws an `ApiError` rather than
+   * handing back the JSON error as if it were the report.
+   */
+  async downloadFindingExport(
+    id: string,
+    format: FindingExportFormat,
+    opts?: { signal?: AbortSignal },
+  ): Promise<Blob> {
+    const res = await fetch(findingExportUrl(id, format), {
+      credentials: 'same-origin',
+      signal: opts?.signal,
+    });
+    return exportBlob(res);
   },
 
   /**

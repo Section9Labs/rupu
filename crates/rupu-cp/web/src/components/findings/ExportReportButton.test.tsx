@@ -28,6 +28,32 @@ describe('ExportReportButton', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
+  it('returns focus to the trigger when the dialog closes, even if the click never focused it', () => {
+    render(<ExportReportButton findings={[{ id: 'a', profile: 'full' }]} defaultTitle="T" />);
+    const trigger = screen.getByRole('button', { name: 'Export report' });
+    // Safari / Firefox on macOS do not focus a button on click: nothing has focus.
+    expect(trigger).not.toHaveFocus();
+    fireEvent.click(trigger);
+    expect(screen.getByRole('radio', { name: 'Markdown' })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
+  it('also returns focus on Escape', () => {
+    render(<ExportReportButton findings={[{ id: 'a', profile: 'full' }]} defaultTitle="T" />);
+    const trigger = screen.getByRole('button', { name: 'Export report' });
+    fireEvent.click(trigger);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(trigger).toHaveFocus();
+  });
+
+  it('does not steal focus on first render', () => {
+    render(<ExportReportButton findings={[{ id: 'a', profile: 'full' }]} defaultTitle="T" />);
+    expect(screen.getByRole('button', { name: 'Export report' })).not.toHaveFocus();
+  });
+
   it('is disabled, with a reason, when the filtered set is empty', () => {
     render(<ExportReportButton findings={[]} defaultTitle="T" />);
     const button = screen.getByRole('button', { name: 'Export report' });

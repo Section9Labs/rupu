@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import fixture from '../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
 import { api, ApiError, type FindingDetail as Detail } from '../lib/api';
@@ -171,34 +171,125 @@ describe('FindingDetail page', () => {
     expect(back.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it('offers Markdown / HTML / PDF export links on a full report', async () => {
-    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
-    renderAt();
-    const group = await screen.findByRole('group', { name: 'Export finding' });
-    for (const [name, fmt] of [['Markdown', 'md'], ['HTML', 'html'], ['PDF', 'pdf']] as const) {
-      const link = within(group).getByRole('link', { name });
-      expect(link).toHaveAttribute('href', `/api/findings/fnd_1/export?format=${fmt}`);
-      expect(link).toHaveAttribute('download');
-    }
-  });
+  describe('per-finding export buttons', () => {
+    let clicked: HTMLAnchorElement[];
+    let createObjectURL: ReturnType<typeof vi.fn>;
 
-  it('offers the same export links on the summary layout', async () => {
-    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'summary', report: null }));
-    renderAt();
-    const group = await screen.findByRole('group', { name: 'Export finding' });
-    for (const [name, fmt] of [['Markdown', 'md'], ['HTML', 'html'], ['PDF', 'pdf']] as const) {
-      const link = within(group).getByRole('link', { name });
-      expect(link).toHaveAttribute('href', `/api/findings/fnd_1/export?format=${fmt}`);
-      expect(link).toHaveAttribute('download');
-    }
-  });
+    beforeEach(() => {
+      clicked = [];
+      createObjectURL = vi.fn(() => 'blob:mock-url');
+      Object.defineProperty(URL, 'createObjectURL', { value: createObjectURL, configurable: true, writable: true });
+      Object.defineProperty(URL, 'revokeObjectURL', { value: vi.fn(), configurable: true, writable: true });
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+        clicked.push(this);
+      });
+    });
 
-  it('keeps the export links above the report header', async () => {
-    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
-    renderAt();
-    const group = await screen.findByRole('group', { name: 'Export finding' });
-    const h1 = screen.getByRole('heading', { level: 1 });
-    expect(group.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    async function renderFull() {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
+      renderAt();
+      return screen.findByRole('group', { name: 'Export finding' });
+    }
+
+    it('offers Markdown / HTML / PDF buttons on a full report', async () => {
+      const group = await renderFull();
+      for (const name of ['Markdown', 'HTML', 'PDF']) {
+        expect(within(group).getByRole('button', { name })).toBeEnabled();
+      }
+      // Buttons, not plain download links: a failure must be shown, not saved.
+      expect(within(group).queryAllByRole('link')).toHaveLength(0);
+    });
+
+    it('offers the same buttons on the summary layout', async () => {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'summary', report: null }));
+      renderAt();
+      const group = await screen.findByRole('group', { name: 'Export finding' });
+      for (const name of ['Markdown', 'HTML', 'PDF']) {
+        expect(within(group).getByRole('button', { name })).toBeInTheDocument();
+      }
+    });
+
+    it('keeps the buttons above the report header', async () => {
+      const group = await renderFull();
+      const h1 = screen.getByRole('heading', { level: 1 });
+      expect(group.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("fetches the format and saves it under the server's filename", async () => {
+      const spy = vi.spyOn(api, 'downloadFindingExport').mockResolvedValue(new File(['x'], 'SEC-001-notes-idor.pdf'));
+      const group = await renderFull();
+      fireEvent.click(within(group).getByRole('button', { name: 'PDF' }));
+
+      await waitFor(() => expect(clicked).toHaveLength(1));
+      expect(spy).toHaveBeenCalledWith('fnd_1', 'pdf', { signal: expect.any(AbortSignal) });
+      expect(clicked[0].download).toBe('SEC-001-notes-idor.pdf');
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('falls back to <id>.<ext> when the server names no file', async () => {
+      vi.spyOn(api, 'downloadFindingExport').mockResolvedValue(new Blob(['x']));
+      const group = await renderFull();
+      fireEvent.click(within(group).getByRole('button', { name: 'Markdown' }));
+      await waitFor(() => expect(clicked).toHaveLength(1));
+      expect(clicked[0].download).toBe('fnd_1.md');
+    });
+
+    it('shows a 501 as a message next to the buttons and saves nothing', async () => {
+      const body = JSON.stringify({ error: 'this build was compiled without PDF support' });
+      vi.spyOn(api, 'downloadFindingExport').mockRejectedValue(new ApiError(501, body, body));
+      const group = await renderFull();
+      fireEvent.click(within(group).getByRole('button', { name: 'PDF' }));
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent('this build was compiled without PDF support');
+      expect(alert).not.toHaveTextContent('{');
+      expect(group.parentElement).toContainElement(alert);
+      expect(clicked).toHaveLength(0);
+      expect(createObjectURL).not.toHaveBeenCalled();
+      // Buttons are usable again.
+      expect(within(group).getByRole('button', { name: 'PDF' })).toBeEnabled();
+    });
+
+    it('clears a stale error when another export starts', async () => {
+      const spy = vi.spyOn(api, 'downloadFindingExport').mockRejectedValueOnce(new Error('first failed'));
+      const group = await renderFull();
+      fireEvent.click(within(group).getByRole('button', { name: 'HTML' }));
+      await screen.findByRole('alert');
+
+      spy.mockResolvedValue(new Blob(['x']));
+      fireEvent.click(within(group).getByRole('button', { name: 'Markdown' }));
+      await waitFor(() => expect(clicked).toHaveLength(1));
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('disables all three buttons while a download is in flight', async () => {
+      let resolve!: (b: Blob) => void;
+      const spy = vi.spyOn(api, 'downloadFindingExport').mockReturnValue(new Promise<Blob>((r) => { resolve = r; }));
+      const group = await renderFull();
+      fireEvent.click(within(group).getByRole('button', { name: 'HTML' }));
+
+      for (const name of ['Markdown', 'HTML', 'PDF']) {
+        expect(within(group).getByRole('button', { name })).toBeDisabled();
+      }
+      fireEvent.click(within(group).getByRole('button', { name: 'Markdown' }));
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      resolve(new Blob(['x']));
+      await waitFor(() => expect(within(group).getByRole('button', { name: 'HTML' })).toBeEnabled());
+      expect(clicked).toHaveLength(1);
+    });
+
+    it('aborts an in-flight download when the page is left', async () => {
+      let signal: AbortSignal | undefined;
+      vi.spyOn(api, 'downloadFindingExport').mockImplementation((_id, _fmt, opts) => {
+        signal = opts?.signal;
+        return new Promise<Blob>(() => {});
+      });
+      const group = await renderFull();
+      fireEvent.click(within(group).getByRole('button', { name: 'PDF' }));
+      cleanup();
+      expect(signal?.aborted).toBe(true);
+    });
   });
 
   it('shows an alert with the error text when the API fails', async () => {

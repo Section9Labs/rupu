@@ -10,6 +10,13 @@
 // ids are left out of the request — otherwise the toggle would do nothing.
 // An empty `ids` list means "no restriction" server-side (every finding), so
 // it is never sent: with nothing to export the button is disabled instead.
+//
+// Lifecycle: Cancel, Escape and an overlay click all close the dialog, and
+// while an export is running they also abort its request (a stalled server
+// must not lock the dialog). Focus: the first control is focused on open, Tab
+// is trapped inside, and returning focus to whatever opened the dialog is the
+// OWNER's job (see ExportReportButton) — it knows its trigger, and a mouse
+// click does not focus a button in every browser.
 
 import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import {
@@ -19,6 +26,7 @@ import {
   type FindingOut,
   type FindingsExportBody,
 } from '../../lib/api';
+import { saveBlob } from '../../lib/download';
 import { Button } from '../ui/Button';
 import { ErrorBanner } from '../ui/ErrorBanner';
 
@@ -52,19 +60,21 @@ const checkLabelCls = 'flex items-center gap-2 text-lead text-ink';
 
 const FOCUSABLE = 'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])';
 
-/** Offer `blob` to the browser as a download named `name`. */
-function saveBlob(blob: Blob, name: string): void {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  a.hidden = true;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  // After the click has been handed to the browser; revoking inside the same
-  // task can cancel the download in some engines.
-  setTimeout(() => URL.revokeObjectURL(url), 0);
+/** The controls Tab visits, in order. A radio group is ONE tab stop — its
+ *  checked member (else its first) — so only that radio is listed; treating
+ *  every radio as a stop would leave Shift+Tab from a non-first checked radio
+ *  free to walk out of the dialog. */
+function tabStops(root: HTMLElement): HTMLElement[] {
+  const all = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+    (el) => !(el as HTMLInputElement).disabled && !el.closest('fieldset[disabled]'),
+  );
+  const isRadio = (el: HTMLElement): el is HTMLInputElement =>
+    el instanceof HTMLInputElement && el.type === 'radio' && el.name !== '';
+  return all.filter((el) => {
+    if (!isRadio(el)) return true;
+    const group = all.filter((o): o is HTMLInputElement => isRadio(o) && o.name === el.name);
+    return el === (group.find((r) => r.checked) ?? group[0]);
+  });
 }
 
 export function ExportDialog({ open, onClose, findings, defaultTitle, wsId }: ExportDialogProps) {
@@ -95,41 +105,76 @@ function ExportForm({
   const ids = (includeSummaries ? findings : findings.filter((f) => f.profile === 'full')).map((f) => f.id);
   const canExport = ids.length > 0;
 
-  // Focus the first control on open and give focus back to the opener on close.
+  const abortRef = useRef<AbortController | null>(null);
+  const wasBusy = useRef(false);
+  const lastFocused = useRef<HTMLElement | null>(null);
+
+  // Focus the first control on open.
   useEffect(() => {
-    const opener = document.activeElement;
     firstRef.current?.focus();
-    return () => {
-      if (opener instanceof HTMLElement) opener.focus();
-    };
   }, []);
 
-  // Escape closes — but not mid-export, which would orphan the download.
+  // Closing for any reason (including the owner unmounting us) abandons a
+  // request still in flight.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  // Cancel / Escape / overlay click: abort a running export, then close.
+  function close() {
+    abortRef.current?.abort();
+    setBusy(false);
+    onClose();
+  }
+  const closeRef = useRef(close);
+  closeRef.current = close;
+
   useEffect(() => {
     function onKey(e: globalThis.KeyboardEvent) {
-      if (e.key === 'Escape' && !busy) onClose();
+      if (e.key === 'Escape') closeRef.current();
     }
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [busy, onClose]);
+  }, []);
+
+  // The Export button is disabled while running, so a keyboard user loses
+  // focus to <body>: put it back when the export ends and the dialog stays.
+  useEffect(() => {
+    if (wasBusy.current && !busy) {
+      panelRef.current?.querySelector<HTMLButtonElement>('button[type="submit"]')?.focus();
+    }
+    wasBusy.current = busy;
+  }, [busy]);
 
   // Keep Tab inside the dialog (it is modal).
   function trapTab(e: KeyboardEvent<HTMLDivElement>) {
     if (e.key !== 'Tab' || !panelRef.current) return;
-    const items = Array.from(panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-      (el) => !el.hasAttribute('disabled'),
-    );
-    if (items.length === 0) return;
-    const first = items[0];
-    const last = items[items.length - 1];
-    if (e.shiftKey && document.activeElement === first) {
+    const stops = tabStops(panelRef.current);
+    if (stops.length === 0) return;
+    const first = stops[0];
+    const last = stops[stops.length - 1];
+    const at = stops.indexOf(document.activeElement as HTMLElement);
+    if (e.shiftKey && at <= 0) {
       e.preventDefault();
       last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
+    } else if (!e.shiftKey && (at === -1 || at === stops.length - 1)) {
       e.preventDefault();
       first.focus();
     }
   }
+
+  // Belt and braces for focus that gets out by other means (a script, browser
+  // chrome): when focus lands outside the dialog, send it back to where it was
+  // inside. Listens for `focusin` (after the move) rather than blur, since
+  // refocusing from inside a blur handler loses to the move in progress.
+  useEffect(() => {
+    function onFocusIn(e: globalThis.FocusEvent) {
+      const panel = panelRef.current;
+      if (!panel || !(e.target instanceof Node) || panel.contains(e.target)) return;
+      const back = lastFocused.current;
+      (back && panel.contains(back) && !(back as HTMLInputElement).disabled ? back : tabStops(panel)[0])?.focus();
+    }
+    document.addEventListener('focusin', onFocusIn);
+    return () => document.removeEventListener('focusin', onFocusIn);
+  }, []);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -138,16 +183,19 @@ function ExportForm({
     const t = title.trim();
     if (t) body.title = t;
     if (wsId) body.ws_id = wsId;
+    const controller = new AbortController();
+    abortRef.current = controller;
     setBusy(true);
     setError(null);
     try {
-      const blob = await api.exportFindings(body);
+      const blob = await api.exportFindings(body, { signal: controller.signal });
+      if (controller.signal.aborted) return; // cancelled while the bytes arrived
       // The server names the download (carried on a File); else a sensible default.
-      const name = blob instanceof File && blob.name ? blob.name : `findings-report.${split ? 'zip' : format}`;
-      saveBlob(blob, name);
+      saveBlob(blob, `findings-report.${split ? 'zip' : format}`);
       setBusy(false);
       onClose();
     } catch (err: unknown) {
+      if (controller.signal.aborted) return; // cancelled: nothing to report
       setError(apiErrorMessage(err));
       setBusy(false);
     }
@@ -158,7 +206,7 @@ function ExportForm({
       data-testid="export-overlay"
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/30 p-4 pt-[10vh]"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose();
+        if (e.target === e.currentTarget) close();
       }}
     >
       <div
@@ -167,6 +215,7 @@ function ExportForm({
         aria-modal="true"
         aria-labelledby={titleId}
         onKeyDown={trapTab}
+        onFocus={(e) => { lastFocused.current = e.target as HTMLElement; }}
         className="w-full max-w-md rounded-xl border border-border bg-panel p-5 shadow-card"
       >
         <h2 id={titleId} className="text-base font-semibold text-ink">
@@ -247,7 +296,7 @@ function ExportForm({
                 Exporting…
               </span>
             )}
-            <Button variant="secondary" onClick={onClose} disabled={busy}>
+            <Button variant="secondary" onClick={close}>
               Cancel
             </Button>
             <Button type="submit" disabled={busy || !canExport}>

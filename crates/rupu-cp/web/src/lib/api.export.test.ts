@@ -128,3 +128,58 @@ describe('api.exportFindings', () => {
     expect((err as ApiError).message).toBe('Not Implemented');
   });
 });
+
+describe('api.exportFindings abort', () => {
+  it('hands the AbortSignal to fetch so a stalled export can be cancelled', async () => {
+    const fetchMock = stubFetch(new Response('x', { status: 200 }));
+    const controller = new AbortController();
+    await api.exportFindings({ format: 'md' }, { signal: controller.signal });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.signal).toBe(controller.signal);
+  });
+});
+
+describe('api.downloadFindingExport', () => {
+  it('GETs the per-finding export URL and returns the bytes', async () => {
+    const fetchMock = stubFetch(new Response('# one finding', { status: 200 }));
+    const blob = await api.downloadFindingExport('fnd_1', 'md');
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/findings/fnd_1/export?format=md');
+    expect(init.credentials).toBe('same-origin');
+    expect(init.method ?? 'GET').toBe('GET');
+    expect(await blob.text()).toBe('# one finding');
+  });
+
+  it("names the result after the server's Content-Disposition filename", async () => {
+    stubFetch(
+      new Response('pdfbytes', {
+        status: 200,
+        headers: { 'Content-Disposition': `attachment; filename*=UTF-8''SEC-001.pdf` },
+      }),
+    );
+    const blob = await api.downloadFindingExport('fnd_1', 'pdf');
+    expect(blob).toBeInstanceOf(File);
+    expect((blob as File).name).toBe('SEC-001.pdf');
+  });
+
+  it('throws ApiError with the server message on a non-2xx response', async () => {
+    stubFetch(
+      new Response(JSON.stringify({ error: 'this build was compiled without PDF support' }), {
+        status: 501,
+        statusText: 'Not Implemented',
+      }),
+    );
+    const err = await api.downloadFindingExport('fnd_1', 'pdf').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(501);
+    expect(apiErrorMessage(err)).toBe('this build was compiled without PDF support');
+  });
+
+  it('hands the AbortSignal to fetch', async () => {
+    const fetchMock = stubFetch(new Response('x', { status: 200 }));
+    const controller = new AbortController();
+    await api.downloadFindingExport('fnd_1', 'html', { signal: controller.signal });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.signal).toBe(controller.signal);
+  });
+});
