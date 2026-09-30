@@ -227,11 +227,6 @@ export default function SessionDetailPage() {
             showCrew
             derived={session.codename_derived}
           />
-          <span className="text-ui text-ink-dim">
-            <span className="font-mono">{session.agent_name}</span>
-            <span className="mx-1 text-border">·</span>
-            <span className="font-mono">{session.model}</span>
-          </span>
           <span className="inline-flex items-center gap-1.5">
             <span
               className={cn('inline-block h-2 w-2 rounded-full', sessionStatusDot(session.status))}

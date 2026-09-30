@@ -48,7 +48,7 @@ const ROW: RunListRow = {
 };
 
 describe('WorkflowRuns — canonical column order', () => {
-  it('renders headers as Name, Status, Workflow, Run, Trigger, Host, In, Out, Cached, Cost, Turns, Duration, Started, (actions)', async () => {
+  it('renders headers as Status, Workflow, Run, Trigger, Host, In, Out, Cached, Cost, Turns, Duration, Started, (actions)', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([ROW]);
 
@@ -64,7 +64,6 @@ describe('WorkflowRuns — canonical column order', () => {
       (th) => th.textContent?.trim() ?? '',
     );
     expect(headers).toEqual([
-      'Name',
       'Status',
       'Workflow',
       'Run',

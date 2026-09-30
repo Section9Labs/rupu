@@ -16,12 +16,12 @@
 // keystroke, over workflow name / run id / host id — composing with (not
 // replacing) the lifecycle/trigger pills above it.
 
-import { CrewChip } from '../../components/codename/CrewChip';
-import { parseCodename } from '../../lib/codename';
 import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { api, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
+import { CrewChip } from '../../components/codename/CrewChip';
+import { parseCodename } from '../../lib/codename';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
@@ -352,14 +352,6 @@ function runDurationMs(run: RunListRow): number | null {
 
 const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
   {
-    key: 'name',
-    header: 'Name',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.codename,
-    render: (r) => <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />,
-  },
-  {
     key: 'status',
     header: 'Status',
     fit: true,
@@ -374,7 +366,12 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     sortable: true,
     sortValue: (r) => r.workflow_name,
     titleValue: (r) => r.workflow_name,
-    render: (r) => <span className="text-sm font-medium text-ink">{r.workflow_name}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center gap-2">
+        <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />
+        <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
+      </span>
+    ),
   },
   {
     key: 'run',

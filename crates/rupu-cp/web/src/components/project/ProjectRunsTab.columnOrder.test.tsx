@@ -37,7 +37,7 @@ const ROW: RunListRow = {
 };
 
 describe('ProjectRunsTab — column order', () => {
-  it('renders headers as Name, Status, Workflow, Run, Trigger, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
+  it('renders headers as Status, Workflow, Run, Trigger, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
     vi.spyOn(api, 'getProjectRuns').mockResolvedValue([ROW]);
     // ProjectUsageTimeline (Task U4) fetches independently of the run list
     // above — mock it too so this test isn't tripped up by an unmocked call.
@@ -55,7 +55,6 @@ describe('ProjectRunsTab — column order', () => {
       (th) => th.textContent?.trim() ?? '',
     );
     expect(headers).toEqual([
-      'Name',
       'Status',
       'Workflow',
       'Run',

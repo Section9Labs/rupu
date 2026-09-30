@@ -20,7 +20,6 @@
 // keystroke, over agent name / session id / host id — composing with (not
 // replacing) the Active/Archived pill above it.
 
-import { AgentName } from '../components/codename/AgentName';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageSquare, RefreshCw } from 'lucide-react';
@@ -36,6 +35,7 @@ import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../components/HostSelect';
 import { SessionStatusPill } from '../components/StatusPill';
+import { AgentName } from '../components/codename/AgentName';
 import { usePagedList } from '../lib/usePagedList';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
@@ -258,7 +258,6 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
         <AgentName
           codename={s.codename}
           agent={s.agent_name}
-          model={s.model}
           showCrew
           derived={s.codename_derived}
         />

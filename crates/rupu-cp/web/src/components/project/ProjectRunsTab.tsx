@@ -22,12 +22,11 @@
 // keystroke, over workflow name / run id / trigger — composing with (not
 // replacing) the status/trigger pills above it.
 
-import { CrewChip } from '../codename/CrewChip';
-import { parseCodename } from '../../lib/codename';
 import { useState } from 'react';
 import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
 import { StatusPill } from '../StatusPill';
 import { TriggerChip } from '../TriggerChip';
+import { CrewChip } from '../codename/CrewChip';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { FilterBar } from '../ui/FilterBar';
 import { FilterPills, type FilterPillOption } from '../ui/FilterPills';
@@ -41,6 +40,7 @@ import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
+import { parseCodename } from '../../lib/codename';
 
 // --- Filter definitions -----------------------------------------------------
 
@@ -87,14 +87,6 @@ function runDurationMs(run: RunListRow): number | null {
 
 const RUN_COLUMNS: Column<RunListRow>[] = [
   {
-    key: 'name',
-    header: 'Name',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.codename,
-    render: (r) => <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />,
-  },
-  {
     key: 'status',
     header: 'Status',
     fit: true,
@@ -109,7 +101,12 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
     sortable: true,
     sortValue: (r) => r.workflow_name,
     titleValue: (r) => r.workflow_name,
-    render: (r) => <span className="text-sm font-medium text-ink">{r.workflow_name}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center gap-2">
+        <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />
+        <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
+      </span>
+    ),
   },
   {
     key: 'run',

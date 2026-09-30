@@ -12,8 +12,6 @@
 // getRunUsageTimeline are called with the host parameter. All control/SSE
 // calls also include the host param.
 
-import { CrewChip } from '../components/codename/CrewChip';
-import { parseCodename } from '../lib/codename';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, ArrowLeft, FileText, GitBranch, ListOrdered, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
@@ -46,6 +44,8 @@ import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/r
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
+import { CrewChip } from '../components/codename/CrewChip';
+import { parseCodename } from '../lib/codename';
 
 const MAX_EVENTS = 2000;
 

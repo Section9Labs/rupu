@@ -17,7 +17,6 @@
 // single merged row's `source` field, it does not need to dedupe anything
 // itself.
 
-import { AgentName } from '../../components/codename/AgentName';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
@@ -33,6 +32,7 @@ import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
 import { Badge } from '../../components/ui/Badge';
 import { StatusPill } from '../../components/StatusPill';
+import { AgentName } from '../../components/codename/AgentName';
 import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { cn } from '../../lib/cn';
 import { shortId } from '../../lib/shortId';
