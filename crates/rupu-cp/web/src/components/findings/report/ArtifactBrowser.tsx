@@ -48,18 +48,24 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
   return (
     <div className="grid overflow-hidden rounded-md border border-border bg-panel md:grid-cols-[minmax(12rem,16rem)_minmax(0,1fr)]">
       <ul className="border-b border-border p-1.5 md:border-b-0 md:border-r">
-        {artifacts.map((a) => (
-          <li key={`${a.path}-${a.sha256}`}>
-            <button
-              type="button"
-              onClick={() => void open(a)}
-              className={`flex w-full justify-between gap-2 rounded px-2 py-1 text-left font-mono text-note ${selected?.sha256 === a.sha256 ? 'bg-brand-50 text-ink' : 'text-ink-dim hover:bg-surface'}`}
-            >
-              <span className="truncate">{a.path}</span>
-              <span className="shrink-0 text-ink-mute">{formatBytes(a.size)}</span>
-            </button>
-          </li>
-        ))}
+        {artifacts.map((a) => {
+          // Identity is path AND sha: two paths with identical content share a
+          // sha, and must not both read as selected.
+          const isSelected = selected?.path === a.path && selected?.sha256 === a.sha256;
+          return (
+            <li key={`${a.path}-${a.sha256}`}>
+              <button
+                type="button"
+                aria-pressed={isSelected}
+                onClick={() => void open(a)}
+                className={`flex w-full justify-between gap-2 rounded px-2 py-1 text-left font-mono text-note ${isSelected ? 'bg-brand-50 text-ink' : 'text-ink-dim hover:bg-surface'}`}
+              >
+                <span className="truncate">{a.path}</span>
+                <span className="shrink-0 text-ink-mute">{formatBytes(a.size)}</span>
+              </button>
+            </li>
+          );
+        })}
       </ul>
       <div className="min-w-0">
         {!selected && <p className="px-3 py-2 text-ui text-ink-mute">Select an artifact to preview it.</p>}
@@ -74,7 +80,7 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
               )}
             </div>
             {loading && <p role="status" className="px-3 py-2 text-ui text-ink-mute">Loading…</p>}
-            {error && <p className="px-3 py-2 text-ui text-err">{error}</p>}
+            {error && <p role="alert" className="px-3 py-2 text-ui text-err">{error}</p>}
             {text !== null && <pre className="max-h-96 overflow-auto px-3 py-2 text-note font-mono text-ink whitespace-pre">{text}</pre>}
             {selected.kind !== 'text' && !selected.host && <p className="px-3 py-2 text-ui text-ink-mute">Binary file. Use Download.</p>}
           </>

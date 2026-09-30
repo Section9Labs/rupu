@@ -247,6 +247,30 @@ describe('ArtifactBrowser', () => {
       expect(await screen.findByText('Internal Server Error')).toBeInTheDocument();
     });
 
+    it('marks only the selected artifact as pressed, even when two paths share a sha', async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(() => Promise.resolve(new Response('same bytes')));
+      const dup: ArtifactRef = { ...artA, path: 'poc/a-copy.txt' };
+      render(<ArtifactBrowser findingId="fnd_1" artifacts={[artA, dup, artB]} />);
+      const btn = (re: RegExp) => screen.getByRole('button', { name: re });
+      // nothing selected yet
+      for (const re of [/poc\/a\.txt/, /poc\/a-copy\.txt/, /poc\/b\.txt/]) expect(btn(re)).toHaveAttribute('aria-pressed', 'false');
+      fireEvent.click(btn(/poc\/a\.txt/));
+      expect(btn(/poc\/a\.txt/)).toHaveAttribute('aria-pressed', 'true');
+      expect(btn(/poc\/a-copy\.txt/)).toHaveAttribute('aria-pressed', 'false');
+      expect(btn(/poc\/b\.txt/)).toHaveAttribute('aria-pressed', 'false');
+      fireEvent.click(btn(/poc\/a-copy\.txt/));
+      expect(btn(/poc\/a\.txt/)).toHaveAttribute('aria-pressed', 'false');
+      expect(btn(/poc\/a-copy\.txt/)).toHaveAttribute('aria-pressed', 'true');
+      await screen.findByText('same bytes');
+    });
+
+    it('announces a preview error with role="alert"', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ error: 'gone' }), { status: 404 }));
+      render(<ArtifactBrowser findingId="fnd_1" artifacts={[artA]} />);
+      fireEvent.click(screen.getByRole('button', { name: /poc\/a\.txt/ }));
+      expect(await screen.findByRole('alert')).toHaveTextContent('gone');
+    });
+
     it('refuses to preview an oversized text artifact and never fetches it', () => {
       const fetchSpy = vi.spyOn(globalThis, 'fetch');
       const big: ArtifactRef = { path: 'poc/big.log', sha256: '3'.repeat(64), size: 300 * 1024, kind: 'text', stored: 'copied' };
