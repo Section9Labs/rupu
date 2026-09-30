@@ -73,9 +73,9 @@ async fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Valu
     let steps = s.run_store.read_step_results(id).unwrap_or_default();
     let u = crate::usage::run_usage_blocking(Arc::clone(&s.run_store), id.to_string()).await;
     let usage = crate::usage::summarize_run_usage(&u, &s.pricing);
-    Ok(Json(
-        serde_json::json!({ "run": record, "steps": steps, "usage": usage }),
-    ))
+    let mut out = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
+    crate::codename_legacy::fill_detail_steps(&s.run_store, &record, &mut out);
+    Ok(Json(out))
 }
 
 /// Run a synchronous request body — run-store reads plus the usage fold,
@@ -640,6 +640,9 @@ pub fn query_run_detail(
     let usage = crate::usage::summarize_run(store, id, pricing);
     let mut out = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
     crate::codename::inject_codename(&mut out["run"], &record.id, None);
+    // Legacy runs: derive names below the run level too (steps, units,
+    // panelists, fixers, parallel sub-steps, findings).
+    crate::codename_legacy::fill_detail_steps(store, &record, &mut out);
     Ok(out)
 }
 
@@ -1067,8 +1070,8 @@ async fn tail_local_log(store: &RunStore, id: &str) -> Result<Response, ApiError
     store
         .load(id)
         .map_err(|e| run_not_found_or_internal(id, e))?;
-    let events_path = store.events_path(id);
-    let sse = crate::sse::tail_events_sse(events_path)
+    let store = std::sync::Arc::new(RunStore::new(store.root.clone()));
+    let sse = crate::sse::tail_events_sse(store, id)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(sse.into_response())

@@ -162,9 +162,12 @@ export interface StepResultRecord {
   rendered_prompt?: string;
   kind?: string;
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename record. */
+  codename_derived?: boolean;
   items?: unknown[];
   findings?: Array<{
     codename?: string;
+    codename_derived?: boolean;
     source: string;
     severity: string;
     title: string;
@@ -233,6 +236,8 @@ export interface StepStartedEvent extends RunEventBase {
   kind: string;
   agent?: string | null;
   codename?: string;
+  /** True when the CP derived `codename` for a pre-codename run's event. */
+  codename_derived?: boolean;
 }
 
 export interface StepWorkingEvent extends RunEventBase {
@@ -277,6 +282,7 @@ export interface UnitStartedEvent extends RunEventBase {
   unit_key: string;
   agent?: string | null;
   codename?: string;
+  codename_derived?: boolean;
   transcript_path: string;
 }
 
@@ -341,6 +347,7 @@ export interface DispatchStartedEvent extends RunEventBase {
   agent?: string | null;
   transcript_path: string;
   codename?: string;
+  codename_derived?: boolean;
   provider?: string;
   model?: string;
 }
@@ -351,6 +358,7 @@ export interface AgentStartedEvent extends RunEventBase {
   step_id: string;
   unit_index?: number;
   codename?: string;
+  codename_derived?: boolean;
   agent: string;
   provider?: string;
   model?: string;
@@ -482,6 +490,8 @@ export interface UnitCheckpoint {
   success: boolean | null;
   finished_at: string;      // ISO-8601
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename run. */
+  codename_derived?: boolean;
   /** Folded server-side from the unit's `agent_started` (graph endpoint). */
   agent?: string;
   provider?: string;
@@ -491,6 +501,8 @@ export interface UnitCheckpoint {
 /** An agent instance's identity, folded server-side from `events.jsonl`. */
 export interface AgentIdentityDto {
   codename?: string;
+  /** True when `codename` was derived on read for a pre-codename run. */
+  codename_derived?: boolean;
   agent?: string;
   provider?: string;
   model?: string;

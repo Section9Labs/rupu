@@ -19,6 +19,8 @@ import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
 import { memberLabel, parseCodename } from '../../lib/codename';
+import { cn } from '../../lib/cn';
+import { derivedTitle } from '../codename/CrewChip';
 import { RoleBadge } from '../codename/RoleBadge';
 
 export interface FanoutNodeData extends Record<string, unknown> {
@@ -38,15 +40,23 @@ const PREVIEW_CELLS = 60;
  *  Per-unit names stay out of the node — they live in unit lists/selection,
  *  which keeps the header O(1) at hundreds–thousands of units. */
 function FanoutRole({ node, total }: { node: GraphNode; total: number }) {
-  const codename = node.codename ?? node.fanout?.units.find((u) => u.codename)?.codename;
+  const named: { codename?: string; codenameDerived?: boolean } | undefined = node.codename
+    ? node
+    : node.fanout?.units.find((u) => u.codename);
+  const codename = named?.codename;
   if (!codename) return null;
+  const derived = named?.codenameDerived === true;
   const { role } = parseCodename(codename);
   if (!role) return null;
   return (
     <span
       data-testid="rg-fanout-role"
-      title={codename}
-      className="inline-flex shrink-0 items-center gap-1 normal-case tracking-normal"
+      title={derivedTitle(codename, derived)}
+      data-derived={derived || undefined}
+      className={cn(
+        'inline-flex shrink-0 items-center gap-1 normal-case tracking-normal',
+        derived && 'opacity-60',
+      )}
     >
       <RoleBadge role={role} size={10} />
       <span className="font-mono">

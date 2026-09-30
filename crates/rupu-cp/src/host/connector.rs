@@ -753,11 +753,26 @@ pub(crate) async fn open_run_events_tail(
         .await
         .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
 
-    let stream = source.map(|ev| {
-        let json = serde_json::to_string(&ev)
+    // Legacy (pre-codename) runs' step/unit/dispatch events get a derived
+    // name; every other event is serialized exactly as before.
+    // Classified once at attach, off the executor (`None` for a codename-era
+    // run); any per-event disk work runs on the blocking pool.
+    let namers = crate::codename_legacy::namers_for_run(Arc::clone(run_store), run_id).await;
+    let stream = source.then(move |ev| {
+        let namers = namers.clone();
+        async move {
+            let row = match &namers {
+                Some(n) => crate::codename_legacy::name_event(n, &ev).await,
+                None => None,
+            };
+            let json = match row {
+                Some(row) => serde_json::to_string(&row),
+                None => serde_json::to_string(&ev),
+            }
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let frame = format!("data: {json}\n\n");
-        Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
+            let frame = format!("data: {json}\n\n");
+            Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
+        }
     });
 
     Ok(Box::pin(stream))

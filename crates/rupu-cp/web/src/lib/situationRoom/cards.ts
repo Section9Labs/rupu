@@ -67,6 +67,9 @@ export interface StreamCard {
   /** Server-minted agent codename (e.g. `jade-reef/heron#4`) when the event /
    *  finding carries one. Display-only — never computed client-side. */
   codename?: string;
+  /** True when the server derived `codename` for a pre-codename run (render
+   *  it muted). */
+  codenameDerived?: boolean;
   /** Crew word of the run (`jade-reef`) — from the event's codename, or the
    *  caller's run_id → run codename lookup for run-level cards. Drives the
    *  tint stripe + the run link label. */
@@ -135,6 +138,11 @@ export interface CardContext {
    *  agent_started card show the fan-out target its (suppressed, named)
    *  unit_started carried. */
   unitKeys?: ReadonlyMap<string, string>;
+  /** (run, step, unit index) of every unit-scoped agent_started, from
+   *  {@link agentUnitIndex}. A pre-codename run whose unit has BOTH a
+   *  unit_started and an agent_started (both named on read) renders only the
+   *  agent_started card — the same one-card-per-unit rule as a named run. */
+  agentUnits?: ReadonlySet<string>;
 }
 
 function unitKeyId(runId: string, stepId: string, index: number): string {
@@ -151,12 +159,32 @@ export function unitKeyIndex(events: Iterable<RunEvent>): Map<string, string> {
   return out;
 }
 
+/** Keys (see {@link CardContext.agentUnits}) of every unit-scoped
+ *  agent_started in `events`. */
+export function agentUnitIndex(events: Iterable<RunEvent>): Set<string> {
+  const out = new Set<string>();
+  for (const ev of events) {
+    if (!isKnownRunEvent(ev) || ev.type !== 'agent_started' || ev.unit_index == null) continue;
+    out.add(unitKeyId(ev.run_id, ev.step_id, ev.unit_index));
+  }
+  return out;
+}
+
 export function cardFromEvent(
   ev: RunEvent,
   ts: number,
   key: string,
   ctx?: CardContext,
 ): StreamCard | null {
+  if (
+    ctx?.agentUnits &&
+    isKnownRunEvent(ev) &&
+    ev.type === 'unit_started' &&
+    ev.codename_derived &&
+    ctx.agentUnits.has(unitKeyId(ev.run_id, ev.step_id, ev.index))
+  ) {
+    return null;
+  }
   let card = cardFromEventInner(ev, ts, key);
   if (!card || !ctx) return card;
   if (ctx.unitKeys && isKnownRunEvent(ev) && ev.type === 'agent_started' && ev.unit_index != null) {
@@ -170,9 +198,19 @@ export function cardFromEvent(
   return card;
 }
 
-/** Codename + its crew word, spread onto a card when the event carries one. */
-function named(codename: string | undefined): { codename?: string; crew?: string } {
-  return codename ? { codename, crew: parseCodename(codename).crew } : {};
+/** Codename + its crew word (+ the derived flag), spread onto a card when
+ *  the event carries one. */
+function named(
+  codename: string | undefined,
+  derived?: boolean,
+): { codename?: string; crew?: string; codenameDerived?: boolean } {
+  if (!codename) return {};
+  const out: { codename?: string; crew?: string; codenameDerived?: boolean } = {
+    codename,
+    crew: parseCodename(codename).crew,
+  };
+  if (derived === true) out.codenameDerived = true;
+  return out;
 }
 
 function cardFromEventInner(ev: RunEvent, ts: number, key: string): StreamCard | null {
@@ -205,7 +243,7 @@ function cardFromEventInner(ev: RunEvent, ts: number, key: string): StreamCard |
     case 'step_started':
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: k.agent ? 'Scanning' : 'Step', stepId: k.step_id, agent: k.agent ?? undefined,
-        stepKind: k.kind, ...named(k.codename),
+        stepKind: k.kind, ...named(k.codename, k.codename_derived),
         // Agent is rendered as its own field; the title is just the step so it
         // isn't repeated ("agent agent · step").
         title: stepLabel(k.step_id),
@@ -238,17 +276,19 @@ function cardFromEventInner(ev: RunEvent, ts: number, key: string): StreamCard |
     case 'unit_started':
       // New-era runs always follow a named unit_started with an agent_started
       // (which carries provider/model too) — render only that one, so a wide
-      // fan-out doesn't double its cards. Legacy (unnamed) units keep theirs.
-      if (k.codename) return null;
+      // fan-out doesn't double its cards. Legacy units (no agent_started)
+      // keep theirs — including ones whose name the server derived on read.
+      if (k.codename && !k.codename_derived) return null;
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: 'Fan-out', stepId: k.step_id, agent: k.agent ?? undefined,
+        ...named(k.codename, k.codename_derived),
         unitKey: k.unit_key, transcriptPath: k.transcript_path,
         // Agent + unit render as their own fields; keep the title the step.
         title: stepLabel(k.step_id) };
     case 'agent_started':
       return { ...base, form: 'activity', group: 'activity', accent: 'brand',
         badge: 'Agent', stepId: k.step_id, agent: k.agent,
-        provider: k.provider, model: k.model, ...named(k.codename),
+        provider: k.provider, model: k.model, ...named(k.codename, k.codename_derived),
         transcriptPath: k.transcript_path,
         // The member label IS the headline: who launched, on what.
         title: memberLabel(k.codename, k.agent, k.provider, k.model),
@@ -310,7 +350,7 @@ export function cardFromFinding(f: FindingOut): StreamCard {
     filePath: f.file_path ?? undefined,
     fileLine: f.line_range?.[0],
     permalink: f.permalink ?? undefined,
-    ...named(who?.codename),
+    ...named(who?.codename, who?.derived),
     agent: who?.agent,
     provider: who?.provider,
     model: who?.model,

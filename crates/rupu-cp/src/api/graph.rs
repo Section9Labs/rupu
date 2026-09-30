@@ -119,11 +119,29 @@ fn build_run_graph_json(
     // so the client doesn't depend on its bounded live-event window to name
     // units — at 1000+ units that window drops the early `agent_started`s.
     let EventFold {
-        units,
-        step_identities,
-        unit_identities,
-        subrun_identities,
+        mut units,
+        mut step_identities,
+        mut unit_identities,
+        mut subrun_identities,
     } = merge_event_units(id, store, checkpoints);
+
+    // 5b. Legacy runs (recorded before codenames): derive every missing name
+    // below the run level, flagged `codename_derived` (spec §6).
+    let mut step_results: Vec<serde_json::Value> = step_results
+        .iter()
+        .filter_map(|r| serde_json::to_value(r).ok())
+        .collect();
+    if crate::codename_legacy::run_is_legacy(&run) {
+        derive_legacy_names(
+            store,
+            id,
+            &mut step_results,
+            &mut units,
+            &mut step_identities,
+            &mut unit_identities,
+            &mut subrun_identities,
+        );
+    }
 
     // 6. Token/cost rollup for the run-detail header breakdown.
     let usage = crate::usage::summarize_run(store, id, pricing);
@@ -217,6 +235,9 @@ async fn run_graph(
 struct Identity {
     #[serde(skip_serializing_if = "Option::is_none")]
     codename: Option<String>,
+    /// `Some(true)` when `codename` was derived on read for a legacy run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codename_derived: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,10 +255,121 @@ impl Identity {
                 *slot = Some(v);
             }
         }
+        if later.codename.as_deref().is_some_and(|c| !c.is_empty()) {
+            self.codename_derived = later.codename_derived;
+        }
         pick(&mut self.codename, later.codename);
         pick(&mut self.agent, later.agent);
         pick(&mut self.provider, later.provider);
         pick(&mut self.model, later.model);
+    }
+}
+
+/// Derive-on-read names for a run recorded before codenames (spec §6) — the
+/// caller gates on [`crate::codename_legacy::run_is_legacy`] — via
+/// the shared [`crate::codename_legacy::LegacyNamer`]: fills missing
+/// codenames on `step_results` / `units`, and the identity maps where the
+/// event fold found none (legacy runs have no `agent_started` /
+/// codename-bearing `dispatch_started`). Every derived name carries
+/// `codename_derived: true`. A run whose records are all named is untouched
+/// and its snapshot never parsed.
+fn derive_legacy_names(
+    store: &RunStore,
+    id: &str,
+    step_results: &mut [serde_json::Value],
+    units: &mut [serde_json::Value],
+    step_identities: &mut BTreeMap<String, Identity>,
+    unit_identities: &mut BTreeMap<String, BTreeMap<usize, Identity>>,
+    subrun_identities: &mut BTreeMap<String, Identity>,
+) {
+    use crate::codename_legacy::{
+        record_lacks_name, transcript_run_start, LegacyNamer, DERIVED_KEY,
+    };
+    let unit_lacks = |u: &serde_json::Value| {
+        u.get("codename")
+            .and_then(|v| v.as_str())
+            .is_none_or(str::is_empty)
+    };
+    if !units.iter().any(unit_lacks) && !step_results.iter().any(record_lacks_name) {
+        return;
+    }
+    let mut namer = LegacyNamer::open(store, id);
+    let derived = namer.fill_step_records(step_results) + namer.fill_units(units);
+    if derived == 0 {
+        // Nothing below the run was unnamed-but-nameable (e.g. a new run's
+        // agent-less gate step): not a legacy run — skip the sub-run walk.
+        return;
+    }
+    let is_derived =
+        |v: &serde_json::Value| v.get(DERIVED_KEY) == Some(&serde_json::Value::Bool(true));
+
+    for rec in step_results.iter() {
+        let Some(step_id) = rec.get("step_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Linear step: its member's identity (agent from the snapshot,
+        // provider/model from its transcript's first-line `RunStart`).
+        if is_derived(rec) {
+            let slot = step_identities.entry(step_id.to_string()).or_default();
+            if slot.codename.is_none() {
+                slot.codename = rec
+                    .get("codename")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                slot.codename_derived = Some(true);
+                if slot.agent.is_none() {
+                    slot.agent = namer.step_agent(step_id);
+                }
+                if slot.provider.is_none() && slot.model.is_none() {
+                    let start = rec
+                        .get("transcript_path")
+                        .and_then(|v| v.as_str())
+                        .filter(|p| !p.is_empty())
+                        .and_then(|p| transcript_run_start(std::path::Path::new(p)));
+                    if let Some((_, provider, model, _)) = start {
+                        slot.provider = Some(provider).filter(|s| !s.is_empty());
+                        slot.model = Some(model).filter(|s| !s.is_empty());
+                    }
+                }
+            }
+        }
+        // Parallel sub-steps: keyed by declared position, like `agent_started`.
+        let items_derived = rec
+            .get("items")
+            .and_then(|v| v.as_array())
+            .is_some_and(|items| items.iter().any(is_derived));
+        if items_derived {
+            for (index, codename, agent) in namer.parallel_subs(step_id) {
+                let slot = unit_identities
+                    .entry(step_id.to_string())
+                    .or_default()
+                    .entry(index)
+                    .or_default();
+                if slot.codename.is_none() {
+                    slot.codename = Some(codename);
+                    slot.codename_derived = Some(true);
+                    slot.agent.get_or_insert(agent);
+                }
+            }
+        }
+    }
+
+    // Dispatched sub-agents anywhere in the run's tree.
+    for (sub_id, ident) in namer.subs(store).clone() {
+        let slot = subrun_identities.entry(sub_id).or_default();
+        if slot.codename.is_none() && ident.codename.is_some() {
+            slot.codename = ident.codename;
+            slot.codename_derived = ident.derived.then_some(true);
+        }
+        for (field, value) in [
+            (&mut slot.agent, ident.agent),
+            (&mut slot.provider, ident.provider),
+            (&mut slot.model, ident.model),
+        ] {
+            if field.is_none() {
+                *field = value;
+            }
+        }
     }
 }
 
@@ -362,6 +494,7 @@ fn merge_event_units(
                     agent: Some(agent),
                     provider,
                     model,
+                    ..Default::default()
                 };
                 let slot = match unit_index {
                     None => step_identities.entry(step_id).or_default(),
@@ -389,6 +522,7 @@ fn merge_event_units(
                         agent,
                         provider,
                         model,
+                        ..Default::default()
                     });
             }
             _ => {}

@@ -955,3 +955,69 @@ describe('seeded identities from the graph response', () => {
     expect(a.codename).toBe('jade-reef/heron');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Derived (legacy, derive-on-read) codenames carry a muted flag
+// ---------------------------------------------------------------------------
+
+describe('derived codenames', () => {
+  const PAR: StepNodeDto = {
+    id: 'p', kind: 'parallel',
+    parallel: [{ id: 'lint', agent: 'linter' }],
+  };
+
+  it('flags derived step, unit, parallel-sub and event names; stored names stay unflagged', () => {
+    const g = makeGraph({
+      steps: [STEP_A, STEP_B, PAR],
+      step_results: [
+        { run_id: runId(), step_id: 'a', success: true, codename: 'jade-reef/hedgehog', codename_derived: true },
+        {
+          run_id: runId(), step_id: 'p', success: true,
+          items: [{ index: 0, sub_id: 'lint', codename: 'jade-reef/heron', codename_derived: true }],
+        },
+      ],
+      units: [
+        {
+          step_id: 'b', index: 0, item: 'f0.ts', run_id: runId(), transcript_path: '/t/0.jsonl',
+          output: '', success: true, finished_at: '2026-06-18T00:01:00Z',
+          codename: 'jade-reef/numbat#1', codename_derived: true,
+        },
+        {
+          step_id: 'b', index: 1, item: 'f1.ts', run_id: runId(), transcript_path: '/t/1.jsonl',
+          output: '', success: true, finished_at: '2026-06-18T00:01:00Z',
+          codename: 'jade-reef/numbat#2',
+        },
+      ],
+    });
+    const events: RunEvent[] = [
+      {
+        type: 'unit_started', run_id: runId(), step_id: 'b', index: 2, unit_key: 'f2.ts',
+        transcript_path: '/t/2.jsonl', codename: 'jade-reef/numbat#3', codename_derived: true,
+      },
+    ];
+    const model = buildRunGraphModel(g, events);
+    expect(model.nodeById('a')!.codenameDerived).toBe(true);
+    expect(model.nodeById('p')!.parallel![0].codenameDerived).toBe(true);
+    const units = model.nodeById('b')!.fanout!.units;
+    expect(units.find((u) => u.index === 0)!.codenameDerived).toBe(true);
+    expect(units.find((u) => u.index === 1)!.codenameDerived).toBeUndefined();
+    expect(units.find((u) => u.index === 2)!.codenameDerived).toBe(true);
+  });
+
+  it('a stored name arriving later clears the derived flag', () => {
+    const g = makeGraph({
+      step_results: [{ run_id: runId(), step_id: 'a', success: true, codename: 'jade-reef/hedgehog', codename_derived: true }],
+      steps: [STEP_A],
+    });
+    const events: RunEvent[] = [
+      { type: 'step_started', run_id: runId(), step_id: 'a', kind: 'step', codename: 'jade-reef/hedgehog' },
+    ];
+    expect(buildRunGraphModel(g, events).nodeById('a')!.codenameDerived).toBeUndefined();
+  });
+
+  it('seeded step identity carries the derived flag', () => {
+    const g = makeGraph({ steps: [STEP_A] });
+    g.step_identities = { a: { codename: 'jade-reef/hedgehog', codename_derived: true, agent: 'agent-a' } };
+    expect(buildRunGraphModel(g, []).nodeById('a')!.codenameDerived).toBe(true);
+  });
+});

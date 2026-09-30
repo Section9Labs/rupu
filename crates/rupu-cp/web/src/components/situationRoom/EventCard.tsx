@@ -209,7 +209,13 @@ export default function EventCard({
           {card.codename ? (
             <>
               <span className="shrink-0 text-brand-700">
-                <AgentName codename={card.codename} agent={card.agent} provider={card.provider} model={card.model} />
+                <AgentName
+                  codename={card.codename}
+                  derived={card.codenameDerived}
+                  agent={card.agent}
+                  provider={card.provider}
+                  model={card.model}
+                />
               </span>
               {!titleIsName && <span className="shrink-0 text-ink-mute">·</span>}
               {!titleIsName && <span className="min-w-0">{card.title}</span>}
