@@ -2624,20 +2624,30 @@ impl SessionInteractiveState {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                purpose,
                 ..
             } => {
+                // Billed spend either way: a compaction summariser call
+                // counts toward the session's usage too.
                 self.live_usage.provider = Some(provider.clone());
                 self.live_usage.model = Some(model.clone());
                 self.live_usage.input_tokens += *input_tokens as u64;
                 self.live_usage.output_tokens += *output_tokens as u64;
                 self.live_usage.cached_tokens += *cached_tokens as u64;
-                // Track the most recent single-turn input size for the context gauge.
-                self.last_turn_input_tokens = *input_tokens as u64;
-                // Authoritative per-turn usage just landed. The on-disk
-                // streaming estimate for THIS turn is now redundant —
-                // zero the overlay so we don't keep displaying it on top
-                // of the value it was estimating.
-                self.streaming_overlay = SessionLiveUsage::default();
+                // A compaction call is not a turn: its input is the whole
+                // pre-compaction history, so it must not drive the context
+                // gauge, and it doesn't settle the in-flight turn's
+                // streaming estimate either.
+                if !is_compaction(purpose.as_deref()) {
+                    // Track the most recent single-turn input size for the
+                    // context gauge.
+                    self.last_turn_input_tokens = *input_tokens as u64;
+                    // Authoritative per-turn usage just landed. The on-disk
+                    // streaming estimate for THIS turn is now redundant —
+                    // zero the overlay so we don't keep displaying it on top
+                    // of the value it was estimating.
+                    self.streaming_overlay = SessionLiveUsage::default();
+                }
                 self.push_entry(SessionEntry::Usage {
                     provider: provider.clone(),
                     model: model.clone(),
@@ -6644,16 +6654,53 @@ async fn stop(session_id: &str) -> anyhow::Result<()> {
 
 /// The input-token count of the LAST turn recorded in a transcript — a single
 /// turn's prompt size, not the run's cumulative total. Used to calibrate
-/// compaction sizing to real tokens.
+/// compaction sizing to real tokens. A compaction summariser call's `Usage`
+/// is skipped: its input is the whole pre-compaction history, not a turn's
+/// prompt, and would mis-calibrate the next compaction.
 fn last_turn_input_tokens(path: &Path) -> Option<u32> {
     let iter = JsonlReader::iter(path).ok()?;
     let mut last = None;
     for event in iter.flatten() {
-        if let TranscriptEvent::Usage { input_tokens, .. } = event {
-            last = Some(input_tokens);
+        if let TranscriptEvent::Usage {
+            input_tokens,
+            purpose,
+            ..
+        } = event
+        {
+            if !is_compaction(purpose.as_deref()) {
+                last = Some(input_tokens);
+            }
         }
     }
     last
+}
+
+/// `Usage.purpose` of a context-compaction summariser call (as written by
+/// `rupu_agent`'s runner): billed spend, but not an agent turn.
+const COMPACTION_PURPOSE: &str = "compaction";
+
+fn is_compaction(purpose: Option<&str>) -> bool {
+    purpose == Some(COMPACTION_PURPOSE)
+}
+
+/// The transcript `Usage` event recording a compaction summariser call's
+/// spend — the same shape the agent runner writes for an in-run compaction
+/// (reasoning tokens billed as output), so every usage fold over the
+/// transcript counts it as tokens, never as a turn.
+fn compaction_usage_event(
+    provider: &str,
+    model: &str,
+    usage: &rupu_providers::types::Usage,
+) -> TranscriptEvent {
+    TranscriptEvent::Usage {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        served_model: None,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens.saturating_add(usage.reasoning_tokens),
+        cached_tokens: usage.cached_tokens,
+        purpose: Some(COMPACTION_PURPOSE.to_string()),
+    }
 }
 
 async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Result<()> {
@@ -6719,11 +6766,13 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     // tokens-per-char, making compaction far too aggressive). Read the last
     // Usage event from the most recent transcript; fall back to a dense-content
     // estimate (~0.5 tok/char) if no transcript usage is available.
-    let last_input_tokens: u32 = session
+    let latest_transcript = session
         .active_transcript_path
-        .as_ref()
-        .or(session.last_transcript_path.as_ref())
-        .and_then(|p| last_turn_input_tokens(p))
+        .clone()
+        .or_else(|| session.last_transcript_path.clone());
+    let last_input_tokens: u32 = latest_transcript
+        .as_deref()
+        .and_then(last_turn_input_tokens)
         .filter(|&t| t > 0)
         .unwrap_or_else(|| (total_chars / 2).max(1) as u32);
 
@@ -6776,6 +6825,12 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     .await
     {
         Ok(Some(outcome)) => {
+            record_offline_compaction_usage(
+                latest_transcript.as_deref(),
+                &session.provider_name,
+                &session.model,
+                &outcome.usage,
+            );
             let summarized = outcome.summarized_messages;
             let before = session.message_history.len();
             session.message_history = outcome.messages;
@@ -6800,6 +6855,40 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     }
 
     Ok(())
+}
+
+/// Record an offline `rupu session compact`'s summariser spend. That command
+/// mints no run of its own, so the spend is appended — as a
+/// `purpose: compaction` `Usage` event, which no turn counter or context
+/// calibration reads as a turn — to the transcript the compaction calibrated
+/// from: the session's latest turn. Every usage fold over the session's
+/// transcripts then counts it. With no transcript to attach it to, the spend
+/// can't be recorded; say so rather than drop it silently.
+fn record_offline_compaction_usage(
+    transcript: Option<&Path>,
+    provider: &str,
+    model: &str,
+    usage: &rupu_providers::types::Usage,
+) {
+    let event = compaction_usage_event(provider, model, usage);
+    let written = transcript
+        .filter(|path| path.is_file())
+        .map(|path| {
+            JsonlWriter::append(path)
+                .and_then(|mut writer| {
+                    writer.write(&event)?;
+                    writer.flush()
+                })
+                .map_err(|e| format!("{}: {e}", path.display()))
+        })
+        .unwrap_or_else(|| Err("the session has no turn transcript".to_string()));
+    if let Err(why) = written {
+        eprintln!(
+            "rupu: warning: compaction spend not recorded ({} in / {} out tokens): {why}",
+            usage.input_tokens,
+            usage.output_tokens.saturating_add(usage.reasoning_tokens)
+        );
+    }
 }
 
 /// Re-activate a session the operator previously stopped so it can take new
@@ -7242,6 +7331,13 @@ async fn run_compact_request(
     .await
     {
         Ok(Some(outcome)) => {
+            // The summariser call is billed: record it in this pseudo-run's
+            // own transcript (as a `purpose: compaction` usage, never a turn).
+            writer.write(&compaction_usage_event(
+                &session.provider_name,
+                &session.model,
+                &outcome.usage,
+            ))?;
             let summarized = outcome.summarized_messages;
             session.message_history = outcome.messages;
             // Same reasoning as the offline `rupu session compact` path: the
@@ -10164,6 +10260,51 @@ mod tests {
         );
     }
 
+    fn usage_event(input: u32, output: u32, purpose: Option<&str>) -> TranscriptEvent {
+        TranscriptEvent::Usage {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            served_model: None,
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: 0,
+            purpose: purpose.map(str::to_string),
+        }
+    }
+
+    fn write_events(path: &Path, events: &[TranscriptEvent]) {
+        let mut writer = JsonlWriter::create(path).expect("create transcript");
+        for event in events {
+            writer.write(event).expect("write event");
+        }
+        writer.flush().expect("flush transcript");
+    }
+
+    fn read_events(path: &Path) -> Vec<TranscriptEvent> {
+        JsonlReader::iter(path)
+            .expect("open transcript")
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// The `Usage` events a compaction summariser call left in `path`.
+    fn compaction_usage(path: &Path) -> Vec<(u32, u32, String, String)> {
+        read_events(path)
+            .into_iter()
+            .filter_map(|e| match e {
+                TranscriptEvent::Usage {
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    purpose: Some(p),
+                    ..
+                } if p == "compaction" => Some((input_tokens, output_tokens, provider, model)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// An idle session under `<tmp>/global` with a dense history that
     /// reliably exceeds a tiny compaction window (the recipe of
     /// `compact_clears_history_source_transcript_and_next_turn_seeds_inline`).
@@ -10219,6 +10360,130 @@ mod tests {
             None => std::env::remove_var("RUPU_HOME"),
         }
         out
+    }
+
+    const SUMMARY_SCRIPT: &str = r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#;
+
+    /// Ruling (Task 3 review): the compaction summariser's `Usage` event
+    /// carries the WHOLE history as input — calibrating the next manual
+    /// `session compact` against it would size the recent budget wrong.
+    #[test]
+    fn last_turn_input_tokens_ignores_compaction_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run_turn.jsonl");
+        write_events(
+            &path,
+            &[
+                usage_event(1_200, 40, None),
+                usage_event(95_000, 800, Some("compaction")),
+            ],
+        );
+        assert_eq!(last_turn_input_tokens(&path), Some(1_200));
+    }
+
+    /// Ruling (Task 3 review): the TUI context gauge tracks the last TURN's
+    /// prompt size; a compaction call is billed spend but not a turn.
+    #[test]
+    fn tui_context_gauge_ignores_compaction_usage() {
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_transcript_event(&usage_event(1_200, 40, None));
+        state.push_transcript_event(&usage_event(95_000, 800, Some("compaction")));
+        assert_eq!(state.last_turn_input_tokens, 1_200);
+        // ... while the spend still counts toward the session's usage.
+        assert_eq!(state.live_usage.input_tokens, 96_200);
+        assert_eq!(state.live_usage.output_tokens, 840);
+    }
+
+    /// Ruling (Task 3 review): the offline `rupu session compact` makes a
+    /// billed summariser call; its spend lands as a `purpose: compaction`
+    /// `Usage` event on the transcript it calibrated from (the session's
+    /// latest turn), so every usage fold over the session's transcripts
+    /// sees it.
+    #[tokio::test]
+    async fn manual_compact_records_the_summariser_spend_on_the_sessions_transcript() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_compact_spend01");
+        let last = record.transcripts_dir.join("run_prev.jsonl");
+        write_events(
+            &last,
+            &[
+                TranscriptEvent::RunStart {
+                    run_id: "run_prev".into(),
+                    workspace_id: "ws_test".into(),
+                    agent: "issue-reader".into(),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    started_at: Utc::now(),
+                    mode: RunMode::Bypass,
+                    schema: None,
+                    system_prompt: None,
+                },
+                usage_event(6_000, 50, None),
+                TranscriptEvent::RunComplete {
+                    run_id: "run_prev".into(),
+                    status: RunStatus::Ok,
+                    total_tokens: 6_050,
+                    duration_ms: 10,
+                    error: None,
+                },
+            ],
+        );
+        record.last_run_id = Some("run_prev".into());
+        record.last_transcript_path = Some(last.clone());
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+
+        with_mock_home(
+            &global,
+            SUMMARY_SCRIPT,
+            compact(&record.session_id, Some(1000)),
+        )
+        .await
+        .expect("compact completes");
+
+        assert_eq!(
+            compaction_usage(&last),
+            vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
+        );
+        // The appended event never mis-calibrates the next compaction.
+        assert_eq!(last_turn_input_tokens(&last), Some(6_000));
+    }
+
+    /// Ruling (Task 3 review): the worker's compact pseudo-run writes its
+    /// summariser spend into its own transcript.
+    #[tokio::test]
+    async fn compact_pseudo_run_records_the_summariser_spend_in_its_transcript() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, mut record) = idle_dense_session(&tmp, "ses_compact_spend02");
+        record.context_window_tokens = Some(1000);
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let request = SessionTurnRequest {
+            version: SessionTurnRequest::VERSION,
+            request_id: "req_1".into(),
+            run_id: "run_compact01".into(),
+            prompt: "[compact]".into(),
+            transcript_path: record.transcripts_dir.join("run_compact01.jsonl"),
+            enqueued_at: Utc::now(),
+            compact: true,
+        };
+
+        with_mock_home(
+            &global,
+            SUMMARY_SCRIPT,
+            run_compact_request(&global, SessionScope::Active, &record.session_id, &request),
+        )
+        .await
+        .expect("compact pseudo-run completes");
+
+        assert_eq!(
+            compaction_usage(&request.transcript_path),
+            vec![(500, 10, "anthropic".into(), "claude-sonnet-4-6".into())]
+        );
     }
 
     /// A turn's cached tokens come from its `RunResult` — the summed
