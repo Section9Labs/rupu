@@ -9,12 +9,20 @@ use rupu_scm::Registry;
 use std::sync::Arc;
 
 fn ctx(workspace: &std::path::Path) -> FindingsContext {
+    ctx_with(workspace, rupu_coverage::FindingProfile::Summary)
+}
+
+fn ctx_with(
+    workspace: &std::path::Path,
+    profile: rupu_coverage::FindingProfile,
+) -> FindingsContext {
     FindingsContext {
         workspace_path: workspace.to_path_buf(),
         scope_name: "chimera-campaign".to_string(),
         run_id: "run_mcp_test".to_string(),
         model: "gpt-5.6-cyber".to_string(),
         surface: rupu_coverage::Surface::Workflow,
+        options: rupu_coverage::FindingWriteOptions::default().with_profile(profile),
     }
 }
 
@@ -96,4 +104,129 @@ async fn locator_validation_applies_on_this_path_too() {
         !paths.findings.exists(),
         "a refused finding must not reach the ledger"
     );
+}
+
+#[tokio::test]
+async fn full_profile_records_a_report() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    let out = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect("full report records");
+    assert!(out.starts_with("finding_id: fnd_"), "got {out}");
+
+    let paths = rupu_coverage::CoveragePaths::new(
+        tmp.path(),
+        &rupu_coverage::target_id(tmp.path(), "chimera-campaign"),
+    );
+    let text = std::fs::read_to_string(&paths.findings).expect("ledger should exist");
+    let rec: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(
+        rec["report"].is_object(),
+        "report must reach the ledger: {rec}"
+    );
+}
+
+#[tokio::test]
+async fn full_profile_refuses_a_summary_only_call() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let err = dispatcher
+        .call("findings.record", host_finding())
+        .await
+        .expect_err("summary-shaped call must be refused under full");
+    let msg = err.to_string();
+    // The author supplied `rationale`, not `evidence`; the message must
+    // name the field they actually sent.
+    assert!(msg.contains("derived from `report`"), "{msg}");
+    assert!(
+        !msg.contains("`evidence`"),
+        "must name `rationale`, got: {msg}"
+    );
+    assert!(msg.contains("`rationale`"), "{msg}");
+}
+
+#[tokio::test]
+async fn full_profile_requires_a_report() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let err = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "host", "target_ref": "h.example" }),
+        )
+        .await
+        .expect_err("no report under full must be refused");
+    assert!(err.to_string().contains("`report` is required"), "{err}");
+}
+
+#[tokio::test]
+async fn full_profile_refuses_stray_excerpt_and_references() {
+    // `code_excerpt` / `references` are derived from the report too; sending
+    // them alongside a report must fail loudly, not be silently dropped.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    let err = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({
+                "scope": "repo",
+                "report": report,
+                "references": ["https://example.invalid/x"]
+            }),
+        )
+        .await
+        .expect_err("stray references must be refused under full");
+    assert!(err.to_string().contains("derived from `report`"), "{err}");
+}
+
+#[tokio::test]
+async fn summary_profile_missing_rationale_names_rationale() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx(tmp.path()));
+    let mut bad = host_finding();
+    bad.as_object_mut().unwrap().remove("rationale");
+    let err = dispatcher
+        .call("findings.record", bad)
+        .await
+        .expect_err("summary profile needs a rationale");
+    let msg = err.to_string();
+    assert!(msg.contains("`rationale` is required"), "{msg}");
+    assert!(!msg.contains("`evidence`"), "{msg}");
+}
+
+#[tokio::test]
+async fn summary_profile_refuses_a_report() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx(tmp.path()));
+    let report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    let err = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("report under summary must be refused");
+    assert!(err.to_string().contains("summary profile"), "{err}");
 }

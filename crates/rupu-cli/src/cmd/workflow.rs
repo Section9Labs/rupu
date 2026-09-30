@@ -3237,6 +3237,7 @@ pub(crate) async fn resume_run(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            options: rupu_coverage::FindingWriteOptions::default(),
         }),
     );
     let mode_str_for_policy = mode_str.clone();
@@ -4787,6 +4788,7 @@ async fn execute_workflow_invocation(
             run_id: run_id.clone(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            options: rupu_coverage::FindingWriteOptions::default(),
         }),
     );
 

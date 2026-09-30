@@ -320,6 +320,7 @@ async fn rebuild_opts_from_disk(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            options: rupu_coverage::FindingWriteOptions::default(),
         }),
     );
     let factory = Arc::new(DefaultStepFactory {
