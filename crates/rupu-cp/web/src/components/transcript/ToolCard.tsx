@@ -28,7 +28,7 @@
 import { useContext, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
-import type { ToolView, FindingView, ToolAuditView } from './transcriptView';
+import type { ToolView, ToolAuditView } from './transcriptView';
 import FindingCard from './FindingCard';
 import SourcePreview from './SourcePreview';
 import AstTree from './AstTree';
@@ -997,10 +997,13 @@ export default function ToolCard({
    *  transcript fetch's `host` plumbing. */
   host?: string;
 }) {
-  // Findings get their own full chrome — no outer header wrapper.
-  if (tool.kind === 'finding') {
-    const finding = tool.finding as FindingView;
-    return <FindingCard finding={finding} runId={runId} host={host} />;
+  // Findings get their own full chrome — no outer header wrapper. A
+  // `finding`-kind call whose input could not be parsed into a finding
+  // (malformed, or a shape this build does not know) falls through to the
+  // generic card below, which shows its args and any error, rather than
+  // handing FindingCard an undefined finding.
+  if (tool.kind === 'finding' && tool.finding) {
+    return <FindingCard finding={tool.finding} runId={runId} host={host} />;
   }
 
   const summary = summarizeInput(tool);
@@ -1047,7 +1050,7 @@ export default function ToolCard({
       )}
       {tool.kind === 'coverage' && <CoverageBody tool={tool} />}
       {tool.kind === 'ast_grep' && <AstGrepBody tool={tool} runId={runId} host={host} />}
-      {tool.kind === 'generic' && <GenericBody tool={tool} />}
+      {(tool.kind === 'generic' || tool.kind === 'finding') && <GenericBody tool={tool} />}
 
       {/* Error block — shown when tool.error is set */}
       {tool.error && <ErrorBlock error={tool.error} />}

@@ -139,6 +139,26 @@ pub struct UnitDispatch {
     /// directory each unit gets on the host is still its own — sharing the
     /// packed input is not sharing a working directory.
     pub workspace: Option<PreparedWorkspace>,
+    /// The step's findings profile as far as the coordinator can resolve it
+    /// (step `findings_profile` → workflow `defaults.findings_profile`; see
+    /// [`remote_unit_findings_profile`]). The dispatcher must deliver it to the
+    /// host as `rupu run --findings-profile` or refuse the launch. `None` ⇒
+    /// the host resolves from the agent file's `findingsProfile`, else `full`.
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
+}
+
+/// The findings profile a remote (`host:` / `distribute:`) unit must run
+/// under, as far as the coordinator can resolve it: step → workflow
+/// `defaults`. The rest of the chain (agent `findingsProfile` → `full`) lives
+/// in the agent file, which the host loads itself — so this returns `None`
+/// rather than falling back to the built-in default, which would override
+/// that frontmatter on the host. Same precedence `DefaultStepFactory` applies
+/// to a local step.
+pub(crate) fn remote_unit_findings_profile(
+    step: &Step,
+    defaults: &crate::workflow::WorkflowDefaults,
+) -> Option<rupu_coverage::FindingProfile> {
+    step.findings_profile.or(defaults.findings_profile)
 }
 
 /// Outcome of one unit dispatched to a remote host.
@@ -3036,6 +3056,7 @@ fn augment_workflow_with_loop_supernodes(wf: &Workflow) -> Workflow {
             distribute: None,
             host: None,
             workspace: None,
+            findings_profile: None,
             next: Vec::new(),
             depends_on: Vec::new(),
             split: None,
@@ -4701,6 +4722,7 @@ async fn run_node(
                     render_mode(opts.strict_templates),
                     effective_continue_on_error,
                     &opts.transcript_dir,
+                    opts.workflow.action_findings_profile(step),
                 )
                 .await
             }
@@ -5397,6 +5419,11 @@ async fn execute_action_step(
     mode: RenderMode,
     continue_on_error: bool,
     transcript_dir: &Path,
+    // The profile a `findings.record` call records under — this step's
+    // `findings_profile`, else `defaults.findings_profile`, else `full`
+    // (`Workflow::action_findings_profile`). The dispatcher is built once
+    // per run, so the per-step value travels with the call.
+    findings_profile: rupu_coverage::FindingProfile,
 ) -> Result<StepResult, RunWorkflowError> {
     let tool = step
         .action
@@ -5418,7 +5445,10 @@ async fn execute_action_step(
     // Narrowing here makes it structural: even if a future caller reuses
     // this dispatcher, an action step can still only invoke the tool named
     // in the workflow source.
-    let call_result = dispatcher.narrowed_to(tool).call(tool, args.clone()).await;
+    let call_result = dispatcher
+        .narrowed_to(tool)
+        .call_with_findings_profile(tool, args.clone(), findings_profile)
+        .await;
 
     let (allowed, applied, reason) = match &call_result {
         Ok(_) => (true, true, None),
@@ -5552,6 +5582,7 @@ async fn fire_notify_hooks(
             distribute: None,
             host: None,
             workspace: None,
+            findings_profile: None,
             next: Vec::new(),
             depends_on: Vec::new(),
             split: None,
@@ -5560,7 +5591,18 @@ async fn fire_notify_hooks(
             with: Some(n.with.clone()),
             run: None,
         };
-        match execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await {
+        let findings_profile = opts.workflow.action_findings_profile(&synth);
+        match execute_action_step(
+            dispatcher,
+            &synth,
+            ctx,
+            mode,
+            true,
+            &opts.transcript_dir,
+            findings_profile,
+        )
+        .await
+        {
             Ok(result) => {
                 persist_step_result(opts, run_id, &result);
                 step_results.push(result);
@@ -5796,6 +5838,7 @@ pub async fn run_reject_cleanup(
                         render_mode(opts.strict_templates),
                         false,
                         &opts.transcript_dir,
+                        opts.workflow.action_findings_profile(step),
                     )
                     .await
                 }
@@ -6134,6 +6177,7 @@ async fn dispatch_placed_step(
         index: 0,
         run_id: run_id.to_string(),
         workspace: prepared,
+        findings_profile: remote_unit_findings_profile(step, &opts.workflow.defaults),
         codename: codename.map(ToString::to_string),
     };
     announce_placed_agent(
@@ -6809,6 +6853,9 @@ async fn run_fanout_step(
     // so a unit that hasn't started yet is never dispatched (local OR
     // remote) once a pause has landed.
     let unit_pause = opts.pause.clone();
+    // Same for every unit of the step (and its retry); `Copy`, so each
+    // spawned task gets its own.
+    let unit_findings_profile = remote_unit_findings_profile(step, &opts.workflow.defaults);
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -6953,6 +7000,7 @@ async fn run_fanout_step(
                                     index: idx,
                                     run_id: run_id_clone.clone(),
                                     workspace: unit_ws.clone(),
+                                    findings_profile: unit_findings_profile,
                                     codename: unit_codename.as_ref().map(ToString::to_string),
                                 };
                                 announce_placed_agent(
@@ -7030,6 +7078,7 @@ async fn run_fanout_step(
                                             index: idx,
                                             run_id: retry_run_id.clone(),
                                             workspace: unit_ws.clone(),
+                                            findings_profile: unit_findings_profile,
                                             codename: unit_codename
                                                 .as_ref()
                                                 .map(ToString::to_string),

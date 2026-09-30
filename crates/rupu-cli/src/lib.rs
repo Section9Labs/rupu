@@ -18,6 +18,7 @@ pub mod cp_session_sender;
 pub mod cp_session_starter;
 pub mod cp_transcript_mutator;
 pub mod crash;
+pub mod findings_opts;
 pub mod fleet_unit_dispatcher;
 pub mod logging;
 pub mod netflow_sink;
@@ -176,6 +177,11 @@ pub enum Cmd {
     Coverage {
         #[command(subcommand)]
         action: cmd::coverage::Action,
+    },
+    /// Finding reports: the embedded report schema.
+    Findings {
+        #[command(subcommand)]
+        action: cmd::findings::Action,
     },
     /// Schedule-driven workflow firing (designed for system cron).
     Cron {
@@ -366,6 +372,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
+        Cmd::Findings { action } => cmd::findings::handle(action).await,
         Cmd::Cron { action } => {
             cmd::cron::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
@@ -434,6 +441,11 @@ fn ensure_output_format_supported(
             &[output::formats::OutputFormat::Table],
         ),
         Cmd::Coverage { action } => cmd::coverage::ensure_output_format(action, format),
+        Cmd::Findings { .. } => output::formats::ensure_supported(
+            "findings",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
         Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
         Cmd::Webhook { .. } => output::formats::ensure_supported(
             "webhook",

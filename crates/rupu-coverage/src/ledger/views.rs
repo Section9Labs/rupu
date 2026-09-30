@@ -161,6 +161,8 @@ mod tests {
                 provider: None,
             },
             declared_at: chrono::Utc::now(),
+            profile: crate::report::FindingProfile::Summary,
+            report: None,
         };
         std::fs::write(&paths.findings, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
         let got = read_findings(&paths).unwrap();

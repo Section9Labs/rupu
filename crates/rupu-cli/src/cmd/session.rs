@@ -381,6 +381,11 @@ struct SessionRecord {
     anthropic_speed: Option<Speed>,
     #[serde(default)]
     dispatchable_agents: Option<Vec<String>>,
+    /// The session agent's `findingsProfile` frontmatter, snapshotted at
+    /// session creation like the other agent-spec fields above. Absent ⇒
+    /// `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    findings_profile: Option<rupu_coverage::FindingProfile>,
     workspace_id: String,
     workspace_path: PathBuf,
     #[serde(default)]
@@ -1594,6 +1599,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         anthropic_context_management: spec.anthropic_context_management,
         anthropic_speed: spec.anthropic_speed,
         dispatchable_agents: spec.dispatchable_agents.clone(),
+        findings_profile: spec.findings_profile,
         workspace_id: ws.id,
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root,
@@ -7504,6 +7510,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             rupu_codename::derive_legacy(&session.session_id, Some(&session.agent_name))
         });
         let tool_context = ToolContext {
+            findings: Some(
+                crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
+                    rupu_coverage::FindingProfile::resolve(None, None, session.findings_profile),
+                ),
+            ),
             workspace_path: session.workspace_path.clone(),
             bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
             bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
@@ -9837,6 +9848,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             dispatchable_agents: None,
+            findings_profile: None,
             workspace_id: "ws_test".into(),
             workspace_path: PathBuf::from("/tmp/repo"),
             project_root: Some(PathBuf::from("/tmp/repo")),

@@ -129,9 +129,12 @@ Currently supported:
 ```yaml
 defaults:
   continue_on_error: true
+  findings_profile: full     # full | summary — see `findings_profile` below
 ```
 
 If a step does not set `continue_on_error`, it inherits the workflow default.
+
+`defaults.findings_profile` sets the findings contract for every step that runs an agent, and for `action:` steps that call `findings.record`. A step's own `findings_profile` overrides it. See [`findings_profile`](#findings_profile).
 
 ---
 
@@ -307,6 +310,7 @@ Common fields:
 | `max_parallel` | integer | `for_each`, `parallel`, `panel` | Concurrency cap, must be at least 1 |
 | `approval` | object | all steps | Human pause before the step dispatches |
 | `contract` | object | linear steps | Optional documentation for a structured step output |
+| `findings_profile` | `full` \| `summary` | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Findings contract for this step — see below |
 
 ### `actions`
 
@@ -346,6 +350,45 @@ steps:
     agent: issue-reporter
     actions: []                          # unrestricted — full agent grant
 ```
+
+### `findings_profile`
+
+Chooses the contract findings are recorded under for a step: `full` (a complete structured `report`, the built-in default) or `summary` (the lightweight `summary` / `severity` / `evidence` record). See `docs/coverage.md` for what each requires.
+
+Precedence, most specific first:
+
+1. the step's `findings_profile`
+2. the workflow's `defaults.findings_profile`
+3. the agent's `findingsProfile` frontmatter (see [agent-format.md](agent-format.md#findingsprofile))
+4. `full`
+
+```yaml
+defaults:
+  findings_profile: full          # every agent step records complete reports...
+steps:
+  - id: sweep
+    agent: quick-scanner
+    prompt: "Skim {{ inputs.path }} for hard-coded secrets"
+    findings_profile: summary     # ...except this cheap first pass
+  - id: deep-dive
+    agent: security-assessor
+    prompt: "Assess {{ inputs.path }}"
+```
+
+Rules:
+
+- `parallel:` sub-steps inherit their parent step's profile; a sub-step has no `findings_profile` of its own.
+- An `action: findings.record` step resolves its profile as the step's own `findings_profile` → `defaults.findings_profile` → `full` (there is no agent frontmatter to consult). Gate `notify:` hooks have no step of their own and use `defaults.findings_profile` (else `full`).
+- `findings.record` needs different `with:` keys per profile, and a missing key is a parse error naming the step, the profile, and the keys: `full` needs `scope` and `report`; `summary` needs `scope`, `summary`, `severity`, and `rationale`. Only key presence is checked, so a value may be a `{{ … }}` template.
+- Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
+- Remote steps (`host:` / `distribute:`) follow the same order. The coordinator resolves the step's value, else `defaults.findings_profile`, and launches each unit with `rupu run --findings-profile <profile>`. When neither is set, the host resolves the agent's `findingsProfile` from its own copy of the agent file, then `full`. A fan-out unit retried on its fallback host keeps the profile.
+- A remote host that can't honour the profile refuses the launch; the unit doesn't run under a different profile. That covers an older tunnel node that didn't advertise support, a bucket whose pull workers haven't advertised it, and an HTTP host whose `/api/host/info` doesn't list it. An older SSH host's `rupu run` rejects the unknown flag, so the unit fails. One gap remains on bucket hosts: an old worker polling the same bucket as an upgraded one can't be detected and may still claim the unit.
+- Upgrade rupu on a remote host before adding `findingsProfile` to an agent it runs: an older release rejects agent files that contain `findingsProfile`, because agent frontmatter does not accept unknown keys.
+- The field must never be silently ignored, so these are parse errors:
+  - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`);
+  - `findings_profile` on an `action:` step that calls any tool other than `findings.record` (e.g. `action: issues.comment`) — only `findings.record` has a findings contract for the profile to configure.
+
+> **Upgrading:** the built-in profile is `full`, so an existing `action: findings.record` step that sends `summary` / `severity` / `rationale` now fails to parse. Add `findings_profile: summary` to that step (or `defaults.findings_profile: summary` to the workflow), or change its `with:` to send a `report`.
 
 ### `when`
 
@@ -1281,6 +1324,7 @@ Common parse-time failures:
 - invalid input defaults or enum defaults
 - extraneous fields inside `trigger:`
 - an `action:` naming an unknown tool, or `with:` failing the tool's schema
+- a `findings_profile:` on an agent-less step, or on an `action:` step other than `findings.record`
 - a `branch:` target that doesn't exist, isn't forward, or appears in both arms
 - a `join:` with no inbound edges, or a `wait: { count: N }` exceeding its inbound path count
 - a cycle anywhere in the workflow's dependency graph

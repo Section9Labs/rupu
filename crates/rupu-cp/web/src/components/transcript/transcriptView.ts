@@ -214,10 +214,21 @@ function asStringArray(v: unknown): string[] {
 /**
  * Parse a `report_finding` tool_call input into a FindingView.
  * Returns null when the shape isn't a recognisable finding.
+ *
+ * Two input shapes exist, one per findings profile:
+ *   • summary — `{ scope, summary, severity, evidence: { rationale, … } }`;
+ *   • full (the default) — `{ scope, file_path?, line_range?, report: {…} }`,
+ *     with no top-level summary/severity/evidence. Those are derived from the
+ *     report exactly as `report_finding` derives them for the ledger
+ *     (`crates/rupu-coverage/src/tools/report_finding.rs`): summary ← title,
+ *     severity ← rating.risk_rating, rationale ← root_cause, excerpt ← the
+ *     first evidence claim that carries one.
  */
 function asFinding(input: unknown): FindingView | null {
   const rec = asRecord(input);
   if (!rec) return null;
+  const report = asRecord(rec.report);
+  if (report) return asReportFinding(rec, report);
   const evidence = asRecord(rec.evidence) ?? {};
   const summary = asString(rec.summary);
   const rationale = asString(evidence.rationale);
@@ -239,6 +250,42 @@ function asFinding(input: unknown): FindingView | null {
   if (concernId !== null) finding.concernId = concernId;
   const codeExcerpt = asString(evidence.code_excerpt);
   if (codeExcerpt !== null) finding.codeExcerpt = codeExcerpt;
+  return finding;
+}
+
+/** The full-profile shape of {@link asFinding}. Locators stay top-level. */
+function asReportFinding(
+  rec: Record<string, unknown>,
+  report: Record<string, unknown>,
+): FindingView | null {
+  const title = asString(report.title);
+  const rootCause = asString(report.root_cause);
+  if (title === null && rootCause === null) return null;
+  const rating = asRecord(report.rating) ?? {};
+  const risk = asString(rating.risk_rating);
+
+  const finding: FindingView = {
+    severity: asSeverity(risk === null ? null : risk.toLowerCase()),
+    summary: title ?? '',
+    scope: asString(rec.scope) ?? '',
+    rationale: rootCause ?? '',
+    references: [],
+  };
+  const filePath = asString(rec.file_path);
+  if (filePath !== null) finding.filePath = filePath;
+  const lineRange = asLineRange(rec.line_range);
+  if (lineRange !== undefined) finding.lineRange = lineRange;
+  const concernId = asString(rec.concern_id);
+  if (concernId !== null) finding.concernId = concernId;
+  if (Array.isArray(report.evidence)) {
+    for (const claim of report.evidence) {
+      const excerpt = asString(asRecord(claim)?.excerpt);
+      if (excerpt !== null) {
+        finding.codeExcerpt = excerpt;
+        break;
+      }
+    }
+  }
   return finding;
 }
 

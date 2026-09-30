@@ -60,6 +60,26 @@ pub struct Args {
     /// Pre-assign the run id (so a caller can reference the run before it starts).
     #[arg(long)]
     pub run_id: Option<String>,
+    /// Findings contract for this run (`full` | `summary`), overriding the
+    /// agent's `findingsProfile`. A placed workflow unit's coordinator
+    /// passes its step's resolved profile this way.
+    #[arg(long, value_name = "PROFILE", value_parser = parse_findings_profile)]
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
+}
+
+fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
+    s.parse()
+}
+
+/// The standalone run's findings profile: `--findings-profile` → the agent's
+/// `findingsProfile` → `full`. The flag sits in the step slot of
+/// [`rupu_coverage::FindingProfile::resolve`] — it is how a placed unit's
+/// step/workflow-default override reaches the host that runs the agent.
+fn resolve_findings_profile(
+    flag: Option<rupu_coverage::FindingProfile>,
+    agent: Option<rupu_coverage::FindingProfile>,
+) -> rupu_coverage::FindingProfile {
+    rupu_coverage::FindingProfile::resolve(flag, None, agent)
 }
 
 /// `rupu run <agent> [target] [prompt] …` — OR `rupu run pause|resume
@@ -790,6 +810,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // through — bare `rupu run` uses the `LineStreamPrinter`, which
         // renders dispatch children post-hoc from the parent transcript's
         // tool_call/tool_result entries rather than tailing `events.jsonl`.
+        let findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
         let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
             global.clone(),
             project_root.clone(),
@@ -805,6 +826,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             provider_factory::openai_compatible_map(&cfg.providers),
             provider_factory::provider_tuning_map(&cfg.providers),
             provider_factory::resolve_kind_map(&cfg.providers),
+            findings_base.clone(),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -819,6 +841,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
         let tool_context = ToolContext {
+            findings: Some(findings_base.with_profile(resolve_findings_profile(
+                args.findings_profile,
+                spec.findings_profile,
+            ))),
             workspace_path: workspace_path.clone(),
             bash_env_allowlist: bash_allowlist,
             bash_timeout_secs: bash_timeout,
@@ -1370,6 +1396,36 @@ pub(crate) fn standalone_codename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn launch_args(argv: &[&str]) -> Result<Args, clap::Error> {
+        parse_launch_args(argv.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn findings_profile_flag_parses_in_either_position() {
+        use rupu_coverage::FindingProfile::{Full, Summary};
+        let args = launch_args(&["sec", "--findings-profile", "summary", "--prompt", "p"]).unwrap();
+        assert_eq!(args.findings_profile, Some(Summary));
+        let args = launch_args(&["--findings-profile", "full", "sec"]).unwrap();
+        assert_eq!(args.findings_profile, Some(Full));
+        assert_eq!(args.agent, "sec");
+        assert_eq!(launch_args(&["sec"]).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn findings_profile_flag_rejects_an_unknown_profile() {
+        let err = launch_args(&["sec", "--findings-profile", "brief"]).unwrap_err();
+        assert!(err.to_string().contains("`full` or `summary`"), "{err}");
+    }
+
+    #[test]
+    fn findings_profile_flag_beats_the_agent_frontmatter() {
+        use rupu_coverage::FindingProfile::{Full, Summary};
+        assert_eq!(resolve_findings_profile(Some(Full), Some(Summary)), Full);
+        assert_eq!(resolve_findings_profile(Some(Summary), Some(Full)), Summary);
+        assert_eq!(resolve_findings_profile(None, Some(Summary)), Summary);
+        assert_eq!(resolve_findings_profile(None, None), Full);
+    }
 
     #[test]
     fn standalone_codename_derives_or_honours_env() {

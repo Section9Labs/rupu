@@ -806,6 +806,19 @@ struct AgentRunBody {
     scope_kind: Option<String>,
     #[serde(default)]
     scope_id: Option<String>,
+    /// Optional `full` | `summary` — `rupu run --findings-profile`, overriding
+    /// the agent's `findingsProfile`. Honoured on both the local and the
+    /// remote-proxy path. `String` for the same reason as `scope_kind`: an
+    /// unknown value is a handler-controlled 400.
+    #[serde(default)]
+    findings_profile: Option<String>,
+}
+
+fn parse_findings_profile(
+    raw: Option<&str>,
+) -> Result<Option<rupu_coverage::FindingProfile>, ApiError> {
+    raw.map(|s| s.parse().map_err(ApiError::bad_request))
+        .transpose()
 }
 
 /// Testable core: map the body + a concrete launcher to a run id.
@@ -814,6 +827,7 @@ async fn run_agent_with(
     body: AgentRunBody,
     launcher: Arc<dyn AgentLauncher>,
 ) -> Result<String, ApiError> {
+    let findings_profile = parse_findings_profile(body.findings_profile.as_deref())?;
     let req = AgentLaunchRequest {
         codename: None,
         agent: name.to_string(),
@@ -822,6 +836,7 @@ async fn run_agent_with(
         target: body.target,
         working_dir: body.working_dir,
         run_id: None,
+        findings_profile,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -952,6 +967,7 @@ async fn run_agent(
         // Remote: scope fields, if present, are silently ignored — see this
         // function's doc comment. The request proceeds exactly as it would
         // with no scope fields at all.
+        let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
             codename: None,
@@ -961,10 +977,13 @@ async fn run_agent(
             target: b.target,
             working_dir: b.working_dir,
             run_id: None,
+            findings_profile,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            // e.g. the host can't honour `findings_profile` — refused, not failed.
+            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
             other => ApiError::internal(other.to_string()),
         })?;
         return Ok(Json(
@@ -1195,6 +1214,7 @@ mod tests {
             host: None,
             scope_kind: None,
             scope_id: None,
+            findings_profile: None,
         };
         let run_id = run_agent_with("triage", body, mock.clone())
             .await
@@ -1204,6 +1224,40 @@ mod tests {
         assert_eq!(got.agent, "triage");
         assert_eq!(got.prompt.as_deref(), Some("do it"));
         assert_eq!(got.working_dir.as_deref(), Some("/tmp/p"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_the_findings_profile() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body = AgentRunBody {
+            findings_profile: Some("summary".into()),
+            ..AgentRunBody::default()
+        };
+        run_agent_with("sec", body, mock.clone()).await.expect("ok");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            got.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_an_unknown_findings_profile_before_launching() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body = AgentRunBody {
+            findings_profile: Some("verbose".into()),
+            ..AgentRunBody::default()
+        };
+        let err = run_agent_with("sec", body, mock.clone())
+            .await
+            .expect_err("unknown profile must be refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("`full` or `summary`"), "{}", err.1);
+        assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
     }
 
     #[tokio::test]
@@ -1263,6 +1317,7 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
+            findings_profile: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1300,6 +1355,7 @@ mod tests {
             host: None,
             scope_kind: None,
             scope_id: None,
+            findings_profile: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1338,6 +1394,7 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1380,6 +1437,7 @@ mod tests {
             host: Some(host.id.clone()),
             scope_kind: Some("project".into()),
             scope_id: Some("ws_unknown_locally".into()),
+            findings_profile: None,
         };
         let resp = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1430,6 +1488,7 @@ mod tests {
             host: None,
             scope_kind: Some("global".into()),
             scope_id: None,
+            findings_profile: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1471,6 +1530,7 @@ mod tests {
             host: None,
             scope_kind: Some("global".into()),
             scope_id: None,
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1500,6 +1560,7 @@ mod tests {
             host: None,
             scope_kind: Some("bogus".into()),
             scope_id: None,
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1530,6 +1591,7 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_missing".into()),
+            findings_profile: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await

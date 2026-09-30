@@ -33,9 +33,10 @@ use std::sync::Arc;
 /// is sound rather than permissive, resting on three invariants:
 ///
 /// 1. Every consumer of `opts.action_dispatcher` funnels into
-///    `execute_action_step`, whose only dispatch is `dispatcher.call(tool,
-///    …)` with `tool = step.action`. Agent-step tool calls never reach
-///    this dispatcher.
+///    `execute_action_step`, whose only dispatch is
+///    `dispatcher.call_with_findings_profile(tool, …)` with `tool =
+///    step.action` (the profile only matters to `findings.record`).
+///    Agent-step tool calls never reach this dispatcher.
 /// 2. That tool is validated against the live MCP catalog at parse time by
 ///    `validate_action_step` (`rupu-orchestrator`'s `workflow.rs`).
 /// 3. A step may not carry a non-empty `actions:` alongside `action:` —
@@ -309,6 +310,7 @@ async fn rebuild_opts_from_disk(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
+        crate::findings_opts::base_options(&global, &cfg.findings),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -330,6 +332,13 @@ async fn rebuild_opts_from_disk(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            options: crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
+                rupu_coverage::FindingProfile::resolve(
+                    None,
+                    workflow.defaults.findings_profile,
+                    None,
+                ),
+            ),
             codename: Some(rupu_codename::crew_for(run_id)),
             provider: cfg.default_provider.clone(),
         }),
@@ -350,6 +359,7 @@ async fn rebuild_opts_from_disk(
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
+        findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
     });
 
     let opts = OrchestratorRunOpts {

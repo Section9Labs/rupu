@@ -13,6 +13,8 @@ pub mod config;
 // that the lib re-export shape is stable from skeleton onward.
 pub mod layer;
 
+pub mod findings_config;
+
 pub mod netflow_config;
 
 pub mod policy_config;
@@ -35,6 +37,7 @@ pub mod update_config;
 
 pub use autoflow_config::{AutoflowCheckout, AutoflowConfig};
 pub use config::{BashConfig, Config, UiConfig, UiCpConfig, UiPaletteConfig, UiSyntaxConfig};
+pub use findings_config::FindingsConfig;
 pub use layer::{layer_files, layer_files_locked, LayerError};
 pub use netflow_config::NetflowConfig;
 pub use policy_config::{CpConfig, PolicyConfig};

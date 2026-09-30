@@ -407,6 +407,8 @@ mod tests {
             },
             declared_by: attribution(run),
             declared_at: Utc::now(),
+            profile: crate::report::FindingProfile::Summary,
+            report: None,
         }
     }
 

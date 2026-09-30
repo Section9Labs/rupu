@@ -25,7 +25,7 @@ use crate::{
     },
     launcher::LaunchRequest,
     node::{
-        protocol::{Frame, RunSpec, RunSpecKind},
+        protocol::{Frame, RunSpec, RunSpecKind, CAP_AGENT_FINDINGS_PROFILE},
         NodeMirror, NodeRegistry,
     },
     session_sender::SendMessageRequest,
@@ -109,6 +109,7 @@ impl HostConnector for TunnelHostConnector {
             prompt: None,
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: None,
         };
 
         // Verify the node is reachable BEFORE creating the mirror run.
@@ -151,12 +152,28 @@ impl HostConnector for TunnelHostConnector {
             prompt: req.prompt.clone(),
             mode: req.mode.clone(),
             target: req.target.clone(),
+            findings_profile: req.findings_profile,
         };
 
         // Verify the node is reachable BEFORE creating the mirror run.
         // This prevents an offline node from leaving an uncancellable Running
         // record with no executor attached.
         let conn = self.live_conn()?;
+
+        // A node that predates `RunSpec.findings_profile` would deserialize
+        // the frame, drop the field, and run the agent under its own
+        // frontmatter profile. Refuse before creating the mirror run instead.
+        if let Some(profile) = req.findings_profile {
+            if !conn.supports(CAP_AGENT_FINDINGS_PROFILE) {
+                return Err(HostConnectorError::Unsupported(format!(
+                    "node {} (rupu {}) does not support findings_profile on agent \
+                     launches, so this run cannot be held to the `{profile}` profile; \
+                     upgrade rupu on that node",
+                    self.node_id,
+                    conn.rupu_version().unwrap_or("unknown version"),
+                )));
+            }
+        }
 
         self.mirror
             .create_run(&run_id, &self.node_id, &spec)

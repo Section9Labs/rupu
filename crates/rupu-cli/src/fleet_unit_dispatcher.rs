@@ -298,6 +298,8 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 target: None,
                 working_dir: working_dir.clone(),
                 run_id: Some(unit_run_id.clone()),
+                // Every connector delivers this or refuses the launch.
+                findings_profile: unit.findings_profile,
             })
             .await
         {
@@ -681,9 +683,9 @@ mod tests {
         /// trait default, a transport with no probe) is exercised
         /// explicitly by its own test.
         start_evidence: RunStartEvidence,
-        /// The `run_id` the most recent `launch_agent` call received, so
-        /// tests can assert the dispatcher forwarded the unit's minted id.
-        launched_run_id: std::sync::Mutex<Option<String>>,
+        /// The most recent `launch_agent` request, so tests can assert what
+        /// the dispatcher forwarded (the unit's minted id, its profile).
+        launched: std::sync::Mutex<Option<AgentLaunchRequest>>,
     }
 
     impl FakeConnector {
@@ -702,7 +704,7 @@ mod tests {
                 calls: Default::default(),
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
                 start_evidence: RunStartEvidence::NoTrace,
-                launched_run_id: Default::default(),
+                launched: Default::default(),
             }
         }
 
@@ -736,7 +738,7 @@ mod tests {
                 calls: Default::default(),
                 non_terminal_polls: std::sync::atomic::AtomicU32::new(0),
                 start_evidence: RunStartEvidence::NoTrace,
-                launched_run_id: Default::default(),
+                launched: Default::default(),
             }
         }
 
@@ -771,7 +773,7 @@ mod tests {
             &self,
             req: AgentLaunchRequest,
         ) -> Result<String, HostConnectorError> {
-            *self.launched_run_id.lock().unwrap() = req.run_id.clone();
+            *self.launched.lock().unwrap() = Some(req);
             Ok(self.run_id.to_string())
         }
         async fn start_session(
@@ -958,6 +960,7 @@ mod tests {
             index: 0,
             run_id: "r".to_string(),
             workspace: None,
+            findings_profile: None,
             codename: None,
         }
     }
@@ -2106,9 +2109,33 @@ steps:
         unit.run_id = "run_01UNITID".into();
         d.dispatch_unit(unit, "h1").await.unwrap();
         assert_eq!(
-            conn.launched_run_id.lock().unwrap().as_deref(),
+            conn.launched
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|r| r.run_id.as_deref()),
             Some("run_01UNITID")
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_the_units_findings_profile_to_launch_agent() {
+        for profile in [
+            Some(rupu_coverage::FindingProfile::Summary),
+            Some(rupu_coverage::FindingProfile::Full),
+            None,
+        ] {
+            let conn = Arc::new(FakeConnector::completed());
+            let d = FleetUnitDispatcher::from_connector(
+                Arc::clone(&conn) as Arc<dyn HostConnector>,
+                PathBuf::from("/g"),
+            );
+            let mut unit = make_unit();
+            unit.findings_profile = profile;
+            d.dispatch_unit(unit, "h1").await.unwrap();
+            let launched = conn.launched.lock().unwrap().clone().expect("launched");
+            assert_eq!(launched.findings_profile, profile);
+        }
     }
 
     #[test]

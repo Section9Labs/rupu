@@ -98,10 +98,155 @@ list them in the agent's `tools:`):
 | Tool | Purpose |
 |------|---------|
 | `coverage_mark` | record a `(concern, file)` verdict + evidence |
-| `report_finding` | record an issue (severity, location, remediation) |
+| `report_finding` | record an issue — a complete `report` under the `full` profile (default), or `summary` / `severity` / `evidence` under `summary`; see [Finding reports](#finding-reports) |
 | `coverage_remaining` | list in-scope files still lacking an assertion |
 | `coverage_status` | summary of assessed-vs-gap progress |
 | `coverage_concerns_search` / `coverage_concerns_detail` | search / fetch full bodies for index-mode catalogs |
+
+## Finding reports
+
+A finding is recorded once, as structured data. That structured record is the
+source of truth for the finding: rendered views and exports are built on it (see
+the "Not built yet" note at the end of this section for what exists today).
+
+### Profiles
+
+| Profile | What `report_finding` / `findings.record` accepts |
+|---------|----------------------------------------------------|
+| `full` (default) | A complete `report` object. `summary`, `severity`, and `evidence` are **rejected**: rupu derives them (`summary` ← `title`, `severity` ← `rating.risk_rating`, `evidence.rationale` ← `root_cause`). |
+| `summary` | The lightweight `summary` / `severity` / `evidence` record. A `report` is **refused**, never silently dropped. |
+
+Pick a profile with the agent's `findingsProfile` frontmatter, a workflow's
+`defaults.findings_profile`, a step's `findings_profile`, or `rupu run
+--findings-profile` for a standalone run. Precedence is
+step (or the flag) → workflow defaults → agent `findingsProfile` → `full`
+(see `docs/agent-format.md` and `docs/workflow-format.md`). Remote workflow
+units (`host:` / `distribute:`) get the same resolution: the step or default
+value travels to the host as `--findings-profile`. The chosen profile
+is stored on each finding record; records written before profiles existed read
+back as `summary`.
+
+> **Upgrading:** the built-in default is `full`, so an existing agent that
+> records thin findings is rejected until it declares `findingsProfile: summary`
+> or its prompt is updated to send a `report`. Agents outside the repo (for
+> example under `~/.rupu/agents/`) need that one-line change.
+
+### What `full` requires
+
+Every field of the report is required except `cwe` (it may be an empty list)
+and `artifacts`. The rules below are enforced at write time; a
+rejected call returns **every** problem at once, each with its field path, so
+the agent can fix them all in one retry. (A structurally malformed JSON argument
+surfaces as a single parse error instead.) When a full-profile run can record
+findings (the agent has a `concerns:` block or `report_finding` in `tools:`),
+finding-writing guidance is also appended to its system prompt, so the agent
+needs no external reporting-standard file.
+
+`artifacts` is described under [Artifacts](#artifacts) below.
+
+Some fields of a stored report are set by rupu, never by the reporting agent,
+and are left out of the schema the agent is shown:
+
+- `verification` (`{status: unverified|confirmed|disputed|inconclusive,
+  by_run?, notes?}`) is set by verification runs, not by the agent that wrote
+  the finding. A `report_finding` / `findings.record` call that supplies it is
+  rejected at `report.verification`.
+- Each evidence claim's `sha256` is the hash rupu takes of the claim's `file`
+  at write time. Anything the agent sends there is discarded; a claim whose
+  file is not in the workspace is stored without a hash.
+- An artifact's `sha256`, `size`, `kind`, `stored`, and `host` are filled in
+  when rupu stores it; the agent supplies only `path`.
+
+- Required strings must be non-empty after trimming.
+- Ratings (`impact`, `risk_rating`, `risk_factor`) are `Low`/`Medium`/`High`/`Critical`;
+  `likelihood` is `Low`/`Medium`/`High`. `cwe` is a list of `CWE-<n>` ids and may be empty.
+- `evidence` needs at least one claim and `replication_steps` at least one step.
+- `file` values are workspace-relative and `lines` is `[start, end]` with `1 <= start <= end`.
+- `cross_references[].finding_id` must be an existing finding id.
+- The serialized report must fit `[findings].report_max_bytes` (default 256 KiB),
+  so a pasted log cannot swell the ledger. The limit is checked again after
+  artifact directories are expanded.
+
+### Sentinels
+
+Where information genuinely cannot be determined, a field uses a sentinel
+instead of being omitted or guessed. On the structured fields (tickets, call
+chain, patch, CI/CD detection, regression test, cross references) a sentinel is
+accepted only in its exact form, and only the ones listed for that field:
+
+| Sentinel | Used for |
+|----------|----------|
+| `Unknown` | owner, product, affected component, source repository, attack vector, CVSS score, tickets |
+| `Not Applicable` | source repository, when no source-controlled code is involved |
+| `None Provided` | tickets, when none are mentioned |
+| `None` | cross references, when there is no related finding |
+| `Not Provided — <justification>` (em dash) | call chain, recommended patch, CI/CD detection, regression test; the justification must be non-empty |
+
+`Unknown` is **not** accepted for the patch, CI/CD detection, or regression
+test: provide the item or say why it could not be produced.
+
+### Artifacts
+
+`report.artifacts[].path` lists proof-of-concept files (scripts, outputs,
+harnesses) as workspace-relative paths. At write time rupu hashes each one:
+
+- A file up to `[findings].artifact_max_bytes` (default 500 MiB) is copied into a
+  content-addressed store at `<RUPU_HOME>/findings/artifacts/<aa>/<sha256>` and
+  recorded `stored: copied`. Identical content is stored once across runs and
+  projects, and the store outlives the workspace.
+- A larger file is recorded `stored: external` with its path, size, and sha256.
+- A directory expands to the files inside it, each handled by the same rule.
+  Symlinks inside a directory are skipped.
+- One report's artifacts are bounded before anything is copied: at most
+  `[findings].artifact_max_files` files (default 500), and the files that
+  will be copied into the store may add up to at most
+  `[findings].artifact_total_max_bytes` bytes (default 2 GiB). A file over
+  `artifact_max_bytes` is recorded by reference and does not count toward
+  that total, so it never rejects the finding. A larger set rejects the
+  finding with the count or total named; list specific files instead of
+  large directories.
+- A path that escapes the workspace, names the workspace root itself (`.`),
+  does not exist, or names something other than a regular file (a device,
+  socket, or the like) rejects the finding, so a typo is not silently dropped.
+- A remote workflow unit (`host:` / `distribute:`) runs `report_finding` on the
+  host, so its artifacts go into **that host's** store and are recorded
+  `stored: copied` with no `host`. Recording them as `stored: external` with
+  `host` set, and pulling them into the coordinator's store on first view, is
+  specified but not built yet.
+
+Each evidence claim's `sha256` is taken only from a file that resolves inside
+the workspace and is no larger than `artifact_max_bytes`; other claims are
+stored without a hash.
+
+### Configuration
+
+```toml
+[findings]
+artifact_max_bytes = 524288000   # copy cap per artifact file (default 500 MiB)
+artifact_max_files = 500         # files per report's artifacts (default 500)
+artifact_total_max_bytes = 2147483648  # bytes copied into the store per report (default 2 GiB)
+report_max_bytes = 262144        # serialized report budget (default 256 KiB)
+ticket_patterns = ["ABC-[0-9]+"] # extra hints appended to the full-profile guidance
+```
+
+`ticket_patterns` lets an organisation say which reference formats count as
+existing tickets. Nothing organisation-specific ships in rupu. The keys are also
+listed in [configuration.md](configuration.md#findings).
+
+### `rupu findings schema`
+
+```
+rupu findings schema                 Print the embedded draft-07 JSON Schema of a finding report
+rupu findings schema --advertised    Print the simplified copy used in tool definitions
+```
+
+The schema is embedded in the binary and kept in lockstep with the validator by
+a test, so external prompts and tools can be generated from rupu rather than
+maintained by hand.
+
+> Not built yet: Markdown / HTML / PDF export, the web report page, and the
+> macOS views arrive in later plans. Today a `full` report is stored on the
+> finding record and its artifacts are stored as described above.
 
 ## CLI
 
@@ -163,6 +308,8 @@ deterministic; sampling is not.
 
 ## See also
 
-- `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:`)
+- `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:` and `findingsProfile`)
+- `docs/workflow-format.md` — workflow `findings_profile` (step and `defaults`)
+- `docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md` — the finding report design
 - `docs/agent-authoring.md` — writing good agents
 - Slice specs/plans under `docs/superpowers/{specs,plans}/` (search `coverage-harness`)

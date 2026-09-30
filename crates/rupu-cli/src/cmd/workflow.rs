@@ -3254,6 +3254,7 @@ pub(crate) async fn resume_run(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
+        crate::findings_opts::base_options(&global, &cfg.findings),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -3275,6 +3276,13 @@ pub(crate) async fn resume_run(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            options: crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
+                rupu_coverage::FindingProfile::resolve(
+                    None,
+                    workflow.defaults.findings_profile,
+                    None,
+                ),
+            ),
             codename: Some(rupu_codename::crew_for(run_id)),
             provider: cfg.default_provider.clone(),
         }),
@@ -3296,6 +3304,7 @@ pub(crate) async fn resume_run(
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
+        findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
     });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
@@ -4812,6 +4821,7 @@ async fn execute_workflow_invocation(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
+        crate::findings_opts::base_options(&global, &cfg.findings),
     );
     // One codename namer for the whole run — shared by the orchestrator
     // (static slots), the sub-agent dispatcher (`>role#n`), and the inline
@@ -4839,6 +4849,13 @@ async fn execute_workflow_invocation(
             run_id: run_id.clone(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
+            options: crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
+                rupu_coverage::FindingProfile::resolve(
+                    None,
+                    workflow.defaults.findings_profile,
+                    None,
+                ),
+            ),
             codename: Some(rupu_codename::crew_for(&run_id)),
             provider: cfg.default_provider.clone(),
         }),
@@ -4860,6 +4877,7 @@ async fn execute_workflow_invocation(
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
+        findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
     });
 
     let workflow_for_resume = workflow.clone();

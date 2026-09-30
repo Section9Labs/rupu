@@ -12,8 +12,9 @@ use rupu_config::{KeyProvenance, KeySource};
 use rupu_coverage::{
     AssertionStatus, Attribution as CoverageAttribution, CatalogMode, Concern, ConcernAssertion,
     Evidence as CoverageEvidence, FileView, FindingEvidence as CoverageFindingEvidence,
-    FindingRecord as CoverageFindingRecord, FindingScope as CoverageFindingScope, FlatCatalog,
-    Severity as CoverageSeverity, Surface as CoverageSurface, TouchStrength,
+    FindingProfile as CoverageFindingProfile, FindingRecord as CoverageFindingRecord,
+    FindingScope as CoverageFindingScope, FlatCatalog, Severity as CoverageSeverity,
+    Surface as CoverageSurface, TouchStrength,
 };
 use rupu_cp::api::autoflow_claims::ClaimRow;
 use rupu_cp::api::code::{FileContent, FileListResult, TreeEntry, TreeResult};
@@ -1548,6 +1549,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_9k2f"),
                 declared_at: t,
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
         FindingOut {
@@ -1574,6 +1577,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_9k2f"),
                 declared_at: t - chrono::Duration::hours(1),
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
         FindingOut {
@@ -1605,6 +1610,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_am4d"),
                 declared_at: t - chrono::Duration::days(1),
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
         FindingOut {
@@ -1631,6 +1638,8 @@ fn findings_global_fixture_is_current() {
                 },
                 declared_by: coverage_attribution("run_am4d"),
                 declared_at: t - chrono::Duration::days(2),
+                profile: CoverageFindingProfile::Summary,
+                report: None,
             },
         },
     ];
@@ -1741,6 +1750,8 @@ fn coverage_detail_fixture_is_current() {
         },
         declared_by: coverage_attribution("run_9k2f"),
         declared_at: t,
+        profile: CoverageFindingProfile::Summary,
+        report: None,
     }];
 
     let files = vec![FileView {

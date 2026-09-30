@@ -9,6 +9,7 @@
 //! control/<run_id>/<seq:020>.json — control messages from CP to node, zero-padded seq
 //! runs/<run_id>/<key>         — result objects uploaded by the node
 //! runs/<run_id>/finished      — terminal status string written by the node
+//! nodes/<worker_id>.json      — a pull worker's self-description (version + capabilities)
 //! ```
 
 use async_trait::async_trait;
@@ -35,6 +36,26 @@ pub struct ControlEnvelope {
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+// ── worker self-description ───────────────────────────────────────────────────
+
+/// What a pull worker (`rupu node pull`) writes to `nodes/<worker_id>.json`
+/// at startup. The bucket transport has no handshake, so this is how the
+/// connector learns which [`crate::node::protocol::RunSpec`] fields the
+/// workers on this bucket will honour before it puts a job that needs one
+/// (see [`BucketHostConnector`]'s `launch_agent`). A worker predating this
+/// marker writes none.
+///
+/// Both ends use this SAME type, like [`ControlEnvelope`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkerInfo {
+    pub worker_id: String,
+    pub rupu_version: String,
+    /// Same vocabulary as the tunnel's `Hello.capabilities`
+    /// ([`crate::node::protocol::node_capabilities`]).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 // ── error ─────────────────────────────────────────────────────────────────────
@@ -90,6 +111,14 @@ pub trait Bucket: Send + Sync {
     /// Lightweight connectivity probe — succeeds on a reachable bucket,
     /// returns `Err` on a misconfigured or unreachable one.
     async fn probe(&self) -> Result<(), BucketError>;
+
+    /// Write `worker_id`'s [`WorkerInfo`] at `nodes/<worker_id>.json`,
+    /// overwriting any previous one.
+    async fn put_worker_info(&self, worker_id: &str, body: &[u8]) -> Result<(), BucketError>;
+
+    /// Every worker self-description under `nodes/`, in key order. Empty when
+    /// no worker has written one.
+    async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError>;
 }
 
 // ── key-layout helpers ────────────────────────────────────────────────────────
@@ -127,4 +156,9 @@ pub(crate) fn prefix_results(run_id: &str) -> String {
 /// `runs/<run_id>/finished`
 pub(crate) fn key_finished(run_id: &str) -> String {
     format!("runs/{run_id}/finished")
+}
+
+/// `nodes/<worker_id>.json`
+pub(crate) fn key_worker_info(worker_id: &str) -> String {
+    format!("nodes/{worker_id}.json")
 }

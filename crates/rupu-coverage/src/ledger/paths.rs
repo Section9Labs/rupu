@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 /// Canonical layout of a target's coverage data on disk.
 #[derive(Debug, Clone)]
 pub struct CoveragePaths {
+    /// The workspace the coverage data belongs to (artifact paths and
+    /// evidence-claim files resolve against it).
+    pub workspace: PathBuf,
     pub root: PathBuf,
     pub files: PathBuf,
     pub concerns: PathBuf,
@@ -15,6 +18,7 @@ impl CoveragePaths {
     pub fn new(workspace: &Path, target_id: &str) -> Self {
         let root = workspace.join(".rupu").join("coverage").join(target_id);
         Self {
+            workspace: workspace.to_path_buf(),
             files: root.join("files.jsonl"),
             concerns: root.join("concerns.jsonl"),
             findings: root.join("findings.jsonl"),
