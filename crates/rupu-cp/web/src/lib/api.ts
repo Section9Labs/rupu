@@ -18,6 +18,7 @@ export type {
   UnpricedGap,
   UsageRunRow,
 } from './usage';
+import type { FindingReport, ReportSummary, ClaimState } from './findingReport';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -1306,6 +1307,10 @@ export interface FindingRecord {
    *  up in a later task — optional so consumers (`InlineFindingCard`) can
    *  guard it now and pick it up automatically once populated. */
   permalink?: string | null;
+  target_ref?: string | null;
+  profile?: 'full' | 'summary';
+  report_summary?: ReportSummary | null;
+  report?: FindingReport | null;
 }
 
 /** Severity rollup for a set of findings — matches the `GET /api/findings`
@@ -1326,6 +1331,11 @@ export interface FindingOut extends FindingRecord {
   project: string;
   target_id: string;
   workflow_name?: string | null;
+}
+
+/** Finding detail with evidence status — response from `GET /api/findings/:id`. */
+export interface FindingDetail extends FindingOut {
+  evidence_status: ClaimState[];
 }
 
 /** Response from `GET /api/findings` — the severity-sorted cross-project
@@ -2454,6 +2464,9 @@ export const api = {
     const qs = q.toString();
     return request<FindingsResponse>(`/api/findings${qs ? `?${qs}` : ''}`);
   },
+  getFinding(id: string): Promise<FindingDetail> {
+    return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}`);
+  },
 
   /**
    * Subscribe to the JSONL event stream for a single run.
@@ -2705,3 +2718,7 @@ export const api = {
     return request<AstResponse>(url);
   },
 };
+
+export function findingArtifactUrl(id: string, sha256: string): string {
+  return `/api/findings/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(sha256)}`;
+}
