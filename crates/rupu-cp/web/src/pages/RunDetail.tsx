@@ -45,6 +45,7 @@ import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { CrewChip } from '../components/codename/CrewChip';
+import { AgentName } from '../components/codename/AgentName';
 import { parseCodename } from '../lib/codename';
 
 const MAX_EVENTS = 2000;
@@ -725,6 +726,21 @@ export default function RunDetail() {
 
   const findingsCount = findings?.findings.length ?? 0;
   const selectedLabel = selection ? selection.stepId : 'whole run';
+  // The selected agent's identity: the chosen unit's (fan-out/panel/parallel
+  // instances live on units) or the linear step's own. Display-only — the
+  // cursor itself stays keyed by step id / unit index.
+  const selectedUnit =
+    selection?.unitIndex != null
+      ? selectedNode?.fanout?.units.find((u) => u.index === selection.unitIndex)
+      : undefined;
+  const selectedIdentity = selectedUnit ?? selectedNode ?? undefined;
+  // A for_each unit runs the step's one agent; panel/parallel units each run
+  // their own, which the node-level `agent` doesn't name.
+  const selectedAgent = selectedUnit
+    ? selectedNode?.kind === 'for_each'
+      ? selectedNode.agent
+      : undefined
+    : selectedNode?.agent;
 
   return (
     // min-h-full (not h-full): the page grows past the viewport so the parent
@@ -1191,7 +1207,20 @@ export default function RunDetail() {
       </div>
 
       <div className="px-8 pt-2 text-note text-ink-dim">
-        selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
+        <span data-testid="run-selected-label" className="inline-flex flex-wrap items-center gap-1.5">
+          selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
+          {selectedIdentity?.codename && (
+            <>
+              <span className="text-ink-mute">·</span>
+              <AgentName
+                codename={selectedIdentity.codename}
+                agent={selectedAgent}
+                provider={selectedIdentity.provider}
+                model={selectedIdentity.model}
+              />
+            </>
+          )}
+        </span>
       </div>
 
       {/* Definite, generous height so the transcript / events / findings panels
@@ -1204,6 +1233,7 @@ export default function RunDetail() {
               <StepTranscriptBrowser
                 stepId={selection.stepId}
                 units={selectedFanout.units}
+                agent={selectedNode?.kind === 'for_each' ? selectedNode.agent : undefined}
                 initialUnitIndex={selection.unitIndex}
                 runId={id}
                 host={host}

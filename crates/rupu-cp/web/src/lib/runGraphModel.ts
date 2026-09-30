@@ -33,6 +33,11 @@ export interface UnitView {
   key: string;
   state: StepState;
   transcriptPath?: string;
+  /** Server-minted agent codename for this unit (checkpoint / unit_started / agent_started). */
+  codename?: string;
+  /** Provider + model from the unit's `agent_started` (absent for placed units). */
+  provider?: string;
+  model?: string;
 }
 
 export interface FanoutState {
@@ -45,6 +50,12 @@ export interface GraphNode {
   id: string;
   kind: StepNodeDto['kind'];
   agent?: string;
+  /** Server-minted codename for a linear step's agent. Fan-out / panel /
+   *  parallel steps carry none — their instances live on `fanout.units`. */
+  codename?: string;
+  /** Provider + model from the step's `agent_started` event. */
+  provider?: string;
+  model?: string;
   state: StepState;
   /** Path to this step's agent transcript JSONL, when one was recorded. */
   transcriptPath?: string;
@@ -82,6 +93,19 @@ function coerceItem(item: unknown): string {
   // strings pass through; everything else stringifies, falling back to
   // `String(item)` when stringify yields undefined (e.g. `item === undefined`).
   return typeof item === 'string' ? item : (JSON.stringify(item) ?? String(item));
+}
+
+interface AgentIdentity {
+  codename?: string;
+  provider?: string;
+  model?: string;
+}
+
+/** Overlay an agent_started identity; absent fields leave existing values. */
+function applyIdentity(target: { codename?: string; provider?: string; model?: string }, id: AgentIdentity): void {
+  if (id.codename) target.codename = id.codename;
+  if (id.provider) target.provider = id.provider;
+  if (id.model) target.model = id.model;
 }
 
 /** Zero-fill a byState counter object. */
@@ -138,6 +162,7 @@ export function buildRunGraphModel(
     if (!node) continue;
 
     if (result.transcript_path != null) node.transcriptPath = result.transcript_path;
+    if (result.codename) node.codename = result.codename;
 
     if (result.skipped === true) {
       node.state = 'skipped';
@@ -168,6 +193,7 @@ export function buildRunGraphModel(
       state: unitState,
       transcriptPath: cp.transcript_path,
     };
+    if (cp.codename) unit.codename = cp.codename;
     units.set(cp.index, unit);
   }
 
@@ -177,6 +203,13 @@ export function buildRunGraphModel(
   // Events are processed in array order; later events overwrite earlier
   // ones for the same step/unit (last-event-wins within the events slice).
   // ------------------------------------------------------------------
+  // `agent_started` identities are applied after the loop: a unit's
+  // agent_started can precede (or race) its unit_started, so deferring lets
+  // it land on the unit whichever arrives first. `unit_index` absent ⇒ the
+  // step itself; present ⇒ that unit. Last event wins per target.
+  const stepIdentities = new Map<string, AgentIdentity>();
+  const unitIdentities = new Map<string, Map<number, AgentIdentity>>();
+
   for (const ev of events) {
     if (!isKnownRunEvent(ev)) continue;
 
@@ -186,6 +219,7 @@ export function buildRunGraphModel(
         const node = nodeMap.get(ev.step_id);
         if (node) {
           node.state = 'running';
+          if (ev.type === 'step_started' && ev.codename) node.codename = ev.codename;
           // A running linear step has no persisted step_result yet, so its
           // transcript path arrives live on step_working — adopt it so the
           // panel can select and tail the file in real time.
@@ -226,13 +260,30 @@ export function buildRunGraphModel(
         const existing = units.get(ev.index);
         if (existing) {
           existing.state = 'running';
+          if (ev.codename) existing.codename = ev.codename;
         } else {
-          units.set(ev.index, {
+          const unit: UnitView = {
             index: ev.index,
             key: ev.unit_key,
             state: 'running',
             transcriptPath: ev.transcript_path,
-          });
+          };
+          if (ev.codename) unit.codename = ev.codename;
+          units.set(ev.index, unit);
+        }
+        break;
+      }
+      case 'agent_started': {
+        const id: AgentIdentity = { codename: ev.codename, provider: ev.provider, model: ev.model };
+        if (ev.unit_index == null) {
+          stepIdentities.set(ev.step_id, id);
+        } else {
+          let m = unitIdentities.get(ev.step_id);
+          if (!m) {
+            m = new Map<number, AgentIdentity>();
+            unitIdentities.set(ev.step_id, m);
+          }
+          m.set(ev.unit_index, id);
         }
         break;
       }
@@ -270,6 +321,22 @@ export function buildRunGraphModel(
         // in-flight step's own `step_paused`/`step_resumed` event, above,
         // carries the per-node transition).
         break;
+    }
+  }
+
+  // Apply deferred agent_started identities. A unit key matches the unit
+  // list's `index` (== the unit_started index; panel/parallel units use
+  // their own view/declared index). Never fabricates a node or unit.
+  for (const [stepId, id] of stepIdentities) {
+    const node = nodeMap.get(stepId);
+    if (node) applyIdentity(node, id);
+  }
+  for (const [stepId, byIndex] of unitIdentities) {
+    const units = unitsByStep.get(stepId);
+    if (!units) continue;
+    for (const [idx, id] of byIndex) {
+      const unit = units.get(idx);
+      if (unit) applyIdentity(unit, id);
     }
   }
 

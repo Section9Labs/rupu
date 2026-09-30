@@ -37,6 +37,7 @@ import TerminalBlock from './TerminalBlock';
 import StructuredView from './StructuredView';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
+import { AgentName } from '../codename/AgentName';
 import { formatDuration } from '../../lib/duration';
 
 // ---------------------------------------------------------------------------
@@ -452,6 +453,10 @@ export interface SubrunPayload {
   transcriptPath: string | null;
   subRunID: string | null;
   error: string | null;
+  /** Server-minted codename of the dispatched sub-agent (absent on older runs). */
+  codename: string | null;
+  /** The dispatched agent's name. */
+  agent: string | null;
 }
 
 export interface ParsedSubrunOutput {
@@ -470,7 +475,9 @@ function subrunPayloadFromRecord(rec: Record<string, unknown>): SubrunPayload | 
   if (ok === null && tokensUsed === null && transcriptPath === null && subRunID === null && error === null) {
     return null;
   }
-  return { ok, tokensUsed, transcriptPath, subRunID, error };
+  const codename = typeof rec.codename === 'string' && rec.codename ? rec.codename : null;
+  const agent = typeof rec.agent === 'string' && rec.agent ? rec.agent : null;
+  return { ok, tokensUsed, transcriptPath, subRunID, error, codename, agent };
 }
 
 /**
@@ -506,10 +513,15 @@ function SubrunPayloadRow({
   payload: SubrunPayload;
   onOpenTranscript?: (path: string) => void;
 }) {
-  const { ok, tokensUsed, transcriptPath, error } = payload;
+  const { ok, tokensUsed, transcriptPath, error, codename, agent } = payload;
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap gap-1.5 items-center">
+        {codename && (
+          <span className="text-[11px] text-ink">
+            <AgentName codename={codename} agent={agent ?? undefined} />
+          </span>
+        )}
         {ok !== null && (
           <Badge tone={ok ? 'green' : 'red'} className="px-2 font-mono">
             {ok ? 'ok' : 'failed'}

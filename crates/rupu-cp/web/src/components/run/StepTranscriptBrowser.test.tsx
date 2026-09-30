@@ -72,4 +72,17 @@ describe('StepTranscriptBrowser', () => {
     const panel = screen.getByTestId('transcript-panel');
     expect(panel.getAttribute('data-path')).toBe('/runs/r1/units/2.jsonl');
   });
+
+  it('shows the unit codename with provider/model next to its key', () => {
+    const units: UnitView[] = [
+      { ...UNITS[0], codename: 'jade-reef/heron#0', provider: 'anthropic', model: 'claude-opus-5-5' },
+      { ...UNITS[1], codename: 'jade-reef/heron#1' },
+    ];
+    render(<StepTranscriptBrowser stepId="process_items" units={units} agent="scanner" />);
+    expect(screen.getByText('heron#0 · scanner · anthropic/claude-opus-5-5')).toBeTruthy();
+    // placed unit: provider/model absent → just leaf · agent
+    expect(screen.getByText('heron#1 · scanner')).toBeTruthy();
+    // key stays visible for rows
+    expect(screen.getByTitle('item-a')).toBeTruthy();
+  });
 });

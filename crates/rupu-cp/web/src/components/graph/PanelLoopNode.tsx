@@ -13,6 +13,8 @@ import { stateStyle, glyphBg } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { PANEL_W, PANEL_H } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
+import { memberLabel } from '../../lib/codename';
+import { AgentName } from '../codename/AgentName';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -107,7 +109,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
             <button
               key={u.index}
               type="button"
-              title={`${u.key} · ${stateStyle(colors, u.state).label}`}
+              title={`${u.codename ? memberLabel(u.codename, u.key, u.provider, u.model) : u.key} · ${stateStyle(colors, u.state).label}`}
               onClick={() => onOpenUnit?.(node.id, u.index)}
               className="inline-flex items-center gap-1 rounded bg-panel/80 px-1.5 py-px text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
             >
@@ -116,7 +118,9 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
                 style={{ background: glyphBg(colors, u.state) }}
                 aria-hidden
               />
-              <span className="max-w-[88px] truncate">{u.key}</span>
+              <span className="max-w-[88px] truncate">
+                {u.codename ? <AgentName codename={u.codename} /> : u.key}
+              </span>
             </button>
           ))}
         </div>

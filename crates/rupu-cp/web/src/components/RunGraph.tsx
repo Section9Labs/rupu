@@ -34,6 +34,7 @@ import FanoutNode from './graph/FanoutNode';
 import PanelLoopNode from './graph/PanelLoopNode';
 import GateNode from './graph/GateNode';
 import ActionNode from './graph/ActionNode';
+import { parseCodename } from '../lib/codename';
 
 import '@xyflow/react/dist/style.css';
 
@@ -111,7 +112,9 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
           onSelectNode({
             path: unit.transcriptPath ?? null,
             live: unit.state === 'running',
-            label: unit.key,
+            // Prefer the unit's codename leaf; RunDetail routes units via
+            // onOpenUnit, so this label is display-only.
+            label: unit.codename ? parseCodename(unit.codename).leaf : unit.key,
           });
         }
       }

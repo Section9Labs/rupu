@@ -388,6 +388,8 @@ describe('parseSubrunOutput', () => {
       transcriptPath: '/tmp/sub_TEST/transcript.jsonl',
       subRunID: 'sub_TEST',
       error: null,
+      codename: null,
+      agent: 'reviewer',
     });
     expect(parsed?.requests).toEqual([]);
   });
@@ -408,6 +410,20 @@ describe('parseSubrunOutput', () => {
     expect(parsed?.requests[0].payload.transcriptPath).toBe('/t/a.jsonl');
     expect(parsed?.requests[1].payload.ok).toBe(false);
     expect(parsed?.requests[1].payload.error).toBe('boom');
+  });
+
+  it('parses the sub-agent codename (single and parallel shapes)', () => {
+    const single = parseSubrunOutput(JSON.stringify({
+      ok: true, agent: 'reviewer', tokens_used: 1, transcript_path: '/t/s.jsonl',
+      sub_run_id: 'sub_s', codename: 'otter-3/lead>lynx#1',
+    }));
+    expect(single?.top?.codename).toBe('otter-3/lead>lynx#1');
+    const par = parseSubrunOutput(JSON.stringify({
+      ok: true,
+      results: { a: { ok: true, agent: 'a1', sub_run_id: 'sub_a', codename: 'otter-3/lead>scout#2' } },
+    }));
+    expect(par?.requests[0].payload.codename).toBe('otter-3/lead>scout#2');
+    expect(par?.requests[0].payload.agent).toBe('a1');
   });
 
   it('returns null for non-JSON, non-object JSON, and objects with none of the wire fields', () => {
@@ -726,4 +742,19 @@ describe('AstGrepBody (via ToolCard)', () => {
     render(<ToolCard tool={tv} />);
     expect(screen.queryByRole('button', { name: /^tree$/ })).toBeNull();
   });
+});
+
+it('subrun ToolView with a codename renders the sub-agent name next to its agent', () => {
+  const tv: ToolView = {
+    tool: 'dispatch_agent',
+    kind: 'subrun',
+    input: { agent: 'scanner' },
+    output: JSON.stringify({
+      ok: true, agent: 'scanner', tokens_used: 5,
+      transcript_path: '/runs/abc/transcript.jsonl', sub_run_id: 'sub_abc',
+      codename: 'otter-3/lead>lynx#1',
+    }),
+  };
+  render(<ToolCard tool={tv} />);
+  expect(screen.getByText('lead>lynx#1 · scanner')).not.toBeNull();
 });

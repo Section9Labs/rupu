@@ -1057,3 +1057,38 @@ describe('RunDetail — codename', () => {
     );
   });
 });
+
+describe('RunDetail selection label codenames', () => {
+  const CODENAME_GRAPH: RunGraphResponse = {
+    ...GRAPH,
+    step_results: [
+      { ...GRAPH.step_results[0], codename: 'jade-reef/heron' },
+    ],
+    units: [{ ...GRAPH.units[0], codename: 'jade-reef/lynx#0' }],
+  };
+
+  function stub() {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(CODENAME_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  it('shows the selected step codename next to its agent', async () => {
+    stub();
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('select-step-a'));
+    const sel = screen.getByTestId('run-selected-label');
+    expect(sel).toHaveTextContent('step_a');
+    expect(sel).toHaveTextContent('heron · reviewer');
+  });
+
+  it('shows the selected unit codename leaf when a unit is opened', async () => {
+    stub();
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('open-unit'));
+    expect(screen.getByTestId('run-selected-label')).toHaveTextContent('lynx#0');
+  });
+});

@@ -64,6 +64,8 @@ export interface TranscriptHeader {
   provider: string;
   mode: string;
   startedAt: string;
+  /** Server-minted agent codename (absent on pre-codename transcripts). */
+  codename?: string;
 }
 
 export interface TranscriptFooter {
@@ -347,6 +349,10 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           mode: asString(data.mode) ?? '',
           startedAt: asString(data.started_at) ?? '',
         };
+        {
+          const codename = asString(data.codename);
+          if (codename) header.codename = codename;
+        }
         break;
       }
 

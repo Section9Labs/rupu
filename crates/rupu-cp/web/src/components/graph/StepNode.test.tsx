@@ -35,4 +35,14 @@ describe('StepNode', () => {
     renderNode({ kind: 'step' });
     expect(screen.getByTestId('rg-kindpill')).toHaveTextContent('step');
   });
+
+  it('shows codename · agent · provider/model when the node has a codename', () => {
+    renderNode({ agent: 'security-reviewer', codename: 'jade-reef/heron', provider: 'anthropic', model: 'claude-opus-5-5' });
+    expect(screen.getByText('heron · security-reviewer · anthropic/claude-opus-5-5')).toBeInTheDocument();
+  });
+
+  it('keeps the plain agent chip without a codename', () => {
+    renderNode({ agent: 'security-reviewer' });
+    expect(screen.getByText('security-reviewer')).toBeInTheDocument();
+  });
 });

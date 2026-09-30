@@ -9,6 +9,7 @@ import type { StepState, UnitView } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from '../graph/stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import TranscriptPanel from '../TranscriptPanel';
+import { AgentName } from '../codename/AgentName';
 
 const ROW_CAP = 300;
 
@@ -32,9 +33,13 @@ export default function StepTranscriptBrowser({
   initialUnitIndex,
   runId,
   host,
+  agent,
 }: {
   stepId: string;
   units: UnitView[];
+  /** The agent every unit runs (for_each). Omit for panel/parallel steps
+   *  whose units each run their own agent. */
+  agent?: string;
   /**
    * Seed the initially-selected unit (e.g. the unit-square the user clicked in
    * the graph). Falls back to the first visible unit if this index isn't in the
@@ -140,6 +145,16 @@ export default function StepTranscriptBrowser({
                       <span className="truncate font-mono text-ink" title={u.key}>
                         {u.key}
                       </span>
+                      {u.codename && (
+                        <span className="min-w-0 truncate text-ink-dim">
+                          <AgentName
+                            codename={u.codename}
+                            agent={agent}
+                            provider={u.provider}
+                            model={u.model}
+                          />
+                        </span>
+                      )}
                       <span
                         className="ml-auto shrink-0 text-meta font-medium uppercase tracking-wide"
                         style={{ color: st.color }}

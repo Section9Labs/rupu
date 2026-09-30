@@ -770,3 +770,103 @@ describe('pause / resume events', () => {
     expect(() => buildRunGraphModel(g, events)).not.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Codenames + provider/model (agent codenames Plan 2, Task 5)
+// ---------------------------------------------------------------------------
+
+describe('codenames and provider/model', () => {
+  const cp = (index: number, codename?: string): UnitCheckpoint => ({
+    step_id: 'b', index, item: `f${index}.ts`,
+    run_id: runId(), transcript_path: `/tmp/t${index}.jsonl`,
+    output: 'ok', success: true, finished_at: '2026-06-18T00:01:00Z',
+    ...(codename ? { codename } : {}),
+  });
+
+  it('checkpoint codename flows to UnitView.codename', () => {
+    const g = makeGraph({ units: [cp(0, 'otter-3/scout#0')] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('b')!.fanout!.units[0].codename).toBe('otter-3/scout#0');
+  });
+
+  it('agent_started with unit_index sets provider/model on that unit only', () => {
+    const g = makeGraph({ units: [cp(0), cp(1), cp(2), cp(3)] });
+    const events: RunEvent[] = [
+      {
+        type: 'agent_started', run_id: runId(), step_id: 'b', unit_index: 3,
+        codename: 'otter-3/scout#3', agent: 'agent-b', provider: 'anthropic',
+        model: 'claude-sonnet-4-6', agent_run_id: 'ar-3', transcript_path: '/tmp/t3.jsonl',
+      },
+    ];
+    const model = buildRunGraphModel(g, events);
+    const b = model.nodeById('b')!;
+    const u3 = b.fanout!.units.find((u) => u.index === 3)!;
+    expect(u3.provider).toBe('anthropic');
+    expect(u3.model).toBe('claude-sonnet-4-6');
+    expect(u3.codename).toBe('otter-3/scout#3');
+    const u2 = b.fanout!.units.find((u) => u.index === 2)!;
+    expect(u2.provider).toBeUndefined();
+    expect(u2.model).toBeUndefined();
+    // Unit-scoped agent_started never lands on the step node itself.
+    expect(b.provider).toBeUndefined();
+    expect(b.codename).toBeUndefined();
+  });
+
+  it('agent_started arriving before unit_started still lands on the unit', () => {
+    const g = makeGraph({});
+    const events: RunEvent[] = [
+      {
+        type: 'agent_started', run_id: runId(), step_id: 'b', unit_index: 1,
+        agent: 'agent-b', provider: 'openai', model: 'gpt-5',
+        agent_run_id: 'ar-1', transcript_path: '/tmp/t1.jsonl',
+      },
+      { type: 'unit_started', run_id: runId(), step_id: 'b', index: 1, unit_key: 'x', transcript_path: '/tmp/t1.jsonl', codename: 'otter-3/scout#1' },
+    ];
+    const u = buildRunGraphModel(g, events).nodeById('b')!.fanout!.units[0];
+    expect(u.codename).toBe('otter-3/scout#1');
+    expect(u.provider).toBe('openai');
+    expect(u.model).toBe('gpt-5');
+  });
+
+  it('unit_started codename populates a live unit', () => {
+    const g = makeGraph({ units: [cp(0)] });
+    const events: RunEvent[] = [
+      { type: 'unit_started', run_id: runId(), step_id: 'b', index: 0, unit_key: 'f0.ts', transcript_path: '/tmp/t0.jsonl', codename: 'otter-3/scout#0' },
+    ];
+    expect(buildRunGraphModel(g, events).nodeById('b')!.fanout!.units[0].codename).toBe('otter-3/scout#0');
+  });
+
+  it('step_results codename lands on the node; step_started overrides; agent_started sets provider/model', () => {
+    const g = makeGraph({
+      step_results: [{ run_id: runId(), step_id: 'a', success: true, codename: 'otter-3/lead' }],
+      steps: [STEP_A, STEP_C],
+    });
+    const events: RunEvent[] = [
+      { type: 'step_started', run_id: runId(), step_id: 'c', kind: 'step', agent: 'agent-c', codename: 'otter-3/fixer' },
+      {
+        type: 'agent_started', run_id: runId(), step_id: 'c', agent: 'agent-c',
+        provider: 'anthropic', model: 'claude-opus-4-7', agent_run_id: 'ar-c', transcript_path: '/tmp/c.jsonl',
+      },
+    ];
+    const model = buildRunGraphModel(g, events);
+    expect(model.nodeById('a')!.codename).toBe('otter-3/lead');
+    const c = model.nodeById('c')!;
+    expect(c.codename).toBe('otter-3/fixer');
+    expect(c.provider).toBe('anthropic');
+    expect(c.model).toBe('claude-opus-4-7');
+  });
+
+  it('placed-unit agent_started without provider/model leaves them absent', () => {
+    const g = makeGraph({ units: [cp(0)] });
+    const events: RunEvent[] = [
+      {
+        type: 'agent_started', run_id: runId(), step_id: 'b', unit_index: 0,
+        codename: 'otter-3/scout#0', agent: 'agent-b', agent_run_id: 'ar-0', transcript_path: '/tmp/t0.jsonl',
+      },
+    ];
+    const u = buildRunGraphModel(g, events).nodeById('b')!.fanout!.units[0];
+    expect(u.codename).toBe('otter-3/scout#0');
+    expect(u.provider).toBeUndefined();
+    expect(u.model).toBeUndefined();
+  });
+});

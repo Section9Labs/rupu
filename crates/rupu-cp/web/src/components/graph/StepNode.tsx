@@ -11,6 +11,7 @@ import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { STEP_W, STEP_H } from '../../lib/nodeSize';
 import { runKindAccent, runKindIcon, runKindLabel } from './kindBridge';
+import { AgentName } from '../codename/AgentName';
 
 export interface StepNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -73,10 +74,21 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
           <KindIcon size={10} aria-hidden />
           {runKindLabel(node.kind)}
         </span>
-        {node.agent && (
-          <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
-            {node.agent}
+        {node.codename ? (
+          <span className="min-w-0 truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
+            <AgentName
+              codename={node.codename}
+              agent={node.agent}
+              provider={node.provider}
+              model={node.model}
+            />
           </span>
+        ) : (
+          node.agent && (
+            <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
+              {node.agent}
+            </span>
+          )
         )}
       </div>
 
