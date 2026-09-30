@@ -334,6 +334,43 @@ fn make_model_info(id: &str) -> crate::model_pool::ModelInfo {
     }
 }
 
+/// Copilot `GET {api}/models` → `ModelInfo`s (spec 2026-09-30 §3). Input is
+/// `max_prompt_tokens` (often far below the window), else
+/// `max_context_window_tokens`; non-chat models are skipped.
+pub(crate) fn copilot_models_from_listing(
+    v: &serde_json::Value,
+) -> Vec<crate::model_pool::ModelInfo> {
+    let arr = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .or_else(|| v.as_array());
+    arr.into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let id = e.get("id")?.as_str()?;
+            let caps = e.get("capabilities");
+            if let Some(t) = caps.and_then(|c| c.get("type")).and_then(|t| t.as_str()) {
+                if t != "chat" {
+                    return None;
+                }
+            }
+            let limits = caps.and_then(|c| c.get("limits"));
+            let n = |k: &str| {
+                limits
+                    .and_then(|l| l.get(k))
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x.min(u32::MAX as u64) as u32)
+            };
+            let mut mi = make_model_info(id);
+            mi.context_window = n("max_prompt_tokens")
+                .or_else(|| n("max_context_window_tokens"))
+                .unwrap_or(0);
+            mi.max_output_tokens = n("max_output_tokens").unwrap_or(0);
+            Some(mi)
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl crate::provider::LlmProvider for GithubCopilotClient {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
@@ -349,14 +386,50 @@ impl crate::provider::LlmProvider for GithubCopilotClient {
     }
 
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
-        // GitHub Copilot doesn't expose a public /models endpoint.
-        // Slice B-1 spec §6a: ship a baked-in list. Users who have access
-        // to additional models register them as custom entries in
+        // Offline fallback list. Live limits come from fetch_models; users with
+        // access to additional models register them as custom entries in
         // ~/.rupu/config.toml.
         ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4-6", "o4-mini"]
             .into_iter()
             .map(make_model_info)
             .collect()
+    }
+
+    async fn fetch_models(&mut self) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+        self.ensure_valid_token().await?;
+        let mut headers = self.build_headers()?;
+        headers.insert(reqwest::header::ACCEPT, "application/json".parse().unwrap());
+        headers.insert("X-GitHub-Api-Version", "2025-10-01".parse().unwrap());
+        let resp = self
+            .client
+            .get(format!("{}/models", self.api_url))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        Ok(copilot_models_from_listing(&v))
+    }
+
+    fn output_shares_context(&self) -> bool {
+        false
     }
 
     fn default_model(&self) -> &str {
@@ -929,6 +1002,32 @@ mod tests {
             "malformed tool arguments should return error"
         );
     }
+
+    #[tokio::test]
+    async fn fetch_models_calls_live_models_endpoint() {
+        use crate::provider::LlmProvider;
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET).path("/models")
+                .header("authorization", "Bearer cop-tok")
+                .header("x-github-api-version", "2025-10-01");
+            then.status(200).json_body(serde_json::json!({ "data": [
+                { "id": "chat-a", "capabilities": { "type": "chat", "limits": { "max_prompt_tokens": 1000, "max_output_tokens": 500 } } }
+            ]}));
+        });
+        let mut client =
+            GithubCopilotClient::new(test_creds(), None, Arc::new(rupu_netflow::NullSink)).unwrap();
+        client.copilot_token = "cop-tok".into();
+        client.copilot_expires_ms = u64::MAX;
+        client.api_url = server.url("");
+        let ms = <GithubCopilotClient as LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        m.assert();
+        assert_eq!((ms[0].context_window, ms[0].max_output_tokens), (1000, 500));
+        assert!(!<GithubCopilotClient as LlmProvider>::output_shares_context(&client));
+    }
 }
 
 #[cfg(test)]
@@ -967,5 +1066,25 @@ mod baked_in_tests {
         let models = client.list_models().await;
         assert!(!models.is_empty());
         assert!(models.iter().any(|m| m.id == "gpt-4o"));
+    }
+
+    #[test]
+    fn copilot_listing_prefers_max_prompt_tokens() {
+        let v = serde_json::json!({ "data": [
+            { "id": "chat-a", "capabilities": { "type": "chat", "limits": {
+                "max_context_window_tokens": 400000, "max_prompt_tokens": 128000, "max_output_tokens": 64000 } } },
+            { "id": "chat-b", "capabilities": { "type": "chat", "limits": { "max_context_window_tokens": 200000 } } },
+            { "id": "embed-x", "capabilities": { "type": "embeddings", "limits": { "max_prompt_tokens": 8000 } } }
+        ]});
+        let ms = copilot_models_from_listing(&v);
+        assert_eq!(ms.len(), 2, "embeddings are not chat models");
+        assert_eq!(
+            (ms[0].context_window, ms[0].max_output_tokens),
+            (128_000, 64_000)
+        );
+        assert_eq!(
+            (ms[1].context_window, ms[1].max_output_tokens),
+            (200_000, 0)
+        );
     }
 }
