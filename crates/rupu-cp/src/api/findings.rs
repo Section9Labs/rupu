@@ -282,14 +282,15 @@ fn project_name(path: &str) -> String {
 /// WITHOUT the `RunStore` `workflow_name` join — `list_findings` does that
 /// join itself afterward, since it needs `AppState.run_store`.
 ///
-/// `pub(crate)`: this is the one workspace/target walk. `list_findings` and
+/// `pub`: this is the one workspace/target walk. `list_findings`,
 /// `LocalHostConnector::dashboard_summary`'s open-findings count
-/// (`host/local.rs`) both call it rather than each re-implementing the walk.
+/// (`host/local.rs`) and the report exports (here, and `rupu findings
+/// export`) all call it rather than each re-implementing the walk.
 ///
 /// Tolerant by design: a workspace whose path is gone, or a target whose
 /// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather
 /// than failing the caller.
-pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
+pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
 
     let mut out: Vec<FindingOut> = Vec::new();
@@ -355,7 +356,7 @@ pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingO
 ///
 /// Without (2), the Findings tab shows nothing for an in-progress run even
 /// though the findings are already on disk.
-fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
+pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
     let mut set = HashSet::new();
     set.insert(parent.to_string());
     for cp in store.read_unit_checkpoints(parent).unwrap_or_default() {
@@ -742,13 +743,38 @@ struct ExportBody {
     split: bool,
 }
 
-/// A rendered file on its way to the client.
-struct Download {
-    bytes: Vec<u8>,
-    content_type: &'static str,
-    name: String,
+/// A rendered report on its way to a client or a file.
+#[derive(Debug)]
+pub struct ExportedReport {
+    pub bytes: Vec<u8>,
+    pub content_type: &'static str,
+    /// The file name (with extension) to offer it under.
+    pub name: String,
     /// Rendered HTML: additionally served with a sandboxing CSP.
-    html: bool,
+    pub html: bool,
+}
+
+/// Why a report could not be produced. The HTTP handlers map it to a status
+/// (`ApiError`), `rupu findings export` prints it.
+#[derive(Debug, thiserror::Error)]
+pub enum ReportError {
+    /// The selection matched no finding (or the named finding does not exist).
+    #[error("{0}")]
+    NotFound(String),
+    #[error(transparent)]
+    Render(#[from] ExportError),
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<ReportError> for ApiError {
+    fn from(e: ReportError) -> Self {
+        match e {
+            ReportError::NotFound(msg) => ApiError::not_found(msg),
+            ReportError::Render(e) => export_error(e),
+            ReportError::Internal(msg) => ApiError::internal(msg),
+        }
+    }
 }
 
 /// The requested format, refused up front when it is unknown or this build
@@ -770,25 +796,24 @@ fn export_error(e: ExportError) -> ApiError {
     }
 }
 
-fn parse_min_severity(raw: &str) -> Result<Severity, ApiError> {
-    serde_json::from_value(serde_json::Value::String(raw.to_lowercase())).map_err(|_| {
-        ApiError::bad_request("min_severity must be one of critical, high, medium, low, info")
-    })
+/// A severity name (`critical` | `high` | `medium` | `low` | `info`, any
+/// case), or `None` for anything else.
+pub fn parse_min_severity(raw: &str) -> Option<Severity> {
+    serde_json::from_value(serde_json::Value::String(raw.to_lowercase())).ok()
+}
+
+fn min_severity_error() -> ApiError {
+    ApiError::bad_request("min_severity must be one of critical, high, medium, low, info")
 }
 
 /// The display-number prefix: `[findings].export_id_prefix` when it is a
 /// sane identifier, else `SEC`. The value ends up in file names and document
 /// text and the project layer of the config is repo-controlled, so an invalid
 /// one is refused (with a warning) rather than escaped.
-fn export_prefix(s: &AppState) -> String {
-    let configured = s
-        .config
-        .read()
-        .ok()
-        .and_then(|c| c.findings.export_id_prefix.clone());
+pub fn resolve_export_prefix(configured: Option<&str>) -> String {
     match configured {
         None => DEFAULT_PREFIX.to_string(),
-        Some(p) if is_valid_prefix(&p) => p,
+        Some(p) if is_valid_prefix(p) => p.to_string(),
         Some(p) => {
             tracing::warn!(
                 prefix = ?p.chars().take(32).collect::<String>(),
@@ -798,6 +823,53 @@ fn export_prefix(s: &AppState) -> String {
             DEFAULT_PREFIX.to_string()
         }
     }
+}
+
+fn export_prefix(s: &AppState) -> String {
+    let configured = s
+        .config
+        .read()
+        .ok()
+        .and_then(|c| c.findings.export_id_prefix.clone());
+    resolve_export_prefix(configured.as_deref())
+}
+
+/// The title of a project report: `raw` trimmed, or [`DEFAULT_EXPORT_TITLE`]
+/// when it is absent or blank. Refused when longer than
+/// [`MAX_EXPORT_TITLE_CHARS`] (the title lands in the document, its page
+/// header and the file name).
+pub fn normalize_export_title(raw: Option<&str>) -> Result<String, String> {
+    match raw.map(str::trim) {
+        Some(t) if t.chars().count() > MAX_EXPORT_TITLE_CHARS => Err(format!(
+            "title is longer than {MAX_EXPORT_TITLE_CHARS} characters"
+        )),
+        Some(t) if !t.is_empty() => Ok(t.to_string()),
+        _ => Ok(DEFAULT_EXPORT_TITLE.to_string()),
+    }
+}
+
+/// Resolve a project given as a workspace id or as a path to its checkout to
+/// the workspace id. A path is matched against the registered workspaces'
+/// (canonicalised) paths.
+pub fn resolve_project(global_dir: &std::path::Path, project: &str) -> Result<String, String> {
+    let workspaces = store_for(global_dir).list().unwrap_or_default();
+    if let Some(w) = workspaces.iter().find(|w| w.id == project) {
+        return Ok(w.id.clone());
+    }
+    let wanted = std::path::Path::new(project);
+    let wanted = wanted
+        .canonicalize()
+        .unwrap_or_else(|_| wanted.to_path_buf());
+    workspaces
+        .iter()
+        .find(|w| {
+            let p = std::path::Path::new(&w.path);
+            p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == wanted
+        })
+        .map(|w| w.id.clone())
+        .ok_or_else(|| {
+            format!("no project matches `{project}` (expected a workspace id or the path of a registered project)")
+        })
 }
 
 fn export_input(f: FindingOut) -> ExportInput {
@@ -855,7 +927,7 @@ fn attachment_disposition(name: &str) -> String {
 
 /// The download response: always an attachment (rendered HTML is never shown
 /// inline from this origin), `nosniff`, and for HTML a `sandbox` CSP as well.
-fn download_response(d: Download) -> Response {
+fn download_response(d: ExportedReport) -> Response {
     let mut resp = Response::new(Body::from(d.bytes));
     let h = resp.headers_mut();
     h.insert(
@@ -890,19 +962,21 @@ fn report_file_stem(title: &str) -> String {
     }
 }
 
-fn render_one_finding(
+/// One finding rendered as a stand-alone report, numbered within its own
+/// project (so it carries the number it has in the project's full report).
+pub fn export_finding_report(
     global: &std::path::Path,
     runs: &RunStore,
     id: &str,
     prefix: &str,
     fmt: Format,
-) -> Result<Download, ApiError> {
+) -> Result<ExportedReport, ReportError> {
     let all = collect_all_findings(global);
     let ws_id = all
         .iter()
         .find(|f| f.record.id == id)
         .map(|f| f.ws_id.clone())
-        .ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+        .ok_or_else(|| ReportError::NotFound(format!("finding {id} not found")))?;
     // Numbers are per project: number only the finding's own.
     let project: Vec<ExportInput> = all
         .into_iter()
@@ -914,11 +988,11 @@ fn render_one_finding(
     let pos = numbered
         .iter()
         .position(|f| f.input.record.id == id)
-        .ok_or_else(|| ApiError::internal(format!("finding {id} was not numbered")))?;
+        .ok_or_else(|| ReportError::Internal(format!("finding {id} was not numbered")))?;
     let mut finding = numbered.swap_remove(pos);
     attach_workflow_names(runs, std::slice::from_mut(&mut finding));
-    let bytes = render_finding(&finding, &numbers, fmt).map_err(export_error)?;
-    Ok(Download {
+    let bytes = render_finding(&finding, &numbers, fmt)?;
+    Ok(ExportedReport {
         bytes,
         content_type: fmt.content_type(),
         name: filename(&finding, fmt.ext()),
@@ -936,23 +1010,47 @@ async fn export_finding(
     let fmt = export_format(q.format.as_deref())?;
     let prefix = export_prefix(&s);
     let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
-    let download =
-        tokio::task::spawn_blocking(move || render_one_finding(&global, &runs, &id, &prefix, fmt))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))??;
+    let download = tokio::task::spawn_blocking(move || {
+        export_finding_report(&global, &runs, &id, &prefix, fmt)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
     Ok(download_response(download))
 }
 
-fn render_selection(
+/// What a project report covers. Every filter narrows the selection; unset
+/// ones keep everything.
+#[derive(Debug, Clone, Default)]
+pub struct ReportRequest {
+    /// The report's title (already through [`normalize_export_title`]).
+    pub title: String,
+    /// Only these finding ids (which also opts summary findings in).
+    pub ids: Vec<String>,
+    pub ws_id: Option<String>,
+    /// A run and its sub-runs, resolved as the list endpoint does.
+    pub run_id: Option<String>,
+    /// This severity and worse.
+    pub min_severity: Option<Severity>,
+    pub owner: Option<String>,
+    pub cwe: Option<String>,
+    /// Keep summary-profile findings (off by default).
+    pub include_summaries: bool,
+    /// One file per finding plus an index, as a zip.
+    pub split: bool,
+}
+
+/// A report over the findings `req` selects: one file, or with `req.split` a
+/// zip of one file per finding plus an index. Every finding is numbered
+/// within its project before any is dropped, so a number never depends on
+/// what else was left out. [`ReportError::NotFound`] when nothing matches.
+pub fn export_project_report(
     global: &std::path::Path,
     runs: &RunStore,
     prefix: &str,
-    body: ExportBody,
+    req: ReportRequest,
     fmt: Format,
-    min_severity: Option<Severity>,
-    title: String,
-) -> Result<Download, ApiError> {
-    let run_ids = body
+) -> Result<ExportedReport, ReportError> {
+    let run_ids = req
         .run_id
         .as_deref()
         .map(|parent| resolve_run_scope(runs, parent));
@@ -966,36 +1064,38 @@ fn render_selection(
         prefix,
     );
     let sel = Selection {
-        ids: body.ids,
-        ws_id: body.ws_id,
+        ids: req.ids,
+        ws_id: req.ws_id,
         run_ids,
-        min_severity,
-        owner: body.owner,
-        cwe: body.cwe,
-        include_summaries: body.include_summaries,
+        min_severity: req.min_severity,
+        owner: req.owner,
+        cwe: req.cwe,
+        include_summaries: req.include_summaries,
     };
     let mut chosen = select(numbered, &sel);
     if chosen.is_empty() {
-        return Err(ApiError::not_found("no findings match this selection"));
+        return Err(ReportError::NotFound(
+            "no findings match this selection".to_string(),
+        ));
     }
     attach_workflow_names(runs, &mut chosen);
     let meta = ReportMeta {
-        scope: describe(&sel, body.run_id.as_deref(), &chosen),
-        title,
+        scope: describe(&sel, req.run_id.as_deref(), &chosen),
+        title: req.title,
         generated_at: chrono::Utc::now(),
     };
     let stem = report_file_stem(&meta.title);
-    if body.split {
-        let bytes = render_split_zip(&meta, &chosen, fmt).map_err(export_error)?;
-        Ok(Download {
+    if req.split {
+        let bytes = render_split_zip(&meta, &chosen, fmt)?;
+        Ok(ExportedReport {
             bytes,
             content_type: "application/zip",
             name: format!("{stem}.zip"),
             html: false,
         })
     } else {
-        let bytes = render_project(&meta, &chosen, fmt).map_err(export_error)?;
-        Ok(Download {
+        let bytes = render_project(&meta, &chosen, fmt)?;
+        Ok(ExportedReport {
             bytes,
             content_type: fmt.content_type(),
             name: format!("{stem}.{}", fmt.ext()),
@@ -1015,21 +1115,24 @@ async fn export_findings(
     let min_severity = body
         .min_severity
         .as_deref()
-        .map(parse_min_severity)
+        .map(|raw| parse_min_severity(raw).ok_or_else(min_severity_error))
         .transpose()?;
-    let title = match body.title.as_deref().map(str::trim) {
-        Some(t) if t.chars().count() > MAX_EXPORT_TITLE_CHARS => {
-            return Err(ApiError::bad_request(format!(
-                "title is longer than {MAX_EXPORT_TITLE_CHARS} characters"
-            )));
-        }
-        Some(t) if !t.is_empty() => t.to_string(),
-        _ => DEFAULT_EXPORT_TITLE.to_string(),
-    };
+    let title = normalize_export_title(body.title.as_deref()).map_err(ApiError::bad_request)?;
     let prefix = export_prefix(&s);
+    let req = ReportRequest {
+        title,
+        ids: body.ids,
+        ws_id: body.ws_id,
+        run_id: body.run_id,
+        min_severity,
+        owner: body.owner,
+        cwe: body.cwe,
+        include_summaries: body.include_summaries,
+        split: body.split,
+    };
     let (global, runs) = (s.global_dir.clone(), Arc::clone(&s.run_store));
     let download = tokio::task::spawn_blocking(move || {
-        render_selection(&global, &runs, &prefix, body, fmt, min_severity, title)
+        export_project_report(&global, &runs, &prefix, req, fmt)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))??;
@@ -3134,5 +3237,83 @@ mod tests {
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // ── the export pipeline as a library (used by `rupu findings export`) ────
+
+    #[test]
+    fn resolve_project_takes_a_workspace_id_or_a_checkout_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_named_workspace(tmp.path(), "ws_a", "repo_a", &[]);
+        seed_named_workspace(tmp.path(), "ws_b", "repo_b", &[]);
+        let global = tmp.path();
+        assert_eq!(resolve_project(global, "ws_b").unwrap(), "ws_b");
+        let repo_a = global.join("repo_a");
+        assert_eq!(
+            resolve_project(global, repo_a.to_str().unwrap()).unwrap(),
+            "ws_a"
+        );
+        // A path that reaches the same directory another way still matches.
+        let indirect = global.join("repo_b").join("..").join("repo_b");
+        assert_eq!(
+            resolve_project(global, indirect.to_str().unwrap()).unwrap(),
+            "ws_b"
+        );
+        let err = resolve_project(global, "nope").unwrap_err();
+        assert!(err.contains("`nope`"), "{err}");
+    }
+
+    #[test]
+    fn export_titles_are_trimmed_defaulted_and_bounded() {
+        assert_eq!(normalize_export_title(None).unwrap(), "Findings report");
+        assert_eq!(
+            normalize_export_title(Some("   ")).unwrap(),
+            "Findings report"
+        );
+        assert_eq!(normalize_export_title(Some(" Q3 ")).unwrap(), "Q3");
+        assert!(normalize_export_title(Some(&"t".repeat(200))).is_ok());
+        assert!(normalize_export_title(Some(&"t".repeat(201))).is_err());
+    }
+
+    #[test]
+    fn export_prefix_is_the_configured_one_when_valid() {
+        assert_eq!(resolve_export_prefix(None), "SEC");
+        assert_eq!(resolve_export_prefix(Some("ACME")), "ACME");
+        for bad in ["", "1A", "A B", "../x"] {
+            assert_eq!(resolve_export_prefix(Some(bad)), "SEC", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn severity_names_parse_in_any_case() {
+        assert_eq!(parse_min_severity("High"), Some(Severity::High));
+        assert_eq!(parse_min_severity("info"), Some(Severity::Info));
+        assert_eq!(parse_min_severity("urgent"), None);
+    }
+
+    #[test]
+    fn the_report_pipeline_reports_what_it_could_not_find() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
+        let runs = RunStore::new(tmp.path().join("runs"));
+        let missing = export_finding_report(tmp.path(), &runs, "fnd_zzz", "SEC", Format::Markdown);
+        assert!(matches!(missing, Err(ReportError::NotFound(m)) if m.contains("fnd_zzz")));
+        let nothing = export_project_report(
+            tmp.path(),
+            &runs,
+            "SEC",
+            ReportRequest {
+                title: "T".into(),
+                min_severity: Some(Severity::Info),
+                owner: Some("nobody".into()),
+                ..ReportRequest::default()
+            },
+            Format::Markdown,
+        );
+        assert!(matches!(nothing, Err(ReportError::NotFound(_))));
+        let ok =
+            export_finding_report(tmp.path(), &runs, "fnd_a", "SEC", Format::Markdown).unwrap();
+        assert!(ok.name.ends_with(".md"));
+        assert!(String::from_utf8(ok.bytes).unwrap().contains("SEC-001"));
     }
 }

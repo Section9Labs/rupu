@@ -13,6 +13,13 @@ workspace = true
 name = "rupu"
 path = "src/main.rs"
 
+[features]
+# In-process PDF for `rupu findings export` (embeds Typst and its fonts,
+# roughly +50 MB in a release binary). Without it every other export format
+# still works and `--format pdf` exits with a clear message.
+default = ["pdf"]
+pdf = ["rupu-findings-report/pdf", "rupu-cp/pdf"]
+
 [dependencies]
 clap.workspace = true
 clap_complete.workspace = true
@@ -54,7 +61,8 @@ rupu-mcp = { path = "../rupu-mcp" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-webhook = { path = "../rupu-webhook" }
-rupu-cp = { path = "../rupu-cp" }
+rupu-cp = { path = "../rupu-cp", default-features = false }
+rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-update = { path = "../rupu-update" }
@@ -77,6 +85,8 @@ assert_cmd = { workspace = true }
 predicates.workspace = true
 httpmock.workspace = true
 tar.workspace = true
+# `findings_export` opens the `--split` zip it gets back.
+zip.workspace = true
 # I-35: unit tests in `cmd/cp.rs` spin up a real `rupu-cp` HTTP server
 # in-process (via `rupu_cp::server::router` + `axum::serve`) to exercise
 # the web reject handler end to end, then run the gate sweep against the

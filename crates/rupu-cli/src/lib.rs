@@ -64,6 +64,7 @@ use std::process::ExitCode;
 )]
 pub struct Cli {
     /// Structured output format for commands that support tabular/report views.
+    /// `md`, `html` and `pdf` are the document formats of `findings export`.
     #[arg(long, global = true)]
     pub format: Option<output::formats::OutputFormat>,
     /// Show absolute ISO timestamps in tables instead of relative ages.
@@ -178,7 +179,7 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::coverage::Action,
     },
-    /// Finding reports: the embedded report schema.
+    /// Finding reports: the embedded report schema, and report exports.
     Findings {
         #[command(subcommand)]
         action: cmd::findings::Action,
@@ -372,7 +373,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
-        Cmd::Findings { action } => cmd::findings::handle(action).await,
+        Cmd::Findings { action } => cmd::findings::handle(action, cli.format).await,
         Cmd::Cron { action } => {
             cmd::cron::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
@@ -441,11 +442,7 @@ fn ensure_output_format_supported(
             &[output::formats::OutputFormat::Table],
         ),
         Cmd::Coverage { action } => cmd::coverage::ensure_output_format(action, format),
-        Cmd::Findings { .. } => output::formats::ensure_supported(
-            "findings",
-            format,
-            &[output::formats::OutputFormat::Table],
-        ),
+        Cmd::Findings { action } => cmd::findings::ensure_output_format(action, format),
         Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
         Cmd::Webhook { .. } => output::formats::ensure_supported(
             "webhook",

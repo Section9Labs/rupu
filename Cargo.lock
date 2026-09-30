@@ -4584,6 +4584,7 @@ dependencies = [
  "rupu-config",
  "rupu-coverage",
  "rupu-cp",
+ "rupu-findings-report",
  "rupu-mcp",
  "rupu-netflow",
  "rupu-orchestrator",
@@ -4614,6 +4615,7 @@ dependencies = [
  "ulid",
  "which",
  "whoami",
+ "zip",
 ]
 
 [[package]]
