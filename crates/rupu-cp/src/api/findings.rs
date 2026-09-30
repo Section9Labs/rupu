@@ -522,13 +522,60 @@ fn safe_filename(path: &str) -> String {
     }
 }
 
+/// Read size for streaming an artifact body (tokio's default is 4 KiB, which
+/// is a syscall and an allocation per tiny chunk for multi-hundred-MB files).
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Open `path`, confirm the handle is a regular file whose contents hash to
+/// `expected_sha`, and return that SAME handle rewound to the start, so the
+/// bytes streamed are exactly the bytes that were hashed. Synchronous and
+/// potentially slow (it reads the whole file): async callers must run it under
+/// `spawn_blocking`.
+///
+/// `recorded_size` (0 = not recorded) short-circuits an obviously changed file
+/// with a 409 before paying for the hash.
+fn open_verified(
+    path: &std::path::Path,
+    expected_sha: &str,
+    recorded_size: u64,
+) -> Result<std::fs::File, ApiError> {
+    use std::io::{Seek, SeekFrom};
+    let gone = || ApiError::not_found("artifact is no longer in the workspace");
+    let changed = || ApiError::conflict("artifact changed since the finding was recorded");
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            gone()
+        } else {
+            ApiError::internal(e.to_string())
+        }
+    })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(gone());
+    }
+    if recorded_size != 0 && meta.len() != recorded_size {
+        return Err(changed());
+    }
+    let now = rupu_coverage::report::sha256_reader(&mut file)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if now != expected_sha {
+        return Err(changed());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(file)
+}
+
 /// `GET /api/findings/:id/artifacts/:sha256` — the bytes of an artifact the
 /// finding's report references.
 ///
 /// Only artifacts listed in the finding's own `report.artifacts` are served, so
 /// this can never be used to read an arbitrary blob out of the shared store.
 /// Artifacts are never rendered as HTML: text is `text/plain` inline, anything
-/// else an `application/octet-stream` attachment, always `nosniff`.
+/// else an `application/octet-stream` attachment, always `nosniff` and
+/// `Content-Security-Policy: sandbox`.
 async fn get_artifact(
     State(s): State<AppState>,
     Path((id, sha)): Path<(String, String)>,
@@ -551,7 +598,7 @@ async fn get_artifact(
         .cloned()
         .ok_or_else(|| ApiError::not_found("this finding does not reference that artifact"))?;
 
-    let path = match (artifact.stored, artifact.host.as_deref()) {
+    let file = match (artifact.stored, artifact.host.as_deref()) {
         (Some(ArtifactStorage::External), Some(host)) => {
             return Err(ApiError::not_found(format!(
                 "artifact is stored on host {host}; remote fetch is not supported yet"
@@ -565,35 +612,33 @@ async fn get_artifact(
                 &artifact.path,
             )
             .map_err(|_| gone())?;
+            // Cheap early refusal so a FIFO or directory is never opened.
             if !p.is_file() {
                 return Err(gone());
             }
-            // Hashing reads the whole file, so keep it off the runtime.
-            let hashed = p.clone();
-            let now =
-                tokio::task::spawn_blocking(move || rupu_coverage::report::sha256_file(&hashed))
+            // Open, verify and hash ONE handle off the runtime, then serve that
+            // same handle: a path in an agent-writable workspace can be
+            // re-pointed between a check and a later open, a handle cannot.
+            let (expected, recorded_size) = (sha.clone(), artifact.size);
+            let verified =
+                tokio::task::spawn_blocking(move || open_verified(&p, &expected, recorded_size))
                     .await
-                    .map_err(|e| ApiError::internal(e.to_string()))?
-                    .map_err(|e| ApiError::internal(e.to_string()))?;
-            if now != sha {
-                return Err(ApiError::conflict(
-                    "artifact changed since the finding was recorded",
-                ));
-            }
-            p
+                    .map_err(|e| ApiError::internal(e.to_string()))??;
+            tokio::fs::File::from_std(verified)
         }
-        _ => {
-            if !blob.is_file() {
-                return Err(ApiError::not_found("artifact blob missing from the store"));
+        _ => tokio::fs::File::open(&blob).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::not_found("artifact blob missing from the store")
+            } else {
+                ApiError::internal(e.to_string())
             }
-            blob
-        }
+        })?,
     };
 
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let body = Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+        file,
+        STREAM_CHUNK_BYTES,
+    ));
     let name = safe_filename(&artifact.path);
     let (ctype, disposition) = match artifact.kind {
         Some(ArtifactKind::Text) => (
@@ -611,6 +656,12 @@ async fn get_artifact(
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
+    );
+    // Belt and braces with `nosniff`: even if a client did render the bytes,
+    // `sandbox` gives them an opaque origin with no scripts, forms or plugins.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
     );
     h.insert(
         header::CONTENT_DISPOSITION,
@@ -1502,6 +1553,7 @@ mod tests {
         // Even HTML-looking text is plain text, never rendered.
         assert!(header_str(&headers, "content-type").starts_with("text/plain"));
         assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
         let disp = header_str(&headers, "content-disposition");
         assert!(disp.starts_with("inline"), "disposition: {disp}");
         assert!(
@@ -1538,6 +1590,7 @@ mod tests {
             "application/octet-stream"
         );
         assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
         let disp = header_str(&headers, "content-disposition");
         assert!(disp.starts_with("attachment"), "disposition: {disp}");
         assert!(
@@ -1708,6 +1761,7 @@ mod tests {
         assert_eq!(bytes, body);
         assert!(header_str(&headers, "content-type").starts_with("text/plain"));
         assert_eq!(header_str(&headers, "x-content-type-options"), "nosniff");
+        assert_eq!(header_str(&headers, "content-security-policy"), "sandbox");
     }
 
     #[tokio::test]
@@ -1766,42 +1820,109 @@ mod tests {
         assert_eq!(error_of(&bytes), "artifact is no longer in the workspace");
     }
 
-    #[tokio::test]
-    async fn artifact_external_local_never_escapes_the_workspace() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // `<global>/outside.txt` is next to the workspace at `<global>/repo`,
-        // and it really does hash to the recorded value: only the escape check
-        // can explain a refusal.
-        std::fs::write(tmp.path().join("outside.txt"), b"not yours\n").unwrap();
-        let sha = rupu_coverage::report::sha256_file(&tmp.path().join("outside.txt")).unwrap();
+    /// Seed a finding whose only artifact is an EXTERNAL local one at
+    /// `artifact_path`, whose recorded hash is `outside`'s real hash (so a
+    /// refusal can only come from the containment checks), then request it.
+    /// Asserts a 404 that leaks none of `outside`'s bytes.
+    async fn assert_outside_file_is_refused(
+        global: &std::path::Path,
+        artifact_path: &str,
+        outside: &std::path::Path,
+    ) {
+        let secret = std::fs::read(outside).unwrap();
+        let sha = rupu_coverage::report::sha256_file(outside).unwrap();
         seed_artifact_finding(
-            tmp.path(),
-            vec![
-                artifact_ref(
-                    "../outside.txt",
-                    &sha,
-                    10,
-                    Some(ArtifactKind::Text),
-                    Some(ArtifactStorage::External),
-                    None,
-                ),
-                artifact_ref(
-                    tmp.path().join("outside.txt").to_str().unwrap(),
-                    &sha,
-                    10,
-                    Some(ArtifactKind::Text),
-                    Some(ArtifactStorage::External),
-                    None,
-                ),
-            ],
+            global,
+            vec![artifact_ref(
+                artifact_path,
+                &sha,
+                secret.len() as u64,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
         );
-        let (status, _, bytes) = get_raw(
-            app_for(tmp.path()),
+        let (status, headers, bytes) = get_raw(
+            app_for(global),
             &format!("/api/findings/fnd_art/artifacts/{sha}"),
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(error_of(&bytes), "artifact is no longer in the workspace");
+        assert!(!bytes.windows(secret.len()).any(|w| w == secret.as_slice()));
+        assert_ne!(
+            header_str(&headers, "content-type"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_relative_dotdot_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `<global>/outside.txt` sits next to the workspace at `<global>/repo`.
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"not yours\n").unwrap();
+        assert_outside_file_is_refused(tmp.path(), "../outside.txt", &outside).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_absolute_path_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"not yours\n").unwrap();
+        assert_outside_file_is_refused(tmp.path(), outside.to_str().unwrap(), &outside).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_external_local_symlink_pointing_outside_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"not yours\n").unwrap();
+        // A perfectly relative, `..`-free path that is a symlink INSIDE the
+        // workspace pointing OUTSIDE it: only canonicalize + starts_with can
+        // catch this one.
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link.txt")).unwrap();
+        // The link really does reach the outside bytes.
+        assert_eq!(
+            std::fs::read(repo.join("link.txt")).unwrap(),
+            b"not yours\n"
+        );
+        assert_outside_file_is_refused(tmp.path(), "link.txt", &outside).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_external_local_same_size_edit_is_409() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("dump.log"), b"as recorded\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&repo.join("dump.log")).unwrap();
+        seed_artifact_finding(
+            tmp.path(),
+            vec![artifact_ref(
+                "dump.log",
+                &sha,
+                12,
+                Some(ArtifactKind::Text),
+                Some(ArtifactStorage::External),
+                None,
+            )],
+        );
+        // Same length, different bytes: only the hash can tell.
+        std::fs::write(repo.join("dump.log"), b"AS recorded\n").unwrap();
+        let (status, _, bytes) = get_raw(
+            app_for(tmp.path()),
+            &format!("/api/findings/fnd_art/artifacts/{sha}"),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error_of(&bytes),
+            "artifact changed since the finding was recorded"
+        );
     }
 
     #[tokio::test]
@@ -1840,5 +1961,76 @@ mod tests {
         // A trailing slash leaves nothing to name the download with.
         assert_eq!(safe_filename("dir/"), "artifact");
         assert_eq!(safe_filename(""), "artifact");
+    }
+
+    #[test]
+    fn open_verified_hands_back_the_hashed_handle_rewound_to_the_start() {
+        use std::io::Read as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("a.log");
+        let body = b"hashed and served from one handle\n";
+        std::fs::write(&p, body).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&p).unwrap();
+        // Hashing leaves the cursor at EOF; the returned handle must serve the
+        // whole file, not the empty tail.
+        let mut f = open_verified(&p, &sha, body.len() as u64).unwrap();
+        let mut got = Vec::new();
+        f.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        // A recorded size of 0 means "not recorded": only the hash decides.
+        assert!(open_verified(&p, &sha, 0).is_ok());
+    }
+
+    #[test]
+    fn open_verified_refuses_changed_missing_and_non_regular_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("a.log");
+        std::fs::write(&p, b"as recorded\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&p).unwrap();
+
+        // Same size, different bytes: caught by the hash.
+        std::fs::write(&p, b"AS recorded\n").unwrap();
+        assert_eq!(
+            open_verified(&p, &sha, 12).unwrap_err().0,
+            axum::http::StatusCode::CONFLICT
+        );
+        // Different size: caught before hashing.
+        std::fs::write(&p, b"longer than recorded\n").unwrap();
+        assert_eq!(
+            open_verified(&p, &sha, 12).unwrap_err().0,
+            axum::http::StatusCode::CONFLICT
+        );
+        // Gone.
+        assert_eq!(
+            open_verified(&dir.path().join("nope.log"), &sha, 12)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+        // Not a regular file (a directory opens fine on unix; the handle's own
+        // metadata is what refuses it).
+        assert_eq!(
+            open_verified(dir.path(), &sha, 0).unwrap_err().0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_verified_handle_keeps_the_hashed_bytes_if_the_path_is_repointed_after() {
+        use std::io::Read as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("a.log");
+        let elsewhere = dir.path().join("elsewhere.txt");
+        std::fs::write(&p, b"the hashed bytes\n").unwrap();
+        std::fs::write(&elsewhere, b"an arbitrary other file\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&p).unwrap();
+        let mut f = open_verified(&p, &sha, 17).unwrap();
+        // The swap an agent-writable workspace allows between check and stream.
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &p).unwrap();
+        let mut got = String::new();
+        f.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "the hashed bytes\n");
     }
 }
