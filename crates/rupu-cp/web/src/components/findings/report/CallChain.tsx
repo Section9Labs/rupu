@@ -14,7 +14,7 @@ export default function CallChain({ chain, wsId }: { chain: OrSentinel<ChainHop[
       {chain.map((h, i) => (
         <li key={`${h.label}-${i}`} className="grid grid-cols-[1.25rem_minmax(0,1fr)] gap-3">
           <div className="flex flex-col items-center">
-            <span aria-label={h.role} className={`mt-1.5 h-2.5 w-2.5 rounded-full ${DOT[h.role]}`} />
+            <span role="img" aria-label={h.role} className={`mt-1.5 h-2.5 w-2.5 rounded-full ${DOT[h.role]}`} />
             {i < chain.length - 1 && <span className="w-px flex-1 bg-border" />}
           </div>
           <div className="min-w-0 space-y-0.5 pb-3">

@@ -1,26 +1,55 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { findingArtifactUrl } from '../../../lib/api';
 import { formatBytes, type ArtifactRef } from '../../../lib/findingReport';
 
 const PREVIEW_LIMIT = 256 * 1024;
 
+/** Server errors are `{"error": "..."}`; show the message, not the JSON. */
+async function errorMessage(res: Response): Promise<string> {
+  const raw = await res.text().catch(() => '');
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && 'error' in parsed && typeof parsed.error === 'string' && parsed.error) {
+      return parsed.error;
+    }
+  } catch {
+    // not JSON; fall through to the raw text
+  }
+  return raw.trim() || res.statusText || `Request failed (HTTP ${res.status})`;
+}
+
 export default function ArtifactBrowser({ findingId, artifacts }: { findingId: string; artifacts: ArtifactRef[] }) {
   const [selected, setSelected] = useState<ArtifactRef | null>(null);
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  // Bumped on every selection; a fetch only writes state while it is still
+  // the latest one, so a slow earlier response can't land under a newer name.
+  const token = useRef(0);
 
   async function open(a: ArtifactRef) {
+    const mine = ++token.current;
+    const current = () => token.current === mine;
     setSelected(a);
     setText(null);
     setError(null);
+    setLoading(false);
     if (a.kind !== 'text' || a.host) return;
     if (a.size > PREVIEW_LIMIT) { setError(`Too large to preview (${formatBytes(a.size)}); download it instead.`); return; }
+    setLoading(true);
     try {
       const res = await fetch(findingArtifactUrl(findingId, a.sha256), { credentials: 'same-origin' });
-      if (!res.ok) { setError(await res.text()); return; }
-      setText(await res.text());
+      if (!res.ok) {
+        const msg = await errorMessage(res);
+        if (current()) setError(msg);
+        return;
+      }
+      const body = await res.text();
+      if (current()) setText(body);
     } catch (e) {
-      setError(String(e));
+      if (current()) setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (current()) setLoading(false);
     }
   }
 
@@ -52,6 +81,7 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
                 <a href={findingArtifactUrl(findingId, selected.sha256)} download className="text-brand-700 hover:underline">Download</a>
               )}
             </div>
+            {loading && <p role="status" className="px-3 py-2 text-ui text-ink-mute">Loading…</p>}
             {error && <p className="px-3 py-2 text-ui text-err">{error}</p>}
             {text !== null && <pre className="max-h-96 overflow-auto px-3 py-2 text-note font-mono text-ink whitespace-pre">{text}</pre>}
             {selected.kind !== 'text' && !selected.host && <p className="px-3 py-2 text-ui text-ink-mute">Binary file. Use Download.</p>}

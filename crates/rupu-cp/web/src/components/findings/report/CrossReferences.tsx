@@ -1,17 +1,17 @@
 import { Link } from 'react-router-dom';
 import Markdown from '../../transcript/Markdown';
-import { isSentinel, type CrossRef, type OrSentinel } from '../../../lib/findingReport';
+import { isSentinel, sentinelLabel, type CrossRef, type OrSentinel } from '../../../lib/findingReport';
 
 export default function CrossReferences({ refs, references }: { refs: OrSentinel<CrossRef[]>; references: string }) {
   return (
     <div className="space-y-2">
-      <div className="text-ink-dim"><Markdown text={references} /></div>
+      <div className="text-ink-dim"><Markdown text={sentinelLabel(references)} /></div>
       <div className="text-ui text-ink-dim">
         <span className="font-semibold text-ink">Related findings: </span>
-        {isSentinel(refs) ? refs : (
+        {isSentinel(refs) ? sentinelLabel(refs) : (
           <ul className="mt-1 space-y-0.5">
-            {refs.map((r) => (
-              <li key={r.finding_id}>
+            {refs.map((r, i) => (
+              <li key={`${r.finding_id}-${r.relation}-${i}`}>
                 <span className="text-ink-mute">{r.relation}</span>{' '}
                 <Link to={`/findings/${encodeURIComponent(r.finding_id)}`} className="font-mono text-brand-700 hover:underline">{r.finding_id}</Link>
                 {r.note && <span className="text-ink-mute"> — {r.note}</span>}

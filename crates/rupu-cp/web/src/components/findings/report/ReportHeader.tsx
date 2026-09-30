@@ -1,13 +1,13 @@
 import SeverityChip from '../../coverage/SeverityChip';
 import { normFindingSeverity, type FindingOut } from '../../../lib/api';
-import { isGapSentinel, isSentinel, type FindingReport } from '../../../lib/findingReport';
+import { isGapSentinel, isSentinel, sentinelLabel, type FindingReport } from '../../../lib/findingReport';
 
 function Cell({ label, value }: { label: string; value: string }) {
   const gap = isGapSentinel(value);
   return (
     <>
       <dt className="text-ui text-ink-mute">{label}</dt>
-      <dd data-gap={gap ? 'true' : 'false'} className={`min-w-0 break-words text-ui ${gap ? 'text-warn' : 'text-ink'}`}>{value}</dd>
+      <dd data-gap={gap ? 'true' : 'false'} className={`min-w-0 break-words text-ui ${gap ? 'text-warn' : 'text-ink'}`}>{sentinelLabel(value)}</dd>
     </>
   );
 }

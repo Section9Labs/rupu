@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import fixture from '../../../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
 import { codeHref, type ArtifactRef, type FindingReport } from '../../../lib/findingReport';
@@ -16,6 +16,7 @@ import CrossReferences from './CrossReferences';
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -37,6 +38,7 @@ describe('CallChain', () => {
     expect(items[0].querySelector('[aria-label="source"]')).not.toBeNull();
     expect(items[2].querySelector('[aria-label="sink"]')).not.toBeNull();
     expect(container.querySelectorAll('[aria-label="sink"]')).toHaveLength(1);
+    expect(screen.getAllByRole('img', { name: 'sink' })).toHaveLength(1);
   });
 
   it('links each hop with a file to the code viewer at its first line', () => {
@@ -68,6 +70,25 @@ describe('EvidenceClaims', () => {
     const pre = container.querySelector('pre');
     expect(pre).not.toBeNull();
     expect(pre).toHaveTextContent('store.find_by_id(id)');
+  });
+});
+
+describe('EvidenceClaims language handling', () => {
+  const claim = (lang: string) => [{ claim: 'c', excerpt: 'let x = 1;', lang }];
+
+  it('falls back to a plain <pre> with the excerpt for an unknown language', () => {
+    const { container } = withRouter(<EvidenceClaims claims={claim('cobol')} states={['current']} wsId={WS} />);
+    const pre = container.querySelector('pre');
+    expect(pre).toHaveTextContent('let x = 1;');
+    expect(container.querySelector('.hljs')).toBeNull();
+  });
+
+  it('highlights aliased and mixed-case language tags', () => {
+    for (const lang of ['rs', 'Rust', 'RS']) {
+      const { container, unmount } = withRouter(<EvidenceClaims claims={claim(lang)} states={['current']} wsId={WS} />);
+      expect(container.querySelector('.hljs')).not.toBeNull();
+      unmount();
+    }
   });
 });
 
@@ -103,6 +124,43 @@ describe('CommandBlock', () => {
   });
 });
 
+describe('CommandBlock feedback', () => {
+  it('shows "Copy failed" when the clipboard rejects, then resets', async () => {
+    vi.useFakeTimers();
+    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockRejectedValue(new Error('denied')) } });
+    render(<CommandBlock label="Command" command="ls" />);
+    fireEvent.click(screen.getByRole('button'));
+    await act(async () => {});
+    expect(screen.getByRole('button', { name: 'Copy failed' })).toBeInTheDocument();
+    act(() => { vi.advanceTimersByTime(1600); });
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+  });
+
+  it('announces status through a polite live region', async () => {
+    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    render(<CommandBlock label="Command" command="ls" />);
+    fireEvent.click(screen.getByRole('button'));
+    const live = await screen.findByText('Copied');
+    expect(live).toHaveAttribute('aria-live', 'polite');
+  });
+
+  it('a second copy restarts the reset timer instead of racing the first', async () => {
+    vi.useFakeTimers();
+    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    render(<CommandBlock label="Command" command="ls" />);
+    fireEvent.click(screen.getByRole('button'));
+    await act(async () => {});
+    act(() => { vi.advanceTimersByTime(1000); });
+    fireEvent.click(screen.getByRole('button'));
+    await act(async () => {});
+    // The first timer would have fired at 1500ms; it must have been cleared.
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument();
+    act(() => { vi.advanceTimersByTime(600); });
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+  });
+});
+
 describe('ArtifactBrowser', () => {
   const sha = 'a'.repeat(64);
   const textArt: ArtifactRef = { path: 'poc/request.http', sha256: sha, size: 20, kind: 'text', stored: 'copied' };
@@ -133,6 +191,71 @@ describe('ArtifactBrowser', () => {
     expect(screen.getByText(/on host kuki/)).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Download' })).toBeNull();
   });
+
+  describe('robustness', () => {
+    const artA: ArtifactRef = { path: 'poc/a.txt', sha256: '1'.repeat(64), size: 10, kind: 'text', stored: 'copied' };
+    const artB: ArtifactRef = { path: 'poc/b.txt', sha256: '2'.repeat(64), size: 10, kind: 'text', stored: 'copied' };
+
+    it('drops a stale response that resolves after a newer selection', async () => {
+      const resolvers: Record<string, (r: Response) => void> = {};
+      vi.spyOn(globalThis, 'fetch').mockImplementation((input) =>
+        new Promise<Response>((resolve) => { resolvers[String(input)] = resolve; }),
+      );
+      const { container } = render(<ArtifactBrowser findingId="fnd_1" artifacts={[artA, artB]} />);
+      fireEvent.click(screen.getByRole('button', { name: /poc\/a\.txt/ }));
+      fireEvent.click(screen.getByRole('button', { name: /poc\/b\.txt/ }));
+      expect(screen.getByRole('status')).toHaveTextContent('Loading');
+      // B lands first, then A's slow response arrives late.
+      await act(async () => { resolvers[findingArtifactUrl('fnd_1', artB.sha256)](new Response('BODY-B')); });
+      await waitFor(() => expect(container.querySelector('pre')).toHaveTextContent('BODY-B'));
+      await act(async () => { resolvers[findingArtifactUrl('fnd_1', artA.sha256)](new Response('BODY-A')); });
+      expect(container.querySelector('pre')).toHaveTextContent('BODY-B');
+      expect(screen.queryByText('BODY-A')).toBeNull();
+      expect(screen.queryByRole('status')).toBeNull();
+    });
+
+    it('drops a stale response even when the newer one is still pending', async () => {
+      const resolvers: Record<string, (r: Response) => void> = {};
+      vi.spyOn(globalThis, 'fetch').mockImplementation((input) =>
+        new Promise<Response>((resolve) => { resolvers[String(input)] = resolve; }),
+      );
+      const { container } = render(<ArtifactBrowser findingId="fnd_1" artifacts={[artA, artB]} />);
+      fireEvent.click(screen.getByRole('button', { name: /poc\/a\.txt/ }));
+      fireEvent.click(screen.getByRole('button', { name: /poc\/b\.txt/ }));
+      await act(async () => { resolvers[findingArtifactUrl('fnd_1', artA.sha256)](new Response('BODY-A')); });
+      expect(container.querySelector('pre')).toBeNull();
+      expect(screen.getByRole('status')).toHaveTextContent('Loading');
+    });
+
+    it('shows the message from a JSON error body, not the JSON', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ error: 'artifact is no longer in the workspace' }), { status: 404 }),
+      );
+      render(<ArtifactBrowser findingId="fnd_1" artifacts={[artA]} />);
+      fireEvent.click(screen.getByRole('button', { name: /poc\/a\.txt/ }));
+      expect(await screen.findByText('artifact is no longer in the workspace')).toBeInTheDocument();
+      expect(screen.queryByText(/"error"/)).toBeNull();
+    });
+
+    it('falls back to the raw text, then the status text, for non-JSON errors', async () => {
+      const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('upstream exploded', { status: 502 }));
+      render(<ArtifactBrowser findingId="fnd_1" artifacts={[artA, artB]} />);
+      fireEvent.click(screen.getByRole('button', { name: /poc\/a\.txt/ }));
+      expect(await screen.findByText('upstream exploded')).toBeInTheDocument();
+      spy.mockResolvedValue(new Response('', { status: 500, statusText: 'Internal Server Error' }));
+      fireEvent.click(screen.getByRole('button', { name: /poc\/b\.txt/ }));
+      expect(await screen.findByText('Internal Server Error')).toBeInTheDocument();
+    });
+
+    it('refuses to preview an oversized text artifact and never fetches it', () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      const big: ArtifactRef = { path: 'poc/big.log', sha256: '3'.repeat(64), size: 300 * 1024, kind: 'text', stored: 'copied' };
+      render(<ArtifactBrowser findingId="fnd_1" artifacts={[big]} />);
+      fireEvent.click(screen.getByRole('button', { name: /poc\/big\.log/ }));
+      expect(screen.getByText(/Too large to preview \(300\.0 KB\)/)).toBeInTheDocument();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('ReportHeader', () => {
@@ -153,10 +276,40 @@ describe('ReportHeader', () => {
   });
 });
 
+describe('ReportHeader sentinels', () => {
+  it('renders a "Not Provided" cell through sentinelLabel and styles it as a gap', () => {
+    const finding = { id: 'fnd_1', ws_id: WS, project: 'p', target_id: 't', severity: 'high', summary: 's' } as unknown as FindingOut;
+    render(<ReportHeader finding={finding} report={{ ...report, tickets: 'Not Provided — no tracker' }} />);
+    const cell = screen.getByText('Not provided: no tracker');
+    expect(cell).toHaveAttribute('data-gap', 'true');
+    expect(screen.queryByText(/Not Provided —/)).toBeNull();
+  });
+});
+
 describe('CrossReferences', () => {
   it('renders the None sentinel', () => {
     withRouter(<CrossReferences refs="None" references={report.references} />);
     expect(screen.getByText(/Related findings:/).parentElement).toHaveTextContent(/Related findings:\s*None$/);
+  });
+
+  it('renders a "Not Provided" sentinel through sentinelLabel', () => {
+    withRouter(<CrossReferences refs="Not Provided — none found" references="x" />);
+    expect(screen.getByText(/Related findings:/).parentElement).toHaveTextContent('Not provided: none found');
+  });
+
+  it('keys rows by id, relation and index so repeated ids do not collide', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    withRouter(
+      <CrossReferences
+        refs={[
+          { finding_id: 'fnd_9', relation: 'sibling' },
+          { finding_id: 'fnd_9', relation: 'duplicate' },
+        ]}
+        references="x"
+      />,
+    );
+    expect(screen.getAllByRole('link', { name: 'fnd_9' })).toHaveLength(2);
+    expect(err).not.toHaveBeenCalled();
   });
 
   it('links related findings to their detail page', () => {

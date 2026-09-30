@@ -17,7 +17,7 @@ export default function FixSections({ report }: { report: FindingReport }) {
       <Section id="s-patch" title="Recommended patch">
         {isSentinel(patch) ? <SentinelNote value={patch} /> : (
           <div className="space-y-2">
-            <div className="overflow-hidden rounded-md border border-border"><DiffView diff={patch.diff} /></div>
+            <DiffView diff={patch.diff} />
             {patch.notes && <div className="text-ink-dim"><Markdown text={patch.notes} /></div>}
           </div>
         )}
