@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { cweFromFinding } from './cwe';
+import { cweFromFinding, cweRef, findingCweIds } from './cwe';
 
 describe('cweFromFinding', () => {
   it('derives CWE from a concern_id', () => {
@@ -27,5 +27,31 @@ describe('cweFromFinding', () => {
         evidence: { references: ['https://owasp.org/Top10/A01'] },
       }),
     ).toBeNull();
+  });
+});
+
+describe('cweRef', () => {
+  it('accepts CWE-n, bare n and cwe_n spellings', () => {
+    const want = { id: 'CWE-639', url: 'https://cwe.mitre.org/data/definitions/639.html' };
+    expect(cweRef('CWE-639')).toEqual(want);
+    expect(cweRef('639')).toEqual(want);
+    expect(cweRef('cwe_639')).toEqual(want);
+  });
+
+  it('returns null with no number', () => {
+    expect(cweRef('unknown')).toBeNull();
+  });
+});
+
+describe('findingCweIds', () => {
+  it('unions report_summary.cwe with the concern-derived id, deduplicated', () => {
+    expect(
+      findingCweIds({
+        report_summary: { cwe: ['CWE-639', '862'] },
+        concern_id: 'cwe-top25:cwe-639-idor',
+      }),
+    ).toEqual(['CWE-639', 'CWE-862']);
+    expect(findingCweIds({ concern_id: 'cwe-top25:cwe-787-oob' })).toEqual(['CWE-787']);
+    expect(findingCweIds({})).toEqual([]);
   });
 });

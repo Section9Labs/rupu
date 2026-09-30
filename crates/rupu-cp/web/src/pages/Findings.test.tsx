@@ -94,3 +94,108 @@ describe('Findings — table rules', () => {
     expect(subjectCell?.querySelector(`[title="${FINDING.summary}"]`)).toBeInTheDocument();
   });
 });
+
+describe('Findings — profile / owner / CWE filters', () => {
+  function full(id: string, summary: string, owner: string, cwe: string[]): FindingOut {
+    return {
+      ...FINDING,
+      id,
+      summary,
+      profile: 'full',
+      report_summary: {
+        owner,
+        product: 'Notebin',
+        cwe,
+        root_cause: 'rc',
+        chain: [],
+        completeness: { filled: 9, total: 11, gaps: [] },
+        has_poc: false,
+        verification_status: null,
+      },
+    };
+  }
+
+  const ROWS: FindingOut[] = [
+    full('a', 'Full alpha', 'Team A', ['CWE-639']),
+    full('b', 'Full beta', 'Team B', ['CWE-862']),
+    { ...FINDING, id: 'c', summary: 'Summary gamma', profile: 'summary', concern_id: 'cwe-top25:cwe-639-idor' },
+    { ...FINDING, id: 'd', summary: 'Summary delta' },
+  ];
+  const SUM4: FindingsSummary = { total: 4, critical: 0, high: 4, medium: 0, low: 0, info: 0 };
+
+  async function loaded() {
+    vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: ROWS, summary: SUM4 });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Full alpha')).toBeInTheDocument());
+  }
+
+  it('the Full reports pill hides summary rows, Summaries hides full rows, All restores', async () => {
+    await loaded();
+    fireEvent.click(screen.getByRole('button', { name: 'Full reports' }));
+    expect(screen.getByText('Full alpha')).toBeInTheDocument();
+    expect(screen.getByText('Full beta')).toBeInTheDocument();
+    expect(screen.queryByText('Summary gamma')).not.toBeInTheDocument();
+    expect(screen.queryByText('Summary delta')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Summaries' }));
+    expect(screen.queryByText('Full alpha')).not.toBeInTheDocument();
+    expect(screen.getByText('Summary gamma')).toBeInTheDocument();
+    expect(screen.getByText('Summary delta')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
+    expect(screen.getByText('Full alpha')).toBeInTheDocument();
+    expect(screen.getByText('Summary delta')).toBeInTheDocument();
+  });
+
+  it('the Owner select keeps only matching rows and lists distinct owners', async () => {
+    await loaded();
+    const owner = screen.getByLabelText('Owner filter');
+    const options = Array.from(owner.querySelectorAll('option')).map((o) => o.textContent);
+    expect(options).toEqual(['All owners', 'Team A', 'Team B']);
+
+    fireEvent.change(owner, { target: { value: 'Team B' } });
+    expect(screen.getByText('Full beta')).toBeInTheDocument();
+    expect(screen.queryByText('Full alpha')).not.toBeInTheDocument();
+    expect(screen.queryByText('Summary gamma')).not.toBeInTheDocument();
+  });
+
+  it('the CWE select matches report_summary.cwe or the concern-derived CWE', async () => {
+    await loaded();
+    const cwe = screen.getByLabelText('CWE filter');
+    const options = Array.from(cwe.querySelectorAll('option')).map((o) => o.textContent);
+    expect(options).toEqual(['All CWEs', 'CWE-639', 'CWE-862']);
+
+    fireEvent.change(cwe, { target: { value: 'CWE-639' } });
+    expect(screen.getByText('Full alpha')).toBeInTheDocument();
+    expect(screen.getByText('Summary gamma')).toBeInTheDocument();
+    expect(screen.queryByText('Full beta')).not.toBeInTheDocument();
+    expect(screen.queryByText('Summary delta')).not.toBeInTheDocument();
+  });
+
+  it('combines with the severity filter and leaves the metric totals untouched', async () => {
+    const rows = [
+      ...ROWS,
+      { ...ROWS[0], id: 'e', summary: 'Full crit', severity: 'critical' },
+    ];
+    vi.spyOn(api, 'getFindings').mockResolvedValue({
+      findings: rows,
+      summary: { ...SUM4, total: 5, critical: 1 },
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Full alpha')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Full reports' }));
+    fireEvent.click(screen.getByRole('button', { name: /critical/i }));
+    expect(screen.getByText('Full crit')).toBeInTheDocument();
+    expect(screen.queryByText('Full alpha')).not.toBeInTheDocument();
+    // Tiles still report the unfiltered totals.
+    expect(screen.getByRole('button', { name: /critical/i })).toHaveTextContent('1');
+  });
+
+  it('shows the no-matches state when the filters exclude everything', async () => {
+    await loaded();
+    fireEvent.change(screen.getByLabelText('Owner filter'), { target: { value: 'Team A' } });
+    fireEvent.change(screen.getByLabelText('CWE filter'), { target: { value: 'CWE-862' } });
+    expect(screen.getByText('No matches')).toBeInTheDocument();
+  });
+});

@@ -5,7 +5,7 @@
 
 import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { normFindingSeverity, type FindingRecord } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { cweFromFinding } from '../../lib/cwe';
@@ -105,6 +105,14 @@ export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps
               <span>
                 concern <span className="font-mono">{finding.concern_id}</span>
               </span>
+            )}
+            {finding.profile === 'full' && (
+              <Link
+                to={`/findings/${encodeURIComponent(finding.id)}`}
+                className="text-brand-700 hover:underline"
+              >
+                Open report →
+              </Link>
             )}
             {hasEvidence && (
               <button
