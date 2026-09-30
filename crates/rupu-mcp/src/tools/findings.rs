@@ -81,8 +81,9 @@ pub fn specs() -> Vec<ToolSpec> {
         name: "findings.record",
         description: "Record a security finding in this project's findings ledger, so it appears \
                       in the control plane rather than only in an external tracker. Use the \
-                      narrowest scope the evidence supports. Under the run's full findings \
-                      profile send `report` (a complete finding report) and omit \
+                      narrowest scope the evidence supports. Under the full findings profile \
+                      (the step's `findings_profile`, else the workflow default, else full) \
+                      send `report` (a complete finding report) and omit \
                       summary/severity/rationale; under the summary profile send summary, \
                       severity and rationale.",
         input_schema,
