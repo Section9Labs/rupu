@@ -116,9 +116,12 @@ sequences.
   active simultaneously (**frontier**, a set — not one slot).
 - **Fan-out aggregates** per `for_each`/`parallel` step: counts by status
   (`queued / running / done / failed`), %-complete, aggregated usage, and the full
-  unit list (indexed by `unit_key`, not by a reused array slot — fixes the
-  sub-agent overwrite bug). Sub-agents attach to their **parent unit** via
-  `DispatchStarted`'s parentage, not to `units.len()`.
+  unit list keyed by the unit's own **`index`** (stable per unit within a step), not
+  by a reused array slot — this is what fixes the sub-agent overwrite bug.
+  `DispatchStarted` carries no `step_id` and no parent-unit link (see the event's
+  doc comment), so sub-agents live in their **own map keyed by `sub_run_id`**,
+  attributed to whichever step was active when the dispatch began — never appended
+  into the unit array at `units.len()`.
 - **Panel** rounds from `PanelRound{round, max_iterations, max_severity_remaining}`
   and **loop** iterations from `loop_progress` / `loop_iteration`.
 - **Per-unit usage** folded correctly: each transcript's `usage` events are counted
