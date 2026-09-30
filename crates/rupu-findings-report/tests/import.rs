@@ -240,9 +240,19 @@ fn an_exported_report_round_trips() {
     assert_eq!(r.regression_test, original.regression_test);
     assert_eq!(r.replication_steps, original.replication_steps);
     assert_eq!(r.cross_references, original.cross_references);
-    assert_eq!(r.references, original.references);
+    // The export's display number and the record's provenance have no report
+    // field; they are kept after the references, never dropped.
+    let (references, other) = r
+        .references
+        .split_once("\n\nOther imported text:\n\n")
+        .unwrap();
+    assert_eq!(references, original.references);
+    assert_eq!(other, EXPORTED_OTHER_TEXT);
     assert_valid(&r, &[]);
 }
+
+/// What an export of the fixture carries that no report field takes.
+const EXPORTED_OTHER_TEXT: &str = "Header:\n\n**Identifier:** SEC-001\n\nProvenance:\n\n**Project:** notebin\n**Workflow:** audit\n**Run:** run_01\n**Surface:** workflow\n**Model:** claude-x\n**Declared:** 2026-03-01T10:00:00Z\n**Scope:** repo";
 
 #[test]
 fn a_file_that_is_not_a_report_is_skipped() {
@@ -511,14 +521,560 @@ fn an_exported_report_with_every_optional_part_round_trips() {
     assert_eq!(
         r.references,
         format!(
-            "{}\n\nCross-references (imported):\n\n- {ID2} (sibling) — Share pages read notes through the same store.",
+            "{}\n\nCross-references (imported):\n\n- {ID2} (sibling) — Share pages read notes through the same store.\n\nOther imported text:\n\n{EXPORTED_OTHER_TEXT}\n**Verification:** Confirmed by run_02",
             original.references
         )
     );
     // rupu fills in an artifact's hash, size and storage when it is written.
     let paths: Vec<&str> = r.artifacts.iter().map(|a| a.path.as_str()).collect();
     assert_eq!(paths, ["out/access.log"]);
-    // Verification is a claim about a run in the exporting installation.
+    // Verification is a claim about a run in the exporting installation: it
+    // is kept as text (above), not as a typed verification.
     assert!(r.verification.is_none());
     assert_valid(&r, &[ID2]);
+}
+
+fn other_text(r: &rupu_coverage::FindingReport) -> &str {
+    r.references
+        .split_once("Other imported text:\n\n")
+        .map_or("", |(_, o)| o)
+}
+
+// ---- fix round 1 -----------------------------------------------------------
+
+#[test]
+fn a_clean_report_keeps_no_other_text_but_its_identifier() {
+    let (r, _) = report_of(&PLAIN.replace("Identifier: NB-001\n", ""));
+    assert!(
+        !r.references.contains("Other imported text:"),
+        "{}",
+        r.references
+    );
+    // The legacy identifier has no report field and is kept; the file name
+    // and the finding id are not.
+    let (r, _) = report_of(PLAIN);
+    assert_eq!(other_text(&r), "Header:\n\nIdentifier: NB-001");
+}
+
+#[test]
+fn unknown_header_lines_are_kept() {
+    let md = PLAIN.replace(
+        "Identifier: NB-001\n",
+        "Identifier: NB-001\nStatus: Open, reported to vendor 2024-05-01\n\nOne user's notes are readable by every other user.\n",
+    );
+    let (r, _) = report_of(&md);
+    let other = other_text(&r);
+    assert!(
+        other.contains("Status: Open, reported to vendor 2024-05-01"),
+        "{other}"
+    );
+    assert!(
+        other.contains("One user's notes are readable by every other user."),
+        "{other}"
+    );
+}
+
+#[test]
+fn a_field_continued_on_the_next_line_keeps_its_continuation() {
+    let md = PLAIN.replace(
+        "Attack Vector: Authenticated HTTP request with another user's note id",
+        "Attack Vector: Authenticated HTTP request\n  with another user's note id",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.attack_vector,
+        "Authenticated HTTP request with another user's note id"
+    );
+}
+
+#[test]
+fn a_code_block_in_the_header_is_kept_verbatim() {
+    let md = PLAIN.replace(
+        "Identifier: NB-001\n",
+        "Identifier: NB-001\n```\nGET /api/notes/7 -> 200\n```\n",
+    );
+    let (r, _) = report_of(&md);
+    assert!(
+        other_text(&r).contains("```\nGET /api/notes/7 -> 200\n```"),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn an_unknown_section_before_the_first_known_one_is_kept_under_its_name() {
+    let md = MARKDOWN.replace(
+        "## Description",
+        "## Executive Summary\n\nAttackers can read shared notes forever; fix before GA.\n\n## Description",
+    );
+    let (r, _) = report_of(&md);
+    assert!(
+        other_text(&r).contains(
+            "Executive Summary:\n\nAttackers can read shared notes forever; fix before GA."
+        ),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn artifacts_prose_is_kept() {
+    let md = format!(
+        "{PLAIN}\nArtifacts\nThe capture was taken on the staging box at 10:02.\n\n- out/capture.pcap\n"
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.artifacts.len(), 1);
+    assert_eq!(r.artifacts[0].path, "out/capture.pcap");
+    assert!(
+        other_text(&r).contains("Artifacts:\n\nThe capture was taken on the staging box at 10:02."),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn provenance_text_is_kept_but_not_the_finding_id() {
+    let md = format!(
+        "{MARKDOWN}\n## Provenance\n\nFinding ID: {ID2}\n\nFound during the Q2 manual review by the red team.\n"
+    );
+    let (r, _) = report_of(&md);
+    let other = other_text(&r);
+    assert!(
+        other.contains("Provenance:\n\nFound during the Q2 manual review by the red team."),
+        "{other}"
+    );
+    assert!(!other.contains("Finding ID"), "{other}");
+}
+
+#[test]
+fn unused_structured_ticket_lines_are_kept() {
+    let md = MARKDOWN.replace(
+        "  Notes: Product team tracking remediation\n",
+        "  Notes: Product team tracking remediation\n  Status: Won't fix until 3.0\n",
+    );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(t) = &r.tickets else {
+        panic!("{:?}", r.tickets)
+    };
+    assert_eq!(t.len(), 1);
+    assert!(
+        other_text(&r).contains("Ticket references:\n\nStatus: Won't fix until 3.0"),
+        "{}",
+        r.references
+    );
+}
+
+#[test]
+fn rating_qualifiers_are_kept() {
+    let md = PLAIN
+        .replace(
+            "Impact: High",
+            "Impact: High — only for tenants with sharing enabled",
+        )
+        .replace("Risk Factor: High", "Risk Factor: High (see appendix B)");
+    let (r, _) = report_of(&md);
+    assert_eq!(r.rating.impact, RiskLevel::High);
+    assert_eq!(r.rating.risk_factor, RiskLevel::High);
+    let other = other_text(&r);
+    assert!(
+        other.contains("Impact rating:\n\n— only for tenants with sharing enabled"),
+        "{other}"
+    );
+    assert!(
+        other.contains("Risk Factor:\n\n(see appendix B)"),
+        "{other}"
+    );
+}
+
+#[test]
+fn identifier_and_severity_are_kept() {
+    let md = PLAIN.replace("Owner: Unknown\n", "Owner: Unknown\nSeverity: Critical\n");
+    let (r, _) = report_of(&md);
+    let other = other_text(&r);
+    assert!(other.contains("Identifier: NB-001"), "{other}");
+    assert!(other.contains("Severity: Critical"), "{other}");
+}
+
+#[test]
+fn a_byte_order_mark_is_ignored() {
+    let (r, cited) = report_of(&format!("\u{feff}{PLAIN}"));
+    assert_eq!(r.title, "Notes API returns another user's note by id");
+    assert_eq!(cited, vec![ID1.to_string()]);
+    let (r, _) = report_of(&format!(
+        "\u{feff}{}",
+        MARKDOWN.replace("Filename: NB-002 - Share links never expire.pdf\n\n", "")
+    ));
+    assert_eq!(r.title, "Share links never expire");
+}
+
+#[test]
+fn sentinel_spellings_are_sentinels() {
+    let (r, _) = report_of(&PLAIN.replace(
+        "Existing Ticket References: None Provided",
+        "Existing Ticket References: N/A",
+    ));
+    assert_eq!(r.tickets, OrSentinel::Sentinel("None Provided".into()));
+    let (r, _) = report_of(&PLAIN.replace(
+        "Existing Ticket References: None Provided",
+        "Existing Ticket References: _TBD_",
+    ));
+    assert_eq!(r.tickets, OrSentinel::Sentinel("Unknown".into()));
+
+    let ci_start = PLAIN.find("CI/CD Detection\n").unwrap();
+    let ci_end = PLAIN.find("Regression Test\n").unwrap();
+    let md = format!(
+        "{}CI/CD Detection\nNone\n\n{}",
+        &PLAIN[..ci_start],
+        &PLAIN[ci_end..]
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.ci_cd_detection,
+        OrSentinel::Sentinel("Not Provided — None".into())
+    );
+
+    let chain_start = PLAIN.find("Call Chain / Attack Flow\n").unwrap();
+    let chain_end = PLAIN.find("Evidence\n").unwrap();
+    let md = format!(
+        "{}Call Chain / Attack Flow\n**N/A**\n\n{}",
+        &PLAIN[..chain_start],
+        &PLAIN[chain_end..]
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.call_chain,
+        OrSentinel::Sentinel("Not Provided — N/A".into())
+    );
+
+    let rt_start = PLAIN.find("Regression Test\n").unwrap();
+    let rt_end = PLAIN.find("Cross-References\n").unwrap();
+    let md = format!(
+        "{}Regression Test\nNot provided.\n\n{}",
+        &PLAIN[..rt_start],
+        &PLAIN[rt_end..]
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.regression_test,
+        OrSentinel::Sentinel("Not Provided — not given in the imported report".into())
+    );
+    assert_valid(&r, &[]);
+}
+
+#[test]
+fn an_authors_full_hash_stays_in_the_claim() {
+    let hash = "a".repeat(64);
+    let md = MARKDOWN.replace(
+        "- Verification never compares a time (`src/share/token.rs:30-41`).",
+        &format!(
+            "- Verification never compares a time (`src/share/token.rs:30-41`) (sha256 {hash})"
+        ),
+    );
+    let (r, _) = report_of(&md);
+    assert!(
+        r.evidence[1].claim.contains(&hash),
+        "{}",
+        r.evidence[1].claim
+    );
+}
+
+#[test]
+fn an_optional_section_one_level_off_is_still_read() {
+    let (r, _) = report_of(&MARKDOWN.replace("## Recommended Patch", "### Recommended Patch"));
+    let OrSentinel::Value(p) = &r.recommended_patch else {
+        panic!("{:?}", r.recommended_patch)
+    };
+    assert!(p.diff.contains("check_exp"));
+    assert!(!r.remediation.contains("```"), "{}", r.remediation);
+}
+
+#[test]
+fn an_indented_code_line_is_not_a_heading() {
+    let md = MARKDOWN.replace(
+        "so a link keeps working after the owner stops sharing the note.",
+        "so a link keeps working after the owner stops sharing the note.\n\nExample:\n\n    ## Remediation\n    body",
+    );
+    let (r, _) = report_of(&md);
+    assert!(
+        r.description.contains("    ## Remediation\n    body"),
+        "{}",
+        r.description
+    );
+    assert!(
+        r.remediation.starts_with("Add an `exp` claim"),
+        "{}",
+        r.remediation
+    );
+}
+
+#[test]
+fn headings_may_close_with_hashes() {
+    let closed: String = MARKDOWN
+        .lines()
+        .map(|l| {
+            if l.starts_with("## ") {
+                format!("{l} ##\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    assert_eq!(report_of(&closed), report_of(MARKDOWN));
+}
+
+#[test]
+fn a_rule_is_never_a_claim_or_part_of_a_step() {
+    let md = MARKDOWN.replace(
+        "- The token claims have no expiry (`src/share/token.rs:5-9`).\n",
+        "- The token claims have no expiry (`src/share/token.rs:5-9`).\n\n---\n\n",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.evidence.len(), 3);
+    assert!(r.evidence.iter().all(|c| c.claim != "---"));
+    let (r, _) = report_of(&PLAIN.replace(
+        "Step 2: Sign up as user B.\n",
+        "Step 2: Sign up as user B.\n\n---\n\n",
+    ));
+    assert_eq!(r.replication_steps[1], "Sign up as user B.");
+}
+
+#[test]
+fn a_step_marker_alone_on_its_line_takes_the_next_line() {
+    let (r, _) =
+        report_of(&PLAIN.replace("Step 1: Sign up as user A", "Step 1:\nSign up as user A"));
+    assert_eq!(
+        r.replication_steps[0],
+        "Sign up as user A and create a note; record its id."
+    );
+    assert_eq!(r.replication_steps.len(), 3);
+
+    let (r, _) = report_of(&MARKDOWN.replace(
+        "Step 1: `GET /s/{token}` route",
+        "Step 1:\n`GET /s/{token}` route",
+    ));
+    let OrSentinel::Value(hops) = &r.call_chain else {
+        panic!()
+    };
+    assert_eq!(hops.len(), 3);
+    assert!(
+        hops[0].label.starts_with("`GET /s/{token}`"),
+        "{}",
+        hops[0].label
+    );
+    assert_eq!(hops[0].role, HopRole::Source);
+    assert_eq!(hops[0].file.as_deref(), Some("src/app.rs"));
+}
+
+#[test]
+fn two_findings_in_different_layouts_are_detected_without_file_names() {
+    let plain = PLAIN.split_once('\n').unwrap().1;
+    let markdown = MARKDOWN.split_once('\n').unwrap().1;
+    let md = format!("{plain}\n---\n\n{markdown}");
+    assert_eq!(
+        parse_report(&md).unwrap_err(),
+        ImportError::SeveralFindings(2)
+    );
+}
+
+#[test]
+fn a_prose_filename_line_is_not_a_second_finding() {
+    let md = PLAIN.replace(
+        "by iterating ids.\n",
+        "by iterating ids.\nFilename: notes.txt is ignored by the handler.\n",
+    );
+    let (r, _) = report_of(&md);
+    assert!(r.impact.contains("Filename: notes.txt"), "{}", r.impact);
+}
+
+#[test]
+fn a_self_reference_stays_until_the_caller_drops_it() {
+    let md = MARKDOWN
+        .replace(
+            "- NB-007 covers link revocation.",
+            &format!("- {ID2} duplicates an older write-up."),
+        )
+        .replace(
+            "the owner stops sharing the note.",
+            &format!("the owner stops sharing the note. See {ID1}."),
+        );
+    let (mut r, cited) = report_of(&md);
+    assert_eq!(cited, vec![ID2.to_string(), ID1.to_string()]);
+    let OrSentinel::Value(x) = &r.cross_references else {
+        panic!("{:?}", r.cross_references)
+    };
+    let ids: Vec<&str> = x.iter().map(|c| c.finding_id.as_str()).collect();
+    assert_eq!(ids, [ID1, ID2]);
+    // The caller passes the ledger's ids minus the report's own.
+    retain_known_cross_references(&mut r, &HashSet::from([ID1.to_string()]));
+    let OrSentinel::Value(x) = &r.cross_references else {
+        panic!("{:?}", r.cross_references)
+    };
+    assert_eq!(x.len(), 1);
+    assert_eq!(x[0].finding_id, ID1);
+    assert_valid(&r, &[ID1]);
+}
+
+#[test]
+fn a_code_span_that_is_not_a_place_stays_text() {
+    let md = MARKDOWN
+        .replace(
+            "Step 1: `GET /s/{token}` route (`src/app.rs:44-46`)",
+            "Step 1: **Route** — `GET /s/{token}` — role: source",
+        )
+        .replace(
+            "- The token claims have no expiry (`src/share/token.rs:5-9`).",
+            "**`GET /s/{token}`** — returns the note to anyone holding the link.",
+        );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(hops) = &r.call_chain else {
+        panic!()
+    };
+    assert_eq!(hops[0].file, None);
+    assert!(
+        hops[0].label.contains("`GET /s/{token}`"),
+        "{}",
+        hops[0].label
+    );
+    assert_eq!(hops[0].role, HopRole::Source);
+    assert_eq!(r.evidence[0].file, None);
+    assert!(
+        r.evidence[0].claim.contains("GET /s/{token}"),
+        "{}",
+        r.evidence[0].claim
+    );
+}
+
+// ---- deviations from the brief's parser ------------------------------------
+
+#[test]
+fn multibyte_text_at_a_marker_boundary_does_not_panic() {
+    // Byte 5 (`Step `) and byte 12 (`Not provided`) fall inside a character.
+    let md = PLAIN.replace(
+        "Step 2: Sign up as user B.\n",
+        "Step 2: Sign up as user B.\n日本語のメモを確認する。\n",
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(
+        r.replication_steps[1],
+        "Sign up as user B.\n日本語のメモを確認する。"
+    );
+    let ci_start = PLAIN.find("CI/CD Detection\n").unwrap();
+    let ci_end = PLAIN.find("Regression Test\n").unwrap();
+    let md = format!(
+        "{}CI/CD Detection\nCI: 日本語のテストで検出する。\n\n{}",
+        &PLAIN[..ci_start],
+        &PLAIN[ci_end..]
+    );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(ci) = &r.ci_cd_detection else {
+        panic!()
+    };
+    assert_eq!(ci.body, "CI: 日本語のテストで検出する。");
+}
+
+#[test]
+fn only_references_gives_up_its_rating_lines() {
+    let md = PLAIN.replace(
+        "by iterating ids.\n",
+        "by iterating ids.\nRisk Factor: Medium once sharing ships.\n",
+    );
+    let (r, _) = report_of(&md);
+    assert!(
+        r.impact.contains("Risk Factor: Medium once sharing ships."),
+        "{}",
+        r.impact
+    );
+    assert_eq!(r.rating.risk_factor, RiskLevel::High);
+}
+
+#[test]
+fn an_escaped_pipe_in_an_artifact_path_is_part_of_it() {
+    let md = format!(
+        "{PLAIN}\nArtifacts\n| Path | Notes |\n| --- | --- |\n| out/a\\|b.log | capture |\n"
+    );
+    let (r, _) = report_of(&md);
+    assert_eq!(r.artifacts[0].path, "out/a|b.log");
+}
+
+#[test]
+fn a_backtick_line_with_backticks_after_it_is_inline_code() {
+    let md = PLAIN.replace(
+        "The get_note handler loads",
+        "```get_note``` is inline code.\nThe get_note handler loads",
+    );
+    let (r, _) = report_of(&md);
+    assert!(
+        r.description.starts_with("```get_note``` is inline code."),
+        "{}",
+        r.description
+    );
+    assert!(
+        r.remediation.starts_with("Scope the lookup"),
+        "{}",
+        r.remediation
+    );
+}
+
+#[test]
+fn an_id_glued_to_a_trailing_underscore_is_not_an_id() {
+    assert!(fnd_ids(&format!("{ID1}_suffix")).is_empty());
+}
+
+#[test]
+fn a_binary_and_its_address_are_read_together() {
+    let md = PLAIN.replace(
+        "→ NoteStore::find_by_id() (src/store/notes.rs:88-97)",
+        "→ lookup in libnotes.so@0x4010a0",
+    );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(hops) = &r.call_chain else {
+        panic!()
+    };
+    assert_eq!(hops[2].binary_va.as_deref(), Some("libnotes.so@0x4010a0"));
+}
+
+#[test]
+fn the_exporters_no_evidence_note_is_no_evidence() {
+    let start = PLAIN.find("Evidence\n").unwrap();
+    let end = PLAIN.find("Remediation\n").unwrap();
+    let md = format!(
+        "{}Evidence\n_No evidence recorded._\n\n{}",
+        &PLAIN[..start],
+        &PLAIN[end..]
+    );
+    assert_eq!(
+        parse_report(&md).unwrap_err(),
+        ImportError::MissingSection("Evidence")
+    );
+}
+
+#[test]
+fn the_exporters_labels_and_last_command_block_win() {
+    let md = MARKDOWN
+        .replace(
+            "**Fails when:** an expired token verifies",
+            "Expected: 404 from the share route.\n\n**Fails when:** an expired token verifies",
+        )
+        .replace(
+            "`share_expiry::expired_link_is_rejected` mints a token that expired an hour ago.\n",
+            "`share_expiry::expired_link_is_rejected` mints a token that expired an hour ago.\n\n```sh\ncargo build --tests\n```\n",
+        );
+    let (r, _) = report_of(&md);
+    let OrSentinel::Value(ci) = &r.ci_cd_detection else {
+        panic!()
+    };
+    assert_eq!(ci.expect, "an expired token verifies");
+    assert!(
+        ci.body.contains("Expected: 404 from the share route."),
+        "{}",
+        ci.body
+    );
+    let OrSentinel::Value(rt) = &r.regression_test else {
+        panic!()
+    };
+    assert_eq!(
+        rt.command,
+        "cargo test --test share_expiry expired_link_is_rejected"
+    );
+    assert!(rt.body.contains("cargo build --tests"), "{}", rt.body);
 }
