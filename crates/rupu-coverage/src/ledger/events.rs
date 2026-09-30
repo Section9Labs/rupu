@@ -236,6 +236,13 @@ pub struct FindingRecord {
     pub evidence: FindingEvidence,
     pub declared_by: Attribution,
     pub declared_at: DateTime<Utc>,
+    /// Contract this finding was recorded under. Absent on ledger lines that
+    /// predate profiles, which were all summary records.
+    #[serde(default = "crate::report::FindingProfile::legacy")]
+    pub profile: crate::report::FindingProfile,
+    /// The full report. `Some` exactly when `profile` is `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<crate::report::FindingReport>,
 }
 
 #[cfg(test)]
@@ -329,9 +336,50 @@ mod tests {
             },
             declared_by: attribution(),
             declared_at: Utc::now(),
+            profile: crate::report::FindingProfile::Summary,
+            report: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let decoded: FindingRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, decoded);
+    }
+
+    #[test]
+    fn legacy_finding_line_deserializes_as_summary_without_report() {
+        let line = r#"{"id":"fnd_1","scope":"repo","summary":"s","severity":"high",
+            "evidence":{"rationale":"r"},
+            "declared_by":{"run_id":"run_1","model":"m","surface":"workflow"},
+            "declared_at":"2026-09-01T00:00:00Z"}"#;
+        let rec: FindingRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(rec.profile, crate::report::FindingProfile::Summary);
+        assert!(rec.report.is_none());
+    }
+
+    #[test]
+    fn full_record_round_trips_with_its_report() {
+        let fixture = include_str!("../../tests/fixtures/finding_report/valid_full.json");
+        let report: crate::report::FindingReport = serde_json::from_str(fixture).unwrap();
+        let rec = FindingRecord {
+            id: "fnd_2".into(),
+            file_path: None,
+            line_range: None,
+            target_ref: None,
+            scope: FindingScope::Repo,
+            summary: report.title.clone(),
+            severity: crate::catalog::types::Severity::Critical,
+            concern_id: None,
+            evidence: FindingEvidence {
+                code_excerpt: None,
+                rationale: report.root_cause.clone(),
+                references: vec![],
+            },
+            declared_by: attribution(),
+            declared_at: Utc::now(),
+            profile: crate::report::FindingProfile::Full,
+            report: Some(report),
+        };
+        let back: FindingRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(back, rec);
     }
 }

@@ -1,0 +1,46 @@
+{
+  "title": "Notes API returns another user's note by id",
+  "ownership": {
+    "owner": "Unknown",
+    "product": "Notebin (sample app)",
+    "affected_component": "GET /api/notes/{id} handler",
+    "source_repository": "example/notebin"
+  },
+  "tickets": "None Provided",
+  "rating": {
+    "impact": "High",
+    "likelihood": "High",
+    "risk_rating": "Critical",
+    "risk_factor": "High",
+    "cvss_v3": "Unknown"
+  },
+  "category": "Authorization Bypass Through User-Controlled Key",
+  "attack_vector": "Authenticated HTTP request with another user's note id",
+  "cwe": ["CWE-639", "CWE-862"],
+  "description": "The `get_note` handler loads a note by the `id` path parameter and returns it without checking that the note belongs to the signed-in user.",
+  "impact": "Any signed-in user can read every other user's notes by iterating ids.",
+  "location": {
+    "input": "`GET /api/notes/{id}` path parameter `id`.",
+    "output": "The JSON body of the note, including `title` and `body`."
+  },
+  "root_cause": "`NoteStore::find_by_id` is called with only the note id; the owner id from the session is never part of the lookup.",
+  "call_chain": [
+    { "label": "router: GET /api/notes/{id}", "file": "src/app.rs", "lines": [12, 30], "gate": "session cookie", "passes_because": "any signed-in user has one", "role": "source" },
+    { "label": "get_note()", "file": "src/routes/notes.rs", "lines": [40, 58], "role": "hop" },
+    { "label": "NoteStore::find_by_id()", "file": "src/store/notes.rs", "lines": [88, 97], "role": "sink" }
+  ],
+  "evidence": [
+    { "claim": "The handler looks the note up by id alone.", "file": "src/routes/notes.rs", "lines": [40, 58], "excerpt": "let note = store.find_by_id(id).await?;\nOk(Json(note))", "lang": "rust" }
+  ],
+  "remediation": "Scope the lookup to the session user and return 404 when the note belongs to someone else.",
+  "recommended_patch": { "diff": "--- a/src/routes/notes.rs\n+++ b/src/routes/notes.rs\n@@\n-    let note = store.find_by_id(id).await?;\n+    let note = store.find_by_id_for_owner(id, session.user_id).await?;\n" },
+  "ci_cd_detection": { "stage": "pre-merge", "body": "Integration test: user B requests user A's note and must get 404.", "command": "cargo test --test notes_access", "expect": "test fails when the response is 200" },
+  "regression_test": { "body": "`notes_access::other_users_note_is_404` creates two users and one note.", "command": "cargo test --test notes_access other_users_note_is_404", "expect_vulnerable": "fails: got 200", "expect_patched": "passes: got 404" },
+  "replication_steps": [
+    "Sign up as user A and create a note; record its id.",
+    "Sign up as user B.",
+    "As user B, request `GET /api/notes/{id}` with user A's note id."
+  ],
+  "cross_references": "None",
+  "references": "CWE-639; CWE-862; OWASP A01:2021 Broken Access Control"
+}

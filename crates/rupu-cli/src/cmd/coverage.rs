@@ -1971,6 +1971,8 @@ mod tests {
                 surface: rupu_coverage::Surface::Agent,
             },
             declared_at: Utc::now(),
+            profile: rupu_coverage::FindingProfile::Summary,
+            report: None,
         }
     }
 

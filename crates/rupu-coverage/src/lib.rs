@@ -7,6 +7,7 @@ pub mod audit;
 pub mod catalog;
 pub mod diff;
 pub mod ledger;
+pub mod report;
 pub mod rerun;
 pub mod tool_mappings;
 pub mod tools;
@@ -43,4 +44,5 @@ pub use ledger::{
     Surface,
 };
 pub use rerun::{plan_rerun, RerunError, RerunInvocation};
+pub use report::{FindingProfile, FindingReport};
 pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};

@@ -63,6 +63,8 @@ pub fn report_finding(
         evidence: input.evidence,
         declared_by: attribution,
         declared_at: Utc::now(),
+        profile: crate::report::FindingProfile::Summary,
+        report: None,
     };
     paths.ensure_dir()?;
     use std::io::Write;
