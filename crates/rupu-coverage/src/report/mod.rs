@@ -6,12 +6,16 @@
 //! exactly once. Design: docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md
 
 pub mod artifacts;
+pub mod guidance;
+pub mod options;
 pub mod profile;
 pub mod schema;
 pub mod types;
 pub mod validate;
 
 pub use artifacts::{ArtifactError, ArtifactStore};
+pub use guidance::guidance;
+pub use options::{FindingWriteOptions, DEFAULT_ARTIFACT_MAX_BYTES, DEFAULT_REPORT_MAX_BYTES};
 pub use profile::FindingProfile;
 pub use types::*;
 pub use validate::{validate_report, FieldError, ReportValidationError, ValidateCtx};

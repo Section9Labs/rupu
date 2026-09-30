@@ -18,11 +18,18 @@ pub struct ReportFindingInput {
     #[serde(default)]
     pub target_ref: Option<String>,
     pub scope: FindingScope,
-    pub summary: String,
-    pub severity: Severity,
+    /// Required under the summary profile; derived from `report` under full.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub severity: Option<Severity>,
     #[serde(default)]
     pub concern_id: Option<String>,
-    pub evidence: FindingEvidence,
+    #[serde(default)]
+    pub evidence: Option<FindingEvidence>,
+    /// The full report. Required under the full profile; refused under summary.
+    #[serde(default)]
+    pub report: Option<crate::report::FindingReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,14 +49,87 @@ pub enum ReportFindingError {
         needs: &'static str,
         got: &'static str,
     },
+    #[error("`{0}` is required under the summary findings profile")]
+    MissingField(&'static str),
+    #[error("this step records findings under the full profile: `report` is required (see the report_finding tool schema)")]
+    ReportRequired,
+    #[error("this step records findings under the summary profile: omit `report`, or have the workflow author set findings_profile: full")]
+    ReportInSummaryMode,
+    #[error("under the full findings profile `summary`, `severity` and `evidence` are derived from `report`; omit them")]
+    DerivedFieldsSupplied,
+    #[error("{0}")]
+    Report(#[from] crate::report::ReportValidationError),
+    #[error("{0}")]
+    Artifact(#[from] crate::report::ArtifactError),
 }
 
 pub fn report_finding(
     paths: &CoveragePaths,
     attribution: Attribution,
     input: ReportFindingInput,
+    opts: &crate::report::FindingWriteOptions,
 ) -> Result<ReportFindingOutput, ReportFindingError> {
+    use crate::report::{FindingProfile, ValidateCtx};
+
     validate_locator(&input)?;
+    let (summary, severity, evidence, report) = match opts.profile {
+        FindingProfile::Summary => {
+            if input.report.is_some() {
+                return Err(ReportFindingError::ReportInSummaryMode);
+            }
+            (
+                input
+                    .summary
+                    .ok_or(ReportFindingError::MissingField("summary"))?,
+                input
+                    .severity
+                    .ok_or(ReportFindingError::MissingField("severity"))?,
+                input
+                    .evidence
+                    .ok_or(ReportFindingError::MissingField("evidence"))?,
+                None,
+            )
+        }
+        FindingProfile::Full => {
+            if input.summary.is_some() || input.severity.is_some() || input.evidence.is_some() {
+                return Err(ReportFindingError::DerivedFieldsSupplied);
+            }
+            let mut report = input.report.ok_or(ReportFindingError::ReportRequired)?;
+            let known: Vec<String> = crate::ledger::read_findings(paths)?
+                .into_iter()
+                .map(|f| f.id)
+                .collect();
+            crate::report::validate_report(
+                &report,
+                &ValidateCtx {
+                    known_finding_ids: &known,
+                    max_bytes: opts.report_max_bytes,
+                },
+            )?;
+            if !report.artifacts.is_empty() {
+                let store = opts
+                    .artifact_root
+                    .as_ref()
+                    .map(crate::report::ArtifactStore::new)
+                    .ok_or(crate::report::ArtifactError::NoStore)?;
+                report.artifacts =
+                    store.ingest(&paths.workspace, &report.artifacts, opts.artifact_max_bytes)?;
+            }
+            hash_claim_files(&paths.workspace, &mut report);
+            let evidence = FindingEvidence {
+                code_excerpt: report.evidence.iter().find_map(|c| c.excerpt.clone()),
+                rationale: report.root_cause.clone(),
+                references: Vec::new(),
+            };
+            (
+                report.title.clone(),
+                Severity::from(report.rating.risk_rating),
+                evidence,
+                Some(report),
+            )
+        }
+    };
+
     let id = format!("fnd_{}", Ulid::new());
     let record = FindingRecord {
         id: id.clone(),
@@ -57,14 +137,14 @@ pub fn report_finding(
         line_range: input.line_range,
         target_ref: input.target_ref,
         scope: input.scope,
-        summary: input.summary,
-        severity: input.severity,
+        summary,
+        severity,
         concern_id: input.concern_id,
-        evidence: input.evidence,
+        evidence,
         declared_by: attribution,
         declared_at: Utc::now(),
-        profile: crate::report::FindingProfile::Summary,
-        report: None,
+        profile: opts.profile,
+        report,
     };
     paths.ensure_dir()?;
     use std::io::Write;
@@ -77,6 +157,23 @@ pub fn report_finding(
     f.write_all(b"\n")?;
     f.flush()?;
     Ok(ReportFindingOutput { id })
+}
+
+/// Record the SHA-256 of each evidence claim's file as it is right now, so a
+/// viewer can later flag a claim whose code has changed. Claims whose file
+/// is not in the workspace (binary targets, other trees) keep whatever the
+/// agent supplied.
+fn hash_claim_files(workspace: &std::path::Path, report: &mut crate::report::FindingReport) {
+    for claim in &mut report.evidence {
+        if let Some(file) = &claim.file {
+            let abs = workspace.join(file);
+            if abs.is_file() {
+                if let Ok(h) = crate::report::artifacts::sha256_file(&abs) {
+                    claim.sha256 = Some(h);
+                }
+            }
+        }
+    }
 }
 
 /// A scope must actually point at something.
@@ -144,14 +241,15 @@ mod tests {
             line_range: None,
             target_ref: None,
             scope,
-            summary: "s".to_string(),
-            severity: Severity::Medium,
+            summary: Some("s".to_string()),
+            severity: Some(Severity::Medium),
             concern_id: None,
-            evidence: FindingEvidence {
+            evidence: Some(FindingEvidence {
                 code_excerpt: None,
                 rationale: "r".to_string(),
                 references: vec![],
-            },
+            }),
+            report: None,
         }
     }
 
@@ -164,7 +262,7 @@ mod tests {
             FindingScope::Endpoint,
             FindingScope::Resource,
         ] {
-            let err = report_finding(&paths, attribution(), input(scope))
+            let err = report_finding(&paths, attribution(), input(scope), &summary_opts())
                 .expect_err("a target scope with no target_ref must be refused");
             assert!(
                 matches!(err, ReportFindingError::Locator { .. }),
@@ -182,7 +280,7 @@ mod tests {
         let mut i = input(FindingScope::Host);
         i.target_ref = Some("   ".to_string());
         assert!(matches!(
-            report_finding(&paths, attribution(), i),
+            report_finding(&paths, attribution(), i, &summary_opts()),
             Err(ReportFindingError::Locator { .. })
         ));
     }
@@ -193,7 +291,7 @@ mod tests {
         let paths = CoveragePaths::new(tmp.path(), "t");
         let mut i = input(FindingScope::Host);
         i.target_ref = Some("identity.us-westjordan-1.example".to_string());
-        report_finding(&paths, attribution(), i).expect("should record");
+        report_finding(&paths, attribution(), i, &summary_opts()).expect("should record");
         let text = std::fs::read_to_string(&paths.findings).unwrap();
         let rec: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(rec["scope"], "host");
@@ -207,19 +305,29 @@ mod tests {
         let paths = CoveragePaths::new(tmp.path(), "t");
         // file: no file_path
         assert!(matches!(
-            report_finding(&paths, attribution(), input(FindingScope::File)),
+            report_finding(
+                &paths,
+                attribution(),
+                input(FindingScope::File),
+                &summary_opts()
+            ),
             Err(ReportFindingError::Locator { .. })
         ));
         // line: file_path but no line_range
         let mut i = input(FindingScope::Line);
         i.file_path = Some("src/a.rs".to_string());
         assert!(matches!(
-            report_finding(&paths, attribution(), i),
+            report_finding(&paths, attribution(), i, &summary_opts()),
             Err(ReportFindingError::Locator { .. })
         ));
         // repo: locates nothing, needs nothing
-        report_finding(&paths, attribution(), input(FindingScope::Repo))
-            .expect("repo scope needs no locator");
+        report_finding(
+            &paths,
+            attribution(),
+            input(FindingScope::Repo),
+            &summary_opts(),
+        )
+        .expect("repo scope needs no locator");
     }
 
     #[test]
@@ -245,15 +353,17 @@ mod tests {
                 line_range: Some([20, 28]),
                 target_ref: None,
                 scope: FindingScope::Line,
-                summary: "Hardcoded API key.".to_string(),
-                severity: Severity::High,
+                summary: Some("Hardcoded API key.".to_string()),
+                severity: Some(Severity::High),
                 concern_id: Some("secrets-in-source".to_string()),
-                evidence: FindingEvidence {
+                evidence: Some(FindingEvidence {
                     code_excerpt: Some("const X = \"...\";".to_string()),
                     rationale: "Key in source.".to_string(),
                     references: vec![],
-                },
+                }),
+                report: None,
             },
+            &summary_opts(),
         )
         .unwrap();
         assert!(out.id.starts_with("fnd_"));
@@ -273,15 +383,17 @@ mod tests {
                 line_range: None,
                 target_ref: None,
                 scope: FindingScope::Repo,
-                summary: "Spotted while looking for something else.".to_string(),
-                severity: Severity::Low,
+                summary: Some("Spotted while looking for something else.".to_string()),
+                severity: Some(Severity::Low),
                 concern_id: None,
-                evidence: FindingEvidence {
+                evidence: Some(FindingEvidence {
                     code_excerpt: None,
                     rationale: "ad-hoc".to_string(),
                     references: vec![],
-                },
+                }),
+                report: None,
             },
+            &summary_opts(),
         )
         .unwrap();
         assert!(out.id.starts_with("fnd_"));
@@ -306,5 +418,204 @@ mod tests {
                 "scope {json_str:?} should round-trip cleanly"
             );
         }
+    }
+
+    fn summary_opts() -> crate::report::FindingWriteOptions {
+        crate::report::FindingWriteOptions::default()
+            .with_profile(crate::report::FindingProfile::Summary)
+    }
+
+    fn full_opts(store: &std::path::Path) -> crate::report::FindingWriteOptions {
+        crate::report::FindingWriteOptions {
+            artifact_root: Some(store.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    fn fixture_report() -> crate::report::FindingReport {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap()
+    }
+
+    fn full_input(report: crate::report::FindingReport) -> ReportFindingInput {
+        ReportFindingInput {
+            file_path: None,
+            line_range: None,
+            target_ref: None,
+            scope: FindingScope::Repo,
+            summary: None,
+            severity: None,
+            concern_id: None,
+            evidence: None,
+            report: Some(report),
+        }
+    }
+
+    fn only_record(paths: &CoveragePaths) -> FindingRecord {
+        let text = std::fs::read_to_string(&paths.findings).unwrap();
+        serde_json::from_str(text.lines().next().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn full_profile_records_report_and_derives_top_level_fields() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        report_finding(
+            &paths,
+            attribution(),
+            full_input(fixture_report()),
+            &full_opts(store.path()),
+        )
+        .expect("valid full report records");
+        let rec = only_record(&paths);
+        assert_eq!(rec.profile, crate::report::FindingProfile::Full);
+        let report = rec.report.as_ref().unwrap();
+        assert_eq!(rec.summary, report.title);
+        assert_eq!(rec.severity, Severity::Critical);
+        assert_eq!(rec.evidence.rationale, report.root_cause);
+        assert_eq!(
+            rec.evidence.code_excerpt.as_deref(),
+            report.evidence[0].excerpt.as_deref()
+        );
+    }
+
+    #[test]
+    fn full_profile_without_report_is_rejected() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut i = full_input(fixture_report());
+        i.report = None;
+        let err = report_finding(&paths, attribution(), i, &full_opts(ws.path())).unwrap_err();
+        assert!(matches!(err, ReportFindingError::ReportRequired), "{err}");
+        assert!(!paths.findings.exists(), "nothing written on rejection");
+    }
+
+    #[test]
+    fn full_profile_rejects_derived_fields() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut i = full_input(fixture_report());
+        i.summary = Some("x".into());
+        let err = report_finding(&paths, attribution(), i, &full_opts(ws.path())).unwrap_err();
+        assert!(
+            matches!(err, ReportFindingError::DerivedFieldsSupplied),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn full_profile_surfaces_every_validation_problem() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut r = fixture_report();
+        r.root_cause = String::new();
+        r.regression_test = crate::report::OrSentinel::Sentinel("Unknown".into());
+        let err = report_finding(&paths, attribution(), full_input(r), &full_opts(ws.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report.root_cause"), "{err}");
+        assert!(err.contains("report.regression_test"), "{err}");
+        assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn summary_profile_rejects_a_report() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let err = report_finding(
+            &paths,
+            attribution(),
+            full_input(fixture_report()),
+            &summary_opts(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ReportFindingError::ReportInSummaryMode),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn full_profile_ingests_artifacts_and_hashes_claim_files() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let store = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("src/routes")).unwrap();
+        std::fs::write(
+            ws.path().join("src/routes/notes.rs"),
+            "async fn get_note() {}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.path().join("pocs")).unwrap();
+        std::fs::write(
+            ws.path().join("pocs/out.txt"),
+            "GET /api/notes/42 as user B: 200\n",
+        )
+        .unwrap();
+        let mut r = fixture_report();
+        r.artifacts = vec![crate::report::ArtifactRef {
+            path: "pocs/out.txt".into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        report_finding(
+            &paths,
+            attribution(),
+            full_input(r),
+            &full_opts(store.path()),
+        )
+        .unwrap();
+        let rec = only_record(&paths);
+        let rep = rec.report.unwrap();
+        assert_eq!(
+            rep.artifacts[0].stored,
+            Some(crate::report::ArtifactStorage::Copied)
+        );
+        assert_eq!(rep.evidence[0].sha256.as_ref().map(String::len), Some(64));
+    }
+
+    #[test]
+    fn artifacts_without_a_store_fail_loudly() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("out.txt"), "x").unwrap();
+        let mut r = fixture_report();
+        r.artifacts = vec![crate::report::ArtifactRef {
+            path: "out.txt".into(),
+            sha256: String::new(),
+            size: 0,
+            kind: None,
+            stored: None,
+            host: None,
+        }];
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let opts = crate::report::FindingWriteOptions::default(); // no artifact_root
+        let err = report_finding(&paths, attribution(), full_input(r), &opts).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReportFindingError::Artifact(crate::report::ArtifactError::NoStore)
+            ),
+            "{err}"
+        );
+        assert!(!paths.findings.exists());
+    }
+
+    #[test]
+    fn summary_profile_requires_its_three_fields() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(ws.path(), "t");
+        let mut i = input(FindingScope::Repo);
+        i.severity = None;
+        let err = report_finding(&paths, attribution(), i, &summary_opts()).unwrap_err();
+        assert!(
+            matches!(err, ReportFindingError::MissingField("severity")),
+            "{err}"
+        );
     }
 }
