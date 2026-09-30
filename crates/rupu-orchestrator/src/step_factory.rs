@@ -867,7 +867,7 @@ mod provider_build_error_stub_tests {
             model: "test-model".into(),
             system: None,
             messages: vec![],
-            max_tokens: 1,
+            max_tokens: Some(1),
             tools: vec![],
             cell_id: None,
             trace_id: None,

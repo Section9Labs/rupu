@@ -378,9 +378,10 @@ impl GoogleGeminiClient {
         }
 
         // Generation config
-        let mut gen_config = serde_json::json!({
-            "maxOutputTokens": request.max_tokens,
-        });
+        let mut gen_config = serde_json::json!({});
+        if let Some(n) = request.max_tokens {
+            gen_config["maxOutputTokens"] = serde_json::json!(n);
+        }
 
         // Thinking config. `Auto` uses Gemini's dynamic-budget sentinel
         // (`thinkingBudget: -1`); the level field is omitted in that
@@ -1089,7 +1090,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: Some("Be helpful.".into()),
             messages: vec![Message::user("Hello")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1119,6 +1120,32 @@ mod tests {
     }
 
     #[test]
+    fn unset_max_tokens_omits_max_output_tokens() {
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+
+        let mut request = LlmRequest {
+            model: "gemini-2.5-pro".into(),
+            messages: vec![Message::user("Hello")],
+            max_tokens: None,
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request);
+        assert!(body["request"]["generationConfig"]
+            .get("maxOutputTokens")
+            .is_none());
+
+        request.max_tokens = Some(2048);
+        let body = client.build_request_body(&request);
+        assert_eq!(body["request"]["generationConfig"]["maxOutputTokens"], 2048);
+    }
+
+    #[test]
     fn test_build_request_body_antigravity_user_agent() {
         let client = GoogleGeminiClient::new(
             test_creds("proj"),
@@ -1132,7 +1159,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("Hi")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1165,7 +1192,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: None,
             messages: vec![Message::user("read file")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![ToolDefinition {
                 name: "read_file".into(),
                 description: "Read a file".into(),
@@ -1206,7 +1233,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: None,
             messages: vec![Message::user("think hard")],
-            max_tokens: 16000,
+            max_tokens: Some(16000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1247,7 +1274,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             system: None,
             messages: vec![Message::user("max")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1285,7 +1312,7 @@ mod tests {
             model: "gemini-3-pro-preview".into(),
             system: None,
             messages: vec![Message::user("think hard")],
-            max_tokens: 16000,
+            max_tokens: Some(16000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1335,7 +1362,7 @@ mod tests {
                     model: model.into(),
                     system: None,
                     messages: vec![Message::user("test")],
-                    max_tokens: 4096,
+                    max_tokens: Some(4096),
                     tools: vec![],
                     cell_id: None,
                     trace_id: None,
@@ -2179,7 +2206,7 @@ mod tests {
                 model: "gemini-2.5-pro".into(),
                 system: None,
                 messages: vec![Message::user("test")],
-                max_tokens: 64000,
+                max_tokens: Some(64000),
                 tools: vec![],
                 cell_id: None,
                 trace_id: None,

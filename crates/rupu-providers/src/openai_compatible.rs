@@ -315,7 +315,7 @@ mod tests {
         let req = LlmRequest {
             model: "/raid/models/zai-org/GLM-5.2-FP8".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 2048,
+            max_tokens: Some(2048),
             tools: vec![ToolDefinition {
                 name: "read_file".into(),
                 description: "read".into(),
@@ -342,7 +342,7 @@ mod tests {
         let req = LlmRequest {
             model: "/raid/models/zai-org/GLM-5.2-FP8".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 2048,
+            max_tokens: Some(2048),
             ..Default::default()
         };
         let body = c.request_body(&req, true);

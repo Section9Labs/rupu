@@ -166,7 +166,11 @@ pub struct LlmRequest {
     pub model: String,
     pub system: Option<String>,
     pub messages: Vec<Message>,
-    pub max_tokens: u32,
+    /// Output-token cap. `None` means neither pinned nor discovered: providers
+    /// where the cap is optional omit it (the model's own max applies);
+    /// Anthropic sends `model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS`
+    /// (spec 2026-09-30 §6.3).
+    pub max_tokens: Option<u32>,
     pub tools: Vec<ToolDefinition>,
     /// Identity of the requesting cell (for cost tracking and audit).
     pub cell_id: Option<String>,

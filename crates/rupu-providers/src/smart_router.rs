@@ -508,7 +508,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("test")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,

@@ -207,7 +207,7 @@ pub async fn generate_definition(
             model: req.model.clone(),
             system: Some(system.clone()),
             messages: messages.clone(),
-            max_tokens: MAX_TOKENS,
+            max_tokens: Some(MAX_TOKENS),
             ..Default::default()
         };
         let resp = provider.send(&llm_req).await?;

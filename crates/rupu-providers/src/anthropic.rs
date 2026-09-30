@@ -1849,9 +1849,12 @@ impl AnthropicClient {
         // touched by the tool-name sanitizer's block-rewriting pass.
         restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
 
+        let max_tokens = request
+            .max_tokens
+            .unwrap_or(crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS);
         let mut body = serde_json::json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages_value,
             "stream": stream,
         });
@@ -1964,11 +1967,11 @@ impl AnthropicClient {
                         ThinkingLevel::Low => 2000,
                         ThinkingLevel::Medium => 5000,
                         ThinkingLevel::High => 10000,
-                        ThinkingLevel::Max => request.max_tokens.saturating_sub(2000),
+                        ThinkingLevel::Max => max_tokens.saturating_sub(2000),
                         ThinkingLevel::Auto => unreachable!(),
                     };
                     if raw_budget > 0 {
-                        let clamped = raw_budget.min(request.max_tokens);
+                        let clamped = raw_budget.min(max_tokens);
                         if clamped >= 1024 {
                             body["thinking"] = serde_json::json!({
                                 "type": "enabled",
@@ -2691,7 +2694,7 @@ mod tests {
                 description: "list repos".into(),
                 input_schema: serde_json::json!({"type": "object"}),
             }],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             cell_id: None,
             trace_id: None,
             thinking: None,
@@ -2778,7 +2781,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -2803,7 +2806,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hello")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -2826,13 +2829,32 @@ mod tests {
     }
 
     #[test]
+    fn unset_max_tokens_sends_the_anthropic_fallback() {
+        let client = AnthropicClient::with_url(
+            "k".into(),
+            "http://x/v1/messages".into(),
+            Arc::new(rupu_netflow::NullSink),
+        );
+        let mut req = make_request(None);
+        req.max_tokens = None;
+        let body = client.build_request_body(&req, false);
+        assert_eq!(
+            body["max_tokens"],
+            crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS
+        );
+        req.max_tokens = Some(64_000);
+        let body = client.build_request_body(&req, false);
+        assert_eq!(body["max_tokens"], 64_000);
+    }
+
+    #[test]
     fn test_build_request_body_with_system_and_tools() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: Some("You are helpful.".into()),
             messages: vec![Message::user("hello")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![ToolDefinition {
                 name: "test".into(),
                 description: "A test tool".into(),
@@ -2887,7 +2909,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: Some("cell-abc".into()),
             trace_id: None,
@@ -2923,7 +2945,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: Some("cell-abc".into()),
             trace_id: None,
@@ -2955,7 +2977,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: Some("cell-xyz".into()),
             trace_id: None,
@@ -2986,7 +3008,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3016,7 +3038,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: system.map(str::to_string),
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3086,7 +3108,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("low effort")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3115,7 +3137,7 @@ mod tests {
             model: "claude-opus-4-7".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3145,7 +3167,7 @@ mod tests {
             model: "claude-opus-4-7".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3175,7 +3197,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3214,7 +3236,7 @@ mod tests {
                     content: blocks,
                 },
             ],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3416,7 +3438,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("medium effort")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3442,7 +3464,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("think hard")],
-            max_tokens: 16000,
+            max_tokens: Some(16000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3468,7 +3490,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("quick")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3493,7 +3515,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("classify")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3518,7 +3540,7 @@ mod tests {
             model: "claude-opus-4-6".into(),
             system: None,
             messages: vec![Message::user("deep analysis")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3544,7 +3566,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("think")],
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -3574,7 +3596,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             system: None,
             messages: vec![Message::user("tiny")],
-            max_tokens: 500,
+            max_tokens: Some(500),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -4147,7 +4169,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             ..Default::default()
         };
@@ -4173,7 +4195,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             output_schema: Some(schema.clone()),
             ..Default::default()
@@ -4220,7 +4242,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_schema: Some(schema),
             ..Default::default()
         };
@@ -4296,7 +4318,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             output_schema: None,
             ..Default::default()
@@ -4316,7 +4338,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_schema: Some(schema.clone()),
             anthropic_task_budget: Some(1500),
             ..Default::default()
@@ -4335,7 +4357,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             anthropic_task_budget: Some(2048),
             ..Default::default()
         };
@@ -4349,7 +4371,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             anthropic_context_management: Some(crate::types::ContextManagement::ToolClearing),
             ..Default::default()
         };
@@ -4363,7 +4385,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             anthropic_speed: Some(crate::types::Speed::Fast),
             ..Default::default()
         };
@@ -4377,7 +4399,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             ..Default::default()
         };
         let body = client.build_request_body(&request, false);
@@ -4399,7 +4421,7 @@ mod tests {
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             anthropic_task_budget: Some(1500),
             ..Default::default()
@@ -4479,7 +4501,7 @@ mod tests {
                 Message::user("second"),
             ],
             tools: vec![cache_tool("read_file")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             ..Default::default()
         };
         let b = body_for(&client, &req);
@@ -4801,7 +4823,7 @@ mod tests {
                 },
                 Message::tool_result("toolu_r2", "", false),
             ],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             ..Default::default()
         };
         let on = body_for(&client, &req);
@@ -5007,7 +5029,7 @@ mod tests {
                 },
                 Message::tool_result("toolu_1", "ok", false),
             ],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             ..Default::default()
         };
         let on = body_for(&cached, &req);

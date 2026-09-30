@@ -91,12 +91,15 @@ impl LocalModelProvider {
             }));
         }
 
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_name,
             "messages": msgs,
-            "max_tokens": request.max_tokens,
             "stream": false
-        })
+        });
+        if let Some(n) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(n);
+        }
+        body
     }
 }
 
@@ -281,7 +284,7 @@ mod tests {
             model: "test".into(),
             system: Some("You are helpful.".into()),
             messages: vec![Message::user("Hello")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -324,7 +327,7 @@ mod tests {
                 Message::assistant("Hi there!"),
                 Message::user("How are you?"),
             ],
-            max_tokens: 200,
+            max_tokens: Some(200),
             tools: vec![],
             cell_id: None,
             trace_id: None,

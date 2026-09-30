@@ -278,7 +278,7 @@ mod tests {
             model: "m".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 16,
+            max_tokens: Some(16),
             tools: vec![],
             cell_id: None,
             trace_id: None,

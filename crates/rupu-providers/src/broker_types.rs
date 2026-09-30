@@ -43,7 +43,9 @@ impl From<&LlmRequest> for LlmRequestWire {
             model: r.model.clone(),
             system: r.system.clone(),
             messages: r.messages.clone(),
-            max_tokens: r.max_tokens,
+            max_tokens: r
+                .max_tokens
+                .unwrap_or(crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS),
             tools: r.tools.clone(),
             cell_id: r.cell_id.clone(),
             trace_id: r.trace_id.clone(),
@@ -58,7 +60,7 @@ impl From<LlmRequestWire> for LlmRequest {
             model: w.model,
             system: w.system,
             messages: w.messages,
-            max_tokens: w.max_tokens,
+            max_tokens: Some(w.max_tokens),
             tools: w.tools,
             cell_id: w.cell_id,
             trace_id: w.trace_id,
@@ -186,7 +188,7 @@ mod tests {
             model: "claude-sonnet-4-6-20250514".into(),
             system: Some("sys".into()),
             messages: vec![crate::types::Message::user("hi")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: Some("cell".into()),
             trace_id: Some("trace".into()),

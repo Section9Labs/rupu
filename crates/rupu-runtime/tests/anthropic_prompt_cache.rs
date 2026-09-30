@@ -72,7 +72,7 @@ async fn prompt_cache_resolution_reaches_the_request_body() {
         model: "claude-sonnet-4-6".into(),
         system: Some("You are a reviewer.".into()),
         messages: vec![Message::user("hi")],
-        max_tokens: 16,
+        max_tokens: Some(16),
         ..Default::default()
     };
 

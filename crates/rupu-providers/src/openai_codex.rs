@@ -519,9 +519,12 @@ impl OpenAiCodexClient {
             "parallel_tool_calls": true,
         });
 
-        // max_output_tokens is not supported by all models (e.g., gpt-5.x)
-        if !request.model.starts_with("gpt-5") {
-            body["max_output_tokens"] = serde_json::json!(request.max_tokens);
+        // max_output_tokens is not supported by all models (e.g., gpt-5.x);
+        // unset means the model's own max (spec 2026-09-30 §6.3).
+        if let Some(n) = request.max_tokens {
+            if !request.model.starts_with("gpt-5") {
+                body["max_output_tokens"] = serde_json::json!(n);
+            }
         }
 
         if let Some(system) = &request.system {
@@ -1328,7 +1331,7 @@ mod tool_name_sanitize_tests {
             model: "gpt-5".into(),
             system: None,
             messages: vec![Message::user("hi")],
-            max_tokens: 10,
+            max_tokens: Some(10),
             tools: vec![ToolDefinition {
                 name: "scm.repos.list_owned".into(),
                 description: "list owned repos".into(),
@@ -1370,7 +1373,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: Some("Be helpful.".into()),
             messages: vec![Message::user("Hello")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1406,7 +1409,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: None,
             messages: vec![Message::user("read file")],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![ToolDefinition {
                 name: "read_file".into(),
                 description: "Read a file".into(),
@@ -1445,7 +1448,7 @@ mod tests {
             model: "o3".into(),
             system: None,
             messages: vec![Message::user("think")],
-            max_tokens: 8000,
+            max_tokens: Some(8000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1477,7 +1480,7 @@ mod tests {
             model: "gpt-5.2".into(),
             system: None,
             messages: vec![Message::user("deep")],
-            max_tokens: 32000,
+            max_tokens: Some(32000),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1805,7 +1808,7 @@ mod tests {
                 Message::assistant("Hi there!"),
                 Message::user("How are you?"),
             ],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1842,7 +1845,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: None,
             messages: vec![Message::tool_result("call_abc", "file contents", false)],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1878,7 +1881,7 @@ mod tests {
             model: "gpt-4.1".into(),
             system: None,
             messages: vec![Message::tool_result("call_empty", "", false)],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -1933,7 +1936,7 @@ mod tests {
                 },
                 Message::tool_result("call_123", "file1.rs\nfile2.rs", false),
             ],
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             tools: vec![],
             cell_id: None,
             trace_id: None,
@@ -2185,7 +2188,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Json),
             ..Default::default()
         };
@@ -2208,7 +2211,7 @@ mod tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             output_format: Some(crate::types::OutputFormat::Text),
             ..Default::default()
         };
@@ -2244,7 +2247,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::High),
             ..Default::default()
         };
@@ -2271,7 +2274,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::Auto),
             ..Default::default()
         };
@@ -2293,7 +2296,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-5".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: None,
             ..Default::default()
         };
@@ -2313,7 +2316,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "o3".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::Auto),
             ..Default::default()
         };
@@ -2332,7 +2335,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-4.1".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: None,
             ..Default::default()
         };
@@ -2360,7 +2363,7 @@ mod reasoning_capture_tests {
         let request = LlmRequest {
             model: "gpt-4.1".into(),
             messages: vec![Message::user("hi")],
-            max_tokens: 100,
+            max_tokens: Some(100),
             thinking: Some(ThinkingLevel::High),
             ..Default::default()
         };
@@ -2762,9 +2765,31 @@ mod reasoning_capture_tests {
         LlmRequest {
             model: "gpt-5".into(),
             messages,
-            max_tokens: 100,
+            max_tokens: Some(100),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unset_max_tokens_omits_max_output_tokens() {
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey { key: "k".into() },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        let mut r = request_with(vec![Message::user("hi")]);
+        r.model = "o4-mini".into(); // not gated like gpt-5.x
+        r.max_tokens = None;
+        assert!(client
+            .build_request_body(&r, false)
+            .get("max_output_tokens")
+            .is_none());
+        r.max_tokens = Some(900);
+        assert_eq!(
+            client.build_request_body(&r, false)["max_output_tokens"],
+            900
+        );
     }
 
     #[test]

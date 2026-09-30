@@ -114,7 +114,7 @@ async fn the_factory_binds_the_supplied_sink_to_the_built_provider() {
         model: "mock-model".into(),
         system: None,
         messages: vec![rupu_providers::types::Message::user("hi")],
-        max_tokens: 16,
+        max_tokens: Some(16),
         tools: vec![],
         cell_id: None,
         trace_id: None,
