@@ -82,12 +82,13 @@ fn typst_error(
 }
 
 /// How many renders an unused cache entry survives (`comemo::evict`'s
-/// `max_age`). Measured on 500 distinct project reports in a release build:
-/// 10 keeps the resident set flat within a few MB after a ~50 MB warm-up,
-/// 3 sits at about +15 MB, and 0 (clear everything) is fully flat but ~30%
-/// slower per render (10 ms vs 7 ms). Raise it only for workloads that
-/// re-render near-identical documents back to back.
-const CACHE_MAX_AGE: usize = 10;
+/// `max_age`); 0 clears the whole cache after every render. Measured on 500
+/// distinct project reports in a release build: 10 leaves the resident set
+/// about 50 MB above baseline and still creeping (~7 KB per render), 3 sits at
+/// about +15 MB, and 0 is flat (~0.4 KB per render) for about 3 ms more per
+/// render (10 ms vs 7 ms). Reports rarely share work, so a long-running
+/// `cp serve` takes flat memory over the small speed-up.
+const CACHE_MAX_AGE: usize = 0;
 
 /// Evicts Typst's global memoization cache when a render ends, on success and
 /// failure alike (it is a drop guard so no early return skips it).
