@@ -40,6 +40,10 @@ type Tab = (typeof TABS)[number];
 
 const EMPTY_NOTE = 'text-ui text-ink-mute';
 
+/** `Root cause` -> `root-cause`: a valid HTML id fragment (no spaces) so the
+ *  tabpanel's `aria-labelledby` IDREF resolves. */
+const tabSlug = (t: Tab) => t.toLowerCase().replace(/\s+/g, '-');
+
 /** The tabbed report body for a full-profile finding. Rendered only once the
  *  detail (row + `report` + `evidence_status`) has loaded. */
 function ReportTabs({ detail, wsId }: { detail: FindingDetail; wsId?: string }) {
@@ -58,7 +62,7 @@ function ReportTabs({ detail, wsId }: { detail: FindingDetail; wsId?: string }) 
             key={t}
             type="button"
             role="tab"
-            id={`${baseId}-tab-${t}`}
+            id={`${baseId}-tab-${tabSlug(t)}`}
             aria-selected={tab === t}
             aria-controls={`${baseId}-panel`}
             onClick={() => setTab(t)}
@@ -75,7 +79,7 @@ function ReportTabs({ detail, wsId }: { detail: FindingDetail; wsId?: string }) 
       <div
         role="tabpanel"
         id={`${baseId}-panel`}
-        aria-labelledby={`${baseId}-tab-${tab}`}
+        aria-labelledby={`${baseId}-tab-${tabSlug(tab)}`}
         className="pt-2"
       >
         {tab === 'Root cause' && (
@@ -184,7 +188,11 @@ export default function InlineFindingCard({ finding, stale }: InlineFindingCardP
               ⚠ The code may have changed since this finding was recorded.
             </div>
           )}
-          {finding.evidence?.rationale && (
+          {/* For full-profile findings the server sets `evidence.rationale` to
+              the report's root cause, which is the default tab's content —
+              so it only stands in as the placeholder until the report has
+              loaded (or if loading fails). */}
+          {finding.evidence?.rationale && !(isFull && loaded?.report) && (
             <div className="-mx-1 [&_p]:text-[12px] [&_p]:text-ink-dim">
               <Markdown text={finding.evidence.rationale} />
             </div>

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import fixture from '../../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
 import { api, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
@@ -23,7 +23,10 @@ const FULL = {
   summary: 'IDOR on notes read',
   severity: 'high',
   profile: 'full',
-  evidence: { rationale: 'Rationale prose for the card.' },
+  // The server writes `evidence.rationale = report.root_cause` for full-profile
+  // findings, so the card's rationale block and the Root cause tab carry the
+  // same text.
+  evidence: { rationale: report.root_cause },
 } as unknown as FindingOut;
 
 const SUMMARY = {
@@ -49,6 +52,7 @@ function view(f: FindingRecord) {
 }
 
 const header = () => screen.getByRole('button', { name: /IDOR on notes read/ });
+const ROOT_CAUSE = /owner id from the session is never part/;
 
 describe('InlineFindingCard — full-profile report tabs', () => {
   it('does not fetch until the card is expanded', async () => {
@@ -65,7 +69,9 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     view(FULL);
     fireEvent.click(header());
     expect(screen.getByRole('status')).toBeInTheDocument();
-    expect(await screen.findByText(/owner id from the session is never part/)).toBeInTheDocument();
+    // The tablist only exists once the report has loaded (the stored rationale
+    // is on screen earlier as a placeholder, so it isn't a reliable signal).
+    expect(await screen.findByRole('tabpanel', { name: 'Root cause' })).toHaveTextContent(ROOT_CAUSE);
     expect(screen.queryByRole('status')).toBeNull();
     expect(screen.getByRole('tab', { name: 'Root cause' })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByRole('tablist')).toBeInTheDocument();
@@ -74,11 +80,44 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     ]);
   });
 
+  it('shows the root cause exactly once: as the placeholder while loading, then only in the tab', async () => {
+    let resolve!: (d: FindingDetail) => void;
+    vi.spyOn(api, 'getFinding').mockReturnValue(new Promise((r) => { resolve = r; }));
+    view(FULL);
+    fireEvent.click(header());
+    // Loading: the stored rationale stands in for the not-yet-loaded tab.
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.getAllByText(ROOT_CAUSE)).toHaveLength(1);
+    expect(screen.queryByRole('tablist')).toBeNull();
+    resolve(detailOf());
+    // Loaded: the rationale block is hidden; only the Root cause tab shows it.
+    await screen.findByRole('tablist');
+    expect(screen.getAllByText(ROOT_CAUSE)).toHaveLength(1);
+    expect(screen.getByRole('tabpanel')).toHaveTextContent(ROOT_CAUSE);
+  });
+
+  it('gives the tabpanel an accessible name matching the selected tab, with resolvable ids', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(detailOf());
+    view(FULL);
+    fireEvent.click(header());
+    await screen.findByRole('tablist');
+    expect(screen.getByRole('tabpanel', { name: 'Root cause' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('tab', { name: 'Call chain' }));
+    expect(screen.getByRole('tabpanel', { name: 'Call chain' })).toBeInTheDocument();
+    // ids are valid (no whitespace) and the tab controls the panel.
+    const tab = screen.getByRole('tab', { name: 'Call chain' });
+    const panel = screen.getByRole('tabpanel');
+    expect(tab.id).not.toMatch(/\s/);
+    expect(panel.id).not.toMatch(/\s/);
+    expect(tab).toHaveAttribute('aria-controls', panel.id);
+    expect(panel).toHaveAttribute('aria-labelledby', tab.id);
+  });
+
   it('switches to the Call chain tab and shows the hop labels', async () => {
     vi.spyOn(api, 'getFinding').mockResolvedValue(detailOf());
     view(FULL);
     fireEvent.click(header());
-    await screen.findByText(/owner id from the session/);
+    await screen.findByRole('tablist');
     fireEvent.click(screen.getByRole('tab', { name: 'Call chain' }));
     expect(screen.getByRole('tab', { name: 'Call chain' })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByText('router: GET /api/notes/{id}')).toBeInTheDocument();
@@ -95,7 +134,7 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     vi.spyOn(api, 'getFinding').mockResolvedValue(detailOf());
     view(FULL);
     fireEvent.click(header());
-    await screen.findByText(/owner id from the session/);
+    await screen.findByRole('tablist');
     fireEvent.click(screen.getByRole('tab', { name: 'Evidence' }));
     expect(screen.getByText('The handler looks the note up by id alone.')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: 'Patch' }));
@@ -110,7 +149,7 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     );
     view(FULL);
     fireEvent.click(header());
-    await screen.findByText(/owner id from the session/);
+    await screen.findByRole('tablist');
     fireEvent.click(screen.getByRole('tab', { name: 'Patch' }));
     expect(screen.getByText('Not provided: no fix yet')).toBeInTheDocument();
   });
@@ -119,7 +158,7 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     vi.spyOn(api, 'getFinding').mockResolvedValue(detailOf());
     view(FULL);
     fireEvent.click(header());
-    await screen.findByText(/owner id from the session/);
+    await screen.findByRole('tablist');
     expect(screen.getByRole('link', { name: /Open full report/ })).toHaveAttribute('href', '/findings/f-full');
   });
 
@@ -129,31 +168,57 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     fireEvent.click(header());
     expect(await screen.findByText(/boom: 500/)).toBeInTheDocument();
     expect(screen.queryByRole('status')).toBeNull();
+    // the stored rationale stays as the placeholder when the report can't load
+    expect(screen.getAllByText(ROOT_CAUSE)).toHaveLength(1);
     // the full report link is still reachable so the user can retry there
     expect(screen.getByRole('link', { name: /Open full report/ })).toBeInTheDocument();
   });
 
-  it('does not set state or refetch after collapse / unmount', async () => {
-    let resolve!: (d: FindingDetail) => void;
-    const spy = vi.spyOn(api, 'getFinding').mockReturnValue(new Promise((r) => { resolve = r; }));
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const { unmount } = view(FULL);
-    fireEvent.click(header());
-    unmount();
-    resolve(detailOf());
-    await Promise.resolve();
-    expect(errSpy).not.toHaveBeenCalled();
-    expect(spy).toHaveBeenCalledTimes(1);
+  it('drops a late response for a previous finding after the card is re-pointed at another id', async () => {
+    const resolvers: Record<string, (d: FindingDetail) => void> = {};
+    const spy = vi.spyOn(api, 'getFinding').mockImplementation(
+      (id: string) => new Promise<FindingDetail>((r) => { resolvers[id] = r; }),
+    );
+    const A = { ...FULL, id: 'f-a', summary: 'Finding A' } as unknown as FindingRecord;
+    const B = { ...FULL, id: 'f-b', summary: 'Finding B' } as unknown as FindingRecord;
+    const reportFor = (root_cause: string) => ({ ...report, root_cause });
+    const { rerender } = render(
+      <MemoryRouter><InlineFindingCard finding={A} stale={false} /></MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /Finding A/ }));
+    expect(spy).toHaveBeenCalledWith('f-a');
+
+    // Re-point the same card instance (still expanded) at B before A resolves.
+    rerender(<MemoryRouter><InlineFindingCard finding={B} stale={false} /></MemoryRouter>);
+    expect(spy).toHaveBeenCalledWith('f-b');
+    expect(screen.getByRole('status')).toBeInTheDocument();
+
+    // A's response lands late: B's card must not show A's content.
+    await act(async () => {
+      resolvers['f-a'](detailOf({ id: 'f-a', report: reportFor('ALPHA root cause text') }));
+    });
+    expect(screen.queryByText(/ALPHA root cause text/)).toBeNull();
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open full report/ })).toHaveAttribute('href', '/findings/f-b');
+
+    // B's own response then renders normally.
+    await act(async () => {
+      resolvers['f-b'](detailOf({ id: 'f-b', report: reportFor('BRAVO root cause text') }));
+    });
+    expect(await screen.findByText(/BRAVO root cause text/)).toBeInTheDocument();
+    expect(screen.queryByText(/ALPHA root cause text/)).toBeNull();
   });
 
   it('keeps the fetched detail across collapse / re-expand (no refetch)', async () => {
     const spy = vi.spyOn(api, 'getFinding').mockResolvedValue(detailOf());
     view(FULL);
     fireEvent.click(header());
-    await screen.findByText(/owner id from the session/);
+    await screen.findByRole('tablist');
     fireEvent.click(header());
     fireEvent.click(header());
-    expect(await screen.findByText(/owner id from the session/)).toBeInTheDocument();
+    expect(await screen.findByRole('tabpanel', { name: 'Root cause' })).toHaveTextContent(ROOT_CAUSE);
+    expect(screen.getAllByText(ROOT_CAUSE)).toHaveLength(1);
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
@@ -168,7 +233,7 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     fireEvent.click(header());
     expect(screen.getByText(/code may have changed/i)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /view on repository/i })).toBeInTheDocument();
-    await screen.findByText(/owner id from the session/);
+    await screen.findByRole('tablist');
   });
 });
 
