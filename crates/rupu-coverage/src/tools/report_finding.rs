@@ -194,9 +194,13 @@ pub fn report_finding(
         .create(true)
         .append(true)
         .open(&paths.findings)?;
-    let line = serde_json::to_string(&record)?;
+    // One `write_all` of the line and its newline together: with two
+    // writes, a concurrent writer appending to the same ledger could land
+    // its line between ours and our newline, fusing two records into one
+    // unparseable line.
+    let mut line = serde_json::to_string(&record)?;
+    line.push('\n');
     f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
     f.flush()?;
     Ok(ReportFindingOutput { id })
 }
