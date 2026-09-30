@@ -7475,6 +7475,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         )?;
 
         let tool_context = ToolContext {
+            findings: None,
             workspace_path: session.workspace_path.clone(),
             bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
             bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),

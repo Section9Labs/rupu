@@ -910,6 +910,21 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         opts.agent_system_prompt.push_str(&bundle.prompt_section);
     }
 
+    // Findings contract for this run. Resolved before `RunStart` is written
+    // so the guidance is part of the recorded system prompt.
+    let findings_opts = opts.tool_context.findings.clone().unwrap_or_default();
+    let records_findings = coverage.is_some()
+        || opts
+            .agent_tools
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t == "report_finding"));
+    if records_findings {
+        if let Some(g) = rupu_coverage::report::guidance(&findings_opts) {
+            opts.agent_system_prompt.push_str("\n\n");
+            opts.agent_system_prompt.push_str(&g);
+        }
+    }
+
     writer.write(&Event::RunStart {
         run_id: opts.run_id.clone(),
         workspace_id: opts.workspace_id.clone(),
@@ -944,7 +959,12 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
 
     // Register coverage tools when coverage is enabled.
     if let Some(bundle) = &coverage {
-        coverage_tools::register(&mut registry, bundle.catalog.clone(), bundle.paths.clone());
+        coverage_tools::register(
+            &mut registry,
+            bundle.catalog.clone(),
+            bundle.paths.clone(),
+            findings_opts.clone(),
+        );
     }
 
     // Findings WITHOUT the coverage harness.
@@ -980,7 +1000,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
         registry.insert(
             "report_finding",
-            std::sync::Arc::new(coverage_tools::ReportFindingTool::new(paths)),
+            std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
+                paths,
+                findings_opts.clone(),
+            )),
         );
     }
 

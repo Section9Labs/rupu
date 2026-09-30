@@ -135,6 +135,10 @@ struct Frontmatter {
     /// omitted. Clamped to `[10, 95]`.
     #[serde(default, rename = "compactAtPercent")]
     compact_at_percent: Option<u8>,
+    /// Findings contract when no workflow step or workflow default overrides
+    /// it: `full` (a complete report) or `summary`. Absent => `full`.
+    #[serde(default, rename = "findingsProfile")]
+    findings_profile: Option<rupu_coverage::FindingProfile>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -170,6 +174,8 @@ pub struct AgentSpec {
     pub context_window_tokens: Option<u32>,
     /// Compact-at percentage threshold. See `compactAtPercent` frontmatter.
     pub compact_at_percent: Option<u8>,
+    /// Findings contract for this agent. See `findingsProfile` frontmatter.
+    pub findings_profile: Option<rupu_coverage::FindingProfile>,
     pub system_prompt: String,
     /// The full original file text (frontmatter + body) verbatim. Lets the CP
     /// render the definition source with syntax highlighting; agents are
@@ -220,6 +226,7 @@ impl AgentSpec {
             max_tokens: fm.max_tokens,
             context_window_tokens: fm.context_window_tokens,
             compact_at_percent: fm.compact_at_percent,
+            findings_profile: fm.findings_profile,
             system_prompt: body.to_string(),
             raw,
         })
@@ -260,6 +267,18 @@ You are a test agent.
         let spec = AgentSpec::parse(src).expect("parse ok");
         assert_eq!(spec.context_window_tokens, None);
         assert_eq!(spec.compact_at_percent, None);
+    }
+
+    #[test]
+    fn parses_findings_profile() {
+        let s = "---\nname: a\nfindingsProfile: summary\n---\nbody\n";
+        let spec = AgentSpec::parse(s).unwrap();
+        assert_eq!(
+            spec.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+        let s = "---\nname: a\n---\nbody\n";
+        assert_eq!(AgentSpec::parse(s).unwrap().findings_profile, None);
     }
 
     #[test]

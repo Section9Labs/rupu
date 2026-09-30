@@ -166,6 +166,7 @@ impl StepFactory for DispatchFactory {
             max_turns: 5,
             decider: Arc::new(BypassDecider),
             tool_context: ToolContext {
+                findings: None,
                 workspace_path,
                 bash_env_allowlist: Vec::new(),
                 bash_timeout_secs: 120,
@@ -336,6 +337,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 max_turns: 5,
                 decider: Arc::new(BypassDecider),
                 tool_context: ToolContext {
+                    findings: None,
                     workspace_path,
                     bash_env_allowlist: Vec::new(),
                     bash_timeout_secs: 120,

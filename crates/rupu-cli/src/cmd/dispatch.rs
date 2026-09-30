@@ -303,6 +303,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let child_depth = parent_depth + 1;
 
         let child_tool_ctx = ToolContext {
+            findings: None,
             workspace_path: self.workspace_path.clone(),
             bash_env_allowlist: Vec::new(),
             bash_timeout_secs: 120,

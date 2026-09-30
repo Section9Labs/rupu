@@ -193,6 +193,7 @@ fn resolve_step_agent_spec(
         Ok(spec) => (spec, None),
         Err(e) => (
             rupu_agent::AgentSpec {
+                findings_profile: None,
                 name: agent_name.to_string(),
                 description: None,
                 provider: None,
@@ -417,6 +418,7 @@ impl StepFactory for DefaultStepFactory {
                 Arc::new(BypassDecider) as Arc<dyn PermissionDecider>
             },
             tool_context: ToolContext {
+                findings: None,
                 workspace_path,
                 bash_env_allowlist: self.bash_env_allowlist.clone(),
                 bash_timeout_secs: self.bash_timeout_secs,

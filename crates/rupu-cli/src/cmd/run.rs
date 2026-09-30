@@ -803,6 +803,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
         let tool_context = ToolContext {
+            findings: None,
             workspace_path: workspace_path.clone(),
             bash_env_allowlist: bash_allowlist,
             bash_timeout_secs: bash_timeout,

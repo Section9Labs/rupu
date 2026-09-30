@@ -97,6 +97,12 @@ pub struct ToolContext {
     /// means no mappings are loaded; built-in tools self-instrument regardless.
     #[serde(skip)]
     pub tool_mappings: Option<std::sync::Arc<rupu_coverage::ToolMappings>>,
+    /// How findings are recorded in this run: the resolved profile, the
+    /// artifact store, and size limits. `None` means the caller did not
+    /// configure it, and tools use `FindingWriteOptions::default()`, which
+    /// is the full profile with no artifact store.
+    #[serde(skip)]
+    pub findings: Option<rupu_coverage::FindingWriteOptions>,
 }
 
 impl Default for ToolContext {
@@ -114,6 +120,7 @@ impl Default for ToolContext {
             run_id: None,
             model: None,
             tool_mappings: None,
+            findings: None,
         }
     }
 }

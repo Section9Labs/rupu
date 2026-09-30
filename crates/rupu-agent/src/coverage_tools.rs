@@ -254,10 +254,12 @@ impl Tool for CoverageRemainingTool {
 
 pub struct ReportFindingTool {
     paths: CoveragePaths,
+    options: rupu_coverage::FindingWriteOptions,
 }
 
 impl ReportFindingTool {
-    /// Build the tool against an explicit ledger location.
+    /// Build the tool against an explicit ledger location and the run's
+    /// findings options (profile, artifact store, limits).
     ///
     /// `register` below wires this up as part of the coverage harness. This
     /// constructor exists for the other caller: an agent that records
@@ -265,8 +267,8 @@ impl ReportFindingTool {
     /// findings-without-coverage registration). A campaign that assesses
     /// hosts rather than files has no catalog and no concerns, but still
     /// produces findings.
-    pub fn new(paths: CoveragePaths) -> Self {
-        Self { paths }
+    pub fn new(paths: CoveragePaths, options: rupu_coverage::FindingWriteOptions) -> Self {
+        Self { paths, options }
     }
 }
 
@@ -277,62 +279,17 @@ impl Tool for ReportFindingTool {
     }
 
     fn description(&self) -> &'static str {
-        "Record a security or quality finding. Returns the generated finding id \
-         which can be referenced in subsequent coverage_mark calls."
+        "Record a security or quality finding in this project's ledger. Returns the \
+         generated finding id (use it in coverage_mark calls and in another finding's \
+         cross_references). Under the full profile send a complete `report`; a rejected \
+         call lists every problem to fix."
     }
 
     fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["scope", "summary", "severity", "evidence"],
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Workspace-relative path of the affected file, if applicable."
-                },
-                "line_range": {
-                    "type": "array",
-                    "items": { "type": "integer" },
-                    "minItems": 2,
-                    "maxItems": 2,
-                    "description": "Line range [start, end] within the file, if applicable."
-                },
-                "target_ref": {
-                    "type": "string",
-                    "description": "What this finding is about when it is not a file: a host or IP (host), a URL (endpoint), or a cloud resource id such as an OCID/ARN/URN (resource). Required for those three scopes."
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["line", "file", "repo", "host", "endpoint", "resource"],
-                    "description": "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a specific service URL), 'resource' (a cloud resource by its own id). Pick the narrowest scope the evidence actually supports - claiming a whole host for a defect on one endpoint overstates it."
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "One-sentence description of the finding."
-                },
-                "severity": {
-                    "type": "string",
-                    "enum": ["info", "low", "medium", "high", "critical"],
-                    "description": "Severity of the finding."
-                },
-                "concern_id": {
-                    "type": "string",
-                    "description": "Concern ID this finding relates to, if known."
-                },
-                "evidence": {
-                    "type": "object",
-                    "required": ["rationale"],
-                    "properties": {
-                        "code_excerpt": { "type": "string" },
-                        "rationale": { "type": "string" },
-                        "references": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        }
-                    }
-                }
-            }
-        })
+        match self.options.profile {
+            rupu_coverage::FindingProfile::Summary => summary_schema(),
+            rupu_coverage::FindingProfile::Full => full_schema(),
+        }
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -340,11 +297,82 @@ impl Tool for ReportFindingTool {
         let parsed: ReportFindingInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let attribution = attribution_from_ctx(ctx);
-        match report_finding(&self.paths, attribution, parsed) {
+        match report_finding(&self.paths, attribution, parsed, &self.options) {
             Ok(out) => Ok(ok_output(format!("finding_id: {}", out.id), started)),
             Err(e) => Ok(err_output(e.to_string(), started)),
         }
     }
+}
+
+/// The lightweight record: the original schema, verbatim.
+fn summary_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["scope", "summary", "severity", "evidence"],
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Workspace-relative path of the affected file, if applicable."
+            },
+            "line_range": {
+                "type": "array",
+                "items": { "type": "integer" },
+                "minItems": 2,
+                "maxItems": 2,
+                "description": "Line range [start, end] within the file, if applicable."
+            },
+            "target_ref": {
+                "type": "string",
+                "description": "What this finding is about when it is not a file: a host or IP (host), a URL (endpoint), or a cloud resource id such as an OCID/ARN/URN (resource). Required for those three scopes."
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["line", "file", "repo", "host", "endpoint", "resource"],
+                "description": "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a specific service URL), 'resource' (a cloud resource by its own id). Pick the narrowest scope the evidence actually supports - claiming a whole host for a defect on one endpoint overstates it."
+            },
+            "summary": {
+                "type": "string",
+                "description": "One-sentence description of the finding."
+            },
+            "severity": {
+                "type": "string",
+                "enum": ["info", "low", "medium", "high", "critical"],
+                "description": "Severity of the finding."
+            },
+            "concern_id": {
+                "type": "string",
+                "description": "Concern ID this finding relates to, if known."
+            },
+            "evidence": {
+                "type": "object",
+                "required": ["rationale"],
+                "properties": {
+                    "code_excerpt": { "type": "string" },
+                    "rationale": { "type": "string" },
+                    "references": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The full profile: locators + a complete `report`. `summary`, `severity`
+/// and `evidence` are derived from the report, so they are not offered.
+fn full_schema() -> Value {
+    let mut s = summary_schema();
+    let props = s["properties"].as_object_mut().expect("object schema");
+    props.remove("summary");
+    props.remove("severity");
+    props.remove("evidence");
+    props.insert(
+        "report".to_string(),
+        rupu_coverage::report::schema::advertised_schema(),
+    );
+    s["required"] = serde_json::json!(["scope", "report"]);
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +486,7 @@ pub fn register(
     registry: &mut crate::tool_registry::ToolRegistry,
     catalog: FlatCatalog,
     paths: CoveragePaths,
+    findings: rupu_coverage::FindingWriteOptions,
 ) {
     let catalog = Arc::new(catalog);
     registry.insert(
@@ -480,7 +509,10 @@ pub fn register(
             catalog: catalog.clone(),
         }),
     );
-    registry.insert("report_finding", Arc::new(ReportFindingTool { paths }));
+    registry.insert(
+        "report_finding",
+        Arc::new(ReportFindingTool::new(paths, findings)),
+    );
     registry.insert(
         "coverage_concerns_search",
         Arc::new(CoverageConcernsSearchTool {
@@ -491,4 +523,46 @@ pub fn register(
         "coverage_concerns_detail",
         Arc::new(CoverageConcernsDetailTool { catalog }),
     );
+}
+
+#[cfg(test)]
+mod findings_profile_tests {
+    use super::*;
+    use rupu_coverage::{FindingProfile, FindingWriteOptions};
+
+    fn tool(profile: FindingProfile) -> ReportFindingTool {
+        let tmp = std::env::temp_dir();
+        ReportFindingTool::new(
+            CoveragePaths::new(&tmp, "t"),
+            FindingWriteOptions::default().with_profile(profile),
+        )
+    }
+
+    #[test]
+    fn full_profile_advertises_report_as_required() {
+        let s = tool(FindingProfile::Full).input_schema();
+        let req: Vec<&str> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(req.contains(&"report"), "{req:?}");
+        assert!(!req.contains(&"summary"));
+        assert!(s["properties"]["report"]["properties"]["root_cause"].is_object());
+        assert!(s["properties"].get("summary").is_none());
+    }
+
+    #[test]
+    fn summary_profile_advertises_the_lightweight_fields() {
+        let s = tool(FindingProfile::Summary).input_schema();
+        let req: Vec<&str> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(req.contains(&"summary") && req.contains(&"severity") && req.contains(&"evidence"));
+        assert!(s["properties"].get("report").is_none());
+    }
 }
