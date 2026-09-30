@@ -122,9 +122,9 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         model: ctx.model.clone(),
         surface: ctx.surface,
     };
-    // Under the full profile the excerpt and references are derived from
-    // `report` too. `report_finding` refuses summary/severity/evidence there,
-    // but `code_excerpt`/`references` are folded into `evidence` only when a
+    // Under the full profile the excerpt and references belong inside
+    // `report`. `report_finding` refuses summary/severity/evidence there, but
+    // `code_excerpt`/`references` are folded into `evidence` only when a
     // `rationale` is present — sent alone they would be dropped silently. Catch
     // that residual case; everything else is left to the shared check.
     if ctx.options.profile == rupu_coverage::FindingProfile::Full
@@ -134,13 +134,14 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         && (args.code_excerpt.is_some() || !args.references.is_empty())
     {
         return Err(
-            "under the full findings profile `code_excerpt` and `references` are derived from \
-             `report`; omit them"
+            "`code_excerpt` and `references` are not accepted under the full findings profile; \
+             put them in `report.evidence` / `report.references` instead"
                 .to_string(),
         );
     }
     // A missing `rationale` leaves `evidence` unset, which the summary profile
-    // reports as a missing field (renamed below to the name this tool exposes).
+    // reports as a missing `evidence` (renamed by `record_error` to the field
+    // name this tool exposes).
     let evidence = args
         .rationale
         .map(|rationale| rupu_coverage::FindingEvidence {
@@ -164,6 +165,29 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
     // agreeing about a contract only stays true when it is one path.
     rupu_coverage::report_finding(&paths, attribution, input, &ctx.options)
         .map(|out| out.id)
-        // `evidence` is the ledger's name; this tool's caller sent `rationale`.
-        .map_err(|e| e.to_string().replace("`evidence`", "`rationale`"))
+        .map_err(record_error)
+}
+
+/// Render a `report_finding` failure in this tool's vocabulary.
+///
+/// The ledger calls the summary-profile detail block `evidence`; this tool
+/// exposes it as `rationale` (with `code_excerpt`/`references` alongside), and
+/// names itself rather than the agent builtin. The mapping is by error variant
+/// on purpose: rewriting the rendered string would also rewrite unrelated text
+/// that happens to contain the word, such as an artifact path an author named
+/// `evidence`.
+fn record_error(e: rupu_coverage::ReportFindingError) -> String {
+    use rupu_coverage::ReportFindingError as E;
+    match e {
+        E::MissingField("evidence") => {
+            "`rationale` is required under the summary findings profile".to_string()
+        }
+        E::DerivedFieldsSupplied => "under the full findings profile `summary`, `severity` and \
+                                     `rationale` are derived from `report`; omit them"
+            .to_string(),
+        E::ReportRequired => "this step records findings under the full profile: `report` is \
+                              required (see the findings.record tool schema)"
+            .to_string(),
+        other => other.to_string(),
+    }
 }

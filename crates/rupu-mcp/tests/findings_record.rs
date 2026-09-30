@@ -168,7 +168,9 @@ async fn full_profile_requires_a_report() {
         )
         .await
         .expect_err("no report under full must be refused");
-    assert!(err.to_string().contains("`report` is required"), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("`report` is required"), "{msg}");
+    assert!(msg.contains("findings.record tool schema"), "{msg}");
 }
 
 #[tokio::test]
@@ -193,7 +195,67 @@ async fn full_profile_refuses_stray_excerpt_and_references() {
         )
         .await
         .expect_err("stray references must be refused under full");
-    assert!(err.to_string().contains("derived from `report`"), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not accepted under the full findings profile"),
+        "{msg}"
+    );
+    assert!(msg.contains("report.references"), "{msg}");
+}
+
+#[tokio::test]
+async fn full_profile_refuses_a_stray_code_excerpt() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    let err = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({
+                "scope": "repo",
+                "report": report,
+                "code_excerpt": "let x = 1;"
+            }),
+        )
+        .await
+        .expect_err("stray code_excerpt must be refused under full");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not accepted under the full findings profile"),
+        "{msg}"
+    );
+    assert!(msg.contains("report.evidence"), "{msg}");
+}
+
+#[tokio::test]
+async fn error_mapping_does_not_rewrite_an_artifact_path_named_evidence() {
+    // Errors are mapped by type, not by string replace: an artifact path the
+    // author happened to name `evidence` must reach them verbatim.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = tempfile::TempDir::new().unwrap();
+    let mut ctx = ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full);
+    ctx.options.artifact_root = Some(store.path().to_path_buf());
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx);
+    let mut report: serde_json::Value = serde_json::from_str(include_str!(
+        "../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    ))
+    .unwrap();
+    report["artifacts"] = serde_json::json!([{ "path": "evidence" }]);
+    let err = dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("a missing artifact must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("artifact `evidence`"), "{msg}");
+    assert!(!msg.contains("artifact `rationale`"), "{msg}");
 }
 
 #[tokio::test]
