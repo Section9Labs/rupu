@@ -7,17 +7,23 @@
 //! * [`fanout_block`] — a `for_each`/`parallel` step as a status density bar +
 //!   a few live movers (collapsed) or the filtered unit list (drilled); `graph`
 //!   delegates every fan-out step to it.
+//! * [`live_layout`] — the whole frame: those zones plus a breadcrumb, a feed
+//!   and a key legend, with the graph adaptively collapsed so the active
+//!   frontier and the feed never scroll off.
 //!
 //! Every datum is shown only when the run has actually produced it (no mock
 //! zeros): cost needs a priced run, findings need at least one finding,
 //! provider/model need an `AgentStarted`, coverage is omitted entirely until
 //! `RunView` carries it.
 
+use std::ops::Range;
+
 use chrono::{DateTime, Utc};
 use rupu_orchestrator::runs::{RunStatus, StepKind};
+use unicode_width::UnicodeWidthStr;
 
 use crate::output::live_view::nav::{Depth, NavState, UnitFilter};
-use crate::output::live_view::row::Line;
+use crate::output::live_view::row::{truncate_to, Line};
 use crate::output::palette::Status;
 use crate::output::run_model::{
     fmt_hms, step_status, DispatchView, RunView, StepState, StepView, UnitStatus, UnitView,
@@ -164,17 +170,21 @@ const LEADER: &str = " ···· ";
 /// dispatched as indented `┣━`/`┗━` children.
 pub fn graph(view: &RunView, nav: &NavState) -> Vec<Line> {
     let focus = focused_step_id(view, nav);
-    let mut rows = Vec::new();
-    for step in &view.steps {
-        let marked = focus == Some(step.step_id.as_str());
-        if is_fan_out(step) {
-            rows.extend(fanout_block(step, nav, marked));
-        } else {
-            rows.push(step_row(step, marked));
-            if marked {
-                rows.extend(dispatch_rows(view, step));
-            }
-        }
+    view.steps
+        .iter()
+        .flat_map(|step| step_block(view, step, nav, focus == Some(step.step_id.as_str())))
+        .collect()
+}
+
+/// One step's rows: a [`fanout_block`] for a fan-out step, otherwise its row
+/// (plus, when `marked`, the sub-agents it dispatched).
+fn step_block(view: &RunView, step: &StepView, nav: &NavState, marked: bool) -> Vec<Line> {
+    if is_fan_out(step) {
+        return fanout_block(step, nav, marked);
+    }
+    let mut rows = vec![step_row(step, marked)];
+    if marked {
+        rows.extend(dispatch_rows(view, step));
     }
     rows
 }
@@ -204,10 +214,15 @@ fn is_fan_out(step: &StepView) -> bool {
 /// on step 0 — that is not a selection, so nothing is marked. Once the
 /// operator has moved the cursor or drilled in, the cursor step is the focus.
 fn focused_step_id<'a>(view: &'a RunView, nav: &NavState) -> Option<&'a str> {
+    chosen_step(view, nav).map(|s| s.step_id.as_str())
+}
+
+/// The step the operator has chosen (see [`focused_step_id`]) — what the
+/// graph marks `▸`, what the layout never collapses, and whose state picks the
+/// footer legend.
+fn chosen_step<'a>(view: &'a RunView, nav: &NavState) -> Option<&'a StepView> {
     let chosen = !nav.is_following() || nav.depth() != Depth::Run;
-    nav.selected_step(view)
-        .filter(|_| chosen)
-        .map(|s| s.step_id.as_str())
+    nav.selected_step(view).filter(|_| chosen)
 }
 
 fn step_row(step: &StepView, marked: bool) -> Line {
@@ -243,6 +258,8 @@ fn step_row(step: &StepView, marked: bool) -> Line {
 const DENSITY_WIDTH: usize = 20;
 /// How many live movers a collapsed fan-out block lists.
 const MOVERS: usize = 4;
+/// Rows a fan-out block always opens with: its header and density row.
+const FANOUT_HEAD: usize = 2;
 /// Tree branch glyphs of a fan-out unit row.
 const BRANCH_MID: &str = "┣━ ";
 const BRANCH_LAST: &str = "┗━ ";
@@ -269,6 +286,7 @@ pub fn fanout_block(step: &StepView, nav: &NavState, selected: bool) -> Vec<Line
         fanout_header(step, nav, selected, expanded),
         density_row(step),
     ];
+    debug_assert_eq!(rows.len(), FANOUT_HEAD);
     if expanded {
         rows.extend(expanded_rows(step, nav));
     } else {
@@ -660,6 +678,504 @@ fn codename_line(codename: &str) -> Option<Line> {
         }
     }
     Some(line)
+}
+
+// ---- live_layout: compose + adaptive bounding ---------------------------------
+
+/// Rows the feed is guaranteed, when it has that many lines. The graph yields
+/// to this floor — never the reverse.
+const FEED_MIN: usize = 4;
+/// A collapsed run names its steps up to this many; longer runs read
+/// `first … last`.
+const SUMMARY_NAMES: usize = 3;
+/// Columns of label a clipped row keeps before it gives up protecting its
+/// right-hand state (so a sliver of label is never traded for a state word).
+const MIN_LABEL: usize = 8;
+
+/// The whole live-view frame, top to bottom: dashboard, a breadcrumb (when
+/// drilled), the graph, the feed, and a one-row key legend. At most `h` rows,
+/// every row at most `w` columns, no terminal I/O.
+///
+/// The graph is bounded to whatever the other zones leave, in this order, and
+/// **the active frontier (every running / awaiting-approval step) and the
+/// feed's floor are never sacrificed to it**:
+///
+/// 1. settled steps (complete / skipped, not the operator's selection) fold
+///    into `✓ first … last  (+N done)` summary rows, oldest first, only as
+///    far as needed;
+/// 2. pending steps then fold the same way, latest first;
+/// 3. fan-out blocks (the drilled one included) are trimmed to their header +
+///    density row plus a window around the unit cursor, largest first;
+/// 4. as a last resort the rows are windowed around the first frontier row.
+///
+/// The feed gets `min(feed.len(), FEED_MIN)` rows guaranteed and every row
+/// the graph leaves spare (its newest lines). The breadcrumb yields when it
+/// would starve the graph. Below the floor (the dashboard, the footer, the
+/// feed's floor and one graph row) the frame degrades by priority — footer,
+/// title, frontier row, feed, rest of the dashboard; that range is a cramped
+/// terminal, not a layout contract.
+///
+/// `nav` should have been [`NavState::sync`]ed against `view` this tick; a
+/// stale one is clamped, never a panic.
+pub fn live_layout(
+    view: &RunView,
+    nav: &NavState,
+    feed: &[Line],
+    now: DateTime<Utc>,
+    w: usize,
+    h: usize,
+) -> Vec<Line> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let dash = dashboard(view, now);
+    let feed_min = feed.len().min(FEED_MIN);
+    let floor = dash.len() + 1 + feed_min + 1;
+    if h < floor {
+        return cramped(view, nav, &dash, feed, w, h);
+    }
+
+    let crumb = (nav.depth() != Depth::Run && h > floor)
+        .then(|| crumb_line(&nav.breadcrumb(view), w))
+        .flatten();
+    let fixed = dash.len() + usize::from(crumb.is_some()) + 1;
+    // `h >= floor (+1 with a crumb)`, so both subtractions are in range and
+    // the graph has at least one row.
+    let graph_rows = fit_graph(view, nav, h - fixed - feed_min);
+    let feed_room = h - fixed - graph_rows.len();
+    let skip = feed.len().saturating_sub(feed_room);
+
+    let mut out = Vec::with_capacity(h);
+    out.extend(dash.into_iter().map(|l| truncate_to(l, w)));
+    out.extend(crumb);
+    out.extend(graph_rows.into_iter().map(|l| clip_row(l, w)));
+    out.extend(feed[skip..].iter().cloned().map(|l| truncate_to(l, w)));
+    out.push(footer_line(view, nav, w));
+    out
+}
+
+/// A frame for a terminal below the layout floor: rows are granted by
+/// priority — footer, dashboard title, one frontier row, the feed's floor,
+/// the rest of the dashboard — and emitted in screen order.
+fn cramped(
+    view: &RunView,
+    nav: &NavState,
+    dash: &[Line],
+    feed: &[Line],
+    w: usize,
+    h: usize,
+) -> Vec<Line> {
+    let mut room = h;
+    let mut take = |want: usize| {
+        let n = want.min(room);
+        room -= n;
+        n
+    };
+    let footer_n = take(1);
+    let title_n = take(1);
+    let graph_n = take(1);
+    let feed_n = take(feed.len().min(FEED_MIN));
+    let dash_n = (title_n + take(dash.len().saturating_sub(1))).min(dash.len());
+
+    let mut out: Vec<Line> = dash[..dash_n]
+        .iter()
+        .cloned()
+        .map(|l| truncate_to(l, w))
+        .collect();
+    out.extend(
+        fit_graph(view, nav, graph_n)
+            .into_iter()
+            .map(|l| clip_row(l, w)),
+    );
+    out.extend(
+        feed[feed.len() - feed_n..]
+            .iter()
+            .cloned()
+            .map(|l| truncate_to(l, w)),
+    );
+    if footer_n > 0 {
+        out.push(footer_line(view, nav, w));
+    }
+    out
+}
+
+/// How a step is treated when the graph must shrink to fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Running or awaiting approval — the active frontier. Never collapsed.
+    Frontier,
+    /// Failed, paused, or chosen by the operator. Never collapsed.
+    Keep,
+    /// Complete or skipped, and not chosen. The first thing to fold.
+    Settled,
+    /// Not started, and not chosen. Folds once the settled steps have.
+    Pending,
+}
+
+fn classify(state: StepState, chosen: bool) -> Class {
+    match state {
+        StepState::Running | StepState::AwaitingApproval => Class::Frontier,
+        _ if chosen => Class::Keep,
+        StepState::Complete | StepState::Skipped => Class::Settled,
+        StepState::Pending => Class::Pending,
+        StepState::Failed | StepState::Paused => Class::Keep,
+    }
+}
+
+/// One step's rows plus what the fitter needs to know about them.
+struct Block<'a> {
+    step: &'a StepView,
+    rows: Vec<Line>,
+    class: Class,
+    /// Leading rows that survive any trimming: the step row, or a fan-out's
+    /// header + density row.
+    head: usize,
+    /// Row the unit cursor sits on (an expanded fan-out only); trimming keeps
+    /// it in view.
+    cursor: Option<usize>,
+}
+
+fn make_block<'a>(
+    view: &RunView,
+    step: &'a StepView,
+    nav: &NavState,
+    focus: Option<&str>,
+) -> Block<'a> {
+    let chosen = focus == Some(step.step_id.as_str());
+    let fan_out = is_fan_out(step);
+    let cursor = (fan_out && chosen && nav.depth() != Depth::Run)
+        .then(|| {
+            let cur = nav.selected_unit_in(step)?;
+            let pos = nav
+                .filtered_units(step)
+                .iter()
+                .position(|u| u.index == cur.index)?;
+            Some(FANOUT_HEAD + pos)
+        })
+        .flatten();
+    Block {
+        step,
+        rows: step_block(view, step, nav, chosen),
+        class: classify(step.state, chosen),
+        head: if fan_out { FANOUT_HEAD } else { 1 },
+        cursor,
+    }
+}
+
+/// A display piece of the fitted graph: a visible block, or one summary row
+/// standing for a run of collapsed blocks.
+enum Piece {
+    Block(usize),
+    Run(Range<usize>),
+}
+
+/// Partition the blocks into pieces: each visible block on its own, each
+/// maximal run of same-class collapsed blocks as one summary. A lone collapsed
+/// block that is a single row already stays as it is — a summary of one row
+/// would save nothing.
+fn pieces(blocks: &[Block], collapsed: &[bool]) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        if !collapsed[i] {
+            out.push(Piece::Block(i));
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < blocks.len() && collapsed[j] && blocks[j].class == blocks[i].class {
+            j += 1;
+        }
+        if j - i == 1 && blocks[i].rows.len() <= 1 {
+            out.push(Piece::Block(i));
+        } else {
+            out.push(Piece::Run(i..j));
+        }
+        i = j;
+    }
+    out
+}
+
+/// Rows the graph takes with these collapse flags and per-block trim targets.
+fn graph_height(blocks: &[Block], collapsed: &[bool], trim: &[usize]) -> usize {
+    pieces(blocks, collapsed)
+        .iter()
+        .map(|p| match p {
+            Piece::Block(i) => trim[*i],
+            Piece::Run(_) => 1,
+        })
+        .sum()
+}
+
+/// The graph bounded to `avail` rows (see [`live_layout`] for the order in
+/// which it shrinks). `avail == 0` is an empty graph.
+fn fit_graph(view: &RunView, nav: &NavState, avail: usize) -> Vec<Line> {
+    if avail == 0 {
+        return Vec::new();
+    }
+    let focus = focused_step_id(view, nav);
+    let blocks: Vec<Block> = view
+        .steps
+        .iter()
+        .map(|s| make_block(view, s, nav, focus))
+        .collect();
+    let n = blocks.len();
+    let mut collapsed = vec![false; n];
+    let mut trim: Vec<usize> = blocks.iter().map(|b| b.rows.len()).collect();
+    let fits = |collapsed: &[bool], trim: &[usize]| graph_height(&blocks, collapsed, trim) <= avail;
+
+    // 1. Settled steps fold oldest first, only until the graph fits.
+    let settled = (0..n).filter(|&i| blocks[i].class == Class::Settled);
+    for i in settled {
+        if fits(&collapsed, &trim) {
+            break;
+        }
+        collapsed[i] = true;
+    }
+    // 2. Then pending steps fold, furthest from the frontier first.
+    let pending = (0..n).rev().filter(|&i| blocks[i].class == Class::Pending);
+    for i in pending {
+        if fits(&collapsed, &trim) {
+            break;
+        }
+        collapsed[i] = true;
+    }
+    // 3. Then the biggest surviving block gives up rows, one at a time. A
+    //    target of `head + 1` has no room for a unit and the marker, so it
+    //    goes straight to `head`.
+    while !fits(&collapsed, &trim) {
+        let biggest = (0..n)
+            .filter(|&i| !collapsed[i] && trim[i] > blocks[i].head)
+            .max_by_key(|&i| trim[i] - blocks[i].head);
+        let Some(i) = biggest else { break };
+        trim[i] = if trim[i] == blocks[i].head + 2 {
+            blocks[i].head
+        } else {
+            trim[i] - 1
+        };
+    }
+
+    let mut rows: Vec<Line> = Vec::new();
+    let (mut frontier_at, mut keep_at) = (None, None);
+    for piece in pieces(&blocks, &collapsed) {
+        match piece {
+            Piece::Block(i) => {
+                let b = &blocks[i];
+                if frontier_at.is_none() && b.class == Class::Frontier {
+                    frontier_at = Some(rows.len());
+                }
+                if keep_at.is_none() && b.class == Class::Keep {
+                    keep_at = Some(rows.len());
+                }
+                rows.extend(trim_block(b, trim[i]));
+            }
+            Piece::Run(range) => rows.push(summary_line(&blocks[range])),
+        }
+    }
+    // 4. Only reachable when frontier + kept rows alone exceed `avail`.
+    hard_clip(rows, frontier_at.or(keep_at).unwrap_or(0), avail)
+}
+
+/// `block`'s rows cut to `target`: the head rows, a window of the rest centred
+/// on the unit cursor, and a last `⋮ +N above · +M below` row for what was
+/// dropped. A target with no room for a window plus that marker keeps just the
+/// head.
+fn trim_block(block: &Block, target: usize) -> Vec<Line> {
+    let rows = &block.rows;
+    let head = block.head.min(rows.len());
+    if target >= rows.len() {
+        return rows.clone();
+    }
+    if target < head + 2 {
+        return rows[..head].to_vec();
+    }
+    let body = &rows[head..];
+    let slots = target - head - 1;
+    let cursor = block
+        .cursor
+        .map_or(0, |c| c.saturating_sub(head))
+        .min(body.len() - 1);
+    let start = cursor.saturating_sub(slots / 2).min(body.len() - slots);
+    let mut out = rows[..head].to_vec();
+    out.extend_from_slice(&body[start..start + slots]);
+    out.push(hidden_row(start, body.len() - start - slots));
+    out
+}
+
+/// `⋮ +N above · +M below` — what a trimmed window left out.
+fn hidden_row(above: usize, below: usize) -> Line {
+    let parts: Vec<String> = [(above, "above"), (below, "below")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, side)| format!("+{n} {side}"))
+        .collect();
+    Line::new()
+        .dim(CHILD_INDENT)
+        .dim(format!("⋮ {}", parts.join(" · ")))
+}
+
+/// `✓ first … last  (+N done · M skipped)` / `○ first … last  (+N pending)`
+/// for a run of collapsed steps; runs of up to [`SUMMARY_NAMES`] list every
+/// step.
+fn summary_line(run: &[Block]) -> Line {
+    let names: Vec<String> = run.iter().map(|b| printable(&b.step.step_id)).collect();
+    let label = if names.len() <= SUMMARY_NAMES {
+        names.join(" · ")
+    } else {
+        format!("{} … {}", names[0], names[names.len() - 1])
+    };
+    let pending = run.iter().all(|b| b.class == Class::Pending);
+    let (st, count) = if pending {
+        (Status::Waiting, format!("{} pending", run.len()))
+    } else {
+        let skipped = run
+            .iter()
+            .filter(|b| b.step.state == StepState::Skipped)
+            .count();
+        let done = run.len() - skipped;
+        let mut parts = Vec::new();
+        if done > 0 {
+            parts.push(format!("{done} done"));
+        }
+        if skipped > 0 {
+            parts.push(format!("{skipped} skipped"));
+        }
+        let st = if done > 0 {
+            Status::Complete
+        } else {
+            Status::Skipped
+        };
+        (st, parts.join(" · "))
+    };
+    Line::new()
+        .dim(NO_MARK)
+        .status(st, st.glyph().to_string())
+        .plain(" ")
+        .dim(label)
+        .dim(format!("  (+{count})"))
+}
+
+/// Keep `avail` of `rows` with `anchor` inside the window (one row of context
+/// above it when there is room), marking what was cut with `⋮` rows. Only
+/// reached when the frontier itself outgrows the graph's budget.
+fn hard_clip(mut rows: Vec<Line>, anchor: usize, avail: usize) -> Vec<Line> {
+    if rows.len() <= avail {
+        return rows;
+    }
+    let lead = usize::from(avail >= 3);
+    let start = anchor.saturating_sub(lead).min(rows.len() - avail);
+    let above = start;
+    let below = rows.len() - start - avail;
+    let mut out: Vec<Line> = rows.drain(start..start + avail).collect();
+    if above > 0 && avail >= 3 {
+        out[0] = hidden_row(above + 1, 0);
+    }
+    if below > 0 && avail >= 2 {
+        let last = out.len() - 1;
+        out[last] = hidden_row(0, below + 1);
+    }
+    out
+}
+
+/// Width-clip a graph row while protecting its right-hand state. A row with a
+/// [`LEADER`] (`<label> ···· <state>`) loses its *label* middle to an ellipsis
+/// — the leading glyph and the trailing state stay; when even that is too
+/// tight the leader shrinks to one space, and below that the row is clipped
+/// plain (its leading glyph still says the state). Rows without a leader
+/// (summaries, markers) are clipped plain.
+fn clip_row(line: Line, w: usize) -> Line {
+    if line.width() <= w {
+        return line;
+    }
+    let Some(at) = line.segments.iter().rposition(|s| s.text == LEADER) else {
+        return truncate_to(line, w);
+    };
+    let state_w: usize = line.segments[at + 1..].iter().map(|s| s.text.width()).sum();
+    let Some(gap) = [LEADER, " "]
+        .into_iter()
+        .find(|g| w >= g.width() + state_w + MIN_LABEL)
+    else {
+        return truncate_to(line, w);
+    };
+    let mut label = line;
+    let state = label.segments.split_off(at + 1);
+    label.segments.pop(); // the leader itself
+    let mut out = truncate_to(label, w - gap.width() - state_w).dim(gap);
+    out.segments.extend(state);
+    out
+}
+
+/// The breadcrumb row, ` › `-joined. A path too wide for `w` loses crumbs
+/// from the *left* (`… › otter#41 › wren#1`): the deepest crumb is the one
+/// that says where you are. `None` for an empty path.
+fn crumb_line(crumbs: &[String], w: usize) -> Option<Line> {
+    if crumbs.is_empty() {
+        return None;
+    }
+    let build = |from: usize| {
+        let mut line = Line::new();
+        if from > 0 {
+            line = line.dim("… › ");
+        }
+        for (i, crumb) in crumbs[from..].iter().enumerate() {
+            if i > 0 {
+                line = line.dim(" › ");
+            }
+            line = line.dim(printable(crumb));
+        }
+        line
+    };
+    let fitting = (0..crumbs.len()).map(build).find(|line| line.width() <= w);
+    Some(fitting.unwrap_or_else(|| truncate_to(build(crumbs.len() - 1), w)))
+}
+
+/// The one-row key legend for what is selected. At an approval gate the
+/// modal approve / reject keys replace the navigation set. Hints carry a rank;
+/// a terminal too narrow for them all drops the highest-ranked (least
+/// important) first, `q quit` (rank 0) last.
+fn footer_line(view: &RunView, nav: &NavState, w: usize) -> Line {
+    const NAVIGATE: &[(&str, u8)] = &[
+        ("↑↓ move", 1),
+        ("enter drill", 2),
+        ("← back", 3),
+        ("/ filter", 4),
+        ("q quit", 0),
+    ];
+    const AT_GATE: &[(&str, u8)] = &[
+        ("a approve", 1),
+        ("r reject", 2),
+        ("v findings", 3),
+        ("q quit", 0),
+    ];
+    let at_gate = chosen_step(view, nav).is_some_and(|s| s.state == StepState::AwaitingApproval);
+    let mut hints = if at_gate { AT_GATE } else { NAVIGATE }.to_vec();
+    while legend(&hints).width() > w && hints.len() > 1 {
+        let Some(least) = hints
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (_, rank))| *rank)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        hints.remove(least);
+    }
+    truncate_to(legend(&hints), w)
+}
+
+/// `key label · key label …`: the key plain, its label dim.
+fn legend(hints: &[(&str, u8)]) -> Line {
+    let mut line = Line::new();
+    for (i, (hint, _)) in hints.iter().enumerate() {
+        if i > 0 {
+            line = line.dim(" · ");
+        }
+        match hint.split_once(' ') {
+            Some((key, label)) => line = line.plain(key).dim(format!(" {label}")),
+            None => line = line.plain(*hint),
+        }
+    }
+    line
 }
 
 #[cfg(test)]
@@ -1109,7 +1625,12 @@ mod tests {
     /// `hunt`: 86 units — 52 done, 6 running (54..60), 2 failed (7, 31),
     /// 26 queued (60..86).
     fn fanout_view_86() -> RunView {
-        let statuses: Vec<UnitStatus> = (0..86)
+        fanout_with("hunt", StepKind::ForEach, &statuses_86())
+    }
+
+    /// The 86 unit statuses of [`fanout_view_86`].
+    fn statuses_86() -> Vec<UnitStatus> {
+        (0..86)
             .map(|i| {
                 if i == 7 || i == 31 {
                     UnitStatus::Failed
@@ -1121,8 +1642,7 @@ mod tests {
                     UnitStatus::Queued
                 }
             })
-            .collect();
-        fanout_with("hunt", StepKind::ForEach, &statuses)
+            .collect()
     }
 
     /// A nav drilled into step 0 with the filter cycled `presses` times
@@ -1498,5 +2018,530 @@ mod tests {
         no_empty(&[UnitStatus::Done; 86]); // 86/86: no empty run
         no_empty(&[]); // 0/0
         no_empty(&[UnitStatus::Done, UnitStatus::Queued]); // both runs present
+    }
+
+    // ---- live_layout: compose + adaptive bounding ----------------------------
+
+    /// Terminal width of the frame snapshots.
+    const W: usize = 100;
+
+    /// 40 steps / 86 units: `stage-00`..`stage-29` settled (05 and 06
+    /// skipped), the `hunt` for_each fan-out running, nine steps pending.
+    fn big_run() -> RunView {
+        let mut v = RunView::default();
+        v.workflow_name = "assess-services".into();
+        v.crew = Some("mint-tundra".into());
+        v.status = RunStatus::Running;
+        v.started_at = Some(now() - Duration::seconds(4 * 60 + 12));
+        for i in 0..30 {
+            complete(&mut v, &format!("stage-{i:02}"));
+        }
+        for skipped in ["stage-05", "stage-06"] {
+            v.step_mut(skipped).state = StepState::Skipped;
+        }
+        start_as(&mut v, "hunt", StepKind::ForEach, None, None);
+        for (i, st) in statuses_86().into_iter().enumerate() {
+            v.step_mut("hunt").units.insert(i, unit(i, st));
+        }
+        for id in [
+            "verify", "triage", "report", "notify", "ticket", "archive", "digest", "publish",
+            "cleanup",
+        ] {
+            v.step_mut(id);
+        }
+        v.usage = Some(rupu_cp::usage::UsageSummary {
+            input_tokens: 6_100_000,
+            output_tokens: 420_000,
+            total_tokens: 6_520_000,
+            cost_usd: Some(18.40),
+            priced: true,
+            ..Default::default()
+        });
+        v.findings_by_severity.insert("high".into(), 2);
+        v
+    }
+
+    /// `n` feed lines, oldest first; every one starts `feed `.
+    fn feed(n: usize) -> Vec<Line> {
+        (0..n)
+            .map(|i| {
+                Line::new()
+                    .dim("feed ")
+                    .plain(format!("{i:02} otter#57 read_file src/lib.rs"))
+            })
+            .collect()
+    }
+
+    fn feed_rows(out: &[Line]) -> Vec<String> {
+        lines_of(out)
+            .into_iter()
+            .filter(|l| l.starts_with("feed "))
+            .collect()
+    }
+
+    /// Rows of the running `hunt` fan-out's block (its header names it; the
+    /// dashboard's progress row does not carry `for_each`).
+    fn hunt_headers(out: &[Line]) -> usize {
+        lines_of(out)
+            .iter()
+            .filter(|l| l.contains("hunt · for_each"))
+            .count()
+    }
+
+    /// A nav that selected step `idx`, drilled in once, with the unit filter
+    /// cycled `presses` times.
+    fn drilled_at(view: &RunView, idx: usize, presses: usize) -> NavState {
+        let mut nav = nav_at(view, idx);
+        nav.apply(NavKey::In, view);
+        for _ in 0..presses {
+            nav.apply(NavKey::Filter, view);
+        }
+        nav
+    }
+
+    #[test]
+    fn live_layout_24_rows_collapses_settled_and_keeps_frontier_and_feed() {
+        let v = big_run();
+        assert_eq!(v.steps.len(), 40);
+        assert_eq!(v.steps.iter().map(|s| s.units.len()).sum::<usize>(), 86);
+        let out = live_layout(&v, &NavState::default(), &feed(12), now(), W, 24);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        assert_eq!(out.len(), 24, "{s}");
+        // The running frontier and its density block are on screen.
+        assert!(s.contains("◐ hunt · for_each · 86 units"), "{s}");
+        assert!(s.contains("52/86 ✓52 ◐6 ✗2 ○26"), "{s}");
+        assert!(s.contains("+82 more · [enter] expand"), "{s}");
+        // Every settled step folded into one summary row.
+        assert!(
+            s.contains("✓ stage-00 … stage-29  (+28 done · 2 skipped)"),
+            "{s}"
+        );
+        assert_eq!(s.matches("stage-").count(), 2, "summary names 2 ends:\n{s}");
+        // The feed keeps its minimum — and it is the newest lines.
+        let feed = feed_rows(&out);
+        assert_eq!(feed.len(), 4, "{s}");
+        assert_eq!(
+            feed.last().unwrap(),
+            "feed 11 otter#57 read_file src/lib.rs"
+        );
+        assert!(lines_of(&out).last().unwrap().starts_with("↑↓ move"), "{s}");
+    }
+
+    #[test]
+    fn live_layout_60_rows_shows_every_step_and_more_feed() {
+        let v = big_run();
+        let out = live_layout(&v, &NavState::default(), &feed(12), now(), W, 60);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+
+        assert!(out.len() <= 60, "{s}");
+        // Room for the whole graph: nothing is collapsed.
+        assert!(!s.contains("(+"), "no summary rows:\n{s}");
+        assert_eq!(s.matches("stage-").count(), 30, "{s}");
+        assert!(s.contains("○ cleanup"), "{s}");
+        assert!(s.contains("◐ hunt · for_each · 86 units"), "{s}");
+        // The 46-row graph leaves 10 rows: the feed shows its newest 10.
+        let feed = feed_rows(&out);
+        assert_eq!(feed.len(), 10, "{s}");
+        assert!(
+            feed[0].starts_with("feed 02") && feed[9].starts_with("feed 11"),
+            "{s}"
+        );
+        assert_eq!(out.len(), 60, "{s}");
+    }
+
+    #[test]
+    fn collapse_is_progressive_oldest_settled_first() {
+        // 40 rows: 32 for the graph; 46 needed, so the oldest 15 settled
+        // steps fold (saving 14 rows) and the newest 15 stay.
+        let v = big_run();
+        let s = render_plain(&live_layout(
+            &v,
+            &NavState::default(),
+            &feed(12),
+            now(),
+            W,
+            40,
+        ));
+        assert!(
+            s.contains("✓ stage-00 … stage-14  (+13 done · 2 skipped)"),
+            "{s}"
+        );
+        assert!(!s.contains("stage-14 ·"), "{s}");
+        assert!(s.contains("✓ stage-15 ·"), "stage-15 stays expanded:\n{s}");
+        assert!(s.contains("✓ stage-29 ·"), "{s}");
+        assert!(s.contains("○ cleanup"), "pending is not folded:\n{s}");
+    }
+
+    #[test]
+    fn breadcrumb_row_appears_only_when_drilled() {
+        let v = big_run();
+        let run_depth = lines_of(&live_layout(
+            &v,
+            &NavState::default(),
+            &feed(12),
+            now(),
+            W,
+            30,
+        ));
+        assert!(run_depth.iter().all(|l| !l.contains('›')), "{run_depth:#?}");
+
+        let nav = drilled_at(&v, 30, 0);
+        assert_eq!(nav.depth(), Depth::Step);
+        let out = live_layout(&v, &nav, &feed(12), now(), W, 24);
+        let s = render_plain(&out);
+        insta::assert_snapshot!(s);
+        let lines = lines_of(&out);
+        // Dashboard (3 rows), then the breadcrumb.
+        assert_eq!(lines[3], "mint-tundra › hunt", "{s}");
+        // The expanded fan-out is bounded to the terminal, keeps its header +
+        // density, the cursor unit, and says what was dropped.
+        assert!(out.len() <= 24, "{s}");
+        assert!(lines[4].starts_with("  ✓ stage-00 … stage-29"), "{s}");
+        assert!(
+            lines[5].starts_with("▸ ◐ hunt · for_each · 86 units"),
+            "{s}"
+        );
+        assert!(lines[6].contains("52/86 ✓52 ◐6 ✗2 ○26"), "{s}");
+        assert!(
+            lines[7].starts_with("  ▸ ┣━ ✓") && lines[7].contains("svc-0 "),
+            "{s}"
+        );
+        assert!(s.contains("⋮ +"), "{s}");
+        assert_eq!(feed_rows(&out).len(), 4, "{s}");
+
+        // One level deeper the path grows a unit crumb.
+        let mut unit_nav = nav;
+        unit_nav.apply(NavKey::In, &v);
+        assert_eq!(unit_nav.depth(), Depth::Unit);
+        let out = live_layout(&v, &unit_nav, &feed(12), now(), W, 24);
+        assert_eq!(lines_of(&out)[3], "mint-tundra › hunt › svc-0");
+    }
+
+    #[test]
+    fn breadcrumb_clips_from_the_left_and_yields_before_the_frontier() {
+        let crumbs: Vec<String> = ["mint-tundra", "hunt", "otter#41", "wren#1"]
+            .map(String::from)
+            .to_vec();
+        let plain = |w: usize| render_plain(&[crumb_line(&crumbs, w).unwrap()]);
+        assert_eq!(plain(80), "mint-tundra › hunt › otter#41 › wren#1");
+        // Too narrow: the root crumbs go first, the deepest one stays.
+        assert_eq!(plain(28), "… › hunt › otter#41 › wren#1");
+        assert_eq!(plain(27), "… › otter#41 › wren#1");
+        assert_eq!(plain(21), "… › otter#41 › wren#1");
+        assert_eq!(plain(20), "… › wren#1");
+        assert_eq!(plain(10), "… › wren#1");
+        assert_eq!(plain(6), "… › w…");
+        assert!(crumb_line(&[], 80).is_none());
+
+        // At the very floor there is no spare row for the breadcrumb: it
+        // yields so the frontier still fits.
+        let v = big_run();
+        let floor = dashboard(&v, now()).len() + 1 + 4 + 1;
+        let nav = drilled_at(&v, 30, 0);
+        let out = live_layout(&v, &nav, &feed(12), now(), W, floor);
+        let s = render_plain(&out);
+        assert_eq!(out.len(), floor, "{s}");
+        assert!(!s.contains("mint-tundra ›"), "{s}");
+        assert_eq!(hunt_headers(&out), 1, "{s}");
+    }
+
+    #[test]
+    fn footer_is_a_context_key_legend() {
+        let mut v = RunView::default();
+        v.status = RunStatus::AwaitingApproval;
+        complete(&mut v, "build");
+        let gate = v.step_mut("gate");
+        gate.kind = StepKind::ApprovalGate;
+        gate.state = StepState::AwaitingApproval;
+        v.step_mut("deploy");
+
+        let footer = |nav: &NavState, w: usize| {
+            let out = live_layout(&v, nav, &feed(6), now(), w, 24);
+            render_plain(&out[out.len() - 1..])
+        };
+        let normal = "↑↓ move · enter drill · ← back · / filter · q quit";
+        let at_gate = "a approve · r reject · v findings · q quit";
+        // Not selecting anything, or selecting another step: navigation keys.
+        assert_eq!(footer(&NavState::default(), W), normal);
+        assert_eq!(footer(&nav_at(&v, 2), W), normal);
+        // Selecting the parked gate: the modal approve/reject set.
+        assert_eq!(footer(&nav_at(&v, 1), W), at_gate);
+        assert_eq!(footer(&drilled_at(&v, 1, 0), W), at_gate);
+
+        // A narrow terminal drops the least important hints; `q quit` stays.
+        assert_eq!(
+            footer(&NavState::default(), 30),
+            "↑↓ move · enter drill · q quit"
+        );
+        assert_eq!(footer(&nav_at(&v, 1), 30), "a approve · r reject · q quit");
+        assert_eq!(footer(&nav_at(&v, 1), 24), "a approve · q quit");
+        assert_eq!(footer(&NavState::default(), 6), "q quit");
+    }
+
+    #[test]
+    fn selected_and_failed_steps_are_never_collapsed() {
+        let mut v = big_run();
+        v.step_mut("stage-20").state = StepState::Failed;
+        // Select a settled step in the middle of the settled region.
+        let s = render_plain(&live_layout(&v, &nav_at(&v, 10), &feed(12), now(), W, 24));
+        assert!(s.contains("▸ ✓ stage-10 "), "selected stays:\n{s}");
+        assert!(s.contains("✗ stage-20 · "), "failed stays:\n{s}");
+        // Runs either side of the kept rows fold independently.
+        assert!(
+            s.contains("✓ stage-00 … stage-09  (+8 done · 2 skipped)"),
+            "{s}"
+        );
+        assert!(s.contains("✓ stage-11 … stage-19  (+9 done)"), "{s}");
+        assert!(s.contains("✓ stage-21 … stage-29  (+9 done)"), "{s}");
+        assert!(s.contains("◐ hunt · for_each"), "{s}");
+    }
+
+    #[test]
+    fn state_survives_a_narrow_terminal() {
+        // `scan` is selected: its label is long, its state is what matters.
+        let v = graph_view();
+        let out = live_layout(&v, &nav_at(&v, 3), &feed(4), now(), 44, 24);
+        let rows = lines_of(&out);
+        let scan = rows.iter().find(|l| l.contains("scan")).unwrap();
+        assert!(scan.ends_with(" ···· ◐ running"), "{scan}");
+        assert!(scan.contains('…') && scan.starts_with("▸ ◐ scan"), "{scan}");
+        assert!(out.iter().all(|l| l.width() <= 44), "{rows:#?}");
+
+        // A done row keeps its duration, a fan-out unit row its state.
+        let s = render_plain(&live_layout(&v, &nav_at(&v, 3), &feed(4), now(), 26, 24));
+        assert!(s.contains("✓ 18s"), "{s}");
+        let fan = big_run();
+        let s = render_plain(&live_layout(
+            &fan,
+            &drilled_at(&fan, 30, 1),
+            &feed(4),
+            now(),
+            40,
+            30,
+        ));
+        let unit = s
+            .lines()
+            .find(|l| l.contains("┣━") || l.contains("┗━"))
+            .unwrap();
+        assert!(unit.ends_with("◐ running"), "{s}");
+        assert!(
+            unit.contains('…') && unicode_width::UnicodeWidthStr::width(unit) <= 40,
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn frontier_and_feed_are_always_visible_above_the_floor() {
+        let v = big_run();
+        let feed = feed(12);
+        let floor = dashboard(&v, now()).len() + 1 + 4 + 1;
+        let navs = [
+            ("following", NavState::default()),
+            ("select hunt", nav_at(&v, 30)),
+            ("select a settled step", nav_at(&v, 3)),
+            ("select the last pending step", nav_at(&v, 39)),
+            ("drill hunt", drilled_at(&v, 30, 0)),
+            ("drill hunt, failed filter", drilled_at(&v, 30, 2)),
+            ("drill a settled step", drilled_at(&v, 3, 0)),
+            ("drill a pending step", drilled_at(&v, 35, 0)),
+            ("drill a unit", {
+                let mut n = drilled_at(&v, 30, 0);
+                n.apply(NavKey::In, &v);
+                n
+            }),
+        ];
+        for (name, nav) in &navs {
+            for w in [100usize, 60, 30] {
+                for h in floor..=70 {
+                    let out = live_layout(&v, nav, &feed, now(), w, h);
+                    let s = render_plain(&out);
+                    let ctx = format!("{name} w={w} h={h}\n{s}");
+                    assert!(out.len() <= h, "{ctx}");
+                    assert!(out.iter().all(|l| l.width() <= w), "{ctx}");
+                    assert!(hunt_headers(&out) >= 1, "frontier row missing:\n{ctx}");
+                    let fr = feed_rows(&out);
+                    assert!(fr.len() >= 4, "feed shrank below its floor:\n{ctx}");
+                    assert!(
+                        fr[fr.len() - 1].starts_with("feed 11"),
+                        "newest feed:\n{ctx}"
+                    );
+                    assert!(
+                        lines_of(&out).last().unwrap().ends_with("q quit"),
+                        "footer is always the last row:\n{ctx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_drilled_non_frontier_fan_out_does_not_push_the_frontier_off() {
+        // `sweep` (done, 30 units) is drilled; `hunt` is what is running.
+        let mut v = RunView::default();
+        v.crew = Some("mint-tundra".into());
+        v.status = RunStatus::Running;
+        start_as(&mut v, "sweep", StepKind::ForEach, None, None);
+        for i in 0..30 {
+            v.step_mut("sweep")
+                .units
+                .insert(i, unit(i, UnitStatus::Done));
+        }
+        v.step_mut("sweep").state = StepState::Complete;
+        start_as(&mut v, "hunt", StepKind::ForEach, None, None);
+        for (i, st) in statuses_86().into_iter().take(10).enumerate() {
+            v.step_mut("hunt").units.insert(i, unit(i, st));
+        }
+        let nav = drilled_at(&v, 0, 0);
+        assert_eq!(nav.selected_step(&v).unwrap().step_id, "sweep");
+        // dashboard 2 + breadcrumb 1 + footer 1 + feed 4 = 8 fixed rows.
+        for h in 9..=30 {
+            let out = live_layout(&v, &nav, &feed(8), now(), W, h);
+            let s = render_plain(&out);
+            assert!(out.len() <= h, "h={h}\n{s}");
+            // The frontier is on screen at every height…
+            assert_eq!(hunt_headers(&out), 1, "h={h}\n{s}");
+            assert!(feed_rows(&out).len() >= 4, "h={h}\n{s}");
+            // …and once the graph has room for both headers + densities, so
+            // is the drilled step the operator asked for.
+            if h >= 8 + 4 {
+                assert!(s.contains("▸ ✓ sweep · for_each · 30 units"), "h={h}\n{s}");
+                assert!(s.contains("30/30 ✓30"), "h={h}\n{s}");
+            }
+        }
+        // With room, the drilled list shows its cursor unit as well.
+        let s = render_plain(&live_layout(&v, &nav, &feed(8), now(), W, 26));
+        assert!(s.contains("▸ ┣━ ✓") && s.contains("svc-0 "), "{s}");
+    }
+
+    #[test]
+    fn many_running_steps_are_clipped_around_the_first_with_a_marker() {
+        // 12 parallel running steps cannot all fit: the graph keeps the
+        // frontier's start, never a window that starts past it.
+        let mut v = RunView::default();
+        v.status = RunStatus::Running;
+        complete(&mut v, "prep");
+        for i in 0..12 {
+            start(&mut v, &format!("lane-{i:02}"));
+        }
+        let floor = dashboard(&v, now()).len() + 1 + 4 + 1;
+        for h in floor..=floor + 6 {
+            let out = live_layout(&v, &NavState::default(), &feed(10), now(), W, h);
+            let s = render_plain(&out);
+            assert_eq!(out.len(), h, "{s}");
+            assert!(s.contains("◐ lane-00"), "first frontier row kept:\n{s}");
+            assert!(feed_rows(&out).len() >= 4, "{s}");
+        }
+        let s = render_plain(&live_layout(
+            &v,
+            &NavState::default(),
+            &feed(10),
+            now(),
+            W,
+            floor + 4,
+        ));
+        assert!(s.contains("⋮ +"), "says rows were cut:\n{s}");
+    }
+
+    #[test]
+    fn feed_shorter_than_its_floor_gives_the_rest_to_the_graph() {
+        let v = big_run();
+        // No feed at all: the graph gets every row it can use.
+        let out = live_layout(&v, &NavState::default(), &[], now(), W, 24);
+        assert_eq!(out.len(), 24);
+        assert!(feed_rows(&out).is_empty());
+        let with_feed = live_layout(&v, &NavState::default(), &feed(2), now(), W, 24);
+        assert_eq!(feed_rows(&with_feed).len(), 2);
+        // Each feed row costs the graph one: the 46-row graph folds its oldest
+        // settled steps only as far as it must (20 rows free, then 18).
+        let shows = |o: &[Line], step: &str| render_plain(o).contains(&format!("✓ {step} ·"));
+        assert!(shows(&out, "stage-27") && shows(&out, "stage-29"));
+        assert!(!shows(&with_feed, "stage-27") && shows(&with_feed, "stage-29"));
+    }
+
+    #[test]
+    fn cramped_terminals_still_get_a_bounded_useful_frame() {
+        let v = big_run();
+        let floor = dashboard(&v, now()).len() + 1 + 4 + 1;
+        for h in 0..floor {
+            let out = live_layout(&v, &NavState::default(), &feed(12), now(), W, h);
+            let s = render_plain(&out);
+            assert!(out.len() <= h, "h={h}\n{s}");
+            if h > 0 {
+                assert!(s.lines().last().unwrap().ends_with("q quit"), "h={h}\n{s}");
+            }
+        }
+        assert!(live_layout(&v, &NavState::default(), &feed(12), now(), W, 0).is_empty());
+        assert!(live_layout(&v, &NavState::default(), &feed(12), now(), 0, 24).is_empty());
+        // h=3: title, the frontier row, the footer.
+        let s = render_plain(&live_layout(
+            &v,
+            &NavState::default(),
+            &feed(12),
+            now(),
+            W,
+            3,
+        ));
+        let rows: Vec<&str> = s.lines().collect();
+        assert!(rows[0].starts_with("assess-services"), "{s}");
+        assert!(rows[1].contains("hunt · for_each"), "{s}");
+    }
+
+    // ---- NavState edges through live_layout ------------------------------------
+
+    #[test]
+    fn drilling_into_a_step_with_no_units_renders_without_panicking() {
+        let v = graph_view(); // `scan` (index 3) dispatches sub-agents, has no units
+        let mut nav = nav_at(&v, 3);
+        nav.apply(NavKey::In, &v);
+        assert_eq!(nav.depth(), Depth::Step);
+        nav.apply(NavKey::In, &v); // nothing to descend into: stays put
+        assert_eq!(nav.depth(), Depth::Step);
+
+        let out = live_layout(&v, &nav, &feed(6), now(), W, 24);
+        let lines = lines_of(&out);
+        let s = render_plain(&out);
+        assert!(out.len() <= 24, "{s}");
+        // Dashboard (2 rows: no usage yet), then the breadcrumb.
+        assert_eq!(lines[2], "scan", "{s}");
+        assert!(s.contains("▸ ◐ scan"), "{s}");
+        assert!(s.contains("┗━ ◐ lynx#3"), "sub-agents still listed:\n{s}");
+        assert_eq!(feed_rows(&out).len(), 6, "{s}");
+    }
+
+    #[test]
+    fn nav_clamps_when_the_view_shrinks_or_grows_between_calls() {
+        let v = graph_view(); // 4 steps
+        let mut nav = nav_at(&v, 3); // on the last
+        nav.apply(NavKey::In, &v);
+
+        // The next tick's view is shorter. Stale nav must not panic…
+        let mut shorter = RunView::default();
+        shorter.status = RunStatus::Running;
+        start(&mut shorter, "only");
+        let stale = live_layout(&shorter, &nav, &feed(6), now(), W, 24);
+        assert!(render_plain(&stale).contains("▸ ◐ only"));
+        // …and after `sync` the cursor is re-clamped to the real last step.
+        nav.sync(&shorter);
+        assert_eq!(nav.selected_step(&shorter).unwrap().step_id, "only");
+        let out = live_layout(&shorter, &nav, &feed(6), now(), W, 24);
+        assert_eq!(lines_of(&out)[2], "only", "{}", render_plain(&out));
+
+        // A view that emptied out entirely is just a dashboard + feed + footer.
+        let empty = RunView::default();
+        nav.sync(&empty);
+        assert_eq!(nav.depth(), Depth::Run);
+        let out = live_layout(&empty, &nav, &feed(6), now(), W, 24);
+        assert!(out.len() <= 24 && feed_rows(&out).len() == 6);
+
+        // Growth keeps the operator on the same index; the new steps append.
+        let mut nav = nav_at(&v, 3);
+        let grown = big_run();
+        nav.sync(&grown);
+        assert_eq!(nav.selected_step(&grown).unwrap().step_id, "stage-03");
+        let s = render_plain(&live_layout(&grown, &nav, &feed(6), now(), W, 24));
+        assert!(s.contains("▸ ✓ stage-03 "), "{s}");
     }
 }
