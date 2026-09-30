@@ -221,7 +221,8 @@ pub fn md_to_typst(md: &str) -> String {
                 inlines.push(emit);
             }
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough) => {
-                if inlines.pop().unwrap_or(false) {
+                let emitted = inlines.pop().unwrap_or(false);
+                if emitted {
                     open_inlines -= 1;
                     out.push(']');
                 }
@@ -234,7 +235,8 @@ pub fn md_to_typst(md: &str) -> String {
                 quotes.push(emit);
             }
             Event::End(TagEnd::BlockQuote(_)) => {
-                if quotes.pop().unwrap_or(false) {
+                let emitted = quotes.pop().unwrap_or(false);
+                if emitted {
                     out.push_str("]\n");
                 }
             }
