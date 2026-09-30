@@ -697,6 +697,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens: 0,
+                purpose: None,
             })
             .unwrap();
         writer

@@ -8242,6 +8242,7 @@ mod tests {
                         input_tokens: 10,
                         output_tokens: 20,
                         cached_tokens: 0,
+                        purpose: None,
                     })
                     .unwrap(),
                 );
@@ -9221,6 +9222,7 @@ mod tests {
             input_tokens: 12,
             output_tokens: 5,
             cached_tokens: 2,
+            purpose: None,
         });
 
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 120, 12);
@@ -9638,6 +9640,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 4,
             cached_tokens: 0,
+            purpose: None,
         });
         state.push_transcript_event(&TranscriptEvent::AssistantMessage {
             content: "Hello world".into(),

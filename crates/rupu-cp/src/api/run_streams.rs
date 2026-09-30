@@ -2114,6 +2114,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 50,
                 cached_tokens: 0,
+                purpose: None,
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),
@@ -2122,6 +2123,7 @@ mod tests {
                 input_tokens: 20,
                 output_tokens: 10,
                 cached_tokens: 0,
+                purpose: None,
             },
             rupu_transcript::Event::RunComplete {
                 run_id: run_id.into(),

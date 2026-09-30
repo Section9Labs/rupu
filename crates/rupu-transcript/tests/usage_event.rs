@@ -9,6 +9,7 @@ fn usage_event_serde_roundtrip() {
         input_tokens: 1234,
         output_tokens: 567,
         cached_tokens: 890,
+        purpose: None,
     };
     let json = serde_json::to_string(&e).unwrap();
     assert!(json.contains("\"type\":\"usage\""));
@@ -24,6 +25,7 @@ fn usage_event_serde_roundtrip() {
             input_tokens,
             output_tokens,
             cached_tokens,
+            purpose,
         } => {
             assert_eq!(provider, "anthropic");
             assert_eq!(model, "claude-sonnet-4-6");
@@ -31,6 +33,7 @@ fn usage_event_serde_roundtrip() {
             assert_eq!(input_tokens, 1234);
             assert_eq!(output_tokens, 567);
             assert_eq!(cached_tokens, 890);
+            assert_eq!(purpose, None);
         }
         _ => panic!("expected Event::Usage"),
     }
@@ -45,6 +48,7 @@ fn usage_event_with_served_model_roundtrips() {
         input_tokens: 10,
         output_tokens: 20,
         cached_tokens: 0,
+        purpose: None,
     };
     let json = serde_json::to_string(&e).unwrap();
     assert!(json.contains("\"served_model\":\"claude-mythos-preview\""));
@@ -82,4 +86,30 @@ fn old_usage_json_without_served_model_deserializes() {
         }
         _ => panic!("expected Event::Usage"),
     }
+}
+
+#[test]
+fn usage_purpose_round_trips_and_defaults_to_none() {
+    let with = rupu_transcript::Event::Usage {
+        provider: "anthropic".into(),
+        model: "m".into(),
+        served_model: None,
+        input_tokens: 10,
+        output_tokens: 2,
+        cached_tokens: 0,
+        purpose: Some("compaction".into()),
+    };
+    let json = serde_json::to_string(&with).unwrap();
+    assert!(json.contains("\"purpose\":\"compaction\""));
+    let back: rupu_transcript::Event = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, with);
+
+    // Older lines (no purpose) still parse, as None, and don't serialize it.
+    let old = r#"{"type":"usage","data":{"provider":"p","model":"m","input_tokens":1,"output_tokens":1,"cached_tokens":0}}"#;
+    let ev: rupu_transcript::Event = serde_json::from_str(old).unwrap();
+    match &ev {
+        rupu_transcript::Event::Usage { purpose, .. } => assert!(purpose.is_none()),
+        _ => panic!("expected usage"),
+    }
+    assert!(!serde_json::to_string(&ev).unwrap().contains("purpose"));
 }

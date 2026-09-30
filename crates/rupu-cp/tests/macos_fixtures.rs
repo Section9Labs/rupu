@@ -439,6 +439,7 @@ fn transcript_events_fixture_is_current() {
             input_tokens: 1000,
             output_tokens: 200,
             cached_tokens: 50,
+            purpose: None,
         },
         rupu_transcript::Event::Usage {
             provider: "anthropic".into(),
@@ -447,6 +448,7 @@ fn transcript_events_fixture_is_current() {
             input_tokens: 10,
             output_tokens: 5,
             cached_tokens: 0,
+            purpose: None,
         },
         rupu_transcript::Event::RunComplete {
             run_id: "run-01".into(),

@@ -1545,6 +1545,7 @@ mod tests {
             input_tokens,
             output_tokens: 0,
             cached_tokens: 0,
+            purpose: None,
         };
         let mut buf = Vec::new();
         for ev in [&start, &usage] {

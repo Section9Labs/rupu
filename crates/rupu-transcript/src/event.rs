@@ -141,6 +141,12 @@ pub enum Event {
         output_tokens: u32,
         #[serde(default)]
         cached_tokens: u32,
+        /// Why this call happened, when it is not a normal agent turn.
+        /// `Some("compaction")` = the context-compaction summariser call —
+        /// real, billed spend that is NOT an agent turn (turn counters skip
+        /// it; token/cost totals include it). `None` = a normal turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
     },
     RunComplete {
         run_id: String,

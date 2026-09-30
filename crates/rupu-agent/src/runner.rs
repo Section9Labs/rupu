@@ -1313,6 +1313,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 input_tokens: resp.usage.input_tokens,
                 output_tokens: billable_output_tokens as u32,
                 cached_tokens: resp.usage.cached_tokens,
+                purpose: None,
             })?;
 
             // Proactive context compaction: if the previous turn's input exceeded

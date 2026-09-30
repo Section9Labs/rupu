@@ -84,6 +84,7 @@ fn write_run_transcript(path: &std::path::Path, model: &str) {
         input_tokens: 1000,
         output_tokens: 200,
         cached_tokens: 0,
+        purpose: None,
     };
     let mut buf = Vec::new();
     for ev in [&start, &usage] {
@@ -263,6 +264,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 input_tokens: 1000,
                 output_tokens: 200,
                 cached_tokens: 0,
+                purpose: None,
             })
             .unwrap(),
         ),
@@ -541,6 +543,7 @@ fn write_run_transcript_for(
         input_tokens,
         output_tokens,
         cached_tokens: 0,
+        purpose: None,
     };
     let mut buf = Vec::new();
     for ev in [&start, &usage] {

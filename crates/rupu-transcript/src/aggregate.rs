@@ -255,6 +255,7 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            purpose: None,
         }
     }
 
@@ -349,6 +350,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             cached_tokens: 0,
+            purpose: None,
         };
         let sonnet = Event::Usage {
             provider: "anthropic".into(),
@@ -357,6 +359,7 @@ mod tests {
             input_tokens: 30,
             output_tokens: 10,
             cached_tokens: 0,
+            purpose: None,
         };
         let p = write_transcript(
             tmp.path(),

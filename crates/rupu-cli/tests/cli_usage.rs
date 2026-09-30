@@ -63,6 +63,7 @@ fn write_usage_transcript(
             input_tokens,
             output_tokens,
             cached_tokens: 0,
+            purpose: None,
         })
         .unwrap();
     writer
