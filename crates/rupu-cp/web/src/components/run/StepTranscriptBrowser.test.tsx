@@ -85,4 +85,14 @@ describe('StepTranscriptBrowser', () => {
     // key stays visible for rows
     expect(screen.getByTitle('item-a')).toBeTruthy();
   });
+
+  it('orders a named row identity-first, item key second (spec §9)', () => {
+    const units: UnitView[] = [{ ...UNITS[0], codename: 'jade-reef/heron#0' }];
+    render(<StepTranscriptBrowser stepId="process_items" units={units} agent="scanner" />);
+    const ident = screen.getByTestId('unit-identity');
+    const key = screen.getByTestId('unit-key');
+    // DOCUMENT_POSITION_FOLLOWING: key comes after identity in the row
+    expect(ident.compareDocumentPosition(key) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(key.textContent).toBe('item-a');
+  });
 });

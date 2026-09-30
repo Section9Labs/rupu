@@ -142,17 +142,28 @@ export default function StepTranscriptBrowser({
                       >
                         {st.glyph}
                       </span>
-                      <span className="truncate font-mono text-ink" title={u.key}>
-                        {u.key}
-                      </span>
-                      {u.codename && (
-                        <span className="min-w-0 truncate text-ink-dim">
-                          <AgentName
-                            codename={u.codename}
-                            agent={u.agent ?? agent}
-                            provider={u.provider}
-                            model={u.model}
-                          />
+                      {/* Identity first (who), item key second (context) — spec §9. */}
+                      {u.codename ? (
+                        <>
+                          <span data-testid="unit-identity" className="min-w-0 shrink truncate text-ink">
+                            <AgentName
+                              codename={u.codename}
+                              agent={u.agent ?? agent}
+                              provider={u.provider}
+                              model={u.model}
+                            />
+                          </span>
+                          <span
+                            data-testid="unit-key"
+                            className="min-w-0 truncate font-mono text-ink-dim"
+                            title={u.key}
+                          >
+                            {u.key}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="truncate font-mono text-ink" title={u.key}>
+                          {u.key}
                         </span>
                       )}
                       <span
