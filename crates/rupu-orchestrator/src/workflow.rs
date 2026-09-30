@@ -200,6 +200,14 @@ pub enum WorkflowParseError {
     ActionsUnsupportedOnRemoteStep { step: String },
     #[error("step `{step}`: `findings_profile` is not supported on an `action:` step; set `defaults.findings_profile` instead")]
     FindingsProfileOnActionStep { step: String },
+    #[error("step `{step}`: `findings_profile` is not yet supported on a remote step (`host:` / `distribute:`); set `findingsProfile` in the agent's frontmatter instead")]
+    FindingsProfileOnRemoteStep { step: String },
+    #[error("`defaults.findings_profile` does not yet reach remote step `{step}` (`host:` / `distribute:`); set `findings_profile` on the local steps and `findingsProfile` in the remote agent's frontmatter instead")]
+    FindingsProfileDefaultWithRemoteSteps { step: String },
+    #[error(
+        "step `{step}`: `findings_profile` has no effect on a step that runs no agent; remove it"
+    )]
+    FindingsProfileOnNonAgentStep { step: String },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -1273,6 +1281,7 @@ impl Workflow {
             validate_step_shape(step)?;
             validate_step_actions(step)?;
         }
+        validate_findings_profile_default(&wf)?;
         for (name, def) in &wf.inputs {
             validate_input_def(name, def)?;
         }
@@ -1848,12 +1857,63 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         });
     }
 
-    if step.action.is_some() && step.findings_profile.is_some() {
-        return Err(WorkflowParseError::FindingsProfileOnActionStep {
+    if step.findings_profile.is_some() {
+        if step.action.is_some() {
+            return Err(WorkflowParseError::FindingsProfileOnActionStep {
+                step: step.id.clone(),
+            });
+        }
+        // A step that runs no agent has no findings contract to configure.
+        // Branch / standalone gate / `run:` / bare `split`/`join` nodes are
+        // classified with the same predicates the shape validation above
+        // uses. (A `loop:<name>` supernode is synthesized at run time and
+        // never appears in parsed YAML, so it cannot carry this field.)
+        let runs_no_agent = step.branch.is_some()
+            || is_approval_gate(step)
+            || step.run.is_some()
+            || ((step.split.is_some() || step.join.is_some())
+                && step.agent.is_none()
+                && step.prompt.is_none()
+                && step.for_each.is_none()
+                && step.parallel.is_none()
+                && step.panel.is_none());
+        if runs_no_agent {
+            return Err(WorkflowParseError::FindingsProfileOnNonAgentStep {
+                step: step.id.clone(),
+            });
+        }
+        // A remote unit never reaches `build_opts_for_step`; it launches
+        // `rupu run` on the host via a request that carries no profile, so
+        // the field would be silently ignored. Fail closed (same class as
+        // `ActionsUnsupportedOnRemoteStep`).
+        if step.host.is_some() || step.distribute.is_some() {
+            return Err(WorkflowParseError::FindingsProfileOnRemoteStep {
+                step: step.id.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// `defaults.findings_profile` is resolved per step in `build_opts_for_step`,
+/// which a remote (`host:` / `distribute:`) step never reaches — so with any
+/// remote step present the default would be silently ignored on that step.
+/// Reject the combination at parse time (same fail-closed class as
+/// [`WorkflowParseError::ActionsUnsupportedOnRemoteStep`]).
+fn validate_findings_profile_default(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    if wf.defaults.findings_profile.is_none() {
+        return Ok(());
+    }
+    if let Some(step) = wf
+        .steps
+        .iter()
+        .find(|s| s.host.is_some() || s.distribute.is_some())
+    {
+        return Err(WorkflowParseError::FindingsProfileDefaultWithRemoteSteps {
             step: step.id.clone(),
         });
     }
-
     Ok(())
 }
 
@@ -3096,6 +3156,105 @@ steps:
             matches!(err, WorkflowParseError::FindingsProfileOnActionStep { .. }),
             "{err}"
         );
+    }
+
+    // ── findings_profile fails closed where it would be silently ignored ────
+
+    #[test]
+    fn findings_profile_on_a_host_step_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: r\n    agent: a\n    prompt: p\n    host: some-host\n    findings_profile: summary\n";
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::FindingsProfileOnRemoteStep { step } => assert_eq!(step, "r"),
+            other => panic!("expected FindingsProfileOnRemoteStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findings_profile_on_a_distribute_step_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: fan
+    for_each: "x"
+    agent: a
+    prompt: p
+    distribute:
+      hosts: [h1]
+    findings_profile: full
+"#;
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::FindingsProfileOnRemoteStep { .. }
+        ));
+    }
+
+    #[test]
+    fn default_findings_profile_with_a_remote_step_is_rejected() {
+        let raw = "name: w\ndefaults:\n  findings_profile: summary\nsteps:\n  - id: local\n    agent: a\n    prompt: p\n  - id: remote\n    agent: a\n    prompt: p\n    host: some-host\n";
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::FindingsProfileDefaultWithRemoteSteps { step } => {
+                assert_eq!(step, "remote");
+            }
+            other => panic!("expected FindingsProfileDefaultWithRemoteSteps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_findings_profile_with_only_local_steps_still_parses() {
+        let raw = "name: w\ndefaults:\n  findings_profile: summary\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).expect("defaults.findings_profile is fine with local steps");
+        assert_eq!(
+            wf.defaults.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+    }
+
+    #[test]
+    fn remote_step_without_any_findings_profile_still_parses() {
+        // The new checks only fire when a profile is actually set.
+        let raw = "name: w\nsteps:\n  - id: r\n    agent: a\n    prompt: p\n    host: some-host\n";
+        Workflow::parse(raw).expect("a remote step with no findings_profile must stay legal");
+    }
+
+    #[test]
+    fn findings_profile_on_a_branch_step_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: g\n    findings_profile: summary\n    branch:\n      condition: \"{{ steps.a.output }}\"\n      then: [x]\n      else: [y]\n  - id: x\n    agent: a\n    prompt: p\n  - id: y\n    agent: a\n    prompt: p\n";
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::FindingsProfileOnNonAgentStep { step } => assert_eq!(step, "g"),
+            other => panic!("expected FindingsProfileOnNonAgentStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findings_profile_on_a_gate_step_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: gate\n    approval:\n      required: true\n    findings_profile: summary\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::FindingsProfileOnNonAgentStep { .. }
+        ));
+    }
+
+    #[test]
+    fn findings_profile_on_a_run_step_is_rejected() {
+        let raw =
+            "name: w\nsteps:\n  - id: r\n    run: { cmd: echo }\n    findings_profile: summary\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::FindingsProfileOnNonAgentStep { .. }
+        ));
+    }
+
+    #[test]
+    fn findings_profile_stays_legal_on_every_agent_running_shape() {
+        // linear, for_each, parallel, panel — the shapes that run an agent.
+        let linear = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    findings_profile: summary\n";
+        Workflow::parse(linear).expect("linear agent step");
+        let for_each = "name: w\nsteps:\n  - id: a\n    for_each: \"x\"\n    agent: x\n    prompt: p\n    findings_profile: full\n";
+        Workflow::parse(for_each).expect("for_each agent step");
+        let parallel = "name: w\nsteps:\n  - id: a\n    findings_profile: summary\n    parallel:\n      - id: s1\n        agent: x\n        prompt: p\n";
+        Workflow::parse(parallel).expect("parallel step");
+        let panel = "name: w\nsteps:\n  - id: a\n    findings_profile: summary\n    panel:\n      panelists: [x]\n      subject: s\n";
+        Workflow::parse(panel).expect("panel step");
     }
 
     // ── §3b-bis: remote (host:/distribute:) steps fail closed ────────────────
