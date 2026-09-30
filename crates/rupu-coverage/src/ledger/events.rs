@@ -256,10 +256,8 @@ mod tests {
     #[test]
     fn attribution_agent_provider_optional_on_the_wire() {
         // A legacy record (no agent/provider) still parses, as None.
-        let legacy: Attribution = serde_json::from_str(
-            r#"{"run_id":"r","model":"m","surface":"workflow"}"#,
-        )
-        .unwrap();
+        let legacy: Attribution =
+            serde_json::from_str(r#"{"run_id":"r","model":"m","surface":"workflow"}"#).unwrap();
         assert_eq!(legacy.agent, None);
         assert_eq!(legacy.provider, None);
         // None is omitted; Some round-trips.

@@ -799,20 +799,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = RunStore::new(tmp.path().join("runs"));
         std::fs::create_dir_all(store.events_path("run_x").parent().unwrap()).unwrap();
-        let agent_started = |step: &str, unit: Option<usize>, codename: Option<&str>, provider: Option<&str>| {
-            serde_json::to_string(&Event::AgentStarted {
-                run_id: "run_x".into(),
-                step_id: step.into(),
-                unit_index: unit,
-                codename: codename.map(str::to_string),
-                agent: "sec-reviewer".into(),
-                provider: provider.map(str::to_string),
-                model: provider.map(|_| "claude-sonnet-4-6".to_string()),
-                agent_run_id: "ar".into(),
-                transcript_path: "/t/a.jsonl".into(),
-            })
-            .unwrap()
-        };
+        let agent_started =
+            |step: &str, unit: Option<usize>, codename: Option<&str>, provider: Option<&str>| {
+                serde_json::to_string(&Event::AgentStarted {
+                    run_id: "run_x".into(),
+                    step_id: step.into(),
+                    unit_index: unit,
+                    codename: codename.map(str::to_string),
+                    agent: "sec-reviewer".into(),
+                    provider: provider.map(str::to_string),
+                    model: provider.map(|_| "claude-sonnet-4-6".to_string()),
+                    agent_run_id: "ar".into(),
+                    transcript_path: "/t/a.jsonl".into(),
+                })
+                .unwrap()
+            };
         let unit_started = serde_json::to_string(&Event::UnitStarted {
             run_id: "run_x".into(),
             step_id: "fan".into(),
