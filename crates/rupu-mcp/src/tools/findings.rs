@@ -28,9 +28,11 @@ pub struct FindingsContext {
     pub run_id: String,
     pub model: String,
     pub surface: rupu_coverage::Surface,
-    /// Profile + artifact store + limits. For an `action:` step this is the
-    /// workflow `defaults.findings_profile` (the dispatcher is built once per
-    /// run); a step-level `findings_profile` on an action step is a parse error.
+    /// Profile + artifact store + limits. The profile here is the run
+    /// default (workflow `defaults.findings_profile`, else `full`); the
+    /// dispatcher is built once per run, so an `action:` step's own
+    /// `findings_profile` reaches `findings.record` per call through
+    /// `ToolDispatcher::call_with_findings_profile`.
     pub options: rupu_coverage::FindingWriteOptions,
 }
 

@@ -33,9 +33,10 @@ use std::sync::Arc;
 /// is sound rather than permissive, resting on three invariants:
 ///
 /// 1. Every consumer of `opts.action_dispatcher` funnels into
-///    `execute_action_step`, whose only dispatch is `dispatcher.call(tool,
-///    …)` with `tool = step.action`. Agent-step tool calls never reach
-///    this dispatcher.
+///    `execute_action_step`, whose only dispatch is
+///    `dispatcher.call_with_findings_profile(tool, …)` with `tool =
+///    step.action` (the profile only matters to `findings.record`).
+///    Agent-step tool calls never reach this dispatcher.
 /// 2. That tool is validated against the live MCP catalog at parse time by
 ///    `validate_action_step` (`rupu-orchestrator`'s `workflow.rs`).
 /// 3. A step may not carry a non-empty `actions:` alongside `action:` —

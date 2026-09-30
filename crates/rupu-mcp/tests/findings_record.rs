@@ -321,3 +321,32 @@ async fn full_profile_refuses_an_agent_supplied_verification() {
     );
     assert!(!paths.findings.exists(), "nothing written on rejection");
 }
+
+#[tokio::test]
+async fn a_per_call_profile_overrides_the_run_default() {
+    // The dispatcher is built once per run with the run default (`full`);
+    // an action step's own `findings_profile: summary` arrives per call.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    dispatcher
+        .call("findings.record", host_finding())
+        .await
+        .expect_err("summary-shaped call is refused under the run default");
+    let out = dispatcher
+        .call_with_findings_profile(
+            "findings.record",
+            host_finding(),
+            rupu_coverage::FindingProfile::Summary,
+        )
+        .await
+        .expect("summary-shaped call records under a per-call summary profile");
+    assert!(out.starts_with("finding_id: fnd_"), "got {out}");
+    let paths = rupu_coverage::CoveragePaths::new(
+        tmp.path(),
+        &rupu_coverage::target_id(tmp.path(), "chimera-campaign"),
+    );
+    let recs = rupu_coverage::read_findings(&paths).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].profile, rupu_coverage::FindingProfile::Summary);
+}

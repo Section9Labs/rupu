@@ -198,8 +198,13 @@ pub enum WorkflowParseError {
     ActionsOnActionStep { step: String },
     #[error("step `{step}`: a non-empty `actions:` is not supported on a remote step (`host:`/`distribute:`) — the roster never reaches the remote dispatch payload, so it would be silently ignored; remove `actions:` or clear it to `[]`")]
     ActionsUnsupportedOnRemoteStep { step: String },
-    #[error("step `{step}`: `findings_profile` is not supported on an `action:` step; set `defaults.findings_profile` instead")]
-    FindingsProfileOnActionStep { step: String },
+    #[error("step `{step}`: `findings.record` records under the `{profile}` findings profile here, which needs `with:` keys {missing}; {hint}")]
+    FindingsRecordMissingKeys {
+        step: String,
+        profile: &'static str,
+        missing: String,
+        hint: &'static str,
+    },
     #[error("step `{step}`: `findings_profile` is not yet supported on a remote step (`host:` / `distribute:`); set `findingsProfile` in the agent's frontmatter instead")]
     FindingsProfileOnRemoteStep { step: String },
     #[error("`defaults.findings_profile` does not yet reach remote step `{step}` (`host:` / `distribute:`); set `findings_profile` on the local steps and `findingsProfile` in the remote agent's frontmatter instead")]
@@ -867,7 +872,8 @@ pub struct WorkflowDefaults {
     pub workspace: Option<WorkspaceMode>,
     /// Findings contract for every step unless a step overrides it:
     /// `full` (complete report) or `summary`. Absent ⇒ the agent's
-    /// `findingsProfile`, else `full`. Action steps always use this.
+    /// `findingsProfile`, else `full`. An `action:` step (which has no
+    /// agent) resolves step → this → `full`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
 }
@@ -1130,7 +1136,8 @@ pub struct Step {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMode>,
     /// Per-step findings contract override (step → workflow defaults →
-    /// agent `findingsProfile` → `full`). Not allowed on an `action:` step.
+    /// agent `findingsProfile` → `full`). On an `action:` step it sets the
+    /// profile `findings.record` records under (step → defaults → `full`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
     /// Explicit successor edge(s). Empty in a legacy (edge-free) workflow,
@@ -1241,6 +1248,18 @@ pub struct Workflow {
 }
 
 impl Workflow {
+    /// The findings profile an `action:` step's `findings.record` call
+    /// records under: the step's own `findings_profile`, else
+    /// `defaults.findings_profile`, else `full`. There is no agent
+    /// frontmatter to consult — an action step runs no agent.
+    pub fn action_findings_profile(&self, step: &Step) -> rupu_coverage::FindingProfile {
+        rupu_coverage::FindingProfile::resolve(
+            step.findings_profile,
+            self.defaults.findings_profile,
+            None,
+        )
+    }
+
     /// Parse a YAML string. Validates step-id uniqueness and input
     /// defaults / enum constraints; returns clear errors on failure.
     pub fn parse(s: &str) -> Result<Self, WorkflowParseError> {
@@ -1282,6 +1301,7 @@ impl Workflow {
             validate_step_actions(step)?;
         }
         validate_findings_profile_default(&wf)?;
+        validate_findings_record_actions(&wf)?;
         for (name, def) in &wf.inputs {
             validate_input_def(name, def)?;
         }
@@ -1858,12 +1878,10 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
     }
 
     if step.findings_profile.is_some() {
-        if step.action.is_some() {
-            return Err(WorkflowParseError::FindingsProfileOnActionStep {
-                step: step.id.clone(),
-            });
-        }
         // A step that runs no agent has no findings contract to configure.
+        // (An `action:` step is the exception: it runs no agent, but the
+        // profile decides what `findings.record` accepts, so it is allowed
+        // there — see `Workflow::action_findings_profile`.)
         // Branch / standalone gate / `run:` / bare `split`/`join` nodes are
         // classified with the same predicates the shape validation above
         // uses. (A `loop:<name>` supernode is synthesized at run time and
@@ -1893,6 +1911,78 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         }
     }
 
+    Ok(())
+}
+
+/// Every `action: findings.record` call site — top-level steps, gate
+/// `on_reject` cleanup steps, and gate `notify:` hooks — must carry the
+/// `with:` keys its resolved findings profile requires. `findings.record`'s
+/// own schema can only require `scope` (the rest depends on the profile), so
+/// without this a summary-shaped step parses under the default `full`
+/// profile and fails only when it runs. Checks key PRESENCE only: values may
+/// be minijinja templates whose shape is known only at render time.
+fn validate_findings_record_actions(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    fn check(
+        step_id: &str,
+        profile: rupu_coverage::FindingProfile,
+        with: Option<&serde_json::Value>,
+    ) -> Result<(), WorkflowParseError> {
+        use rupu_coverage::FindingProfile;
+        let (name, required, hint): (&'static str, &[&str], &'static str) = match profile {
+            FindingProfile::Full => (
+                "full",
+                &["scope", "report"],
+                "send a complete `report`, or set `findings_profile: summary` on the step (or `defaults.findings_profile: summary`) to record summary / severity / rationale",
+            ),
+            FindingProfile::Summary => (
+                "summary",
+                &["scope", "summary", "severity", "rationale"],
+                "send summary / severity / rationale, or set `findings_profile: full` to record a `report`",
+            ),
+        };
+        let keys = with.and_then(serde_json::Value::as_object);
+        let missing: Vec<String> = required
+            .iter()
+            .filter(|k| !keys.is_some_and(|m| m.contains_key(**k)))
+            .map(|k| format!("`{k}`"))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(WorkflowParseError::FindingsRecordMissingKeys {
+            step: step_id.to_string(),
+            profile: name,
+            missing: missing.join(", "),
+            hint,
+        })
+    }
+    const TOOL: &str = "findings.record";
+    for step in &wf.steps {
+        if step.action.as_deref() == Some(TOOL) {
+            check(
+                &step.id,
+                wf.action_findings_profile(step),
+                step.with.as_ref(),
+            )?;
+        }
+        let Some(ap) = &step.approval else { continue };
+        for sub in &ap.on_reject {
+            if sub.action.as_deref() == Some(TOOL) {
+                check(&sub.id, wf.action_findings_profile(sub), sub.with.as_ref())?;
+            }
+        }
+        for na in &ap.notify {
+            if na.action == TOOL {
+                // A notify hook has no step of its own to set a profile on.
+                let profile = rupu_coverage::FindingProfile::resolve(
+                    None,
+                    wf.defaults.findings_profile,
+                    None,
+                );
+                check(&format!("{}.notify", step.id), profile, Some(&na.with))?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3146,16 +3236,122 @@ steps:
         );
     }
 
+    const SUMMARY_WITH: &str =
+        "{ scope: repo, summary: s, severity: high, rationale: \"{{ steps.a.output }}\" }";
+
     #[test]
-    fn findings_profile_on_an_action_step_is_rejected() {
+    fn findings_profile_on_an_action_step_parses_and_resolves() {
+        let wf = Workflow::parse(&format!(
+            "name: w\ndefaults:\n  findings_profile: full\nsteps:\n  - id: a\n    action: findings.record\n    with: {SUMMARY_WITH}\n    findings_profile: summary\n",
+        ))
+        .expect("a local action step may set findings_profile");
+        assert_eq!(
+            wf.action_findings_profile(&wf.steps[0]),
+            rupu_coverage::FindingProfile::Summary
+        );
+    }
+
+    #[test]
+    fn action_step_profile_falls_back_to_defaults_then_full() {
+        let wf = Workflow::parse(&format!(
+            "name: w\ndefaults:\n  findings_profile: summary\nsteps:\n  - id: a\n    action: findings.record\n    with: {SUMMARY_WITH}\n",
+        ))
+        .expect("defaults.findings_profile: summary covers the action step");
+        assert_eq!(
+            wf.action_findings_profile(&wf.steps[0]),
+            rupu_coverage::FindingProfile::Summary
+        );
+        let wf = Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    action: findings.record\n    with: { scope: repo, report: \"{{ inputs.report }}\" }\n",
+        )
+        .expect("a templated report is checked for presence only");
+        assert_eq!(
+            wf.action_findings_profile(&wf.steps[0]),
+            rupu_coverage::FindingProfile::Full
+        );
+    }
+
+    #[test]
+    fn summary_shaped_findings_record_under_full_is_a_parse_error() {
+        let err = Workflow::parse(&format!(
+            "name: w\nsteps:\n  - id: record\n    action: findings.record\n    with: {SUMMARY_WITH}\n",
+        ))
+        .unwrap_err();
+        match &err {
+            WorkflowParseError::FindingsRecordMissingKeys {
+                step,
+                profile,
+                missing,
+                ..
+            } => {
+                assert_eq!(step, "record");
+                assert_eq!(*profile, "full");
+                assert_eq!(missing, "`report`");
+            }
+            other => panic!("expected FindingsRecordMissingKeys, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("findings_profile: summary"), "{msg}");
+    }
+
+    #[test]
+    fn full_shaped_findings_record_under_summary_names_every_missing_key() {
         let err = Workflow::parse(
-            "name: w\nsteps:\n  - id: a\n    action: findings.record\n    with: { scope: repo }\n    findings_profile: summary\n",
+            "name: w\nsteps:\n  - id: record\n    action: findings.record\n    with: { scope: repo, report: \"{{ inputs.report }}\" }\n    findings_profile: summary\n",
         )
         .unwrap_err();
-        assert!(
-            matches!(err, WorkflowParseError::FindingsProfileOnActionStep { .. }),
-            "{err}"
+        match err {
+            WorkflowParseError::FindingsRecordMissingKeys {
+                profile, missing, ..
+            } => {
+                assert_eq!(profile, "summary");
+                assert_eq!(missing, "`summary`, `severity`, `rationale`");
+            }
+            other => panic!("expected FindingsRecordMissingKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findings_record_in_on_reject_and_notify_is_checked_too() {
+        let on_reject = "name: w\nsteps:\n  - id: gate\n    approval:\n      required: true\n      on_reject:\n        - id: cleanup\n          action: findings.record\n          with: { scope: repo, summary: s, severity: low, rationale: r }\n";
+        match Workflow::parse(on_reject).unwrap_err() {
+            WorkflowParseError::FindingsRecordMissingKeys { step, .. } => {
+                assert_eq!(step, "cleanup")
+            }
+            other => panic!("expected FindingsRecordMissingKeys, got {other:?}"),
+        }
+        let notify = "name: w\nsteps:\n  - id: gate\n    approval:\n      required: true\n      notify:\n        - action: findings.record\n          with: { scope: repo, summary: s, severity: low, rationale: r }\n";
+        match Workflow::parse(notify).unwrap_err() {
+            WorkflowParseError::FindingsRecordMissingKeys { step, .. } => {
+                assert_eq!(step, "gate.notify")
+            }
+            other => panic!("expected FindingsRecordMissingKeys, got {other:?}"),
+        }
+        // Under a summary default both parse.
+        let summary_default = |raw: &str| {
+            raw.replacen(
+                "name: w\n",
+                "name: w\ndefaults:\n  findings_profile: summary\n",
+                1,
+            )
+        };
+        Workflow::parse(&summary_default(on_reject)).expect("on_reject under summary");
+        Workflow::parse(&summary_default(notify)).expect("notify under summary");
+    }
+
+    #[test]
+    fn an_action_step_is_always_local_so_its_profile_always_applies() {
+        // `findings_profile` is allowed on an action step because the step
+        // runs in-process, where the per-call profile reaches the tool. An
+        // action step cannot be placed on a host at all.
+        let raw = format!(
+            "name: w\nsteps:\n  - id: a\n    action: findings.record\n    with: {SUMMARY_WITH}\n    host: some-host\n    findings_profile: summary\n"
         );
+        match Workflow::parse(&raw) {
+            Err(WorkflowParseError::HostOnNonLinearStep { step }) => assert_eq!(step, "a"),
+            Err(other) => panic!("expected HostOnNonLinearStep, got {other:?}"),
+            Ok(_) => panic!("an action step must not be placed on a host"),
+        }
     }
 
     // ── findings_profile fails closed where it would be silently ignored ────

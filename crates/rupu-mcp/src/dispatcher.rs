@@ -53,6 +53,33 @@ impl ToolDispatcher {
     }
 
     pub async fn call(&self, name: &str, args: Value) -> Result<String, McpError> {
+        self.dispatch(name, args, None).await
+    }
+
+    /// [`call`](Self::call), but `findings.record` records under `profile`
+    /// instead of the run default carried in [`FindingsContext::options`].
+    ///
+    /// The action dispatcher is built once per run, while the findings
+    /// profile is per step (`step.findings_profile` → `defaults` → `full`),
+    /// so the orchestrator's action-step path passes each step's resolved
+    /// profile here. Every other tool ignores it.
+    ///
+    /// [`FindingsContext::options`]: tools::findings::FindingsContext::options
+    pub async fn call_with_findings_profile(
+        &self,
+        name: &str,
+        args: Value,
+        profile: rupu_coverage::FindingProfile,
+    ) -> Result<String, McpError> {
+        self.dispatch(name, args, Some(profile)).await
+    }
+
+    async fn dispatch(
+        &self,
+        name: &str,
+        args: Value,
+        findings_profile: Option<rupu_coverage::FindingProfile>,
+    ) -> Result<String, McpError> {
         let kind = self.kind_for(name)?;
         self.permission.check(name, kind)?;
         match name {
@@ -92,7 +119,11 @@ impl ToolDispatcher {
                 })?;
                 let parsed: tools::findings::RecordArgs = serde_json::from_value(args)
                     .map_err(|e| McpError::Tool(format!("invalid findings.record input: {e}")))?;
-                tools::findings::dispatch_record(ctx, parsed)
+                let mut ctx = ctx.clone();
+                if let Some(profile) = findings_profile {
+                    ctx.options.profile = profile;
+                }
+                tools::findings::dispatch_record(&ctx, parsed)
                     .map(|id| format!("finding_id: {id}"))
                     .map_err(McpError::Tool)
             }

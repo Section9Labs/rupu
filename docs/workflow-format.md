@@ -378,12 +378,15 @@ steps:
 Rules:
 
 - `parallel:` sub-steps inherit their parent step's profile; a sub-step has no `findings_profile` of its own.
-- `action:` steps have no step-level value: an `action: findings.record` step uses `defaults.findings_profile` (else `full`), and a `findings_profile:` on the `action:` step itself is a parse error.
+- An `action: findings.record` step resolves its profile as the step's own `findings_profile` → `defaults.findings_profile` → `full` (there is no agent frontmatter to consult). Gate `notify:` hooks have no step of their own and use `defaults.findings_profile` (else `full`).
+- `findings.record` needs different `with:` keys per profile, and a missing key is a parse error naming the step, the profile, and the keys: `full` needs `scope` and `report`; `summary` needs `scope`, `summary`, `severity`, and `rationale`. Only key presence is checked, so a value may be a `{{ … }}` template.
 - Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
 - The field must never be silently ignored, so these are parse errors:
   - `findings_profile` on a remote step (`host:` / `distribute:`) — remote units resolve their profile from the agent file, so set `findingsProfile` in that agent's frontmatter instead;
   - `defaults.findings_profile` in a workflow that has any remote step, for the same reason;
-  - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`).
+  - `findings_profile` on a step that runs no agent (`branch:`, a standalone gate / `approval:`, `run:`, or a bare `split:` / `join:`). An `action:` step is the exception above: its profile decides what `findings.record` accepts.
+
+> **Upgrading:** the built-in profile is `full`, so an existing `action: findings.record` step that sends `summary` / `severity` / `rationale` now fails to parse. Add `findings_profile: summary` to that step (or `defaults.findings_profile: summary` to the workflow), or change its `with:` to send a `report`.
 
 ### `when`
 
