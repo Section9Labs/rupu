@@ -7,10 +7,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use rupu_coverage::report::ReportSummary;
 use rupu_coverage::{
     builtin_names, coverage_status, discover_targets, file_views, list_runs, read_file_events,
     read_findings, read_snapshot, resolve_builtin, run_audit, run_diff, CoveragePaths,
-    CoverageStatusInput, DiffError, RunSelector,
+    CoverageStatusInput, DiffError, FindingRecord, RunSelector,
 };
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,16 @@ async fn list_coverage(State(s): State<AppState>) -> ApiResult<Json<Vec<Coverage
     Ok(Json(summaries))
 }
 
+/// A finding as `GET /api/coverage/:target` lists it: the report body is left
+/// to `GET /api/findings/:id`; full-profile findings carry a `report_summary`.
+#[derive(Serialize)]
+struct CoverageFindingOut {
+    #[serde(flatten)]
+    record: FindingRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report_summary: Option<ReportSummary>,
+}
+
 #[derive(Deserialize)]
 struct GetCoverageQuery {
     /// Workspace id the target lives under. Required to disambiguate colliding
@@ -129,7 +140,17 @@ async fn get_coverage(
             let paths = CoveragePaths::new(wp, &target);
             let assertions = coverage_status(&paths, CoverageStatusInput::default())
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            let findings = read_findings(&paths).map_err(|e| ApiError::internal(e.to_string()))?;
+            let findings: Vec<CoverageFindingOut> = read_findings(&paths)
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .into_iter()
+                .map(|r| {
+                    let (record, report_summary) = crate::api::findings::slim(r);
+                    CoverageFindingOut {
+                        record,
+                        report_summary,
+                    }
+                })
+                .collect();
             // Per-file heatmap. Tolerate a missing files.jsonl → empty vec so the
             // detail still renders for targets that predate the file ledger.
             let files = file_views(&read_file_events(&paths).unwrap_or_default());
@@ -477,5 +498,98 @@ mod tests {
             parse_selector(&Some("run_123".to_string()), RunSelector::Latest),
             RunSelector::RunId("run_123".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn coverage_detail_slims_full_profile_findings() {
+        use rupu_coverage::{
+            Attribution, FindingEvidence, FindingProfile, FindingScope, Severity, Surface,
+        };
+        use tower::ServiceExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let global = tmp.path();
+        let repo = global.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws = rupu_workspace::Workspace {
+            id: "ws1".to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: None,
+            initial_branch: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        std::fs::create_dir_all(global.join("workspaces")).unwrap();
+        std::fs::write(
+            global.join("workspaces/ws1.toml"),
+            toml::to_string(&ws).unwrap(),
+        )
+        .unwrap();
+
+        let report: rupu_coverage::FindingReport = serde_json::from_str(include_str!(
+            "../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+        ))
+        .unwrap();
+        let base = FindingRecord {
+            id: "fnd_summary".into(),
+            file_path: Some("src/a.rs".into()),
+            line_range: Some([1, 10]),
+            target_ref: None,
+            scope: FindingScope::Line,
+            summary: "summary".into(),
+            severity: Severity::High,
+            concern_id: None,
+            evidence: FindingEvidence {
+                code_excerpt: None,
+                rationale: "why".into(),
+                references: vec![],
+            },
+            declared_by: Attribution {
+                run_id: "run_1".into(),
+                model: "claude-sonnet-4-6".into(),
+                surface: Surface::Workflow,
+            },
+            declared_at: chrono::Utc::now(),
+            profile: FindingProfile::Summary,
+            report: None,
+        };
+        let mut full = base.clone();
+        full.id = "fnd_full".into();
+        full.profile = FindingProfile::Full;
+        full.summary = report.title.clone();
+        full.report = Some(report);
+
+        let paths = CoveragePaths::new(&repo, "tgt1");
+        paths.ensure_dir().unwrap();
+        let jsonl: String = [&base, &full]
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.findings, jsonl).unwrap();
+
+        let state = AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default());
+        let req = axum::http::Request::builder()
+            .uri("/api/coverage/tgt1?ws_id=ws1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = routes().with_state(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = json["findings"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let by_id = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
+
+        let full_row = by_id("fnd_full");
+        assert!(
+            full_row.get("report").is_none(),
+            "report body must be slimmed"
+        );
+        assert!(full_row["report_summary"]["root_cause"].is_string());
+        let summary_row = by_id("fnd_summary");
+        assert!(summary_row.get("report").is_none());
+        assert!(summary_row.get("report_summary").is_none());
     }
 }

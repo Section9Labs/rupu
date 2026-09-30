@@ -52,11 +52,20 @@ pub struct FindingOut {
     pub record: FindingRecord,
 }
 
+/// The one slimming rule for finding lists: the record without its report
+/// body, plus the summary a row needs (present only when the record had a
+/// report). Shared by `/api/findings` rows and `/api/coverage/:target`.
+pub(crate) fn slim(mut record: FindingRecord) -> (FindingRecord, Option<ReportSummary>) {
+    let summary = record.report.take().as_ref().map(summarize);
+    (record, summary)
+}
+
 impl FindingOut {
     /// The list-endpoint shape: summary fields in, report body out.
     pub(crate) fn into_list_row(mut self) -> Self {
-        self.report_summary = self.record.report.as_ref().map(summarize);
-        self.record.report = None;
+        let (record, summary) = slim(self.record);
+        self.record = record;
+        self.report_summary = summary;
         self
     }
 }
@@ -76,19 +85,37 @@ pub enum ClaimState {
 }
 
 /// One [`ClaimState`] per `report.evidence[i]`, comparing each claim's recorded
-/// `sha256` against the file's current contents under `workspace`.
+/// `sha256` against the file's current contents under `workspace`. Files larger
+/// than the artifact cap are not hashed (`Unknown`). Synchronous and
+/// potentially slow: async callers must run it under `spawn_blocking`.
 pub(crate) fn claim_states(
     workspace: &std::path::Path,
     r: &rupu_coverage::FindingReport,
+) -> Vec<ClaimState> {
+    claim_states_capped(
+        workspace,
+        r,
+        rupu_coverage::report::DEFAULT_ARTIFACT_MAX_BYTES,
+    )
+}
+
+fn claim_states_capped(
+    workspace: &std::path::Path,
+    r: &rupu_coverage::FindingReport,
+    max_bytes: u64,
 ) -> Vec<ClaimState> {
     r.evidence
         .iter()
         .map(|c| match (&c.file, &c.sha256) {
             (Some(file), Some(recorded)) => {
                 match crate::api::source::resolve_under_workspace(workspace, file) {
-                    Ok(p) if p.is_file() => match rupu_coverage::report::sha256_file(&p) {
-                        Ok(now) if &now == recorded => ClaimState::Current,
-                        Ok(_) => ClaimState::Changed,
+                    Ok(p) if p.is_file() => match std::fs::metadata(&p) {
+                        Ok(m) if m.len() > max_bytes => ClaimState::Unknown,
+                        Ok(_) => match rupu_coverage::report::sha256_file(&p) {
+                            Ok(now) if &now == recorded => ClaimState::Current,
+                            Ok(_) => ClaimState::Changed,
+                            Err(_) => ClaimState::Missing,
+                        },
                         Err(_) => ClaimState::Missing,
                     },
                     _ => ClaimState::Missing,
@@ -441,10 +468,16 @@ async fn get_finding(
         finding.workflow_name = Some(run.workflow_name);
     }
     let evidence_status = match (
-        &finding.record.report,
+        finding.record.report.clone(),
         crate::api::code::load_workspace(&s, &finding.ws_id),
     ) {
-        (Some(report), Ok(ws)) => claim_states(std::path::Path::new(&ws.path), report),
+        // Hashing reads arbitrary workspace files, so keep it off the runtime.
+        (Some(report), Ok(ws)) => {
+            let root = std::path::PathBuf::from(ws.path);
+            tokio::task::spawn_blocking(move || claim_states(&root, &report))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+        }
         (Some(report), Err(_)) => vec![ClaimState::Unknown; report.evidence.len()],
         (None, _) => Vec::new(),
     };
@@ -1170,5 +1203,66 @@ mod tests {
             assert!(row.get("report").is_none());
             assert!(row["report_summary"]["root_cause"].is_string());
         }
+    }
+
+    #[test]
+    fn claim_states_reject_paths_that_escape_the_workspace() {
+        let root = tempfile::TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = root.path().join("outside.rs");
+        std::fs::write(&outside, "fn secret() {}\n").unwrap();
+        let sha = rupu_coverage::report::sha256_file(&outside).unwrap();
+
+        let mut report = full_record("f4").report.unwrap();
+        let mut dotdot = report.evidence[0].clone();
+        dotdot.file = Some("../outside.rs".into());
+        dotdot.sha256 = Some(sha.clone());
+        let mut absolute = report.evidence[0].clone();
+        absolute.file = Some(outside.to_str().unwrap().to_string());
+        absolute.sha256 = Some(sha);
+        report.evidence = vec![dotdot, absolute];
+        // The files exist and hash correctly: only the escape check can
+        // explain a `Missing` (never `Current`).
+        assert_eq!(
+            claim_states(&ws, &report),
+            vec![ClaimState::Missing, ClaimState::Missing]
+        );
+    }
+
+    #[test]
+    fn claim_states_skip_hashing_files_over_the_size_cap() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("big.bin"), vec![7u8; 64]).unwrap();
+        let sha = rupu_coverage::report::sha256_file(&ws.path().join("big.bin")).unwrap();
+        let mut report = full_record("f5").report.unwrap();
+        report.evidence[0].file = Some("big.bin".into());
+        report.evidence[0].sha256 = Some(sha);
+        report.evidence.truncate(1);
+        assert_eq!(
+            claim_states_capped(ws.path(), &report, 63),
+            vec![ClaimState::Unknown]
+        );
+        assert_eq!(
+            claim_states_capped(ws.path(), &report, 64),
+            vec![ClaimState::Current]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_finding_for_a_summary_finding_has_empty_evidence_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let summary = finding("fnd_summary", Severity::High, "2026-09-29T00:00:00Z").record;
+        seed_workspace_findings(tmp.path(), &[summary]);
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let (status, json) =
+            get_json(routes().with_state(state), "/api/findings/fnd_summary").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["id"], "fnd_summary");
+        assert_eq!(json["evidence_status"], serde_json::json!([]));
+        assert!(json.get("report").is_none());
     }
 }
