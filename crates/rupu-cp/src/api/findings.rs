@@ -21,11 +21,10 @@ use rupu_findings_report::number::{
 };
 use rupu_findings_report::select::{describe, parse_cwe, select, Selection};
 use rupu_findings_report::{render_finding, render_project, render_split_zip, ExportError, Format};
-use rupu_orchestrator::{executor::Event, runs::RunStore};
+use rupu_orchestrator::runs::RunStore;
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
@@ -387,46 +386,16 @@ pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
 /// (`.../<sub_id>/transcript.jsonl`) has a generic `transcript` stem, so fall
 /// back to the parent directory name there. Missing/garbled file → empty.
 fn sub_run_ids_from_events(store: &RunStore, parent: &str) -> Vec<String> {
-    let path = store.events_path(parent);
-    let Ok(file) = std::fs::File::open(&path) else {
+    let Ok(body) = std::fs::read_to_string(store.events_path(parent)) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Event>(&line) else {
-            continue;
-        };
-        let tp = match event {
-            Event::UnitStarted {
-                transcript_path, ..
-            } => Some(transcript_path),
-            Event::StepWorking {
-                transcript_path: Some(p),
-                ..
-            } => Some(p),
-            _ => None,
-        };
-        if let Some(tp) = tp {
-            let id = match tp.file_stem().and_then(|s| s.to_str()) {
-                // Nested sub-run layout: `<parent>/sub/<sub_id>/transcript.jsonl`.
-                Some("transcript") => tp
-                    .parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|s| s.to_str())
-                    .map(str::to_string),
-                Some(stem) => Some(stem.to_string()),
-                None => None,
-            };
-            if let Some(id) = id {
-                out.push(id);
-            }
-        }
-    }
-    out
+    body.lines()
+        .filter_map(rupu_orchestrator::runs::known_transcript_from_event_line)
+        // Findings scope: step/unit transcripts only. A `dispatch_started`
+        // child has no step id and was never part of this scope.
+        .filter(|k| k.step_id.is_some())
+        .map(|k| k.key)
+        .collect()
 }
 
 /// `run_id → workflow_name` for each distinct, non-empty id in `run_ids` whose
@@ -1219,6 +1188,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use rupu_coverage::{Attribution, FindingEvidence, FindingScope, Surface};
+    use rupu_orchestrator::executor::Event;
 
     fn attribution() -> Attribution {
         attribution_run("run_01KS19A4MQXP")

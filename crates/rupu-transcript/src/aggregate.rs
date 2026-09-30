@@ -35,7 +35,10 @@ pub struct UsageRow {
     pub workspace_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache reads — a subset of `input_tokens`.
     pub cached_tokens: u64,
+    /// Cache writes — a subset of `input_tokens`, like `cached_tokens`.
+    pub cache_write_tokens: u64,
     /// How many distinct transcripts contributed to this row.
     pub runs: u64,
 }
@@ -101,6 +104,7 @@ pub fn aggregate<P: AsRef<Path>>(paths: &[P], window: TimeWindow) -> Vec<UsageRo
             entry.input_tokens += row.input_tokens;
             entry.output_tokens += row.output_tokens;
             entry.cached_tokens += row.cached_tokens;
+            entry.cache_write_tokens += row.cache_write_tokens;
             entry.runs += row.runs;
         }
     }
@@ -154,6 +158,7 @@ fn aggregate_one(
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                cache_write_tokens,
                 ..
             }) => {
                 // Anchor on the run-start agent, but let the Usage
@@ -168,6 +173,7 @@ fn aggregate_one(
                 row.input_tokens += input_tokens as u64;
                 row.output_tokens += output_tokens as u64;
                 row.cached_tokens += cached_tokens as u64;
+                row.cache_write_tokens += cache_write_tokens as u64;
             }
             // Ignore everything else — including parse errors that
             // bubble up from truncated lines.
@@ -256,6 +262,8 @@ mod tests {
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
+            cache_write_tokens: 0,
+            purpose: None,
         }
     }
 
@@ -350,6 +358,8 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             cached_tokens: 0,
+            cache_write_tokens: 0,
+            purpose: None,
         };
         let sonnet = Event::Usage {
             provider: "anthropic".into(),
@@ -358,6 +368,8 @@ mod tests {
             input_tokens: 30,
             output_tokens: 10,
             cached_tokens: 0,
+            cache_write_tokens: 0,
+            purpose: None,
         };
         let p = write_transcript(
             tmp.path(),
@@ -387,6 +399,42 @@ mod tests {
             .expect("sonnet row keyed by requested model");
         assert_eq!(sonnet_row.input_tokens, 30);
         assert_eq!(sonnet_row.output_tokens, 10);
+    }
+
+    #[test]
+    fn cache_write_tokens_sum_within_and_across_transcripts() {
+        let tmp = TempDir::new().unwrap();
+        let with_write = |input: u32, write: u32| Event::Usage {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            served_model: None,
+            input_tokens: input,
+            output_tokens: 1,
+            cached_tokens: 0,
+            cache_write_tokens: write,
+            purpose: None,
+        };
+        let a = write_transcript(
+            tmp.path(),
+            "a.jsonl",
+            &[
+                run_start("reviewer", "anthropic", "claude-sonnet-4-6"),
+                with_write(100, 30),
+                with_write(100, 5),
+            ],
+        );
+        let b = write_transcript(
+            tmp.path(),
+            "b.jsonl",
+            &[
+                run_start("reviewer", "anthropic", "claude-sonnet-4-6"),
+                with_write(50, 7),
+            ],
+        );
+        let rows = aggregate(&[a, b], TimeWindow::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cache_write_tokens, 42);
+        assert_eq!(rows[0].input_tokens, 250);
     }
 
     #[test]

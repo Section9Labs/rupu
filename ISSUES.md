@@ -150,9 +150,50 @@ P0/P1/P2, and a fix closes an issue only when it is observed at the consumer.
 |---|---|---|---|---|
 | I-88 | P1 | rupu-cli | A disabled autoflow still fires on the cron tick — the CP toggle writes `autoflow.enabled: false` and `push_cron` never reads it | fixed |
 | I-89 | P2 | rupu-config | `--test parse` fails intermittently under heavy parallel load — **not reproduced in 5 attempts**; needs the failing test name captured | open |
+| I-92 | P1 | rupu-runtime | Anthropic-kind `[providers.*].base_url` is ignored; only the process-wide `RUPU_ANTHROPIC_BASE_URL_OVERRIDE` env var routes to a gateway | open |
 
 
 ## Open
+
+### I-92 — anthropic-kind `[providers.*].base_url` is ignored; only the env override routes to a gateway
+
+**Where.** `crates/rupu-runtime/src/provider_factory.rs`, `build_anthropic`: the client is
+built with `AnthropicClient::from_auth` (Anthropic's own API) unless the process-wide
+`RUPU_ANTHROPIC_BASE_URL_OVERRIDE` environment variable is set, in which case
+`from_auth_with_url` gets that URL. The account's `[providers.<name>].base_url` is never
+consulted. The only reader of `[providers.*].base_url` in the factory is
+`openai_compatible_params` (`kind = "openai-compatible"`).
+
+**Symptom.** An operator who declares a gateway account —
+
+```toml
+[providers.anthropic-gw]
+kind = "anthropic"
+base_url = "https://llm-gateway.example.internal"
+```
+
+— gets requests sent to `api.anthropic.com`, not the gateway, with no warning.
+`docs/providers.md` documented `base_url` as "override the vendor's default API endpoint"
+for every account.
+
+**Impact.** Two ways to be wrong. (1) Traffic meant for a gateway silently goes to the
+vendor (or fails auth there). (2) The only working route, the env var, redirects **every**
+Anthropic account in the process. Per-account settings that exist for a gateway —
+notably `prompt_cache = false` for a gateway that rejects `cache_control` (spec
+2026-09-29 §9.4) — then protect nothing unless they are set on every Anthropic account
+the process uses: `[providers.anthropic]` keeps sending breakpoints to the gateway.
+
+**Interim (docs only).** `docs/providers.md` now says `base_url` is read only by
+openai-compatible accounts today, and that under the env override `prompt_cache = false`
+must be set on every Anthropic account actually used.
+
+**Fix.** In `build_anthropic`, prefer the account's `base_url` (normalized to the
+`/v1/messages` endpoint the client expects) over the default, keeping the env var as the
+test seam. Validate at the consumer: a test that builds an anthropic-kind account with a
+`base_url` pointing at an `httpmock` server and asserts the request lands there, and that
+a second anthropic account without `base_url` in the same process does not.
+
+---
 
 ### I-91 — `make macos-release` crashes Xcode 16.4's Swift frontend; rupu.app ships from no release
 
@@ -2012,7 +2053,7 @@ papered over. Every `file:line` in the table was re-verified against the tip of
 | `[bash].env_allowlist` | `rupu-cli/src/resume.rs:250`, `cmd/session.rs:6786` — I-18 |
 | `[retry].max_attempts` | **deleted** — I-13. Still *parses* as an inert no-op (`config.rs`'s `Config::retry`) so an existing config.toml carrying it does not lose its other keys; `Config::warn_deprecated_keys` warns; never re-serialized |
 | `[retry].initial_delay_ms` | as above — **deleted**, I-13 |
-| `[providers.*].base_url` | `rupu-runtime/src/provider_factory.rs:66` (`openai_compatible_params`) |
+| `[providers.*].base_url` | `rupu-runtime/src/provider_factory.rs:66` (`openai_compatible_params`) — openai-compatible accounts only; **anthropic-kind accounts ignore it** (I-92) |
 | `[providers.*].kind` | `rupu-runtime/src/provider_factory.rs:63`; validated in `config.rs:169` |
 | `[providers.*].stream` | `rupu-runtime/src/provider_factory.rs:80` |
 | `[providers.*].default_model` | `rupu-runtime/src/provider_factory.rs:67` + `resolve_model`'s third tier |
@@ -2021,6 +2062,7 @@ papered over. Every `file:line` in the table was re-verified against the tip of
 | `[providers.*].timeout_ms` | `rupu-providers/src/tuning.rs` (`client_timeout` → `http_client_builder`) → each client's `with_tuning` — **I-9, wired here** |
 | `[providers.*].max_retries` | `rupu-providers/src/tuning.rs` (`retry_budget`) → `AnthropicClient::max_rate_limit_retries` + `tuned::RetryingProvider` — **I-10, wired here** |
 | `[providers.*].max_concurrency` | `rupu-providers/src/tuning.rs` (`concurrency_permits`) → `tuned::ThrottledProvider` — **I-11, wired here** |
+| `[providers.*].prompt_cache` | carried uncollapsed in `ProviderTuning::prompt_cache` (`rupu-runtime/src/provider_factory.rs`, `provider_tuning`) → `resolve_anthropic_prompt_cache` (agent `anthropicPromptCache` wins, default on) → `AnthropicClient::with_prompt_cache` → `apply_cache_breakpoints` (spec 2026-09-29 §9.3–9.4) |
 | `[[providers.*.models]].id` | `rupu-runtime/src/provider_factory.rs:72` |
 | `[[providers.*.models]].context_window` | `rupu-runtime/src/provider_factory.rs:73` |
 | `[[providers.*.models]].max_output` | `rupu-runtime/src/provider_factory.rs:74` |
@@ -2054,6 +2096,7 @@ papered over. Every `file:line` in the table was re-verified against the tip of
 | `[pricing.<provider>.<model>].input_per_mtok` | `rupu-config/src/pricing_config.rs:74` (`cost_usd`), called from `rupu-cli/src/cmd/session.rs:5810` and the run/workflow cost columns |
 | `[pricing.<provider>.<model>].output_per_mtok` | as above |
 | `[pricing.<provider>.<model>].cached_input_per_mtok` | as above |
+| `[pricing.<provider>.<model>].cache_write_per_mtok` | as above — `ModelPricing::cost_usd`'s fourth argument (cache-write tokens), falling back to `input_per_mtok` when unset (spec 2026-09-29 §9) |
 | `[storage].archived_session_retention` | `rupu-cli/src/cmd/session.rs:7395` |
 | `[storage].archived_transcript_retention` | `rupu-cli/src/cmd/transcript.rs:1838` |
 | `[policy].lock` | `rupu-config/src/resolve.rs` (enforcement) + `rupu-cp/src/api/config.rs:325` — I-7 |

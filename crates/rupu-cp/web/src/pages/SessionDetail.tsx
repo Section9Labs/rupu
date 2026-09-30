@@ -7,7 +7,7 @@
 //   • a secondary, collapsed "Session details" disclosure (usage chart + fields)
 // Route: /sessions/:id
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
 import { api, type SessionSummary, type SessionRunRow, type UsageTimelinePoint } from '../lib/api';
@@ -52,7 +52,44 @@ export default function SessionDetailPage() {
   const [sendError, setSendError] = useState<string | null>(null);
   const [sendOk, setSendOk] = useState(false);
 
-  // Fetch session identity (header + active_run_id).
+  // Identity of the session currently on screen. The refresh loaders below
+  // are fired from timers and can resolve after the route moved to another
+  // session — they drop such stale replies rather than paint them.
+  const currentKey = `${id}|${host ?? ''}`;
+  const currentKeyRef = useRef(currentKey);
+  currentKeyRef.current = currentKey;
+
+  // Fetch session identity (header + usage + active_run_id). Session usage
+  // folds the session's transcripts server-side, so it moves mid-turn — the
+  // adaptive poll below re-calls this while a turn is in flight.
+  // Errors here only matter for the first load (the page-level error state);
+  // a later transient failure keeps the last good session on screen.
+  const loadSession = () => {
+    if (!id) return;
+    const key = currentKey;
+    api
+      .getSession(id, { host })
+      .then((data) => {
+        if (currentKeyRef.current === key) setSession(data);
+      })
+      .catch(() => {/* keep stale session on transient error */});
+  };
+
+  // Aggregated per-turn usage timeline for the Details disclosure chart.
+  // Failures keep the last good series (a poll blip must not blank the chart).
+  const loadTimeline = () => {
+    if (!id) return;
+    const key = currentKey;
+    api
+      .getSessionUsageTimeline(id, { host })
+      .then((pts) => {
+        if (currentKeyRef.current === key) setSeries(pts);
+      })
+      .catch(() => {/* keep the last good series */});
+  };
+
+  // Initial load on mount / session change: the identity fetch owns the
+  // page-level error state, the timeline starts from empty.
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
@@ -73,24 +110,11 @@ export default function SessionDetailPage() {
     };
   }, [id, host]);
 
-  // Aggregated per-turn usage timeline for the Details disclosure chart.
   useEffect(() => {
     if (!id) return;
-    let cancelled = false;
     setSeries([]);
-    api
-      .getSessionUsageTimeline(id, { host })
-      .then((pts) => {
-        if (cancelled) return;
-        setSeries(pts);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setSeries([]);
-      });
-    return () => {
-      cancelled = true;
-    };
+    loadTimeline();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, host]);
 
   // Fetch the session's turn-runs (the conversation).
@@ -111,22 +135,33 @@ export default function SessionDetailPage() {
   // so the new turn / updated active_run_id surfaces immediately.
   const reload = () => {
     if (!id) return;
-    api
-      .getSession(id, { host })
-      .then((data) => setSession(data))
-      .catch(() => {/* keep stale session on transient error */});
+    loadSession();
+    loadTimeline();
     loadRuns();
   };
 
   // Adaptive poll: fast (1.5s) while a turn is in flight, slow (5s) otherwise.
   // Re-arm when the cadence changes (e.g. session goes active → idle).
+  // While a turn is in flight each tick also refreshes the header usage and
+  // the by-turn chart (both grow mid-turn); an idle session only re-polls the
+  // conversation, as before.
   const pollInterval = pollIntervalFor(session);
+  const sessionActive = isSessionActive(session);
   useEffect(() => {
     loadRuns();
-    const t = window.setInterval(loadRuns, pollInterval);
+    const tick = () => {
+      loadRuns();
+      // Hidden tabs skip the extra usage refreshes; the next visible tick
+      // catches up (≤1.5s while a turn is in flight).
+      if (sessionActive && document.visibilityState === 'visible') {
+        loadSession();
+        loadTimeline();
+      }
+    };
+    const t = window.setInterval(tick, pollInterval);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, pollInterval, host]);
+  }, [id, pollInterval, sessionActive, host]);
 
   async function onArchive() {
     if (actionPending) return;

@@ -962,6 +962,7 @@ fn process_gemini_sse(
             input_tokens: acc.input_tokens,
             output_tokens: acc.output_tokens,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             reasoning_tokens: acc.reasoning_tokens,
         }));
     }
@@ -1100,6 +1101,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1142,6 +1144,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1178,6 +1181,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1214,6 +1218,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1254,6 +1259,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1291,6 +1297,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
 
         let body = client.build_request_body(&request);
@@ -1340,6 +1347,7 @@ mod tests {
                     anthropic_task_budget: None,
                     anthropic_context_management: None,
                     anthropic_speed: None,
+                    disable_prompt_cache: false,
                 };
                 let body = client.build_request_body(&request);
                 let config = &body["request"]["generationConfig"]["thinkingConfig"];
@@ -1984,7 +1992,7 @@ mod tests {
         assert_eq!(response.usage.output_tokens, 5);
         assert_eq!(response.usage.reasoning_tokens, 120);
         assert!(events.iter().any(|event| event.contains(
-            "UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5, cached_tokens: 0, reasoning_tokens: 120"
+            "UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5, cached_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 120"
         )));
     }
 
@@ -2183,6 +2191,7 @@ mod tests {
                 anthropic_task_budget: None,
                 anthropic_context_management: None,
                 anthropic_speed: None,
+                disable_prompt_cache: false,
             };
             let body = client.build_request_body(&request);
             let config = &body["request"]["generationConfig"]["thinkingConfig"];

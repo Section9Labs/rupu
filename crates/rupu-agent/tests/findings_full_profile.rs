@@ -32,6 +32,7 @@ fn opts(
     turns: Vec<ScriptedTurn>,
 ) -> AgentRunOpts {
     AgentRunOpts {
+        on_usage: None,
         seed_source: None,
         agent_name: "assessor".into(),
         agent_system_prompt: "You assess code.".into(),

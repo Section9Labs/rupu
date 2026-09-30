@@ -38,6 +38,10 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "notice",
 ];
 
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     remote = "Self",
@@ -143,8 +147,22 @@ pub enum Event {
         served_model: Option<String>,
         input_tokens: u32,
         output_tokens: u32,
+        /// Prompt tokens served from the provider's prompt cache (cache
+        /// reads) — a subset of `input_tokens`.
         #[serde(default)]
         cached_tokens: u32,
+        /// Prompt tokens written to the provider's prompt cache on this call
+        /// — a subset of `input_tokens`, like `cached_tokens`. Only Anthropic
+        /// reports it; omitted when `0`, so older lines and non-caching
+        /// providers' lines are unchanged.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        cache_write_tokens: u32,
+        /// Why this call happened, when it is not a normal agent turn.
+        /// `Some("compaction")` = the context-compaction summariser call —
+        /// real, billed spend that is NOT an agent turn (turn counters skip
+        /// it; token/cost totals include it). `None` = a normal turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
     },
     RunComplete {
         run_id: String,

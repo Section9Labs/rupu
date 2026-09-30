@@ -186,6 +186,7 @@ fn linear_agent_opts(
         step_id: String::new(),
         on_tool_call,
         on_stream_event: None,
+        on_usage: None,
         concerns: None,
         max_tokens: DEFAULT_MAX_TOKENS,
         context_window_tokens: None,

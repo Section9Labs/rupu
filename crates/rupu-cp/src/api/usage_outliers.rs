@@ -3,7 +3,12 @@
 //!
 //! Baseline is PER WORKFLOW, not global. An absolute threshold would flag an
 //! expensive-by-design workflow forever and never flag a cheap one that
-//! regressed 10x — the opposite of useful.
+//! regressed 10x — the opposite of useful. Standalone agent runs and session
+//! turns are candidates too (spec 2026-09-29 §2), baselined per `(kind,
+//! agent)` — a standalone run against that agent's other standalone runs, a
+//! session turn against that agent's other turns — never mixed into a
+//! workflow's baseline. Each transcript is counted once, attributed workflow
+//! run > session > standalone (`crate::api::usage::local_sources`).
 //!
 //! Local-only for now: this endpoint does not fan out across hosts the way
 //! `/api/usage` and `/api/dashboard` do. A remote host's runs are invisible
@@ -12,6 +17,7 @@
 
 #![deny(clippy::all)]
 
+use crate::usage_sources::SourceKind;
 use crate::{
     error::{ApiError, ApiResult},
     state::AppState,
@@ -42,16 +48,52 @@ struct OutliersQuery {
 #[derive(Debug, Clone)]
 pub struct RunCost {
     pub run_id: String,
+    pub kind: SourceKind,
+    /// `""` for a standalone agent run or session turn.
     pub workflow_name: String,
+    /// The agent a standalone run / session turn ran; `""` for a workflow run.
+    pub agent: String,
+    /// The session a session turn belongs to; `None` otherwise.
+    pub session_id: Option<String>,
+    /// The source's own transcript (standalone run / session turn); `None`
+    /// for a workflow run.
+    pub transcript_path: Option<String>,
     /// `None` = unpriced. NOT zero — we do not know what it cost.
     pub cost_usd: Option<f64>,
     pub started_at: DateTime<Utc>,
 }
 
+impl RunCost {
+    /// The population this run is baselined against: its workflow, or — for
+    /// a standalone run / session turn — its agent within that kind.
+    fn baseline_key(&self) -> (SourceKind, &str) {
+        match self.kind {
+            SourceKind::Workflow => (self.kind, self.workflow_name.as_str()),
+            SourceKind::Agent | SourceKind::Session => (self.kind, self.agent.as_str()),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct OutlierRun {
     pub run_id: String,
+    /// `"workflow"` | `"agent"` | `"session"` (additive).
+    pub kind: &'static str,
+    /// `""` for a standalone agent run or session turn.
     pub workflow_name: String,
+    /// The baseline agent of a standalone run / session turn (additive;
+    /// absent for a workflow run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The session a session-turn outlier belongs to — where the UI links it
+    /// (additive; absent for workflow and standalone rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The outlier's own transcript path — where the UI links a standalone
+    /// agent run / session turn, since neither is in the run store so
+    /// `/runs/:id` would 404 (additive; absent for workflow rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub cost_usd: f64,
     pub baseline_usd: f64,
     pub ratio: f64,
@@ -77,17 +119,18 @@ fn median(mut xs: Vec<f64>) -> f64 {
     }
 }
 
-/// Find runs costing more than `threshold`x their workflow's median.
+/// Find runs costing more than `threshold`x their baseline population's
+/// median (see [`RunCost::baseline_key`]).
 pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
     use std::collections::HashMap;
 
-    let mut by_wf: HashMap<&str, Vec<&RunCost>> = HashMap::new();
+    let mut by_wf: HashMap<(SourceKind, &str), Vec<&RunCost>> = HashMap::new();
     for r in runs {
         // Unpriced runs contribute to neither the baseline nor the results:
         // None means unknown, and averaging unknown as 0 would drag every
         // baseline down and manufacture outliers.
         if r.cost_usd.is_some() {
-            by_wf.entry(r.workflow_name.as_str()).or_default().push(r);
+            by_wf.entry(r.baseline_key()).or_default().push(r);
         }
     }
 
@@ -106,7 +149,11 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
             if ratio >= threshold {
                 out.push(OutlierRun {
                     run_id: r.run_id.clone(),
+                    kind: r.kind.as_str(),
                     workflow_name: r.workflow_name.clone(),
+                    agent: (r.kind != SourceKind::Workflow).then(|| r.agent.clone()),
+                    session_id: r.session_id.clone(),
+                    transcript_path: r.transcript_path.clone(),
                     cost_usd: cost,
                     baseline_usd: baseline,
                     ratio,
@@ -123,10 +170,12 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
     out
 }
 
-/// Build this host's `RunCost`s for every run started within `[since, until]`,
-/// using the same per-run cost path `/api/usage`'s summary uses
-/// (`crate::usage::summarize_run`) — no second cost computation to drift out
-/// of sync with what `cost_usd` means everywhere else in the CP.
+/// Build this host's `RunCost`s for every spend source started within
+/// `[since, until]` — workflow runs, standalone agent runs and session turns
+/// — from the SAME source set and rows `/api/usage`'s summary uses
+/// (`crate::api::usage::local_sources`, priced by `crate::usage::summarize`)
+/// — no second cost computation to drift out of sync with what `cost_usd`
+/// means everywhere else in the CP.
 ///
 /// The window itself is resolved via `crate::api::usage::resolve_window`
 /// (Task W1) — reused, not re-derived, so this endpoint can't drift from
@@ -143,22 +192,20 @@ async fn get_usage_outliers(
         crate::api::usage::resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
             .map_err(ApiError::bad_request)?;
 
-    let runs = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    let run_costs: Vec<RunCost> = runs
-        .iter()
-        .filter(|r| r.started_at >= since && r.started_at <= until)
-        .map(|r| {
-            let summary = crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing);
-            RunCost {
-                run_id: r.id.clone(),
-                workflow_name: r.workflow_name.clone(),
-                cost_usd: summary.cost_usd,
-                started_at: r.started_at,
-            }
+    let (sources, _) = crate::api::usage::local_sources(&s, since, until, None).await?;
+    let run_costs: Vec<RunCost> = sources
+        .into_iter()
+        .map(|src| RunCost {
+            cost_usd: crate::usage::summarize(&src.rows, &s.pricing).cost_usd,
+            run_id: src.id,
+            kind: src.kind,
+            workflow_name: src.workflow,
+            agent: src.agent,
+            session_id: src.session_id,
+            transcript_path: src
+                .transcript_path
+                .map(|p| p.to_string_lossy().into_owned()),
+            started_at: src.started_at,
         })
         .collect();
 
@@ -173,11 +220,95 @@ mod tests {
         runs.into_iter()
             .map(|(workflow_name, run_id, cost)| RunCost {
                 run_id: run_id.into(),
+                kind: SourceKind::Workflow,
                 workflow_name: workflow_name.into(),
+                agent: String::new(),
+                session_id: None,
+                transcript_path: None,
                 cost_usd: Some(cost),
                 started_at: chrono::Utc::now(),
             })
             .collect()
+    }
+
+    fn standalone(kind: SourceKind, agent: &str, run_id: &str, cost: f64) -> RunCost {
+        RunCost {
+            run_id: run_id.into(),
+            kind,
+            workflow_name: String::new(),
+            agent: agent.into(),
+            session_id: (kind == SourceKind::Session).then(|| format!("sess_{agent}")),
+            transcript_path: Some(format!("/t/{run_id}.jsonl")),
+            cost_usd: Some(cost),
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Standalone runs are baselined per agent, session turns per agent
+    /// separately, and neither mixes with a workflow's population — even one
+    /// whose name equals the agent's.
+    #[test]
+    fn standalone_and_session_runs_are_baselined_per_kind_and_agent() {
+        let mut runs = to_fixtures(vec![
+            ("solo", "w1", 10.0),
+            ("solo", "w2", 10.0),
+            ("solo", "w3", 10.0),
+        ]);
+        runs.extend([
+            standalone(SourceKind::Agent, "solo", "a1", 1.0),
+            standalone(SourceKind::Agent, "solo", "a2", 1.0),
+            standalone(SourceKind::Agent, "solo", "a3", 1.0),
+            standalone(SourceKind::Agent, "solo", "a_spike", 5.0),
+            // Two session turns: no baseline of their own, and never
+            // judged against the standalone runs.
+            standalone(SourceKind::Session, "solo", "t1", 1.0),
+            standalone(SourceKind::Session, "solo", "t2", 50.0),
+        ]);
+        let out = find_outliers(&runs, 3.0);
+        let ids: Vec<_> = out.iter().map(|o| o.run_id.as_str()).collect();
+        assert_eq!(ids, vec!["a_spike"]);
+        assert_eq!(out[0].kind, "agent");
+        assert_eq!(out[0].agent.as_deref(), Some("solo"));
+        assert_eq!(out[0].workflow_name, "");
+    }
+
+    /// A flagged run carries the link target of its own kind: a session turn its
+    /// session + transcript, a standalone run its transcript, a workflow run
+    /// neither.
+    #[test]
+    fn outliers_carry_their_link_targets() {
+        let mut runs = to_fixtures(vec![
+            ("wf", "w1", 1.0),
+            ("wf", "w2", 1.0),
+            ("wf", "w3", 1.0),
+            ("wf", "w_spike", 10.0),
+        ]);
+        runs.extend([
+            standalone(SourceKind::Agent, "solo", "a1", 1.0),
+            standalone(SourceKind::Agent, "solo", "a2", 1.0),
+            standalone(SourceKind::Agent, "solo", "a3", 1.0),
+            standalone(SourceKind::Agent, "solo", "a_spike", 10.0),
+            standalone(SourceKind::Session, "chat", "t1", 1.0),
+            standalone(SourceKind::Session, "chat", "t2", 1.0),
+            standalone(SourceKind::Session, "chat", "t3", 1.0),
+            standalone(SourceKind::Session, "chat", "t_spike", 10.0),
+        ]);
+        let out = find_outliers(&runs, 3.0);
+        let by_id = |id: &str| out.iter().find(|o| o.run_id == id).expect(id);
+
+        let wf = by_id("w_spike");
+        assert_eq!(
+            (wf.session_id.as_deref(), wf.transcript_path.as_deref()),
+            (None, None)
+        );
+
+        let agent = by_id("a_spike");
+        assert_eq!(agent.session_id, None);
+        assert_eq!(agent.transcript_path.as_deref(), Some("/t/a_spike.jsonl"));
+
+        let session = by_id("t_spike");
+        assert_eq!(session.session_id.as_deref(), Some("sess_chat"));
+        assert_eq!(session.transcript_path.as_deref(), Some("/t/t_spike.jsonl"));
     }
 
     #[test]
@@ -214,7 +345,11 @@ mod tests {
         let out = find_outliers(
             &[RunCost {
                 run_id: "r1".into(),
+                kind: SourceKind::Workflow,
                 workflow_name: "wf".into(),
+                agent: String::new(),
+                session_id: None,
+                transcript_path: None,
                 cost_usd: None,
                 started_at: chrono::Utc::now(),
             }],

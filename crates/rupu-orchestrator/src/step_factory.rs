@@ -206,6 +206,7 @@ fn resolve_step_agent_spec(
                 max_turns: Some(50),
                 permission_mode: None,
                 anthropic_oauth_prefix: None,
+                anthropic_prompt_cache: None,
                 effort: None,
                 context_window: None,
                 output_format: None,
@@ -334,6 +335,7 @@ impl StepFactory for DefaultStepFactory {
                 );
                 let provider_config = provider_factory::ProviderConfig {
                     anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+                    anthropic_prompt_cache: spec.anthropic_prompt_cache,
                     openai_compatible: oai_params,
                     tuning: self.provider_tuning.get(&provider_name).cloned(),
                     kind: self.kinds.get(&provider_name).cloned(),
@@ -480,6 +482,7 @@ impl StepFactory for DefaultStepFactory {
             step_id: step_id.to_string(),
             on_tool_call: Some(audited_on_tool_call),
             on_stream_event: None,
+            on_usage: None,
             // Workflow-level concerns take precedence over agent-level concerns.
             // When the workflow declares `concerns:`, every step uses it —
             // the agent frontmatter's `concerns:` is ignored for this run.
@@ -876,6 +879,7 @@ mod provider_build_error_stub_tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         }
     }
 

@@ -98,6 +98,60 @@ pub struct LineStreamPrinter {
     /// so we don't re-read the config on every assistant chunk —
     /// streaming hot paths fire dozens of these per step.
     prefs: crate::cmd::ui::UiPrefs,
+    /// The ticker's caller-supplied message (`running tool bash…`), kept
+    /// so a [`Self::usage_live`] update can re-render the row without
+    /// losing it.
+    ticker_base: String,
+    /// The live `⇡in ⇣out · $cost` status ([`Self::usage_live`]), shown at
+    /// the head of the ticker row. TTY only; cleared at step close.
+    usage_status: Option<String>,
+}
+
+/// A step's (or run's) billed spend for a footer: tokens (in + out) and the
+/// priced cost — `None` when no contributing model has a price (rendered
+/// `—`, never a made-up `$0.00`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepUsage {
+    pub tokens: u64,
+    pub cost: Option<f64>,
+}
+
+/// `N tokens · $X.XX`, or `N tokens · —` when unpriced.
+pub fn usage_tally(tokens: u64, cost: Option<f64>) -> String {
+    format!("{tokens} tokens · {}", cost_or_dash(cost))
+}
+
+/// `⇡{in} ⇣{out} · {cost}` in the compact units the live views use.
+pub fn usage_live_line(tokens_in: u64, tokens_out: u64, cost: Option<f64>) -> String {
+    use super::fmt::format_token_compact;
+    format!(
+        "⇡{} ⇣{} · {}",
+        format_token_compact(tokens_in),
+        format_token_compact(tokens_out),
+        cost_or_dash(cost)
+    )
+}
+
+fn cost_or_dash(cost: Option<f64>) -> String {
+    cost.map_or_else(|| "—".to_string(), super::fmt::format_cost_compact)
+}
+
+/// Append ` · N tokens · $X.XX` to a footer tally when the step spent
+/// anything.
+fn push_usage_tally(tally: &mut String, usage: Option<StepUsage>) {
+    if let Some(usage) = usage.filter(|u| u.tokens > 0) {
+        tally.push_str(" · ");
+        tally.push_str(&usage_tally(usage.tokens, usage.cost));
+    }
+}
+
+/// The ticker row's message: the live usage (when any) first, so clamping
+/// a long caller message never cuts the spend off.
+fn ticker_message_with_usage(base: &str, usage: Option<&str>) -> String {
+    match usage {
+        Some(usage) => format!("{usage} · {base}"),
+        None => base.to_string(),
+    }
 }
 
 impl Default for LineStreamPrinter {
@@ -141,6 +195,8 @@ impl LineStreamPrinter {
             is_tty,
             term_width,
             prefs,
+            ticker_base: String::new(),
+            usage_status: None,
         }
     }
 
@@ -209,7 +265,8 @@ impl LineStreamPrinter {
             // test capture) get a clean stdout stream.
             return;
         }
-        let message = self.clamp_ticker_message(message.into());
+        self.ticker_base = message.into();
+        let message = self.ticker_message();
         if let Some(pb) = &self.ticker {
             // Already running — update the message in place rather
             // than double-starting (which would put two bars on the
@@ -254,10 +311,32 @@ impl LineStreamPrinter {
     /// Update the ticker's message in place. No-op when no ticker is
     /// running — caller can blindly call this on every event without
     /// having to re-check state.
-    pub fn tick_with(&self, message: impl Into<String>) {
+    pub fn tick_with(&mut self, message: impl Into<String>) {
+        self.ticker_base = message.into();
         if let Some(pb) = &self.ticker {
-            pb.set_message(self.clamp_ticker_message(message.into()));
+            pb.set_message(self.ticker_message());
         }
+    }
+
+    /// Redraw the live `⇡in ⇣out · $cost` status (`cost: None` = unpriced,
+    /// shown as `—`) at the head of the ticker row. TTY only: off a TTY
+    /// nothing is printed until the step's closing footer.
+    pub fn usage_live(&mut self, tokens_in: u64, tokens_out: u64, cost: Option<f64>) {
+        if !self.is_tty {
+            return;
+        }
+        self.usage_status = Some(usage_live_line(tokens_in, tokens_out, cost));
+        if let Some(pb) = &self.ticker {
+            pb.set_message(self.ticker_message());
+        }
+    }
+
+    /// The clamped ticker message: live usage (when any) + caller message.
+    fn ticker_message(&self) -> String {
+        self.clamp_ticker_message(ticker_message_with_usage(
+            &self.ticker_base,
+            self.usage_status.as_deref(),
+        ))
     }
 
     /// Stop and clear the bottom-row ticker. Idempotent — safe to call
@@ -462,6 +541,7 @@ impl LineStreamPrinter {
         success_count: usize,
         total: usize,
         duration: Duration,
+        usage: Option<StepUsage>,
     ) {
         self.stop_ticker();
         let elapsed = self
@@ -481,7 +561,8 @@ impl LineStreamPrinter {
         let _ = palette::write_bold_colored(&mut buf, glyph, color);
         buf.push(' ');
         let closure = if success { "done" } else { "failed" };
-        let tally = format!("{closure} · {success_count}/{total} · {dur_str}");
+        let mut tally = format!("{closure} · {success_count}/{total} · {dur_str}");
+        push_usage_tally(&mut tally, usage);
         let _ = palette::write_colored(&mut buf, &tally, color);
         let _ = palette::write_colored(&mut buf, &format!("  ({step_id})"), DIM);
         self.out(&buf);
@@ -713,6 +794,7 @@ impl LineStreamPrinter {
         success: bool,
         findings_count: usize,
         duration: Duration,
+        usage: Option<StepUsage>,
     ) {
         self.stop_ticker();
         let elapsed = self
@@ -734,11 +816,12 @@ impl LineStreamPrinter {
         // Closure word + tally + duration in the success/failure
         // color so the panel footer reads as one unmistakable line.
         let closure = if success { "done" } else { "failed" };
-        let tally = if findings_count == 1 {
+        let mut tally = if findings_count == 1 {
             format!("{closure} · 1 finding · {dur_str}")
         } else {
             format!("{closure} · {findings_count} findings · {dur_str}")
         };
+        push_usage_tally(&mut tally, usage);
         let _ = palette::write_colored(&mut buf, &tally, color);
         let _ = palette::write_colored(&mut buf, &format!("  ({step_id})"), DIM);
         self.out(&buf);
@@ -753,7 +836,20 @@ impl LineStreamPrinter {
     /// per v0.4.8 lessons (cursor-save/restore fights with the
     /// print thread); the prominent footer is the closure cue.
     pub fn step_done(&mut self, step_id: &str, duration: Duration, total_tokens: u64) {
+        let meta = (total_tokens > 0).then(|| format!("{total_tokens} tokens"));
+        self.step_done_meta(step_id, duration, meta);
+    }
+
+    /// [`Self::step_done`] with the step's priced spend:
+    /// `done · <duration> · N tokens · $X.XX` (`—` when unpriced).
+    pub fn step_done_priced(&mut self, step_id: &str, duration: Duration, usage: StepUsage) {
+        let meta = (usage.tokens > 0).then(|| usage_tally(usage.tokens, usage.cost));
+        self.step_done_meta(step_id, duration, meta);
+    }
+
+    fn step_done_meta(&mut self, step_id: &str, duration: Duration, usage: Option<String>) {
         self.stop_ticker();
+        self.usage_status = None;
         let elapsed = self
             .step_start
             .take()
@@ -770,10 +866,9 @@ impl LineStreamPrinter {
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, "✓", COMPLETE);
         buf.push(' ');
-        let meta = if total_tokens > 0 {
-            format!("done · {dur_str} · {total_tokens} tokens")
-        } else {
-            format!("done · {dur_str}")
+        let meta = match usage {
+            Some(usage) => format!("done · {dur_str} · {usage}"),
+            None => format!("done · {dur_str}"),
         };
         let _ = palette::write_colored(&mut buf, &meta, COMPLETE);
         // step_id only useful when it differs from the headline (panels,
@@ -790,6 +885,7 @@ impl LineStreamPrinter {
     /// [`Self::step_done`].
     pub fn step_failed(&mut self, step_id: &str, reason: &str) {
         self.stop_ticker();
+        self.usage_status = None;
         self.step_start = None;
         let mut buf = String::new();
         self.push_frame_close(&mut buf);
@@ -960,6 +1056,42 @@ impl LineStreamPrinter {
         duration: Duration,
         total_tokens: u64,
     ) {
+        self.workflow_done_meta(
+            workflow_name,
+            run_id,
+            duration,
+            format!("{total_tokens} tokens total"),
+        );
+    }
+
+    /// [`Self::workflow_done`] with the run's priced spend:
+    /// `· <duration> · N tokens total · $X.XX` (`—` when unpriced).
+    pub fn workflow_done_priced(
+        &mut self,
+        workflow_name: &str,
+        run_id: &str,
+        duration: Duration,
+        usage: StepUsage,
+    ) {
+        self.workflow_done_meta(
+            workflow_name,
+            run_id,
+            duration,
+            format!(
+                "{} tokens total · {}",
+                usage.tokens,
+                cost_or_dash(usage.cost)
+            ),
+        );
+    }
+
+    fn workflow_done_meta(
+        &mut self,
+        workflow_name: &str,
+        run_id: &str,
+        duration: Duration,
+        usage: String,
+    ) {
         self.stop_ticker();
         self.out("");
         let dur_str = format_duration(duration);
@@ -970,7 +1102,7 @@ impl LineStreamPrinter {
         buf.push_str(" complete  ");
         let _ = palette::write_colored(&mut buf, run_id, DIM);
         buf.push_str("  ");
-        let meta = format!("· {dur_str} · {total_tokens} tokens total");
+        let meta = format!("· {dur_str} · {usage}");
         let _ = palette::write_colored(&mut buf, &meta, DIM);
         self.out(&buf);
     }
@@ -1811,9 +1943,66 @@ mod tests {
     }
 
     #[test]
+    fn usage_tally_prices_or_dashes() {
+        assert_eq!(usage_tally(12_345, Some(0.4567)), "12345 tokens · $0.46");
+        assert_eq!(usage_tally(12_345, None), "12345 tokens · —");
+    }
+
+    #[test]
+    fn usage_live_line_is_compact_in_out_and_cost() {
+        assert_eq!(
+            usage_live_line(12_300, 1_240, Some(0.041)),
+            "⇡12K ⇣1.2K · $0.04"
+        );
+        assert_eq!(usage_live_line(0, 0, None), "⇡0 ⇣0 · —");
+    }
+
+    #[test]
+    fn ticker_message_leads_with_usage_so_clamping_keeps_it() {
+        assert_eq!(
+            ticker_message_with_usage("running tool bash…", Some("⇡1K ⇣10 · $0.01")),
+            "⇡1K ⇣10 · $0.01 · running tool bash…"
+        );
+        assert_eq!(
+            ticker_message_with_usage("model streaming…", None),
+            "model streaming…"
+        );
+    }
+
+    #[test]
+    fn usage_live_prints_nothing_off_a_tty() {
+        // Off a TTY the live line must stay unset, so nothing reaches a
+        // pipe until the end-of-run footer. (Forced: `cargo test` run from
+        // a terminal leaves fd 1 a TTY.)
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        p.is_tty = false;
+        p.usage_live(1_000, 100, Some(0.5));
+        assert!(p.usage_status.is_none());
+    }
+
+    #[test]
+    fn step_done_priced_clears_the_live_usage_line() {
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        let _h = p.step_start("step_a", None, None, None);
+        p.usage_status = Some("⇡1K ⇣10 · $0.01".into());
+        p.step_done_priced(
+            "step_a",
+            Duration::from_secs(1),
+            StepUsage {
+                tokens: 1_010,
+                cost: Some(0.01),
+            },
+        );
+        assert!(p.usage_status.is_none());
+        assert!(p.ticker.is_none());
+    }
+
+    #[test]
     fn test_tick_with_no_ticker_is_noop() {
         no_color();
-        let p = LineStreamPrinter::new();
+        let mut p = LineStreamPrinter::new();
         // Caller can blindly tick on every event without checking
         // whether a ticker is running — must not panic.
         p.tick_with("update");

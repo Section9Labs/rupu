@@ -19,8 +19,9 @@ use crate::{
     agent_launcher::{AgentLaunchRequest, AgentLauncher},
     api::runs::{query_run_detail, query_run_rows},
     host::connector::{
-        open_run_events_tail, read_transcript_file, EventByteStream, HostCapabilities,
-        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, RunStartEvidence,
+        blocking_host, open_run_events_tail, read_transcript_file, EventByteStream,
+        HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
+        RunStartEvidence,
     },
     host::workspace_stage::{collect_from_dir, discard_from_dir, stage_to_dir},
     launcher::{LaunchRequest, RunLauncher},
@@ -180,24 +181,30 @@ impl HostConnector for LocalHostConnector {
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let workflow_only = params.kind == RunKind::Workflow;
-        let rows = query_run_rows(
-            &self.run_store,
-            params.offset,
-            params.limit,
-            params.lifecycle.as_deref(),
-            workflow_only,
-            None, // local host shows all runs regardless of worker_id
-            &self.pricing,
-            // `RunListQuery` (the cross-host connector protocol) carries no
-            // since/until — a remote-per-gate style contract extension is
-            // out of scope for this task (perf & interaction arc, Plan 5
-            // Task 5); the CP's own `/api/runs/workflows` handler applies
-            // date-range filtering directly for its "host=local" fast path
-            // instead of routing through this trait method at all (see
-            // `api::runs::list_workflow_runs`).
-            &crate::pagination::DateRangeQuery::default(),
-        )
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        let store = Arc::clone(&self.run_store);
+        let pricing = self.pricing.clone();
+        // Store reads + the usage fold run on the blocking pool.
+        let rows = blocking_host(move || {
+            query_run_rows(
+                &store,
+                params.offset,
+                params.limit,
+                params.lifecycle.as_deref(),
+                workflow_only,
+                None, // local host shows all runs regardless of worker_id
+                &pricing,
+                // `RunListQuery` (the cross-host connector protocol) carries no
+                // since/until — a remote-per-gate style contract extension is
+                // out of scope for this task (perf & interaction arc, Plan 5
+                // Task 5); the CP's own `/api/runs/workflows` handler applies
+                // date-range filtering directly for its "host=local" fast path
+                // instead of routing through this trait method at all (see
+                // `api::runs::list_workflow_runs`).
+                &crate::pagination::DateRangeQuery::default(),
+            )
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+        })
+        .await?;
         // Convert typed rows to Value so the trait's return type is uniform
         // across local and HTTP connectors.
         rows.iter()
@@ -208,8 +215,13 @@ impl HostConnector for LocalHostConnector {
     }
 
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-        query_run_detail(&self.run_store, run_id, &self.pricing)
-            .map_err(|e| map_store_err(run_id, e))
+        let store = Arc::clone(&self.run_store);
+        let pricing = self.pricing.clone();
+        let run_id = run_id.to_string();
+        blocking_host(move || {
+            query_run_detail(&store, &run_id, &pricing).map_err(|e| map_store_err(&run_id, e))
+        })
+        .await
     }
 
     /// Local evidence that a launched run's process started: its transcript.

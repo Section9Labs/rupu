@@ -15,10 +15,12 @@
   },
   "steps": [],
   "usage": {
+    "cache_write_tokens": 0,
     "cached_tokens": 0,
     "cost_usd": null,
     "input_tokens": 0,
     "output_tokens": 0,
+    "partial": false,
     "priced": false,
     "runs": 0,
     "total_tokens": 0

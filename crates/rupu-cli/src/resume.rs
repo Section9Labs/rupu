@@ -311,6 +311,10 @@ async fn rebuild_opts_from_disk(
         provider_tuning.clone(),
         kinds.clone(),
         crate::findings_opts::base_options(&global, &cfg.findings),
+        // Dispatched children append the resumed run's own ledger.
+        Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
+            &store_arc, run_id,
+        )),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over

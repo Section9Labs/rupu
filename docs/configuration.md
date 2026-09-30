@@ -49,7 +49,7 @@ user-declared `openai-compatible` name such as `oracle`). Full narrative referen
 
 | Key               | Type                     | Default                                             |
 |-------------------|--------------------------|-------------------------------------------------------|
-| `base_url`        | string                   | vendor's documented URL                                |
+| `base_url`        | string                   | vendor's documented URL; today read only by `openai-compatible` accounts — anthropic-kind ignores it (I-92) |
 | `kind`            | string                   | none (built-in provider); `"openai-compatible"` declares a generic adapter |
 | `stream`          | bool                     | `true`                                                 |
 | `org_id`          | string                   | none (OpenAI-only; sent as `OpenAI-Organization`)      |
@@ -57,6 +57,7 @@ user-declared `openai-compatible` name such as `oracle`). Full narrative referen
 | `timeout_ms`      | integer                  | `120000` (2 min); `0` treated as unset                 |
 | `max_retries`     | integer                  | `1` (retries after the first attempt on a retryable error) |
 | `max_concurrency` | integer                  | anthropic `4`, openai `8`, gemini `4`, copilot `4`; `0` treated as unset |
+| `prompt_cache`    | bool                     | `true` (Anthropic only; `false` for gateways that reject `cache_control` — gateway routing is process-wide today, see [providers.md](providers.md#field-reference); agent `anthropicPromptCache` overrides) |
 | `default_model`   | string                   | none — the agent must set `model:` or rely on this      |
 | `models`          | array\<table\>           | `[]` — each entry: `id` (required), `context_window` (default `32768`), `max_output` (default `8192`) |
 
@@ -142,14 +143,16 @@ Model ids are matched exact first, then with a trailing `[tag]` stripped
 (`claude-sonnet-4-6[1m]` → `claude-sonnet-4-6`), then with a date snapshot stripped —
 both OpenAI's `-YYYY-MM-DD` and Anthropic's compact `-YYYYMMDD`. The built-in table
 carries each vendor's standard-tier, short-context (≤200k prompt) list rate; long-context
-surcharges (OpenAI, Gemini Pro), batch/flex tiers, cache-write premiums, and regional
-uplifts are not modeled. Override in config when accuracy matters.
+surcharges (OpenAI, Gemini Pro), batch/flex tiers, and regional uplifts are not modeled.
+Anthropic prompt-cache writes are modeled: the built-in Anthropic entries bill them at
+1.25x the input rate (the 5-minute TTL, rupu's only TTL). Override in config when accuracy matters.
 
 ```toml
 [pricing.anthropic."claude-sonnet-4-6"]
 input_per_mtok = 3.0
 output_per_mtok = 15.0
 cached_input_per_mtok = 0.30   # optional; omit to bill cached tokens at the full input rate
+cache_write_per_mtok = 3.75    # optional; omit to bill cache writes at the full input rate
 
 [pricing.openai."gpt-5"]
 input_per_mtok = 1.25
@@ -164,9 +167,10 @@ output_per_mtok = 15.0
 |--------------------------|--------|:--------:|---------|-------|
 | `input_per_mtok`         | float  | yes      | —       | USD per million input tokens |
 | `output_per_mtok`        | float  | yes      | —       | USD per million output tokens |
-| `cached_input_per_mtok`  | float  | no       | falls back to `input_per_mtok` | USD per million cached-input tokens; `cached` is treated as a subset of `input` |
+| `cached_input_per_mtok`  | float  | no       | falls back to `input_per_mtok` | USD per million cached-input (cache read) tokens; `cached` is treated as a subset of `input` |
+| `cache_write_per_mtok`   | float  | no       | falls back to `input_per_mtok` | USD per million cache-write tokens; `cache_write` is a second, disjoint subset of `input` (Anthropic bills it at 1.25x input) |
 
-`cost_usd(input_tokens, output_tokens, cached_tokens)` expects `output_tokens` to
+`cost_usd(input_tokens, output_tokens, cached_tokens, cache_write_tokens)` expects `output_tokens` to
 already be the **billable** output figure. Gemini reports "thinking"/reasoning tokens
 (`thoughtsTokenCount`) outside `candidatesTokenCount`, but Google bills them at the
 output rate — that fold happens once, upstream, in `rupu-agent`'s runner

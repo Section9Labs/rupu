@@ -5,13 +5,27 @@
 export interface UsageSummary {
   input_tokens: number;
   output_tokens: number;
+  /** Cache reads — a subset of `input_tokens`. */
   cached_tokens: number;
+  /**
+   * Cache writes — a subset of `input_tokens`, like `cached_tokens`. Optional
+   * only so a payload from an older CP, which predates the field, type-checks.
+   */
+  cache_write_tokens?: number;
   total_tokens: number;
   /** null when no contributing model was priced (a partial total when `priced` is false). */
   cost_usd: number | null;
   /** false when at least one contributing model lacked a price. */
   priced: boolean;
   runs: number;
+  /**
+   * True when some of this run's transcripts were not readable on this CP (a
+   * remote host that is not yet mirrored) — the totals are a lower bound.
+   * The Rust `UsageSummary` serializes it on every summary (default false);
+   * it stays optional here only so a payload from an older remote CP, which
+   * predates the field, still type-checks.
+   */
+  partial?: boolean;
 }
 
 /**
@@ -33,6 +47,8 @@ export interface UsageBreakdownRow {
   input_tokens: number;
   output_tokens: number;
   cached_tokens: number;
+  /** Cache writes; absent from CPs that predate the field. */
+  cache_write_tokens?: number;
   total_tokens: number;
   cost_usd: number | null;
   priced: boolean;
@@ -68,7 +84,11 @@ export interface UnpricedGap {
  */
 export interface UsageRunRow {
   run_id: string;
+  /** Which kind of run spent this: a workflow run, a standalone `rupu run`
+   *  (`agent`) or a session turn (`session`). Absent from CPs predating it. */
+  kind?: 'workflow' | 'agent' | 'session';
   started_at: string;
+  /** `""` for a standalone agent run or session turn. */
   workflow_name: string;
   agent: string;
   provider: string;
@@ -78,6 +98,8 @@ export interface UsageRunRow {
   input_tokens: number;
   output_tokens: number;
   cached_tokens: number;
+  /** Cache writes; absent from CPs that predate the field. */
+  cache_write_tokens?: number;
   total_tokens: number;
   cost_usd: number | null;
   priced: boolean;

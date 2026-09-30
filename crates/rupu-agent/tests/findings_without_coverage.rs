@@ -72,6 +72,7 @@ fn opts_for(
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        on_usage: None,
         // The whole point: no coverage harness.
         concerns: None,
         scope_name: None,

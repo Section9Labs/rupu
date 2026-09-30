@@ -246,7 +246,7 @@ import Foundation
 
 @Test func decodesUsageRunsFixtureAsFlatPerRunModelRows() throws {
     let rows = try JSONDecoder().decode([APIUsageRunRow].self, from: Fixtures.data("usage_runs.json"))
-    #expect(rows.count == 6)
+    #expect(rows.count == 7)
 
     let first = rows[0]
     #expect(first.runID == "run-01")
@@ -262,11 +262,18 @@ import Foundation
     #expect(unpriced.model == "llama-3-70b")
     #expect(unpriced.costUSD == nil)
     #expect(unpriced.priced == false)
+
+    // A standalone agent run has no workflow: the server sends
+    // `workflow_name: ""` (additive-only wire change; `kind` says which).
+    let standalone = rows[6]
+    #expect(standalone.runID == "run-07")
+    #expect(standalone.workflowName == "")
+    #expect(standalone.totalTokens == 5000)
 }
 
 @Test func decodesUsageOutliersFixture() throws {
     let outliers = try JSONDecoder().decode([APIOutlierRun].self, from: Fixtures.data("usage_outliers.json"))
-    #expect(outliers.count == 2)
+    #expect(outliers.count == 3)
 
     let worst = outliers[0]
     #expect(worst.runID == "run-06")
@@ -277,4 +284,9 @@ import Foundation
 
     #expect(outliers[1].runID == "run-09")
     #expect(outliers[1].ratio == 4.0)
+
+    // A standalone agent run outlier: additive `kind`/`agent` keys are
+    // ignored, `workflow_name` is "".
+    #expect(outliers[2].runID == "run-10")
+    #expect(outliers[2].workflowName == "")
 }

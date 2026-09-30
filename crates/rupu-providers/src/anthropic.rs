@@ -195,6 +195,147 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
     }
 }
 
+/// Content-block types that may carry `cache_control`. An allowlist, not a
+/// denylist: `thinking` / `redacted_thinking` must never be marked, and they
+/// are the only types `restore_reasoning_blocks` ever echoes (Anthropic
+/// `Reasoning` blocks are captured exclusively from those two wire types), so
+/// a restored raw block can never become a marker target — and neither can a
+/// block type nobody has vetted yet.
+const CACHEABLE_BLOCK_TYPES: &[&str] = &["text", "image", "document", "tool_use", "tool_result"];
+
+/// Whether a `text`-shaped string carries anything (not empty / whitespace).
+fn has_text(s: Option<&str>) -> bool {
+    s.is_some_and(|t| !t.trim().is_empty())
+}
+
+/// Whether `block` can carry `cache_control`: a cacheable type, and not an
+/// empty (or whitespace-only) text block, which cannot carry a marker.
+///
+/// A `tool_result` with no real content — absent, an empty / whitespace
+/// string, an empty array, or an array of only empty / whitespace text
+/// blocks — is treated as uncacheable too. Every silent `bash` call yields
+/// exactly that as the final message's only block, and whether the API
+/// accepts `cache_control` there is unverified; the marker walks back instead
+/// (see [`apply_cache_breakpoints`]).
+fn is_cacheable_block(block: &serde_json::Value) -> bool {
+    let Some(ty) = block.get("type").and_then(|t| t.as_str()) else {
+        return false;
+    };
+    if !CACHEABLE_BLOCK_TYPES.contains(&ty) {
+        return false;
+    }
+    match ty {
+        "text" => has_text(block.get("text").and_then(|t| t.as_str())),
+        "tool_result" => match block.get("content") {
+            Some(serde_json::Value::String(s)) => has_text(Some(s)),
+            // Any non-text inner block (image, document, …) is content; text
+            // blocks count only when non-empty.
+            Some(serde_json::Value::Array(inner)) => inner.iter().any(|b| {
+                b.get("type").and_then(|t| t.as_str()) != Some("text")
+                    || has_text(b.get("text").and_then(|t| t.as_str()))
+            }),
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
+/// How many messages BEFORE the final one the rolling breakpoint may walk
+/// back to when the final message has no cacheable block. Bounded so the
+/// marker never lands deep in history — beyond this, no message-level marker
+/// is placed at all.
+const MAX_BREAKPOINT_WALK_BACK: usize = 3;
+
+/// The one breakpoint value ever emitted: the 5-minute ephemeral cache.
+fn ephemeral_marker() -> serde_json::Value {
+    serde_json::json!({ "type": "ephemeral" })
+}
+
+/// Mark the last cacheable block of `msg`, converting non-empty string
+/// content to a single text block first (only when that block is the one
+/// being marked). Returns whether a marker was placed.
+fn mark_last_cacheable_block(msg: &mut serde_json::Value) -> bool {
+    if let Some(text) = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+    {
+        if text.trim().is_empty() {
+            return false;
+        }
+        msg["content"] = serde_json::json!([{ "type": "text", "text": text }]);
+    }
+    match msg
+        .get_mut("content")
+        .and_then(|c| c.as_array_mut())
+        .and_then(|blocks| blocks.iter_mut().rev().find(|b| is_cacheable_block(b)))
+    {
+        Some(block) => {
+            block["cache_control"] = ephemeral_marker();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Explicit prompt-cache breakpoints (spec 2026-09-29 §9.3). Two markers:
+/// (a) the last `system` block — caches tools + system (tools render first);
+///     with no (non-empty) system block, the last tool definition instead;
+/// (b) the last cacheable block of the final message — the rolling
+///     conversation breakpoint, so each turn re-reads all prior history.
+///     When the final message has no cacheable block (e.g. a silent `bash`
+///     call's empty `tool_result`), walk back — at most
+///     [`MAX_BREAKPOINT_WALK_BACK`] messages — and mark the last cacheable
+///     block of the nearest message that has one (typically the preceding
+///     assistant's `tool_use`). Cache reads are anchored at explicit
+///     breakpoints, so a request with no message-level marker reads no
+///     history from the cache at all; moving a marker onto a history block is
+///     not a history edit. Mirrors the API's own automatic caching, which
+///     walks backward to the nearest eligible block.
+///
+/// Explicit `{"type": "ephemeral"}` markers only (5-minute TTL — no `ttl`, no
+/// top-level automatic caching), so at most 2 of the API's 4 breakpoints.
+/// Never marks thinking / redacted_thinking / empty-text / empty-tool_result
+/// blocks. Runs LAST in `build_request_body`, after tool-name sanitizing and
+/// reasoning restoration, and only touches the marked blocks' `cache_control`
+/// key — except that a message with string content is converted to a single
+/// text block, and only when that block is the one being marked.
+///
+/// A prefix shorter than the model's minimum cacheable length (512–4096
+/// tokens) is silently not cached by the API — no error, just no cache usage.
+fn apply_cache_breakpoints(body: &mut serde_json::Value) {
+    // (a) The prefix breakpoint: system, else tools.
+    let mut marked_prefix = false;
+    if let Some(block) = body
+        .get_mut("system")
+        .and_then(|s| s.as_array_mut())
+        .and_then(|sys| sys.iter_mut().rev().find(|b| is_cacheable_block(b)))
+    {
+        block["cache_control"] = ephemeral_marker();
+        marked_prefix = true;
+    }
+    if !marked_prefix {
+        if let Some(last_tool) = body
+            .get_mut("tools")
+            .and_then(|t| t.as_array_mut())
+            .and_then(|t| t.last_mut())
+        {
+            last_tool["cache_control"] = ephemeral_marker();
+        }
+    }
+
+    // (b) The rolling conversation breakpoint: the final message, else the
+    // nearest of the preceding MAX_BREAKPOINT_WALK_BACK messages.
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages.iter_mut().rev().take(1 + MAX_BREAKPOINT_WALK_BACK) {
+        if mark_last_cacheable_block(msg) {
+            return;
+        }
+    }
+}
+
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 // ─────────────────────────────────────────────────────────────────────
@@ -766,6 +907,12 @@ pub struct AnthropicClient {
     /// opt-out via `anthropicOauthPrefix: false` in agent frontmatter.
     /// Has no effect on api-key requests.
     oauth_system_prefix_enabled: bool,
+    /// Whether `build_request_body` places the explicit prompt-cache
+    /// breakpoints (see [`apply_cache_breakpoints`]). Defaults to true in
+    /// every constructor; opt out via `[providers.<name>] prompt_cache =
+    /// false` or agent frontmatter `anthropicPromptCache: false` (the agent
+    /// wins), threaded through [`AnthropicClient::with_prompt_cache`].
+    prompt_cache_enabled: bool,
     /// Per-request 429 retry budget. Defaults to [`MAX_RATE_LIMIT_RETRIES`];
     /// `[providers.anthropic].max_retries` overrides it via
     /// [`AnthropicClient::with_tuning`] (ISSUES.md I-10).
@@ -798,6 +945,7 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
         }
@@ -864,6 +1012,15 @@ impl AnthropicClient {
         self
     }
 
+    /// Explicit prompt-cache breakpoints (default ON). `false` from
+    /// `[providers.<name>] prompt_cache = false` or agent frontmatter
+    /// `anthropicPromptCache: false` — e.g. for an Anthropic-compatible
+    /// gateway that rejects `cache_control`.
+    pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
+        self.prompt_cache_enabled = enabled;
+        self
+    }
+
     /// Create a client with an auth.json path for persisting refreshed tokens.
     ///
     /// `sink` is the run's netflow sink; there is no process-global
@@ -883,6 +1040,7 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
         }
@@ -907,6 +1065,7 @@ impl AnthropicClient {
             credential_store: Some(store),
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
         }
@@ -945,6 +1104,7 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
         }
@@ -971,6 +1131,7 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            prompt_cache_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
             semaphore: None,
         }
@@ -1697,8 +1858,8 @@ impl AnthropicClient {
 
         // System prompts go as an array of TextBlock-shaped objects rather
         // than a bare string. Both shapes are accepted by Anthropic, but the
-        // block form is what `@anthropic-ai/sdk` emits and is the path that
-        // supports `cache_control` per-block in future.
+        // block form is what `@anthropic-ai/sdk` emits and is the shape that
+        // carries per-block `cache_control` (see `apply_cache_breakpoints`).
         //
         // For OAuth requests, prepend the canonical "You are Claude Code,
         // …" prefix block as system[0] when the per-client toggle is on
@@ -1912,6 +2073,15 @@ impl AnthropicClient {
             body["speed"] = serde_json::Value::String(speed_str.to_string());
         }
 
+        // Must stay LAST: it marks the final shape of `system` / `tools` /
+        // `messages` (post-sanitizing, post-reasoning-restoration, post-OAuth
+        // prefix) and touches only the chosen blocks' `cache_control` key.
+        // A per-request opt-out (`disable_prompt_cache`) wins over the
+        // client-level flag.
+        if self.prompt_cache_enabled && !request.disable_prompt_cache {
+            apply_cache_breakpoints(&mut body);
+        }
+
         body
     }
 
@@ -1936,24 +2106,17 @@ impl AnthropicClient {
                         .unwrap_or_default()
                         .to_string();
                     if let Some(usage) = msg.get("usage") {
-                        acc.input_tokens = usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        acc.cached_tokens = usage
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as u32)
-                            .unwrap_or(0);
+                        acc.wire = serde_json::from_value(usage.clone()).unwrap_or_default();
+                        // message_start's `output_tokens` is a placeholder
+                        // (real streams send 1). Output is authoritative only
+                        // from `message_delta`; a nonzero placeholder would
+                        // freeze the live output estimate, which only
+                        // updates while output == 0.
+                        acc.wire.output_tokens = 0;
                         // Anthropic's output_tokens already includes reasoning
                         // tokens, so reasoning_tokens stays at 0 — see the
                         // contrast note on `Usage::reasoning_tokens`.
-                        on_event(StreamEvent::UsageSnapshot(Usage {
-                            input_tokens: acc.input_tokens,
-                            output_tokens: acc.output_tokens,
-                            cached_tokens: acc.cached_tokens,
-                            reasoning_tokens: 0,
-                        }));
+                        on_event(StreamEvent::UsageSnapshot(acc.wire.normalize()));
                     }
                 }
             }
@@ -2118,19 +2281,23 @@ impl AnthropicClient {
                     }
                 }
                 if let Some(usage) = data.get("usage") {
-                    acc.output_tokens = usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
+                    let field = |k: &str| usage.get(k).and_then(|v| v.as_u64());
+                    acc.wire.output_tokens = field("output_tokens").unwrap_or(0) as u32;
+                    // Newer API versions repeat the input/cache fields in the
+                    // delta with their final values — overwrite when present.
+                    if let Some(n) = field("input_tokens") {
+                        acc.wire.input_tokens = n as u32;
+                    }
+                    if let Some(n) = field("cache_read_input_tokens") {
+                        acc.wire.cache_read_input_tokens = n as u32;
+                    }
+                    if let Some(n) = field("cache_creation_input_tokens") {
+                        acc.wire.cache_creation_input_tokens = n as u32;
+                    }
                     // Anthropic's output_tokens already includes reasoning
                     // tokens, so reasoning_tokens stays at 0 — see the
                     // contrast note on `Usage::reasoning_tokens`.
-                    on_event(StreamEvent::UsageSnapshot(Usage {
-                        input_tokens: acc.input_tokens,
-                        output_tokens: acc.output_tokens,
-                        cached_tokens: acc.cached_tokens,
-                        reasoning_tokens: 0,
-                    }));
+                    on_event(StreamEvent::UsageSnapshot(acc.wire.normalize()));
                 }
             }
             "message_stop" | "ping" => {}
@@ -2139,6 +2306,47 @@ impl AnthropicClient {
             }
         }
         Ok(())
+    }
+}
+
+/// Anthropic's wire usage. Its `input_tokens` EXCLUDES cache reads and cache
+/// writes; `normalize` folds both back in so every provider's
+/// `Usage.input_tokens` means "the whole prompt".
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AnthropicWireUsage {
+    #[serde(default, deserialize_with = "null_as_zero")]
+    input_tokens: u32,
+    #[serde(default, deserialize_with = "null_as_zero")]
+    output_tokens: u32,
+    #[serde(default, deserialize_with = "null_as_zero")]
+    cache_read_input_tokens: u32,
+    #[serde(default, deserialize_with = "null_as_zero")]
+    cache_creation_input_tokens: u32,
+}
+
+/// `#[serde(default)]` covers a missing key, not an explicit `null` — and the
+/// Anthropic SDK types declare the cache fields optional. Map `null` to 0 so
+/// one null counter cannot zero the others (streaming) or fail the whole
+/// response parse (non-streaming).
+fn null_as_zero<'de, D>(d: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u32>::deserialize(d)?.unwrap_or(0))
+}
+
+impl AnthropicWireUsage {
+    fn normalize(&self) -> Usage {
+        Usage {
+            input_tokens: self
+                .input_tokens
+                .saturating_add(self.cache_read_input_tokens)
+                .saturating_add(self.cache_creation_input_tokens),
+            output_tokens: self.output_tokens,
+            cached_tokens: self.cache_read_input_tokens,
+            cache_write_tokens: self.cache_creation_input_tokens,
+            reasoning_tokens: 0,
+        }
     }
 }
 
@@ -2158,9 +2366,7 @@ struct StreamAccumulator {
     text: String,
     content_blocks: Vec<ContentBlock>,
     stop_reason: Option<StopReason>,
-    input_tokens: u32,
-    output_tokens: u32,
-    cached_tokens: u32,
+    wire: AnthropicWireUsage,
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     current_tool_input: String,
@@ -2197,12 +2403,7 @@ impl StreamAccumulator {
             model: self.model,
             content: self.content_blocks,
             stop_reason: self.stop_reason,
-            usage: Usage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                cached_tokens: self.cached_tokens,
-                reasoning_tokens: 0,
-            },
+            usage: self.wire.normalize(),
         })
     }
 }
@@ -2278,7 +2479,7 @@ struct AnthropicResponse {
     model: String,
     content: Vec<serde_json::Value>,
     stop_reason: Option<StopReason>,
-    usage: Usage,
+    usage: AnthropicWireUsage,
 }
 
 impl AnthropicResponse {
@@ -2289,7 +2490,7 @@ impl AnthropicResponse {
             model: self.model,
             content,
             stop_reason: self.stop_reason,
-            usage: self.usage,
+            usage: self.usage.normalize(),
         }
     }
 }
@@ -2501,6 +2702,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -2588,6 +2790,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["model"], "claude-sonnet-4-6");
@@ -2612,6 +2815,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["model"], "claude-sonnet-4-6");
@@ -2644,11 +2848,18 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, true);
+        // Prompt caching is on by default: the (last) system block carries
+        // the prefix breakpoint.
         assert_eq!(
             body["system"],
-            serde_json::json!([{ "type": "text", "text": "You are helpful." }])
+            serde_json::json!([{
+                "type": "text",
+                "text": "You are helpful.",
+                "cache_control": { "type": "ephemeral" },
+            }])
         );
         assert_eq!(body["stream"], true);
         assert!(body["tools"].is_array());
@@ -2688,6 +2899,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         // `betas` belongs in the `anthropic-beta` header only — including it
@@ -2723,6 +2935,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert!(
@@ -2754,6 +2967,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         let user_id = body["metadata"]["user_id"]
@@ -2784,6 +2998,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         let user_id = body["metadata"]["user_id"]
@@ -2813,6 +3028,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         }
     }
 
@@ -2882,6 +3098,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -2910,6 +3127,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -2939,6 +3157,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -2968,6 +3187,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -3006,6 +3226,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         }
     }
 
@@ -3020,7 +3241,10 @@ mod tests {
 
     #[test]
     fn reasoning_block_is_restored_to_anthropic_wire_shape() {
-        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        // Caching off: this pins the restoration shape exactly;
+        // `restored_reasoning_raw_block_is_byte_identical` pins the cache-on shape.
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
         let raw = anthropic_thinking_raw();
         let request = request_with_assistant_blocks(vec![
             ContentBlock::Reasoning {
@@ -3055,7 +3279,10 @@ mod tests {
     fn foreign_provider_reasoning_block_is_dropped_from_request() {
         // A Gemini thoughtSignature is an alien wire format; it must never
         // reach Anthropic.
-        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        // Caching off: this pins the restoration shape exactly;
+        // `restored_reasoning_raw_block_is_byte_identical` pins the cache-on shape.
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
         let request = request_with_assistant_blocks(vec![
             ContentBlock::Reasoning {
                 text: Some("gemini thoughts".into()),
@@ -3119,7 +3346,10 @@ mod tests {
     fn unknown_block_is_dropped_from_request() {
         // `ContentBlock::Unknown` serializes as `{"type":"Unknown"}` (pinned by
         // a test in types.rs), which no provider accepts.
-        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        // Caching off: this pins the restoration shape exactly;
+        // `restored_reasoning_raw_block_is_byte_identical` pins the cache-on shape.
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
         assert_eq!(
             serde_json::to_value(ContentBlock::Unknown).unwrap()["type"],
             "Unknown",
@@ -3144,7 +3374,10 @@ mod tests {
         // `Some` — a `null`, scalar, or `{}` `raw` must still be rejected
         // before being echoed, or it goes on the wire as a malformed content
         // block and Anthropic 400s the request.
-        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        // Caching off: this pins the restoration shape exactly;
+        // `restored_reasoning_raw_block_is_byte_identical` pins the cache-on shape.
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
         let request = request_with_assistant_blocks(vec![
             ContentBlock::Reasoning {
                 text: Some("null raw".into()),
@@ -3195,6 +3428,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -3220,6 +3454,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -3245,6 +3480,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert!(body.get("thinking").is_none());
@@ -3269,6 +3505,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert!(body.get("thinking").is_none()); // Minimal = skip
@@ -3293,6 +3530,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -3318,6 +3556,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
@@ -3347,6 +3586,7 @@ mod tests {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            disable_prompt_cache: false,
         };
         let body = client.build_request_body(&request, false);
         assert!(
@@ -3362,8 +3602,8 @@ mod tests {
         acc.model = "claude-sonnet-4-6".into();
         acc.text = "Hello world".into();
         acc.stop_reason = Some(StopReason::EndTurn);
-        acc.input_tokens = 10;
-        acc.output_tokens = 5;
+        acc.wire.input_tokens = 10;
+        acc.wire.output_tokens = 5;
 
         let response = acc.into_response().unwrap();
         assert_eq!(response.id, "msg_123");
@@ -3707,7 +3947,191 @@ mod tests {
         let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
         let resp: LlmResponse = parsed.into_llm_response();
         assert_eq!(resp.usage.cached_tokens, 200);
-        assert_eq!(resp.usage.input_tokens, 10);
+        // Anthropic's wire `input_tokens` (10) EXCLUDES cache reads; the
+        // provider boundary normalizes it to the whole prompt: 10 + 200.
+        assert_eq!(resp.usage.input_tokens, 210);
+        assert_eq!(resp.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn decode_response_normalizes_cache_reads_and_writes_into_input() {
+        let body = r#"{
+            "id": "msg_x", "model": "claude-opus-5-5",
+            "content": [{"type":"text","text":"hi"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": 200, "cache_creation_input_tokens": 30}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let resp = parsed.into_llm_response();
+        assert_eq!(resp.usage.input_tokens, 240);
+        assert_eq!(resp.usage.cached_tokens, 200);
+        assert_eq!(resp.usage.cache_write_tokens, 30);
+        assert_eq!(resp.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn stream_usage_normalizes_and_message_delta_cache_fields_win_when_present() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let mut snapshots: Vec<Usage> = Vec::new();
+
+        // message_start carries input 10 / read 200 / write 30; message_delta
+        // carries output 7 and (newer API) repeats the cache fields.
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_c","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |se| {
+                    if let StreamEvent::UsageSnapshot(u) = se {
+                        snapshots.push(u);
+                    }
+                })
+                .unwrap();
+        }
+
+        // message_start snapshot is already normalized.
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].input_tokens, 240);
+        assert_eq!(snapshots[0].cached_tokens, 200);
+        assert_eq!(snapshots[0].cache_write_tokens, 30);
+        // Final usage.
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 240);
+        assert_eq!(response.usage.cached_tokens, 200);
+        assert_eq!(response.usage.cache_write_tokens, 30);
+        assert_eq!(response.usage.output_tokens, 7);
+        assert_eq!(snapshots[1].input_tokens, 240);
+        assert_eq!(snapshots[1].output_tokens, 7);
+    }
+
+    #[test]
+    fn stream_message_delta_cache_fields_overwrite_message_start_values() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_d","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4,"input_tokens":12,"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+        let response = acc.into_response().unwrap();
+        // 12 + 100 + 50
+        assert_eq!(response.usage.input_tokens, 162);
+        assert_eq!(response.usage.cached_tokens, 100);
+        assert_eq!(response.usage.cache_write_tokens, 50);
+        assert_eq!(response.usage.output_tokens, 4);
+    }
+
+    #[test]
+    fn stream_message_delta_without_cache_fields_keeps_message_start_values() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_e","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":30}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 240);
+        assert_eq!(response.usage.cached_tokens, 200);
+        assert_eq!(response.usage.cache_write_tokens, 30);
+        assert_eq!(response.usage.output_tokens, 9);
+    }
+
+    #[test]
+    fn stream_message_start_output_tokens_is_not_authoritative() {
+        // Real streams send `"output_tokens": 1` in message_start. The live
+        // output estimate only updates while output == 0, so the first
+        // snapshot must carry 0; the final value comes from message_delta.
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let mut snapshots: Vec<Usage> = Vec::new();
+        let sse_events = vec![
+            crate::sse::SseEvent {
+                event_type: "message_start".into(),
+                data: r#"{"type":"message_start","message":{"id":"msg_o","model":"claude-opus-5-5","usage":{"input_tokens":25,"output_tokens":1}}}"#.into(),
+            },
+            crate::sse::SseEvent {
+                event_type: "message_delta".into(),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#.into(),
+            },
+        ];
+        for event in &sse_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |se| {
+                    if let StreamEvent::UsageSnapshot(u) = se {
+                        snapshots.push(u);
+                    }
+                })
+                .unwrap();
+        }
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].input_tokens, 25);
+        assert_eq!(snapshots[0].output_tokens, 0);
+        assert_eq!(snapshots[1].output_tokens, 42);
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 25);
+        assert_eq!(response.usage.output_tokens, 42);
+    }
+
+    #[test]
+    fn stream_message_start_null_cache_field_keeps_other_counters() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut acc = StreamAccumulator::new();
+        let event = crate::sse::SseEvent {
+            event_type: "message_start".into(),
+            data: r#"{"type":"message_start","message":{"id":"msg_n","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":200,"cache_creation_input_tokens":null}}}"#.into(),
+        };
+        client
+            .process_sse_event(&event, &mut acc, &mut |_| {})
+            .unwrap();
+        let response = acc.into_response().unwrap();
+        // 10 + 200 + (null -> 0): input and read survive the null write field.
+        assert_eq!(response.usage.input_tokens, 210);
+        assert_eq!(response.usage.cached_tokens, 200);
+        assert_eq!(response.usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn decode_response_tolerates_null_cache_fields() {
+        let body = r#"{
+            "id": "msg_x", "model": "claude-opus-5-5",
+            "content": [{"type":"text","text":"hi"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_read_input_tokens": null, "cache_creation_input_tokens": 30}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let resp = parsed.into_llm_response();
+        assert_eq!(resp.usage.input_tokens, 40);
+        assert_eq!(resp.usage.cached_tokens, 0);
+        assert_eq!(resp.usage.cache_write_tokens, 30);
         assert_eq!(resp.usage.output_tokens, 5);
     }
 
@@ -3983,6 +4407,692 @@ mod tests {
         let body = client.build_request_body(&request, false);
         assert_eq!(body["output_config"]["task_budget"], 1500);
         assert!(body["output_config"].get("format").is_none());
+    }
+
+    // ── Prompt caching (spec 2026-09-29 §9.3) ─────────────────────────
+
+    fn body_for(client: &AnthropicClient, req: &LlmRequest) -> serde_json::Value {
+        client.build_request_body(req, true)
+    }
+
+    /// Every `cache_control` key anywhere in the body.
+    fn cache_markers(v: &serde_json::Value) -> usize {
+        let mut n = 0;
+        fn walk(v: &serde_json::Value, n: &mut usize) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    if m.contains_key("cache_control") {
+                        *n += 1;
+                    }
+                    m.values().for_each(|x| walk(x, n));
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, n)),
+                _ => {}
+            }
+        }
+        walk(v, &mut n);
+        n
+    }
+
+    /// The body with every `cache_control` key removed — equal to the
+    /// caching-off body iff `apply_cache_breakpoints` touched nothing else.
+    fn strip_cache_control(mut v: serde_json::Value) -> serde_json::Value {
+        fn walk(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.remove("cache_control");
+                    m.values_mut().for_each(walk);
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(walk),
+                _ => {}
+            }
+        }
+        walk(&mut v);
+        v
+    }
+
+    fn ephemeral() -> serde_json::Value {
+        serde_json::json!({ "type": "ephemeral" })
+    }
+
+    fn cache_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: format!("the {name} tool"),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn uncached_client() -> AnthropicClient {
+        AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink)).with_prompt_cache(false)
+    }
+
+    #[test]
+    fn caching_marks_last_system_block_and_last_message_block() {
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let req = LlmRequest {
+            model: "claude-opus-5-5".into(),
+            system: Some("You are a reviewer.".into()),
+            messages: vec![
+                Message::user("first"),
+                Message::assistant("an answer"),
+                Message::user("second"),
+            ],
+            tools: vec![cache_tool("read_file")],
+            max_tokens: 1024,
+            ..Default::default()
+        };
+        let b = body_for(&client, &req);
+        let sys = b["system"].as_array().unwrap();
+        // Exactly `{"type":"ephemeral"}` — the 5-minute TTL, never a `ttl`.
+        assert_eq!(sys.last().unwrap()["cache_control"], ephemeral());
+        // Tools render before system, so the system marker already caches
+        // them; the tool itself carries no second marker.
+        assert!(b["tools"][0].get("cache_control").is_none());
+        let msgs = b["messages"].as_array().unwrap();
+        let last_msg = msgs.last().unwrap();
+        let blocks = last_msg["content"]
+            .as_array()
+            .expect("Message::user serializes content as a block array");
+        assert_eq!(blocks.last().unwrap()["cache_control"], ephemeral());
+        // One rolling conversation breakpoint: no earlier message is marked.
+        for m in &msgs[..msgs.len() - 1] {
+            assert_eq!(cache_markers(m), 0, "history message marked: {m}");
+        }
+        // No top-level (automatic) caching field.
+        assert!(b.get("cache_control").is_none());
+        assert_eq!(cache_markers(&b), 2);
+        // Only `cache_control` keys were added — nothing else changed.
+        assert_eq!(strip_cache_control(b), body_for(&uncached_client(), &req));
+    }
+
+    #[test]
+    fn caching_disabled_emits_no_markers() {
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink))
+            .with_prompt_cache(false);
+        let req = LlmRequest {
+            model: "m".into(),
+            system: Some("s".into()),
+            messages: vec![Message::user("hi")],
+            tools: vec![cache_tool("t")],
+            ..Default::default()
+        };
+        assert_eq!(cache_markers(&body_for(&client, &req)), 0);
+    }
+
+    #[test]
+    fn per_request_opt_out_emits_no_markers_even_with_caching_enabled() {
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        assert!(client.prompt_cache_enabled);
+        let mut req = LlmRequest {
+            model: "m".into(),
+            system: Some("summarize the prior turns".into()),
+            messages: vec![
+                Message::user("a"),
+                Message::assistant("b"),
+                Message::user("c"),
+            ],
+            tools: vec![cache_tool("t")],
+            ..Default::default()
+        };
+        // Sanity: the same request is marked without the opt-out.
+        assert_eq!(cache_markers(&body_for(&client, &req)), 2);
+        req.disable_prompt_cache = true;
+        let b = body_for(&client, &req);
+        assert_eq!(cache_markers(&b), 0);
+        assert_eq!(b, body_for(&uncached_client(), &req));
+        // OAuth (system-prefix blocks prepended) honours it too.
+        assert_eq!(cache_markers(&body_for(&oauth_client(), &req)), 0);
+    }
+
+    #[test]
+    fn caching_is_on_by_default_for_every_constructor() {
+        let sink = || -> Arc<dyn rupu_netflow::FlowSink> { Arc::new(rupu_netflow::NullSink) };
+        let api_key = || AuthMethod::ApiKey("k".into());
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::credential_store::CredentialStore::load(
+            dir.path().join("auth.json"),
+            dir.path().join("auth_status.json"),
+        )
+        .expect("empty credential store");
+        let clients = [
+            ("from_auth", AnthropicClient::from_auth(api_key(), sink())),
+            ("new", AnthropicClient::new("k".into(), sink())),
+            (
+                "with_url",
+                AnthropicClient::with_url("k".into(), "http://x.test".into(), sink()),
+            ),
+            (
+                "from_auth_with_url",
+                AnthropicClient::from_auth_with_url(api_key(), "http://x.test".into(), sink()),
+            ),
+            (
+                "from_auth_with_path",
+                AnthropicClient::from_auth_with_path(api_key(), dir.path().join("a.json"), sink()),
+            ),
+            (
+                "from_auth_with_store",
+                AnthropicClient::from_auth_with_store(api_key(), Arc::new(store), sink()),
+            ),
+        ];
+        for (name, client) in clients {
+            assert!(
+                client.prompt_cache_enabled,
+                "{name}: caching must default ON"
+            );
+            assert!(!client.with_prompt_cache(false).prompt_cache_enabled);
+        }
+    }
+
+    #[test]
+    fn no_system_marks_last_tool_instead() {
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let req = LlmRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![cache_tool("a"), cache_tool("b")],
+            ..Default::default()
+        };
+        let b = body_for(&client, &req);
+        assert!(b.get("system").is_none());
+        assert!(b["tools"][0].get("cache_control").is_none());
+        assert_eq!(b["tools"][1]["cache_control"], ephemeral());
+        assert_eq!(b["messages"][0]["content"][0]["cache_control"], ephemeral());
+        assert_eq!(cache_markers(&b), 2);
+        assert_eq!(strip_cache_control(b), body_for(&uncached_client(), &req));
+    }
+
+    #[test]
+    fn no_system_and_no_tools_marks_only_the_final_message() {
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let req = LlmRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let b = body_for(&client, &req);
+        assert_eq!(b["messages"][0]["content"][0]["cache_control"], ephemeral());
+        assert_eq!(cache_markers(&b), 1);
+    }
+
+    #[test]
+    fn empty_system_text_block_is_skipped_for_the_prefix_marker() {
+        // An empty text block cannot carry `cache_control`; with no other
+        // system block the prefix marker falls back to the last tool.
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let req = LlmRequest {
+            model: "m".into(),
+            system: Some(String::new()),
+            messages: vec![Message::user("hi")],
+            tools: vec![cache_tool("a")],
+            ..Default::default()
+        };
+        let b = body_for(&client, &req);
+        assert!(b["system"][0].get("cache_control").is_none());
+        assert_eq!(b["tools"][0]["cache_control"], ephemeral());
+        assert_eq!(cache_markers(&b), 2);
+    }
+
+    #[test]
+    fn never_marks_thinking_or_empty_text_blocks() {
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let thinking = || ContentBlock::Reasoning {
+            text: Some("step one, then step two".into()),
+            provider: PROVIDER_TAG.into(),
+            model: "claude-opus-4-7".into(),
+            raw: anthropic_thinking_raw(),
+        };
+        let redacted = || ContentBlock::Reasoning {
+            text: None,
+            provider: PROVIDER_TAG.into(),
+            model: "claude-opus-4-7".into(),
+            raw: serde_json::json!({ "type": "redacted_thinking", "data": "enc_abc" }),
+        };
+        let text = |t: &str| ContentBlock::Text { text: t.into() };
+
+        // [text "x", thinking] → the marker lands on "x", the last
+        // NON-thinking block; the thinking block is untouched.
+        let b = body_for(
+            &client,
+            &request_with_assistant_blocks(vec![text("x"), thinking()]),
+        );
+        let content = b["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["cache_control"], ephemeral());
+        assert_eq!(content[1], anthropic_thinking_raw());
+        assert_eq!(cache_markers(&b), 1);
+
+        // [tool_use, empty text, whitespace text] → the tool_use is marked.
+        let b = body_for(
+            &client,
+            &request_with_assistant_blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "a" }),
+                },
+                text(""),
+                text(" \n"),
+            ]),
+        );
+        let content = b["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["cache_control"], ephemeral());
+        assert!(content[1].get("cache_control").is_none());
+        assert!(content[2].get("cache_control").is_none());
+        assert_eq!(cache_markers(&b), 1);
+
+        // Nothing cacheable in the final message → the final message stays
+        // unmarked and the rolling marker walks back to the nearest earlier
+        // message with a cacheable block (here the opening user "hi").
+        // Without that, the request would carry no message-level breakpoint
+        // and read no history from the cache at all.
+        for blocks in [
+            vec![text("")],
+            vec![thinking()],
+            vec![redacted(), thinking()],
+        ] {
+            let mut req = request_with_assistant_blocks(blocks);
+            req.system = Some("s".into());
+            let b = body_for(&client, &req);
+            assert_eq!(b["system"][0]["cache_control"], ephemeral());
+            assert_eq!(
+                cache_markers(&b["messages"][1]),
+                0,
+                "final message must stay unmarked: {}",
+                b["messages"]
+            );
+            assert_eq!(b["messages"][0]["content"][0]["cache_control"], ephemeral());
+            assert_eq!(cache_markers(&b), 2);
+            // Thinking bytes untouched: only `cache_control` was added.
+            assert_eq!(strip_cache_control(b), body_for(&uncached_client(), &req));
+        }
+    }
+
+    /// A tool-use turn: user prompt, assistant `[text, tool_use]`, then the
+    /// tool result as the final message.
+    fn tool_turn_request(result: &str) -> LlmRequest {
+        LlmRequest {
+            model: "m".into(),
+            system: Some("s".into()),
+            messages: vec![
+                Message::user("rebuild the widget crate"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "Rebuilding now.".into(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "toolu_q7".into(),
+                            name: "bash".into(),
+                            input: serde_json::json!({ "command": "make -s widget" }),
+                        },
+                    ],
+                },
+                Message::tool_result("toolu_q7", result, false),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_tool_result_tail_walks_back_to_the_preceding_tool_use() {
+        // A silent bash command yields `tool_result` with `content: ""` as the
+        // final message's only block. It must not carry the marker; the
+        // preceding assistant's `tool_use` does instead.
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        for silent in ["", "  \n\t"] {
+            let req = tool_turn_request(silent);
+            let b = body_for(&client, &req);
+            let msgs = b["messages"].as_array().unwrap();
+            assert_eq!(cache_markers(&msgs[2]), 0, "empty tool_result marked");
+            assert_eq!(msgs[1]["content"][1]["type"], "tool_use");
+            assert_eq!(msgs[1]["content"][1]["cache_control"], ephemeral());
+            assert!(msgs[1]["content"][0].get("cache_control").is_none());
+            assert_eq!(cache_markers(&msgs[0]), 0);
+            assert_eq!(b["system"][0]["cache_control"], ephemeral());
+            assert_eq!(cache_markers(&b), 2);
+            assert_eq!(strip_cache_control(b), body_for(&uncached_client(), &req));
+        }
+    }
+
+    #[test]
+    fn real_tool_result_tail_keeps_the_marker() {
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let req = tool_turn_request("compiled 3 units\nok");
+        let b = body_for(&client, &req);
+        let msgs = b["messages"].as_array().unwrap();
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["cache_control"], ephemeral());
+        assert_eq!(
+            cache_markers(&msgs[1]),
+            0,
+            "no walk-back when the tail is cacheable"
+        );
+        assert_eq!(cache_markers(&b), 2);
+        assert_eq!(strip_cache_control(b), body_for(&uncached_client(), &req));
+    }
+
+    #[test]
+    fn walk_back_skips_thinking_before_the_tool_use() {
+        // [thinking, tool_use] + [tool_result ""] → the tool_use is marked
+        // and the restored thinking block stays byte-identical.
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let raw = anthropic_thinking_raw();
+        let req = LlmRequest {
+            model: "claude-opus-4-7".into(),
+            messages: vec![
+                Message::user("list the repos"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Reasoning {
+                            text: Some("step one, then step two".into()),
+                            provider: PROVIDER_TAG.into(),
+                            model: "claude-opus-4-7".into(),
+                            raw: raw.clone(),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "toolu_r2".into(),
+                            name: "scm.repos.list".into(),
+                            input: serde_json::json!({}),
+                        },
+                    ],
+                },
+                Message::tool_result("toolu_r2", "", false),
+            ],
+            max_tokens: 8000,
+            ..Default::default()
+        };
+        let on = body_for(&client, &req);
+        let off = body_for(&uncached_client(), &req);
+        assert_eq!(
+            serde_json::to_string(&on["messages"][1]["content"][0]).unwrap(),
+            serde_json::to_string(&off["messages"][1]["content"][0]).unwrap(),
+        );
+        assert_eq!(on["messages"][1]["content"][0], raw);
+        assert_eq!(
+            on["messages"][1]["content"][1]["cache_control"],
+            ephemeral()
+        );
+        assert_eq!(cache_markers(&on["messages"][2]), 0);
+        assert_eq!(cache_markers(&on), 1);
+        assert_eq!(strip_cache_control(on), off);
+    }
+
+    #[test]
+    fn empty_tool_result_is_not_cacheable_in_any_content_shape() {
+        let tr = |content: Option<serde_json::Value>| {
+            let mut b = serde_json::json!({ "type": "tool_result", "tool_use_id": "toolu_1" });
+            if let Some(c) = content {
+                b["content"] = c;
+            }
+            b
+        };
+        for empty in [
+            None,
+            Some(serde_json::json!("")),
+            Some(serde_json::json!(" \n")),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!([{ "type": "text", "text": "" }])),
+            Some(serde_json::json!([
+                { "type": "text", "text": "  " },
+                { "type": "text", "text": "" },
+            ])),
+        ] {
+            let block = tr(empty.clone());
+            assert!(!is_cacheable_block(&block), "cacheable: {block}");
+        }
+        for real in [
+            serde_json::json!("exit 0"),
+            serde_json::json!([{ "type": "text", "text": "" }, { "type": "text", "text": "ok" }]),
+            serde_json::json!([{
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0K" },
+            }]),
+        ] {
+            let block = tr(Some(real));
+            assert!(is_cacheable_block(&block), "not cacheable: {block}");
+        }
+
+        // End to end on a raw body: `[user: tool_result []]` walks back to the
+        // preceding assistant's tool_use.
+        for empty in [
+            serde_json::json!([]),
+            serde_json::json!([{ "type": "text", "text": "" }]),
+        ] {
+            let mut body = serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "go" }] },
+                    { "role": "assistant", "content": [
+                        { "type": "tool_use", "id": "toolu_1", "name": "bash", "input": {} },
+                    ] },
+                    { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_1", "content": empty },
+                    ] },
+                ],
+            });
+            apply_cache_breakpoints(&mut body);
+            assert_eq!(cache_markers(&body["messages"][2]), 0);
+            assert_eq!(
+                body["messages"][1]["content"][0]["cache_control"],
+                ephemeral()
+            );
+            assert_eq!(cache_markers(&body), 1);
+        }
+    }
+
+    #[test]
+    fn walk_back_is_bounded_to_three_messages_before_the_last() {
+        let msg = |role: &str, content: serde_json::Value| serde_json::json!({ "role": role, "content": content });
+        let anchor = || {
+            msg(
+                "user",
+                serde_json::json!([{ "type": "text", "text": "anchor" }]),
+            )
+        };
+        let thinking = || {
+            msg(
+                "assistant",
+                serde_json::json!([{ "type": "thinking", "thinking": "hm", "signature": "sig" }]),
+            )
+        };
+        let redacted = || {
+            msg(
+                "assistant",
+                serde_json::json!([{ "type": "redacted_thinking", "data": "enc" }]),
+            )
+        };
+        let empty_result = |content: serde_json::Value| {
+            msg(
+                "user",
+                serde_json::json!([{ "type": "tool_result", "tool_use_id": "t", "content": content }]),
+            )
+        };
+
+        // The anchor is exactly 3 messages before the last → still reached.
+        let mut body = serde_json::json!({ "messages": [
+            anchor(),
+            empty_result(serde_json::json!("")),
+            redacted(),
+            empty_result(serde_json::json!([])),
+        ] });
+        apply_cache_breakpoints(&mut body);
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            ephemeral()
+        );
+        assert_eq!(cache_markers(&body), 1);
+
+        // One more uncacheable message pushes it 4 back → out of range, so
+        // no message-level marker at all (rather than one deep in history).
+        let mut body = serde_json::json!({ "messages": [
+            anchor(),
+            thinking(),
+            empty_result(serde_json::json!("")),
+            redacted(),
+            empty_result(serde_json::json!([])),
+        ] });
+        let before = body.clone();
+        apply_cache_breakpoints(&mut body);
+        assert_eq!(cache_markers(&body), 0);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn oauth_billing_blocks_stay_first_and_unmarked_except_last_system_block() {
+        let client = oauth_client();
+        let b = body_for(&client, &make_request(Some("agent persona")));
+        let sys = b["system"].as_array().expect("system is array");
+        assert_eq!(sys.len(), 3);
+        // Byte-identical billing + self-description blocks, in order, unmarked.
+        assert_eq!(
+            sys[0],
+            serde_json::json!({ "type": "text", "text": ANTHROPIC_BILLING_HEADER_BLOCK })
+        );
+        assert_eq!(
+            sys[1],
+            serde_json::json!({ "type": "text", "text": ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION })
+        );
+        assert_eq!(
+            sys[2],
+            serde_json::json!({
+                "type": "text",
+                "text": "agent persona",
+                "cache_control": { "type": "ephemeral" },
+            })
+        );
+        assert_eq!(cache_markers(&b), 2);
+
+        // No agent system prompt: the self-description is now the last
+        // system block and carries the marker; the billing block never does.
+        let b = body_for(&client, &make_request(None));
+        let sys = b["system"].as_array().expect("system is array");
+        assert_eq!(sys.len(), 2);
+        assert_eq!(
+            sys[0],
+            serde_json::json!({ "type": "text", "text": ANTHROPIC_BILLING_HEADER_BLOCK })
+        );
+        assert_eq!(sys[1]["text"], ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION);
+        assert_eq!(sys[1]["cache_control"], ephemeral());
+        assert_eq!(cache_markers(&b), 2);
+    }
+
+    #[test]
+    fn restored_reasoning_raw_block_is_byte_identical() {
+        let cached = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
+        let raw = anthropic_thinking_raw();
+        let reasoning = ContentBlock::Reasoning {
+            text: Some("step one, then step two".into()),
+            provider: PROVIDER_TAG.into(),
+            model: "claude-opus-4-7".into(),
+            raw: raw.clone(),
+        };
+
+        // Restored block in history; the final message is the tool result.
+        let req = LlmRequest {
+            model: "claude-opus-4-7".into(),
+            messages: vec![
+                Message::user("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        reasoning.clone(),
+                        ContentBlock::ToolUse {
+                            id: "toolu_1".into(),
+                            name: "scm.repos.list".into(),
+                            input: serde_json::json!({}),
+                        },
+                    ],
+                },
+                Message::tool_result("toolu_1", "ok", false),
+            ],
+            max_tokens: 8000,
+            ..Default::default()
+        };
+        let on = body_for(&cached, &req);
+        let off = body_for(&uncached_client(), &req);
+        assert_eq!(
+            serde_json::to_string(&on["messages"][1]["content"][0]).unwrap(),
+            serde_json::to_string(&off["messages"][1]["content"][0]).unwrap(),
+        );
+        assert_eq!(on["messages"][1]["content"][0], raw);
+        assert_eq!(
+            on["messages"][2]["content"][0]["cache_control"],
+            ephemeral()
+        );
+        assert_eq!(strip_cache_control(on), off);
+
+        // Restored block as the LAST block of the final message: skipped,
+        // not marked, and still byte-identical.
+        let req = request_with_assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+            reasoning,
+        ]);
+        let on = body_for(&cached, &req);
+        let off = body_for(&uncached_client(), &req);
+        assert_eq!(
+            serde_json::to_string(&on["messages"][1]["content"][1]).unwrap(),
+            serde_json::to_string(&off["messages"][1]["content"][1]).unwrap(),
+        );
+        assert_eq!(on["messages"][1]["content"][1], raw);
+        assert_eq!(
+            on["messages"][1]["content"][0]["cache_control"],
+            ephemeral()
+        );
+        assert_eq!(strip_cache_control(on), off);
+    }
+
+    #[test]
+    fn apply_cache_breakpoints_converts_string_content_only_when_marking() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "earlier" },
+                { "role": "user", "content": "hello" },
+            ],
+        });
+        apply_cache_breakpoints(&mut body);
+        // History string content is left as-is.
+        assert_eq!(body["messages"][0]["content"], "earlier");
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "hello",
+                "cache_control": { "type": "ephemeral" },
+            }])
+        );
+
+        // Empty string content cannot carry a marker → left untouched.
+        let mut body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "" }],
+        });
+        apply_cache_breakpoints(&mut body);
+        assert_eq!(body["messages"][0]["content"], "");
+        assert_eq!(cache_markers(&body), 0);
+
+        // Empty final string content → walk back: the earlier string content
+        // is converted (because it is now the block being marked); the empty
+        // final message is left as-is.
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "earlier" },
+                { "role": "user", "content": " " },
+            ],
+        });
+        apply_cache_breakpoints(&mut body);
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "earlier",
+                "cache_control": { "type": "ephemeral" },
+            }])
+        );
+        assert_eq!(body["messages"][1]["content"], " ");
+        assert_eq!(cache_markers(&body), 1);
     }
 
     #[tokio::test]

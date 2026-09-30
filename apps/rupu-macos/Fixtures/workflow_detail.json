@@ -3,10 +3,12 @@
   "scope_id": null,
   "scope_kind": "global",
   "usage": {
+    "cache_write_tokens": 0,
     "cached_tokens": 300,
     "cost_usd": 0.42,
     "input_tokens": 5000,
     "output_tokens": 1200,
+    "partial": false,
     "priced": true,
     "runs": 5,
     "total_tokens": 6500

@@ -103,6 +103,47 @@ describe('buildTranscriptView — header / footer', () => {
     expect(view.footer?.status).toBeNull();
   });
 
+  it('footer totals are a running sum of usage events until run_complete', () => {
+    const usage = (input_tokens: number, output_tokens: number): TranscriptEvent => ({
+      type: 'usage',
+      data: { input_tokens, output_tokens },
+    });
+    const view = buildTranscriptView([RUN_START, usage(100, 10), usage(200, 20)]);
+    expect(view.footer?.totalTokens).toBe(330);
+    expect(view.footer?.status).toBeNull();
+  });
+
+  it('the running sum skips compaction usage (run_complete.total_tokens excludes it)', () => {
+    const usage = (input_tokens: number, output_tokens: number, purpose?: string): TranscriptEvent => ({
+      type: 'usage',
+      data: { input_tokens, output_tokens, ...(purpose ? { purpose } : {}) },
+    });
+    const view = buildTranscriptView([
+      RUN_START,
+      usage(100, 10),
+      usage(5000, 500, 'compaction'),
+      usage(200, 20),
+    ]);
+    expect(view.footer?.totalTokens).toBe(330);
+  });
+
+  it('run_complete supplies the authoritative total over the running usage sum', () => {
+    const usage = (input_tokens: number, output_tokens: number): TranscriptEvent => ({
+      type: 'usage',
+      data: { input_tokens, output_tokens },
+    });
+    const view = buildTranscriptView([
+      RUN_START,
+      usage(100, 10),
+      usage(200, 20),
+      RUN_COMPLETE,
+      // A straggler after run_complete must not overwrite the final figure.
+      usage(5, 5),
+    ]);
+    expect(view.footer?.totalTokens).toBe(4210);
+    expect(view.footer?.status).toBe('completed');
+  });
+
   it('handles an empty stream', () => {
     const view = buildTranscriptView([]);
     expect(view.header).toBeNull();
