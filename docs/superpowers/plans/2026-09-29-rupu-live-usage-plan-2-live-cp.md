@@ -788,6 +788,11 @@ export function mergeSnapshotAndStream<T>(snapshot: T[], stream: T[]): T[] {
       (1.5 s) therefore refreshes the header usage and chart while a turn is in
       flight.
     - `reload()` also calls `loadTimeline()`.
+  - `components/usage/OutlierPanel.tsx` (~56): the name column reads only
+    `workflow_name`, which is `""` for standalone/session outliers (Plan 1
+    Task 9 made outliers include them, with additive `kind` + `agent`
+    fields). Render `workflow_name || agent` and a small `agent`/`session`
+    kind tag when `kind !== 'workflow'`; extend `OutlierPanel.test.tsx`.
   - `Usage.tsx`: in the `getUsage` effect, when `usageWindow.until == null`
     (or whatever marks "ends at now" in `UsageRangeControls`; check its
     window construction), start
