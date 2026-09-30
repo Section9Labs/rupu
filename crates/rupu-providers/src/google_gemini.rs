@@ -2584,22 +2584,47 @@ mod llm_provider_impl_tests {
     async fn fetch_models_respects_50_page_limit() {
         use httpmock::prelude::*;
         let server = MockServer::start();
-        // Simple mock: return 50 models in a single page with no pagination.
-        // This verifies the function collects models correctly; the 50-page cap
-        // is verified by code inspection (i == 49 check inside loop).
-        let _mock = server.mock(|when, then| {
-            when.method(GET).path("/v1beta/models");
+
+        // Page 1 mock (no pageToken)
+        let page1 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .matches(no_page_token);
             then.status(200).json_body(serde_json::json!({
-                "models": (0..50)
-                    .map(|i| serde_json::json!({
-                        "name": format!("models/model-{}", i),
-                        "inputTokenLimit": 1000 + i,
-                        "outputTokenLimit": 100,
-                        "supportedGenerationMethods": ["generateContent"]
-                    }))
-                    .collect::<Vec<_>>()
+                "models": [{"name": "models/g-1", "inputTokenLimit": 1000, "outputTokenLimit": 100, "supportedGenerationMethods": ["generateContent"]}],
+                "nextPageToken": "t1"
             }));
         });
+
+        // Pages 2-50 mocks (pageToken t1..t49, each with nextPageToken t2..t50)
+        let mut page_mocks = Vec::new();
+        for i in 1..=49 {
+            let token = format!("t{}", i);
+            let next_token = format!("t{}", i + 1);
+            let model_name = format!("g-{}", i + 1);
+            let mock = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/v1beta/models")
+                    .query_param("pageToken", token.as_str());
+                then.status(200).json_body(serde_json::json!({
+                    "models": [{"name": format!("models/{}", model_name), "inputTokenLimit": 1000 + i, "outputTokenLimit": 100, "supportedGenerationMethods": ["generateContent"]}],
+                    "nextPageToken": next_token
+                }));
+            });
+            page_mocks.push(mock);
+        }
+
+        // Page 51 mock (pageToken t50) — should never be called because cap stops at 50 iterations
+        let page51 = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1beta/models")
+                .query_param("pageToken", "t50");
+            then.status(200).json_body(serde_json::json!({
+                "models": [{"name": "models/g-51", "inputTokenLimit": 1000, "outputTokenLimit": 100, "supportedGenerationMethods": ["generateContent"]}],
+                "nextPageToken": "t51"
+            }));
+        });
+
         let mut client = GoogleGeminiClient::new(
             AuthCredentials::ApiKey {
                 key: "g-key".into(),
@@ -2613,10 +2638,27 @@ mod llm_provider_impl_tests {
         let ms = <GoogleGeminiClient as LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap();
-        // Verify 50 models are collected correctly
-        assert_eq!(ms.len(), 50);
-        // Verify context_window is properly extracted
-        assert_eq!(ms[0].context_window, 1000);
-        assert_eq!(ms[49].context_window, 1049);
+
+        // Verify exactly 50 pages fetched
+        assert_eq!(ms.len(), 50, "should fetch exactly 50 models at the cap");
+
+        // Verify no duplicates
+        let ids: std::collections::HashSet<_> = ms.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            50,
+            "all 50 model ids should be unique"
+        );
+
+        // Verify page 1 (no pageToken) was hit exactly once
+        page1.assert_hits(1);
+
+        // Verify pages 2-50 (pageToken t1..t49) were each hit exactly once
+        for mock in &page_mocks {
+            mock.assert_hits(1);
+        }
+
+        // Verify page 51 (pageToken t50) was never called — the cap stopped at 50
+        page51.assert_hits(0);
     }
 }
