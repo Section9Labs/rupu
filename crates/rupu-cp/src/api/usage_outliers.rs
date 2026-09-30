@@ -53,6 +53,11 @@ pub struct RunCost {
     pub workflow_name: String,
     /// The agent a standalone run / session turn ran; `""` for a workflow run.
     pub agent: String,
+    /// The session a session turn belongs to; `None` otherwise.
+    pub session_id: Option<String>,
+    /// The source's own transcript (standalone run / session turn); `None`
+    /// for a workflow run.
+    pub transcript_path: Option<String>,
     /// `None` = unpriced. NOT zero — we do not know what it cost.
     pub cost_usd: Option<f64>,
     pub started_at: DateTime<Utc>,
@@ -80,6 +85,15 @@ pub struct OutlierRun {
     /// absent for a workflow run).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The session a session-turn outlier belongs to — where the UI links it
+    /// (additive; absent for workflow and standalone rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The outlier's own transcript path — where the UI links a standalone
+    /// agent run / session turn, since neither is in the run store so
+    /// `/runs/:id` would 404 (additive; absent for workflow rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub cost_usd: f64,
     pub baseline_usd: f64,
     pub ratio: f64,
@@ -138,6 +152,8 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
                     kind: r.kind.as_str(),
                     workflow_name: r.workflow_name.clone(),
                     agent: (r.kind != SourceKind::Workflow).then(|| r.agent.clone()),
+                    session_id: r.session_id.clone(),
+                    transcript_path: r.transcript_path.clone(),
                     cost_usd: cost,
                     baseline_usd: baseline,
                     ratio,
@@ -185,6 +201,10 @@ async fn get_usage_outliers(
             kind: src.kind,
             workflow_name: src.workflow,
             agent: src.agent,
+            session_id: src.session_id,
+            transcript_path: src
+                .transcript_path
+                .map(|p| p.to_string_lossy().into_owned()),
             started_at: src.started_at,
         })
         .collect();
@@ -203,6 +223,8 @@ mod tests {
                 kind: SourceKind::Workflow,
                 workflow_name: workflow_name.into(),
                 agent: String::new(),
+                session_id: None,
+                transcript_path: None,
                 cost_usd: Some(cost),
                 started_at: chrono::Utc::now(),
             })
@@ -215,6 +237,8 @@ mod tests {
             kind,
             workflow_name: String::new(),
             agent: agent.into(),
+            session_id: (kind == SourceKind::Session).then(|| format!("sess_{agent}")),
+            transcript_path: Some(format!("/t/{run_id}.jsonl")),
             cost_usd: Some(cost),
             started_at: chrono::Utc::now(),
         }
@@ -246,6 +270,45 @@ mod tests {
         assert_eq!(out[0].kind, "agent");
         assert_eq!(out[0].agent.as_deref(), Some("solo"));
         assert_eq!(out[0].workflow_name, "");
+    }
+
+    /// A flagged run carries the link target of its own kind: a session turn its
+    /// session + transcript, a standalone run its transcript, a workflow run
+    /// neither.
+    #[test]
+    fn outliers_carry_their_link_targets() {
+        let mut runs = to_fixtures(vec![
+            ("wf", "w1", 1.0),
+            ("wf", "w2", 1.0),
+            ("wf", "w3", 1.0),
+            ("wf", "w_spike", 10.0),
+        ]);
+        runs.extend([
+            standalone(SourceKind::Agent, "solo", "a1", 1.0),
+            standalone(SourceKind::Agent, "solo", "a2", 1.0),
+            standalone(SourceKind::Agent, "solo", "a3", 1.0),
+            standalone(SourceKind::Agent, "solo", "a_spike", 10.0),
+            standalone(SourceKind::Session, "chat", "t1", 1.0),
+            standalone(SourceKind::Session, "chat", "t2", 1.0),
+            standalone(SourceKind::Session, "chat", "t3", 1.0),
+            standalone(SourceKind::Session, "chat", "t_spike", 10.0),
+        ]);
+        let out = find_outliers(&runs, 3.0);
+        let by_id = |id: &str| out.iter().find(|o| o.run_id == id).expect(id);
+
+        let wf = by_id("w_spike");
+        assert_eq!(
+            (wf.session_id.as_deref(), wf.transcript_path.as_deref()),
+            (None, None)
+        );
+
+        let agent = by_id("a_spike");
+        assert_eq!(agent.session_id, None);
+        assert_eq!(agent.transcript_path.as_deref(), Some("/t/a_spike.jsonl"));
+
+        let session = by_id("t_spike");
+        assert_eq!(session.session_id.as_deref(), Some("sess_chat"));
+        assert_eq!(session.transcript_path.as_deref(), Some("/t/t_spike.jsonl"));
     }
 
     #[test]
@@ -285,6 +348,8 @@ mod tests {
                 kind: SourceKind::Workflow,
                 workflow_name: "wf".into(),
                 agent: String::new(),
+                session_id: None,
+                transcript_path: None,
                 cost_usd: None,
                 started_at: chrono::Utc::now(),
             }],

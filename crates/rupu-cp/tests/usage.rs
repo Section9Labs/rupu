@@ -1600,6 +1600,87 @@ async fn outliers_include_standalone_runs_and_never_double_count() {
     assert_eq!(out[0]["workflow_name"], "");
 }
 
+/// Outlier rows carry the target the UI links them to: a standalone run its
+/// own transcript, a session turn its session (and transcript), a workflow run
+/// neither (it links to `/runs/:id`, which standalone/session runs never have).
+#[tokio::test]
+async fn outlier_rows_carry_their_link_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let now = chrono::Utc::now();
+
+    // Standalone agent runs of `solo`: three baseline + one spike.
+    for id in ["run_A1", "run_A2", "run_A3"] {
+        write_standalone_run(global, id, "solo", "ws_a", &[(1000, 0)]);
+    }
+    write_standalone_run(global, "run_ASPIKE", "solo", "ws_a", &[(10_000, 0)]);
+
+    // Session turns of `chatty` in session `sess_S1`: three baseline + a spike.
+    let tdir = global.join("transcripts");
+    for (id, tokens) in [
+        ("run_T1", 1000),
+        ("run_T2", 1000),
+        ("run_T3", 1000),
+        ("run_TSPIKE", 10_000),
+    ] {
+        write_fold_transcript(
+            &tdir.join(format!("{id}.jsonl")),
+            "chatty",
+            "ws_a",
+            &[(tokens, 0)],
+        );
+        write_standalone_meta(&tdir, id, Some("sess_S1"), "session_turn");
+    }
+
+    // A workflow: three baseline runs + a spike.
+    for (i, tokens) in [100_000, 100_000, 100_000, 1_000_000]
+        .into_iter()
+        .enumerate()
+    {
+        seed_run_with_usage(
+            global,
+            &format!("run_W{i}"),
+            "wf",
+            "ws_a",
+            "anthropic",
+            "claude-sonnet-4-6",
+            tokens,
+            0,
+            now - chrono::Duration::hours(1),
+        );
+    }
+
+    let srv = spawn_server(global).await;
+    let out = get_json(format!("{}/api/usage/outliers", srv.base_url)).await;
+    let out = out.as_array().expect("array");
+    let row = |id: &str| {
+        out.iter()
+            .find(|r| r["run_id"] == id)
+            .unwrap_or_else(|| panic!("{id} not flagged: {out:?}"))
+    };
+
+    let agent = row("run_ASPIKE");
+    assert_eq!(agent["kind"], "agent");
+    let agent_path = agent["transcript_path"]
+        .as_str()
+        .expect("agent transcript_path");
+    assert!(agent_path.ends_with("run_ASPIKE.jsonl"), "{agent}");
+    assert!(agent.get("session_id").is_none(), "no session: {agent}");
+
+    let session = row("run_TSPIKE");
+    assert_eq!(session["kind"], "session");
+    assert_eq!(session["session_id"], "sess_S1", "{session}");
+    let session_path = session["transcript_path"]
+        .as_str()
+        .expect("session transcript_path");
+    assert!(session_path.ends_with("run_TSPIKE.jsonl"), "{session}");
+
+    let wf = row("run_W3");
+    assert_eq!(wf["kind"], "workflow");
+    assert!(wf.get("session_id").is_none(), "workflow row: {wf}");
+    assert!(wf.get("transcript_path").is_none(), "workflow row: {wf}");
+}
+
 // ---------------------------------------------------------------------------
 // Part E: `GET /api/runs/:id/usage` — the live run usage endpoint (live usage
 // ledger, Plan 2 Task 3): summary, per-step summaries, turns, partial, a

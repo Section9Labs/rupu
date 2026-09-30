@@ -22,6 +22,7 @@
     "kind": "agent",
     "workflow_name": "",
     "agent": "rupuso",
+    "transcript_path": "/Users/dev/.rupu/transcripts/run-10.jsonl",
     "cost_usd": 3.5,
     "baseline_usd": 1.0,
     "ratio": 3.5,

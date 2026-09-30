@@ -150,16 +150,34 @@ export default function TranscriptPanel({
     // A fresh subscription replays the file from byte 0, so start its copy
     // empty (covers `live` flipping off and back on for the same path).
     setStream([]);
-    // EventSource auto-reconnects after an error and the server replays from
-    // byte 0 again — the next event after an error therefore restarts the
-    // stream copy instead of extending it (which would duplicate the backlog).
-    let restart = false;
+    // `shown` mirrors what `stream` state holds. EventSource auto-reconnects
+    // after an error and the server replays from byte 0 again; extending the
+    // shown copy would duplicate the backlog, and restarting it would rewind
+    // the view (the merge falls back to the shorter snapshot) until the replay
+    // caught up. So a post-error replay is buffered in `replay` and swapped in
+    // only once it is at least as long as what is already on screen — the
+    // previous stream stays visible until then, and the view never shrinks.
+    let shown: TranscriptEvent[] = [];
+    let replay: TranscriptEvent[] | null = null;
+    let reconnected = false;
     const unsub = api.subscribeTranscript(
       path,
       (e) => {
-        const fromStart = restart;
-        restart = false;
-        setStream((prev) => (fromStart ? [e] : [...prev, e]));
+        if (reconnected) {
+          reconnected = false;
+          replay = [];
+        }
+        if (replay) {
+          replay.push(e);
+          if (replay.length >= shown.length) {
+            shown = replay;
+            replay = null;
+            setStream(shown);
+          }
+        } else {
+          shown = [...shown, e];
+          setStream(shown);
+        }
         if (
           !completedRef.current &&
           (e.type === 'run_complete' || e.type === 'run_failed')
@@ -170,7 +188,7 @@ export default function TranscriptPanel({
       },
       () => {
         setConnected(false);
-        restart = true;
+        reconnected = true;
       },
       { host, run: runId },
     );

@@ -90,6 +90,12 @@ export default function Usage() {
   // "custom" chip and the preset-button highlighting agree.
   const [usageWindow, setUsageWindow] = useState<UsageWindow>(() => presetWindow('30d'));
   const [isCustomWindow, setIsCustomWindow] = useState(false);
+  // Why `usageWindow` last changed: an operator action (`'user'`: preset
+  // button, drag-select, clearing the custom chip) or the periodic live
+  // refresh below (`'tick'`). A tick refetch is background work — it keeps
+  // the last good data on failure and shows no "updating" cue; a user change
+  // keeps both. Always set in the same batch as `setUsageWindow`.
+  const [windowSource, setWindowSource] = useState<'user' | 'tick'>('user');
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   // Task loading-ux: pivot switches and filter-exclusion toggles trigger a
@@ -103,6 +109,7 @@ export default function Usage() {
     setRange(r);
     setUsageWindow(presetWindow(r));
     setIsCustomWindow(false);
+    setWindowSource('user');
   }, []);
 
   // Task W3: a drag-select on the graph narrows the whole page to an
@@ -112,6 +119,7 @@ export default function Usage() {
   const handleSelectRange = useCallback((startDay: string, endDay: string) => {
     setUsageWindow(windowFromDayRange(startDay, endDay));
     setIsCustomWindow(true);
+    setWindowSource('user');
   }, []);
 
   // "custom · ×" chip's clear: return to the currently-highlighted preset's
@@ -119,6 +127,7 @@ export default function Usage() {
   const clearCustomWindow = useCallback(() => {
     setUsageWindow(presetWindow(range));
     setIsCustomWindow(false);
+    setWindowSource('user');
   }, [range]);
 
   const [data, setData] = useState<UsageResponse | null>(null);
@@ -182,7 +191,8 @@ export default function Usage() {
         if (!cancelled) setOutliers(rows);
       })
       .catch(() => {
-        if (!cancelled) setOutliers([]);
+        // A failed tick-driven refresh keeps the last good outliers.
+        if (!cancelled && windowSource !== 'tick') setOutliers([]);
       });
     return () => {
       cancelled = true;
@@ -202,6 +212,7 @@ export default function Usage() {
     if (isCustomWindow) return;
     const t = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
+      setWindowSource('tick');
       setUsageWindow(presetWindow(range));
     }, USAGE_REFRESH_MS);
     return () => window.clearInterval(t);
@@ -303,6 +314,7 @@ export default function Usage() {
             onRunsLoaded={setRuns}
             onSelectRange={handleSelectRange}
             pending={isPending}
+            background={windowSource === 'tick'}
             hosts={data.hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),

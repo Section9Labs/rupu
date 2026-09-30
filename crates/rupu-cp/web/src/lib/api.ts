@@ -813,6 +813,13 @@ export interface OutlierRun {
   /** The agent a standalone run / session turn ran (the baseline agent);
    *  absent for a workflow run. */
   agent?: string | null;
+  /** The session a `session` outlier belongs to — its link target. Absent for
+   *  workflow and standalone rows (and on older servers). */
+  session_id?: string | null;
+  /** The outlier's own transcript path — the link target of an `agent` (and
+   *  fallback for a `session`) outlier, which never enter the run store so
+   *  `/runs/:id` can't show them. Absent for workflow rows. */
+  transcript_path?: string | null;
   cost_usd: number;
   baseline_usd: number;
   ratio: number;

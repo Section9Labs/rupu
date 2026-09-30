@@ -14,11 +14,23 @@ import '@testing-library/jest-dom/vitest';
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, presetWindow, windowFromDayRange, type UsageResponse } from '../lib/api';
+import {
+  api,
+  presetWindow,
+  windowFromDayRange,
+  type OutlierRun,
+  type UsageResponse,
+  type UsageRunRow,
+} from '../lib/api';
 
+// The chart stub exposes a drag-select trigger and how many day buckets the
+// page fed it (0 = the graph was blanked).
 vi.mock('../components/dashboard/UsageTimelineStacked', () => ({
-  default: (props: { onSelectRange?: (startDay: string, endDay: string) => void }) => (
-    <button onClick={() => props.onSelectRange?.('2026-07-10', '2026-07-12')}>trigger-select</button>
+  default: (props: { buckets: unknown[]; onSelectRange?: (startDay: string, endDay: string) => void }) => (
+    <>
+      <button onClick={() => props.onSelectRange?.('2026-07-10', '2026-07-12')}>trigger-select</button>
+      <span data-testid="bucket-count">{props.buckets.length}</span>
+    </>
   ),
 }));
 
@@ -47,6 +59,36 @@ function usageResponse(): UsageResponse {
     breakdown: [],
     unpriced: { models: [], rows: 0 },
     hosts: [],
+  };
+}
+
+function runRow(): UsageRunRow {
+  return {
+    run_id: 'run_1',
+    started_at: new Date().toISOString(),
+    workflow_name: 'nightly-review',
+    agent: 'reviewer',
+    provider: 'anthropic',
+    model: 'claude',
+    workspace_id: 'ws_1',
+    host_id: 'local',
+    input_tokens: 1000,
+    output_tokens: 500,
+    cached_tokens: 0,
+    total_tokens: 1500,
+    cost_usd: 4.5,
+    priced: true,
+  };
+}
+
+function outlierRow(): OutlierRun {
+  return {
+    run_id: 'run-42',
+    workflow_name: 'nightly-review',
+    cost_usd: 12,
+    baseline_usd: 3,
+    ratio: 4,
+    started_at: new Date().toISOString(),
   };
 }
 
@@ -149,5 +191,64 @@ describe('Usage page — 30s live refresh', () => {
 
     unmount();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('Usage page — background refreshes are quiet', () => {
+  it('a failed tick refresh keeps the last good outliers; a failed user change blanks them', async () => {
+    vi.mocked(api.getUsageOutliers)
+      .mockResolvedValueOnce([outlierRow()])
+      .mockRejectedValue(new Error('outliers down'));
+    renderUsage();
+    await flush();
+    expect(screen.getByRole('link', { name: 'nightly-review' })).toBeInTheDocument();
+
+    await advance(TICK);
+    await flush();
+    expect(api.getUsageOutliers).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('link', { name: 'nightly-review' })).toBeInTheDocument();
+
+    // The operator changes the window and it fails: that is not background
+    // work, so the (now meaningless) old rows are cleared as before.
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await flush();
+    expect(screen.getByText(/No cost outliers in this window/)).toBeInTheDocument();
+  });
+
+  it('a failed tick refresh keeps the graph rows; a failed user change blanks them', async () => {
+    vi.mocked(api.getUsageRuns)
+      .mockResolvedValueOnce([runRow()])
+      .mockRejectedValue(new Error('runs down'));
+    renderUsage();
+    await flush();
+    expect(screen.getByTestId('bucket-count')).toHaveTextContent('1');
+
+    await advance(TICK);
+    await flush();
+    expect(api.getUsageRuns).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('bucket-count')).toHaveTextContent('1');
+
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await flush();
+    expect(screen.getByTestId('bucket-count')).toHaveTextContent('0');
+  });
+
+  it('shows no "updating" cue for a tick refetch, but does for a user-changed window', async () => {
+    vi.mocked(api.getUsageRuns)
+      .mockResolvedValueOnce([runRow()])
+      // Every later fetch stays in flight so the cue's presence is observable.
+      .mockImplementation(() => new Promise(() => {}));
+    renderUsage();
+    await flush();
+    expect(screen.queryByRole('status', { name: 'updating' })).not.toBeInTheDocument();
+
+    await advance(TICK);
+    await flush();
+    expect(api.getUsageRuns).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('status', { name: 'updating' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '7d' }));
+    await flush();
+    expect(screen.getByRole('status', { name: 'updating' })).toBeInTheDocument();
   });
 });

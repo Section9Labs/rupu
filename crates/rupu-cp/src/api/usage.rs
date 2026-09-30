@@ -424,6 +424,12 @@ pub(crate) struct LocalSource {
     /// The agent named by a standalone run's / session turn's transcript;
     /// `""` for a workflow run (its steps name their own agents in `rows`).
     pub(crate) agent: String,
+    /// The session a session turn belongs to; `None` for a workflow run or a
+    /// standalone agent run.
+    pub(crate) session_id: Option<String>,
+    /// The source's own transcript (a standalone run / session turn); `None`
+    /// for a workflow run, whose transcripts hang off its steps.
+    pub(crate) transcript_path: Option<std::path::PathBuf>,
     /// Stamped with `workflow`, `workspace_id` and `host_id = "local"`.
     pub(crate) rows: Vec<rupu_transcript::UsageRow>,
     pub(crate) partial: bool,
@@ -474,6 +480,8 @@ fn collect_local_sources(
             started_at: r.started_at,
             workflow: r.workflow_name.clone(),
             agent: String::new(),
+            session_id: None,
+            transcript_path: None,
             rows,
             partial: u.partial,
         });
@@ -489,6 +497,9 @@ fn collect_local_sources(
             continue;
         }
         let u = crate::usage::transcripts_usage(&src.paths);
+        // `paths[0]` is the source's own transcript (`source_paths` keeps it
+        // first; dispatch sub-runs follow).
+        let transcript_path = src.paths.first().map(|(_, p)| p.clone());
         let mut rows = u.rows.clone();
         for row in &mut rows {
             row.workflow = String::new();
@@ -501,6 +512,8 @@ fn collect_local_sources(
             started_at: at,
             workflow: String::new(),
             agent: src.agent,
+            session_id: src.session_id,
+            transcript_path,
             rows,
             partial: u.partial,
         });

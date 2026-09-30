@@ -49,7 +49,8 @@
  *   • a header is surfaced from `run_start`; a footer from `run_complete`,
  *     falling back to the running sum of `usage` events while the run is in
  *     flight (each provider call appends one `usage` event, so the sum is the
- *     run's token total so far).
+ *     run's token total so far; `purpose: "compaction"` events are skipped,
+ *     matching `run_complete`'s turn-scoped total).
  *
  * No React, no DOM — a deterministic function over the event list.
  */
@@ -291,8 +292,9 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   let header: TranscriptHeader | null = null;
   let footer: TranscriptFooter | null = null;
   let sawRunComplete = false;
-  // Running total of `usage` events (input + output) — the footer's token
-  // count until `run_complete` supplies the authoritative figure.
+  // Running total of turn `usage` events (input + output; compaction calls
+  // excluded, as in `run_complete.total_tokens`) — the footer's token count
+  // until `run_complete` supplies the authoritative figure.
   let usageSum = 0;
 
   const turns: TurnView[] = [];
@@ -589,7 +591,12 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
       }
 
       case 'usage': {
-        usageSum += (asNumber(data.input_tokens) ?? 0) + (asNumber(data.output_tokens) ?? 0);
+        // A compaction summariser call is real spend but NOT part of
+        // `run_complete.total_tokens` (turn-scoped) — leaving it out keeps the
+        // live figure from dropping when the authoritative total lands.
+        if (asString(data.purpose) !== 'compaction') {
+          usageSum += (asNumber(data.input_tokens) ?? 0) + (asNumber(data.output_tokens) ?? 0);
+        }
         if (!sawRunComplete) {
           footer = {
             ...(footer ?? { status: null, durationMs: null, error: null }),

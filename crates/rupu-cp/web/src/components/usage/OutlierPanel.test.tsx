@@ -87,4 +87,62 @@ describe('OutlierPanel', () => {
     expect(screen.getByText('nightly-review')).toBeInTheDocument();
     expect(screen.queryByText('agent')).not.toBeInTheDocument();
   });
+
+  describe('link targets by kind', () => {
+    it('links a workflow outlier to its run page', () => {
+      renderPanel({ outliers: [outlier({ kind: 'workflow' })] });
+      expect(screen.getByRole('link', { name: 'nightly-review' })).toHaveAttribute('href', '/runs/run-42');
+    });
+
+    it('links a workflow outlier from an older server (no kind) to its run page', () => {
+      renderPanel({ outliers: [outlier()] });
+      expect(screen.getByRole('link', { name: 'nightly-review' })).toHaveAttribute('href', '/runs/run-42');
+    });
+
+    it('links a session outlier to its session page, not /runs (which would 404)', () => {
+      renderPanel({
+        outliers: [
+          outlier({
+            run_id: 'run-s',
+            kind: 'session',
+            workflow_name: '',
+            agent: 'assistant',
+            session_id: 'sess-9',
+            transcript_path: '/t/run-s.jsonl',
+          }),
+        ],
+      });
+      expect(screen.getByRole('link', { name: 'assistant' })).toHaveAttribute('href', '/sessions/sess-9');
+    });
+
+    it('links an agent outlier to the transcript view (the AgentRuns route form)', () => {
+      renderPanel({
+        outliers: [
+          outlier({
+            run_id: 'run-a',
+            kind: 'agent',
+            workflow_name: '',
+            agent: 'reviewer',
+            transcript_path: '/home/me/.rupu/transcripts/run a.jsonl',
+          }),
+        ],
+      });
+      expect(screen.getByRole('link', { name: 'reviewer' })).toHaveAttribute(
+        'href',
+        `/transcript?path=${encodeURIComponent('/home/me/.rupu/transcripts/run a.jsonl')}&live=0`,
+      );
+    });
+
+    it('renders a session/agent outlier as plain text when the server sent no target', () => {
+      renderPanel({
+        outliers: [
+          outlier({ run_id: 'run-s', kind: 'session', workflow_name: '', agent: 'assistant' }),
+          outlier({ run_id: 'run-a', kind: 'agent', workflow_name: '', agent: 'reviewer' }),
+        ],
+      });
+      expect(screen.getByText('assistant')).toBeInTheDocument();
+      expect(screen.getByText('reviewer')).toBeInTheDocument();
+      expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    });
+  });
 });

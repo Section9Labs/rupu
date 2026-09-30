@@ -9,7 +9,11 @@
 // Standalone agent runs and session turns are outlier candidates too, baselined
 // per agent: they carry `workflow_name: ""` plus `kind` (`"agent"`/`"session"`)
 // and `agent`, so the name column falls back to the agent and a small kind tag
-// says what sort of row it is.
+// says what sort of row it is. Only workflow runs live in the run store, so
+// the name links by kind: workflow -> `/runs/:id`, session -> its session page,
+// agent -> its transcript view (the same `/transcript?path=` route
+// `AgentRuns` uses); a row without its target renders as plain text rather
+// than a link that would 404.
 //
 // `excludedRunIds`/`onToggleRun` (Task U3, the interactive `/usage` page) add
 // a per-row exclude checkbox that toggles the run's `run_id` in the caller's
@@ -21,6 +25,23 @@ import { Link } from 'react-router-dom';
 import type { OutlierRun } from '../../lib/api';
 
 export type { OutlierRun };
+
+/** Where an outlier row's name links, or `null` when the server didn't send
+ *  the target for its kind (older API) — then it renders as plain text. */
+function outlierHref(o: OutlierRun): string | null {
+  switch (o.kind ?? 'workflow') {
+    case 'session':
+      return o.session_id ? `/sessions/${encodeURIComponent(o.session_id)}` : null;
+    case 'agent':
+      // The outliers endpoint is local-only, so no `&host=`; outliers are
+      // completed history, so `live=0`.
+      return o.transcript_path
+        ? `/transcript?path=${encodeURIComponent(o.transcript_path)}&live=0`
+        : null;
+    default:
+      return `/runs/${o.run_id}`;
+  }
+}
 
 export function OutlierPanel({
   outliers,
@@ -48,6 +69,8 @@ export function OutlierPanel({
         // agent instead. `kind` is absent on older servers (a workflow run).
         const name = o.workflow_name || o.agent || o.run_id;
         const kind = o.kind ?? 'workflow';
+        const href = outlierHref(o);
+        const nameClass = `font-medium text-ink ${excluded ? 'line-through opacity-50' : ''}`;
         return (
           <li key={o.run_id} className="flex items-center gap-3 px-3 py-2 text-sm">
             {onToggleRun && (
@@ -58,12 +81,13 @@ export function OutlierPanel({
                 onChange={() => onToggleRun(o.run_id)}
               />
             )}
-            <Link
-              to={`/runs/${o.run_id}`}
-              className={`font-medium text-ink ${excluded ? 'line-through opacity-50' : ''}`}
-            >
-              {name}
-            </Link>
+            {href ? (
+              <Link to={href} className={nameClass}>
+                {name}
+              </Link>
+            ) : (
+              <span className={nameClass}>{name}</span>
+            )}
             {kind !== 'workflow' && (
               <span
                 className={`rounded border border-border px-1 py-px text-[10px] uppercase tracking-wide text-ink-mute ${excluded ? 'opacity-50' : ''}`}

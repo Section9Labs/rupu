@@ -41,6 +41,7 @@ export default function UsageTimeline({
   onRunsLoaded,
   onSelectRange,
   pending,
+  background,
 }: {
   /** Scopes the fetch to one project's runs. Omitted on `/usage` — all
    *  local runs. */
@@ -80,6 +81,15 @@ export default function UsageTimeline({
    * still correct — just less proactive.
    */
   pending?: boolean;
+  /**
+   * The current `usageWindow` is a periodic refresh of the same live window
+   * (the caller re-derived "now"), not something the operator asked for.
+   * Such a refetch stays invisible — no "updating" dim/spinner — and a
+   * failure keeps the last good rows on screen instead of blanking the graph.
+   * Read when the window changes; omit (default false) for a user-initiated
+   * change, which keeps both the affordance and the empty-on-failure state.
+   */
+  background?: boolean;
 }) {
   // `null` = "haven't heard back from the fetch yet" — distinct from `[]`
   // ("fetched, genuinely zero rows"). Without this distinction the graph
@@ -102,7 +112,7 @@ export default function UsageTimeline({
   // no refetch.
   useEffect(() => {
     let cancelled = false;
-    setIsFetching(true);
+    if (!background) setIsFetching(true);
     // Called with exactly one argument when `workspaceId` is omitted (rather
     // than an explicit `undefined` second arg) so a caller-side spy
     // assertion like `toHaveBeenCalledWith(usageWindow)` — matching how
@@ -118,8 +128,10 @@ export default function UsageTimeline({
         // The graph is secondary to whatever summary sits above it; a
         // failure here should not blank the whole page. `[]` (not `null`)
         // so a failed fetch still counts as "loaded" — an infinite skeleton
-        // would be worse than a quiet empty state.
-        if (!cancelled) setRuns([]);
+        // would be worse than a quiet empty state. A background refresh that
+        // fails keeps whatever rows are already on screen (a transient blip
+        // must not wipe a graph the operator is looking at).
+        if (!cancelled) setRuns((prev) => (background && prev !== null ? prev : []));
       })
       .finally(() => {
         if (!cancelled) setIsFetching(false);

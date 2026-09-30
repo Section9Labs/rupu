@@ -268,4 +268,39 @@ describe('TranscriptPanel live backlog', () => {
     expect(screen.getAllByText('first message body')).toHaveLength(firstBefore);
     expect(screen.getAllByText('second message body')).toHaveLength(secondBefore);
   });
+
+  it('never rewinds the visible transcript while a reconnect replays (footer included)', async () => {
+    const USAGE: TranscriptEvent = { type: 'usage', data: { input_tokens: 100, output_tokens: 10 } };
+    const THIRD: TranscriptEvent = { type: 'assistant_message', data: { content: 'third message body' } };
+    // The snapshot is only a short prefix of what the stream has already delivered.
+    const { emit, fail } = await mountLive([RUN_START, FIRST]);
+    const SEQ = [RUN_START, FIRST, USAGE, SECOND];
+    SEQ.forEach((e) => emit(e));
+    expect(screen.getAllByText('110 tok').length).toBeGreaterThan(0);
+
+    // What is on screen: everything the stream delivered.
+    const visible = () => ({
+      second: screen.queryAllByText('second message body').length,
+      tokens: screen.queryAllByText('110 tok').length,
+    });
+    const before = visible();
+    expect(before.second).toBeGreaterThan(0);
+
+    // Reconnect: the replay restarts at byte 0 and is shorter than the old
+    // stream for a while. The view must not fall back to the snapshot.
+    fail();
+    for (const e of SEQ.slice(0, -1)) {
+      emit(e);
+      expect(visible()).toEqual(before);
+    }
+    // The last replayed event catches the replay up to the old stream: swapped
+    // in, same content, no duplicates.
+    emit(SECOND);
+    expect(visible()).toEqual(before);
+
+    // …and the stream keeps following the file from there.
+    emit(THIRD);
+    expect(screen.getAllByText('third message body').length).toBeGreaterThan(0);
+    expect(visible()).toEqual(before);
+  });
 });
